@@ -94,7 +94,7 @@ def lazy_import(module_name: str) -> Any:
 
 def has_fsdp2() -> bool:
     try:
-        from torch.distributed.fsdp import fully_shard as _
+        __import__('torch.distributed.fsdp.fully_shard')
         return True
     except Exception:
         return False

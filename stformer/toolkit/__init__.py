@@ -15,6 +15,7 @@ __all__ = [
     'SDPBackend',
     'sdpa_kernel',
     '_to_sdpa_backends',
+    'VarianceThreshold',
 ]
 
 import torch

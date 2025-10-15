@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+from dataclasses import dataclass
 from typing import Any, Optional, Sequence, Tuple, Union, List
 
 import math
+from math import prod
 
 import torch
 import torch.nn.functional as F
@@ -10,9 +12,9 @@ from torch import nn, Tensor
 from torch.distributions import Normal, StudentT
 
 from .network import PatchParameters
-from ..toolkit.optimization import Autocast, ScaledDotProductAttention, GatedMultiScaleRetention
+from ..toolkit.optimization import ScaledDotProductAttention, GatedMultiScaleRetention
 from . import StochasticDepth, _norm, _stochastic_depth_scheduler
-from ..toolkit.compat import _to_sdpa_backends, secure_torch
+from ..toolkit.compat import secure_torch
 
 secure_torch()
 
@@ -1046,7 +1048,6 @@ class GatedCrossAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.zeros(1))
-        from ..toolkit.optimization import ScaledDotProductAttention
         self.sdpa = ScaledDotProductAttention()
 
     def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1062,76 +1063,153 @@ class GatedCrossAttention(nn.Module):
         return q + torch.sigmoid(self.gate) * y
 
 
-class PerceiverResampler(nn.Module):
-    def __init__(self, d_model: int, n_latent: int = 64, nhead: int = 8, dropout: float = 0.0, norm_type: str = "layernorm"):
+class PatchAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *,
+        coord_dim: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+    ) -> None:
         super().__init__()
-        self.latents = nn.Parameter(torch.randn(n_latent, d_model) * 0.02)
-        self.cross = GatedCrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
-        q = self.latents.unsqueeze(0).expand(B, -1, -1)
-        return self.cross(q, x)
-
-
-class KNNTransformer(nn.Module):
-    def __init__(self, d_model: int, nhead: int, mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0, norm_type: str = "layernorm"):
-        super().__init__()
-        assert d_model % nhead == 0
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.norm1 = _norm(norm_type, d_model)
-        self.qkv = nn.Linear(d_model, 3*d_model, bias=True)
-        self.out_proj = nn.Linear(d_model, d_model, bias=True)
-        from ..toolkit.optimization import ScaledDotProductAttention
-        self.sdpa = ScaledDotProductAttention()
+        if d_model % nhead != 0:
+            raise ValueError("d_model must be divisible by nhead for PatchAttention")
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.head_dim = self.d_model // self.nhead
+        self.coord_dim = int(coord_dim)
+        self.norm1 = _norm(norm_type, self.d_model)
+        self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
+        self.rel_bias = nn.Sequential(
+            nn.Linear(self.coord_dim, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.nhead),
+        )
+        self.rel_value = nn.Sequential(
+            nn.Linear(self.coord_dim, self.d_model),
+            nn.SiLU(),
+            nn.Linear(self.d_model, self.d_model),
+        )
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm2 = _norm(norm_type, d_model)
-        hid = int(d_model * mlp_ratio * (2.0/3.0))
-        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+        self.norm2 = _norm(norm_type, self.d_model)
+        hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _apply_attn_mask(self, scores: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if attn_mask is None:
+            return scores
+        mask = attn_mask
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        if mask.shape[-2:] != scores.shape[-2:]:
+            raise ValueError("Attention mask shape mismatch in PatchAttention")
+        return scores.masked_fill(~mask.to(dtype=torch.bool), float('-inf'))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, N, D = x.shape
+        if coords.shape[:2] != (B, N):
+            raise ValueError("coords must have shape (B, N, C)")
         qkv = self.qkv(self.norm1(x))
         q, k, v = qkv.chunk(3, dim=-1)
-        def split(t): return t.view(B, N, self.nhead, self.head_dim).transpose(1, 2)
-        qh, kh, vh = split(q), split(k), split(v)
-        yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
-        y = yh.transpose(1, 2).contiguous().view(B, N, D)
-        x = x + self.drop_path(self.dropout(self.out_proj(y)))
+
+        def _split(t: torch.Tensor) -> torch.Tensor:
+            return t.view(B, N, self.nhead, self.head_dim).transpose(1, 2)
+
+        qh, kh, vh = _split(q), _split(k), _split(v)
+        rel = coords.unsqueeze(2) - coords.unsqueeze(1)
+        rel_bias = self.rel_bias(rel).permute(0, 3, 1, 2)
+        rel_value = self.rel_value(rel).view(B, N, N, self.nhead, self.head_dim).permute(0, 3, 1, 2, 4)
+        scores = torch.einsum('bhid,bhjd->bhij', qh, kh) / math.sqrt(float(self.head_dim))
+        scores = scores + rel_bias
+        scores = self._apply_attn_mask(scores, attn_mask)
+        weights = torch.softmax(scores, dim=-1)
+        value = vh.unsqueeze(2).expand(-1, -1, N, -1, -1) + rel_value
+        y = torch.einsum('bhij,bhijd->bhid', weights, value)
+        y = y.transpose(1, 2).contiguous().view(B, N, D)
+        x = x + self.drop_path(self.dropout(y))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
         return x
 
 
 class SpatialSubnet(nn.Module):
-    def __init__(self, d_model: int, nhead: int, depth: int, mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0, norm_type: str = "layernorm"):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *,
+        coord_dim: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+    ) -> None:
         super().__init__()
-        self.blocks = nn.ModuleList([
-            KNNTransformer(d_model, nhead, mlp_ratio, dropout, drop_path, norm_type) for _ in range(depth)
-        ])
+        drops = _stochastic_depth_scheduler(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                PatchAttention(
+                    d_model,
+                    nhead,
+                    coord_dim=coord_dim,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
         self.norm = _norm(norm_type, d_model)
 
-    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         for blk in self.blocks:
-            x = blk(x, attn_mask=attn_mask)
+            x = blk(x, coords, attn_mask=attn_mask)
         return self.norm(x)
 
 
 class TemporalRetNet(nn.Module):
-    def __init__(self, d_model: int, nhead: int, mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0, norm_type: str = "layernorm"):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+    ) -> None:
         super().__init__()
         self.norm1 = _norm(norm_type, d_model)
-        from ..toolkit.optimization import GatedMultiScaleRetention
         self.msr = GatedMultiScaleRetention(d_model, nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = _norm(norm_type, d_model)
-        hid = int(d_model * mlp_ratio * (2.0/3.0))
+        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
 
-    def forward(self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None, state: Optional[dict] = None) -> Tuple[torch.Tensor, Optional[dict]]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        state: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[dict]]:
         h = self.msr(self.norm1(x), attn_mask=causal_mask, state=state)
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
@@ -1139,11 +1217,32 @@ class TemporalRetNet(nn.Module):
 
 
 class TemporalSubnet(nn.Module):
-    def __init__(self, d_model: int, nhead: int, depth: int, mlp_ratio: float = 4.0, dropout: float = 0.0, drop_path: float = 0.0, norm_type: str = "layernorm"):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+    ) -> None:
         super().__init__()
-        self.blocks = nn.ModuleList([
-            TemporalRetNet(d_model, nhead, mlp_ratio, dropout, drop_path, norm_type) for _ in range(depth)
-        ])
+        drops = _stochastic_depth_scheduler(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                TemporalRetNet(
+                    d_model,
+                    nhead,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
         self.norm = _norm(norm_type, d_model)
 
     def forward(self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1153,16 +1252,241 @@ class TemporalSubnet(nn.Module):
         return self.norm(x)
 
 
-class SpatioTemporalNet(nn.Module):
-    def __init__(self, d_model: int, nhead: int, latent_s: int = 64, latent_t: int = 64, dropout: float = 0.0, norm_type: str = "layernorm"):
+class CrossTransformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+    ) -> None:
         super().__init__()
-        self.resampler_s = PerceiverResampler(d_model, latent_s, nhead, dropout, norm_type)
-        self.resampler_t = PerceiverResampler(d_model, latent_t, nhead, dropout, norm_type)
-        self.mixer_norm = _norm(norm_type, d_model)
-        self.mixer = SwiGLU(d_model, int(d_model * (8.0/3.0)), out_dim=d_model, dropout=dropout)
+        self.cross_s = GatedCrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
+        self.cross_t = GatedCrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
+        self.mix_norm = _norm(norm_type, 2 * d_model)
+        hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
+        self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
 
-    def forward(self, s_tokens: torch.Tensor, t_tokens: torch.Tensor) -> torch.Tensor:
-        ls = self.resampler_s(s_tokens)
-        lt = self.resampler_t(t_tokens)
-        x = torch.cat([ls, lt], dim=1)
-        return self.mixer(self.mixer_norm(x))
+    def forward(
+        self,
+        spatial_tokens: torch.Tensor,
+        temporal_tokens: torch.Tensor,
+        mode: str = "sxt",
+    ) -> torch.Tensor:
+        mode_l = mode.lower()
+        s_context = self.cross_s(spatial_tokens, temporal_tokens)
+        t_context = self.cross_t(temporal_tokens, spatial_tokens)
+        if mode_l == "sxs":
+            return s_context
+        if mode_l == "txt":
+            return t_context
+        if mode_l == "txs":
+            base = torch.cat(
+                [t_context, s_context.mean(dim=1, keepdim=True).expand(-1, t_context.size(1), -1)],
+                dim=-1,
+            )
+            fused = self.mix(self.mix_norm(base))
+            return t_context + self.drop_path(self.dropout(fused))
+        base = torch.cat(
+            [s_context, t_context.mean(dim=1, keepdim=True).expand(-1, s_context.size(1), -1)],
+            dim=-1,
+        )
+        fused = self.mix(self.mix_norm(base))
+        return s_context + self.drop_path(self.dropout(fused))
+
+
+@dataclass
+class Meta:
+    """Aggregated outputs from :class:`SpatioTemporalNet`.
+
+    The spatiotemporal pipeline emits three different views over the model
+    prediction so downstream components can choose the representation that best
+    matches their task:
+
+    * ``tokens`` – the latent token sequence after the perception fusion stage
+      (and optional normalization). This is used by higher level models such as
+      :class:`MetaNet` for refinement or cross-window stitching.
+    * ``context`` – the decoded tensor shaped back into the target context
+      dimensions. This is the primary prediction that matches the desired
+      ``out_shape``.
+    * ``flat`` – the raw flattened context prediction before reshaping. Certain
+      optimization heads operate over the flattened form, so we expose it
+      alongside ``context``.
+    * ``offset`` – the mean value broadcast over the context dimensions. It is
+      primarily consumed for stage-to-stage calibration when merging outputs
+      from multiple windows.
+    * ``context_shape`` – the tuple describing the shape of ``context`` so that
+      consumers can reshape ``flat`` without needing direct access to the
+      originating model configuration.
+    """
+
+    tokens: torch.Tensor
+    context: torch.Tensor
+    flat: torch.Tensor
+    offset: torch.Tensor
+    context_shape: Tuple[int, ...]
+
+
+class MetaNet(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+    ) -> None:
+        super().__init__()
+        drops = _stochastic_depth_scheduler(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                TemporalRetNet(
+                    d_model,
+                    nhead,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = _norm(norm_type, d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        state = None
+        for blk in self.blocks:
+            tokens, state = blk(tokens, causal_mask=None, state=state)
+        return self.norm(tokens)
+
+
+class SpatioTemporalNet(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_shape: Sequence[int],
+        *,
+        config: 'Config',
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_shape = tuple(int(v) for v in out_shape)
+        self.out_dim = int(prod(self.out_shape))
+        self.d_model = int(config.depth)
+        self.nhead = int(config.heads)
+        self.data_definition = str(config.data_definition).lower()
+        self.spatial_tokens = max(1, int(config.spatial_latent_tokens))
+        self.temporal_tokens = max(1, int(config.temporal_latent_tokens))
+        self.mlp_ratio = float(config.mlp_ratio)
+        self.dropout = float(config.dropout)
+        self.drop_path = float(config.drop_path)
+        self.norm_type = str(config.normalize_method)
+
+        self.spatial_tokenizer = nn.Linear(self.in_dim, self.spatial_tokens * self.d_model)
+        self.temporal_tokenizer = nn.Linear(self.in_dim, self.temporal_tokens * self.d_model)
+        self.register_buffer(
+            "spatial_coords_template",
+            self._build_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
+            persistent=False,
+        )
+
+        self.spatial_subnet = SpatialSubnet(
+            self.d_model,
+            self.nhead,
+            depth=max(1, int(config.spatial_depth)),
+            coord_dim=self.spatial_coords_template.shape[-1],
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+        )
+        self.temporal_subnet = TemporalSubnet(
+            self.d_model,
+            self.nhead,
+            depth=max(1, int(config.temporal_depth)),
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+        )
+        self.perception = CrossTransformer(
+            self.d_model,
+            self.nhead,
+            dropout=self.dropout,
+            norm_type=self.norm_type,
+            mlp_ratio=self.mlp_ratio,
+            drop_path=self.drop_path,
+        )
+        self.norm = _norm(self.norm_type, self.d_model)
+        hid = int(self.d_model * max(1.0, self.mlp_ratio))
+        self.head = nn.Sequential(
+            _norm(self.norm_type, self.d_model),
+            nn.Linear(self.d_model, hid),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(hid, self.out_dim),
+        )
+
+    @staticmethod
+    def _build_spatial_coords(n_tokens: int, device: torch.device) -> torch.Tensor:
+        side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
+        coords: List[Tuple[float, float, float]] = []
+        for idx in range(n_tokens):
+            z = idx // (side * side)
+            rem = idx % (side * side)
+            y = rem // side
+            x = rem % side
+            if side == 1:
+                coords.append((0.0, 0.0, 0.0))
+            else:
+                coords.append((x / (side - 1 if side > 1 else 1), y / (side - 1 if side > 1 else 1), z / (side - 1 if side > 1 else 1)))
+        return torch.tensor(coords, dtype=torch.float32, device=device)
+
+    def _spatial_coords(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        coords = self.spatial_coords_template.to(device=device, dtype=dtype)
+        return coords.unsqueeze(0).expand(batch, -1, -1)
+
+    def forward(self, x: torch.Tensor) -> Meta:
+        B = x.shape[0]
+        spatial_tokens = self.spatial_tokenizer(x).view(B, self.spatial_tokens, self.d_model)
+        temporal_tokens = self.temporal_tokenizer(x).view(B, self.temporal_tokens, self.d_model)
+        coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
+        spatial_out = self.spatial_subnet(spatial_tokens, coords)
+        temporal_out = self.temporal_subnet(temporal_tokens)
+        mode = self.data_definition
+        if mode == "sxs":
+            tokens = spatial_out
+        elif mode == "txt":
+            tokens = temporal_out
+        elif mode == "txs":
+            tokens = self.perception(temporal_out, spatial_out, mode="txs")
+        else:
+            tokens = self.perception(spatial_out, temporal_out, mode="sxt")
+        tokens = self.norm(tokens)
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled)
+        context = flat.view(B, *self.out_shape)
+        dims = tuple(range(1, context.ndim))
+        offset = context.mean(dim=dims, keepdim=True)
+        return Meta(
+            tokens=tokens,
+            context=context,
+            flat=flat,
+            offset=offset,
+            context_shape=self.out_shape,
+        )
+
+    def decode(self, tokens: torch.Tensor, *, apply_norm: bool = False) -> torch.Tensor:
+        if apply_norm:
+            tokens = self.norm(tokens)
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled)
+        return flat.view(tokens.shape[0], *self.out_shape)

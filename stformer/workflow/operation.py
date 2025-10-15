@@ -35,7 +35,6 @@ from ..architecture.module import StandardNormalLoss
 from ..architecture.module import StudentsTLoss
 from ..architecture.module import TiledLoss
 from ..architecture.network import Model
-from ..architecture.module import SpatioTemporalNet
 from ..pipeline.collate import stream
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import apply_threading_defaults
@@ -663,7 +662,7 @@ def _epochs(
     register_nvtx_flops_getter(get_total_flops)
     cfg = Config(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict or Config()
     cfg = Config(**{**asdict(cfg), 'device': device})
-    model = Model(in_dim, out_shape, SpatioTemporalNet(in_dim, int(torch.tensor(out_shape).prod().item()), config=cfg), config=cfg)
+    model = Model(in_dim, out_shape, config=cfg)
     if init_ckpt_dir is not None and os.path.isdir(init_ckpt_dir):
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message=pattern_to_ignore)
@@ -727,8 +726,8 @@ def _epochs(
                     ignored_params.append(p)
     ignored_params = set(ignored_params)
     try:
-        if hasattr(model, 'subnet') and hasattr(model.subnet, 'blocks'):
-            for m in model.subnet.blocks:
+        if hasattr(model, 'local') and hasattr(model.local, 'blocks'):
+            for m in model.local.blocks:
                 fully_shard(
                     m,
                     mesh=mesh,
@@ -736,8 +735,15 @@ def _epochs(
                     reshard_after_forward=False,
                     ignored_params=[param for param in m.parameters(recurse=True) if param in ignored_params],
                 ).set_requires_gradient_sync(True)
-        if hasattr(model, 'res_net') and hasattr(model.res_net, 'blocks'):
-            for m in model.res_net.blocks:
+        global_net = None
+        if hasattr(model, 'global'):
+            maybe_global = getattr(model, 'global')
+            if hasattr(maybe_global, 'blocks'):
+                global_net = maybe_global
+        elif hasattr(model, '_global') and hasattr(model._global, 'blocks'):
+            global_net = model._global
+        if global_net is not None:
+            for m in global_net.blocks:
                 fully_shard(
                     m,
                     mesh=mesh,
@@ -1177,7 +1183,7 @@ def _infer(
         pass
     device = get_device()
     cfg = Config(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict or Config()
-    model = Model(in_dim, out_shape, SpatioTemporalNet(in_dim, int(torch.tensor(out_shape).prod().item()), config=cfg), config=cfg)
+    model = Model(in_dim, out_shape, config=cfg)
     if model_ckpt_dir is not None and os.path.isdir(model_ckpt_dir):
         with warnings.catch_warnings():
             warnings.filterwarnings('ignore', message=pattern_to_ignore)
