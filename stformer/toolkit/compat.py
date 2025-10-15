@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import os
 import sys
@@ -161,3 +161,36 @@ def env_info() -> EnvInfo:
         has_cuda_ipc=has_cuda_ipc(),
         has_gds=has_gds(),
     )
+
+
+def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
+    """Convert a collection of backend descriptors to torch SDP backend enums.
+
+    ``SDPBackend`` exposes attributes such as ``FLASH_ATTENTION`` or ``MATH``
+    depending on the runtime PyTorch build.  Historical versions of this project
+    accepted both the enum values themselves as well as string identifiers.  The
+    helper gently normalises the inputs while ignoring unknown identifiers so
+    that callers do not need to guard against missing backends (common in CPU
+    only test environments).
+    """
+
+    if backends is None:
+        candidates: Iterable[Any] = (
+            'FLASH_ATTENTION',
+            'EFFICIENT_ATTENTION',
+            'CUDNN_ATTENTION',
+            'MATH',
+        )
+    else:
+        candidates = backends
+
+    resolved: list[Any] = []
+    for candidate in candidates:
+        if isinstance(candidate, str):
+            attr = candidate.upper()
+            if hasattr(SDPBackend, attr):
+                resolved.append(getattr(SDPBackend, attr))
+        elif candidate is not None:
+            resolved.append(candidate)
+
+    return resolved

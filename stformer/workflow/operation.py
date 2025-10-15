@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import contextlib
 import gc
-import importlib
 import json
 import math
 import multiprocessing
@@ -45,29 +43,32 @@ from ..toolkit.capability import optimal_procs
 from ..toolkit.optimization import AdamW
 from ..toolkit.optimization import Architecture
 from ..toolkit.optimization import Autocast
+from ..toolkit.optimization import NVTXCounterMode
 from ..toolkit.optimization import fsdp_no_sync
 from ..toolkit.optimization import get_total_flops
+from ..toolkit.optimization import nvtx_soft_add
 from ..toolkit.optimization import register_flop_hooks
+from ..toolkit.optimization import register_nvtx_flops_getter
 
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-except Exception:
+except ImportError:
     def precompute_float8_dynamic_scale_for_fsdp(*args: Any, **kwargs: Any) -> Any:
         return None
 
 try:
     from torch.distributed.run import elastic_launch, LaunchConfig
-except Exception:
+except ImportError:
     from torch.distributed.launcher.api import elastic_launch, LaunchConfig
 
 try:
     from torch.distributed.algorithms.join import Join
-except Exception:
+except ImportError:
     Join = None
 
 try:
     from torch.utils.flop_counter import FlopCounterMode
-except Exception:
+except ImportError:
     class _NoOpFlops:
         def __enter__(self) -> Any: return self
         def __exit__(self, *exc: Any) -> bool: return False
@@ -84,130 +85,16 @@ sentences_to_ignore = [
 pattern_to_ignore = '|'.join((f'({sentence})' for sentence in sentences_to_ignore))
 
 
-def _import_callable(spec: str) -> Callable:
-    if not isinstance(spec, str) or not spec.strip():
-        raise ValueError('Empty spec for callable import')
-    raw = spec.strip()
-    root_pkg = __package__.split('.', 1)[0] if __package__ else 'stformer'
-    default_module = f'{root_pkg}.toolkit.optimization'
-    if ':' in raw:
-        mod_part, fn_part = raw.split(':', 1)
-    else:
-        mod_part, fn_part = ('', raw)
-    mod_part = mod_part.strip()
-    fn_part = fn_part.strip()
-    if not fn_part:
-        raise ValueError(f'Missing function in spec: {spec}')
-    if not mod_part:
-        mod_name = default_module
-    elif mod_part.startswith('.'):
-        mod_name = f'{root_pkg}{mod_part}'
-    elif not mod_part.startswith(root_pkg + '.') and (mod_part.split('.')[0] not in ('importlib', 'torch', 'math', 'sys')):
-        mod_name = f'{root_pkg}.{mod_part}'
-    else:
-        mod_name = mod_part
-    module = importlib.import_module(mod_name)
-    fn = getattr(module, fn_part, None)
-    if not callable(fn):
-        raise TypeError(f'{mod_name}:{fn_part} is not callable or not found')
-    return fn
-
-
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
         keys = list(state.keys())
-    except Exception:
+    except (AttributeError, TypeError):
         return state
     for k in list(keys):
         s = str(k)
         if s.endswith('._extra_state') or s.endswith('_extra_state'):
-            try:
-                state.pop(k, None)
-            except Exception:
-                pass
+            state.pop(k, None)
     return state
-
-
-_NVTX_SOFT_COUNTER: float = 0.0
-_NVTX_FLOPS_GETTER: Optional[Callable[[], float]] = None
-
-
-def register_nvtx_flops_getter(fn: Callable[[], float]) -> None:
-    global _NVTX_FLOPS_GETTER
-    _NVTX_FLOPS_GETTER = fn
-
-
-def _nvtx_soft_add(v: float) -> None:
-    global _NVTX_SOFT_COUNTER
-    try:
-        _NVTX_SOFT_COUNTER += float(v) if float(v) > 0 else 0.0
-    except Exception:
-        pass
-
-
-def _nvtx_soft_getter() -> float:
-    return float(_NVTX_SOFT_COUNTER)
-
-
-def _ensure_nvtx_flops_getter() -> None:
-    global _NVTX_FLOPS_GETTER
-    if _NVTX_FLOPS_GETTER is not None:
-        return
-    hook = os.environ.get('STF_NVTX_FLOPS_FN', '').strip()
-    if hook:
-        try:
-            _NVTX_FLOPS_GETTER = _import_callable(hook)
-            return
-        except Exception:
-            pass
-    _NVTX_FLOPS_GETTER = _nvtx_soft_getter
-
-
-class _NoOpNvtxCounter:
-    def __enter__(self) -> '_NoOpNvtxCounter': return self
-    def __exit__(self, *exc: Any) -> bool: return False
-    def get_total_flops(self) -> float: return 0.0
-
-
-class _NvtxCounter:
-    def __init__(self, getter: Callable[[], float]) -> None:
-        self._getter = getter
-        self._start: float = 0.0
-        self._end: float = 0.0
-
-    def __enter__(self) -> '_NvtxCounter':
-        try:
-            self._start = float(self._getter())
-        except Exception:
-            self._start = 0.0
-        return self
-
-    def __exit__(self, *exc: Any) -> bool:
-        try:
-            self._end = float(self._getter())
-        except Exception:
-            self._end = self._start
-        return False
-
-    def get_total_flops(self) -> float:
-        end = float(self._end)
-        if not end > self._start:
-            try:
-                end = float(self._getter())
-            except Exception:
-                end = self._start
-        return max(0.0, float(end) - float(self._start))
-
-
-def NVTXCounterMode(device: Optional[torch.device] = None) -> Any:
-    try:
-        dev = device if device is not None else get_device()
-    except Exception:
-        dev = None
-    if dev is None or getattr(dev, 'type', None) != 'cuda':
-        return _NoOpNvtxCounter()
-    _ensure_nvtx_flops_getter()
-    return _NvtxCounter(_NVTX_FLOPS_GETTER)
 
 
 _SIZEOF = {
@@ -262,7 +149,7 @@ def _size(dtype: torch.dtype | str) -> int:
 def _mp_env() -> None:
     try:
         torch.multiprocessing.set_sharing_strategy('file_system')
-    except Exception:
+    except RuntimeError:
         pass
     start_method = 'spawn' if str(sys.platform).lower().startswith('win') else 'forkserver'
     for _mod in (multiprocessing, torch.multiprocessing):
@@ -270,7 +157,7 @@ def _mp_env() -> None:
             _mod.set_start_method(start_method, force=True)
         except RuntimeError:
             pass
-        except Exception:
+        except ValueError:
             pass
 
 
@@ -360,7 +247,7 @@ def _set_backend(device: torch.device) -> None:
             inet = gws['default'][netifaces.AF_INET][1]
             os.environ['GLOO_SOCKET_IFNAME'] = inet
             os.environ['TP_SOCKET_IFNAME'] = inet
-        except Exception:
+        except (ImportError, KeyError, OSError):
             pass
 
 
@@ -389,8 +276,10 @@ def _preprocess(
     def _feat_row(x_tuple: Any) -> Any:
         try:
             vals = [float(v) for v in _to_tuple(x_tuple)]
-        except Exception as e:
-            raise TypeError(f'_preprocess: feature tuple에는 수치형 값만 와야 합니다. 문제 값={x_tuple!r}') from e
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"_preprocess: feature tuples must contain only numeric values. Invalid value={x_tuple!r}"
+            ) from exc
         return torch.as_tensor(vals, dtype=torch.float32)
 
     def _lbl(y: Any) -> Any:
@@ -427,7 +316,9 @@ def _preprocess(
     if isinstance(data, dict) and len(data) > 0:
         items = list(data.items())
         if any((isinstance(k, str) for k, _ in items)):
-            raise TypeError("_preprocess: 다중 샘플 dict에서는 키가 튜플이어야 합니다. {'X':...,'Y':...}는 단일 샘플로 전달하세요.")
+            raise TypeError(
+                "_preprocess: keys in a multi-sample dict must be tuples. Provide single samples as {'X': ..., 'Y': ...}."
+            )
         keys: List[Tuple] = [_to_tuple(k) for k, _ in items]
         feats = torch.stack([_feat_row(k) for k in keys], dim=0)
         lbl_list = [_lbl(v) for _, v in items]
@@ -437,7 +328,7 @@ def _preprocess(
             labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
         label_shape = tuple(labels.shape[1:])
         return (feats, labels, keys, label_shape)
-    raise ValueError('_preprocess: 지원하지 않는 입력 형식입니다. dict 또는 (X,Y)여야 합니다.')
+    raise ValueError("_preprocess: unsupported input format. Provide a dict or an (X, Y) pair.")
 
 
 def _postprocess(
@@ -460,7 +351,7 @@ def _postprocess(
         if not isinstance(k, tuple):
             try:
                 k = tuple(k)
-            except Exception:
+            except TypeError:
                 k = (k,)
         k_out = k
         if k in seen:
@@ -560,14 +451,10 @@ def train(
         m_sd = get_model_state_dict(model, options=opts)
         save(state_dict={'model': m_sd}, storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True))
     _ = _establish(rdzv_endpoint)
-    device = get_device()
     apply_threading_defaults()
     caps = optimal_procs()
     nprocs = caps['nproc_per_node']
-    try:
-        cfg_obj = getattr(model, '_Model__config', None)
-    except Exception:
-        cfg_obj = None
+    cfg_obj = getattr(model, '_Model__config', None)
     cfg_dict: Dict[str, Any] = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
     lc = LaunchConfig(
         min_nodes=1,
@@ -613,18 +500,9 @@ def train(
         m_sd = _prune_dcp_state_keys(m_sd)
         load(state_dict={'model': m_sd}, storage_reader=FileSystemReader(ckpt_dir))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-    try:
-        shutil.rmtree(memmap_dir, ignore_errors=True)
-    except Exception:
-        pass
-    try:
-        shutil.rmtree(ckpt_dir, ignore_errors=True)
-    except Exception:
-        pass
-    try:
-        shutil.rmtree(init_dir, ignore_errors=True)
-    except Exception:
-        pass
+    shutil.rmtree(memmap_dir, ignore_errors=True)
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+    shutil.rmtree(init_dir, ignore_errors=True)
     return model
 
 
@@ -676,7 +554,7 @@ def _epochs(
         try:
             import torch.distributed as dist
             is_main = dist.is_initialized() and dist.get_rank() == 0
-        except Exception:
+        except (ImportError, RuntimeError):
             is_main = True
         if is_main:
             warnings.warn(msg)
@@ -751,16 +629,27 @@ def _epochs(
                     reshard_after_forward=False,
                     ignored_params=[param for param in m.parameters(recurse=True) if param in ignored_params],
                 ).set_requires_gradient_sync(True)
-        fully_shard(model, mesh=mesh, mp_policy=mp_policy, reshard_after_forward=False, ignored_params=ignored_params).set_requires_gradient_sync(True)
-    except Exception:
-        fully_shard(model, mesh=mesh, mp_policy=mp_policy, ignored_params=ignored_params, reshard_after_forward=False).set_requires_gradient_sync(True)
+        fully_shard(
+            model,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=False,
+            ignored_params=ignored_params,
+        ).set_requires_gradient_sync(True)
+    except (RuntimeError, ValueError, TypeError):
+        fully_shard(
+            model,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            ignored_params=ignored_params,
+            reshard_after_forward=False,
+        ).set_requires_gradient_sync(True)
     net_params = [p for p in model.parameters()]
     optimizer = AdamW.float(net_params, lr=base_lr, weight_decay=weight_decay, use_fp8=device.type == 'cuda', use_foreach=False, use_fused=False, logger=None)
 
     def _dl_ckpt(p: Any) -> Any:
         return os.path.join(p, 'dataloader.json')
 
-    meta = _meta(memmap_dir)
     train_loader0, val_loader0, keep0 = stream(
         memmap_dir=memmap_dir,
         device=device,
@@ -782,13 +671,12 @@ def _epochs(
             return obj.to_tensor()
         return torch.as_tensor(obj)
 
-    # bootstrap running stats from first pass
     for _step_idx, _raw in enumerate(train_loader0):
         _feat0, _label0, *_ = _preprocess(_raw)
         if hasattr(model, 'update_x_stats'):
             try:
                 model.update_x_stats(_feat0)
-            except Exception:
+            except (RuntimeError, ValueError, TypeError):
                 model.update_x_stats(_as_tensor(_feat0).detach().cpu())
         _label0 = _as_tensor(_label0)
         _Y0_flat = _label0.view(_label0.shape[0], -1)
@@ -822,10 +710,8 @@ def _epochs(
         return frac_min + (1.0 - frac_min) * 0.5 * (1.0 + math.cos(math.pi * t / max(1, main_steps)))
 
     def _join_context(m: torch.nn.Module) -> contextlib.AbstractContextManager:
-        try:
-            is_joinable = hasattr(m, 'join_hook')
-        except Exception:
-            is_joinable = False
+        join_hook = getattr(m, 'join_hook', None)
+        is_joinable = join_hook is not None
         return Join([m], throw_on_early_termination=True) if Join is not None and is_joinable else contextlib.nullcontext()
 
     sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_scheduler)
@@ -848,22 +734,26 @@ def _epochs(
             seed=seed,
             shuffle=True,
         )
-        try:
-            dl_state_path = os.path.join(ckpt_dir, 'dataloader.json') if os.path.isfile(os.path.join(ckpt_dir, 'dataloader.json')) else (
-                os.path.join(init_ckpt_dir, 'dataloader.json') if (init_ckpt_dir and os.path.isfile(os.path.join(init_ckpt_dir, 'dataloader.json'))) else None
-            )
-            if dl_state_path:
+        ckpt_state_path = os.path.join(ckpt_dir, 'dataloader.json')
+        init_state_path = os.path.join(init_ckpt_dir, 'dataloader.json') if init_ckpt_dir else None
+        dl_state_path: Optional[str] = None
+        if os.path.isfile(ckpt_state_path):
+            dl_state_path = ckpt_state_path
+        elif init_state_path and os.path.isfile(init_state_path):
+            dl_state_path = init_state_path
+        if dl_state_path:
+            try:
                 with open(dl_state_path, 'r', encoding='utf-8') as _f:
                     _dl = json.load(_f)
-                state_train = _dl.get('train', {})
-                state_val = _dl.get('val', {})
-                with contextlib.suppress(Exception):
-                    train_loader.load_state_dict(state_train)
-                if val_loader is not None:
-                    with contextlib.suppress(Exception):
-                        val_loader.load_state_dict(state_val)
-        except Exception:
-            pass
+            except (OSError, json.JSONDecodeError):
+                _dl = {}
+            state_train = _dl.get('train', {}) if isinstance(_dl, dict) else {}
+            state_val = _dl.get('val', {}) if isinstance(_dl, dict) else {}
+            with contextlib.suppress((RuntimeError, ValueError, TypeError)):
+                train_loader.load_state_dict(state_train)
+            if val_loader is not None:
+                with contextlib.suppress((RuntimeError, ValueError, TypeError)):
+                    val_loader.load_state_dict(state_val)
         with register_flop_hooks(model, mode='train'):
             model.train()
             running = torch.zeros((), device=device, dtype=torch.float32)
@@ -950,8 +840,8 @@ def _epochs(
                         comp_time += torch.tensor((time.perf_counter_ns() - t_comp_start) / 1_000_000_000.0, device=device, dtype=torch.float64)
                     fcm_flops = float(fcm_step.get_total_flops())
                     try:
-                        _nvtx_soft_add(fcm_flops)
-                    except Exception:
+                        nvtx_soft_add(fcm_flops)
+                    except (RuntimeError, ValueError, TypeError):
                         pass
                     nvtx_flops = float(nvtx_step.get_total_flops()) if getattr(device, 'type', None) == 'cuda' else 0.0
                     step_flops = max(fcm_flops, nvtx_flops, get_total_flops(reset=True))
@@ -982,7 +872,7 @@ def _epochs(
                             warnings.filterwarnings('ignore', message=pattern_to_ignore)
                             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
                             m_sd = get_model_state_dict(model, options=opts)
-                            o_sd = get_optimizer_state_dict(optimizer)
+                            o_sd = get_optimizer_state_dict(model, optimizers=optimizer)
                             if torch.distributed.is_initialized():
                                 torch.distributed.barrier(device_ids=[local_rank] if device.type in ('cuda', 'xpu') else None)
                             save(state_dict={'model': m_sd, 'optimizer': o_sd}, storage_writer=FileSystemWriter(ckpt_dir, sync_files=True, overwrite=True))
@@ -1049,10 +939,10 @@ def _epochs(
                                 comp_time += torch.tensor((time.perf_counter_ns() - t_comp_start) / 1_000_000_000.0, device=device, dtype=torch.float64)
                             try:
                                 fcm_vflops = float(fcm_val.get_total_flops())
-                            except Exception:
+                            except (RuntimeError, ValueError, TypeError):
                                 fcm_vflops = 0.0
                             with contextlib.suppress(Exception):
-                                _nvtx_soft_add(fcm_vflops)
+                                nvtx_soft_add(fcm_vflops)
                             nvtx_vflops = float(nvtx_val.get_total_flops()) if getattr(device, 'type', None) == 'cuda' else 0.0
                             v_step_flops = max(fcm_vflops, nvtx_vflops, get_total_flops(reset=True))
                             flops += torch.tensor(v_step_flops, device=device, dtype=torch.float64)
@@ -1090,7 +980,7 @@ def _epochs(
             warnings.filterwarnings('ignore', message=pattern_to_ignore)
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             model_sd = get_model_state_dict(model, options=opts)
-            optim_sd = get_optimizer_state_dict(optimizer)
+            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
             writer = FileSystemWriter(ckpt_dir, sync_files=True, overwrite=True)
             save(state_dict={'model': model_sd, 'optimizer': optim_sd}, storage_writer=writer)
         with contextlib.suppress(Exception):
@@ -1132,12 +1022,8 @@ def predict(
             save(state_dict={'model': m_sd}, storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True))
             if torch.distributed.is_initialized():
                 torch.distributed.barrier(device_ids=[rank_hint] if device.type in ('cuda', 'xpu') else None)
-        try:
-            cfg_obj = getattr(model, '_Model__config', None)
-        except Exception:
-            cfg_obj = None
+        cfg_obj = getattr(model, '_Model__config', None)
         cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
-        # fill missing labels with zeros of the correct shape for pipeline consistency
         if any(v is None for v in data.values()):
             dummy_shape = tuple(model.out_shape)
             data = {k: torch.zeros(dummy_shape) if v is None else torch.as_tensor(v).view(*dummy_shape) for k, v in data.items()}
@@ -1179,7 +1065,7 @@ def _infer(
             torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
         elif hasattr(torch, 'xpu') and torch.xpu.is_available():
             torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
-    except Exception:
+    except (RuntimeError, AttributeError, AssertionError):
         pass
     device = get_device()
     cfg = Config(**cfg_dict) if isinstance(cfg_dict, dict) else cfg_dict or Config()
@@ -1273,15 +1159,15 @@ def _infer(
                     comp_time += (t1 - t0) / 1_000_000_000.0
                 try:
                     fcm_flops = float(fcm_val.get_total_flops())
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     fcm_flops = 0.0
                 try:
                     nvtx_flops = float(nvtx_val.get_total_flops()) if getattr(device, 'type', None) == 'cuda' else 0.0
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     nvtx_flops = 0.0
                 try:
                     step_flops = max(fcm_flops, nvtx_flops, get_total_flops(reset=True))
-                except Exception:
+                except (RuntimeError, ValueError, TypeError):
                     step_flops = max(fcm_flops, nvtx_flops)
                 total_flops += max(0.0, step_flops)
                 mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0

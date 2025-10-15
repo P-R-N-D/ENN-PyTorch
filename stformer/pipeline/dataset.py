@@ -210,12 +210,12 @@ class Batch(IterableWrapper):
         meta = _meta(memmap_dir)
         N = int(meta["N"])
         if fractions is not None:
-            train_frac, val_frac = float(fractions[0]), float(fractions[1])
+            train_frac = float(fractions[0])
         else:
-            train_frac, val_frac = 1.0, 0.0
+            train_frac = 1.0
             if "fractions" in meta:
                 try:
-                    train_frac, val_frac = float(meta["fractions"][0]), float(meta["fractions"][1])
+                    train_frac = float(meta["fractions"][0])
                 except Exception:
                     pass
         if part not in ("train", "val"):

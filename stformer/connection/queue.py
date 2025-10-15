@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Iterator, Optional, Protocol
 
 import base64
 import json
 import queue
 import time
 import uuid
+
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterator, Optional, Protocol
 
 
 class _ZMQProxy:
@@ -17,8 +18,8 @@ class _ZMQProxy:
         if self._mod is None:
             try:
                 import zmq
-            except Exception as e:  
-                raise RuntimeError("pyzmq가 필요합니다: MessageQueue를 사용하려면 pyzmq를 설치하세요.") from e
+            except Exception as e:
+                raise RuntimeError("pyzmq is required. Install pyzmq to use MessageQueue.") from e
             type(self)._mod = zmq
         return getattr(self._mod, name)
 
