@@ -1,14 +1,26 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, List, Dict, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Optional, Sequence, Tuple
 
-import math
 from math import prod
 
 import torch
 import torch.distributed as dist
 from torch import nn
+
+
+@dataclass(frozen=True)
+class PatchParameters:
+    is_square: bool = False
+    patch_size_1d: int = 16
+    grid_size_2d: Optional[int] = None
+    patch_size_2d: int = 4
+    is_cube: bool = False
+    grid_size_3d: Optional[Tuple[int, int, int]] = None
+    patch_size_3d: Tuple[int, int, int] = (2, 2, 2)
+    dropout: float = 0.0
+    use_padding: bool = True
 
 
 @dataclass
@@ -19,40 +31,30 @@ class Config:
     normalize_method: str = 'layernorm'
     depth: int = 128
     heads: int = 4
-    spatial_features: int = 64
-    temporal_features: int = 64
+    spatial_depth: int = 4
+    temporal_depth: int = 4
+    mlp_ratio: float = 4.0
+    drop_path: float = 0.0
+    spatial_latent_tokens: int = 64
+    temporal_latent_tokens: int = 64
+    data_definition: str = 'sxt'
+    patch: PatchParameters = field(default_factory=PatchParameters)
     use_linear_branch: bool = False
     use_compilation: bool = False
     compile_mode: str = 'default'
     loss_space: str = 'z'
 
-from . import StochasticDepth, _norm, _stochastic_depth_scheduler
-from .module import _patch, SinusoidalEncoding, SpatioTemporalRetention, SpatialSubnet, TemporalSubnet, SpatioTemporalNet
-from ..toolkit.optimization import Autocast, attention_flops_bshd, add_flops, compile
-from ..toolkit.compat import sdpa_kernel, secure_torch
+from .module import SpatioTemporalNet, Meta, MetaNet
+from ..toolkit.optimization import Autocast, compile
+from ..toolkit.compat import secure_torch
 
 secure_torch()
-
-
-
-@dataclass(frozen=True)
-class PatchParameters:
-    is_square: bool
-    patch_size_1d: int
-    grid_size_2d: Optional[int]
-    patch_size_2d: int
-    is_cube: bool
-    grid_size_3d: Optional[Tuple[int, int, int]]
-    patch_size_3d: Tuple[int, int, int]
-    dropout: float
-    use_padding: bool
 
 class Model(nn.Module):
     def __init__(
         self,
         in_dim: int,
         out_shape: Sequence[int],
-        subnet: nn.Module,
         *args: Any,
         config: Config,
         **kwargs: Any
@@ -78,8 +80,22 @@ class Model(nn.Module):
             self._device = torch.device(dev)
         self.is_norm_linear = bool(getattr(config, 'use_linear_branch', False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
-        self.subnet = subnet.to(self._device)
-        self.net = SpatioTemporalNet(d_model=config.depth, nhead=config.heads, latent_s=getattr(config, "spatial_features", 64), latent_t=getattr(config, "temporal_features", 64), dropout=(getattr(config, "dropout", None) if getattr(config, "dropout", None) is not None else config.dropout), normalize_method=(config.normalize_method if getattr(config, "normalize_method", None) else config.normalize_method)).to(self._device)
+        self._local = SpatioTemporalNet(
+            self.in_dim,
+            self.out_shape,
+            config=config,
+        ).to(self._device)
+        global_net = MetaNet(
+            int(config.depth),
+            int(config.heads),
+            depth=max(1, int(getattr(config, 'temporal_depth', 1))),
+            mlp_ratio=float(getattr(config, 'mlp_ratio', 4.0)),
+            dropout=float(getattr(config, 'dropout', 0.0)),
+            drop_path=float(getattr(config, 'drop_path', 0.0)),
+            norm_type=str(getattr(config, 'normalize_method', 'layernorm')),
+        ).to(self._device)
+        self._global = global_net
+        setattr(self, 'global', global_net)
         self.microbatch = int(config.microbatch)
         if self.microbatch <= 0:
             raise ValueError(f'config.microbatch must be >= 1, got {config.microbatch}')
@@ -90,9 +106,11 @@ class Model(nn.Module):
         mode = str(getattr(config, 'compile_mode', 'default'))
         try:
             if bool(getattr(config, 'use_compilation', False)):
-                self.subnet = compile(self.subnet, mode=mode, fullgraph=False, dynamic=False, backend='inductor')
+                self._local = compile(self._local, mode=mode, fullgraph=False, dynamic=False, backend='inductor')
             if bool(getattr(config, 'use_compilation', False)):
-                self.net = compile(self.net, mode=mode, fullgraph=False, dynamic=False, backend='inductor')
+                compiled_global = compile(self._global, mode=mode, fullgraph=False, dynamic=False, backend='inductor')
+                self._global = compiled_global
+                setattr(self, 'global', compiled_global)
         except Exception:
             pass
         self.__config = config
@@ -245,51 +263,54 @@ class Model(nn.Module):
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         device = self._device
-        base_dtype = next(self.subnet.parameters()).dtype
+        base_dtype = next(self._local.parameters()).dtype
         infer_mode = labels_flat is None or (net_loss is None and global_loss is None and (local_loss is None))
         try:
             self.x_seen_elems += torch.tensor(features.numel(), device=self.x_seen_elems.device, dtype=self.x_seen_elems.dtype)
         except Exception:
             pass
         num_slices = (b + self.microbatch - 1) // self.microbatch
-        preds: List[torch.Tensor] = []
+        token_chunks: List[torch.Tensor] = []
+        context_chunks: List[torch.Tensor] = []
+        offset_chunks: List[torch.Tensor] = []
         if not infer_mode:
-            self.subnet.train()
-            self.net.train()
+            self._local.train()
+            self._global.train()
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
                 x_slice = features[s:e].to(device, dtype=base_dtype, non_blocking=True)
                 with Autocast.float(device):
-                    p = self.subnet(x_slice)
-                preds.append(p)
+                    out: Meta = self._local(x_slice)
+                token_chunks.append(out.tokens)
+                context_chunks.append(out.context)
+                offset_chunks.append(out.offset)
         else:
-            self.subnet.eval()
-            self.net.eval()
+            self._local.eval()
+            self._global.eval()
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
                 x_slice = features[s:e].to(device, dtype=base_dtype, non_blocking=True)
                 with torch.no_grad(), Autocast.float(device):
-                    p = self.subnet(x_slice)
-                preds.append(p if p.dtype == base_dtype else p.to(base_dtype))
-        assembled = torch.cat(preds, dim=0).to(device=device, dtype=base_dtype)
+                    out = self._local(x_slice)
+                token_chunks.append(out.tokens if out.tokens.dtype == base_dtype else out.tokens.to(base_dtype))
+                context_chunks.append(out.context if out.context.dtype == base_dtype else out.context.to(base_dtype))
+                offset_chunks.append(out.offset if out.offset.dtype == base_dtype else out.offset.to(base_dtype))
+        tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
+        context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
+        offsets = torch.cat(offset_chunks, dim=0).to(device=device, dtype=base_dtype)
+        assembled = context.view(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
+        context_adjusted = context - offsets
+        tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
         with (torch.no_grad() if infer_mode else torch.enable_grad()):
             with Autocast.float(device):
-                if b <= self.microbatch:
-                    residual = self.net(features.to(device, dtype=assembled.dtype), assembled)
-                else:
-                    parts = []
-                    for s in range(0, b, self.microbatch):
-                        e = min(b, s + self.microbatch)
-                        part = self.net(features[s:e].to(device, dtype=assembled.dtype), assembled[s:e])
-                        if not part.is_contiguous():
-                            part = part.contiguous()
-                        parts.append(part)
-                    residual = torch.cat(parts, dim=0)
+                refined_tokens = self._global(tokens_centered)
+        residual_context = self._local.decode(refined_tokens, apply_norm=True)
+        residual = residual_context.view(b, -1)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
@@ -388,3 +409,8 @@ class Model(nn.Module):
     @staticmethod
     def unflatten_labels(flat: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
         return flat.view(flat.shape[0], *shape)
+
+    @property
+    def local(self) -> SpatioTemporalNet:
+        """Return the spatio-temporal subnet used for local feature processing."""
+        return self._local

@@ -4,6 +4,7 @@ from __future__ import annotations
 __all__ = [
     'Model',
     'Config',
+    'PatchParameters',
     'train',
     'predict',
     'new_model',
@@ -17,7 +18,7 @@ __all__ = [
     'to_tensorflow',
 ]
 
-from .architecture.network import Model, Config
+from .architecture.network import Model, Config, PatchParameters
 from .workflow import (
     train,
     predict,

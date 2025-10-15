@@ -125,20 +125,25 @@ class CudaIpc:
 class Ucxx:
     def __init__(self) -> None:
         self._backend: str
+        self._module: Any
         try:
-            import ucxx
+            import ucxx as backend  # type: ignore[import-not-found]
+
             self._backend = "ucxx"
+            self._module = backend
         except Exception:
             try:
-                import ucp
+                import ucp as backend  # type: ignore[import-not-found]
+
                 self._backend = "ucx-py"
+                self._module = backend
             except Exception as e:
                 raise RuntimeError("Neither 'ucxx' nor 'ucx-py' is installed") from e
 
     async def local_echo(self, payload: bytes) -> bytes:
         if self._backend == "ucxx":
             try:
-                import ucxx
+                ucxx = self._module
                 w = ucxx.create_worker()
                 addr = w.getAddress()
                 ep1 = w.createEndpointFromWorkerAddress(addr)
@@ -153,7 +158,7 @@ class Ucxx:
 
         if self._backend == "ucx-py":
             try:
-                import ucp
+                ucp = self._module
                 addr = ucp.get_worker_address()
                 ep1 = await ucp.create_endpoint_from_worker_address(addr)
                 ep2 = await ucp.create_endpoint_from_worker_address(addr)

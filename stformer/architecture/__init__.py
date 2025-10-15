@@ -7,6 +7,10 @@ from .module import (
     SpatialSubnet,
     TemporalSubnet,
     SpatioTemporalNet,
+    PatchAttention,
+    CrossTransformer,
+    Meta,
+    MetaNet,
     GeGLU,
     SwiGLU,
     MultipleQuantileLoss,
@@ -14,7 +18,7 @@ from .module import (
     StudentsTLoss,
     DataFidelityLoss,
 )
-from .network import Model, Config
+from .network import Model, Config, PatchParameters
 
 secure_torch()
 
@@ -23,9 +27,14 @@ __all__ = [
     'SDPBackend',
     'Model',
     'Config',
+    'PatchParameters',
     'SpatialSubnet',
     'TemporalSubnet',
     'SpatioTemporalNet',
+    'PatchAttention',
+    'CrossTransformer',
+    'Meta',
+    'MetaNet',
     'GeGLU',
     'SwiGLU',
     'MultipleQuantileLoss',

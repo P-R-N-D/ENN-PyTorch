@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import asdict
-from typing import Any, Dict, Optional, Tuple, Callable
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
-import os
-import json
-import shutil
-import warnings
-import subprocess
-from pathlib import Path
 import inspect
+import json
+import os
+import shutil
+import subprocess
+import warnings
+from pathlib import Path
 
 import torch
 from torch import nn
@@ -21,7 +21,6 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..architecture.network import Model, Config
-from ..architecture.module import SpatialSubnet, TemporalSubnet, SpatioTemporalNet
 
 
 def _require(module: str, pip_hint: str | None = None) -> None:
@@ -47,13 +46,7 @@ def new_model(
         cfg = config
     else:
         raise TypeError("config must be Config or dict or None")
-    out_dim = int(torch.tensor(out_shape).prod().item()) if len(out_shape) else 1
-    sub = nn.Sequential(
-        nn.Linear(in_dim, max(64, min(1024, 2*int(getattr(cfg, 'depth', 128))))),
-        nn.GELU(),
-        nn.Linear(max(64, min(1024, 2*int(getattr(cfg, 'depth', 128)))), out_dim)
-    )
-    return Model(in_dim, tuple(int(x) for x in out_shape), sub, config=cfg)
+    return Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
 
 
 def load_model(
@@ -321,7 +314,9 @@ def to_nnef(
         sample = _pad_sample(model, sample_input)
         to_onnx(model, onnx_path, sample_input=sample, opset_version=opset_version)
     try:
-        import nnef_tools
+        import importlib
+
+        importlib.import_module("nnef_tools.convert")
     except Exception as e:
         raise ImportError("nnef-tools[onnx] required") from e
     if input_shapes is None:

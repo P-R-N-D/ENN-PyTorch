@@ -5,8 +5,8 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "stformer"
 version = "0.1.0"
-description = "Parallel Spacetime Transformer with Residual Transformer, built with PyTorch"
-readme = { text = "stformer: spatio-temporal Transformer for 2D/3D label training.", content-type = "text/markdown" }
+description = "Pytorch implementation of StNet: Local and Global Spatial-Temporal Modeling for Action Recognition"
+readme = { text = "Pytorch implementation of StNet: Local and Global Spatial-Temporal Modeling for Action Recognition", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "Proprietary" }
 authors = [{ name = "Kim Jeseok" }]
@@ -29,14 +29,14 @@ te = ["transformer-engine[pytorch]>=2.0"]
 intel = ["intel-extension-for-pytorch>=2.3"]
 ucx = ["ucxx-cu12>=0.45.0"]
 export = [
-  "onnx>=1.14","onnx-tf>=1.10.0","onnx2tf>=1.18.0","coremltools>=6.3",
-  "tensorrt>=10.0","executorch>=0.4"
+  "onnx>=1.14",
+  "onnx-tf>=1.10.0",
+  "onnx2tf>=1.18.0",
+  "coremltools>=6.3",
+  "tensorrt>=10.0",
+  "executorch>=0.4"
 ]
 scale = ["torchscale>=0.3.0"]
-
-#[project.urls]
-#Homepage = "0.0.0.0"
-#Repository = "0.0.0.0"
 
 [tool.setuptools]
 include-package-data = true
@@ -46,6 +46,15 @@ include = ["stformer*"]
 
 [tool.setuptools.package-data]
 "stformer" = [
-  "**/*.json", "**/*.yaml", "**/*.yml", "**/*.ini", "**/*.cfg",
-  "**/*.md", "**/*.txt", "**/*.pt", "**/*.pth", "**/*.onnx", "**/*.bin"
+  "**/*.json",
+  "**/*.yaml",
+  "**/*.yml",
+  "**/*.ini",
+  "**/*.cfg",
+  "**/*.md",
+  "**/*.txt",
+  "**/*.pt",
+  "**/*.pth",
+  "**/*.onnx",
+  "**/*.bin"
 ]
