@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Union, List
+from typing import Any, Optional, Sequence, Tuple, Union, List, TYPE_CHECKING
 
 import math
 from math import prod
@@ -11,12 +11,15 @@ import torch.nn.functional as F
 from torch import nn, Tensor
 from torch.distributions import Normal, StudentT
 
-from .network import PatchParameters
 from ..toolkit.optimization import ScaledDotProductAttention, GatedMultiScaleRetention
 from . import StochasticDepth, _norm, _stochastic_depth_scheduler
 from ..toolkit.compat import secure_torch
 
 secure_torch()
+
+
+if TYPE_CHECKING:
+    from .network import Config
 
 
 def _canon_dims(x: torch.Tensor, dims: Any, keep_batch: bool = False) -> Tuple[int, ...]:
@@ -34,6 +37,36 @@ def _canon_dims(x: torch.Tensor, dims: Any, keep_batch: bool = False) -> Tuple[i
     if not out:
         return (1,) if nd > 1 else (0,)
     return out
+
+
+def _stable_std(
+    x: torch.Tensor,
+    dim: Tuple[int, ...] | int | None,
+    ddof: int,
+    eps: float,
+) -> torch.Tensor:
+    if dim is None:
+        dim_tuple: Tuple[int, ...] = tuple()
+    elif isinstance(dim, int):
+        dim_tuple = (dim,)
+    else:
+        dim_tuple = tuple(dim)
+    dims = tuple(d if d >= 0 else x.dim() + d for d in dim_tuple)
+    sample = 1
+    for d in dims:
+        if 0 <= d < x.dim():
+            sample *= max(1, int(x.shape[d]))
+    if sample <= 1:
+        base = x.mean(dim=dim_tuple, keepdim=True)
+        return torch.full_like(base, fill_value=eps)
+    correction = min(int(ddof), max(sample - 1, 0))
+    try:
+        var = torch.var(x, dim=dim_tuple, correction=correction, keepdim=True)
+        std = torch.sqrt(torch.clamp(var, min=eps * eps))
+    except TypeError:
+        std = torch.std(x, dim=dim_tuple, unbiased=correction == 1, keepdim=True)
+        std = torch.clamp(std, min=eps)
+    return std
 
 
 def _normal_cdf_loc_scale(
@@ -262,37 +295,6 @@ class SinusoidalEncoding(nn.Module):
         return pe
 
 
-def _patch(
-    in_dim: int,
-    d_model: int,
-    pc: PatchParameters,
-) -> Tuple[PatchEmbedding, Tuple[str, ...]]:
-    if pc.is_cube or pc.grid_size_3d is not None:
-        if pc.grid_size_3d is None:
-            raise ValueError("grid_3d required")
-        patcher = PatchEmbedding(
-            in_channels=1, d_model=d_model, ndim=3, patch=pc.patch_size_3d, stride=pc.patch_size_3d, grid_3d=pc.grid_size_3d, dropout=pc.dropout, pad_to_multiple=pc.use_padding
-        )
-        return (patcher, ("t", "h", "w"))
-    if pc.is_square:
-        grid = None if pc.grid_size_2d is None else (int(pc.grid_size_2d), int(pc.grid_size_2d))
-        patcher = PatchEmbedding(
-            in_channels=1, d_model=d_model, ndim=2, patch=(pc.patch_size_2d, pc.patch_size_2d), stride=(pc.patch_size_2d, pc.patch_size_2d), grid=grid, dropout=pc.dropout, pad_to_multiple=pc.use_padding
-        )
-        return (patcher, ("h", "w"))
-    patcher = PatchEmbedding(
-        in_channels=1,
-        d_model=d_model,
-        ndim=1,
-        patch=(pc.patch_size_1d,),
-        stride=(pc.patch_size_1d,),
-        grid=None if pc.use_padding and in_dim < pc.patch_size_1d else (in_dim,),
-        dropout=pc.dropout,
-        pad_to_multiple=pc.use_padding,
-    )
-    return (patcher, ("l",))
-
-
 class GeGLU(nn.Module):
     def __init__(
         self,
@@ -464,13 +466,7 @@ class StandardNormalLoss(nn.Module):
         ddof: int,
         eps: float,
     ) -> torch.Tensor:
-        try:
-            var = torch.var(x, dim=dim, correction=ddof, keepdim=True)
-            std = torch.sqrt(torch.clamp(var, min=eps * eps))
-        except TypeError:
-            std = torch.std(x, dim=dim, unbiased=ddof == 1, keepdim=True)
-            std = torch.clamp(std, min=eps)
-        return std
+        return _stable_std(x, dim, ddof, eps)
 
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         match self.reduction:
@@ -653,13 +649,7 @@ class StudentsTLoss(nn.Module):
         ddof: int,
         eps: float,
     ) -> torch.Tensor:
-        try:
-            var = torch.var(x, dim=dim, correction=ddof, keepdim=True)
-            std = torch.sqrt(torch.clamp(var, min=eps * eps))
-        except TypeError:
-            std = torch.std(x, dim=dim, unbiased=ddof == 1, keepdim=True)
-            std = torch.clamp(std, min=eps)
-        return std
+        return _stable_std(x, dim, ddof, eps)
 
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         match self.reduction:
@@ -696,6 +686,8 @@ class StudentsTLoss(nn.Module):
                 if self.mu is None:
                     raise ValueError("mu required when mu_mode='provided'")
                 mu = self._broadcast_param(self.mu, pred)
+            case "error":
+                mu = (pred - target).mean(dim=dims, keepdim=True)
             case "none":
                 mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
             case _:
@@ -737,8 +729,22 @@ class StudentsTLoss(nn.Module):
     def _t_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
         df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
-        dist = StudentT(df=df)
-        return dist.icdf(torch.tensor(q, device=device, dtype=dtype))
+        try:
+            dist = StudentT(df=df)
+            return dist.icdf(torch.tensor(q, device=device, dtype=dtype))
+        except NotImplementedError:
+            target = torch.full_like(df, float(q), dtype=dtype, device=device)
+            loc = torch.zeros_like(df, dtype=dtype, device=device)
+            scale = torch.ones_like(df, dtype=dtype, device=device)
+            lo = torch.full_like(df, -50.0, dtype=dtype, device=device)
+            hi = torch.full_like(df, 50.0, dtype=dtype, device=device)
+            for _ in range(32):
+                mid = (lo + hi) / 2.0
+                cdf_mid = _student_t_cdf_loc_scale(mid, df, loc, scale)
+                mask = cdf_mid < target
+                lo = torch.where(mask, mid, lo)
+                hi = torch.where(mask, hi, mid)
+            return hi
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if pred.shape != target.shape:
@@ -868,13 +874,13 @@ class DataFidelityLoss(nn.Module):
 
     def _mse(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         diff = (a - b).abs() if torch.is_complex(a) or torch.is_complex(b) else a - b
-        is_square= diff * diff
+        sq = diff * diff
         match self.reduction:
             case "mean":
                 val = sq.mean()
             case "sum":
                 val = sq.sum()
-            case _: 
+            case _:
                 B = int(a.shape[0])
                 val = sq.reshape(B, -1).mean(dim=1)
         return val * self.weight
@@ -1374,7 +1380,7 @@ class SpatioTemporalNet(nn.Module):
         in_dim: int,
         out_shape: Sequence[int],
         *,
-        config: 'Config',
+        config: Config,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)

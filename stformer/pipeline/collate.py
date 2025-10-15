@@ -3,10 +3,12 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Iterator, Mapping, Optional, Tuple, Union
 
 import os
+import math
 import collections
 import time
 from functools import partial
 from contextlib import suppress, nullcontext
+import warnings
 
 import numpy as np
 import torch
@@ -275,7 +277,7 @@ class Prefetcher(Iterator[Any]):
 
     def graphs_capture(self, capture_fn: Any) -> bool:
         if not self._graph_enabled:
-            raise RuntimeError("enable_graphs=True && backend=cuda 에서만 사용 가능")
+            raise RuntimeError("graphs_capture requires enable_graphs=True and a CUDA backend.")
         if not self._queue:
             self._preload()
         moved, _ = self._queue[0]
@@ -288,7 +290,7 @@ class Prefetcher(Iterator[Any]):
 
     def graphs_replay(self) -> None:
         if self._graph is None:
-            raise RuntimeError("graphs_capture()를 먼저 호출하세요")
+            raise RuntimeError("Call graphs_capture() before graphs_replay().")
         _ = next(self)
         self._graph.replay()
 
@@ -369,6 +371,33 @@ class _Keep:
                         obj()
 
 
+class _LocalBatchIterable:
+    def __init__(
+        self,
+        mmts: MemoryMappedTensorStream,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> None:
+        self._mmts = mmts
+        self._start = int(start)
+        self._end = int(end)
+        self._batch = max(1, int(batch_size))
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        idx = int(self._start)
+        while idx < self._end:
+            nxt = min(idx + self._batch, self._end)
+            Xb, Yb = self._mmts.batch_range(idx, nxt)
+            yield {"X": Xb, "Y": Yb}
+            idx = nxt
+
+    def __len__(self) -> int:
+        if self._end <= self._start:
+            return 0
+        return int(math.ceil((self._end - self._start) / float(self._batch)))
+
+
 def forward(
     batch: Mapping[str, Any],
     *args: Any,
@@ -414,73 +443,16 @@ def stream(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
-    rank, local_rank, world_size, is_ddp = _world_info()
-    node_id = ArrowFlight.node_id(rank, local_rank)
-    name_train = ArrowFlight.resource_key(memmap_dir, "train")
-    name_val = ArrowFlight.resource_key(memmap_dir, "val")
-    reader_tr = MemoryMappedTensorStream.from_dir(memmap_dir, split="train", batch_size=int(batch_size), val_frac=val_frac)
-    reader_vl = MemoryMappedTensorStream.from_dir(memmap_dir, split="val", batch_size=int(batch_size), val_frac=val_frac) if val_frac > 0 else None
-    meta = reader_tr._load_meta()
-    srv = None
-    if not is_ddp or local_rank == 0:
-        srv, uri = ArrowFlight.start_server_standby(host="0.0.0.0", port=0)
-        ArrowFlight.reg_mmt_dataset(srv, name_train, reader_tr, int(batch_size), "train")
-        if reader_vl is not None:
-            ArrowFlight.reg_mmt_dataset(srv, name_val, reader_vl, int(batch_size), "val")
-        if is_initialized():
-            ArrowFlight.MQ.publish(ArrowFlight.server_key(node_id), uri)
-        uri0 = uri
-    else:
-        uri0 = ArrowFlight.MQ.wait(ArrowFlight.server_key(node_id), timeout_s=120.0)
-    cli = ArrowFlight.Client(uri0)
-    lshape = list(meta.get("label_shape", []))
-
-    def _iter(name: str) -> Iterator[Dict[str, torch.Tensor]]:
-        rdr = cli.reader(name)
-        for rb in rdr:
-            B = int(getattr(rb, "num_rows", 0)) or int(len(rb.column(0)))
-            x_arr = rb.column(0)
-            xnp = x_arr.to_numpy(zero_copy_only=False)
-            if not isinstance(xnp, np.ndarray):
-                xnp = np.array(xnp, copy=True)
-            if getattr(xnp, "flags", None) is None or (not xnp.flags.writeable) or (not xnp.flags.c_contiguous):
-                xnp = np.ascontiguousarray(xnp).copy()
-            if xnp.dtype != np.float32:
-                xnp = xnp.astype(np.float32, copy=False)
-            Xb = torch.from_numpy(xnp).view(B, -1)
-            y_arr = rb.column(1)
-            ynp = y_arr.to_numpy(zero_copy_only=False)
-            if not isinstance(ynp, np.ndarray):
-                ynp = np.array(ynp, copy=True)
-            if getattr(ynp, "flags", None) is None or (not ynp.flags.writeable) or (not ynp.flags.c_contiguous):
-                ynp = np.ascontiguousarray(ynp).copy()
-            Yb = torch.from_numpy(ynp)
-            if lshape:
-                Yb = Yb.reshape(B, -1).view(B, *lshape)
-            else:
-                Yb = Yb.reshape(B, -1)
-            yield {"X": Xb, "Y": Yb}
-
+    io_backend = str(kwargs.pop("io_backend", "auto") or "auto").lower()
+    dev = torch.device(device) if not isinstance(device, torch.device) else device
+    if io_backend == "auto" and dev.type == "cpu":
+        io_backend = "local"
     thr = apply_threading_defaults()
     map_fn = partial(dispatch, labels_dtype=labels_dtype, sanitize=sanitize, flatten_features=flatten_features)
-    dev = torch.device(device) if not isinstance(device, torch.device) else device
-    node_tr = IterableWrapper(_iter(name_train))
-    node_tr = ParallelMapper(
-        node_tr,
-        map_fn=map_fn,
-        num_workers=thr["dataloader_workers"],
-        method="thread",
-        in_order=False,
-        max_concurrent=thr["dataloader_workers"],
-        prebatch=thr["prefetch_factor"],
-    )
-    node_tr = PrefetcherCompat(node_tr, prefetch_factor=prefetch_factor)
-    node_tr = PinMemory(node_tr, pin_memory_device=dev.type)
-    train_loader = DataLoader(device=device, node=node_tr, prefetch_factor=prefetch_factor, non_blocking=bool(non_blocking_copy))
-    if reader_vl is not None:
-        node_vl = IterableWrapper(_iter(name_val))
-        node_vl = ParallelMapper(
-            node_vl,
+
+    def _wrap_node(node: IterableWrapper) -> DataLoader:
+        wrapped = ParallelMapper(
+            node,
             map_fn=map_fn,
             num_workers=thr["dataloader_workers"],
             method="thread",
@@ -488,10 +460,127 @@ def stream(
             max_concurrent=thr["dataloader_workers"],
             prebatch=thr["prefetch_factor"],
         )
-        node_vl = PrefetcherCompat(node_vl, prefetch_factor=prefetch_factor)
-        node_vl = PinMemory(node_vl, pin_memory_device=dev.type)
-        val_loader = DataLoader(device=device, node=node_vl, prefetch_factor=prefetch_factor, non_blocking=bool(non_blocking_copy))
-    else:
-        val_loader = None
-    keep = _Keep(reader_tr, reader_vl, cli, srv)
-    return train_loader, val_loader, keep
+        wrapped = PrefetcherCompat(wrapped, prefetch_factor=prefetch_factor)
+        if dev.type in ("cuda", "xpu", "mps"):
+            wrapped = PinMemory(wrapped, pin_memory_device=dev.type)
+        return DataLoader(device=device, node=wrapped, prefetch_factor=prefetch_factor, non_blocking=bool(non_blocking_copy))
+
+    def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
+        reader_tr = MemoryMappedTensorStream.from_dir(
+            memmap_dir,
+            split="train",
+            batch_size=int(batch_size),
+            val_frac=val_frac,
+        )
+        meta = reader_tr._load_meta()
+        total = int(meta.get("N", 0))
+        train_range = reader_tr._indices()
+        train_start = int(getattr(train_range, "start", 0))
+        train_end = int(getattr(train_range, "stop", total if total else 0))
+        if train_end <= train_start and total:
+            train_end = total
+        keep = _Keep(reader_tr)
+        node_tr = IterableWrapper(
+            _LocalBatchIterable(reader_tr, train_start, train_end, int(batch_size))
+        )
+        train_loader = _wrap_node(node_tr)
+        val_loader: Optional[Any] = None
+        if val_frac > 0 and train_end < total:
+            reader_vl = MemoryMappedTensorStream.from_dir(
+                memmap_dir,
+                split="val",
+                batch_size=int(batch_size),
+                val_frac=val_frac,
+            )
+            keep.add(reader_vl)
+            val_range = reader_vl._indices()
+            val_start = int(getattr(val_range, "start", train_end))
+            val_end = int(getattr(val_range, "stop", total))
+            if val_end <= val_start:
+                val_end = total
+            node_vl = IterableWrapper(
+                _LocalBatchIterable(reader_vl, val_start, val_end, int(batch_size))
+            )
+            val_loader = _wrap_node(node_vl)
+        return train_loader, val_loader, keep
+
+    def _flight_impl() -> Tuple[Any, Optional[Any], _Keep]:
+        rank, local_rank, world_size, is_ddp = _world_info()
+        node_id = ArrowFlight.node_id(rank, local_rank)
+        name_train = ArrowFlight.resource_key(memmap_dir, "train")
+        name_val = ArrowFlight.resource_key(memmap_dir, "val")
+        reader_tr = MemoryMappedTensorStream.from_dir(memmap_dir, split="train", batch_size=int(batch_size), val_frac=val_frac)
+        reader_vl = (
+            MemoryMappedTensorStream.from_dir(memmap_dir, split="val", batch_size=int(batch_size), val_frac=val_frac)
+            if val_frac > 0
+            else None
+        )
+        meta = reader_tr._load_meta()
+        srv = None
+        keep = _Keep(reader_tr, reader_vl)
+        try:
+            if not is_ddp or local_rank == 0:
+                srv, uri = ArrowFlight.start_server_standby(host="0.0.0.0", port=0)
+                keep.add(srv)
+                ArrowFlight.reg_mmt_dataset(srv, name_train, reader_tr, int(batch_size), "train")
+                if reader_vl is not None:
+                    ArrowFlight.reg_mmt_dataset(srv, name_val, reader_vl, int(batch_size), "val")
+                if is_initialized():
+                    ArrowFlight.MQ.publish(ArrowFlight.server_key(node_id), uri)
+                uri0 = uri
+            else:
+                uri0 = ArrowFlight.MQ.wait(ArrowFlight.server_key(node_id), timeout_s=120.0)
+            cli = ArrowFlight.Client(uri0)
+            keep.add(cli)
+            lshape = list(meta.get("label_shape", []))
+
+            def _iter(name: str) -> Iterator[Dict[str, torch.Tensor]]:
+                rdr = cli.reader(name)
+                for rb in rdr:
+                    B = int(getattr(rb, "num_rows", 0)) or int(len(rb.column(0)))
+                    x_arr = rb.column(0)
+                    xnp = x_arr.to_numpy(zero_copy_only=False)
+                    if not isinstance(xnp, np.ndarray):
+                        xnp = np.array(xnp, copy=True)
+                    if getattr(xnp, "flags", None) is None or (not xnp.flags.writeable) or (not xnp.flags.c_contiguous):
+                        xnp = np.ascontiguousarray(xnp).copy()
+                    if xnp.dtype != np.float32:
+                        xnp = xnp.astype(np.float32, copy=False)
+                    Xb = torch.from_numpy(xnp).view(B, -1)
+                    y_arr = rb.column(1)
+                    ynp = y_arr.to_numpy(zero_copy_only=False)
+                    if not isinstance(ynp, np.ndarray):
+                        ynp = np.array(ynp, copy=True)
+                    if getattr(ynp, "flags", None) is None or (not ynp.flags.writeable) or (not ynp.flags.c_contiguous):
+                        ynp = np.ascontiguousarray(ynp).copy()
+                    Yb = torch.from_numpy(ynp)
+                    if lshape:
+                        Yb = Yb.reshape(B, -1).view(B, *lshape)
+                    else:
+                        Yb = Yb.reshape(B, -1)
+                    yield {"X": Xb, "Y": Yb}
+
+            node_tr = IterableWrapper(_iter(name_train))
+            train_loader = _wrap_node(node_tr)
+            if reader_vl is not None:
+                node_vl = IterableWrapper(_iter(name_val))
+                val_loader = _wrap_node(node_vl)
+            else:
+                val_loader = None
+            return train_loader, val_loader, keep
+        except Exception:
+            keep.cleanup()
+            raise
+
+    if io_backend == "local":
+        return _local_impl()
+    try:
+        return _flight_impl()
+    except Exception as exc:
+        if io_backend != "auto":
+            raise
+        warnings.warn(
+            f"Arrow Flight backend unavailable ({exc}). Falling back to local memory-mapped loader.",
+            RuntimeWarning,
+        )
+        return _local_impl()

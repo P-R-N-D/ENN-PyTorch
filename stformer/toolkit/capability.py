@@ -85,8 +85,9 @@ def is_float8_supported(
     if dev.type != "cuda" or not ok_cc:
         return (False, f"FP8 requires sm_90+ (found {dev.type}, cc={cc})")
     try:
-        import transformer_engine.pytorch  # noqa: F401
-        return (True, "TE")
+        import transformer_engine.pytorch as te
+        backend = getattr(te, "__name__", "transformer_engine.pytorch")
+        return (True, backend)
     except Exception:
         return (False, "transformer_engine not found")
 

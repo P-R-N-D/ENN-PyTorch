@@ -11,7 +11,16 @@ import time
 import torch.distributed as dist
 
 from ..connection.socket import ArrowFlight
-from ..connection.socket import FlightModule as fl
+
+try:
+    from ..connection.socket import FlightModule as fl
+except ImportError:  # pragma: no cover - optional dependency may be missing during tests
+    class _FlightFallback:
+        @staticmethod
+        def connect(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("Arrow Flight module is unavailable")
+
+    fl = _FlightFallback()
 
 GRPC_DEFAULT_PORT = 5005
 
@@ -119,7 +128,7 @@ class MessageQueueConfig:
             try:
                 import zmq
             except Exception as e:
-                raise RuntimeError("pyzmq가 필요합니다. `pip install pyzmq`") from e
+                raise RuntimeError("pyzmq is required. Install it with `pip install pyzmq`.") from e
         self._zmq = zmq.Context.instance()
         up_addr = _mq_addr("up")
         down_addr = _mq_addr("down")

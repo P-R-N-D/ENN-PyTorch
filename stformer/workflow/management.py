@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
@@ -26,9 +25,9 @@ from ..architecture.network import Model, Config
 def _require(module: str, pip_hint: str | None = None) -> None:
     try:
         __import__(module)
-    except Exception as e:
+    except ImportError as err:
         hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise ImportError(f"{module} is required for this operation{hint}") from e
+        raise ImportError(f"{module} is required for this operation{hint}") from err
 
 
 def new_model(
@@ -67,7 +66,7 @@ def load_model(
         load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(checkpoint_path))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         return model
-    obj = torch.load(checkpoint_path, map_location=map_location or "cpu")
+    obj = torch.load(checkpoint_path, map_location=map_location or "cpu", weights_only=False)
     meta_in_dim = obj.get("in_dim") if isinstance(obj, dict) else None
     meta_out_shape = obj.get("out_shape") if isinstance(obj, dict) else None
     meta_cfg = obj.get("config") if isinstance(obj, dict) else None
@@ -90,10 +89,7 @@ def save_model(
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None
 ) -> str:
-    try:
-        cfg_obj = getattr(model, "_Model__config", None)
-    except Exception:
-        cfg_obj = None
+    cfg_obj = getattr(model, "_Model__config", None)
     cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
     payload: Dict[str, Any] = {
         "version": 1,
@@ -104,15 +100,16 @@ def save_model(
         "pytorch_version": torch.__version__,
     }
     if optimizer is not None:
-        try:
-            payload["optimizer_state_dict"] = optimizer.state_dict()
-        except Exception:
-            pass
+        if hasattr(optimizer, "state_dict"):
+            try:
+                payload["optimizer_state_dict"] = optimizer.state_dict()
+            except (RuntimeError, NotImplementedError, ValueError, AttributeError):
+                pass
     if extra:
         payload["extra"] = extra
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     torch.save(payload, path)
-    return path
+    return str(path)
 
 
 class _ExportCompat(nn.Module):
@@ -134,14 +131,14 @@ def _infer_tensor_shape(
     if hasattr(model, "in_dim"):
         try:
             in_dim = int(getattr(model, "in_dim"))
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            in_dim = None
     if hasattr(model, "out_shape"):
         try:
             _shape = getattr(model, "out_shape")
             out_shape = tuple(int(x) for x in _shape)
-        except Exception:
-            pass
+        except (TypeError, ValueError):
+            out_shape = None
     if (in_dim is None or out_shape is None) and sample_input is not None:
         dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
@@ -175,7 +172,7 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
 
 def _to_tensorflow_dtype(t: torch.dtype) -> Any:
     _require("tensorflow", "pip install tensorflow")
-    import tensorflow as tf  # type: ignore
+    import tensorflow as tf
     mapping = {
         torch.float32: tf.float32,
         torch.float: tf.float32,
@@ -206,6 +203,8 @@ def to_onnx(
     input_names = ["features"]
     output_names = ["preds_flat"]
     dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}} if dynamic_batch else None
+    export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
+    fallback_errors = (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
     try:
         torch.onnx.export(
             wrapper,
@@ -219,7 +218,7 @@ def to_onnx(
             output_names=output_names,
             dynamic_axes=dynamic_axes,
         )
-    except Exception:
+    except fallback_errors:
         torch.onnx.export(
             wrapper,
             sample,
@@ -243,7 +242,7 @@ def to_ort(
     onnx_path: Optional[str] = None,
     opset_version: int = 18,
     optimization_level: str = "all",
-    optimization_style: str = "fixed",  # "fixed" | "runtime"
+    optimization_style: str = "fixed",
     target_platform: Optional[str] = None,
     save_optimized_onnx_model: bool = False,
     **kwargs: Any
@@ -317,8 +316,8 @@ def to_nnef(
         import importlib
 
         importlib.import_module("nnef_tools.convert")
-    except Exception as e:
-        raise ImportError("nnef-tools[onnx] required") from e
+    except ImportError as exc:
+        raise ImportError("nnef-tools[onnx] required") from exc
     if input_shapes is None:
         sample = _pad_sample(model, sample_input)
         input_shapes = {"features": tuple(int(x) for x in sample.shape)}
@@ -365,8 +364,8 @@ def to_tensorrt(
         to_onnx(model, onnx_path, sample_input=sample, opset_version=opset_version)
     try:
         import tensorrt as trt
-    except Exception as e:
-        raise ImportError("tensorrt required") from e
+    except ImportError as exc:
+        raise ImportError("tensorrt required") from exc
     TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
     EXPLICIT_BATCH = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     with trt.Builder(TRT_LOGGER) as builder, \
@@ -459,8 +458,8 @@ def to_coreml(
 ) -> str:
     try:
         import coremltools as ct
-    except Exception as e:
-        raise ImportError("coremltools required") from e
+    except ImportError as exc:
+        raise ImportError("coremltools required") from exc
     sample = _pad_sample(model, sample_input)
     wrapper = _ExportCompat(model).eval()
     with torch.no_grad():
@@ -471,17 +470,17 @@ def to_coreml(
         "CPU_AND_GPU": getattr(ct.ComputeUnit, "CPU_AND_GPU", None),
         "CPU_AND_NE": getattr(ct.ComputeUnit, "CPU_AND_NE", None),
     }
-    is_cube= cu_map.get(compute_units.upper(), cu_map["ALL"])
-    kwargs: Dict[str, Any] = {
+    selected_cu = cu_map.get(compute_units.upper(), cu_map["ALL"])
+    kwargs_dict: Dict[str, Any] = {
         "inputs": [ct.TensorType(shape=tuple(int(x) for x in sample.shape))],
         "convert_to": convert_to,
-        "compute_units": cu,
+        "compute_units": selected_cu,
     }
     if minimum_deployment_target:
         target = getattr(ct.target, minimum_deployment_target, None)
         if target is not None:
-            kwargs["minimum_deployment_target"] = target
-    mlmodel = ct.convert(scripted, **kwargs)
+            kwargs_dict["minimum_deployment_target"] = target
+    mlmodel = ct.convert(scripted, **kwargs_dict)
     mlmodel.save(coreml_path)
     return coreml_path
 
@@ -519,13 +518,13 @@ def to_litert(
                 raise RuntimeError("onnx2tf did not produce .tflite")
             shutil.copyfile(tflites[0], tflite_path)
             return tflite_path
-        except Exception as e:
-            warnings.warn(f"onnx2tf failed; fallback: {e}")
+        except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
+            warnings.warn(f"onnx2tf failed; fallback: {exc}")
     try:
         import onnx
         from onnx_tf.backend import prepare
-    except Exception as e:
-        raise ImportError("onnx, onnx-tf, tensorflow required") from e
+    except ImportError as exc:
+        raise ImportError("onnx, onnx-tf, tensorflow required") from exc
     import tensorflow as tf
     model_onnx = onnx.load(onnx_path)
     from tempfile import TemporaryDirectory
@@ -564,18 +563,18 @@ def to_executorch(
 ) -> Tuple[str, Optional[str]]:
     try:
         from executorch.exir import to_edge_transform_and_lower
-    except Exception as e:
-        raise ImportError("executorch required") from e
+    except ImportError as exc:
+        raise ImportError("executorch required") from exc
     partitioners = []
     b = backend.lower()
     if b == "xnnpack":
-        from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner  # type: ignore
+        from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
         partitioners = [XnnpackPartitioner()]
     elif b == "coreml":
-        from executorch.backends.apple.coreml.partition import CoreMLPartitioner  # type: ignore
+        from executorch.backends.apple.coreml.partition import CoreMLPartitioner
         partitioners = [CoreMLPartitioner()]
     elif b == "vulkan":
-        from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner  # type: ignore
+        from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
         partitioners = [VulkanPartitioner()]
     else:
         raise ValueError(f"unknown backend: {backend}")
@@ -660,8 +659,11 @@ def to_tensorflow(
     errors: list[str] = []
     if prefer_onnx2tf:
         try:
+            from onnx2tf import convert
+        except ImportError as exc:
+            errors.append(f"onnx2tf import failed: {exc!r}")
+        else:
             try:
-                from onnx2tf import convert
                 convert(
                     input_onnx_file_path=onnx_path,
                     output_folder_path=saved_dir,
@@ -669,23 +671,23 @@ def to_tensorflow(
                     non_verbose=True,
                 )
                 converted = True
-            except Exception:
-                import subprocess as _sp
+            except (RuntimeError, ValueError, OSError) as exc:
                 cmd = [os.sys.executable, "-m", "onnx2tf", "-i", onnx_path, "-o", saved_dir]
-                _sp.run(cmd, check=True)
-                converted = True
-        except Exception as e:
-            errors.append(f"onnx2tf failed: {e!r}")
+                try:
+                    subprocess.run(cmd, check=True)
+                    converted = True
+                except (OSError, subprocess.CalledProcessError) as cli_exc:
+                    errors.append(f"onnx2tf CLI failed: {cli_exc!r}; original: {exc!r}")
     if not converted:
         try:
-            import onnx  # type: ignore
+            import onnx
             from onnx_tf.backend import prepare
             onnx_model = onnx.load(onnx_path)
             tf_rep = prepare(onnx_model)
             tf_rep.export_graph(saved_dir)
             converted = True
-        except Exception as e:
-            errors.append(f"onnx-tf failed: {e!r}")
+        except (ImportError, RuntimeError, ValueError, OSError) as exc:
+            errors.append(f"onnx-tf failed: {exc!r}")
     if not converted:
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)

@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
+import contextlib
+import importlib
+import math
+import os
+
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
-
-import os
-import math
-import contextlib
 
 import torch
 from torch import nn, optim
@@ -104,6 +106,10 @@ class _FlopBucket:
 
 
 _FLOP_BUCKET = _FlopBucket()
+
+
+_NVTX_SOFT_COUNTER: float = 0.0
+_NVTX_FLOPS_GETTER: Optional[Callable[[], float]] = None
 
 
 class FlopHookSession:
@@ -243,6 +249,123 @@ def register_flop_hooks(
         if any(isinstance(m, t) for t in conv_types):
             handles.append(m.register_forward_hook(_hook_conv))
     return FlopHookSession(handles)
+
+
+def _import_callable(spec: str) -> Callable:
+    if not isinstance(spec, str) or not spec.strip():
+        raise ValueError("Empty spec for callable import")
+    raw = spec.strip()
+    root_pkg = __package__.split('.', 1)[0] if __package__ else 'stformer'
+    default_module = f"{root_pkg}.toolkit.optimization"
+    if ':' in raw:
+        mod_part, fn_part = raw.split(':', 1)
+    else:
+        mod_part, fn_part = ('', raw)
+    mod_part = mod_part.strip()
+    fn_part = fn_part.strip()
+    if not fn_part:
+        raise ValueError(f"Missing function in spec: {spec}")
+    if not mod_part:
+        mod_name = default_module
+    elif mod_part.startswith('.'):
+        mod_name = f"{root_pkg}{mod_part}"
+    elif not mod_part.startswith(root_pkg + '.') and (mod_part.split('.')[0] not in ('importlib', 'torch', 'math', 'sys')):
+        mod_name = f"{root_pkg}.{mod_part}"
+    else:
+        mod_name = mod_part
+    module = importlib.import_module(mod_name)
+    fn = getattr(module, fn_part, None)
+    if not callable(fn):
+        raise TypeError(f"{mod_name}:{fn_part} is not callable or not found")
+    return fn
+
+
+def register_nvtx_flops_getter(fn: Callable[[], float]) -> None:
+    global _NVTX_FLOPS_GETTER
+    _NVTX_FLOPS_GETTER = fn
+
+
+def _nvtx_soft_add(v: float) -> None:
+    global _NVTX_SOFT_COUNTER
+    try:
+        _NVTX_SOFT_COUNTER += float(v) if float(v) > 0 else 0.0
+    except Exception:
+        pass
+
+
+def _nvtx_soft_getter() -> float:
+    return float(_NVTX_SOFT_COUNTER)
+
+
+def nvtx_soft_add(v: float) -> None:
+    _nvtx_soft_add(v)
+
+
+def _ensure_nvtx_flops_getter() -> None:
+    global _NVTX_FLOPS_GETTER
+    if _NVTX_FLOPS_GETTER is not None:
+        return
+    hook = os.environ.get("STF_NVTX_FLOPS_FN", "").strip()
+    if hook:
+        try:
+            _NVTX_FLOPS_GETTER = _import_callable(hook)
+            return
+        except Exception:
+            pass
+    _NVTX_FLOPS_GETTER = _nvtx_soft_getter
+
+
+class _NoOpNvtxCounter:
+    def __enter__(self) -> "_NoOpNvtxCounter":
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        return False
+
+    def get_total_flops(self) -> float:
+        return 0.0
+
+
+class _NvtxCounter:
+    def __init__(self, getter: Callable[[], float]) -> None:
+        self._getter = getter
+        self._start: float = 0.0
+        self._end: float = 0.0
+
+    def __enter__(self) -> "_NvtxCounter":
+        try:
+            self._start = float(self._getter())
+        except Exception:
+            self._start = 0.0
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        try:
+            self._end = float(self._getter())
+        except Exception:
+            self._end = self._start
+        return False
+
+    def get_total_flops(self) -> float:
+        end = float(self._end)
+        if not end > self._start:
+            try:
+                end = float(self._getter())
+            except Exception:
+                end = self._start
+        return max(0.0, float(end) - float(self._start))
+
+
+def NVTXCounterMode(device: Optional[torch.device] = None) -> Any:
+    try:
+        dev = device if device is not None else get_device()
+    except Exception:
+        dev = None
+    if dev is None or getattr(dev, "type", None) != "cuda":
+        return _NoOpNvtxCounter()
+    _ensure_nvtx_flops_getter()
+    getter = _NVTX_FLOPS_GETTER if _NVTX_FLOPS_GETTER is not None else _nvtx_soft_getter
+    return _NvtxCounter(getter)
 
 
 def attention_flops_bshd(
@@ -400,17 +523,30 @@ def _is_contiguous_bshd(t: torch.Tensor) -> bool:
 
 
 class ScaledDotProductAttention(torch.nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, te_first: bool = True) -> None:
+    def __init__(
+        self,
+        num_heads: Optional[int] = None,
+        head_dim: Optional[int] = None,
+        te_first: bool = True,
+    ) -> None:
         super().__init__()
-        self.nh = int(num_heads)
-        self.hd = int(head_dim)
+        self.nh = int(num_heads) if num_heads is not None else None
+        self.hd = int(head_dim) if head_dim is not None else None
         self.te_first = te_first
         ok, te = self._is_te_available()
-        self._te_ok = ok and torch.cuda.is_available()
+        self._te_ok = (
+            ok
+            and torch.cuda.is_available()
+            and self.nh is not None
+            and self.hd is not None
+        )
         if self._te_ok:
             self._te = te
             self._te_attn = te.DotProductAttention(
-                num_attention_heads=self.nh, kv_channels=self.hd, qkv_format="bshd", attention_dropout=0.0
+                num_attention_heads=self.nh,
+                kv_channels=self.hd,
+                qkv_format="bshd",
+                attention_dropout=0.0,
             )
 
     @staticmethod
@@ -422,8 +558,8 @@ class ScaledDotProductAttention(torch.nn.Module):
                 import warnings as _w
                 st.enter_context(_w.catch_warnings())
                 _w.filterwarnings("ignore", message="Detected a Jax installation.*", category=RuntimeWarning)
-                import transformer_engine.pytorch as te  # noqa: F401
-            return (True, transformer_engine.pytorch)
+                import transformer_engine.pytorch as te
+            return (True, te)
         except Exception:
             return (False, None)
 
@@ -433,31 +569,56 @@ class ScaledDotProductAttention(torch.nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        dropout_p: float,
-        is_causal: bool,
-        training: bool,
+        dropout_p: float | torch.Tensor = 0.0,
+        is_causal: bool = False,
+        training: bool | None = None,
         attn_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
+        training = bool(training if training is not None else self.training)
+        if isinstance(dropout_p, torch.Tensor):
+            dropout_p = float(dropout_p.item())
         q = self._to_optimal_dtype(q)
         k = self._to_optimal_dtype(k)
         v = self._to_optimal_dtype(v)
         try:
             _bwd = 2.0 if training else 0.0
-            fl = attention_flops_bshd(q, bwd_factor=_bwd, dropout_p=float(dropout_p), training=bool(training))
+            fl = attention_flops_bshd(
+                q,
+                bwd_factor=_bwd,
+                dropout_p=float(dropout_p),
+                training=bool(training),
+            )
             _FLOP_BUCKET.add("Attention", fl)
         except Exception:
             pass
-        if attn_mask is not None:
-            from torch.nn.attention import sdpa_kernel, SDPBackend 
-            backends = [b for name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH") if hasattr(SDPBackend, name) for b in (getattr(SDPBackend, name),)]
-            with sdpa_kernel(backends):
-                q_bhsd = q.permute(0, 2, 1, 3).contiguous()
-                k_bhsd = k.permute(0, 2, 1, 3).contiguous()
-                v_bhsd = v.permute(0, 2, 1, 3).contiguous()
-                out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bhsd, k_bhsd, v_bhsd, attn_mask=attn_mask, dropout_p=float(dropout_p) if training else 0.0, is_causal=bool(is_causal)
-                )
-                return out.permute(0, 2, 1, 3).contiguous()
+        dropout_val = float(dropout_p) if training else 0.0
+        if self._te_ok and attn_mask is None and not kwargs:
+            q_bhsd = q.permute(0, 2, 1, 3).contiguous()
+            k_bhsd = k.permute(0, 2, 1, 3).contiguous()
+            v_bhsd = v.permute(0, 2, 1, 3).contiguous()
+            out = self._te_attn(
+                q_bhsd,
+                k_bhsd,
+                v_bhsd,
+                attn_mask=None,
+                attention_dropout=dropout_val,
+                is_causal=bool(is_causal),
+                training=training,
+            )
+            return out.permute(0, 2, 1, 3).contiguous()
+        q_bhsd = q.permute(0, 2, 1, 3).contiguous()
+        k_bhsd = k.permute(0, 2, 1, 3).contiguous()
+        v_bhsd = v.permute(0, 2, 1, 3).contiguous()
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_bhsd,
+            k_bhsd,
+            v_bhsd,
+            attn_mask=attn_mask,
+            dropout_p=dropout_val,
+            is_causal=bool(is_causal),
+        )
+        return out.permute(0, 2, 1, 3).contiguous()
         if self.te_first and self._te_ok and q.is_cuda and k.is_cuda and v.is_cuda and (q.dtype in (torch.float16, torch.bfloat16)) and _is_contiguous_bshd(q) and _is_contiguous_bshd(k) and _is_contiguous_bshd(v):
             try:
                 out = self._te_attn(
@@ -501,7 +662,7 @@ class _GMSRFallback(nn.Module):
         self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
         self.norm = nn.LayerNorm(self.d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         B, S, D = x.shape
         H, Dh = (self.nhead, self.head_dim)
         q = self.q_proj(x).view(B, S, H, Dh)
@@ -561,12 +722,18 @@ class GatedMultiScaleRetention(nn.Module):
         inner_mask = torch.pow(gammas.view(1, self.nhead, 1, 1), diff.view(1, 1, L, L)) * tril.view(1, 1, L, L)
         return ((sin, cos), inner_mask)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        state: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
         if self._ts_ok:
             _, S, _ = x.shape
             rel_pos = self._build_rel_pos(S, x.device, x.dtype)
-            return self._ts_msr(x, rel_pos, chunkwise_recurrent=False, incremental_state=None)
-        return self._fallback(x)
+            return self._ts_msr(x, rel_pos, chunkwise_recurrent=False, incremental_state=state)
+        return self._fallback(x, attn_mask=attn_mask, state=state, **kwargs)
 
 
 class Autocast:
@@ -836,7 +1003,7 @@ class Architecture:
         **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         try:
-            import transformer_engine.pytorch
+            import transformer_engine.pytorch as te
         except Exception as e:
             raise ImportError(f"Transformer Engine import failed: {e}")
         n_swapped = 0
@@ -846,7 +1013,7 @@ class Architecture:
                 if filter_linear is None or filter_linear(child, fqname):
                     ok_dim = child.in_features % 16 == 0 and child.out_features % 16 == 0
                     if ok_dim:
-                        new = transformer_engine.pytorch.Linear(
+                        new = te.Linear(
                             child.in_features, child.out_features, bias=child.bias is not None, params_dtype=params_dtype
                         )
                         with torch.no_grad():
@@ -858,7 +1025,7 @@ class Architecture:
                         replaced = True
             if not replaced and apply_te_layer_norm and isinstance(child, nn.LayerNorm):
                 hidden = int(child.normalized_shape[0]) if isinstance(child.normalized_shape, (tuple, list)) else int(child.normalized_shape)
-                new = transformer_engine.pytorch.LayerNorm(hidden, eps=float(child.eps), params_dtype=params_dtype)
+                new = te.LayerNorm(hidden, eps=float(child.eps), params_dtype=params_dtype)
                 with torch.no_grad():
                     if child.weight is not None:
                         new.weight.copy_(child.weight)
@@ -1035,7 +1202,7 @@ class Architecture:
         **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         try:
-            import transformer_engine.pytorch
+            import transformer_engine.pytorch as te
         except Exception:
             return (root, 0)
         n_swapped = 0
@@ -1061,7 +1228,7 @@ class Architecture:
                     act_name = "gelu" if isinstance(nxt2, nn.GELU) else "relu" if isinstance(nxt2, nn.ReLU) else None
                     if act_name is not None and isinstance(nxt3, nn.Linear):
                         hidden = int(ln.normalized_shape[0]) if isinstance(ln, nn.LayerNorm) else int(getattr(ln, "weight").shape[0])
-                        mlp = transformer_engine.pytorch.LayerNormMLP(
+                        mlp = te.LayerNormMLP(
                             hidden,
                             int(fc.out_features),
                             eps=float(getattr(ln, "eps", 1e-05)),
@@ -1096,7 +1263,7 @@ class Architecture:
                         n_swapped += 1
                         continue
                     hidden = int(ln.normalized_shape[0]) if isinstance(ln, nn.LayerNorm) else int(getattr(ln, "weight").shape[0])
-                    lnlin = transformer_engine.pytorch.LayerNormLinear(
+                    lnlin = te.LayerNormLinear(
                         int(fc.in_features),
                         int(fc.out_features),
                         eps=float(getattr(ln, "eps", 1e-05)),
@@ -1140,9 +1307,10 @@ class Architecture:
         if dev.type != "cuda":
             return (model, False, "Non-NVIDIA device; TE not applied")
         try:
-            import transformer_engine.pytorch  # noqa: F401
+            import transformer_engine.pytorch as te
         except Exception:
             return (model, False, "transformer_engine not installed")
+        te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
@@ -1158,9 +1326,13 @@ class Architecture:
         n_total = (n_fused or 0) + (n_basic or 0) + (attn_swapped or 0)
         if logger:
             logger(
-                f"[TE] swapped {n_total} modules (fused:{n_fused}, basic:{n_basic}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')})"
+                f"[TE] swapped {n_total} modules (fused:{n_fused}, basic:{n_basic}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}"
             )
-        return (model, n_total > 0, f"TE applied (swapped {n_total}, dtype={params_dtype}, fp8={'on' if fp8_ok else 'off'})")
+        return (
+            model,
+            n_total > 0,
+            f"TE applied (swapped {n_total}, dtype={params_dtype}, fp8={'on' if fp8_ok else 'off'}, backend={te_backend})",
+        )
 
     @staticmethod
     def enable_float8_training(
@@ -1372,7 +1544,7 @@ class DataLoader:
         from ..pipeline.collate import Prefetcher
         node_obj = node or dataset
         if not isinstance(node_obj, _TDBaseNode):
-            raise TypeError("toolkit.optimization.DataLoader는 torchdata.nodes.BaseNode만 지원합니다.")
+            raise TypeError("toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances.")
         self._node = node_obj
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))

@@ -9,7 +9,10 @@ __all__ = [
     'AdamW',
     'attention_flops_bshd',
     'register_flop_hooks',
+    'register_nvtx_flops_getter',
     'get_total_flops',
+    'NVTXCounterMode',
+    'nvtx_soft_add',
     'get_device',
     'secure_torch',
     'SDPBackend',
@@ -300,7 +303,10 @@ from .optimization import (
     AdamW,
     attention_flops_bshd,
     register_flop_hooks,
+    register_nvtx_flops_getter,
     get_total_flops,
+    NVTXCounterMode,
+    nvtx_soft_add,
 )
 from .capability import get_device
 from .compat import SDPBackend, sdpa_kernel, _to_sdpa_backends

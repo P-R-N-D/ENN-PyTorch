@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 from math import prod
 
@@ -272,7 +272,6 @@ class Model(nn.Module):
         num_slices = (b + self.microbatch - 1) // self.microbatch
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []
-        offset_chunks: List[torch.Tensor] = []
         if not infer_mode:
             self._local.train()
             self._global.train()
@@ -284,7 +283,7 @@ class Model(nn.Module):
                     out: Meta = self._local(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
-                offset_chunks.append(out.offset)
+                # offset values are computed but unused downstream
         else:
             self._local.eval()
             self._global.eval()
@@ -296,15 +295,13 @@ class Model(nn.Module):
                     out = self._local(x_slice)
                 token_chunks.append(out.tokens if out.tokens.dtype == base_dtype else out.tokens.to(base_dtype))
                 context_chunks.append(out.context if out.context.dtype == base_dtype else out.context.to(base_dtype))
-                offset_chunks.append(out.offset if out.offset.dtype == base_dtype else out.offset.to(base_dtype))
+                # offset values are computed but unused downstream
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
-        offsets = torch.cat(offset_chunks, dim=0).to(device=device, dtype=base_dtype)
         assembled = context.view(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
-        context_adjusted = context - offsets
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
         with (torch.no_grad() if infer_mode else torch.enable_grad()):
             with Autocast.float(device):
