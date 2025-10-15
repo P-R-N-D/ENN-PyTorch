@@ -466,17 +466,41 @@ def stream(
         return DataLoader(device=device, node=wrapped, prefetch_factor=prefetch_factor, non_blocking=bool(non_blocking_copy))
 
     def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
-        reader = MemoryMappedTensorStream.from_dir(memmap_dir, split="train", batch_size=int(batch_size), val_frac=val_frac)
-        meta = reader._load_meta()
+        reader_tr = MemoryMappedTensorStream.from_dir(
+            memmap_dir,
+            split="train",
+            batch_size=int(batch_size),
+            val_frac=val_frac,
+        )
+        meta = reader_tr._load_meta()
         total = int(meta.get("N", 0))
-        fractions = meta.get("fractions", [1.0, 0.0])
-        train_end = int(total * float(fractions[0])) if total else 0
-        keep = _Keep(reader)
-        node_tr = IterableWrapper(_LocalBatchIterable(reader, 0, train_end if train_end else total, int(batch_size)))
+        train_range = reader_tr._indices()
+        train_start = int(getattr(train_range, "start", 0))
+        train_end = int(getattr(train_range, "stop", total if total else 0))
+        if train_end <= train_start and total:
+            train_end = total
+        keep = _Keep(reader_tr)
+        node_tr = IterableWrapper(
+            _LocalBatchIterable(reader_tr, train_start, train_end, int(batch_size))
+        )
         train_loader = _wrap_node(node_tr)
         val_loader: Optional[Any] = None
         if val_frac > 0 and train_end < total:
-            node_vl = IterableWrapper(_LocalBatchIterable(reader, train_end, total, int(batch_size)))
+            reader_vl = MemoryMappedTensorStream.from_dir(
+                memmap_dir,
+                split="val",
+                batch_size=int(batch_size),
+                val_frac=val_frac,
+            )
+            keep.add(reader_vl)
+            val_range = reader_vl._indices()
+            val_start = int(getattr(val_range, "start", train_end))
+            val_end = int(getattr(val_range, "stop", total))
+            if val_end <= val_start:
+                val_end = total
+            node_vl = IterableWrapper(
+                _LocalBatchIterable(reader_vl, val_start, val_end, int(batch_size))
+            )
             val_loader = _wrap_node(node_vl)
         return train_loader, val_loader, keep
 
