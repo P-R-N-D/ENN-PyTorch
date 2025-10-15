@@ -1,0 +1,6 @@
+include LICENSE*
+include requirements.txt
+include README.md
+
+recursive-include stformer *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt *.pt *.pth *.onnx *.bin
+global-exclude __pycache__ *.py[cod] *.so *.dylib .DS_Store
