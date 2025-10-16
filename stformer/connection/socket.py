@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Any, Iterable, Iterator, Optional
 
 import os
 import threading
 import time
+from typing import Any, Iterator, Optional, Tuple
 
 import pyarrow as pa
 import pyarrow.flight as flight
@@ -15,8 +14,8 @@ from ..pipeline.dataset import MemoryMappedTensorStream as MMTS
 
 class ZeroMQ:
     def __init__(self) -> None:
-        self._enabled: bool = False
-        self._store: Optional[Any] = None
+        self._enabled = False
+        self._store: Any | None = None
         try:
             self._enabled = dist.is_available() and dist.is_initialized()
             if self._enabled:
@@ -33,12 +32,12 @@ class ZeroMQ:
     def wait(self, key: str, timeout_s: float = 120.0) -> Optional[str]:
         if not self._enabled or self._store is None:
             return None
-        t0 = time.time()
+        start = time.time()
         while True:
             try:
                 return self._store.get(key).decode("utf-8")
             except Exception:
-                if (time.time() - t0) > float(timeout_s):
+                if time.time() - start > float(timeout_s):
                     raise TimeoutError(f"ZeroMQ wait timeout: {key}")
                 time.sleep(0.05)
 
@@ -59,187 +58,181 @@ class ArrowFlight:
         return f"flight://node/{node_id}"
 
     @staticmethod
-    def _canon_name(s: Any) -> str:
+    def _canon_name(value: Any) -> str:
         try:
-            if isinstance(s, (bytes, bytearray, memoryview)):
-                s = bytes(s).decode("utf-8")
+            if isinstance(value, (bytes, bytearray, memoryview)):
+                value = bytes(value).decode("utf-8")
         except Exception:
-            s = str(s)
-        return str(s).strip("/")
+            value = str(value)
+        return str(value).strip("/")
 
     @staticmethod
-    def _bytes_of(x: Any) -> bytes:
-        if isinstance(x, (bytes, bytearray)):
-            return bytes(x)
-        if isinstance(x, memoryview):
-            return x.tobytes()
-        if isinstance(x, str):
-            return x.encode("utf-8")
+    def _bytes_of(value: Any) -> bytes:
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, memoryview):
+            return value.tobytes()
+        if isinstance(value, str):
+            return value.encode("utf-8")
         try:
-            return bytes(x)
+            return bytes(value)
         except Exception:
-            return str(x).encode("utf-8")
+            return str(value).encode("utf-8")
 
     @staticmethod
     def _name_from_descriptor(descriptor: Any) -> str:
         path = getattr(descriptor, "path", None)
         if isinstance(path, (list, tuple)) and path:
             parts: list[str] = []
-            for p in path:
+            for part in path:
                 try:
-                    parts.append(ArrowFlight._bytes_of(p).decode("utf-8"))
+                    parts.append(ArrowFlight._bytes_of(part).decode("utf-8"))
                 except Exception:
-                    parts.append(str(p))
+                    parts.append(str(part))
             return ArrowFlight._canon_name("/".join(parts))
-        cmd = getattr(descriptor, "command", None)
-        if cmd is not None:
+        command = getattr(descriptor, "command", None)
+        if command is not None:
             try:
-                return ArrowFlight._canon_name(ArrowFlight._bytes_of(cmd))
+                return ArrowFlight._canon_name(ArrowFlight._bytes_of(command))
             except Exception:
-                return ArrowFlight._canon_name(cmd)
+                return ArrowFlight._canon_name(command)
         return ArrowFlight._canon_name(descriptor)
 
     @staticmethod
     def _build_descriptor(name: str) -> flight.FlightDescriptor:
-        s = ArrowFlight._canon_name(name)
-        parts = [p.encode("utf-8") for p in s.split("/") if p]
+        canonical = ArrowFlight._canon_name(name)
+        parts = [segment.encode("utf-8") for segment in canonical.split("/") if segment]
         if parts:
             return flight.FlightDescriptor.for_path(*parts)
-        return flight.FlightDescriptor.for_command(s.encode("utf-8"))
-
+        return flight.FlightDescriptor.for_command(canonical.encode("utf-8"))
 
     class Server(flight.FlightServerBase):
-        def __init__(self, location: str | tuple[str, int] | flight.Location) -> None:
+        def __init__(self, location: str | Tuple[str, int] | flight.Location) -> None:
             super().__init__(location)
             self._lock = threading.RLock()
             self._datasets: dict[str, pa.RecordBatchReader] = {}
 
-        def list_flights(self, context: Any, criteria: bytes | None) -> Iterable[flight.FlightInfo]:
+        def list_flights(self, context: Any, criteria: bytes | None) -> Iterator[flight.FlightInfo]:
+            del context, criteria
             with self._lock:
-                for name, rdr in self._datasets.items():
-                    parts = [seg.encode("utf-8") for seg in ArrowFlight._canon_name(name).split("/") if seg]
-                    desc = (
-                        flight.FlightDescriptor.for_path(*parts)
-                        if parts
-                        else flight.FlightDescriptor.for_command(ArrowFlight._canon_name(name).encode("utf-8"))
-                    )
-                    yield flight.FlightInfo(
-                        rdr.schema, desc, endpoints=[], total_records=-1, total_bytes=-1
-                    )
+                for name, reader in self._datasets.items():
+                    canonical = ArrowFlight._canon_name(name)
+                    parts = [segment.encode("utf-8") for segment in canonical.split("/") if segment]
+                    if parts:
+                        descriptor = flight.FlightDescriptor.for_path(*parts)
+                    else:
+                        descriptor = flight.FlightDescriptor.for_command(canonical.encode("utf-8"))
+                    yield flight.FlightInfo(reader.schema, descriptor, endpoints=[], total_records=-1, total_bytes=-1)
 
         def get_flight_info(self, context: Any, descriptor: flight.FlightDescriptor) -> flight.FlightInfo:
+            del context
             name = ArrowFlight._name_from_descriptor(descriptor)
             key = ArrowFlight._canon_name(name)
             with self._lock:
-                rdr = self._datasets.get(key)
-                if rdr is None:
-                    for k in list(self._datasets.keys()):
-                        if k.endswith(key):
-                            rdr = self._datasets[k]
-                            key = k
+                reader = self._datasets.get(key)
+                if reader is None:
+                    for candidate_key in list(self._datasets.keys()):
+                        if candidate_key.endswith(key):
+                            reader = self._datasets[candidate_key]
+                            key = candidate_key
                             break
-                if rdr is None:
+                if reader is None:
                     raise KeyError(f"dataset not found: {key} ; candidates={list(self._datasets.keys())}")
             ticket = flight.Ticket(key.encode("utf-8"))
             endpoints = [flight.FlightEndpoint(ticket, [])]
-            return flight.FlightInfo(rdr.schema, descriptor, endpoints=endpoints, total_records=-1, total_bytes=-1)
+            return flight.FlightInfo(reader.schema, descriptor, endpoints=endpoints, total_records=-1, total_bytes=-1)
 
         def do_get(self, context: Any, ticket: flight.Ticket) -> flight.RecordBatchStream:
+            del context
             name = ArrowFlight._canon_name(ticket.ticket)
             with self._lock:
-                rdr = self._datasets[name]
-            return flight.RecordBatchStream(rdr)
+                reader = self._datasets[name]
+            return flight.RecordBatchStream(reader)
 
         def add_reader(self, name: str, reader: pa.RecordBatchReader) -> None:
             with self._lock:
                 key = ArrowFlight._canon_name(name)
                 self._datasets[key] = reader
 
-
     class Client:
-        def __init__(self, uri: str | tuple[str, int] | flight.Location) -> None:
-            self._cli = flight.FlightClient(uri)
+        def __init__(self, uri: str | Tuple[str, int] | flight.Location) -> None:
+            self._client = flight.FlightClient(uri)
 
         def reader(
             self,
             name: str,
-            *args: Any,
+            *,
             timeout_s: float = 30.0,
             poll_interval_s: float = 0.05,
-            **kwargs: Any
         ) -> pa.RecordBatchReader:
-            desc = ArrowFlight._build_descriptor(name)
+            descriptor = ArrowFlight._build_descriptor(name)
             deadline = time.time() + float(timeout_s)
-            last_err: Optional[BaseException] = None
+            last_error: BaseException | None = None
             while time.time() < deadline:
                 try:
-                    info = self._cli.get_flight_info(desc)
+                    info = self._client.get_flight_info(descriptor)
                     endpoints = list(getattr(info, "endpoints", []) or [])
                     if endpoints:
-                        tk = getattr(endpoints[0], "ticket", None)
-                        if tk is not None:
-                            return self._cli.do_get(tk).to_reader()
-                        last_err = RuntimeError("FlightInfo endpoints present but no ticket")
-                except Exception as e:
-                    last_err = e
+                        ticket = getattr(endpoints[0], "ticket", None)
+                        if ticket is not None:
+                            return self._client.do_get(ticket).to_reader()
+                        last_error = RuntimeError("FlightInfo endpoints present but no ticket")
+                except Exception as exc:
+                    last_error = exc
                 time.sleep(poll_interval_s)
-            raise RuntimeError(
-                f"Flight dataset '{name}' not ready: no endpoints within {timeout_s}s"
-            ) from last_err
-
+            raise RuntimeError(f"Flight dataset '{name}' not ready: no endpoints within {timeout_s}s") from last_error
 
     @staticmethod
     def start_server_standby(
-        *args: Any,
+        *,
         host: str = "0.0.0.0",
         port: int = 0,
         wait_ready_s: float = 2.0,
-        **kwargs: Any
-    ) -> tuple["ArrowFlight.Server", str]:
-        srv = ArrowFlight.Server(location=f"grpc://{host}:{port}")
-        t = threading.Thread(target=srv.serve, daemon=True)
-        t.start()
-        t0 = time.time()
-        actual_port = getattr(srv, "port", 0) or port
-        while actual_port in (None, 0) and (time.time() - t0) < wait_ready_s:
+    ) -> Tuple[ArrowFlight.Server, str]:
+        server = ArrowFlight.Server(location=f"grpc://{host}:{port}")
+        thread = threading.Thread(target=server.serve, daemon=True)
+        thread.start()
+        start = time.time()
+        actual_port = getattr(server, "port", 0) or port
+        while actual_port in (None, 0) and (time.time() - start) < wait_ready_s:
             time.sleep(0.01)
-            actual_port = getattr(srv, "port", 0) or port
+            actual_port = getattr(server, "port", 0) or port
         uri = f"grpc://{host}:{actual_port}"
-        return srv, uri
+        return server, uri
 
     @staticmethod
     def reg_mmt_dataset(
-        srv: "ArrowFlight.Server",
+        server: ArrowFlight.Server,
         name: str,
         mmts: MMTS,
         batch_size: int,
         split: str,
     ) -> None:
         meta = mmts._load_meta()
-        N = int(meta["N"])
-        frac = meta.get("fractions", [1.0, 0.0])
-        train_end = int(N * float(frac[0])) if frac else N
-        start, end = ((0, train_end) if split == "train" else (train_end, N))
+        total = int(meta["N"])
+        fractions = meta.get("fractions", [1.0, 0.0])
+        train_end = int(total * float(fractions[0])) if fractions else total
+        start, end = ((0, train_end) if split == "train" else (train_end, total))
 
         def _batches() -> Iterator[pa.RecordBatch]:
-            s = start
-            while s < end:
-                e = min(s + int(batch_size), end)
-                Xb, Yb = mmts.batch_range(s, e)
-                yield MMTS.to_record_batch(Xb, Yb)
-                s = e
+            index = start
+            while index < end:
+                nxt = min(index + int(batch_size), end)
+                xb, yb = mmts.batch_range(index, nxt)
+                yield MMTS.to_record_batch(xb, yb)
+                index = nxt
 
-        gen = _batches()
-        first = next(gen)
-        rest = list(gen)
+        generator = _batches()
+        first = next(generator)
+        rest = list(generator)
         schema = first.schema
-        rdr = pa.RecordBatchReader.from_batches(schema, [first, *rest])
-        srv.add_reader(ArrowFlight._canon_name(name), rdr)
+        reader = pa.RecordBatchReader.from_batches(schema, [first, *rest])
+        server.add_reader(ArrowFlight._canon_name(name), reader)
 
 
-def open_flight_client(uri: str | tuple[str, int] | flight.Location) -> flight.FlightClient:
+def open_flight_client(uri: str | Tuple[str, int] | flight.Location) -> flight.FlightClient:
     return flight.FlightClient(uri)
 
 
-def start_flight_server(host: str = "0.0.0.0", port: int = 0) -> tuple[ArrowFlight.Server, str]:
+def start_flight_server(host: str = "0.0.0.0", port: int = 0) -> Tuple[ArrowFlight.Server, str]:
     return ArrowFlight.start_server_standby(host=host, port=port)

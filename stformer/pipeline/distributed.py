@@ -1,12 +1,10 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import Any, Dict, List
 
 import os
 import socket
 import time
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
 
 import torch.distributed as dist
 
@@ -14,7 +12,7 @@ from ..connection.socket import ArrowFlight
 
 try:
     from ..connection.socket import FlightModule as fl
-except ImportError:  # pragma: no cover - optional dependency may be missing during tests
+except ImportError:
     class _FlightFallback:
         @staticmethod
         def connect(*_args: Any, **_kwargs: Any) -> None:
@@ -51,13 +49,13 @@ def wait_key(key: str, timeout_s: float = 30.0) -> str:
     if not is_initialized():
         raise RuntimeError("distributed not initialized")
     store = dist.distributed_c10d._get_default_store()
-    t0 = time.time()
+    start = time.time()
     while True:
         try:
             value: bytes = store.get(key)
             return value.decode("utf-8")
         except Exception:
-            if time.time() - t0 > timeout_s:
+            if time.time() - start > timeout_s:
                 raise TimeoutError(f"timeout waiting for key: {key}")
             time.sleep(0.05)
 
@@ -70,19 +68,21 @@ def publish_key(key: str, value: str) -> None:
 
 
 def get_available_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("", 0))
+        return sock.getsockname()[1]
 
 
 def _local_rank() -> int:
-    for k in ("LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK"):
-        v = os.environ.get(k)
-        if v is not None:
-            try:
-                return int(v)
-            except ValueError:
-                pass
+    env_keys = ["LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK"]
+    for key in env_keys:
+        value = os.environ.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            continue
     return 0
 
 
@@ -102,9 +102,9 @@ def _infer_local_ip() -> str:
 
 def _gather_all(obj: Any) -> List[Any]:
     _require_dist()
-    buf: List[Any] = [None for _ in range(_world_size())]
-    dist.all_gather_object(buf, obj)
-    return buf
+    buffer: List[Any] = [None for _ in range(_world_size())]
+    dist.all_gather_object(buffer, obj)
+    return buffer
 
 
 def _mq_addr(kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any) -> str:
@@ -127,8 +127,8 @@ class MessageQueueConfig:
         except Exception:
             try:
                 import zmq
-            except Exception as e:
-                raise RuntimeError("pyzmq is required. Install it with `pip install pyzmq`.") from e
+            except Exception as exc:
+                raise RuntimeError("pyzmq is required. Install it with `pip install pyzmq`.") from exc
         self._zmq = zmq.Context.instance()
         up_addr = _mq_addr("up")
         down_addr = _mq_addr("down")
@@ -137,12 +137,12 @@ class MessageQueueConfig:
             self._pull.bind(up_addr)
             self._pub = self._zmq.socket(zmq.PUB)
             self._pub.bind(down_addr)
-        else:
-            self._push = self._zmq.socket(zmq.PUSH)
-            self._push.connect(up_addr)
-            self._sub = self._zmq.socket(zmq.SUB)
-            self._sub.connect(down_addr)
-            self._sub.setsockopt(zmq.SUBSCRIBE, b"")
+            return
+        self._push = self._zmq.socket(zmq.PUSH)
+        self._push.connect(up_addr)
+        self._sub = self._zmq.socket(zmq.SUB)
+        self._sub.connect(down_addr)
+        self._sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     def push_up(self, payload: bytes | memoryview) -> None:
         if self.local_rank == 0 or self._push is None:
@@ -166,12 +166,12 @@ class MessageQueueConfig:
         if self.local_rank == 0 or self._sub is None:
             raise RuntimeError("leader cannot sub_down")
         frames = self._sub.recv_multipart(flags=flags, copy=False)
-        topic_b = bytes(frames[0])
+        topic_bytes = bytes(frames[0])
         payload_mv = frames[1].buffer
-        return topic_b, payload_mv
+        return topic_bytes, payload_mv
 
 
-class DistributedIOCoordinator:
+class IOController:
     def __init__(self) -> None:
         _require_dist()
         self.rank: int = _rank()
@@ -181,32 +181,33 @@ class DistributedIOCoordinator:
         self._mq = MessageQueueConfig(local_rank=self.local_rank)
         self._flight_port: int = GRPC_DEFAULT_PORT
         self._my_ip: str = _infer_local_ip()
-        self._server: Any = None
+        self._server: Any | None = None
         self._clients: Dict[str, Any] = {}
         self._leaders: Dict[str, Dict[str, Any]] = {}
 
-    def start(self) -> "DistributedIOCoordinator":
+    def start(self) -> IOController:
         infos = _gather_all(
             {"rank": self.rank, "host": _hostname(), "local_rank": self.local_rank, "ip": self._my_ip}
         )
         per_host: Dict[str, List[Dict[str, Any]]] = {}
-        for x in infos:
-            per_host.setdefault(x["host"], []).append(x)
+        for info in infos:
+            host = info["host"]
+            per_host.setdefault(host, []).append(info)
         leaders: Dict[str, Dict[str, Any]] = {}
-        for h, arr in per_host.items():
-            leader = next((x for x in arr if x["local_rank"] == 0), sorted(arr, key=lambda t: t["rank"])[0])
-            leaders[h] = leader
+        for host, entries in per_host.items():
+            leader = next((item for item in entries if item["local_rank"] == 0), sorted(entries, key=lambda val: val["rank"])[0])
+            leaders[host] = leader
         self._leaders = leaders
         if self.is_node_leader:
             self._server = ArrowFlight(location=f"grpc+tcp://0.0.0.0:{self._flight_port}", datasets={})
-            for h, info in leaders.items():
-                if h == _hostname():
+            for host, info in leaders.items():
+                if host == _hostname():
                     continue
-                ep = f"grpc+tcp://{info['ip']}:{self._flight_port}"
+                endpoint = f"grpc+tcp://{info['ip']}:{self._flight_port}"
                 try:
-                    self._clients[h] = fl.connect(ep)
+                    self._clients[host] = fl.connect(endpoint)
                 except Exception:
-                    pass
+                    continue
         return self
 
     def push_local_up(self, payload: bytes | memoryview) -> None:
@@ -230,4 +231,6 @@ class DistributedIOCoordinator:
         return self._mq.sub_down(flags=flags)
 
     def flight_endpoint(self) -> str | None:
-        return f"grpc+tcp://{self._my_ip}:{self._flight_port}" if self.is_node_leader else None
+        if not self.is_node_leader:
+            return None
+        return f"grpc+tcp://{self._my_ip}:{self._flight_port}"

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -622,8 +621,14 @@ class ScaledDotProductAttention(torch.nn.Module):
         if self.te_first and self._te_ok and q.is_cuda and k.is_cuda and v.is_cuda and (q.dtype in (torch.float16, torch.bfloat16)) and _is_contiguous_bshd(q) and _is_contiguous_bshd(k) and _is_contiguous_bshd(v):
             try:
                 out = self._te_attn(
-                    q, k, v, attention_mask=None, qkv_format="bshd", attn_mask_type="causal" if is_causal else "no_mask", window_size=(-1, -1)
-                )  # :contentReference[oaicite:3]{index=3}
+                    q,
+                    k,
+                    v,
+                    attention_mask=None,
+                    qkv_format="bshd",
+                    attn_mask_type="causal" if is_causal else "no_mask",
+                    window_size=(-1, -1),
+                )
                 return out if out.shape == q.shape else out.permute(0, 2, 1, 3).contiguous()
             except Exception:
                 pass
@@ -634,8 +639,13 @@ class ScaledDotProductAttention(torch.nn.Module):
             k_bhsd = k.permute(0, 2, 1, 3).contiguous()
             v_bhsd = v.permute(0, 2, 1, 3).contiguous()
             out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd, k_bhsd, v_bhsd, attn_mask=None, dropout_p=float(dropout_p) if training else 0.0, is_causal=bool(is_causal)
-            )  # :contentReference[oaicite:5]{index=5}
+                q_bhsd,
+                k_bhsd,
+                v_bhsd,
+                attn_mask=None,
+                dropout_p=float(dropout_p) if training else 0.0,
+                is_causal=bool(is_causal),
+            )
             return out.permute(0, 2, 1, 3).contiguous()
 
     @staticmethod
@@ -1037,7 +1047,7 @@ class Architecture:
             _is_rms = child.__class__.__name__ == "RMSNorm"
             if not _is_rms and hasattr(nn, "RMSNorm"):
                 try:
-                    _is_rms = isinstance(child, nn.RMSNorm)  # :contentReference[oaicite:6]{index=6}
+                    _is_rms = isinstance(child, nn.RMSNorm)
                 except Exception:
                     _is_rms = False
             if not replaced and apply_te_rms_norm and _is_rms:
@@ -1541,7 +1551,7 @@ class DataLoader:
         non_blocking: bool = True,
         **kwargs: Any,
     ) -> None:
-        from ..pipeline.collate import Prefetcher
+        from ..pipeline.collate import H2DController
         node_obj = node or dataset
         if not isinstance(node_obj, _TDBaseNode):
             raise TypeError("toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances.")
@@ -1551,9 +1561,9 @@ class DataLoader:
         self._non_blocking = bool(non_blocking)
         base = NodesLoader(self._node)
         dev_t = getattr(self._device, "type", "cpu")
-        if dev_t in ("cuda", "mps", "xpu") and Prefetcher is not None:
+        if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
             try:
-                self._iterable = Prefetcher(base, device=self._device, depth=self._prefetch_factor)
+                self._iterable = H2DController(base, device=self._device, depth=self._prefetch_factor)
             except TypeError:
                 self._iterable = base
         else:

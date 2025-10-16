@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
@@ -283,7 +282,6 @@ class Model(nn.Module):
                     out: Meta = self._local(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
-                # offset values are computed but unused downstream
         else:
             self._local.eval()
             self._global.eval()
@@ -295,7 +293,6 @@ class Model(nn.Module):
                     out = self._local(x_slice)
                 token_chunks.append(out.tokens if out.tokens.dtype == base_dtype else out.tokens.to(base_dtype))
                 context_chunks.append(out.context if out.context.dtype == base_dtype else out.context.to(base_dtype))
-                # offset values are computed but unused downstream
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
         assembled = context.view(b, -1)
@@ -409,5 +406,4 @@ class Model(nn.Module):
 
     @property
     def local(self) -> SpatioTemporalNet:
-        """Return the spatio-temporal subnet used for local feature processing."""
         return self._local

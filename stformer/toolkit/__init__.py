@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Iterable, Callable, Any
+
+from typing import Any, Callable, Iterable
 
 __all__ = [
     'Autocast',
@@ -25,6 +25,7 @@ import torch
 from torch import Tensor
 
 from .compat import secure_torch
+
 secure_torch()
 
 class VarianceThreshold:
