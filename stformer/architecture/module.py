@@ -39,6 +39,27 @@ def _canon_dims(x: torch.Tensor, dims: Any, keep_batch: bool = False) -> Tuple[i
     return out
 
 
+def _normalize_data_definition(value: Any) -> str:
+    mode = str(value).strip().lower()
+    if mode in {"ss", "spatial", "sxs"}:
+        return "sxs"
+    if mode in {"tt", "temporal", "txt"}:
+        return "txt"
+    if mode in {"txs"}:
+        return "txs"
+    if mode in {
+        "st",
+        "ts",
+        "sxt",
+        "spatiotemporal",
+        "spatio-temporal",
+        "temporospatial",
+        "temporo-spatial",
+    }:
+        return "sxt"
+    raise ValueError(f"Unsupported data definition '{value}'")
+
+
 def _stable_std(
     x: torch.Tensor,
     dim: Tuple[int, ...] | int | None,
@@ -1282,9 +1303,9 @@ class CrossTransformer(nn.Module):
         self,
         spatial_tokens: torch.Tensor,
         temporal_tokens: torch.Tensor,
-        mode: str = "sxt",
+        mode: str = "spatiotemporal",
     ) -> torch.Tensor:
-        mode_l = mode.lower()
+        mode_l = _normalize_data_definition(mode)
         s_context = self.cross_s(spatial_tokens, temporal_tokens)
         t_context = self.cross_t(temporal_tokens, spatial_tokens)
         if mode_l == "sxs":
@@ -1388,7 +1409,7 @@ class SpatioTemporalNet(nn.Module):
         self.out_dim = int(prod(self.out_shape))
         self.d_model = int(config.depth)
         self.nhead = int(config.heads)
-        self.data_definition = str(config.data_definition).lower()
+        self.data_definition = _normalize_data_definition(config.data_definition)
         self.spatial_tokens = max(1, int(config.spatial_latent_tokens))
         self.temporal_tokens = max(1, int(config.temporal_latent_tokens))
         self.mlp_ratio = float(config.mlp_ratio)
@@ -1474,8 +1495,10 @@ class SpatioTemporalNet(nn.Module):
             tokens = temporal_out
         elif mode == "txs":
             tokens = self.perception(temporal_out, spatial_out, mode="txs")
-        else:
+        elif mode == "sxt":
             tokens = self.perception(spatial_out, temporal_out, mode="sxt")
+        else:
+            raise RuntimeError(f"Unhandled data definition '{mode}'")
         tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)

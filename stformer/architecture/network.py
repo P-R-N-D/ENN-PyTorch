@@ -37,7 +37,7 @@ class Config:
     drop_path: float = 0.0
     spatial_latent_tokens: int = 64
     temporal_latent_tokens: int = 64
-    data_definition: str = 'sxt'
+    data_definition: str = 'spatiotemporal'
     patch: PatchParameters = field(default_factory=PatchParameters)
     use_linear_branch: bool = False
     use_compilation: bool = False
