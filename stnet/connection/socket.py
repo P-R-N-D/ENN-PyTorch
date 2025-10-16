@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -9,7 +10,7 @@ import pyarrow as pa
 import pyarrow.flight as flight
 import torch.distributed as dist
 
-from ..pipeline.dataset import MemoryMappedTensorStream as MMTS
+from ..pipeline.dataset import MemoryMappedTensorStream
 
 
 class ZeroMQ:
@@ -204,7 +205,7 @@ class ArrowFlight:
     def reg_mmt_dataset(
         server: ArrowFlight.Server,
         name: str,
-        mmts: MMTS,
+        mmts: MemoryMappedTensorStream,
         batch_size: int,
         split: str,
     ) -> None:
@@ -219,7 +220,7 @@ class ArrowFlight:
             while index < end:
                 nxt = min(index + int(batch_size), end)
                 xb, yb = mmts.batch_range(index, nxt)
-                yield MMTS.to_record_batch(xb, yb)
+                yield MemoryMappedTensorStream.to_record_batch(xb, yb)
                 index = nxt
 
         generator = _batches()

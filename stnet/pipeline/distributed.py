@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -11,14 +12,12 @@ import torch.distributed as dist
 from ..connection.socket import ArrowFlight
 
 try:
-    from ..connection.socket import FlightModule as fl
+    from ..connection.socket import FlightModule
 except ImportError:
-    class _FlightFallback:
+    class FlightModule:
         @staticmethod
         def connect(*_args: Any, **_kwargs: Any) -> None:
             raise RuntimeError("Arrow Flight module is unavailable")
-
-    fl = _FlightFallback()
 
 GRPC_DEFAULT_PORT = 5005
 
@@ -205,7 +204,7 @@ class IOController:
                     continue
                 endpoint = f"grpc+tcp://{info['ip']}:{self._flight_port}"
                 try:
-                    self._clients[host] = fl.connect(endpoint)
+                    self._clients[host] = FlightModule.connect(endpoint)
                 except Exception:
                     continue
         return self

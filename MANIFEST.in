@@ -2,5 +2,5 @@ include LICENSE*
 include pyproject.toml
 include requirements.txt
 
-recursive-include stformer *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt *.pt *.pth *.onnx *.bin
+recursive-include stnet *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt *.pt *.pth *.onnx *.bin
 global-exclude __pycache__ *.py[cod] *.so *.dylib .DS_Store

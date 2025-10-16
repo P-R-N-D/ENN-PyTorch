@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Sequence, Tuple
@@ -45,9 +46,9 @@ class Config:
 
 from .module import SpatioTemporalNet, Meta, MetaNet
 from ..toolkit.optimization import Autocast, compile
-from ..toolkit.compat import secure_torch
+from ..toolkit.compat import patch_torch
 
-secure_torch()
+patch_torch()
 
 class Model(nn.Module):
     def __init__(

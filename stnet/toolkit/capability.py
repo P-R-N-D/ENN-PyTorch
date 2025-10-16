@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple, Union
@@ -58,14 +59,6 @@ def optimizer_flags(
         flags["fused"] = True
         flags["foreach"] = False
     return flags
-
-def synchronize(device: torch.device) -> None:
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    elif device.type == "xpu" and hasattr(torch, "xpu"):
-        torch.xpu.synchronize()
-    elif device.type == "mps" and hasattr(torch, "mps"):
-        torch.mps.synchronize()
 
 def _is_cuda_cc_equal_or_over_90(
     device: Optional[Union[torch.device, str]] = None,

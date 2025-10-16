@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -10,7 +11,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import torch
 from torch import nn, optim
-from torchdata.nodes import Loader as NodesLoader, BaseNode as _TDBaseNode
+from torchdata.nodes import Loader, BaseNode
 from .capability import (
     get_device,
     is_cpu_bf16_supported,
@@ -105,17 +106,44 @@ class _FlopBucket:
 
 
 _FLOP_BUCKET = _FlopBucket()
+_FLOP_TRACKING_DEPTH = 0
+
+
+def _is_flop_tracking_active() -> bool:
+    return _FLOP_TRACKING_DEPTH > 0
+
+
+def _reset_manual_flops() -> None:
+    _FLOP_BUCKET.reset()
+
+
+def _consume_manual_flops() -> float:
+    total = float(_FLOP_BUCKET.total)
+    _FLOP_BUCKET.reset()
+    return total
 
 
 _NVTX_SOFT_COUNTER: float = 0.0
 _NVTX_FLOPS_GETTER: Optional[Callable[[], float]] = None
 
 
-class FlopHookSession:
+class _FlopHookSession:
     def __init__(self, handles: List[Any]) -> None:
         self._handles = list(handles)
+        self._active = False
+        self._initial_count = len(self._handles)
+
+    def _set_active(self, value: bool) -> None:
+        global _FLOP_TRACKING_DEPTH
+        if value and not self._active:
+            _FLOP_TRACKING_DEPTH += 1
+            self._active = True
+        elif not value and self._active:
+            _FLOP_TRACKING_DEPTH = max(0, _FLOP_TRACKING_DEPTH - 1)
+            self._active = False
 
     def close(self) -> Any:
+        self._set_active(False)
         for h in self._handles:
             try:
                 h.remove()
@@ -123,36 +151,25 @@ class FlopHookSession:
                 pass
         self._handles.clear()
 
-    def __enter__(self) -> Any:
+    def __enter__(self) -> "_FlopHookSession":
+        self._set_active(True)
         return self
 
-    def __exit__(self, *exc: Any) -> Any:
+    def __exit__(self, *exc: Any) -> bool:
         self.close()
         return False
 
-
-def add_flops(typ: str, v: float) -> None:
-    _FLOP_BUCKET.add(typ, v)
-
-
-def reset_total_flops() -> None:
-    _FLOP_BUCKET.reset()
+    @property
+    def handle_count(self) -> int:
+        return self._initial_count
 
 
-def get_total_flops(reset: bool = False) -> float:
-    v = float(_FLOP_BUCKET.total)
-    if reset:
-        _FLOP_BUCKET.reset()
-    return v
-
-
-def register_flop_hooks(
+def _create_flop_hook_session(
     model: nn.Module,
     mode: str = "train",
     bwd_factor: Optional[float] = None,
     include_bias: bool = True,
-) -> FlopHookSession:
-    reset_total_flops()
+) -> _FlopHookSession:
     effective_bwd = 0.0 if mode.lower() == "eval" else 2.0
     _env = os.environ.get("STF_FLOP_BWD_FACTOR", "").strip()
     if _env:
@@ -163,6 +180,7 @@ def register_flop_hooks(
     target_types: List[type] = [Linear]
     try:
         import transformer_engine.pytorch as te
+
         _te_linear = getattr(te, "Linear", None)
         _te_ln_linear = getattr(te, "LayerNormLinear", None)
     except Exception:
@@ -247,14 +265,14 @@ def register_flop_hooks(
             handles.append(m.register_forward_hook(_hook_linear))
         if any(isinstance(m, t) for t in conv_types):
             handles.append(m.register_forward_hook(_hook_conv))
-    return FlopHookSession(handles)
+    return _FlopHookSession(handles)
 
 
 def _import_callable(spec: str) -> Callable:
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("Empty spec for callable import")
     raw = spec.strip()
-    root_pkg = __package__.split('.', 1)[0] if __package__ else 'stformer'
+    root_pkg = __package__.split('.', 1)[0] if __package__ else 'stnet'
     default_module = f"{root_pkg}.toolkit.optimization"
     if ':' in raw:
         mod_part, fn_part = raw.split(':', 1)
@@ -279,11 +297,6 @@ def _import_callable(spec: str) -> Callable:
     return fn
 
 
-def register_nvtx_flops_getter(fn: Callable[[], float]) -> None:
-    global _NVTX_FLOPS_GETTER
-    _NVTX_FLOPS_GETTER = fn
-
-
 def _nvtx_soft_add(v: float) -> None:
     global _NVTX_SOFT_COUNTER
     try:
@@ -294,10 +307,6 @@ def _nvtx_soft_add(v: float) -> None:
 
 def _nvtx_soft_getter() -> float:
     return float(_NVTX_SOFT_COUNTER)
-
-
-def nvtx_soft_add(v: float) -> None:
-    _nvtx_soft_add(v)
 
 
 def _ensure_nvtx_flops_getter() -> None:
@@ -355,7 +364,35 @@ class _NvtxCounter:
         return max(0.0, float(end) - float(self._start))
 
 
-def NVTXCounterMode(device: Optional[torch.device] = None) -> Any:
+class _TorchFlopCounter:
+    def __init__(self, display: bool = False) -> None:
+        try:
+            from torch.utils.flop_counter import FlopCounterMode as _TorchFlopCounterMode
+
+            self._impl = _TorchFlopCounterMode(display=display)
+        except Exception:
+            self._impl = None
+
+    def __enter__(self) -> "_TorchFlopCounter":
+        if self._impl is not None:
+            self._impl.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        if self._impl is not None:
+            self._impl.__exit__(*exc)
+        return False
+
+    def get_total_flops(self) -> float:
+        if self._impl is None:
+            return 0.0
+        try:
+            return float(self._impl.get_total_flops())
+        except Exception:
+            return 0.0
+
+
+def _make_nvtx_counter(device: Optional[torch.device] = None) -> Any:
     try:
         dev = device if device is not None else get_device()
     except Exception:
@@ -365,6 +402,100 @@ def NVTXCounterMode(device: Optional[torch.device] = None) -> Any:
     _ensure_nvtx_flops_getter()
     getter = _NVTX_FLOPS_GETTER if _NVTX_FLOPS_GETTER is not None else _nvtx_soft_getter
     return _NvtxCounter(getter)
+
+
+class _FlopCounterStep:
+    def __init__(self, parent: "FlopCounter", *, display: bool = False) -> None:
+        self._parent = parent
+        self._display = display
+        self._torch_counter: Optional[_TorchFlopCounter] = None
+        self._nvtx_counter: Any = None
+        self.manual_total = 0.0
+        self.torch_total = 0.0
+        self.nvtx_total = 0.0
+        self.total = 0.0
+
+    def __enter__(self) -> "_FlopCounterStep":
+        _reset_manual_flops()
+        self._torch_counter = _TorchFlopCounter(display=self._display)
+        self._torch_counter.__enter__()
+        self._nvtx_counter = _make_nvtx_counter(self._parent.device)
+        self._nvtx_counter.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        manual = _consume_manual_flops()
+        if manual > 0.0:
+            _nvtx_soft_add(manual)
+        self.manual_total = manual
+        if self._torch_counter is not None:
+            self._torch_counter.__exit__(*exc)
+            self.torch_total = self._torch_counter.get_total_flops()
+            self._torch_counter = None
+        if self._nvtx_counter is not None:
+            self._nvtx_counter.__exit__(*exc)
+            try:
+                self.nvtx_total = float(self._nvtx_counter.get_total_flops())
+            except Exception:
+                self.nvtx_total = 0.0
+            self._nvtx_counter = None
+        self.total = max(self.manual_total, self.torch_total, self.nvtx_total)
+        return False
+
+    def get_total_flops(self) -> float:
+        return float(self.total)
+
+
+class FlopCounter:
+    def __init__(
+        self,
+        model: nn.Module,
+        *,
+        mode: str = "train",
+        device: Optional[torch.device] = None,
+        include_bias: bool = True,
+        bwd_factor: Optional[float] = None,
+    ) -> None:
+        self._model = model
+        self._mode = mode
+        self._device = device
+        self._include_bias = include_bias
+        self._bwd_factor = bwd_factor
+        self._hook_session: Optional[_FlopHookSession] = None
+        self._hook_count = 0
+
+    @property
+    def device(self) -> Optional[torch.device]:
+        return self._device
+
+    def __enter__(self) -> "FlopCounter":
+        self._hook_session = _create_flop_hook_session(
+            self._model,
+            mode=self._mode,
+            bwd_factor=self._bwd_factor,
+            include_bias=self._include_bias,
+        )
+        self._hook_session.__enter__()
+        self._hook_count = self._hook_session.handle_count
+        _reset_manual_flops()
+        return self
+
+    def __exit__(self, *exc: Any) -> bool:
+        if self._hook_session is not None:
+            self._hook_session.__exit__(*exc)
+            self._hook_session = None
+        return False
+
+    def step(self, *, display: bool = False) -> _FlopCounterStep:
+        if self._hook_session is None:
+            raise RuntimeError(
+                "FlopCounter hooks are not active. Use `with FlopCounter(...)` before measuring FLOPs."
+            )
+        return _FlopCounterStep(self, display=display)
+
+    @property
+    def hook_count(self) -> int:
+        return int(self._hook_count)
 
 
 def attention_flops_bshd(
@@ -677,6 +808,7 @@ class _GMSRFallback(nn.Module):
         H, Dh = (self.nhead, self.head_dim)
         q = self.q_proj(x).view(B, S, H, Dh)
         v = self.v_proj(x).view(B, S, H, Dh)
+        manual_flops = float(max(S - 1, 0) * B * H * Dh * 2)
         lam = torch.sigmoid(self._beta).view(1, H, 1).to(dtype=v.dtype, device=v.device)
         prev = v[:, 0].clone()
         s_list = [prev]
@@ -684,11 +816,15 @@ class _GMSRFallback(nn.Module):
             prev = lam * prev + v[:, t]
             s_list.append(prev)
         s = torch.stack(s_list, dim=1).contiguous()
+        manual_flops += float(B * S * D)
         y = (q * s).contiguous().view(B, S, D)
         y = self.norm(y)
         if self.use_gate and self.g_proj is not None:
             gate = torch.nn.functional.silu(self.g_proj(x))
+            manual_flops += float(B * S * D)
             y = y * gate
+        if manual_flops > 0.0 and _is_flop_tracking_active():
+            _FLOP_BUCKET.add("GMSR_Fallback", manual_flops)
         return self.o_proj(y)
 
 
@@ -1545,21 +1681,21 @@ class DataLoader:
         self,
         *args: Any,
         device: torch.device,
-        node: "_TDBaseNode" | None = None,
-        dataset: "_TDBaseNode" | None = None,
+        node: "BaseNode" | None = None,
+        dataset: "BaseNode" | None = None,
         prefetch_factor: int = 2,
         non_blocking: bool = True,
         **kwargs: Any,
     ) -> None:
         from ..pipeline.collate import H2DController
         node_obj = node or dataset
-        if not isinstance(node_obj, _TDBaseNode):
+        if not isinstance(node_obj, BaseNode):
             raise TypeError("toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances.")
         self._node = node_obj
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))
         self._non_blocking = bool(non_blocking)
-        base = NodesLoader(self._node)
+        base = Loader(self._node)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
             try:
