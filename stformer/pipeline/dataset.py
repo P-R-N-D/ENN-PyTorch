@@ -1,23 +1,26 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import json
 import math
 import os
 import random
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pyarrow as pa
 import torch
+from tensordict import MemoryMappedTensor
 
 try:
-    from torchdata.nodes import IterableWrapper  
+    from torchdata.nodes import IterableWrapper
 except Exception:
-    from torchdata.datapipes.iter import IterableWrapper 
+    from torchdata.datapipes.iter import IterableWrapper
 
-from tensordict import MemoryMappedTensor
-from . import _meta
+
+def _read_meta(memmap_dir: str) -> Dict[str, Any]:
+    path = os.path.join(memmap_dir, "meta.json")
+    with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
 
 _TORCH2NAME: Dict[torch.dtype, str] = {
     torch.float32: "float32",
@@ -50,11 +53,10 @@ class MemoryMappedTensorStream:
     def __init__(
         self,
         memmap_dir: str,
-        *args: Any,
+        *,
         split: str = "train",
         val_frac: Optional[float] = None,
         batch_size: Optional[int] = None,
-        **kwargs: Any
     ) -> None:
         self.dir = memmap_dir
         self.split = split
@@ -66,136 +68,126 @@ class MemoryMappedTensorStream:
     def from_dir(
         cls,
         memmap_dir: str,
-        *args: Any,
+        *,
         split: str = "train",
         batch_size: int = 1,
         val_frac: Optional[float] = None,
-        **kwargs: Any
-    ) -> "MemoryMappedTensorStream":
+    ) -> MemoryMappedTensorStream:
         return cls(memmap_dir, split=split, val_frac=val_frac, batch_size=int(batch_size))
 
     @staticmethod
     def materialize(
         data: Dict[str, Any],
-        *args: Any,
+        *,
         memmap_dir: str,
         train_frac: float = 1.0,
         val_frac: float = 0.0,
         shuffle: bool = False,
-        **kwargs: Any
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
-        X = torch.as_tensor(data["features"]).detach().cpu().contiguous()
-        Y = torch.as_tensor(data["labels"]).detach().cpu().contiguous()
-        if X.shape[0] != Y.shape[0]:
+        features = torch.as_tensor(data["features"]).detach().cpu().contiguous()
+        labels = torch.as_tensor(data["labels"]).detach().cpu().contiguous()
+        if features.shape[0] != labels.shape[0]:
             raise ValueError("features/labels N mismatch")
-        N = int(X.shape[0])
-        F = int(X.view(N, -1).shape[1])
-        lshape: List[int] = list(Y.shape[1:])
-        Lflat = int(Y.numel() // N)
+        count = int(features.shape[0])
+        feat_dim = int(features.view(count, -1).shape[1])
+        label_shape: List[int] = list(labels.shape[1:])
+        label_flat = int(labels.numel() // count)
         if shuffle:
-            perm = torch.randperm(N)
-            X = X.index_select(0, perm)
-            Y = Y.index_select(0, perm)
-        fx = os.path.join(memmap_dir, "features.mmt")
-        lb = os.path.join(memmap_dir, "labels.mmt")
-        MemoryMappedTensor.from_tensor(X.view(N, F), filename=fx, existsok=True)
-        MemoryMappedTensor.from_tensor(Y.view(N, Lflat), filename=lb, existsok=True)
+            perm = torch.randperm(count)
+            features = features.index_select(0, perm)
+            labels = labels.index_select(0, perm)
+        feat_path = os.path.join(memmap_dir, "features.mmt")
+        label_path = os.path.join(memmap_dir, "labels.mmt")
+        MemoryMappedTensor.from_tensor(features.view(count, feat_dim), filename=feat_path, existsok=True)
+        MemoryMappedTensor.from_tensor(labels.view(count, label_flat), filename=label_path, existsok=True)
         meta = {
-            "N": N,
-            "feature_dim": F,
-            "label_shape": lshape,
-            "features_arrow_dtype": _TORCH2NAME[X.dtype],
-            "labels_arrow_dtype": _TORCH2NAME[Y.dtype],
+            "N": count,
+            "feature_dim": feat_dim,
+            "label_shape": label_shape,
+            "features_arrow_dtype": _TORCH2NAME[features.dtype],
+            "labels_arrow_dtype": _TORCH2NAME[labels.dtype],
             "fractions": [float(train_frac), float(val_frac)],
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
         }
-        with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f)
+        with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
+            json.dump(meta, handle)
 
     def _load_meta(self) -> Dict[str, Any]:
         if self._meta is None:
-            with open(os.path.join(self.dir, "meta.json"), "r", encoding="utf-8") as f:
-                self._meta = json.load(f)
+            with open(os.path.join(self.dir, "meta.json"), "r", encoding="utf-8") as handle:
+                self._meta = json.load(handle)
         return self._meta
 
     def _indices(self) -> range:
-        m = self._load_meta()
-        N = int(m["N"])
-        vf = float(
-            self._val_frac_override
-            if self._val_frac_override is not None
-            else m.get("fractions", [1.0, 0.0])[-1]
+        meta = self._load_meta()
+        total = int(meta["N"])
+        val_fraction = float(
+            self._val_frac_override if self._val_frac_override is not None else meta.get("fractions", [1.0, 0.0])[-1]
         )
-        n_val = int(round(N * vf))
-        n_tr = N - n_val
+        val_count = int(round(total * val_fraction))
+        train_count = total - val_count
         if self.split == "train":
-            return range(0, n_tr)
+            return range(0, train_count)
         if self.split == "val":
-            return range(n_tr, N)
-        return range(0, N)
+            return range(train_count, total)
+        return range(0, total)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        m = self._load_meta()
-        N = int(m["N"])
-        F = int(m["feature_dim"])
-        lshape = list(m["label_shape"])
-        Lflat = int(torch.tensor(lshape).prod().item()) if lshape else 1
-        fx = os.path.join(self.dir, m.get("features_filename", "features.mmt"))
-        lb = os.path.join(self.dir, m.get("labels_filename", "labels.mmt"))
-        fdt = _NAME2TORCH[m.get("features_arrow_dtype", "float32")]
-        ldt = _NAME2TORCH[m.get("labels_arrow_dtype", "float32")]
-        f_mmt = MemoryMappedTensor.from_filename(fx, dtype=fdt, shape=(N, F))
-        l_mmt = MemoryMappedTensor.from_filename(lb, dtype=ldt, shape=(N, Lflat))
-        for i in self._indices():
-            x = f_mmt[i]
-            y = l_mmt[i].view(*lshape)
-            if not isinstance(x, torch.Tensor):
-                x = torch.as_tensor(x)
-            if not isinstance(y, torch.Tensor):
-                y = torch.as_tensor(y)
-            yield x, y
+        meta = self._load_meta()
+        total = int(meta["N"])
+        feat_dim = int(meta["feature_dim"])
+        label_shape = list(meta["label_shape"])
+        label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+        feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
+        label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+        feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
+        label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
+        feat_mmt = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
+        label_mmt = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
+        for index in self._indices():
+            feat = feat_mmt[index]
+            label = label_mmt[index].view(*label_shape)
+            feat_tensor = feat if isinstance(feat, torch.Tensor) else torch.as_tensor(feat)
+            label_tensor = label if isinstance(label, torch.Tensor) else torch.as_tensor(label)
+            yield feat_tensor, label_tensor
 
     def __len__(self) -> int:
         return len(self._indices())
 
     def batch_range(self, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor]:
-        m = self._load_meta()
-        N = int(m["N"])
-        F = int(m["feature_dim"])
-        lshape = list(m["label_shape"])
-        Lflat = int(torch.tensor(lshape).prod().item()) if lshape else 1
-        fx = os.path.join(self.dir, m.get("features_filename", "features.mmt"))
-        lb = os.path.join(self.dir, m.get("labels_filename", "labels.mmt"))
-        fdt = _NAME2TORCH[m.get("features_arrow_dtype", "float32")]
-        ldt = _NAME2TORCH[m.get("labels_arrow_dtype", "float32")]
-        f_mmt = MemoryMappedTensor.from_filename(fx, dtype=fdt, shape=(N, F))
-        l_mmt = MemoryMappedTensor.from_filename(lb, dtype=ldt, shape=(N, Lflat))
-        Xb = f_mmt[start:end]
-        Yb = l_mmt[start:end].view(-1, *lshape)
-        Xb_t = Xb if isinstance(Xb, torch.Tensor) else torch.as_tensor(Xb)
-        Yb_t = Yb if isinstance(Yb, torch.Tensor) else torch.as_tensor(Yb)
-        return Xb_t, Yb_t
+        meta = self._load_meta()
+        total = int(meta["N"])
+        feat_dim = int(meta["feature_dim"])
+        label_shape = list(meta["label_shape"])
+        label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+        feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
+        label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+        feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
+        label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
+        feat_mmt = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
+        label_mmt = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
+        features = feat_mmt[start:end]
+        labels = label_mmt[start:end].view(-1, *label_shape)
+        features_tensor = features if isinstance(features, torch.Tensor) else torch.as_tensor(features)
+        labels_tensor = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(labels)
+        return features_tensor, labels_tensor
 
     @staticmethod
-    def to_record_batch(Xb: torch.Tensor, Yb: torch.Tensor) -> pa.RecordBatch:
-        B = int(Xb.shape[0])
-        F = int(Xb.view(B, -1).shape[1])
-        Lflat = int(Yb.view(B, -1).shape[1])
-        fa = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.asarray(Xb.contiguous().view(-1).cpu().numpy())), F
-        )
-        la = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.asarray(Yb.contiguous().view(-1).cpu().numpy())), Lflat
-        )
-        return pa.record_batch([fa, la], names=["features", "labels"])
+    def to_record_batch(features: torch.Tensor, labels: torch.Tensor) -> pa.RecordBatch:
+        batch = int(features.shape[0])
+        feat_dim = int(features.view(batch, -1).shape[1])
+        label_flat = int(labels.view(batch, -1).shape[1])
+        feat_array = pa.FixedSizeListArray.from_arrays(pa.array(np.asarray(features.contiguous().view(-1).cpu().numpy())), feat_dim)
+        label_array = pa.FixedSizeListArray.from_arrays(pa.array(np.asarray(labels.contiguous().view(-1).cpu().numpy())), label_flat)
+        return pa.record_batch([feat_array, label_array], names=["features", "labels"])
 
 
 class Batch(IterableWrapper):
     def __init__(
         self,
-        *args: Any,
+        *,
         memmap_dir: str,
         part: str,
         batch_size: int,
@@ -205,10 +197,9 @@ class Batch(IterableWrapper):
         world_size: int = 1,
         drop_last: bool = False,
         fractions: Optional[Tuple[float, float]] = None,
-        **kwargs: Any
     ) -> None:
-        meta = _meta(memmap_dir)
-        N = int(meta["N"])
+        meta = _read_meta(memmap_dir)
+        total = int(meta["N"])
         if fractions is not None:
             train_frac = float(fractions[0])
         else:
@@ -217,30 +208,30 @@ class Batch(IterableWrapper):
                 try:
                     train_frac = float(meta["fractions"][0])
                 except Exception:
-                    pass
-        if part not in ("train", "val"):
+                    train_frac = 1.0
+        if part not in {"train", "val"}:
             raise ValueError("part must be 'train' or 'val'")
-        train_cnt = int(math.floor(N * train_frac))
-        start, end = (0, train_cnt) if part == "train" else (train_cnt, N)
-        idx = list(range(start, end))
+        train_count = int(math.floor(total * train_frac))
+        start, end = (0, train_count) if part == "train" else (train_count, total)
+        indices = list(range(start, end))
         if shuffle:
             rng = random.Random(int(seed))
-            rng.shuffle(idx)
+            rng.shuffle(indices)
         if world_size > 1:
-            idx = idx[int(rank) :: int(world_size)]
-        B = int(batch_size)
-        out: List[List[int]] = []
-        cur: List[int] = []
-        for i in idx:
-            cur.append(int(i))
-            if len(cur) == B:
-                out.append(cur)
-                cur = []
-        if cur and (not drop_last):
-            out.append(cur)
+            indices = indices[int(rank) :: int(world_size)]
+        batch_len = int(batch_size)
+        batches: List[List[int]] = []
+        current: List[int] = []
+        for idx in indices:
+            current.append(int(idx))
+            if len(current) == batch_len:
+                batches.append(current)
+                current = []
+        if current and not drop_last:
+            batches.append(current)
 
         def _iter() -> Iterator[List[int]]:
-            for it in out:
-                yield list(it)
+            for chunk in batches:
+                yield list(chunk)
 
         super().__init__(_iter())

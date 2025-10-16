@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
+
 from typing import Any, Iterator, Optional
 
 import contextlib
@@ -127,18 +127,20 @@ class Ucxx:
         self._backend: str
         self._module: Any
         try:
-            import ucxx as backend  # type: ignore[import-not-found]
+            import ucxx as backend
 
             self._backend = "ucxx"
             self._module = backend
+            return
         except Exception:
-            try:
-                import ucp as backend  # type: ignore[import-not-found]
+            pass
+        try:
+            import ucp as backend
 
-                self._backend = "ucx-py"
-                self._module = backend
-            except Exception as e:
-                raise RuntimeError("Neither 'ucxx' nor 'ucx-py' is installed") from e
+            self._backend = "ucx-py"
+            self._module = backend
+        except Exception as exc:
+            raise RuntimeError("Neither 'ucxx' nor 'ucx-py' is installed") from exc
 
     async def local_echo(self, payload: bytes) -> bytes:
         if self._backend == "ucxx":

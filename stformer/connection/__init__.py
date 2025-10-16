@@ -1,18 +1,17 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from .socket import ArrowFlight, ZeroMQ
-from .memory import SharedMemory, MemoryMap, CudaIpc, Ucxx, GpuDirectStorage
 from .queue import CompatQueue, MessageQueue
+from .socket import ArrowFlight, ZeroMQ
+from .memory import CudaIpc, GpuDirectStorage, MemoryMap, SharedMemory, Ucxx
 
 __all__ = [
-    'ArrowFlight',
-    'ZeroMQ',
-    'MemoryMap',
-    'SharedMemory',
-    'CudaIpc',
-    'Ucxx',
-    'GpuDirectStorage',
-    'CompatQueue',
-    'MessageQueue',
+    "ArrowFlight",
+    "ZeroMQ",
+    "MemoryMap",
+    "SharedMemory",
+    "CudaIpc",
+    "Ucxx",
+    "GpuDirectStorage",
+    "CompatQueue",
+    "MessageQueue",
 ]

@@ -1,5 +1,5 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
+
 from typing import Dict, Optional, Tuple, Union
 
 import math

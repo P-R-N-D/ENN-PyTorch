@@ -1,18 +1,16 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
+
 from typing import TypeAlias
 
 import torch
 from torch import nn
 
-from ..toolkit.compat import secure_torch, SDPBackend, sdpa_kernel
+from ..toolkit.compat import SDPBackend, sdpa_kernel, secure_torch
 
 secure_torch()
 
 
 class StochasticDepth(nn.Module):
-    """Stochastic depth / DropPath module compatible with the original project."""
-
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
         super().__init__()
         if not 0.0 <= p <= 1.0:
@@ -20,7 +18,7 @@ class StochasticDepth(nn.Module):
         self.p = float(p)
         self.mode = str(mode)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.p == 0.0:
             return x
         keep_prob = 1.0 - self.p
@@ -39,10 +37,9 @@ def _norm(norm_type: str, d_model: int) -> nn.Module:
     if kind in {"layernorm", "layer_norm", "ln"}:
         return nn.LayerNorm(d_model)
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(d_model)  # type: ignore[attr-defined]
+        return nn.RMSNorm(d_model)
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
         return nn.BatchNorm1d(d_model)
-    # Fallback to LayerNorm for unrecognised identifiers so tests can proceed.
     return nn.LayerNorm(d_model)
 
 
@@ -52,49 +49,49 @@ def _stochastic_depth_scheduler(max_rate: float, depth: int) -> list[float]:
     if max_rate <= 0:
         return [0.0 for _ in range(depth)]
     step = float(max_rate) / max(1, depth)
-    return [step * (i + 1) for i in range(depth)]
+    return [step * (index + 1) for index in range(depth)]
 
 
-from .module import (  # noqa: E402  (import after helper definitions)
-    SpatialSubnet,
-    TemporalSubnet,
-    SpatioTemporalNet,
-    PatchAttention,
+from .module import (
     CrossTransformer,
+    DataFidelityLoss,
+    GeGLU,
     Meta,
     MetaNet,
-    GeGLU,
-    SwiGLU,
     MultipleQuantileLoss,
+    PatchAttention,
+    SpatialSubnet,
+    SpatioTemporalNet,
     StandardNormalLoss,
     StudentsTLoss,
-    DataFidelityLoss,
+    SwiGLU,
+    TemporalSubnet,
 )
-from .network import Model, Config, PatchParameters  # noqa: E402
-
+from .network import Config, Model, PatchParameters
 
 __all__ = [
-    'sdpa_kernel',
-    'SDPBackend',
-    'Model',
-    'Config',
-    'PatchParameters',
-    'SpatialSubnet',
-    'TemporalSubnet',
-    'SpatioTemporalNet',
-    'PatchAttention',
-    'CrossTransformer',
-    'Meta',
-    'MetaNet',
-    'GeGLU',
-    'SwiGLU',
-    'MultipleQuantileLoss',
-    'StandardNormalLoss',
-    'StudentsTLoss',
-    'DataFidelityLoss',
-    'StochasticDepth',
-    '_norm',
-    '_stochastic_depth_scheduler',
+    "sdpa_kernel",
+    "SDPBackend",
+    "Model",
+    "Config",
+    "PatchParameters",
+    "SpatialSubnet",
+    "TemporalSubnet",
+    "SpatioTemporalNet",
+    "PatchAttention",
+    "CrossTransformer",
+    "Meta",
+    "MetaNet",
+    "GeGLU",
+    "SwiGLU",
+    "MultipleQuantileLoss",
+    "StandardNormalLoss",
+    "StudentsTLoss",
+    "DataFidelityLoss",
+    "StochasticDepth",
+    "_norm",
+    "_stochastic_depth_scheduler",
 ]
+
 ZLoss: TypeAlias = StandardNormalLoss
 TLoss: TypeAlias = StudentsTLoss

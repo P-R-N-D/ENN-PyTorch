@@ -1,19 +1,18 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Any, Optional, Sequence, Tuple, Union, List, TYPE_CHECKING
 
 import math
+from dataclasses import dataclass
 from math import prod
+from typing import Any, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
 
 import torch
 import torch.nn.functional as F
-from torch import nn, Tensor
+from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
-from ..toolkit.optimization import ScaledDotProductAttention, GatedMultiScaleRetention
-from . import StochasticDepth, _norm, _stochastic_depth_scheduler
 from ..toolkit.compat import secure_torch
+from ..toolkit.optimization import GatedMultiScaleRetention, ScaledDotProductAttention
+from . import StochasticDepth, _norm, _stochastic_depth_scheduler
 
 secure_torch()
 
@@ -842,7 +841,7 @@ def _nufft_nd_cufinufft(
 ) -> torch.Tensor:
     try:
         import cufinufft
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         raise RuntimeError("cuFINUFFT not available") from e
     B = x_cplx.shape[0]
     ndim = len(shape)
@@ -1084,7 +1083,7 @@ class GatedCrossAttention(nn.Module):
         k, v = kv.chunk(2, dim=-1)
         def split(x): return x.view(B, -1, self.nhead, self.head_dim).transpose(1, 2)
         qh, kh, vh = split(qn), split(k), split(v)
-        yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)  # (B,H,Nq,Hd)
+        yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
         y = self.out_proj(self.dropout(y))
         return q + torch.sigmoid(self.gate) * y
@@ -1329,29 +1328,6 @@ class CrossTransformer(nn.Module):
 
 @dataclass
 class Meta:
-    """Aggregated outputs from :class:`SpatioTemporalNet`.
-
-    The spatiotemporal pipeline emits three different views over the model
-    prediction so downstream components can choose the representation that best
-    matches their task:
-
-    * ``tokens`` – the latent token sequence after the perception fusion stage
-      (and optional normalization). This is used by higher level models such as
-      :class:`MetaNet` for refinement or cross-window stitching.
-    * ``context`` – the decoded tensor shaped back into the target context
-      dimensions. This is the primary prediction that matches the desired
-      ``out_shape``.
-    * ``flat`` – the raw flattened context prediction before reshaping. Certain
-      optimization heads operate over the flattened form, so we expose it
-      alongside ``context``.
-    * ``offset`` – the mean value broadcast over the context dimensions. It is
-      primarily consumed for stage-to-stage calibration when merging outputs
-      from multiple windows.
-    * ``context_shape`` – the tuple describing the shape of ``context`` so that
-      consumers can reshape ``flat`` without needing direct access to the
-      originating model configuration.
-    """
-
     tokens: torch.Tensor
     context: torch.Tensor
     flat: torch.Tensor
