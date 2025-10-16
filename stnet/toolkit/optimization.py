@@ -14,9 +14,11 @@ from torch import nn, optim
 from torchdata.nodes import Loader, BaseNode
 from .capability import (
     get_device,
+    get_runtime_config,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
     is_float8_supported,
+    resolve_sdpa_backends,
 )
 
 try:
@@ -657,12 +659,13 @@ class ScaledDotProductAttention(torch.nn.Module):
         self,
         num_heads: Optional[int] = None,
         head_dim: Optional[int] = None,
-        te_first: bool = True,
+        te_first: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.nh = int(num_heads) if num_heads is not None else None
         self.hd = int(head_dim) if head_dim is not None else None
-        self.te_first = te_first
+        cfg = get_runtime_config()
+        self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
         ok, te = self._is_te_available()
         self._te_ok = (
             ok
@@ -670,6 +673,7 @@ class ScaledDotProductAttention(torch.nn.Module):
             and self.nh is not None
             and self.hd is not None
         )
+        self._te_attn: Any = None
         if self._te_ok:
             self._te = te
             self._te_attn = te.DotProductAttention(
@@ -723,61 +727,62 @@ class ScaledDotProductAttention(torch.nn.Module):
         except Exception:
             pass
         dropout_val = float(dropout_p) if training else 0.0
-        if self._te_ok and attn_mask is None and not kwargs:
+        use_te = (
+            self.te_first
+            and self._te_ok
+            and self._te_attn is not None
+            and attn_mask is None
+            and not kwargs
+        )
+        if use_te:
             q_bhsd = q.permute(0, 2, 1, 3).contiguous()
             k_bhsd = k.permute(0, 2, 1, 3).contiguous()
             v_bhsd = v.permute(0, 2, 1, 3).contiguous()
-            out = self._te_attn(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                attn_mask=None,
-                attention_dropout=dropout_val,
-                is_causal=bool(is_causal),
-                training=training,
-            )
-            return out.permute(0, 2, 1, 3).contiguous()
+            try:
+                out_te = self._te_attn(
+                    q_bhsd,
+                    k_bhsd,
+                    v_bhsd,
+                    attn_mask=None,
+                    attention_dropout=dropout_val,
+                    is_causal=bool(is_causal),
+                    training=training,
+                )
+            except Exception:
+                use_te = False
+            else:
+                return out_te.permute(0, 2, 1, 3).contiguous()
         q_bhsd = q.permute(0, 2, 1, 3).contiguous()
         k_bhsd = k.permute(0, 2, 1, 3).contiguous()
         v_bhsd = v.permute(0, 2, 1, 3).contiguous()
-        out = torch.nn.functional.scaled_dot_product_attention(
-            q_bhsd,
-            k_bhsd,
-            v_bhsd,
-            attn_mask=attn_mask,
-            dropout_p=dropout_val,
-            is_causal=bool(is_causal),
-        )
-        return out.permute(0, 2, 1, 3).contiguous()
-        if self.te_first and self._te_ok and q.is_cuda and k.is_cuda and v.is_cuda and (q.dtype in (torch.float16, torch.bfloat16)) and _is_contiguous_bshd(q) and _is_contiguous_bshd(k) and _is_contiguous_bshd(v):
+        sdpa_kwargs = {
+            "attn_mask": attn_mask,
+            "dropout_p": dropout_val,
+            "is_causal": bool(is_causal),
+        }
+        backends = resolve_sdpa_backends()
+        sdpa_out: Optional[torch.Tensor] = None
+        if backends:
             try:
-                out = self._te_attn(
-                    q,
-                    k,
-                    v,
-                    attention_mask=None,
-                    qkv_format="bshd",
-                    attn_mask_type="causal" if is_causal else "no_mask",
-                    window_size=(-1, -1),
-                )
-                return out if out.shape == q.shape else out.permute(0, 2, 1, 3).contiguous()
+                from torch.nn.attention import sdpa_kernel
             except Exception:
-                pass
-        from torch.nn.attention import sdpa_kernel, SDPBackend
-        backends = [b for name in ("FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION", "MATH") if hasattr(SDPBackend, name) for b in (getattr(SDPBackend, name),)]
-        with sdpa_kernel(backends):
-            q_bhsd = q.permute(0, 2, 1, 3).contiguous()
-            k_bhsd = k.permute(0, 2, 1, 3).contiguous()
-            v_bhsd = v.permute(0, 2, 1, 3).contiguous()
-            out = torch.nn.functional.scaled_dot_product_attention(
+                backends = []
+        if backends:
+            with sdpa_kernel(backends):
+                sdpa_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_bhsd,
+                    k_bhsd,
+                    v_bhsd,
+                    **sdpa_kwargs,
+                )
+        if sdpa_out is None:
+            sdpa_out = torch.nn.functional.scaled_dot_product_attention(
                 q_bhsd,
                 k_bhsd,
                 v_bhsd,
-                attn_mask=None,
-                dropout_p=float(dropout_p) if training else 0.0,
-                is_causal=bool(is_causal),
+                **sdpa_kwargs,
             )
-            return out.permute(0, 2, 1, 3).contiguous()
+        return sdpa_out.permute(0, 2, 1, 3).contiguous()
 
     @staticmethod
     def _to_optimal_dtype(x: torch.Tensor) -> torch.Tensor:

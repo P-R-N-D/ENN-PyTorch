@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import contextlib
@@ -95,6 +95,51 @@ _SIZEOF = {
     'uint8': 1,
     'bool': 1,
 }
+
+
+@dataclass
+class AdaptiveLossBalancer:
+    momentum: float = 0.9
+    min_weight: float = 0.05
+    max_weight: float = 0.95
+    eps: float = 1e-06
+    top_avg: float = 1.0
+    bottom_avg: float = 1.0
+
+    def weights(self) -> Tuple[float, float]:
+        top = max(self.eps, self.top_avg)
+        bottom = max(self.eps, self.bottom_avg)
+        total = top + bottom
+        if total <= 0.0:
+            return (0.5, 0.5)
+        ratio_top = top / total
+        ratio_bottom = bottom / total
+        ratio_top = float(min(max(ratio_top, self.min_weight), self.max_weight))
+        ratio_bottom = float(
+            min(max(ratio_bottom, self.min_weight), self.max_weight)
+        )
+        norm = ratio_top + ratio_bottom
+        if norm <= 0.0:
+            return (0.5, 0.5)
+        return (ratio_top / norm, ratio_bottom / norm)
+
+    def update(
+        self,
+        top_loss: Optional[torch.Tensor],
+        bottom_loss: Optional[torch.Tensor],
+    ) -> None:
+        if top_loss is not None:
+            top_val = float(top_loss.detach().abs().mean().item())
+            self.top_avg = (
+                self.momentum * self.top_avg
+                + (1.0 - self.momentum) * max(top_val, self.eps)
+            )
+        if bottom_loss is not None:
+            bottom_val = float(bottom_loss.detach().abs().mean().item())
+            self.bottom_avg = (
+                self.momentum * self.bottom_avg
+                + (1.0 - self.momentum) * max(bottom_val, self.eps)
+            )
 
 
 def _canonical_dtype(x: torch.dtype | str) -> str:
@@ -196,10 +241,10 @@ def _establish(ep: Optional[str]) -> str:
         port = int(p)
     else:
         host, port = (ep, default_port)
-    if port != 0 and (not _is_port_available(host, port)):
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-            s.bind((host, 0))
-            _, free_port = s.getsockname()
+    if port <= 0 or (port != 0 and (not _is_port_available(host, port))):
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            sock.bind((host, 0))
+            _, free_port = sock.getsockname()
         port = int(free_port)
     return f'{host}:{port}'
 
@@ -676,7 +721,7 @@ def epochs(
     _z = StandardNormalLoss(confidence=0.99, metric='z_value', two_tailed=True, penalty='softplus', tau=1.0, mu_mode='error', std_mode='pooled', ddof=1, clamp_max=8.0, detach_stats=True, dim=-1, reduction='none')
     top_loss = TiledLoss(_t, mask_mode=loss_mask_mode, mask_value=loss_mask_value, tile_dim=loss_tile_dim, tile_size=loss_tile_size, reduction='mean')
     bottom_loss = TiledLoss(_z, mask_mode=loss_mask_mode, mask_value=loss_mask_value, tile_dim=loss_tile_dim, tile_size=loss_tile_size, reduction='mean')
-    loss_weights = (0.5, 0.5)
+    loss_controller = AdaptiveLossBalancer()
     if keep0 is not None:
         keep0.cleanup()
     total_steps = epochs * steps_per_epoch
@@ -786,7 +831,13 @@ def epochs(
                                 t_comp_start = time.perf_counter_ns()
                             with flop_counter.step(display=False) as val_counter:
                                 Yv_flat = Y.reshape(Y.shape[0], -1).to(device, dtype=next(model.parameters()).dtype)
-                                _, loss_val = model(X, labels_flat=Yv_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_weights)
+                                _, loss_val = model(
+                                    X,
+                                    labels_flat=Yv_flat,
+                                    global_loss=top_loss,
+                                    local_loss=bottom_loss,
+                                    loss_weights=loss_controller,
+                                )
                             if use_timer:
                                 ev_end.record()
                                 ev_end.synchronize()
