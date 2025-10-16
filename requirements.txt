@@ -3,6 +3,7 @@ torchvision>=0.16
 torchdata>=0.11
 tensordict>=0.10.0
 numpy>=1.24
+netifaces>=0.11
 pyarrow[flight]>=10
 pyzmq>=25
 tqdm>=4.66
