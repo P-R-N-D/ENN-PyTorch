@@ -17,7 +17,7 @@ dependencies = [
   "torchdata>=0.11",
   "tensordict>=0.10.0",
   "numpy>=1.24",
-  "pyarrow[flight,dataset]>=10",
+  "pyarrow[flight]>=10",
   "pyzmq>=25",
   "tqdm>=4.66"
 ]
