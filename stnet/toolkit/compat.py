@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -26,7 +27,7 @@ except Exception:
         yield
 
 
-def secure_torch() -> None:
+def patch_torch() -> None:
     if not hasattr(nn, "RMSNorm"):
         class _RMSNorm(nn.Module):
             def __init__(self, d_model: int, eps: float = 1e-6) -> None:
@@ -197,7 +198,7 @@ def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
 
 
 __all__ = [
-    "secure_torch",
+    "patch_torch",
     "lazy_import",
     "has_fsdp2",
     "has_arrow_flight",

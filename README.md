@@ -1,17 +1,17 @@
-# STNet (PyTorch)
+# STNet-PyTorch
 
 ## Overview
 This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level workflow API for model construction, training, inference, and export utilities.
 
 ## Key components
-- **Configurable architecture** – `stformer.architecture.network.Config` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer.
+- **Configurable architecture** – `stnet.architecture.network.Config` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer.
 - **Data definition aliases** – `_normalize_data_definition` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Workflow facade** – `stformer.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+- **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
 2. Install PyTorch that matches your hardware (CUDA, ROCm, XPU, or CPU) by following the official [PyTorch instructions](https://pytorch.org/get-started/locally/).
-3. Install STNet and its dependencies:
+3. Install STNet-PyTorch and its dependencies:
    ```bash
    pip install -e .
    ```
@@ -23,7 +23,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 
 ## Quick start
 ```python
-from stformer.workflow import Config, new_model, save_model, load_model, train, predict, to_script
+from stnet.workflow import Config, new_model, save_model, load_model, train, predict, to_script
 
 config = Config(data_definition="spatiotemporal", depth=64, heads=4)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)

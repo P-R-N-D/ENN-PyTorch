@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import TypeAlias
@@ -5,9 +6,9 @@ from typing import TypeAlias
 import torch
 from torch import nn
 
-from ..toolkit.compat import SDPBackend, sdpa_kernel, secure_torch
+from ..toolkit.compat import SDPBackend, sdpa_kernel, patch_torch
 
-secure_torch()
+patch_torch()
 
 
 class StochasticDepth(nn.Module):

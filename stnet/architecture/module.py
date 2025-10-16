@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import math
@@ -10,11 +11,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
-from ..toolkit.compat import secure_torch
+from ..toolkit.compat import patch_torch
 from ..toolkit.optimization import GatedMultiScaleRetention, ScaledDotProductAttention
 from . import StochasticDepth, _norm, _stochastic_depth_scheduler
 
-secure_torch()
+patch_torch()
 
 
 if TYPE_CHECKING:
@@ -1062,7 +1063,14 @@ class TiledLoss(nn.Module):
 
 
 class GatedCrossAttention(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dropout: float = 0.0, norm_type: str = "layernorm", bias: bool = True):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        bias: bool = True,
+    ) -> None:
         super().__init__()
         assert d_model % nhead == 0
         self.d_model = d_model
@@ -1076,12 +1084,19 @@ class GatedCrossAttention(nn.Module):
         self.gate = nn.Parameter(torch.zeros(1))
         self.sdpa = ScaledDotProductAttention()
 
-    def forward(self, q: torch.Tensor, kv: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         B, Nq, D = q.shape
         qn = self.q_proj(self.norm_q(q))
         kv = self.kv_proj(kv)
         k, v = kv.chunk(2, dim=-1)
-        def split(x): return x.view(B, -1, self.nhead, self.head_dim).transpose(1, 2)
+        def split(x: torch.Tensor) -> torch.Tensor:
+            return x.view(B, -1, self.nhead, self.head_dim).transpose(1, 2)
+
         qh, kh, vh = split(qn), split(k), split(v)
         yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
