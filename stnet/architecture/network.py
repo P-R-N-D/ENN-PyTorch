@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 from math import prod
 
@@ -14,11 +14,11 @@ from torch import nn
 class PatchParameters:
     is_square: bool = False
     patch_size_1d: int = 16
-    grid_size_2d: Optional[int] = None
-    patch_size_2d: int = 4
+    grid_size_2d: Optional[Union[int, Tuple[int, int], List[int]]] = None
+    patch_size_2d: Union[int, Tuple[int, int], List[int]] = 4
     is_cube: bool = False
-    grid_size_3d: Optional[Tuple[int, int, int]] = None
-    patch_size_3d: Tuple[int, int, int] = (2, 2, 2)
+    grid_size_3d: Optional[Union[int, Tuple[int, int, int], List[int]]] = None
+    patch_size_3d: Union[int, Tuple[int, int, int], List[int]] = (2, 2, 2)
     dropout: float = 0.0
     use_padding: bool = True
 
@@ -49,6 +49,19 @@ from ..toolkit.optimization import Autocast, compile
 from ..toolkit.compat import patch_torch
 
 patch_torch()
+
+
+class LossWeightController(Protocol):
+    def weights(self) -> Tuple[float, float]:
+        ...
+
+    def update(
+        self,
+        top_loss: Optional[torch.Tensor],
+        bottom_loss: Optional[torch.Tensor],
+    ) -> None:
+        ...
+
 
 class Model(nn.Module):
     def __init__(
@@ -254,7 +267,9 @@ class Model(nn.Module):
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[Tuple[float, float]] = None,
+        loss_weights: Optional[
+            Union[Tuple[float, float], LossWeightController]
+        ] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         features = self._normalize_inputs(features)
@@ -320,8 +335,21 @@ class Model(nn.Module):
             y_hat_out = y_hat_z * sd + mu
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (global_loss is not None or local_loss is not None):
-            w_top, w_bot = (1.0, 0.0) if loss_weights is None else tuple(loss_weights)
+            controller: Optional[LossWeightController] = None
+            weights: Tuple[float, float]
+            if loss_weights is None:
+                weights = (1.0, 0.0)
+            elif isinstance(loss_weights, (tuple, list)):
+                seq = list(loss_weights)
+                if len(seq) != 2:
+                    raise ValueError("loss_weights requires two values")
+                weights = (float(seq[0]), float(seq[1]))
+            else:
+                controller = cast(LossWeightController, loss_weights)
+                weights = controller.weights()
             total = y_hat_out.new_tensor(0.0, dtype=y_hat_out.dtype)
+            top_component: Optional[torch.Tensor] = None
+            bottom_component: Optional[torch.Tensor] = None
             if self._loss_space == 'z' and self.has_valid_y_stats():
                 mu_lbl = self.y_mean.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 sd_lbl = self.y_std.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
@@ -332,9 +360,11 @@ class Model(nn.Module):
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
-                    total = total + w_top * global_loss(y_top, tgt_z)
+                    top_component = global_loss(y_top, tgt_z)
+                    total = total + weights[0] * top_component
                 if local_loss is not None:
-                    total = total + w_bot * local_loss(y_bot, tgt_z)
+                    bottom_component = local_loss(y_bot, tgt_z)
+                    total = total + weights[1] * bottom_component
             else:
                 tgt_y = labels_flat.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
                 y_top = y_hat_out
@@ -347,9 +377,13 @@ class Model(nn.Module):
                 else:
                     y_bot = assembled
                 if global_loss is not None:
-                    total = total + w_top * global_loss(y_top, tgt_y)
+                    top_component = global_loss(y_top, tgt_y)
+                    total = total + weights[0] * top_component
                 if local_loss is not None:
-                    total = total + w_bot * local_loss(y_bot, tgt_y)
+                    bottom_component = local_loss(y_bot, tgt_y)
+                    total = total + weights[1] * bottom_component
+            if controller is not None:
+                controller.update(top_component, bottom_component)
             loss_val = total
         elif net_loss is not None and labels_flat is not None:
             if is_cls_loss:

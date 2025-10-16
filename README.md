@@ -7,6 +7,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 - **Configurable architecture** – `stnet.architecture.network.Config` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer.
 - **Data definition aliases** – `_normalize_data_definition` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
 - **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+- **Architecture utilities** – `stnet.architecture.module` houses reusable building blocks including `StochasticDepth`, `_norm`, `_stochastic_depth_scheduler`, and the model definitions so dependents import everything from a single entry point.
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
@@ -19,7 +20,21 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[export]
    ```
-   Additional extras include `ao`, `gds`, `te`, `intel`, `ucx`, and `scale` as defined in `pyproject.toml`.
+   Additional extras include `ao`, `gds`, `te`, `intel`, `ucx`, `arrow_cuda`, and `scale` as defined in `pyproject.toml`.
+
+## Dependencies
+- `torch>=2.6`
+- `torchvision>=0.16`
+- `torchdata>=0.11`
+- `tensordict>=0.10.0`
+- `numpy>=1.24`
+- `pyarrow[flight]>=10`
+  - add `pyarrow[cuda]` (or install the `arrow_cuda` extra) when GPU-accelerated Arrow Flight is required
+- `pyzmq>=25`
+- `tqdm>=4.66`
+
+Optional extras listed in `pyproject.toml` cover exporter stacks (`export`), advanced optimization toolchains (`ao`, `te`, `scale`),
+vendor accelerators (`intel`, `ucx`), storage pipelines (`gds`), and Arrow GPU acceleration (`arrow_cuda`).
 
 ## Quick start
 ```python
@@ -49,4 +64,10 @@ The workflow helpers manage distributed checkpoints, mixed precision, exporter r
 Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `export` extra to enable the full conversion toolkit.
 
 ## License
-The project is distributed under a proprietary license as declared in `pyproject.toml`.
+**Code** is licensed under **PolyForm Noncommercial 1.0.0**
+(SPDX: `PolyForm-Noncommercial-1.0.0`). See `LICENSE`.
+
+**Model weights / datasets** (and other non-code artifacts) are provided
+under **CC BY-NC 4.0**. See the "Creative Commons Attribution-NonCommercial 4.0 International" section in `LICENSE`.
+
+Commercial use requires a separate license. Please contact the author.

@@ -11,7 +11,7 @@ from .optimization import (
     attention_flops_bshd,
 )
 from .preprocessing import IncrementalPCA, StandardScaler, VarianceThreshold
-from .capability import get_device
+from .capability import get_device, get_runtime_config, resolve_sdpa_backends
 
 __all__ = [
     "Autocast",
@@ -21,6 +21,8 @@ __all__ = [
     "attention_flops_bshd",
     "FlopCounter",
     "get_device",
+    "get_runtime_config",
+    "resolve_sdpa_backends",
     "patch_torch",
     "SDPBackend",
     "sdpa_kernel",
