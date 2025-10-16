@@ -28,6 +28,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 - `torchdata>=0.11`
 - `tensordict>=0.10.0`
 - `numpy>=1.24`
+- `netifaces>=0.11`
 - `pyarrow[flight]>=10`
   - add `pyarrow[cuda]` (or install the `arrow_cuda` extra) when GPU-accelerated Arrow Flight is required
 - `pyzmq>=25`
