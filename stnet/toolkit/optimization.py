@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import logging
 import math
 import os
 from dataclasses import dataclass, field
@@ -117,6 +118,7 @@ class _FlopBucket:
 
 _FLOP_BUCKET = _FlopBucket()
 _FLOP_TRACKING_DEPTH = 0
+_LOGGER = logging.getLogger(__name__)
 
 
 def _is_flop_tracking_active() -> bool:
@@ -683,14 +685,29 @@ def compile(
                 backend=backend,
             )
             return compiled if isinstance(compiled, nn.Module) else m
-        except TypeError:
+        except TypeError as exc:
+            _LOGGER.debug(
+                "module.compile signature mismatch for %s: %s",
+                m.__class__.__name__,
+                exc,
+                exc_info=True,
+            )
             try:
                 compiled = m_compile()
                 return compiled if isinstance(compiled, nn.Module) else m
-            except Exception:
-                pass
-        except Exception:
-            pass
+            except Exception as inner_exc:
+                _LOGGER.debug(
+                    "module.compile() without kwargs failed for %s: %s",
+                    m.__class__.__name__,
+                    inner_exc,
+                    exc_info=True,
+                )
+        except Exception as exc:
+            _LOGGER.warning(
+                "module.compile failed for %s; returning original module",
+                m.__class__.__name__,
+                exc_info=True,
+            )
     _compile = getattr(torch, "compile", None)
     if callable(_compile):
         try:
@@ -701,7 +718,12 @@ def compile(
                 dynamic=dynamic,
                 backend=backend,
             )
-        except Exception:
+        except Exception as exc:
+            _LOGGER.warning(
+                "torch.compile failed for %s; returning original module",
+                m.__class__.__name__,
+                exc_info=True,
+            )
             return m
     return m
 
