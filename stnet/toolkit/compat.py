@@ -30,8 +30,8 @@ except Exception:
         yield
 
 
-_TORCH_COMPAT: "TorchCompat | None" = None
-_ARROW_COMPAT: "ArrowCompat | None" = None
+_TORCH_COMPAT: TorchCompat | None = None
+_ARROW_COMPAT: ArrowCompat | None = None
 
 
 class TorchCompat:
@@ -64,7 +64,7 @@ class TorchCompat:
                 self.eps = float(eps)
                 self.weight = nn_mod.Parameter(torch_mod.ones(d_model))
 
-            def forward(self, x: torch_mod.Tensor) -> torch_mod.Tensor:  # type: ignore[attr-defined]
+            def forward(self, x: Any) -> Any:
                 inv_rms = (
                     x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
                 )
@@ -77,7 +77,7 @@ class TorchCompat:
             return
         torch_mod = self.module
 
-        def _fmin(a: torch_mod.Tensor, b: torch_mod.Tensor) -> torch_mod.Tensor:  # type: ignore[attr-defined]
+        def _fmin(a: Any, b: Any) -> Any:
             a, b = torch_mod.broadcast_tensors(a, b)
             a_nan = torch_mod.isnan(a)
             b_nan = torch_mod.isnan(b)
@@ -95,7 +95,7 @@ class TorchCompat:
         torch_mod = self.module
 
         def _nanmin(
-            x: torch_mod.Tensor,
+            x: Any,
             dim: int | None = None,
             keepdim: bool = False,
         ) -> Any:
@@ -114,7 +114,7 @@ class TorchCompat:
         torch_mod = self.module
 
         def _nanmax(
-            x: torch_mod.Tensor,
+            x: Any,
             dim: int | None = None,
             keepdim: bool = False,
         ) -> Any:
@@ -133,12 +133,12 @@ class TorchCompat:
         torch_mod = self.module
 
         def _nansum(
-            x: torch_mod.Tensor,
+            x: Any,
             dim: int | tuple[int, ...] | None = None,
             keepdim: bool = False,
             *,
-            dtype: torch_mod.dtype | None = None,  # type: ignore[attr-defined]
-        ) -> torch_mod.Tensor:  # type: ignore[attr-defined]
+            dtype: Any = None,
+        ) -> Any:
             target_dtype = dtype if dtype is not None else x.dtype
             x_cast = x.to(target_dtype)
             mask = torch_mod.isfinite(x_cast)
@@ -216,7 +216,7 @@ def patch_arrow(module: Any | None = None) -> ArrowCompat:
     if _ARROW_COMPAT is not None:
         return _ARROW_COMPAT
     if module is None:
-        import pyarrow as pa  # type: ignore
+        import pyarrow as pa
     else:
         pa = module
     try:
