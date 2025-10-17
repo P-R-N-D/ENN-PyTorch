@@ -11,6 +11,7 @@ import socket
 import sys
 import time
 import warnings
+from pathlib import Path
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -186,16 +187,84 @@ def _size(dtype: torch.dtype | str) -> int:
     return _SIZEOF[n]
 
 
+def _ensure_package_path() -> None:
+    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    project_root = os.path.dirname(pkg_root)
+    candidates = []
+    for path in (project_root, pkg_root):
+        if path and os.path.isdir(path):
+            if path not in sys.path:
+                sys.path.insert(0, path)
+            candidates.append(path)
+    if not candidates:
+        return
+    existing = os.environ.get("PYTHONPATH", "")
+    paths = [p for p in existing.split(os.pathsep) if p]
+    for path in candidates:
+        if path not in paths:
+            paths.insert(0, path)
+    os.environ["PYTHONPATH"] = os.pathsep.join(paths)
+
+
+def _has_loadable_main() -> bool:
+    main_mod = sys.modules.get("__main__")
+    if main_mod is None:
+        return False
+    main_path = getattr(main_mod, "__file__", None)
+    if not main_path:
+        return False
+    try:
+        main_path = os.fspath(main_path)
+    except TypeError:
+        return False
+    if main_path.startswith("<") and main_path.endswith(">"):
+        return False
+    return os.path.exists(main_path)
+
+
+def _register_python_path() -> None:
+    try:
+        package_dir = Path(__file__).resolve().parents[1]
+    except Exception:
+        return
+    project_dir = package_dir.parent
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for entry in (package_dir, project_dir):
+        try:
+            resolved = os.fspath(entry)
+        except TypeError:
+            continue
+        if not resolved:
+            continue
+        if not Path(resolved).exists():
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    if not candidates:
+        return
+    separator = os.pathsep
+    current = os.environ.get("PYTHONPATH", "")
+    paths = [path for path in current.split(separator) if path]
+    for candidate in candidates:
+        if candidate not in paths:
+            paths.insert(0, candidate)
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+    os.environ["PYTHONPATH"] = separator.join(paths)
+
+
 def _mp_env() -> None:
     try:
         mp.set_sharing_strategy("file_system")
     except RuntimeError:
         pass
-    start_method = (
-        "spawn"
-        if str(sys.platform).lower().startswith("win")
-        else "forkserver"
-    )
+    _ensure_package_path()
+    start_method = "spawn" if str(sys.platform).lower().startswith("win") else "forkserver"
+    if not _has_loadable_main():
+        start_method = "fork"
     for _mod in (multiprocessing, mp):
         try:
             _mod.set_start_method(start_method, force=True)
@@ -207,13 +276,11 @@ def _mp_env() -> None:
 
 def _start_method() -> str:
     cur = mp.get_start_method(allow_none=True)
-    return (
-        "spawn"
-        if str(sys.platform).lower().startswith("win")
-        else "forkserver"
-        if cur is None
-        else str(cur)
-    )
+    if cur is not None:
+        return str(cur)
+    if str(sys.platform).lower().startswith("win"):
+        return "spawn"
+    return "forkserver" if _has_loadable_main() else "fork"
 
 
 def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
@@ -509,6 +576,7 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Model:
+    _register_python_path()
     feats, labels, _, label_shape = _preprocess(data)
     mp.allow_connection_pickling()
     _mp_env()
@@ -818,6 +886,7 @@ def epochs(
         non_blocking_copy=bool(overlap_h2d),
         seed=seed,
         shuffle=True,
+        io_backend="flight",
     )
     train_steps = len(train_loader0)
     val_steps = len(val_loader0) if val_loader0 is not None else 0
@@ -939,42 +1008,41 @@ def epochs(
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
         flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-        train_loader, val_loader, keep = stream(
-            memmap_dir=memmap_dir,
-            device=device,
-            batch_size=batch_size,
-            val_frac=val_frac,
-            prefetch_factor=prefetch_factor,
-            non_blocking_copy=bool(overlap_h2d),
-            seed=seed,
-            shuffle=True,
-        )
-        ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
-        init_state_path = (
-            os.path.join(init_ckpt_dir, "dataloader.json")
-            if init_ckpt_dir
-            else None
-        )
-        dl_state_path: Optional[str] = None
-        if os.path.isfile(ckpt_state_path):
-            dl_state_path = ckpt_state_path
-        elif init_state_path and os.path.isfile(init_state_path):
-            dl_state_path = init_state_path
-        if dl_state_path:
-            try:
-                with open(dl_state_path, "r", encoding="utf-8") as _f:
-                    _dl = json.load(_f)
-            except (OSError, json.JSONDecodeError):
-                _dl = {}
-            state_train = _dl.get("train", {}) if isinstance(_dl, dict) else {}
-            state_val = _dl.get("val", {}) if isinstance(_dl, dict) else {}
+    train_loader, val_loader, keep = stream(
+        memmap_dir=memmap_dir,
+        device=device,
+        batch_size=batch_size,
+        val_frac=val_frac,
+        prefetch_factor=prefetch_factor,
+        non_blocking_copy=bool(overlap_h2d),
+        seed=seed,
+        shuffle=True,
+        io_backend="flight",
+    )
+    ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
+    init_state_path = (
+        os.path.join(init_ckpt_dir, "dataloader.json")
+        if init_ckpt_dir
+        else None
+    )
+    dl_state_path: Optional[str] = None
+    if os.path.isfile(ckpt_state_path):
+        dl_state_path = ckpt_state_path
+    elif init_state_path and os.path.isfile(init_state_path):
+        dl_state_path = init_state_path
+    if dl_state_path:
+        try:
+            with open(dl_state_path, "r", encoding="utf-8") as _f:
+                _dl = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            _dl = {}
+        state_train = _dl.get("train", {}) if isinstance(_dl, dict) else {}
+        state_val = _dl.get("val", {}) if isinstance(_dl, dict) else {}
+        with contextlib.suppress((RuntimeError, ValueError, TypeError)):
+            train_loader.load_state_dict(state_train)
+        if val_loader is not None:
             with contextlib.suppress((RuntimeError, ValueError, TypeError)):
-                train_loader.load_state_dict(state_train)
-            if val_loader is not None:
-                with contextlib.suppress(
-                    (RuntimeError, ValueError, TypeError)
-                ):
-                    val_loader.load_state_dict(state_val)
+                val_loader.load_state_dict(state_val)
         first_param = next(iter(model.parameters()), None)
         param_dtype = (
             first_param.dtype if first_param is not None else torch.float32
@@ -1342,6 +1410,7 @@ def predict(
     prefetch_factor: Optional[int] = 1,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
+    _register_python_path()
     _mp_env()
     tmp_dir = _new_dir("infer")
     dcp_dir = os.path.join(tmp_dir, "dcp")
@@ -1495,6 +1564,7 @@ def infer(
         non_blocking_copy=True,
         seed=seed,
         shuffle=False,
+        io_backend="flight",
     )
     status_bar = _status_bar("Prediction", len(train_loader), device)
     flop_counter = FlopCounter(model, mode="eval", device=device)

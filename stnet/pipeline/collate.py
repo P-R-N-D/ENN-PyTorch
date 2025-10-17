@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import socket
 import time
 import warnings
 from collections import deque
@@ -22,6 +23,7 @@ from typing import (
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torchdata.nodes import (
     IterableWrapper,
     ParallelMapper,
@@ -29,12 +31,13 @@ from torchdata.nodes import (
     Prefetcher,
 )
 
+from torch.distributed import distributed_c10d
+
 from ..connection.socket import ArrowFlight
 from ..toolkit.compat import patch_arrow
 from ..toolkit.capability import apply_threading_defaults
 from ..toolkit.optimization import DataLoader
 from .dataset import MemoryMappedTensorStream
-from .distributed import is_initialized
 
 
 _ARROW = patch_arrow()
@@ -51,6 +54,35 @@ def _world_info() -> Tuple[int, int, int, bool]:
         os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE", "1"))
     )
     return (rank, local_rank, world_size, world_size > 1)
+
+
+def _negotiate() -> Tuple[int, bool]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return (0, True)
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    hostname = socket.gethostname()
+    hosts: list[str] = ["" for _ in range(world)]
+    dist.all_gather_object(hosts, hostname)
+    peers = [index for index, value in enumerate(hosts) if value == hostname]
+    leader_rank = min(peers) if peers else rank
+    ordered = list(dict.fromkeys(sorted(hosts)))
+    node_id = ordered.index(hostname) if hostname in ordered else 0
+    return (node_id, rank == leader_rank)
+
+
+def _new_flight(split: str, name: str, uri: str) -> Tuple[str, str]:
+    if not (dist.is_available() and dist.is_initialized()):
+        return (name, uri)
+    node_id, is_leader = _negotiate()
+    store = distributed_c10d._get_default_store()
+    key = f"flight/endpoints/{node_id}/{split}".encode("utf-8")
+    if is_leader:
+        store.set(key, f"{name}|{uri}".encode("utf-8"))
+    dist.barrier()
+    value = store.get(key).decode("utf-8")
+    published_name, published_uri = value.split("|", 1)
+    return (published_name, published_uri)
 
 
 class H2DController(Iterator[Any]):
@@ -692,8 +724,9 @@ def stream(
             host = "0.0.0.0"
             if not is_ddp:
                 host = "127.0.0.1"
+            uri_value = ""
             if not is_ddp or local_rank == 0:
-                server, uri = ArrowFlight.start_server_standby(
+                server, uri_value = ArrowFlight.start_server_standby(
                     host=host, port=0
                 )
                 keep.add(server)
@@ -704,21 +737,25 @@ def stream(
                     ArrowFlight.reg_mmt_dataset(
                         server, name_val, reader_vl, int(batch_size), "val"
                     )
-                if is_initialized():
-                    ArrowFlight.MQ.publish(
-                        ArrowFlight.server_key(node_id), uri
-                    )
-                uri0 = uri
-            else:
-                uri0 = ArrowFlight.MQ.wait(
-                    ArrowFlight.server_key(node_id), timeout_s=120.0
+                name_train, uri_value = _new_flight(
+                    "train", name_train, uri_value
                 )
-            client = ArrowFlight.Client(uri0)
+                if reader_vl is not None:
+                    name_val, uri_value = _new_flight(
+                        "val", name_val, uri_value
+                    )
+            else:
+                name_train, uri_value = _new_flight("train", name_train, "")
+                if reader_vl is not None:
+                    name_val, uri_value = _new_flight(
+                        "val", name_val, uri_value
+                    )
+            client = ArrowFlight.Client(uri_value)
             keep.add(client)
             label_shape = list(meta.get("label_shape", []))
 
             def _iter(name: str) -> Iterator[Dict[str, torch.Tensor]]:
-                reader = client.reader(name)
+                reader = client.reader(name, timeout_s=120.0)
                 for record_batch in reader:
                     batch_size_rb = int(
                         getattr(record_batch, "num_rows", 0)
