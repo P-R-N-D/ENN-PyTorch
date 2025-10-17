@@ -7,8 +7,8 @@ import time
 from typing import Any, Iterator, Optional, Tuple
 
 import pyarrow as pa
-import pyarrow.flight as flight
 import torch.distributed as dist
+from pyarrow import flight
 
 from ..pipeline.dataset import MemoryMappedTensorStream
 
