@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import math
 import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -51,6 +49,7 @@ def resolve_sdpa_backends() -> List[object]:
             backends.append(getattr(SDPBackend, key))
     return backends
 
+
 def is_cpu_bf16_supported() -> bool:
     try:
         mkldnn_ops = getattr(torch.ops, "mkldnn", None)
@@ -61,6 +60,7 @@ def is_cpu_bf16_supported() -> bool:
     except Exception:
         pass
     return False
+
 
 def is_cuda_bf16_supported() -> bool:
     try:
@@ -75,6 +75,7 @@ def is_cuda_bf16_supported() -> bool:
         return major >= 8
     except Exception:
         return False
+
 
 def get_device(
     *args: Any,
@@ -93,31 +94,31 @@ def get_device(
     allow_val = (
         bool(allow_tf32)
         if allow_tf32 is not None
-        else (
-            bool(cfg.allow_tf32)
-            if cfg.allow_tf32 is not None and deterministic is None
-            else (False if det_flag else True)
-        )
+        else bool(cfg.allow_tf32)
+        if cfg.allow_tf32 is not None and deterministic is None
+        else False
+        if det_flag
+        else True
     )
     cfg.allow_tf32 = allow_val
     benchmark_val = (
         bool(cudnn_benchmark)
         if cudnn_benchmark is not None
-        else (
-            bool(cfg.cudnn_benchmark)
-            if cfg.cudnn_benchmark is not None and deterministic is None
-            else (False if det_flag else True)
-        )
+        else bool(cfg.cudnn_benchmark)
+        if cfg.cudnn_benchmark is not None and deterministic is None
+        else False
+        if det_flag
+        else True
     )
     cfg.cudnn_benchmark = benchmark_val
     precision_val = (
         str(matmul_precision)
         if matmul_precision is not None
-        else (
-            str(cfg.matmul_precision)
-            if cfg.matmul_precision is not None and deterministic is None
-            else ('highest' if det_flag else 'high')
-        )
+        else str(cfg.matmul_precision)
+        if cfg.matmul_precision is not None and deterministic is None
+        else "highest"
+        if det_flag
+        else "high"
     )
     cfg.matmul_precision = precision_val
     if sdpa_backends is not None:
@@ -125,7 +126,7 @@ def get_device(
     if te_first is not None:
         cfg.te_first = bool(te_first)
     if torch.cuda.is_available():
-        device = torch.device('cuda')
+        device = torch.device("cuda")
         torch.backends.cudnn.deterministic = cfg.deterministic
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:
@@ -136,33 +137,31 @@ def get_device(
             torch.set_float32_matmul_precision(str(cfg.matmul_precision))
         except Exception:
             pass
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = torch.device('mps')
-    elif hasattr(torch, 'is_vulkan_available') and torch.is_vulkan_available():
-        device = torch.device('vulkan')
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
+        device = torch.device("vulkan")
     else:
-        device = torch.device('cpu')
+        device = torch.device("cpu")
     return device
 
+
 def optimizer_flags(
-    device: torch.device,
-    use_foreach: Optional[bool],
-    use_fused: bool,
+    device: torch.device, use_foreach: Optional[bool], use_fused: bool
 ) -> Dict[str, bool]:
     devt = device.type
     flags: Dict[str, bool] = {}
     flags["foreach"] = (
-        devt in {"cuda", "xpu"}
-        if use_foreach is None
-        else bool(use_foreach)
+        devt in {"cuda", "xpu"} if use_foreach is None else bool(use_foreach)
     )
     if use_fused and devt in {"cuda", "xpu"}:
         flags["fused"] = True
         flags["foreach"] = False
     return flags
 
+
 def _is_cuda_cc_equal_or_over_90(
-    device: Optional[Union[torch.device, str]] = None,
+    device: Optional[Union[torch.device, str]] = None
 ) -> Tuple[bool, str]:
     dev = torch.device(device) if device is not None else get_device()
     if dev.type != "cuda" or not torch.cuda.is_available():
@@ -171,8 +170,9 @@ def _is_cuda_cc_equal_or_over_90(
     ok = major >= 9
     return (ok, f"sm_{major}{minor}")
 
+
 def is_float8_supported(
-    device: Optional[Union[torch.device, str]] = None,
+    device: Optional[Union[torch.device, str]] = None
 ) -> Tuple[bool, str]:
     dev = torch.device(device) if device is not None else get_device()
     ok_cc, cc = _is_cuda_cc_equal_or_over_90(dev)
@@ -180,23 +180,24 @@ def is_float8_supported(
         return (False, f"FP8 requires sm_90+ (found {dev.type}, cc={cc})")
     try:
         import transformer_engine.pytorch as te
+
         backend = getattr(te, "__name__", "transformer_engine.pytorch")
         return (True, backend)
     except Exception:
         return (False, "transformer_engine not found")
 
+
 def optimal_procs() -> dict:
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    return {
-        "nproc_per_node": (n_gpu or 1),
-        "device": ("cuda" if n_gpu else "cpu"),
-    }
+    return {"nproc_per_node": n_gpu or 1, "device": "cuda" if n_gpu else "cpu"}
+
 
 def _cpu_count() -> int:
     try:
         return len(os.sched_getaffinity(0))
     except Exception:
         return os.cpu_count() or 1
+
 
 def optimal_threads() -> dict:
     n_cpu = _cpu_count()
@@ -215,6 +216,7 @@ def optimal_threads() -> dict:
         "prefetch_factor": 2,
         "pin_memory": bool(n_gpu > 0),
     }
+
 
 def apply_threading_defaults() -> dict:
     threads = optimal_threads()

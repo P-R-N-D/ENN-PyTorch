@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -14,10 +13,13 @@ from ..connection.socket import ArrowFlight
 try:
     from ..connection.socket import FlightModule
 except ImportError:
+
     class FlightModule:
         @staticmethod
-        def connect(*_args: Any, **_kwargs: Any) -> None:
-            raise RuntimeError("Arrow Flight module is unavailable")
+        def connect(*args: Any, **kwargs: Any) -> None:
+            details = " with args/kwargs" if args or kwargs else ""
+            raise RuntimeError(f"Arrow Flight module is unavailable{details}.")
+
 
 GRPC_DEFAULT_PORT = 5005
 
@@ -73,7 +75,11 @@ def get_available_port() -> int:
 
 
 def _local_rank() -> int:
-    env_keys = ["LOCAL_RANK", "OMPI_COMM_WORLD_LOCAL_RANK", "MV2_COMM_WORLD_LOCAL_RANK"]
+    env_keys = [
+        "LOCAL_RANK",
+        "OMPI_COMM_WORLD_LOCAL_RANK",
+        "MV2_COMM_WORLD_LOCAL_RANK",
+    ]
     for key in env_keys:
         value = os.environ.get(key)
         if value is None:
@@ -106,7 +112,9 @@ def _gather_all(obj: Any) -> List[Any]:
     return buffer
 
 
-def _mq_addr(kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any) -> str:
+def _mq_addr(
+    kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any
+) -> str:
     os.makedirs(base_path, exist_ok=True)
     return f"ipc://{base_path}/stf_{_hostname()}_{kind}.ipc"
 
@@ -127,7 +135,9 @@ class MessageQueueConfig:
             try:
                 import zmq
             except Exception as exc:
-                raise RuntimeError("pyzmq is required. Install it with `pip install pyzmq`.") from exc
+                raise RuntimeError(
+                    "pyzmq is required. Install it with `pip install pyzmq`."
+                ) from exc
         self._zmq = zmq.Context.instance()
         up_addr = _mq_addr("up")
         down_addr = _mq_addr("down")
@@ -154,7 +164,13 @@ class MessageQueueConfig:
         frame = self._pull.recv(flags=flags, copy=False)
         return frame.buffer
 
-    def pub_down(self, payload: bytes | memoryview, *args: Any, topic: bytes = b"", **kwargs: Any) -> None:
+    def pub_down(
+        self,
+        payload: bytes | memoryview,
+        *args: Any,
+        topic: bytes = b"",
+        **kwargs: Any,
+    ) -> None:
         if self.local_rank != 0 or self._pub is None:
             raise RuntimeError("only leader can pub_down")
         if not isinstance(payload, (bytes, bytearray, memoryview)):
@@ -167,7 +183,7 @@ class MessageQueueConfig:
         frames = self._sub.recv_multipart(flags=flags, copy=False)
         topic_bytes = bytes(frames[0])
         payload_mv = frames[1].buffer
-        return topic_bytes, payload_mv
+        return (topic_bytes, payload_mv)
 
 
 class IOController:
@@ -186,7 +202,12 @@ class IOController:
 
     def start(self) -> IOController:
         infos = _gather_all(
-            {"rank": self.rank, "host": _hostname(), "local_rank": self.local_rank, "ip": self._my_ip}
+            {
+                "rank": self.rank,
+                "host": _hostname(),
+                "local_rank": self.local_rank,
+                "ip": self._my_ip,
+            }
         )
         per_host: Dict[str, List[Dict[str, Any]]] = {}
         for info in infos:
@@ -194,11 +215,16 @@ class IOController:
             per_host.setdefault(host, []).append(info)
         leaders: Dict[str, Dict[str, Any]] = {}
         for host, entries in per_host.items():
-            leader = next((item for item in entries if item["local_rank"] == 0), sorted(entries, key=lambda val: val["rank"])[0])
+            leader = next(
+                (item for item in entries if item["local_rank"] == 0),
+                sorted(entries, key=lambda val: val["rank"])[0],
+            )
             leaders[host] = leader
         self._leaders = leaders
         if self.is_node_leader:
-            self._server = ArrowFlight(location=f"grpc+tcp://0.0.0.0:{self._flight_port}", datasets={})
+            self._server = ArrowFlight(
+                location=f"grpc+tcp://0.0.0.0:{self._flight_port}", datasets={}
+            )
             for host, info in leaders.items():
                 if host == _hostname():
                     continue
@@ -219,7 +245,13 @@ class IOController:
             raise RuntimeError("non-leader cannot pull_local_up")
         return self._mq.recv_up(flags=flags)
 
-    def broadcast_down(self, payload: bytes | memoryview, *args: Any, topic: bytes = b"", **kwargs: Any) -> None:
+    def broadcast_down(
+        self,
+        payload: bytes | memoryview,
+        *args: Any,
+        topic: bytes = b"",
+        **kwargs: Any,
+    ) -> None:
         if not self.is_node_leader:
             raise RuntimeError("non-leader cannot broadcast_down")
         self._mq.pub_down(payload, topic=topic)

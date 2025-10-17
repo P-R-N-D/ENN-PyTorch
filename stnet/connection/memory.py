@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
-
-from typing import Any, Iterator, Optional
 
 import contextlib
 import mmap
 import os
+from typing import Any, Iterator, Optional
 
 import numpy as np
 
@@ -15,12 +13,10 @@ try:
 except Exception:
     pa = None
     pa_cuda = None
-
 try:
     from multiprocessing import shared_memory
 except Exception:
     shared_memory = None
-
 try:
     import kvikio
 except Exception:
@@ -28,7 +24,14 @@ except Exception:
 
 
 class MemoryMap:
-    def __init__(self, path: str, size: int, *args: Any, access: int = mmap.ACCESS_WRITE, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        path: str,
+        size: int,
+        *args: Any,
+        access: int = mmap.ACCESS_WRITE,
+        **kwargs: Any,
+    ) -> None:
         size = int(size)
         if size <= 0:
             raise ValueError("size must be > 0")
@@ -75,22 +78,37 @@ class MemoryMap:
     def __enter__(self) -> mmap.mmap:
         return self.open()
 
-    def __exit__(self, *exc_info: Any) -> None:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if exc_type or exc or tb:
+            pass
         self.close()
 
     def to_arrow_buffer(self) -> "pa.Buffer":
         if pa is None:
-            raise RuntimeError("pyarrow is required for converting to Arrow buffers")
+            raise RuntimeError(
+                "pyarrow is required for converting to Arrow buffers"
+            )
         if self._mmap is None:
             raise RuntimeError("call open() first")
         return pa.py_buffer(memoryview(self._mmap))
 
 
 class SharedMemory:
-    def __init__(self, name: str, size: int, *args: Any, create: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        name: str,
+        size: int,
+        *args: Any,
+        create: bool = False,
+        **kwargs: Any,
+    ) -> None:
         if shared_memory is None:
-            raise RuntimeError("multiprocessing.shared_memory is not available on this platform")
-        self._shm = shared_memory.SharedMemory(name=name, create=create, size=size)
+            raise RuntimeError(
+                "multiprocessing.shared_memory is not available on this platform"
+            )
+        self._shm = shared_memory.SharedMemory(
+            name=name, create=create, size=size
+        )
         self.name: str = self._shm.name
         self.size: int = self._shm.size
 
@@ -108,7 +126,9 @@ class SharedMemory:
 class CudaIpc:
     def __init__(self) -> None:
         if pa_cuda is None or pa is None:
-            raise RuntimeError("pyarrow with CUDA support is required (see Arrow CUDA docs)")
+            raise RuntimeError(
+                "pyarrow with CUDA support is required (see Arrow CUDA docs)"
+            )
 
     def export_handle(self, buf: "pa_cuda.CudaBuffer") -> bytes:
         handle = buf.export_for_ipc()
@@ -141,7 +161,9 @@ class Ucxx:
             self._backend = "ucx-py"
             self._module = backend
         except Exception as exc:
-            raise RuntimeError("Neither 'ucxx' nor 'ucx-py' is installed") from exc
+            raise RuntimeError(
+                "Neither 'ucxx' nor 'ucx-py' is installed"
+            ) from exc
 
     async def local_echo(self, payload: bytes) -> bytes:
         if self._backend == "ucxx":
@@ -158,7 +180,6 @@ class Ucxx:
                 return bytes(rx)
             except Exception:
                 pass
-
         if self._backend == "ucx-py":
             try:
                 ucp = self._module
@@ -187,5 +208,7 @@ class GpuDirectStorage:
         if CuFile is None:
             CuFile = getattr(getattr(kvikio, "cufile", None), "CuFile", None)
         if CuFile is None:
-            raise RuntimeError("kvikio.CuFile is not available in this KvikIO version")
+            raise RuntimeError(
+                "kvikio.CuFile is not available in this KvikIO version"
+            )
         return CuFile(self.path, self.mode)

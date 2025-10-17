@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
 from math import prod
-from typing import Any, List, Optional, Sequence, Tuple, TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +11,10 @@ from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
 from ..toolkit.compat import patch_torch
-from ..toolkit.optimization import GatedMultiScaleRetention, ScaledDotProductAttention
+from ..toolkit.optimization import (
+    GatedMultiScaleRetention,
+    ScaledDotProductAttention,
+)
 
 
 class StochasticDepth(nn.Module):
@@ -56,14 +58,15 @@ def _stochastic_depth_scheduler(max_rate: float, depth: int) -> list[float]:
     step = float(max_rate) / max(1, depth)
     return [step * float(index + 1) for index in range(depth)]
 
+
 patch_torch()
-
-
 if TYPE_CHECKING:
     from .network import Config
 
 
-def _canon_dims(x: torch.Tensor, dims: Any, keep_batch: bool = False) -> Tuple[int, ...]:
+def _canon_dims(
+    x: torch.Tensor, dims: Any, keep_batch: bool = False
+) -> Tuple[int, ...]:
     nd = x.ndim
     if dims is None:
         return tuple(range(1, nd)) if nd > 1 else (0,)
@@ -102,10 +105,7 @@ def _normalize_data_definition(value: Any) -> str:
 
 
 def _stable_std(
-    x: torch.Tensor,
-    dim: Tuple[int, ...] | int | None,
-    ddof: int,
-    eps: float,
+    x: torch.Tensor, dim: Tuple[int, ...] | int | None, ddof: int, eps: float
 ) -> torch.Tensor:
     if dim is None:
         dim_tuple: Tuple[int, ...] = tuple()
@@ -113,7 +113,7 @@ def _stable_std(
         dim_tuple = (dim,)
     else:
         dim_tuple = tuple(dim)
-    dims = tuple(d if d >= 0 else x.dim() + d for d in dim_tuple)
+    dims = tuple((d if d >= 0 else x.dim() + d for d in dim_tuple))
     sample = 1
     for d in dims:
         if 0 <= d < x.dim():
@@ -126,25 +126,22 @@ def _stable_std(
         var = torch.var(x, dim=dim_tuple, correction=correction, keepdim=True)
         std = torch.sqrt(torch.clamp(var, min=eps * eps))
     except TypeError:
-        std = torch.std(x, dim=dim_tuple, unbiased=correction == 1, keepdim=True)
+        std = torch.std(
+            x, dim=dim_tuple, unbiased=correction == 1, keepdim=True
+        )
         std = torch.clamp(std, min=eps)
     return std
 
 
 def _normal_cdf_loc_scale(
-    x: torch.Tensor,
-    loc: torch.Tensor,
-    scale: torch.Tensor,
+    x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
 
 def _student_t_cdf_loc_scale(
-    x: torch.Tensor,
-    df: torch.Tensor,
-    loc: torch.Tensor,
-    scale: torch.Tensor,
+    x: torch.Tensor, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     t = (x - loc) / torch.clamp(scale, min=1e-12)
     v = df.to(dtype=t.dtype, device=t.device)
@@ -160,6 +157,327 @@ def _student_t_cdf_loc_scale(
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
 
+class _ScalerBase:
+    def __init__(self, *, device: str = "cpu", dtype: Any = torch.float64) -> None:
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.reset()
+
+    def reset(self) -> None:
+        raise NotImplementedError
+
+    def _prepare(self, X: Tensor) -> Tensor:
+        return X.to(self.device, self.dtype)
+
+
+class VarianceThreshold(_ScalerBase):
+    def __init__(
+        self, threshold: float = 0.0, unbiased: bool = True, **kwargs: Any
+    ) -> None:
+        super().__init__(**kwargs)
+        self.threshold = float(threshold)
+        self.unbiased = bool(unbiased)
+
+    def reset(self) -> None:
+        self.n = 0
+        self.mean: Tensor | None = None
+        self.M2: Tensor | None = None
+
+    @torch.no_grad()
+    def partial_fit(self, X: Tensor) -> VarianceThreshold:
+        X = self._prepare(X)
+        if X.numel() == 0:
+            return self
+        b, _ = X.shape
+        batch_mean = X.mean(dim=0)
+        Xc = X - batch_mean
+        batch_M2 = (Xc * Xc).sum(dim=0)
+        if self.n == 0:
+            self.mean, self.M2, self.n = (batch_mean, batch_M2, b)
+        else:
+            if self.mean is None or self.M2 is None:
+                raise RuntimeError("VarianceThreshold state corrupted")
+            delta = batch_mean - self.mean
+            n = self.n + b
+            self.mean = self.mean + delta * (b / n)
+            self.M2 = self.M2 + batch_M2 + delta * delta * (self.n * b / n)
+            self.n = n
+        return self
+
+    @torch.no_grad()
+    def finalize(self) -> VarianceThreshold:
+        if self.n <= 1 or self.M2 is None:
+            raise ValueError("Not enough samples to estimate variance.")
+        denom = self.n - 1 if self.unbiased else self.n
+        self.variances_ = self.M2 / denom
+        self.feature_mask_ = self.variances_ > self.threshold
+        self.n_features_in_ = int(self.variances_.numel())
+        self.n_features_out_ = int(self.feature_mask_.sum().item())
+        return self
+
+    @torch.no_grad()
+    def transform(self, X: Tensor) -> Tensor:
+        if not hasattr(self, "feature_mask_"):
+            raise RuntimeError("Call finalize() before transform().")
+        return X[..., self.feature_mask_.to(X.device)]
+
+
+class StandardScaler(_ScalerBase):
+    def __init__(
+        self,
+        *,
+        with_mean: bool = True,
+        with_std: bool = True,
+        eps: float = 1e-08,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.with_mean = bool(with_mean)
+        self.with_std = bool(with_std)
+        self.eps = float(eps)
+
+    def reset(self) -> None:
+        self.n = 0
+        self.mean: Tensor | None = None
+        self.M2: Tensor | None = None
+        self.var_: Tensor | None = None
+        self.mean_: Tensor | None = None
+        self.scale_: Tensor | None = None
+        self.min: Tensor | None = None
+        self.max: Tensor | None = None
+        self.min_: Tensor | None = None
+        self.max_: Tensor | None = None
+
+    @torch.no_grad()
+    def partial_fit(self, X: Tensor) -> StandardScaler:
+        X = self._prepare(X)
+        if X.numel() == 0:
+            return self
+        b, _ = X.shape
+        batch_mean = X.mean(dim=0)
+        Xc = X - batch_mean
+        batch_M2 = (Xc * Xc).sum(dim=0)
+        _min_res = torch.nanmin(X, dim=0)
+        _max_res = torch.nanmax(X, dim=0)
+        bmin = getattr(
+            _min_res,
+            "values",
+            _min_res[0] if isinstance(_min_res, (tuple, list)) else _min_res,
+        )
+        bmax = getattr(
+            _max_res,
+            "values",
+            _max_res[0] if isinstance(_max_res, (tuple, list)) else _max_res,
+        )
+        if self.n == 0:
+            self.mean, self.M2, self.n = (batch_mean, batch_M2, b)
+            self.min, self.max = (bmin, bmax)
+        else:
+            if self.mean is None or self.M2 is None:
+                raise RuntimeError("StandardScaler state corrupted")
+            delta = batch_mean - self.mean
+            n = self.n + b
+            self.mean = self.mean + delta * (b / n)
+            self.M2 = self.M2 + batch_M2 + delta * delta * (self.n * b / n)
+            self.n = n
+            self.min = (
+                torch.minimum(self.min, bmin) if self.min is not None else bmin
+            )
+            self.max = (
+                torch.maximum(self.max, bmax) if self.max is not None else bmax
+            )
+        return self
+
+    @torch.no_grad()
+    def finalize(self) -> StandardScaler:
+        if self.n <= 1 or self.M2 is None or self.mean is None:
+            raise ValueError("Not enough samples to estimate variance.")
+        denom = self.n - 1
+        var = self.M2 / denom
+        self.mean_ = (
+            self.mean.clone() if self.with_mean else torch.zeros_like(var)
+        )
+        if self.with_std:
+            scale = torch.sqrt(torch.clamp(var, min=0.0))
+            scale[scale < self.eps] = 1.0
+            self.scale_ = scale
+        else:
+            self.scale_ = torch.ones_like(var)
+        self.var_ = var
+        self.min_ = (
+            self.min.clone()
+            if self.min is not None
+            else torch.full_like(var, float("nan"))
+        )
+        self.max_ = (
+            self.max.clone()
+            if self.max is not None
+            else torch.full_like(var, float("nan"))
+        )
+        return self
+
+    @torch.no_grad()
+    def transform(
+        self, X: Tensor, *, clip: bool = False, clip_sigma: float | None = None
+    ) -> Tensor:
+        if self.mean_ is None or self.scale_ is None:
+            raise RuntimeError("Call finalize() before transform().")
+        mu = self.mean_.to(X.device, X.dtype)
+        sc = self.scale_.to(X.device, X.dtype)
+        Z = (X - mu) / sc
+        if clip:
+            if clip_sigma is not None and clip_sigma > 0:
+                zmin = torch.full_like(Z, -float(clip_sigma))
+                zmax = torch.full_like(Z, float(clip_sigma))
+            else:
+                mn = (
+                    self.min_.to(X.device, X.dtype)
+                    if self.min_ is not None
+                    else None
+                )
+                mx = (
+                    self.max_.to(X.device, X.dtype)
+                    if self.max_ is not None
+                    else None
+                )
+                if mn is not None and mx is not None:
+                    zmin = (mn - mu) / sc
+                    zmax = (mx - mu) / sc
+                else:
+                    zmin = None
+                    zmax = None
+            if zmin is not None and zmax is not None:
+                Z = torch.maximum(Z, zmin.expand_as(Z))
+                Z = torch.minimum(Z, zmax.expand_as(Z))
+        return Z
+
+    @torch.no_grad()
+    def inverse_transform(self, X: Tensor) -> Tensor:
+        if self.mean_ is None or self.scale_ is None:
+            raise RuntimeError("Call finalize() before inverse_transform().")
+        mu = self.mean_.to(X.device, X.dtype)
+        sc = self.scale_.to(X.device, X.dtype)
+        return X * sc + mu
+
+
+class IncrementalPCA(_ScalerBase):
+    def __init__(
+        self,
+        n_components: int,
+        *,
+        method: str = "cov",
+        center: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.n_components = int(n_components)
+        self.method = str(method)
+        self.center = bool(center)
+        if self.n_components <= 0:
+            raise ValueError("n_components must be positive")
+        self._components: Tensor | None = None
+        self._mean: Tensor | None = None
+        self._eigvals: Tensor | None = None
+
+    def reset(self) -> None:
+        self._components = None
+        self._mean = None
+        self._eigvals = None
+        self._count = 0
+
+    @torch.no_grad()
+    def partial_fit(self, X: Tensor) -> IncrementalPCA:
+        X = self._prepare(X)
+        if X.numel() == 0:
+            return self
+        if self.method == "cov":
+            return self._partial_fit_cov(X)
+        if self.method == "oja":
+            return self._partial_fit_oja(X)
+        raise ValueError(f"Unsupported method: {self.method}")
+
+    def _partial_fit_cov(self, X: Tensor) -> IncrementalPCA:
+        if self.center:
+            batch_mean = X.mean(dim=0, keepdim=True)
+            Xc = X - batch_mean
+        else:
+            batch_mean = torch.zeros(
+                1, X.shape[1], device=X.device, dtype=X.dtype
+            )
+            Xc = X
+        denom = max(1, X.shape[0] - (1 if self.center else 0))
+        cov = Xc.T @ Xc / denom
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        top_vals = eigvals.flip(0)[: self.n_components]
+        top_vecs = eigvecs.flip(1)[:, : self.n_components]
+        if self._components is None:
+            self._components = top_vecs.to(self.device, self.dtype)
+            self._eigvals = top_vals.to(self.device, self.dtype)
+            self._mean = (
+                batch_mean.mean(dim=0)
+                if self.center
+                else torch.zeros_like(top_vals)
+            )
+        else:
+            stacked = torch.cat(
+                [self._components, top_vecs.to(self.device, self.dtype)], dim=1
+            )
+            q, _ = torch.linalg.qr(stacked, mode="reduced")
+            self._components = q[:, : self.n_components]
+            self._eigvals = top_vals.to(self.device, self.dtype)
+            if self.center and self._mean is not None:
+                total = self._count + X.shape[0]
+                self._mean = (
+                    self._mean * self._count + batch_mean.sum(dim=0)
+                ) / total
+        self._count += X.shape[0]
+        return self
+
+    def _partial_fit_oja(self, X: Tensor) -> IncrementalPCA:
+        if self._components is None:
+            dim = X.shape[1]
+            comps = torch.randn(
+                dim, self.n_components, device=X.device, dtype=X.dtype
+            )
+            comps = torch.linalg.qr(comps).Q
+            self._components = comps.to(self.device, self.dtype)
+            self._eigvals = torch.zeros(
+                self.n_components, device=self.device, dtype=self.dtype
+            )
+            self._mean = torch.zeros(dim, device=self.device, dtype=self.dtype)
+        eta0 = 1.0
+        for t, x in enumerate(X, start=1 + self._count):
+            if self.center and self._mean is not None:
+                self._mean = (self._mean * (t - 1) + x) / t
+                x = x - self._mean
+            eta = eta0 / float(t)
+            for i in range(self.n_components):
+                w = self._components[:, i]
+                proj = torch.dot(w, x)
+                update = w + eta * proj * (x - proj * w)
+                self._components[:, i] = F.normalize(update, dim=0)
+                self._eigvals[i] = (1 - eta) * self._eigvals[
+                    i
+                ] + eta * proj * proj
+        self._count += X.shape[0]
+        return self
+
+    @torch.no_grad()
+    def finalize(self) -> IncrementalPCA:
+        if self._components is None:
+            raise RuntimeError("Call partial_fit() before finalize().")
+        return self
+
+    @torch.no_grad()
+    def transform(self, X: Tensor) -> Tensor:
+        if self._components is None:
+            raise RuntimeError("Call finalize() before transform().")
+        centered = X.to(self.device, self.dtype)
+        if self.center and self._mean is not None:
+            centered = centered - self._mean
+        return centered @ self._components
+
+
 class PatchEmbedding(nn.Module):
     def __init__(
         self,
@@ -173,7 +491,7 @@ class PatchEmbedding(nn.Module):
         grid_3d: Optional[Tuple[int, int, int]] = None,
         dropout: float = 0.0,
         pad_to_multiple: bool = True,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         if ndim not in (1, 2, 3):
@@ -183,12 +501,19 @@ class PatchEmbedding(nn.Module):
         self.grid_3d = grid_3d
         if any((p <= 0 for p in patch)):
             raise ValueError(f"patch sizes must be positive, got {patch}")
-        if stride is not None and (len(stride) < self.ndim or any((s <= 0 for s in stride[: self.ndim]))):
-            raise ValueError(f"stride must have length >= {self.ndim} with positive values, got {stride}")
+        if stride is not None and (
+            len(stride) < self.ndim
+            or any((s <= 0 for s in stride[: self.ndim]))
+        ):
+            raise ValueError(
+                f"stride must have length >= {self.ndim} with positive values, got {stride}"
+            )
         match self.ndim:
             case 1:
                 if grid is not None and len(grid) not in (0, 1):
-                    raise ValueError(f"1D grid must be None or (S,), got {grid}")
+                    raise ValueError(
+                        f"1D grid must be None or (S,), got {grid}"
+                    )
             case 2:
                 if grid is not None and len(grid) != 2:
                     raise ValueError(f"2D grid must be (H,W), got {grid}")
@@ -202,10 +527,18 @@ class PatchEmbedding(nn.Module):
         stride = patch if stride is None else stride
         match self.ndim:
             case 1:
-                self.proj = nn.Conv1d(in_channels, d_model, kernel_size=(patch[0],), stride=(stride[0],))
+                self.proj = nn.Conv1d(
+                    in_channels,
+                    d_model,
+                    kernel_size=(patch[0],),
+                    stride=(stride[0],),
+                )
             case 2:
                 self.proj = nn.Conv2d(
-                    in_channels, d_model, kernel_size=(patch[0], patch[1]), stride=(stride[0], stride[1])
+                    in_channels,
+                    d_model,
+                    kernel_size=(patch[0], patch[1]),
+                    stride=(stride[0], stride[1]),
                 )
             case 3:
                 self.proj = nn.Conv3d(
@@ -231,7 +564,9 @@ class PatchEmbedding(nn.Module):
                     if fdim < l:
                         x = torch.nn.functional.pad(x, (0, l - fdim))
                     elif fdim > l:
-                        raise ValueError(f"[B,F] grid(L={l}) but F={fdim} > L.")
+                        raise ValueError(
+                            f"[B,F] grid(L={l}) but F={fdim} > L."
+                        )
                     return x.view(b, 1, l)
                 case 2:
                     if self.grid is None:
@@ -241,7 +576,9 @@ class PatchEmbedding(nn.Module):
                         h, w = self.grid
                         need_hw = h * w
                         if fdim > need_hw:
-                            raise ValueError(f"[B,F] grid({h}x{w}) but F={fdim} > H*W={need_hw}.")
+                            raise ValueError(
+                                f"[B,F] grid({h}x{w}) but F={fdim} > H*W={need_hw}."
+                            )
                     need = h * w
                     if fdim < need:
                         x = torch.nn.functional.pad(x, (0, need - fdim))
@@ -250,24 +587,32 @@ class PatchEmbedding(nn.Module):
                         ht = int(math.ceil(h / self.patch[0]) * self.patch[0])
                         wt = int(math.ceil(w / self.patch[1]) * self.patch[1])
                         if ht != h or wt != w:
-                            x = torch.nn.functional.pad(x, (0, wt - w, 0, ht - h))
+                            x = torch.nn.functional.pad(
+                                x, (0, wt - w, 0, ht - h)
+                            )
                     return x.contiguous(memory_format=torch.channels_last)
                 case 3:
                     if self.grid_3d is None:
-                        raise ValueError("Provide grid_3d=(T,H,W) for 3D with [B,F].")
+                        raise ValueError(
+                            "Provide grid_3d=(T,H,W) for 3D with [B,F]."
+                        )
                     t, h, w = self.grid_3d
                     need = t * h * w
                     if fdim < need:
                         x = torch.nn.functional.pad(x, (0, need - fdim))
                     elif fdim > need:
-                        raise ValueError(f"[B,F] grid_3d product {need}, but F={fdim} > product.")
+                        raise ValueError(
+                            f"[B,F] grid_3d product {need}, but F={fdim} > product."
+                        )
                     x = x.view(b, 1, t, h, w)
                     if self.pad_to_multiple:
                         tt = int(math.ceil(t / self.patch[0]) * self.patch[0])
                         ht = int(math.ceil(h / self.patch[1]) * self.patch[1])
                         wt = int(math.ceil(w / self.patch[2]) * self.patch[2])
                         if tt != t or ht != h or wt != w:
-                            x = torch.nn.functional.pad(x, (0, wt - w, 0, ht - h, 0, tt - t))
+                            x = torch.nn.functional.pad(
+                                x, (0, wt - w, 0, ht - h, 0, tt - t)
+                            )
                     return x.contiguous(memory_format=torch.channels_last_3d)
         match self.ndim:
             case 1:
@@ -280,7 +625,9 @@ class PatchEmbedding(nn.Module):
                 return x.contiguous(memory_format=torch.channels_last_3d)
         return x
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, Tuple[int, int, int]]:
         x = self._normalize_shape(x)
         y = self.proj(x)
         match self.ndim:
@@ -294,7 +641,9 @@ class PatchEmbedding(nn.Module):
                 meta = (1, h, w)
             case 3:
                 b, d, t, h, w = y.shape
-                tokens = y.permute(0, 2, 3, 4, 1).contiguous().view(b, t * h * w, d)
+                tokens = (
+                    y.permute(0, 2, 3, 4, 1).contiguous().view(b, t * h * w, d)
+                )
                 meta = (t, h, w)
         return (self.dropout(tokens), meta)
 
@@ -303,11 +652,17 @@ class SinusoidalEncoding(nn.Module):
     def __init__(self, d_model: int, axes: Tuple[str, ...]) -> None:
         super().__init__()
         self.axes = axes
-        assert len(axes) >= 1 and all((a in ("l", "t", "t_score", "h", "w") for a in axes))
+        assert len(axes) >= 1 and all(
+            (a in ("l", "t", "t_score", "h", "w") for a in axes)
+        )
         assert d_model % len(axes) == 0
         self.d_axis = d_model // len(axes)
         assert self.d_axis % 2 == 0
-        self.register_buffer("_cache_meta", torch.tensor([-1, -1, -1], dtype=torch.int64), persistent=False)
+        self.register_buffer(
+            "_cache_meta",
+            torch.tensor([-1, -1, -1], dtype=torch.int64),
+            persistent=False,
+        )
         self.register_buffer("_cache_pe", torch.empty(0, 0), persistent=False)
         self._cache_device = None
         self._cache_dtype = None
@@ -315,7 +670,10 @@ class SinusoidalEncoding(nn.Module):
     @staticmethod
     def _to_1d(n: int, dim: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / dim))
+        div = torch.exp(
+            torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+            * (-math.log(10000.0) / dim)
+        )
         pe = torch.zeros(n, dim, device=device)
         pe[:, 0::2] = torch.sin(pos * div)
         pe[:, 1::2] = torch.cos(pos * div)
@@ -332,7 +690,9 @@ class SinusoidalEncoding(nn.Module):
             self._cache_device == device
             and self._cache_dtype == dtype
             and (self._cache_meta.numel() == 3)
-            and (tuple((int(x) for x in self._cache_meta.tolist())) == (t, h, w))
+            and (
+                tuple((int(x) for x in self._cache_meta.tolist())) == (t, h, w)
+            )
         ):
             return self._cache_pe
         chunks: List[torch.Tensor] = []
@@ -349,7 +709,11 @@ class SinusoidalEncoding(nn.Module):
             l = t
             pl = self._to_1d(l, self.d_axis, device).view(l, 1, 1, self.d_axis)
             chunks.append(pl.expand(l, 1, 1, self.d_axis))
-        pe = torch.cat(chunks, dim=-1).view(-1, self.d_axis * len(self.axes)).to(dtype=dtype)
+        pe = (
+            torch.cat(chunks, dim=-1)
+            .view(-1, self.d_axis * len(self.axes))
+            .to(dtype=dtype)
+        )
         self._cache_meta = torch.tensor([t, h, w], dtype=torch.int64)
         self._cache_pe = pe
         self._cache_device = device
@@ -454,7 +818,11 @@ class MultipleQuantileLoss(nn.Module):
         if self.reduction == "none":
             return losses.transpose(0, qdim) if qdim != 0 else losses
         dims = tuple(range(1, losses.ndim))
-        per_q = losses.mean(dim=dims) if self.reduction == "mean" else losses.sum(dim=dims)
+        per_q = (
+            losses.mean(dim=dims)
+            if self.reduction == "mean"
+            else losses.sum(dim=dims)
+        )
         return (per_q * self.w).sum()
 
 
@@ -481,11 +849,20 @@ class StandardNormalLoss(nn.Module):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         assert 0.0 < confidence < 1.0
-        assert metric.lower() in {"z", "z_score", "z_value", "zscore", "zvalue", "p", "p_value", "pvalue"}
+        assert metric.lower() in {
+            "z",
+            "z_score",
+            "z_value",
+            "zscore",
+            "zvalue",
+            "p",
+            "p_value",
+            "pvalue",
+        }
         assert penalty.lower() in {"hinge", "tau", "soft", "softplus"}
         assert reduction.lower() in {"mean", "sum", "none"}
         self.confidence = float(confidence)
@@ -523,10 +900,7 @@ class StandardNormalLoss(nn.Module):
 
     @staticmethod
     def _safe_std(
-        x: torch.Tensor,
-        dim: Tuple[int, ...],
-        ddof: int,
-        eps: float,
+        x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
     ) -> torch.Tensor:
         return _stable_std(x, dim, ddof, eps)
 
@@ -544,10 +918,7 @@ class StandardNormalLoss(nn.Module):
         return _canon_dims(pred, self.dim, keep_batch=False)
 
     def _compute_mu(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        dims: Tuple[int, ...],
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
         dims = _canon_dims(pred, dims)
         match self.mu_mode:
@@ -570,20 +941,30 @@ class StandardNormalLoss(nn.Module):
         return mu
 
     def _compute_std(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        dims: Tuple[int, ...],
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
         match self.std_mode:
             case "target":
-                std = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = self._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pred":
-                std = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = self._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pooled":
-                std_t = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-                std_p = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
-                std = torch.sqrt(torch.clamp(0.5 * (std_t**2 + std_p**2), min=self.eps * self.eps))
+                std_t = self._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
+                std_p = self._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
+                std = torch.sqrt(
+                    torch.clamp(
+                        0.5 * (std_t**2 + std_p**2),
+                        min=self.eps * self.eps,
+                    )
+                )
             case "provided":
                 if self.std is None:
                     raise ValueError("std required")
@@ -601,9 +982,13 @@ class StandardNormalLoss(nn.Module):
 
     def _z_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
-        return self._std_normal.icdf(torch.tensor(q, device=device, dtype=dtype))
+        return self._std_normal.icdf(
+            torch.tensor(q, device=device, dtype=dtype)
+        )
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError("shape mismatch")
         dims = self._get_dims(pred)
@@ -618,12 +1003,24 @@ class StandardNormalLoss(nn.Module):
             case "p" | "p_value" | "pvalue":
                 x = z_abs
                 try:
-                    one_tail = torch.clamp(1.0 - Normal(loc=0.0, scale=1.0).cdf(x), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - Normal(loc=0.0, scale=1.0).cdf(x), min=self.eps
+                    )
                 except NotImplementedError:
-                    one_tail = torch.clamp(1.0 - _normal_cdf_loc_scale(x, torch.tensor(0.0, device=x.device, dtype=x.dtype), torch.tensor(1.0, device=x.device, dtype=x.dtype)), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0
+                        - _normal_cdf_loc_scale(
+                            x,
+                            torch.tensor(0.0, device=x.device, dtype=x.dtype),
+                            torch.tensor(1.0, device=x.device, dtype=x.dtype),
+                        ),
+                        min=self.eps,
+                    )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
                 alpha = max(1.0 - self.confidence, self.eps)
-                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
+                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(
+                    alpha
+                )
             case _:
                 raise ValueError("Invalid metric")
         match self.penalty:
@@ -664,11 +1061,20 @@ class StudentsTLoss(nn.Module):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         assert 0.0 < confidence < 1.0
-        assert metric.lower() in {"t", "t_score", "t_value", "tscore", "tvalue", "p", "p_value", "pvalue"}
+        assert metric.lower() in {
+            "t",
+            "t_score",
+            "t_value",
+            "tscore",
+            "tvalue",
+            "p",
+            "p_value",
+            "pvalue",
+        }
         assert penalty.lower() in {"hinge", "tau", "soft", "softplus"}
         assert reduction.lower() in {"mean", "sum", "none"}
         self.confidence = float(confidence)
@@ -706,10 +1112,7 @@ class StudentsTLoss(nn.Module):
 
     @staticmethod
     def _safe_std(
-        x: torch.Tensor,
-        dim: Tuple[int, ...],
-        ddof: int,
-        eps: float,
+        x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
     ) -> torch.Tensor:
         return _stable_std(x, dim, ddof, eps)
 
@@ -731,10 +1134,7 @@ class StudentsTLoss(nn.Module):
         return self.dim
 
     def _compute_mu(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        dims: Tuple[int, ...],
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
         dims = _canon_dims(pred, dims)
         match self.mu_mode:
@@ -743,7 +1143,10 @@ class StudentsTLoss(nn.Module):
             case "pred":
                 mu = pred.mean(dim=dims, keepdim=True)
             case "pooled":
-                mu = 0.5 * (target.mean(dim=dims, keepdim=True) + pred.mean(dim=dims, keepdim=True))
+                mu = 0.5 * (
+                    target.mean(dim=dims, keepdim=True)
+                    + pred.mean(dim=dims, keepdim=True)
+                )
             case "provided":
                 if self.mu is None:
                     raise ValueError("mu required when mu_mode='provided'")
@@ -759,20 +1162,30 @@ class StudentsTLoss(nn.Module):
         return mu
 
     def _compute_std(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
-        dims: Tuple[int, ...],
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
         match self.std_mode:
             case "target":
-                std = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = self._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pred":
-                std = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = self._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pooled":
-                std_t = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-                std_p = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
-                std = torch.sqrt(torch.clamp(0.5 * (std_t**2 + std_p**2), min=self.eps * self.eps))
+                std_t = self._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
+                std_p = self._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
+                std = torch.sqrt(
+                    torch.clamp(
+                        0.5 * (std_t**2 + std_p**2),
+                        min=self.eps * self.eps,
+                    )
+                )
             case "provided":
                 if self.std is None:
                     raise ValueError("std required when std_mode='provided'")
@@ -790,7 +1203,9 @@ class StudentsTLoss(nn.Module):
 
     def _t_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
-        df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
+        df = self._to_tensor_like(
+            self.df, torch.empty((), device=device, dtype=dtype)
+        )
         try:
             dist = StudentT(df=df)
             return dist.icdf(torch.tensor(q, device=device, dtype=dtype))
@@ -808,7 +1223,9 @@ class StudentsTLoss(nn.Module):
                 hi = torch.where(mask, hi, mid)
             return hi
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError("shape mismatch")
         dims = self._get_dims(pred)
@@ -823,15 +1240,25 @@ class StudentsTLoss(nn.Module):
             case "p" | "p_value" | "pvalue":
                 df = self._broadcast_param(self.df, t_abs)
                 df_safe = torch.clamp(df, min=2.0 + self.eps)
-                scale = std * torch.sqrt(torch.clamp((df_safe - 2.0) / df_safe, min=self.eps))
+                scale = std * torch.sqrt(
+                    torch.clamp((df_safe - 2.0) / df_safe, min=self.eps)
+                )
                 x = mu + t_abs * scale
                 try:
-                    one_tail = torch.clamp(1.0 - StudentT(df=df, loc=mu, scale=scale).cdf(x), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - StudentT(df=df, loc=mu, scale=scale).cdf(x),
+                        min=self.eps,
+                    )
                 except NotImplementedError:
-                    one_tail = torch.clamp(1.0 - _student_t_cdf_loc_scale(x, df, mu, scale), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - _student_t_cdf_loc_scale(x, df, mu, scale),
+                        min=self.eps,
+                    )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
                 alpha = max(1.0 - self.confidence, self.eps)
-                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
+                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(
+                    alpha
+                )
             case _:
                 raise ValueError("Invalid metric")
         match self.penalty:
@@ -859,7 +1286,7 @@ def _fftn_nd(
     real_input: bool = False,
     inverse: bool = False,
     norm: Optional[str] = "ortho",
-    **kwargs: Any
+    **kwargs: Any,
 ) -> torch.Tensor:
     dims = tuple(range(-len(shape), 0))
     if not inverse:
@@ -879,7 +1306,7 @@ def _nufft_nd_cufinufft(
     *args: Any,
     nufft_type: int = 2,
     eps: float = 1e-06,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> torch.Tensor:
     try:
         import cufinufft
@@ -890,7 +1317,9 @@ def _nufft_nd_cufinufft(
     out_list = []
     if omega.dim() == 2:
         pts = [omega[i].contiguous() for i in range(ndim)]
-        plan = cufinufft.Plan(nufft_type, _as_tuple(shape), n_trans=1, eps=eps, dtype="complex64")
+        plan = cufinufft.Plan(
+            nufft_type, _as_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
+        )
         plan.setpts(*pts)
         for b in range(B):
             fk = plan.execute(x_cplx[b])
@@ -898,7 +1327,13 @@ def _nufft_nd_cufinufft(
     else:
         for b in range(B):
             pts = [omega[b, i].contiguous() for i in range(ndim)]
-            plan = cufinufft.Plan(nufft_type, _as_tuple(shape), n_trans=1, eps=eps, dtype="complex64")
+            plan = cufinufft.Plan(
+                nufft_type,
+                _as_tuple(shape),
+                n_trans=1,
+                eps=eps,
+                dtype="complex64",
+            )
             plan.setpts(*pts)
             fk = plan.execute(x_cplx[b])
             out_list.append(fk.unsqueeze(0))
@@ -917,14 +1352,16 @@ class DataFidelityLoss(nn.Module):
         fft_norm: Optional[str] = "ortho",
         reduction: str = "mean",
         nufft_eps: float = 1e-06,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.out_shape = _as_tuple(out_shape)
         self.ndim = len(self.out_shape)
         self.mode = str(mode).lower()
         self.backend = None if backend is None else str(backend).lower()
-        self.register_buffer("ktraj", ktraj if ktraj is not None else None, persistent=False)
+        self.register_buffer(
+            "ktraj", ktraj if ktraj is not None else None, persistent=False
+        )
         self.weight = float(weight)
         self.fft_norm = fft_norm
         self.reduction = reduction
@@ -935,7 +1372,11 @@ class DataFidelityLoss(nn.Module):
             raise ValueError("ktraj is required for NUFFT mode")
 
     def _mse(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        diff = (a - b).abs() if torch.is_complex(a) or torch.is_complex(b) else a - b
+        diff = (
+            (a - b).abs()
+            if torch.is_complex(a) or torch.is_complex(b)
+            else a - b
+        )
         sq = diff * diff
         match self.reduction:
             case "mean":
@@ -948,9 +1389,7 @@ class DataFidelityLoss(nn.Module):
         return val * self.weight
 
     def forward(
-        self,
-        pred_flat: torch.Tensor,
-        target_flat: torch.Tensor,
+        self, pred_flat: torch.Tensor, target_flat: torch.Tensor
     ) -> torch.Tensor:
         B = int(pred_flat.shape[0])
         shape = self.out_shape
@@ -958,21 +1397,61 @@ class DataFidelityLoss(nn.Module):
         y = target_flat.view(B, *shape)
         match self.mode:
             case "fft":
-                Xk = _fftn_nd(x.to(torch.complex64) if not torch.is_complex(x) else x, shape, real_input=False, inverse=False, norm=self.fft_norm)
-                Yk = _fftn_nd(y.to(torch.complex64) if not torch.is_complex(y) else y, shape, real_input=False, inverse=False, norm=self.fft_norm)
+                Xk = _fftn_nd(
+                    x.to(torch.complex64) if not torch.is_complex(x) else x,
+                    shape,
+                    real_input=False,
+                    inverse=False,
+                    norm=self.fft_norm,
+                )
+                Yk = _fftn_nd(
+                    y.to(torch.complex64) if not torch.is_complex(y) else y,
+                    shape,
+                    real_input=False,
+                    inverse=False,
+                    norm=self.fft_norm,
+                )
             case "nufft":
                 match self.backend:
                     case None | "cufinufft":
                         try:
-                            Xk = _nufft_nd_cufinufft(x.to(torch.complex64).unsqueeze(1), self.ktraj, shape, nufft_type=2, eps=self.nufft_eps)
-                            Yk = _nufft_nd_cufinufft(y.to(torch.complex64).unsqueeze(1), self.ktraj, shape, nufft_type=2, eps=self.nufft_eps)
+                            Xk = _nufft_nd_cufinufft(
+                                x.to(torch.complex64).unsqueeze(1),
+                                self.ktraj,
+                                shape,
+                                nufft_type=2,
+                                eps=self.nufft_eps,
+                            )
+                            Yk = _nufft_nd_cufinufft(
+                                y.to(torch.complex64).unsqueeze(1),
+                                self.ktraj,
+                                shape,
+                                nufft_type=2,
+                                eps=self.nufft_eps,
+                            )
                         except Exception:
-                            Xk = _fftn_nd(x.to(torch.complex64), shape, real_input=False, inverse=False, norm=self.fft_norm)
-                            Yk = _fftn_nd(y.to(torch.complex64), shape, real_input=False, inverse=False, norm=self.fft_norm)
+                            Xk = _fftn_nd(
+                                x.to(torch.complex64),
+                                shape,
+                                real_input=False,
+                                inverse=False,
+                                norm=self.fft_norm,
+                            )
+                            Yk = _fftn_nd(
+                                y.to(torch.complex64),
+                                shape,
+                                real_input=False,
+                                inverse=False,
+                                norm=self.fft_norm,
+                            )
                     case "finufft":
-                        raise NotImplementedError("FINUFFT path: wire with finufft.nufft*d* or Plan if you need CPU NUFFT.")
+                        raise NotImplementedError(
+                            "FINUFFT path: wire with finufft.nufft*d* or Plan if you need CPU NUFFT."
+                        )
                     case _:
-                        raise ValueError(f"Unknown NUFFT backend: {self.backend}")
+                        raise ValueError(
+                            f"Unknown NUFFT backend: {self.backend}"
+                        )
             case _:
                 raise ValueError(f"Invalid mode: {self.mode}")
         return self._mse(Xk, Yk)
@@ -985,14 +1464,19 @@ class LinearCombinationLoss(nn.Module):
         coefficient: Sequence[float],
         loss: Sequence[nn.Module],
         offset: float = 0.0,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
-        if not (isinstance(coefficient, (list, tuple)) and isinstance(loss, (list, tuple))):
+        if not (
+            isinstance(coefficient, (list, tuple))
+            and isinstance(loss, (list, tuple))
+        ):
             raise TypeError("coefficient/loss must be sequences")
         if len(coefficient) != len(loss) or len(loss) == 0:
             raise ValueError("invalid coefficient/loss length")
-        self.register_buffer("coefficient", torch.tensor(list(coefficient), dtype=torch.float32))
+        self.register_buffer(
+            "coefficient", torch.tensor(list(coefficient), dtype=torch.float32)
+        )
         self.losses = nn.ModuleList(list(loss))
         self.offset = float(offset)
 
@@ -1016,7 +1500,7 @@ class TiledLoss(nn.Module):
         tile_dim: Optional[int] = None,
         tile_size: Optional[int] = None,
         reduction: str = "mean",
-        **kwargs: Any
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.base = base
@@ -1028,29 +1512,42 @@ class TiledLoss(nn.Module):
         self.reduction = reduction
 
     def _make_mask(
-        self,
-        pred: torch.Tensor,
-        target: torch.Tensor,
+        self, pred: torch.Tensor, target: torch.Tensor
     ) -> Optional[torch.Tensor]:
+        def _ensure_shape(mask: torch.Tensor) -> torch.Tensor:
+            try:
+                if mask.shape != pred.shape:
+                    mask = mask.expand_as(pred)
+            except Exception:
+                pass
+            return mask
+
         match self.mask_mode:
             case "none":
                 return None
             case "finite":
                 try:
-                    return torch.isfinite(target)
+                    return _ensure_shape(torch.isfinite(target))
                 except Exception:
                     return None
             case "neq":
                 if self.mask_value is None:
                     return None
                 try:
-                    return target != target.new_tensor(self.mask_value, dtype=target.dtype, device=target.device)
+                    base = target.new_tensor(
+                        self.mask_value,
+                        dtype=target.dtype,
+                        device=target.device,
+                    )
+                    return _ensure_shape(target != base)
                 except Exception:
                     return None
-            case _: 
+            case _:
                 return None
 
-    def _reduce(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def _reduce(
+        self, x: torch.Tensor, mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         if mask is not None:
             x = x.masked_select(mask)
         match self.reduction:
@@ -1060,9 +1557,11 @@ class TiledLoss(nn.Module):
                 return x.sum()
             case "none":
                 return x
-        return x 
+        return x
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         mask = self._make_mask(pred, target)
         if self.tile_dim is None or self.tile_size is None:
             v = self.base(pred, target)
@@ -1094,13 +1593,15 @@ class TiledLoss(nn.Module):
             start = end
         match self.reduction:
             case "none":
-                return torch.cat(parts, dim=td) if parts else pred.new_zeros(())
+                return (
+                    torch.cat(parts, dim=td) if parts else pred.new_zeros(())
+                )
             case "sum":
                 return total_sum
             case "mean":
                 denom = torch.clamp(total_count, min=1.0)
                 return total_sum / denom
-        return pred.new_zeros(()) 
+        return pred.new_zeros(())
 
 
 class GatedCrossAttention(nn.Module):
@@ -1119,7 +1620,7 @@ class GatedCrossAttention(nn.Module):
         self.head_dim = d_model // nhead
         self.norm_q = _norm(norm_type, d_model)
         self.q_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.kv_proj = nn.Linear(d_model, 2*d_model, bias=bias)
+        self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.zeros(1))
@@ -1135,10 +1636,11 @@ class GatedCrossAttention(nn.Module):
         qn = self.q_proj(self.norm_q(q))
         kv = self.kv_proj(kv)
         k, v = kv.chunk(2, dim=-1)
+
         def split(x: torch.Tensor) -> torch.Tensor:
             return x.view(B, -1, self.nhead, self.head_dim).transpose(1, 2)
 
-        qh, kh, vh = split(qn), split(k), split(v)
+        qh, kh, vh = (split(qn), split(k), split(v))
         yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
         y = self.out_proj(self.dropout(y))
@@ -1159,7 +1661,9 @@ class PatchAttention(nn.Module):
     ) -> None:
         super().__init__()
         if d_model % nhead != 0:
-            raise ValueError("d_model must be divisible by nhead for PatchAttention")
+            raise ValueError(
+                "d_model must be divisible by nhead for PatchAttention"
+            )
         self.d_model = int(d_model)
         self.nhead = int(nhead)
         self.head_dim = self.d_model // self.nhead
@@ -1180,9 +1684,13 @@ class PatchAttention(nn.Module):
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = _norm(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
-        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
+        self.ffn = SwiGLU(
+            self.d_model, hid, out_dim=self.d_model, dropout=dropout
+        )
 
-    def _apply_attn_mask(self, scores: torch.Tensor, attn_mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def _apply_attn_mask(
+        self, scores: torch.Tensor, attn_mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         if attn_mask is None:
             return scores
         mask = attn_mask
@@ -1192,7 +1700,7 @@ class PatchAttention(nn.Module):
             mask = mask.unsqueeze(1)
         if mask.shape[-2:] != scores.shape[-2:]:
             raise ValueError("Attention mask shape mismatch in PatchAttention")
-        return scores.masked_fill(~mask.to(dtype=torch.bool), float('-inf'))
+        return scores.masked_fill(~mask.to(dtype=torch.bool), float("-inf"))
 
     def forward(
         self,
@@ -1209,16 +1717,22 @@ class PatchAttention(nn.Module):
         def _split(t: torch.Tensor) -> torch.Tensor:
             return t.view(B, N, self.nhead, self.head_dim).transpose(1, 2)
 
-        qh, kh, vh = _split(q), _split(k), _split(v)
+        qh, kh, vh = (_split(q), _split(k), _split(v))
         rel = coords.unsqueeze(2) - coords.unsqueeze(1)
         rel_bias = self.rel_bias(rel).permute(0, 3, 1, 2)
-        rel_value = self.rel_value(rel).view(B, N, N, self.nhead, self.head_dim).permute(0, 3, 1, 2, 4)
-        scores = torch.einsum('bhid,bhjd->bhij', qh, kh) / math.sqrt(float(self.head_dim))
+        rel_value = (
+            self.rel_value(rel)
+            .view(B, N, N, self.nhead, self.head_dim)
+            .permute(0, 3, 1, 2, 4)
+        )
+        scores = torch.einsum("bhid,bhjd->bhij", qh, kh) / math.sqrt(
+            float(self.head_dim)
+        )
         scores = scores + rel_bias
         scores = self._apply_attn_mask(scores, attn_mask)
         weights = torch.softmax(scores, dim=-1)
         value = vh.unsqueeze(2).expand(-1, -1, N, -1, -1) + rel_value
-        y = torch.einsum('bhij,bhijd->bhid', weights, value)
+        y = torch.einsum("bhij,bhijd->bhid", weights, value)
         y = y.transpose(1, 2).contiguous().view(B, N, D)
         x = x + self.drop_path(self.dropout(y))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
@@ -1295,7 +1809,7 @@ class TemporalRetNet(nn.Module):
         h = self.msr(self.norm1(x), attn_mask=causal_mask, state=state)
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
-        return x, state
+        return (x, state)
 
 
 class TemporalSubnet(nn.Module):
@@ -1327,7 +1841,9 @@ class TemporalSubnet(nn.Module):
         )
         self.norm = _norm(norm_type, d_model)
 
-    def forward(self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         state = None
         for blk in self.blocks:
             x, state = blk(x, causal_mask=causal_mask, state=state)
@@ -1346,8 +1862,12 @@ class CrossTransformer(nn.Module):
         drop_path: float = 0.0,
     ) -> None:
         super().__init__()
-        self.cross_s = GatedCrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
-        self.cross_t = GatedCrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
+        self.cross_s = GatedCrossAttention(
+            d_model, nhead, dropout=dropout, norm_type=norm_type
+        )
+        self.cross_t = GatedCrossAttention(
+            d_model, nhead, dropout=dropout, norm_type=norm_type
+        )
         self.mix_norm = _norm(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
         self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
@@ -1369,13 +1889,23 @@ class CrossTransformer(nn.Module):
             return t_context
         if mode_l == "txs":
             base = torch.cat(
-                [t_context, s_context.mean(dim=1, keepdim=True).expand(-1, t_context.size(1), -1)],
+                [
+                    t_context,
+                    s_context.mean(dim=1, keepdim=True).expand(
+                        -1, t_context.size(1), -1
+                    ),
+                ],
                 dim=-1,
             )
             fused = self.mix(self.mix_norm(base))
             return t_context + self.drop_path(self.dropout(fused))
         base = torch.cat(
-            [s_context, t_context.mean(dim=1, keepdim=True).expand(-1, s_context.size(1), -1)],
+            [
+                s_context,
+                t_context.mean(dim=1, keepdim=True).expand(
+                    -1, s_context.size(1), -1
+                ),
+            ],
             dim=-1,
         )
         fused = self.mix(self.mix_norm(base))
@@ -1429,34 +1959,36 @@ class MetaNet(nn.Module):
 
 class SpatioTemporalNet(nn.Module):
     def __init__(
-        self,
-        in_dim: int,
-        out_shape: Sequence[int],
-        *,
-        config: Config,
+        self, in_dim: int, out_shape: Sequence[int], *, config: Config
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
-        self.out_shape = tuple(int(v) for v in out_shape)
+        self.out_shape = tuple((int(v) for v in out_shape))
         self.out_dim = int(prod(self.out_shape))
         self.d_model = int(config.depth)
         self.nhead = int(config.heads)
-        self.data_definition = _normalize_data_definition(config.data_definition)
+        self.data_definition = _normalize_data_definition(
+            config.data_definition
+        )
         self.spatial_tokens = max(1, int(config.spatial_latent_tokens))
         self.temporal_tokens = max(1, int(config.temporal_latent_tokens))
         self.mlp_ratio = float(config.mlp_ratio)
         self.dropout = float(config.dropout)
         self.drop_path = float(config.drop_path)
         self.norm_type = str(config.normalize_method)
-
-        self.spatial_tokenizer = nn.Linear(self.in_dim, self.spatial_tokens * self.d_model)
-        self.temporal_tokenizer = nn.Linear(self.in_dim, self.temporal_tokens * self.d_model)
+        self.spatial_tokenizer = nn.Linear(
+            self.in_dim, self.spatial_tokens * self.d_model
+        )
+        self.temporal_tokenizer = nn.Linear(
+            self.in_dim, self.temporal_tokens * self.d_model
+        )
         self.register_buffer(
             "spatial_coords_template",
-            self._build_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
+            self._build_spatial_coords(
+                self.spatial_tokens, device=torch.device("cpu")
+            ),
             persistent=False,
         )
-
         self.spatial_subnet = SpatialSubnet(
             self.d_model,
             self.nhead,
@@ -1495,7 +2027,9 @@ class SpatioTemporalNet(nn.Module):
         )
 
     @staticmethod
-    def _build_spatial_coords(n_tokens: int, device: torch.device) -> torch.Tensor:
+    def _build_spatial_coords(
+        n_tokens: int, device: torch.device
+    ) -> torch.Tensor:
         side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
         coords: List[Tuple[float, float, float]] = []
         for idx in range(n_tokens):
@@ -1506,17 +2040,29 @@ class SpatioTemporalNet(nn.Module):
             if side == 1:
                 coords.append((0.0, 0.0, 0.0))
             else:
-                coords.append((x / (side - 1 if side > 1 else 1), y / (side - 1 if side > 1 else 1), z / (side - 1 if side > 1 else 1)))
+                coords.append(
+                    (
+                        x / (side - 1 if side > 1 else 1),
+                        y / (side - 1 if side > 1 else 1),
+                        z / (side - 1 if side > 1 else 1),
+                    )
+                )
         return torch.tensor(coords, dtype=torch.float32, device=device)
 
-    def _spatial_coords(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    def _spatial_coords(
+        self, batch: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
         coords = self.spatial_coords_template.to(device=device, dtype=dtype)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
     def forward(self, x: torch.Tensor) -> Meta:
         B = x.shape[0]
-        spatial_tokens = self.spatial_tokenizer(x).view(B, self.spatial_tokens, self.d_model)
-        temporal_tokens = self.temporal_tokenizer(x).view(B, self.temporal_tokens, self.d_model)
+        spatial_tokens = self.spatial_tokenizer(x).view(
+            B, self.spatial_tokens, self.d_model
+        )
+        temporal_tokens = self.temporal_tokenizer(x).view(
+            B, self.temporal_tokens, self.d_model
+        )
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_subnet(spatial_tokens, coords)
         temporal_out = self.temporal_subnet(temporal_tokens)
@@ -1545,7 +2091,9 @@ class SpatioTemporalNet(nn.Module):
             context_shape=self.out_shape,
         )
 
-    def decode(self, tokens: torch.Tensor, *, apply_norm: bool = False) -> torch.Tensor:
+    def decode(
+        self, tokens: torch.Tensor, *, apply_norm: bool = False
+    ) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)

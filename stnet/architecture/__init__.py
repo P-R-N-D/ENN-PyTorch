@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import TypeAlias
@@ -6,8 +5,6 @@ from typing import TypeAlias
 from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
-
-
 from .module import (
     CrossTransformer,
     DataFidelityLoss,
@@ -19,10 +16,10 @@ from .module import (
     SpatialSubnet,
     SpatioTemporalNet,
     StandardNormalLoss,
+    StochasticDepth,
     StudentsTLoss,
     SwiGLU,
     TemporalSubnet,
-    StochasticDepth,
     _norm,
     _stochastic_depth_scheduler,
 )
@@ -51,6 +48,5 @@ __all__ = [
     "_norm",
     "_stochastic_depth_scheduler",
 ]
-
 ZLoss: TypeAlias = StandardNormalLoss
 TLoss: TypeAlias = StudentsTLoss

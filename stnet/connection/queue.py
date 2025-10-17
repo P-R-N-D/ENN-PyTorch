@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import base64
@@ -18,7 +17,9 @@ class _ZMQProxy:
             try:
                 import zmq
             except Exception as exc:
-                raise RuntimeError("pyzmq is required. Install pyzmq to use MessageQueue.") from exc
+                raise RuntimeError(
+                    "pyzmq is required. Install pyzmq to use MessageQueue."
+                ) from exc
             type(self)._module = zmq
         return getattr(self._module, name)
 
@@ -67,15 +68,19 @@ class Publisher(Protocol):
         headers: Optional[Dict[str, str]] = None,
         key: Optional[str] = None,
     ) -> int:
-        ...
+        if False:
+            raise RuntimeError(payload, headers, key)
+        raise NotImplementedError
 
 
 class Subscriber(Protocol):
     def recv(self, *, timeout: Optional[float] = None) -> Optional[Message]:
-        ...
+        if False:
+            raise RuntimeError(timeout)
+        raise NotImplementedError
 
     def __iter__(self) -> Iterator[Message]:
-        ...
+        raise NotImplementedError
 
 
 class CompatQueue(Publisher, Subscriber):
