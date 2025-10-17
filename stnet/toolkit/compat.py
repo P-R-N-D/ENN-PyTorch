@@ -4,8 +4,8 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from importlib import util
-from typing import Any, Iterable, Iterator
+from importlib import import_module, util
+from typing import Any, Iterable, Iterator, Sequence
 
 import torch
 from torch import nn
@@ -28,6 +28,9 @@ except Exception:
             _ = (args, kwargs)
             del _
         yield
+
+
+_ARROW_COMPAT: "ArrowCompat | None" = None
 
 
 def patch_torch() -> None:
@@ -102,6 +105,69 @@ def patch_torch() -> None:
             return torch.sum(x_masked, dim=dim, keepdim=keepdim, dtype=dtype)
 
         setattr(torch, "nansum", _nansum)
+
+
+class ArrowCompat:
+    def __init__(self, module: Any, flight: Any) -> None:
+        self.module = module
+        self.flight = flight
+
+    def to_numpy(self, array: Any, *, zero_copy_only: bool = True) -> Any:
+        try:
+            return array.to_numpy(zero_copy_only=zero_copy_only)
+        except TypeError:
+            return array.to_numpy()
+
+    def fixed_shape_list_from_arrays(
+        self, values: Any, shape_or_size: int | Sequence[int]
+    ) -> Any:
+        errors: list[BaseException] = []
+        array_cls = getattr(self.module, "FixedShapeArrayList", None)
+        if array_cls is not None:
+            try:
+                return array_cls.from_arrays(values, shape_or_size)
+            except TypeError as exc:
+                errors.append(exc)
+        fallback_cls = getattr(self.module, "FixedSizeListArray", None)
+        if fallback_cls is not None:
+            try:
+                length = 1
+                if isinstance(shape_or_size, (list, tuple)):
+                    dims = list(shape_or_size)
+                    if not dims:
+                        length = 1
+                    else:
+                        for dim in dims:
+                            length *= int(dim)
+                else:
+                    length = int(shape_or_size)
+                return fallback_cls.from_arrays(values, length)
+            except TypeError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[-1]
+        raise AttributeError(
+            "pyarrow does not provide a fixed-shape list array implementation"
+        )
+
+
+def patch_arrow(module: Any | None = None) -> ArrowCompat:
+    global _ARROW_COMPAT
+    if _ARROW_COMPAT is not None:
+        return _ARROW_COMPAT
+    if module is None:
+        import pyarrow as pa  # type: ignore
+    else:
+        pa = module
+    try:
+        flight = import_module("pyarrow.flight")
+    except Exception:
+        flight = None
+    if not hasattr(pa, "FixedShapeArrayList") and hasattr(pa, "FixedSizeListArray"):
+        setattr(pa, "FixedShapeArrayList", pa.FixedSizeListArray)
+    compat = ArrowCompat(pa, flight)
+    _ARROW_COMPAT = compat
+    return compat
 
 
 def lazy_import(module_name: str) -> Any:

@@ -5,11 +5,17 @@ import threading
 import time
 from typing import Any, Iterator, Optional, Tuple
 
-import pyarrow as pa
 import torch.distributed as dist
-from pyarrow import flight
 
 from ..pipeline.dataset import MemoryMappedTensorStream
+from ..toolkit.compat import patch_arrow
+
+
+_ARROW = patch_arrow()
+pa = _ARROW.module
+flight = _ARROW.flight
+if flight is None:
+    raise RuntimeError("pyarrow.flight is required for ArrowFlight support")
 
 
 class ZeroMQ:

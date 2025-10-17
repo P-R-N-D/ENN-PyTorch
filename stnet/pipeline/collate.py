@@ -30,10 +30,14 @@ from torchdata.nodes import (
 )
 
 from ..connection.socket import ArrowFlight
+from ..toolkit.compat import patch_arrow
 from ..toolkit.capability import apply_threading_defaults
 from ..toolkit.optimization import DataLoader
 from .dataset import MemoryMappedTensorStream
 from .distributed import is_initialized
+
+
+_ARROW = patch_arrow()
 
 
 def _world_info() -> Tuple[int, int, int, bool]:
@@ -578,7 +582,6 @@ def stream(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
-    io_backend: str = "auto",
     **loader_options: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     device_obj = (
@@ -586,14 +589,6 @@ def stream(
         if not isinstance(device, torch.device)
         else device
     )
-    backend = io_backend or "auto"
-    if not isinstance(backend, str):
-        raise TypeError(
-            "io_backend must be a string such as 'auto', 'local', or 'flight'"
-        )
-    backend = backend.lower()
-    if backend == "auto" and device_obj.type == "cpu":
-        backend = "local"
     threads = apply_threading_defaults()
     map_fn = partial(
         fetch,
@@ -687,9 +682,12 @@ def stream(
         server = None
         keep = _Keep(reader_tr, reader_vl)
         try:
+            host = "0.0.0.0"
+            if not is_ddp:
+                host = "127.0.0.1"
             if not is_ddp or local_rank == 0:
                 server, uri = ArrowFlight.start_server_standby(
-                    host="0.0.0.0", port=0
+                    host=host, port=0
                 )
                 keep.add(server)
                 ArrowFlight.reg_mmt_dataset(
@@ -719,7 +717,11 @@ def stream(
                         getattr(record_batch, "num_rows", 0)
                     ) or int(len(record_batch.column(0)))
                     features_arr = record_batch.column(0)
-                    features_np = features_arr.to_numpy(zero_copy_only=False)
+                    features_np = _ARROW.to_numpy(
+                        features_arr, zero_copy_only=False
+                    )
+                    if isinstance(features_np, np.ndarray) and features_np.dtype == object:
+                        features_np = np.array(features_arr.to_pylist(), dtype=np.float32)
                     if not isinstance(features_np, np.ndarray):
                         features_np = np.array(features_np, copy=True)
                     if (
@@ -736,7 +738,11 @@ def stream(
                         batch_size_rb, -1
                     )
                     labels_arr = record_batch.column(1)
-                    labels_np = labels_arr.to_numpy(zero_copy_only=False)
+                    labels_np = _ARROW.to_numpy(
+                        labels_arr, zero_copy_only=False
+                    )
+                    if isinstance(labels_np, np.ndarray) and labels_np.dtype == object:
+                        labels_np = np.array(labels_arr.to_pylist(), dtype=np.float32)
                     if not isinstance(labels_np, np.ndarray):
                         labels_np = np.array(labels_np, copy=True)
                     if (
@@ -768,15 +774,12 @@ def stream(
             keep.cleanup()
             raise
 
-    if backend == "local":
-        return _local_impl()
     try:
         return _flight_impl()
     except Exception as exc:
-        if backend != "auto":
-            raise
         warnings.warn(
             f"Arrow Flight backend unavailable ({exc}). Falling back to local memory-mapped loader.",
             RuntimeWarning,
         )
         return _local_impl()
+
