@@ -578,6 +578,7 @@ def stream(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
+    io_backend: str = "auto",
     **loader_options: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     device_obj = (
@@ -585,7 +586,11 @@ def stream(
         if not isinstance(device, torch.device)
         else device
     )
-    backend = "auto"
+    backend = io_backend or "auto"
+    if not isinstance(backend, str):
+        raise TypeError(
+            "io_backend must be a string such as 'auto', 'local', or 'flight'"
+        )
     backend = backend.lower()
     if backend == "auto" and device_obj.type == "cpu":
         backend = "local"
