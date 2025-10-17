@@ -102,8 +102,21 @@ class TorchCompat:
             mask = torch_mod.isfinite(x)
             xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("inf")))
             if dim is None:
+                if not bool(mask.any()):
+                    return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
                 return xp.min()
             values, indices = xp.min(dim=dim, keepdim=keepdim)
+            any_valid = mask.any(dim=dim, keepdim=keepdim)
+            values = torch_mod.where(
+                any_valid,
+                values,
+                torch_mod.full_like(values, float("nan")),
+            )
+            indices = torch_mod.where(
+                any_valid,
+                indices,
+                torch_mod.zeros_like(indices),
+            )
             return (values, indices)
 
         setattr(self.module, "nanmin", _nanmin)
@@ -121,8 +134,21 @@ class TorchCompat:
             mask = torch_mod.isfinite(x)
             xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("-inf")))
             if dim is None:
+                if not bool(mask.any()):
+                    return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
                 return xp.max()
             values, indices = xp.max(dim=dim, keepdim=keepdim)
+            any_valid = mask.any(dim=dim, keepdim=keepdim)
+            values = torch_mod.where(
+                any_valid,
+                values,
+                torch_mod.full_like(values, float("nan")),
+            )
+            indices = torch_mod.where(
+                any_valid,
+                indices,
+                torch_mod.zeros_like(indices),
+            )
             return (values, indices)
 
         setattr(self.module, "nanmax", _nanmax)
@@ -139,16 +165,13 @@ class TorchCompat:
             *,
             dtype: Any = None,
         ) -> Any:
-            target_dtype = dtype if dtype is not None else x.dtype
-            x_cast = x.to(target_dtype)
+            x_cast = x.to(dtype) if dtype is not None else x
             mask = torch_mod.isfinite(x_cast)
             zero = torch_mod.zeros(
                 (), device=x_cast.device, dtype=x_cast.dtype
             )
             x_masked = torch_mod.where(mask, x_cast, zero)
-            return torch_mod.sum(
-                x_masked, dim=dim, keepdim=keepdim, dtype=dtype
-            )
+            return torch_mod.sum(x_masked, dim=dim, keepdim=keepdim)
 
         setattr(self.module, "nansum", _nansum)
 
@@ -335,20 +358,3 @@ def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
         if candidate is not None:
             resolved.append(candidate)
     return resolved
-
-
-__all__ = [
-    "TorchCompat",
-    "patch_torch",
-    "lazy_import",
-    "has_fsdp2",
-    "has_arrow_flight",
-    "has_zero_mq",
-    "has_cuda_ipc",
-    "has_gds",
-    "env_info",
-    "EnvInfo",
-    "sdpa_kernel",
-    "SDPBackend",
-    "_to_sdpa_backends",
-]
