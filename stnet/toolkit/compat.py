@@ -4,8 +4,8 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
-from importlib import util
-from typing import Any, Iterable, Iterator
+from importlib import import_module, util
+from typing import Any, Iterable, Iterator, Sequence
 
 import torch
 from torch import nn
@@ -30,78 +30,204 @@ except Exception:
         yield
 
 
-def patch_torch() -> None:
-    if not hasattr(nn, "RMSNorm"):
+_TORCH_COMPAT: TorchCompat | None = None
+_ARROW_COMPAT: ArrowCompat | None = None
 
-        class _RMSNorm(nn.Module):
+
+class TorchCompat:
+    def __init__(
+        self,
+        module: Any | None = None,
+        nn_module: Any | None = None,
+    ) -> None:
+        self.module = module if module is not None else torch
+        self.nn_module = nn_module if nn_module is not None else getattr(
+            self.module, "nn", nn
+        )
+
+    def apply(self) -> None:
+        self._ensure_rmsnorm()
+        self._ensure_fmin()
+        self._ensure_nanmin()
+        self._ensure_nanmax()
+        self._ensure_nansum()
+
+    def _ensure_rmsnorm(self) -> None:
+        if hasattr(self.nn_module, "RMSNorm"):
+            return
+        torch_mod = self.module
+        nn_mod = self.nn_module
+
+        class _RMSNorm(nn_mod.Module):
             def __init__(self, d_model: int, eps: float = 1e-06) -> None:
                 super().__init__()
                 self.eps = float(eps)
-                self.weight = nn.Parameter(torch.ones(d_model))
+                self.weight = nn_mod.Parameter(torch_mod.ones(d_model))
 
-            def forward(self, x: torch.Tensor) -> torch.Tensor:
+            def forward(self, x: Any) -> Any:
                 inv_rms = (
                     x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
                 )
                 return x * inv_rms * self.weight
 
-        setattr(nn, "RMSNorm", _RMSNorm)
-    if not hasattr(torch, "fmin"):
+        setattr(self.nn_module, "RMSNorm", _RMSNorm)
 
-        def _fmin(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            a, b = torch.broadcast_tensors(a, b)
-            a_nan = torch.isnan(a)
-            b_nan = torch.isnan(b)
-            return torch.where(
+    def _ensure_fmin(self) -> None:
+        if hasattr(self.module, "fmin"):
+            return
+        torch_mod = self.module
+
+        def _fmin(a: Any, b: Any) -> Any:
+            a, b = torch_mod.broadcast_tensors(a, b)
+            a_nan = torch_mod.isnan(a)
+            b_nan = torch_mod.isnan(b)
+            return torch_mod.where(
                 a_nan & ~b_nan,
                 b,
-                torch.where(b_nan & ~a_nan, a, torch.minimum(a, b)),
+                torch_mod.where(b_nan & ~a_nan, a, torch_mod.minimum(a, b)),
             )
 
-        setattr(torch, "fmin", _fmin)
-    if not hasattr(torch, "nanmin"):
+        setattr(self.module, "fmin", _fmin)
+
+    def _ensure_nanmin(self) -> None:
+        if hasattr(self.module, "nanmin"):
+            return
+        torch_mod = self.module
 
         def _nanmin(
-            x: torch.Tensor, dim: int | None = None, keepdim: bool = False
+            x: Any,
+            dim: int | None = None,
+            keepdim: bool = False,
         ) -> Any:
-            mask = torch.isfinite(x)
-            xp = torch.where(mask, x, torch.full_like(x, float("inf")))
+            mask = torch_mod.isfinite(x)
+            xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("inf")))
             if dim is None:
                 return xp.min()
             values, indices = xp.min(dim=dim, keepdim=keepdim)
             return (values, indices)
 
-        setattr(torch, "nanmin", _nanmin)
-    if not hasattr(torch, "nanmax"):
+        setattr(self.module, "nanmin", _nanmin)
+
+    def _ensure_nanmax(self) -> None:
+        if hasattr(self.module, "nanmax"):
+            return
+        torch_mod = self.module
 
         def _nanmax(
-            x: torch.Tensor, dim: int | None = None, keepdim: bool = False
+            x: Any,
+            dim: int | None = None,
+            keepdim: bool = False,
         ) -> Any:
-            mask = torch.isfinite(x)
-            xp = torch.where(mask, x, torch.full_like(x, float("-inf")))
+            mask = torch_mod.isfinite(x)
+            xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("-inf")))
             if dim is None:
                 return xp.max()
             values, indices = xp.max(dim=dim, keepdim=keepdim)
             return (values, indices)
 
-        setattr(torch, "nanmax", _nanmax)
-    if not hasattr(torch, "nansum"):
+        setattr(self.module, "nanmax", _nanmax)
+
+    def _ensure_nansum(self) -> None:
+        if hasattr(self.module, "nansum"):
+            return
+        torch_mod = self.module
 
         def _nansum(
-            x: torch.Tensor,
+            x: Any,
             dim: int | tuple[int, ...] | None = None,
             keepdim: bool = False,
             *,
-            dtype: torch.dtype | None = None,
-        ) -> torch.Tensor:
+            dtype: Any = None,
+        ) -> Any:
             target_dtype = dtype if dtype is not None else x.dtype
             x_cast = x.to(target_dtype)
-            mask = torch.isfinite(x_cast)
-            zero = torch.zeros((), device=x_cast.device, dtype=x_cast.dtype)
-            x_masked = torch.where(mask, x_cast, zero)
-            return torch.sum(x_masked, dim=dim, keepdim=keepdim, dtype=dtype)
+            mask = torch_mod.isfinite(x_cast)
+            zero = torch_mod.zeros(
+                (), device=x_cast.device, dtype=x_cast.dtype
+            )
+            x_masked = torch_mod.where(mask, x_cast, zero)
+            return torch_mod.sum(
+                x_masked, dim=dim, keepdim=keepdim, dtype=dtype
+            )
 
-        setattr(torch, "nansum", _nansum)
+        setattr(self.module, "nansum", _nansum)
+
+
+def patch_torch(
+    module: Any | None = None,
+    nn_module: Any | None = None,
+) -> TorchCompat:
+    global _TORCH_COMPAT
+    if _TORCH_COMPAT is None or module is not None or nn_module is not None:
+        compat = TorchCompat(module=module, nn_module=nn_module)
+    else:
+        compat = _TORCH_COMPAT
+    compat.apply()
+    _TORCH_COMPAT = compat
+    return compat
+
+
+class ArrowCompat:
+    def __init__(self, module: Any, flight: Any) -> None:
+        self.module = module
+        self.flight = flight
+
+    def to_numpy(self, array: Any, *, zero_copy_only: bool = True) -> Any:
+        try:
+            return array.to_numpy(zero_copy_only=zero_copy_only)
+        except TypeError:
+            return array.to_numpy()
+
+    def fixed_shape_list_from_arrays(
+        self, values: Any, shape_or_size: int | Sequence[int]
+    ) -> Any:
+        errors: list[BaseException] = []
+        array_cls = getattr(self.module, "FixedShapeArrayList", None)
+        if array_cls is not None:
+            try:
+                return array_cls.from_arrays(values, shape_or_size)
+            except TypeError as exc:
+                errors.append(exc)
+        fallback_cls = getattr(self.module, "FixedSizeListArray", None)
+        if fallback_cls is not None:
+            try:
+                length = 1
+                if isinstance(shape_or_size, (list, tuple)):
+                    dims = list(shape_or_size)
+                    if not dims:
+                        length = 1
+                    else:
+                        for dim in dims:
+                            length *= int(dim)
+                else:
+                    length = int(shape_or_size)
+                return fallback_cls.from_arrays(values, length)
+            except TypeError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[-1]
+        raise AttributeError(
+            "pyarrow does not provide a fixed-shape list array implementation"
+        )
+
+
+def patch_arrow(module: Any | None = None) -> ArrowCompat:
+    global _ARROW_COMPAT
+    if _ARROW_COMPAT is not None:
+        return _ARROW_COMPAT
+    if module is None:
+        import pyarrow as pa
+    else:
+        pa = module
+    try:
+        flight = import_module("pyarrow.flight")
+    except Exception:
+        flight = None
+    if not hasattr(pa, "FixedShapeArrayList") and hasattr(pa, "FixedSizeListArray"):
+        setattr(pa, "FixedShapeArrayList", pa.FixedSizeListArray)
+    compat = ArrowCompat(pa, flight)
+    _ARROW_COMPAT = compat
+    return compat
 
 
 def lazy_import(module_name: str) -> Any:
@@ -212,6 +338,7 @@ def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
 
 
 __all__ = [
+    "TorchCompat",
     "patch_torch",
     "lazy_import",
     "has_fsdp2",

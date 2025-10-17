@@ -59,7 +59,7 @@ def _stochastic_depth_scheduler(max_rate: float, depth: int) -> list[float]:
     return [step * float(index + 1) for index in range(depth)]
 
 
-patch_torch()
+_TORCH_COMPAT = patch_torch()
 if TYPE_CHECKING:
     from .network import Config
 
@@ -506,7 +506,10 @@ class PatchEmbedding(nn.Module):
             or any((s <= 0 for s in stride[: self.ndim]))
         ):
             raise ValueError(
-                f"stride must have length >= {self.ndim} with positive values, got {stride}"
+                (
+                    "stride must have length >= "
+                    f"{self.ndim} with positive values, got {stride}"
+                )
             )
         match self.ndim:
             case 1:
@@ -1446,7 +1449,10 @@ class DataFidelityLoss(nn.Module):
                             )
                     case "finufft":
                         raise NotImplementedError(
-                            "FINUFFT path: wire with finufft.nufft*d* or Plan if you need CPU NUFFT."
+                            (
+                                "FINUFFT path: wire with finufft.nufft*d* "
+                                "or Plan if you need CPU NUFFT."
+                            )
                         )
                     case _:
                         raise ValueError(

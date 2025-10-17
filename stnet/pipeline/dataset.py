@@ -7,7 +7,6 @@ import random
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
-import pyarrow as pa
 import torch
 from tensordict import MemoryMappedTensor
 
@@ -15,6 +14,12 @@ try:
     from torchdata.nodes import IterableWrapper
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
+
+from ..toolkit.compat import patch_arrow
+
+
+_ARROW = patch_arrow()
+pa = _ARROW.module
 
 
 def _read_meta(memmap_dir: str) -> Dict[str, Any]:
@@ -236,14 +241,14 @@ class MemoryMappedTensorStream:
         batch = int(features.shape[0])
         feat_dim = int(features.view(batch, -1).shape[1])
         label_flat = int(labels.view(batch, -1).shape[1])
-        feat_array = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.asarray(features.contiguous().view(-1).cpu().numpy())),
-            feat_dim,
+        feat_values = pa.array(
+            np.asarray(features.contiguous().view(-1).cpu().numpy())
         )
-        label_array = pa.FixedSizeListArray.from_arrays(
-            pa.array(np.asarray(labels.contiguous().view(-1).cpu().numpy())),
-            label_flat,
+        feat_array = _ARROW.fixed_shape_list_from_arrays(feat_values, feat_dim)
+        label_values = pa.array(
+            np.asarray(labels.contiguous().view(-1).cpu().numpy())
         )
+        label_array = _ARROW.fixed_shape_list_from_arrays(label_values, label_flat)
         return pa.record_batch(
             [feat_array, label_array], names=["features", "labels"]
         )

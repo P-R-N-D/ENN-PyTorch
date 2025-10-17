@@ -450,9 +450,7 @@ def _make_nvtx_counter(device: Optional[torch.device] = None) -> Any:
 
 
 class _FlopCounterStep:
-    def __init__(
-        self, parent: "FlopCounter", *, display: bool = False
-    ) -> None:
+    def __init__(self, parent: FlopCounter, *, display: bool = False) -> None:
         self._parent = parent
         self._display = display
         self._torch_counter: Optional[_TorchFlopCounter] = None
@@ -462,7 +460,7 @@ class _FlopCounterStep:
         self.nvtx_total = 0.0
         self.total = 0.0
 
-    def __enter__(self) -> "_FlopCounterStep":
+    def __enter__(self) -> _FlopCounterStep:
         _reset_manual_flops()
         self._torch_counter = _TorchFlopCounter(display=self._display)
         self._torch_counter.__enter__()
@@ -515,7 +513,7 @@ class FlopCounter:
     def device(self) -> Optional[torch.device]:
         return self._device
 
-    def __enter__(self) -> "FlopCounter":
+    def __enter__(self) -> FlopCounter:
         self._hook_session = _create_flop_hook_session(
             self._model,
             mode=self._mode,

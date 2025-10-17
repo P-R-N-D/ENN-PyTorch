@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .capability import get_device, get_runtime_config, resolve_sdpa_backends
-from .compat import SDPBackend, _to_sdpa_backends, patch_torch, sdpa_kernel
+from .compat import SDPBackend, TorchCompat, _to_sdpa_backends, patch_torch, sdpa_kernel
 from .optimization import (
     AdamW,
     Autocast,
@@ -27,6 +27,7 @@ __all__ = [
     "get_runtime_config",
     "resolve_sdpa_backends",
     "patch_torch",
+    "TorchCompat",
     "SDPBackend",
     "sdpa_kernel",
     "_to_sdpa_backends",
@@ -34,4 +35,4 @@ __all__ = [
     "StandardScaler",
     "IncrementalPCA",
 ]
-patch_torch()
+_TORCH_COMPAT = patch_torch()

@@ -48,7 +48,7 @@ from ..toolkit.compat import patch_torch
 from ..toolkit.optimization import Autocast, compile
 from .module import Meta, MetaNet, SpatioTemporalNet
 
-patch_torch()
+_TORCH_COMPAT = patch_torch()
 
 
 class LossWeightController(Protocol):
