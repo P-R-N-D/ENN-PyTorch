@@ -105,7 +105,7 @@ class Model(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self._local = SpatioTemporalNet(
+        self.local_net = SpatioTemporalNet(
             self.in_dim, self.out_shape, config=config
         ).to(self._device)
         global_net = MetaNet(
@@ -117,8 +117,7 @@ class Model(nn.Module):
             drop_path=float(getattr(config, "drop_path", 0.0)),
             norm_type=str(getattr(config, "normalize_method", "layernorm")),
         ).to(self._device)
-        self._global = global_net
-        setattr(self, "global", global_net)
+        self.global_net = global_net
         self.microbatch = int(config.microbatch)
         if self.microbatch <= 0:
             raise ValueError(
@@ -135,8 +134,8 @@ class Model(nn.Module):
         mode = str(getattr(config, "compile_mode", "default"))
         try:
             if bool(getattr(config, "use_compilation", False)):
-                self._local = compile(
-                    self._local,
+                self.local_net = compile(
+                    self.local_net,
                     mode=mode,
                     fullgraph=False,
                     dynamic=False,
@@ -144,14 +143,13 @@ class Model(nn.Module):
                 )
             if bool(getattr(config, "use_compilation", False)):
                 compiled_global = compile(
-                    self._global,
+                    self.global_net,
                     mode=mode,
                     fullgraph=False,
                     dynamic=False,
                     backend="inductor",
                 )
-                self._global = compiled_global
-                setattr(self, "global", compiled_global)
+                self.global_net = compiled_global
         except Exception:
             pass
         self.__config = config
@@ -376,7 +374,7 @@ class Model(nn.Module):
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         device = self._device
-        base_dtype = next(self._local.parameters()).dtype
+        base_dtype = next(self.local_net.parameters()).dtype
         infer_mode = labels_flat is None or (
             net_loss is None and global_loss is None and (local_loss is None)
         )
@@ -392,8 +390,8 @@ class Model(nn.Module):
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []
         if not infer_mode:
-            self._local.train()
-            self._global.train()
+            self.local_net.train()
+            self.global_net.train()
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
@@ -401,12 +399,12 @@ class Model(nn.Module):
                     device, dtype=base_dtype, non_blocking=True
                 )
                 with Autocast.float(device):
-                    out: Meta = self._local(x_slice)
+                    out: Meta = self.local_net(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
         else:
-            self._local.eval()
-            self._global.eval()
+            self.local_net.eval()
+            self.global_net.eval()
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
@@ -414,7 +412,7 @@ class Model(nn.Module):
                     device, dtype=base_dtype, non_blocking=True
                 )
                 with torch.no_grad(), Autocast.float(device):
-                    out = self._local(x_slice)
+                    out = self.local_net(x_slice)
                 token_chunks.append(
                     out.tokens
                     if out.tokens.dtype == base_dtype
@@ -438,8 +436,8 @@ class Model(nn.Module):
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
         with torch.no_grad() if infer_mode else torch.enable_grad():
             with Autocast.float(device):
-                refined_tokens = self._global(tokens_centered)
-        residual_context = self._local.decode(refined_tokens, apply_norm=True)
+                refined_tokens = self.global_net(tokens_centered)
+        residual_context = self.local_net.decode(refined_tokens, apply_norm=True)
         residual = residual_context.view(b, -1)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
@@ -602,6 +600,3 @@ class Model(nn.Module):
     ) -> torch.Tensor:
         return flat.view(flat.shape[0], *shape)
 
-    @property
-    def local(self) -> SpatioTemporalNet:
-        return self._local

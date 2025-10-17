@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import base64
@@ -7,6 +8,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, Optional, Protocol
+
+import torch.distributed as dist
 
 
 class _ZMQProxy:
@@ -179,3 +182,43 @@ class MessageQueue(Publisher, Subscriber):
     def close(self) -> None:
         self._pub.close(0)
         self._sub.close(0)
+
+
+class DistributedQueue:
+    def __init__(self) -> None:
+        self._enabled = False
+        self._store: Any | None = None
+        try:
+            self._enabled = dist.is_available() and dist.is_initialized()
+            if self._enabled:
+                self._store = dist.distributed_c10d._get_default_store()
+        except Exception:
+            self._enabled = False
+            self._store = None
+
+    def publish(self, key: str, value: str) -> None:
+        if not self._enabled or self._store is None:
+            return
+        self._store.set(key, value.encode("utf-8"))
+
+    def wait(self, key: str, timeout_s: float = 120.0) -> Optional[str]:
+        if not self._enabled or self._store is None:
+            return None
+        start = time.time()
+        while True:
+            try:
+                return self._store.get(key).decode("utf-8")
+            except Exception:
+                if time.time() - start > float(timeout_s):
+                    raise TimeoutError(f"DistributedQueue wait timeout: {key}")
+                time.sleep(0.05)
+
+
+__all__ = [
+    "Message",
+    "Publisher",
+    "Subscriber",
+    "CompatQueue",
+    "MessageQueue",
+    "DistributedQueue",
+]

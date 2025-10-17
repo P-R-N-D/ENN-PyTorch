@@ -418,19 +418,61 @@ def _preprocess(
             return y.to_tensor()
         return torch.as_tensor(y)
 
+    def _maybe_batch(
+        x_value: Any, y_value: Any
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
+        def _feature_tensor(value: Any) -> torch.Tensor | None:
+            if isinstance(value, torch.Tensor):
+                return value
+            if hasattr(value, "to_tensor"):
+                try:
+                    return value.to_tensor()
+                except Exception:
+                    return None
+            if hasattr(value, "as_tensor"):
+                try:
+                    return value.as_tensor()
+                except Exception:
+                    return None
+            try:
+                return torch.as_tensor(value)
+            except Exception:
+                return None
+
+        x_tensor = _feature_tensor(x_value)
+        if x_tensor is None:
+            return None
+        try:
+            y_tensor = _lbl(y_value)
+        except Exception:
+            return None
+        if not isinstance(y_tensor, torch.Tensor):
+            return None
+        x_tensor = x_tensor.detach().to(dtype=torch.float32)
+        if x_tensor.dim() == 0:
+            x_tensor = x_tensor.reshape(1, 1)
+        elif x_tensor.dim() == 1:
+            x_tensor = x_tensor.reshape(-1, 1)
+        else:
+            batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
+            x_tensor = x_tensor.reshape(batch_dim, -1)
+        batch = int(x_tensor.shape[0])
+        y_tensor = y_tensor.detach()
+        if y_tensor.dim() == 0:
+            y_tensor = y_tensor.unsqueeze(0)
+        if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
+            y_tensor = y_tensor.unsqueeze(-1)
+        if y_tensor.shape[0] != batch:
+            return None
+        label_shape = tuple(y_tensor.shape[1:])
+        keys = [(int(i),) for i in range(batch)]
+        return (x_tensor, y_tensor, keys, label_shape)
+
     if isinstance(data, dict) and "X" in data and ("Y" in data):
         x, y = (data["X"], data["Y"])
-        if (
-            isinstance(x, torch.Tensor)
-            and isinstance(y, torch.Tensor)
-            and (x.dim() >= 2)
-            and (y.dim() >= 2)
-            and (x.shape[0] == y.shape[0])
-        ):
-            xr, yt = (x, y)
-            keys = [(int(i),) for i in range(int(x.shape[0]))]
-            label_shape = tuple(yt.shape[1:])
-            return (xr, yt, keys, label_shape)
+        batch_result = _maybe_batch(x, y)
+        if batch_result is not None:
+            return batch_result
         xr, yt = (_feat_row(x).unsqueeze(0), _lbl(y))
         if yt.dim() == 0 or yt.dim() == 1:
             yt = yt.unsqueeze(0)
@@ -439,6 +481,9 @@ def _preprocess(
         return (xr, yt, keys, label_shape)
     if isinstance(data, (tuple, list)) and len(data) >= 2:
         x, y = (data[0], data[1])
+        batch_result = _maybe_batch(x, y)
+        if batch_result is not None:
+            return batch_result
         xr = _feat_row(x).unsqueeze(0)
         yt = _lbl(y)
         if yt.dim() == 0:
@@ -813,56 +858,86 @@ def epochs(
                 p = getattr(module, name)
                 if isinstance(p, torch.nn.Parameter):
                     ignored_params.append(p)
-    ignored_params = set(ignored_params)
+
+    class _IdentityParamSet(Sequence[torch.nn.Parameter]):
+        def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
+            self._params = tuple(params)
+            self._ids = {id(p) for p in self._params}
+
+        def __len__(self) -> int:  # type: ignore[override]
+            return len(self._params)
+
+        def __iter__(self):  # type: ignore[override]
+            return iter(self._params)
+
+        def __getitem__(self, index: int) -> torch.nn.Parameter:  # type: ignore[override]
+            return self._params[index]
+
+        def __contains__(self, item: object) -> bool:  # type: ignore[override]
+            if not isinstance(item, torch.nn.Parameter):
+                return False
+            return id(item) in self._ids
+
+    ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
+
+    def _per_module_ignored_params(
+        module: torch.nn.Module,
+    ) -> Optional[_IdentityParamSet]:
+        if len(ignored_param_registry) == 0:
+            return None
+        params = [
+            param
+            for param in module.parameters(recurse=True)
+            if param in ignored_param_registry
+        ]
+        return _IdentityParamSet(tuple(params)) if params else None
+
+    wrapped: set[int] = set()
+
+    def _fsdp_wrap(target: Optional[torch.nn.Module]) -> None:
+        if target is None or id(target) in wrapped:
+            return
+        wrapped.add(id(target))
+        per_module_ignored = _per_module_ignored_params(target)
+        handle = fully_shard(
+            target,
+            mesh=mesh,
+            mp_policy=mp_policy,
+            reshard_after_forward=False,
+            ignored_params=per_module_ignored or None,
+        )
+        handle.set_requires_gradient_sync(True)
+
+    def _collect_block_modules(root: Optional[torch.nn.Module]) -> list[torch.nn.Module]:
+        if root is None:
+            return []
+        blocks: list[torch.nn.Module] = []
+        seen: set[int] = set()
+        for module in root.modules():
+            block_list = getattr(module, "blocks", None)
+            if isinstance(block_list, torch.nn.ModuleList):
+                for block in block_list:
+                    if isinstance(block, torch.nn.Module) and id(block) not in seen:
+                        seen.add(id(block))
+                        blocks.append(block)
+        return blocks
+
     try:
-        if hasattr(model, "local") and hasattr(model.local, "blocks"):
-            for m in model.local.blocks:
-                fully_shard(
-                    m,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=False,
-                    ignored_params=[
-                        param
-                        for param in m.parameters(recurse=True)
-                        if param in ignored_params
-                    ],
-                ).set_requires_gradient_sync(True)
-        global_net = None
-        if hasattr(model, "global"):
-            maybe_global = getattr(model, "global")
-            if hasattr(maybe_global, "blocks"):
-                global_net = maybe_global
-        elif hasattr(model, "_global") and hasattr(model._global, "blocks"):
-            global_net = model._global
-        if global_net is not None:
-            for m in global_net.blocks:
-                fully_shard(
-                    m,
-                    mesh=mesh,
-                    mp_policy=mp_policy,
-                    reshard_after_forward=False,
-                    ignored_params=[
-                        param
-                        for param in m.parameters(recurse=True)
-                        if param in ignored_params
-                    ],
-                ).set_requires_gradient_sync(True)
-        fully_shard(
-            model,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
-            ignored_params=ignored_params,
-        ).set_requires_gradient_sync(True)
+        for submodule in (
+            _collect_block_modules(getattr(model, "local_net", None))
+            + _collect_block_modules(getattr(model, "global_net", None))
+        ):
+            _fsdp_wrap(submodule)
+        _fsdp_wrap(model)
     except (RuntimeError, ValueError, TypeError):
-        fully_shard(
+        handle = fully_shard(
             model,
             mesh=mesh,
             mp_policy=mp_policy,
-            ignored_params=ignored_params,
+            ignored_params=(ignored_param_registry if len(ignored_param_registry) > 0 else None),
             reshard_after_forward=False,
-        ).set_requires_gradient_sync(True)
+        )
+        handle.set_requires_gradient_sync(True)
     net_params = [p for p in model.parameters()]
     optimizer = AdamW.float(
         net_params,
@@ -886,7 +961,7 @@ def epochs(
         non_blocking_copy=bool(overlap_h2d),
         seed=seed,
         shuffle=True,
-        io_backend="flight",
+        io_backend="auto",
     )
     train_steps = len(train_loader0)
     val_steps = len(val_loader0) if val_loader0 is not None else 0
@@ -1046,7 +1121,7 @@ def epochs(
             non_blocking_copy=bool(overlap_h2d),
             seed=seed,
             shuffle=True,
-            io_backend="flight",
+            io_backend="auto",
         )
         if restore_dl_state:
             with contextlib.suppress((RuntimeError, ValueError, TypeError)):
@@ -1576,7 +1651,7 @@ def infer(
         non_blocking_copy=True,
         seed=seed,
         shuffle=False,
-        io_backend="flight",
+        io_backend="auto",
     )
     status_bar = _status_bar("Prediction", len(train_loader), device)
     flop_counter = FlopCounter(model, mode="eval", device=device)

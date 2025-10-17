@@ -34,8 +34,8 @@ from torchdata.nodes import (
 from torch.distributed import distributed_c10d
 
 from ..connection.socket import ArrowFlight
-from ..toolkit.compat import patch_arrow
 from ..toolkit.capability import apply_threading_defaults
+from ..toolkit.compat import has_arrow_flight, patch_arrow
 from ..toolkit.optimization import DataLoader
 from .dataset import MemoryMappedTensorStream
 
@@ -622,12 +622,17 @@ def stream(
         if not isinstance(device, torch.device)
         else device
     )
-    backend = io_backend or "auto"
-    if not isinstance(backend, str):
+    backend_input = io_backend or "auto"
+    if not isinstance(backend_input, str):
         raise TypeError(
             "io_backend must be a string such as 'auto', 'local', or 'flight'"
         )
-    backend = backend.lower()
+    backend_normalized = backend_input.lower()
+    allow_fallback = backend_normalized == "auto"
+    if backend_normalized == "auto":
+        backend = "flight" if has_arrow_flight() else "local"
+    else:
+        backend = backend_normalized
     threads = apply_threading_defaults()
     map_fn = partial(
         fetch,
@@ -830,11 +835,13 @@ def stream(
 
     if backend == "local":
         return _local_impl()
+    if backend != "flight":
+        raise ValueError(f"Unsupported io_backend: {backend_input!r}")
 
     try:
         return _flight_impl()
     except Exception as exc:
-        if backend != "auto":
+        if not allow_fallback:
             raise
         warnings.warn(
             (
