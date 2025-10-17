@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from contextlib import suppress
 from typing import Any, Iterator, Optional, Tuple
 
 import torch.distributed as dist
@@ -234,14 +235,69 @@ class ArrowFlight:
         *, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 2.0
     ) -> Tuple[ArrowFlight.Server, str]:
         server = ArrowFlight.Server(location=f"grpc://{host}:{port}")
-        thread = threading.Thread(target=server.serve, daemon=True)
+        thread_error: list[BaseException] = []
+        bound = threading.Event()
+
+        def _serve() -> None:
+            try:
+                server.serve()
+            except BaseException as exc:
+                thread_error.append(exc)
+                raise
+
+        thread = threading.Thread(target=_serve, daemon=True)
         thread.start()
-        start = time.time()
-        actual_port = getattr(server, "port", 0) or port
-        while actual_port in (None, 0) and time.time() - start < wait_ready_s:
-            time.sleep(0.01)
-            actual_port = getattr(server, "port", 0) or port
+        deadline = time.time() + float(wait_ready_s)
+
+        def _wait_for_bind() -> int:
+            while time.time() < deadline:
+                actual = getattr(server, "port", 0) or port
+                if actual not in (None, 0):
+                    bound.set()
+                    return actual
+                if thread_error:
+                    raise RuntimeError(
+                        "Arrow Flight server thread failed during startup"
+                    ) from thread_error[0]
+                if not thread.is_alive():
+                    raise RuntimeError(
+                        "Arrow Flight server thread exited before binding to a port"
+                    )
+                time.sleep(0.01)
+            return getattr(server, "port", 0) or port
+
+        actual_port = _wait_for_bind()
+        if not bound.is_set():
+            if thread_error:
+                raise RuntimeError(
+                    f"Arrow Flight server failed to bind on {host}"
+                ) from thread_error[0]
+            raise RuntimeError(
+                f"Arrow Flight server did not bind to a port on {host}"
+            )
         uri = f"grpc://{host}:{actual_port}"
+        deadline = time.time() + float(wait_ready_s)
+        ready = False
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                with flight.FlightClient(uri) as client:
+                    list(client.list_flights())
+                ready = True
+                break
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.05)
+        if not ready:
+            if thread_error:
+                raise RuntimeError(
+                    f"Arrow Flight server not ready: {uri}"
+                ) from thread_error[0]
+            if last_error is not None:
+                raise RuntimeError(
+                    f"Arrow Flight server not ready: {uri}"
+                ) from last_error
+            raise RuntimeError(f"Arrow Flight server not ready: {uri}")
         return (server, uri)
 
     @staticmethod
