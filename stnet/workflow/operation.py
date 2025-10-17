@@ -1008,41 +1008,41 @@ def epochs(
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
         flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-    train_loader, val_loader, keep = stream(
-        memmap_dir=memmap_dir,
-        device=device,
-        batch_size=batch_size,
-        val_frac=val_frac,
-        prefetch_factor=prefetch_factor,
-        non_blocking_copy=bool(overlap_h2d),
-        seed=seed,
-        shuffle=True,
-        io_backend="flight",
-    )
-    ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
-    init_state_path = (
-        os.path.join(init_ckpt_dir, "dataloader.json")
-        if init_ckpt_dir
-        else None
-    )
-    dl_state_path: Optional[str] = None
-    if os.path.isfile(ckpt_state_path):
-        dl_state_path = ckpt_state_path
-    elif init_state_path and os.path.isfile(init_state_path):
-        dl_state_path = init_state_path
-    if dl_state_path:
-        try:
-            with open(dl_state_path, "r", encoding="utf-8") as _f:
-                _dl = json.load(_f)
-        except (OSError, json.JSONDecodeError):
-            _dl = {}
-        state_train = _dl.get("train", {}) if isinstance(_dl, dict) else {}
-        state_val = _dl.get("val", {}) if isinstance(_dl, dict) else {}
-        with contextlib.suppress((RuntimeError, ValueError, TypeError)):
-            train_loader.load_state_dict(state_train)
-        if val_loader is not None:
+        train_loader, val_loader, keep = stream(
+            memmap_dir=memmap_dir,
+            device=device,
+            batch_size=batch_size,
+            val_frac=val_frac,
+            prefetch_factor=prefetch_factor,
+            non_blocking_copy=bool(overlap_h2d),
+            seed=seed,
+            shuffle=True,
+            io_backend="flight",
+        )
+        ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
+        init_state_path = (
+            os.path.join(init_ckpt_dir, "dataloader.json")
+            if init_ckpt_dir
+            else None
+        )
+        dl_state_path: Optional[str] = None
+        if os.path.isfile(ckpt_state_path):
+            dl_state_path = ckpt_state_path
+        elif init_state_path and os.path.isfile(init_state_path):
+            dl_state_path = init_state_path
+        if dl_state_path:
+            try:
+                with open(dl_state_path, "r", encoding="utf-8") as _f:
+                    _dl = json.load(_f)
+            except (OSError, json.JSONDecodeError):
+                _dl = {}
+            state_train = _dl.get("train", {}) if isinstance(_dl, dict) else {}
+            state_val = _dl.get("val", {}) if isinstance(_dl, dict) else {}
             with contextlib.suppress((RuntimeError, ValueError, TypeError)):
-                val_loader.load_state_dict(state_val)
+                train_loader.load_state_dict(state_train)
+            if val_loader is not None:
+                with contextlib.suppress((RuntimeError, ValueError, TypeError)):
+                    val_loader.load_state_dict(state_val)
         first_param = next(iter(model.parameters()), None)
         param_dtype = (
             first_param.dtype if first_param is not None else torch.float32
