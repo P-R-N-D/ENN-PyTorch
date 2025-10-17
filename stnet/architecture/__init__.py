@@ -4,7 +4,7 @@ from typing import TypeAlias
 
 from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
 
-patch_torch()
+_TORCH_COMPAT = patch_torch()
 from .module import (
     CrossTransformer,
     DataFidelityLoss,
