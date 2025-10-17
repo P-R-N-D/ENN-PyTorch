@@ -1,17 +1,26 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
 import importlib
 import math
 import os
-
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import nn, optim
-from torchdata.nodes import Loader, BaseNode
+from torchdata.nodes import BaseNode, Loader
+
 from .capability import (
     get_device,
     get_runtime_config,
@@ -23,16 +32,15 @@ from .capability import (
 
 try:
     from torchao.quantization import (
-        quantize_,
-        Float8WeightOnlyConfig,
         Float8DynamicActivationFloat8WeightConfig,
-        Int8WeightOnlyConfig,
-        Int8DynamicActivationInt8WeightConfig,
+        Float8WeightOnlyConfig,
         Int4WeightOnlyConfig,
+        Int8DynamicActivationInt8WeightConfig,
+        Int8WeightOnlyConfig,
+        quantize_,
     )
 except ImportError:
     quantize_ = None
-
 QATConfig = None
 QATStep = None
 try:
@@ -43,8 +51,8 @@ except Exception:
     except Exception:
         try:
             from torchao.quantization.qat import (
-                IntXQuantizationAwareTrainingConfig,
                 FromIntXQuantizationAwareTrainingConfig,
+                IntXQuantizationAwareTrainingConfig,
             )
 
             class _ShimQATStep:
@@ -59,7 +67,7 @@ except Exception:
                     activation_config: Any = None,
                     weight_config: Any = None,
                     step: Any = "prepare",
-                    **kwargs: Any
+                    **kwargs: Any,
                 ) -> None:
                     self.base_config = base_config
                     self.activation_config = activation_config
@@ -137,7 +145,7 @@ class _FlopHookSession:
 
     def _set_active(self, value: bool) -> None:
         global _FLOP_TRACKING_DEPTH
-        if value and not self._active:
+        if value and (not self._active):
             _FLOP_TRACKING_DEPTH += 1
             self._active = True
         elif not value and self._active:
@@ -157,7 +165,9 @@ class _FlopHookSession:
         self._set_active(True)
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type or exc or tb:
+            pass
         self.close()
         return False
 
@@ -200,7 +210,11 @@ def _create_flop_hook_session(
     def _infer_linear_mkn(
         inp: torch.Tensor, weight: Optional[torch.Tensor]
     ) -> Tuple[int, int, int]:
-        K = int(weight.shape[-1]) if weight is not None and weight.ndim >= 2 else int(inp.shape[-1])
+        K = (
+            int(weight.shape[-1])
+            if weight is not None and weight.ndim >= 2
+            else int(inp.shape[-1])
+        )
         M = int(inp.numel() // max(K, 1))
         N = (
             int(weight.shape[0])
@@ -210,11 +224,11 @@ def _create_flop_hook_session(
         return (M, K, N)
 
     def linear_flops(
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        weight: Optional[torch.Tensor],
+        inp: torch.Tensor, out: torch.Tensor, weight: Optional[torch.Tensor]
     ) -> float:
         M, K, N = _infer_linear_mkn(inp, weight)
+        if out is not None and out.numel() > 0 and (N > 0):
+            M = max(M, int(out.numel() // max(N, 1)))
         if M <= 0 or K <= 0 or N <= 0:
             return 0.0
         bias_cost = 1.0 * M * N if include_bias else 0.0
@@ -231,27 +245,42 @@ def _create_flop_hook_session(
             return 0.0
         try:
             out_elems = int(out.numel())
-            cin_per_group = int(weight.shape[1])
+            groups = max(1, int(groups))
+            cin_total = (
+                int(inp.shape[1])
+                if isinstance(inp, torch.Tensor) and inp.ndim >= 2
+                else int(weight.shape[1] * groups)
+            )
+            cin_per_group = max(1, cin_total // groups)
             k_elems = int(math.prod(weight.shape[2:]))
             per_out = 2.0 * cin_per_group * k_elems
-            fwd = per_out * out_elems + out_elems
+            bias_cost = out_elems if include_bias else 0.0
+            fwd = per_out * out_elems + bias_cost
             return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
         except Exception:
             return 0.0
 
-    def _hook_linear(mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor) -> Any:
+    def _hook_linear(
+        mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor
+    ) -> Any:
         try:
             x = inp[0]
             w = getattr(mod, "weight", None)
             if w is None:
                 inner = getattr(mod, "linear", None)
-                w = getattr(inner, "weight", None) if inner is not None else None
+                w = (
+                    getattr(inner, "weight", None)
+                    if inner is not None
+                    else None
+                )
             val = linear_flops(x, out, w)
             _FLOP_BUCKET.add(type(mod).__name__, val)
         except Exception:
             pass
 
-    def _hook_conv(mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor) -> Any:
+    def _hook_conv(
+        mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor
+    ) -> Any:
         try:
             x = inp[0]
             w = getattr(mod, "weight", None)
@@ -263,9 +292,9 @@ def _create_flop_hook_session(
 
     handles: List[Any] = []
     for m in model.modules():
-        if any(isinstance(m, t) for t in target_types):
+        if any((isinstance(m, t) for t in target_types)):
             handles.append(m.register_forward_hook(_hook_linear))
-        if any(isinstance(m, t) for t in conv_types):
+        if any((isinstance(m, t) for t in conv_types)):
             handles.append(m.register_forward_hook(_hook_conv))
     return _FlopHookSession(handles)
 
@@ -274,21 +303,23 @@ def _import_callable(spec: str) -> Callable:
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("Empty spec for callable import")
     raw = spec.strip()
-    root_pkg = __package__.split('.', 1)[0] if __package__ else 'stnet'
+    root_pkg = __package__.split(".", 1)[0] if __package__ else "stnet"
     default_module = f"{root_pkg}.toolkit.optimization"
-    if ':' in raw:
-        mod_part, fn_part = raw.split(':', 1)
+    if ":" in raw:
+        mod_part, fn_part = raw.split(":", 1)
     else:
-        mod_part, fn_part = ('', raw)
+        mod_part, fn_part = ("", raw)
     mod_part = mod_part.strip()
     fn_part = fn_part.strip()
     if not fn_part:
         raise ValueError(f"Missing function in spec: {spec}")
     if not mod_part:
         mod_name = default_module
-    elif mod_part.startswith('.'):
+    elif mod_part.startswith("."):
         mod_name = f"{root_pkg}{mod_part}"
-    elif not mod_part.startswith(root_pkg + '.') and (mod_part.split('.')[0] not in ('importlib', 'torch', 'math', 'sys')):
+    elif not mod_part.startswith(root_pkg + ".") and mod_part.split(".")[
+        0
+    ] not in ("importlib", "torch", "math", "sys"):
         mod_name = f"{root_pkg}.{mod_part}"
     else:
         mod_name = mod_part
@@ -329,7 +360,9 @@ class _NoOpNvtxCounter:
     def __enter__(self) -> "_NoOpNvtxCounter":
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type or exc or tb:
+            pass
         return False
 
     def get_total_flops(self) -> float:
@@ -349,7 +382,9 @@ class _NvtxCounter:
             self._start = 0.0
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type or exc or tb:
+            pass
         try:
             self._end = float(self._getter())
         except Exception:
@@ -369,7 +404,9 @@ class _NvtxCounter:
 class _TorchFlopCounter:
     def __init__(self, display: bool = False) -> None:
         try:
-            from torch.utils.flop_counter import FlopCounterMode as _TorchFlopCounterMode
+            from torch.utils.flop_counter import (
+                FlopCounterMode as _TorchFlopCounterMode,
+            )
 
             self._impl = _TorchFlopCounterMode(display=display)
         except Exception:
@@ -380,9 +417,11 @@ class _TorchFlopCounter:
             self._impl.__enter__()
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type or exc or tb:
+            pass
         if self._impl is not None:
-            self._impl.__exit__(*exc)
+            self._impl.__exit__(exc_type, exc, tb)
         return False
 
     def get_total_flops(self) -> float:
@@ -402,12 +441,18 @@ def _make_nvtx_counter(device: Optional[torch.device] = None) -> Any:
     if dev is None or getattr(dev, "type", None) != "cuda":
         return _NoOpNvtxCounter()
     _ensure_nvtx_flops_getter()
-    getter = _NVTX_FLOPS_GETTER if _NVTX_FLOPS_GETTER is not None else _nvtx_soft_getter
+    getter = (
+        _NVTX_FLOPS_GETTER
+        if _NVTX_FLOPS_GETTER is not None
+        else _nvtx_soft_getter
+    )
     return _NvtxCounter(getter)
 
 
 class _FlopCounterStep:
-    def __init__(self, parent: "FlopCounter", *, display: bool = False) -> None:
+    def __init__(
+        self, parent: "FlopCounter", *, display: bool = False
+    ) -> None:
         self._parent = parent
         self._display = display
         self._torch_counter: Optional[_TorchFlopCounter] = None
@@ -425,17 +470,17 @@ class _FlopCounterStep:
         self._nvtx_counter.__enter__()
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         manual = _consume_manual_flops()
         if manual > 0.0:
             _nvtx_soft_add(manual)
         self.manual_total = manual
         if self._torch_counter is not None:
-            self._torch_counter.__exit__(*exc)
+            self._torch_counter.__exit__(exc_type, exc, tb)
             self.torch_total = self._torch_counter.get_total_flops()
             self._torch_counter = None
         if self._nvtx_counter is not None:
-            self._nvtx_counter.__exit__(*exc)
+            self._nvtx_counter.__exit__(exc_type, exc, tb)
             try:
                 self.nvtx_total = float(self._nvtx_counter.get_total_flops())
             except Exception:
@@ -482,9 +527,11 @@ class FlopCounter:
         _reset_manual_flops()
         return self
 
-    def __exit__(self, *exc: Any) -> bool:
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if exc_type or exc or tb:
+            pass
         if self._hook_session is not None:
-            self._hook_session.__exit__(*exc)
+            self._hook_session.__exit__(exc_type, exc, tb)
             self._hook_session = None
         return False
 
@@ -507,7 +554,7 @@ def attention_flops_bshd(
     dropout_p: float = 0.0,
     training: bool = False,
     include_softmax_scale_dropout: bool = True,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> float:
     try:
         B = int(q.shape[0])
@@ -516,15 +563,15 @@ def attention_flops_bshd(
         d = int(q.shape[3])
     except Exception:
         return 0.0
-    if B <= 0 or S <= 0 or H <= 0 or d <= 0:
+    if B <= 0 or S <= 0 or H <= 0 or (d <= 0):
         return 0.0
-    matmul = 4.0 * B * H * (S ** 2) * d
+    matmul = 4.0 * B * H * S**2 * d
     misc = 0.0
     if include_softmax_scale_dropout:
         misc_coeff = 6.0
         if training and float(dropout_p) > 0.0:
             misc_coeff += 1.0
-        misc = misc_coeff * (B * H * (S ** 2))
+        misc = misc_coeff * (B * H * S**2)
     fwd = matmul + misc
     return float(fwd * (1.0 + max(0.0, float(bwd_factor))))
 
@@ -605,7 +652,9 @@ def _get_node_length(node: Any) -> Any:
         if n is not None and bs:
             steps = max(1, int(math.ceil(n / bs)))
     if not steps:
-        sampler = getattr(node, "batch_sampler", None) or getattr(node, "sampler", None)
+        sampler = getattr(node, "batch_sampler", None) or getattr(
+            node, "sampler", None
+        )
         try:
             steps = len(sampler) if sampler is not None else None
         except Exception:
@@ -618,16 +667,23 @@ def _get_node_length(node: Any) -> Any:
 def compile(
     m: nn.Module,
     *args: Any,
-    mode: str = "max-autotune" if get_device().type == "cuda" else "max-autotune-no-cudagraphs",
+    mode: str = "max-autotune"
+    if get_device().type == "cuda"
+    else "max-autotune-no-cudagraphs",
     fullgraph: bool = True,
     dynamic: bool = True,
     backend: str = "inductor",
-    **kwargs: Any
+    **kwargs: Any,
 ) -> nn.Module:
     m_compile = getattr(m, "compile", None)
     if callable(m_compile):
         try:
-            compiled = m_compile(mode=mode, fullgraph=fullgraph, dynamic=dynamic, backend=backend)
+            compiled = m_compile(
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+                backend=backend,
+            )
             return compiled if isinstance(compiled, nn.Module) else m
         except TypeError:
             try:
@@ -640,7 +696,13 @@ def compile(
     _compile = getattr(torch, "compile", None)
     if callable(_compile):
         try:
-            return _compile(m, mode=mode, fullgraph=fullgraph, dynamic=dynamic, backend=backend)
+            return _compile(
+                m,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+                backend=backend,
+            )
         except Exception:
             return m
     return m
@@ -651,7 +713,13 @@ def _is_contiguous_bshd(t: torch.Tensor) -> bool:
         return False
     _, S, H, D = t.shape
     st = t.stride()
-    return t.is_contiguous() and st[-1] == 1 and (st[-2] == D) and (st[-3] == H * D) and (st[-4] == S * H * D)
+    return (
+        t.is_contiguous()
+        and st[-1] == 1
+        and (st[-2] == D)
+        and (st[-3] == H * D)
+        and (st[-4] == S * H * D)
+    )
 
 
 class ScaledDotProductAttention(torch.nn.Module):
@@ -665,13 +733,15 @@ class ScaledDotProductAttention(torch.nn.Module):
         self.nh = int(num_heads) if num_heads is not None else None
         self.hd = int(head_dim) if head_dim is not None else None
         cfg = get_runtime_config()
-        self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
+        self.te_first = (
+            bool(cfg.te_first) if te_first is None else bool(te_first)
+        )
         ok, te = self._is_te_available()
         self._te_ok = (
             ok
             and torch.cuda.is_available()
-            and self.nh is not None
-            and self.hd is not None
+            and (self.nh is not None)
+            and (self.hd is not None)
         )
         self._te_attn: Any = None
         if self._te_ok:
@@ -690,8 +760,13 @@ class ScaledDotProductAttention(torch.nn.Module):
         try:
             with contextlib.ExitStack() as st:
                 import warnings as _w
+
                 st.enter_context(_w.catch_warnings())
-                _w.filterwarnings("ignore", message="Detected a Jax installation.*", category=RuntimeWarning)
+                _w.filterwarnings(
+                    "ignore",
+                    message="Detected a Jax installation.*",
+                    category=RuntimeWarning,
+                )
                 import transformer_engine.pytorch as te
             return (True, te)
         except Exception:
@@ -730,9 +805,9 @@ class ScaledDotProductAttention(torch.nn.Module):
         use_te = (
             self.te_first
             and self._te_ok
-            and self._te_attn is not None
-            and attn_mask is None
-            and not kwargs
+            and (self._te_attn is not None)
+            and (attn_mask is None)
+            and (not kwargs)
         )
         if use_te:
             q_bhsd = q.permute(0, 2, 1, 3).contiguous()
@@ -770,17 +845,11 @@ class ScaledDotProductAttention(torch.nn.Module):
         if backends:
             with sdpa_kernel(backends):
                 sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bhsd,
-                    k_bhsd,
-                    v_bhsd,
-                    **sdpa_kwargs,
+                    q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
                 )
         if sdpa_out is None:
             sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd,
-                k_bhsd,
-                v_bhsd,
-                **sdpa_kwargs,
+                q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
             )
         return sdpa_out.permute(0, 2, 1, 3).contiguous()
 
@@ -795,7 +864,9 @@ class ScaledDotProductAttention(torch.nn.Module):
 
 
 class _GMSRFallback(nn.Module):
-    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
+    def __init__(
+        self, d_model: int, nhead: int, use_gate: bool = True
+    ) -> None:
         super().__init__()
         self.d_model = int(d_model)
         self.nhead = int(nhead)
@@ -804,17 +875,27 @@ class _GMSRFallback(nn.Module):
         self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.g_proj = nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
+        self.g_proj = (
+            nn.Linear(self.d_model, self.d_model, bias=False)
+            if self.use_gate
+            else None
+        )
         self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
         self.norm = nn.LayerNorm(self.d_model)
 
-    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *args: Any, **kwargs: Any
+    ) -> torch.Tensor:
         B, S, D = x.shape
         H, Dh = (self.nhead, self.head_dim)
         q = self.q_proj(x).view(B, S, H, Dh)
         v = self.v_proj(x).view(B, S, H, Dh)
         manual_flops = float(max(S - 1, 0) * B * H * Dh * 2)
-        lam = torch.sigmoid(self._beta).view(1, H, 1).to(dtype=v.dtype, device=v.device)
+        lam = (
+            torch.sigmoid(self._beta)
+            .view(1, H, 1)
+            .to(dtype=v.dtype, device=v.device)
+        )
         prev = v[:, 0].clone()
         s_list = [prev]
         for t in range(1, S):
@@ -834,27 +915,46 @@ class _GMSRFallback(nn.Module):
 
 
 class GatedMultiScaleRetention(nn.Module):
-    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
+    def __init__(
+        self, d_model: int, nhead: int, use_gate: bool = True
+    ) -> None:
         super().__init__()
-        self.d_model, self.nhead, self.use_gate = (int(d_model), int(nhead), bool(use_gate))
+        self.d_model, self.nhead, self.use_gate = (
+            int(d_model),
+            int(nhead),
+            bool(use_gate),
+        )
         self._ts_ok = False
         try:
-            from torchscale.component.multiscale_retention import MultiScaleRetention as _TSMSR
+            from torchscale.component.multiscale_retention import (
+                MultiScaleRetention as _TSMSR,
+            )
+
             self._ts_msr = _TSMSR(self.d_model, self.nhead)
-            self._ts_key_dim = int(getattr(self._ts_msr, "key_dim", self.d_model // self.nhead))
+            self._ts_key_dim = int(
+                getattr(self._ts_msr, "key_dim", self.d_model // self.nhead)
+            )
             self._ts_ok = True
         except Exception:
             self._ts_ok = False
-            self._fallback = _GMSRFallback(self.d_model, self.nhead, use_gate=self.use_gate)
+            self._fallback = _GMSRFallback(
+                self.d_model, self.nhead, use_gate=self.use_gate
+            )
         self._rope_theta = 10000.0
         self._decay_init = 5.0
         self._decay_range = 1.0
 
     def _build_rel_pos(self, seq_len: Any, device: Any, dtype: Any) -> Any:
-        kd = int(self._ts_key_dim if getattr(self, "_ts_key_dim", None) is not None else self.d_model // self.nhead)
+        kd = int(
+            self._ts_key_dim
+            if getattr(self, "_ts_key_dim", None) is not None
+            else self.d_model // self.nhead
+        )
         half = kd // 2
         t = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = 1.0 / (self._rope_theta ** torch.linspace(0, 1, half, device=device, dtype=torch.float32))
+        inv_freq = 1.0 / self._rope_theta ** torch.linspace(
+            0, 1, half, device=device, dtype=torch.float32
+        )
         freqs = torch.einsum("n,d->nd", t, inv_freq)
 
         def _dup(x: Any) -> Any:
@@ -868,9 +968,16 @@ class GatedMultiScaleRetention(nn.Module):
         diff = (i[:, None] - j[None, :]).to(dtype)
         tril = (i[:, None] >= j[None, :]).to(dtype)
         h = torch.arange(self.nhead, device=device, dtype=dtype)
-        gammas = 1.0 - torch.pow(2.0, -(self._decay_init + self._decay_range * (h / max(self.nhead, 1))))
-        gammas = torch.clamp(gammas, min=torch.finfo(dtype).tiny, max=1 - 1e-09)
-        inner_mask = torch.pow(gammas.view(1, self.nhead, 1, 1), diff.view(1, 1, L, L)) * tril.view(1, 1, L, L)
+        gammas = 1.0 - torch.pow(
+            2.0,
+            -(self._decay_init + self._decay_range * (h / max(self.nhead, 1))),
+        )
+        gammas = torch.clamp(
+            gammas, min=torch.finfo(dtype).tiny, max=1 - 1e-09
+        )
+        inner_mask = torch.pow(
+            gammas.view(1, self.nhead, 1, 1), diff.view(1, 1, L, L)
+        ) * tril.view(1, 1, L, L)
         return ((sin, cos), inner_mask)
 
     def forward(
@@ -883,7 +990,9 @@ class GatedMultiScaleRetention(nn.Module):
         if self._ts_ok:
             _, S, _ = x.shape
             rel_pos = self._build_rel_pos(S, x.device, x.dtype)
-            return self._ts_msr(x, rel_pos, chunkwise_recurrent=False, incremental_state=state)
+            return self._ts_msr(
+                x, rel_pos, chunkwise_recurrent=False, incremental_state=state
+            )
         return self._fallback(x, attn_mask=attn_mask, state=state, **kwargs)
 
 
@@ -903,30 +1012,46 @@ class Autocast:
                 if ok_cc:
                     kwargs = {}
                     try:
-                        if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        if (
+                            torch.distributed.is_available()
+                            and torch.distributed.is_initialized()
+                        ):
                             kwargs["fp8_group"] = torch.distributed.group.WORLD
                     except Exception:
                         pass
                     return fp8_autocast(enabled=True, **kwargs)
             except Exception:
                 pass
-            dtype = torch.bfloat16 if is_cuda_bf16_supported() else torch.float16
-            return torch.amp.autocast(device_type="cuda", dtype=dtype, enabled=True)
+            dtype = (
+                torch.bfloat16 if is_cuda_bf16_supported() else torch.float16
+            )
+            return torch.amp.autocast(
+                device_type="cuda", dtype=dtype, enabled=True
+            )
         if hasattr(torch, "xpu") and dev.type == "xpu":
             try:
-                return torch.amp.autocast(device_type="xpu", dtype=torch.bfloat16, enabled=True)
+                return torch.amp.autocast(
+                    device_type="xpu", dtype=torch.bfloat16, enabled=True
+                )
             except Exception:
                 from contextlib import nullcontext
+
                 return nullcontext()
         if dev.type == "mps":
             try:
-                return torch.amp.autocast(device_type="mps", dtype=torch.float16, enabled=True)
+                return torch.amp.autocast(
+                    device_type="mps", dtype=torch.float16, enabled=True
+                )
             except Exception:
                 from contextlib import nullcontext
+
                 return nullcontext()
         if dev.type == "cpu" and is_cpu_bf16_supported():
-            return torch.amp.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=True)
+            return torch.amp.autocast(
+                device_type="cpu", dtype=torch.bfloat16, enabled=True
+            )
         from contextlib import nullcontext
+
         return nullcontext()
 
     @staticmethod
@@ -935,17 +1060,23 @@ class Autocast:
         if dev.type in ("cpu", "xpu"):
             try:
                 import intel_extension_for_pytorch
-                return intel_extension_for_pytorch.quantization.autocast(dtype=torch.int8)
+
+                return intel_extension_for_pytorch.quantization.autocast(
+                    dtype=torch.int8
+                )
             except (ImportError, AttributeError):
                 pass
         from contextlib import nullcontext
+
         return nullcontext()
 
 
 class AdamW:
     @staticmethod
     def float(
-        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
@@ -954,13 +1085,19 @@ class AdamW:
         use_foreach: Optional[bool] = False,
         use_fused: bool = False,
         logger: Optional[Callable[[str], None]] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> optim.Optimizer:
-        params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+        params = (
+            model_or_params.parameters()
+            if hasattr(model_or_params, "parameters")
+            else model_or_params
+        )
         dev: torch.device = device or get_device()
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
+                from transformer_engine.pytorch.optimizers import (
+                    FusedAdam as TEFusedAdam,
+                )
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
                 if logger:
@@ -975,13 +1112,19 @@ class AdamW:
                 try:
                     from transformer_engine.pytorch.optimizers import FusedAdam
 
-                    opt: optim.Optimizer = FusedAdam(params, lr=lr, weight_decay=weight_decay)
+                    opt: optim.Optimizer = FusedAdam(
+                        params, lr=lr, weight_decay=weight_decay
+                    )
                     if logger:
-                        logger(f"[OPT] Using FusedAdam (transformer_engine) — {why}")
+                        logger(
+                            f"[OPT] Using FusedAdam (transformer_engine) — {why}"
+                        )
                     return opt
                 except Exception as e:
                     if logger:
-                        logger(f"[OPT] transformer_engine.FusedAdam unavailable: {e}")
+                        logger(
+                            f"[OPT] transformer_engine.FusedAdam unavailable: {e}"
+                        )
             if "AO" in str(why):
                 try:
                     from torchao.optim import AdamWFp8
@@ -994,9 +1137,14 @@ class AdamW:
                     if logger:
                         logger(f"[OPT] torchao.AdamWFp8 unavailable: {e}")
             elif logger:
-                logger(f"[OPT] FP8 optimizers not supported ({why}) — fallback")
+                logger(
+                    f"[OPT] FP8 optimizers not supported ({why}) — fallback"
+                )
         from .capability import optimizer_flags
-        flags: Dict[str, bool] = optimizer_flags(dev, use_foreach=use_foreach, use_fused=use_fused)
+
+        flags: Dict[str, bool] = optimizer_flags(
+            dev, use_foreach=use_foreach, use_fused=use_fused
+        )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
         if logger:
             logger(f"[OPT] Using torch.optim.AdamW (flags={flags})")
@@ -1004,7 +1152,9 @@ class AdamW:
 
     @staticmethod
     def integer(
-        model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
         lr: float,
         weight_decay: float = 0.0,
         *args: Any,
@@ -1013,13 +1163,19 @@ class AdamW:
         use_foreach: Optional[bool] = False,
         use_fused: bool = False,
         logger: Optional[Callable[[str], None]] = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> optim.Optimizer:
-        params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
+        params = (
+            model_or_params.parameters()
+            if hasattr(model_or_params, "parameters")
+            else model_or_params
+        )
         dev: torch.device = device or get_device()
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
+                from transformer_engine.pytorch.optimizers import (
+                    FusedAdam as TEFusedAdam,
+                )
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
                 if logger:
@@ -1031,17 +1187,24 @@ class AdamW:
         if dtype in {"int8", "int4"}:
             try:
                 try:
-                    from torchao.optim import AdamW8bit, AdamW4bit
+                    from torchao.optim import AdamW4bit, AdamW8bit
                 except ImportError:
-                    from torchao.prototype.low_bit_optim import AdamW8bit, AdamW4bit
+                    from torchao.prototype.low_bit_optim import (
+                        AdamW4bit,
+                        AdamW8bit,
+                    )
                 match dtype:
                     case "int8":
-                        opt = AdamW8bit(params, lr=lr, weight_decay=weight_decay)
+                        opt = AdamW8bit(
+                            params, lr=lr, weight_decay=weight_decay
+                        )
                         if logger:
                             logger("[OPT] TorchAO AdamW8bit")
                         return opt
                     case _:
-                        opt = AdamW4bit(params, lr=lr, weight_decay=weight_decay)
+                        opt = AdamW4bit(
+                            params, lr=lr, weight_decay=weight_decay
+                        )
                         if logger:
                             logger("[OPT] TorchAO AdamW4bit")
                         return opt
@@ -1049,7 +1212,10 @@ class AdamW:
                 if logger:
                     logger(f"[OPT] TorchAO low-bit optimizer unavailable: {e}")
         from .capability import optimizer_flags
-        flags: Dict[str, bool] = optimizer_flags(dev, use_foreach=use_foreach, use_fused=use_fused)
+
+        flags: Dict[str, bool] = optimizer_flags(
+            dev, use_foreach=use_foreach, use_fused=use_fused
+        )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
         if logger:
             logger(f"[OPT] Using AdamW (flags={flags})")
@@ -1063,7 +1229,7 @@ def ptq(
     dynamic_activations: bool = True,
     group_size: int = 128,
     logger: Any = None,
-    **kwargs: Any
+    **kwargs: Any,
 ) -> Tuple[nn.Module, bool, str]:
     if quantize_ is None:
         msg = "torchao.quantization not installed (PTQ disabled)"
@@ -1073,12 +1239,24 @@ def ptq(
     match mode:
         case "fp8":
             try:
-                cfg = Float8DynamicActivationFloat8WeightConfig() if dynamic_activations else Float8WeightOnlyConfig()
+                cfg = (
+                    Float8DynamicActivationFloat8WeightConfig()
+                    if dynamic_activations
+                    else Float8WeightOnlyConfig()
+                )
             except Exception as e:
-                return (model, False, f"torchao Float8 config unavailable: {e}")
+                return (
+                    model,
+                    False,
+                    f"torchao Float8 config unavailable: {e}",
+                )
         case "int8":
             try:
-                cfg = Int8DynamicActivationInt8WeightConfig() if dynamic_activations else Int8WeightOnlyConfig()
+                cfg = (
+                    Int8DynamicActivationInt8WeightConfig()
+                    if dynamic_activations
+                    else Int8WeightOnlyConfig()
+                )
             except Exception as e:
                 return (model, False, f"torchao Int8 config unavailable: {e}")
         case "int4":
@@ -1103,13 +1281,19 @@ class QAT:
         group_size: int = 128,
         dynamic_activations: bool = True,
         logger: Any = None,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> Any:
         if quantize_ is None:
-            raise ImportError("TorchAO not installed: QAT unavailable (missing quantize_)")
+            raise ImportError(
+                "TorchAO not installed: QAT unavailable (missing quantize_)"
+            )
         match mode:
             case "qat-int8":
-                base_cfg = Int8DynamicActivationInt8WeightConfig() if dynamic_activations else Int8WeightOnlyConfig()
+                base_cfg = (
+                    Int8DynamicActivationInt8WeightConfig()
+                    if dynamic_activations
+                    else Int8WeightOnlyConfig()
+                )
             case "qat-int4":
                 base_cfg = Int4WeightOnlyConfig(group_size=group_size)
             case _:
@@ -1120,9 +1304,17 @@ class QAT:
         return base_cfg
 
     @staticmethod
-    def apply(model: nn.Module, *args: Any, base_cfg: Any, logger: Any = None, **kwargs: Any) -> None:
+    def apply(
+        model: nn.Module,
+        *args: Any,
+        base_cfg: Any,
+        logger: Any = None,
+        **kwargs: Any,
+    ) -> None:
         if quantize_ is None:
-            raise ImportError("TorchAO not installed: QAT unavailable (missing quantize_)")
+            raise ImportError(
+                "TorchAO not installed: QAT unavailable (missing quantize_)"
+            )
         quantize_(model, QATConfig(base_cfg, step=QATStep.CONVERT))
         if logger:
             logger("[QAT] converted to quantized model")
@@ -1151,7 +1343,7 @@ class Architecture:
         apply_te_rms_norm: bool = True,
         filter_linear: Optional[Callable[[nn.Linear, str], bool]] = None,
         params_dtype: torch.dtype = torch.float32,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> Tuple[nn.Module, int]:
         try:
             import transformer_engine.pytorch as te
@@ -1162,21 +1354,41 @@ class Architecture:
             replaced = False
             if apply_te_linear and isinstance(child, nn.Linear):
                 if filter_linear is None or filter_linear(child, fqname):
-                    ok_dim = child.in_features % 16 == 0 and child.out_features % 16 == 0
+                    ok_dim = (
+                        child.in_features % 16 == 0
+                        and child.out_features % 16 == 0
+                    )
                     if ok_dim:
                         new = te.Linear(
-                            child.in_features, child.out_features, bias=child.bias is not None, params_dtype=params_dtype
+                            child.in_features,
+                            child.out_features,
+                            bias=child.bias is not None,
+                            params_dtype=params_dtype,
                         )
                         with torch.no_grad():
                             new.weight.copy_(child.weight)
-                            if child.bias is not None and hasattr(new, "bias") and (new.bias is not None):
+                            if (
+                                child.bias is not None
+                                and hasattr(new, "bias")
+                                and (new.bias is not None)
+                            ):
                                 new.bias.copy_(child.bias)
                         setattr(root, fqname, new)
                         n_swapped += 1
                         replaced = True
-            if not replaced and apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                hidden = int(child.normalized_shape[0]) if isinstance(child.normalized_shape, (tuple, list)) else int(child.normalized_shape)
-                new = te.LayerNorm(hidden, eps=float(child.eps), params_dtype=params_dtype)
+            if (
+                not replaced
+                and apply_te_layer_norm
+                and isinstance(child, nn.LayerNorm)
+            ):
+                hidden = (
+                    int(child.normalized_shape[0])
+                    if isinstance(child.normalized_shape, (tuple, list))
+                    else int(child.normalized_shape)
+                )
+                new = te.LayerNorm(
+                    hidden, eps=float(child.eps), params_dtype=params_dtype
+                )
                 with torch.no_grad():
                     if child.weight is not None:
                         new.weight.copy_(child.weight)
@@ -1194,8 +1406,13 @@ class Architecture:
             if not replaced and apply_te_rms_norm and _is_rms:
                 try:
                     import transformer_engine.pytorch as te
+
                     hidden = int(child.weight.shape[0])
-                    new = te.RMSNorm(hidden, eps=float(getattr(child, "eps", 1e-06)), params_dtype=params_dtype)
+                    new = te.RMSNorm(
+                        hidden,
+                        eps=float(getattr(child, "eps", 1e-06)),
+                        params_dtype=params_dtype,
+                    )
                     with torch.no_grad():
                         new.weight.copy_(child.weight)
                     setattr(root, fqname, new)
@@ -1220,7 +1437,7 @@ class Architecture:
         root: nn.Module,
         *args: Any,
         params_dtype: torch.dtype = torch.float32,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> Tuple[nn.Module, int]:
         try:
             import transformer_engine.pytorch as te
@@ -1228,7 +1445,9 @@ class Architecture:
             return (root, 0)
         n_swapped = 0
         for fqname, child in list(root.named_children()):
-            new_child, k = Architecture._apply_te_attention(child, params_dtype=params_dtype)
+            new_child, k = Architecture._apply_te_attention(
+                child, params_dtype=params_dtype
+            )
             if k:
                 setattr(root, fqname, new_child)
                 n_swapped += k
@@ -1256,14 +1475,22 @@ class Architecture:
                         if getattr(child, "in_proj_bias", None) is not None:
                             te_mha.in_proj_bias.copy_(child.in_proj_bias)
                         te_mha.out_proj.weight.copy_(child.out_proj.weight)
-                        if child.out_proj.bias is not None and te_mha.out_proj.bias is not None:
+                        if (
+                            child.out_proj.bias is not None
+                            and te_mha.out_proj.bias is not None
+                        ):
                             te_mha.out_proj.bias.copy_(child.out_proj.bias)
                     setattr(root, fqname, te_mha)
                     n_swapped += 1
                     replaced = True
             except Exception:
                 pass
-            if not replaced and hasattr(child, "_sdpa") and hasattr(child, "nhead") and hasattr(child, "head_dim"):
+            if (
+                not replaced
+                and hasattr(child, "_sdpa")
+                and hasattr(child, "nhead")
+                and hasattr(child, "head_dim")
+            ):
                 nhead = int(getattr(child, "nhead"))
                 head_dim = int(getattr(child, "head_dim"))
                 drop_p = 0.0
@@ -1273,20 +1500,50 @@ class Architecture:
                     except Exception:
                         drop_p = 0.0
                 try:
-                    te_dpa = te.DotProductAttention(num_attention_heads=nhead, kv_channels=head_dim, qkv_format="bshd", attention_dropout=drop_p)
+                    te_dpa = te.DotProductAttention(
+                        num_attention_heads=nhead,
+                        kv_channels=head_dim,
+                        qkv_format="bshd",
+                        attention_dropout=drop_p,
+                    )
                 except TypeError:
-                    te_dpa = te.DotProductAttention(nhead, head_dim, qkv_format="bshd", attention_dropout=drop_p)
+                    te_dpa = te.DotProductAttention(
+                        nhead,
+                        head_dim,
+                        qkv_format="bshd",
+                        attention_dropout=drop_p,
+                    )
                 if not hasattr(child, "__sdpa_pt__"):
                     child.__sdpa_pt__ = child._sdpa
 
-                def _te_sdpa(self, q: Any, k: Any, v: Any, p: Any, rope_meta: Any = None, _te_dpa: Any = te_dpa) -> Any:
+                def _te_sdpa(
+                    self,
+                    q: Any,
+                    k: Any,
+                    v: Any,
+                    p: Any,
+                    rope_meta: Any = None,
+                    _te_dpa: Any = te_dpa,
+                ) -> Any:
                     if rope_meta is not None:
                         cos, sin = rope_meta
                         q = self._apply_rope(q, cos, sin)
                         k = self._apply_rope(k, cos, sin)
-                    qs, ks, vs = (q.contiguous().clone(), k.contiguous().clone(), v.contiguous().clone())
+                    qs, ks, vs = (
+                        q.contiguous().clone(),
+                        k.contiguous().clone(),
+                        v.contiguous().clone(),
+                    )
                     try:
-                        out = _te_dpa(qs, ks, vs, attention_mask=None, qkv_format="bshd", attn_mask_type="no_mask", window_size=(-1, -1))
+                        out = _te_dpa(
+                            qs,
+                            ks,
+                            vs,
+                            attention_mask=None,
+                            qkv_format="bshd",
+                            attn_mask_type="no_mask",
+                            window_size=(-1, -1),
+                        )
                     except Exception:
                         return self.__sdpa_pt__(q, k, v, p, rope_meta)
                     if out.dim() == 3:
@@ -1297,11 +1554,23 @@ class Architecture:
 
                 child._sdpa = _te_sdpa.__get__(child, type(child))
                 n_swapped += 1
-
             if (
                 not replaced
                 and (not hasattr(child, "_sdpa"))
-                and all(hasattr(child, a) for a in ("nhead", "head_dim", "qkv", "proj", "norm1", "norm2", "forward"))
+                and all(
+                    (
+                        hasattr(child, a)
+                        for a in (
+                            "nhead",
+                            "head_dim",
+                            "qkv",
+                            "proj",
+                            "norm1",
+                            "norm2",
+                            "forward",
+                        )
+                    )
+                )
                 and (not hasattr(child, "__forward_pt__"))
             ):
                 try:
@@ -1312,26 +1581,47 @@ class Architecture:
                         except Exception:
                             p_drop = 0.0
                     te_dpa = te.DotProductAttention(
-                        num_attention_heads=int(child.nhead), kv_channels=int(child.head_dim), qkv_format="bshd", attention_dropout=p_drop
+                        num_attention_heads=int(child.nhead),
+                        kv_channels=int(child.head_dim),
+                        qkv_format="bshd",
+                        attention_dropout=p_drop,
                     )
                     setattr(child, "_te_dpa", te_dpa)
                     child.__forward_pt__ = child.forward
 
-                    def _te_forward(self, x: Any, *args: Any, **kwargs: Any) -> Any:
+                    def _te_forward(
+                        self, x: Any, *args: Any, **kwargs: Any
+                    ) -> Any:
                         B, S, D = x.shape
                         H = int(self.nhead)
                         d = int(D // H)
                         h = self.norm1(x)
-                        qkv = self.qkv(h).view(B, S, 3, H, d).permute(2, 0, 3, 1, 4)
+                        qkv = (
+                            self.qkv(h)
+                            .view(B, S, 3, H, d)
+                            .permute(2, 0, 3, 1, 4)
+                        )
                         q, k, v = (qkv[0], qkv[1], qkv[2])
                         try:
                             q_bshd = q.transpose(1, 2).contiguous()
                             k_bshd = k.transpose(1, 2).contiguous()
                             v_bshd = v.transpose(1, 2).contiguous()
                             a_bshd = self._te_dpa(
-                                q_bshd, k_bshd, v_bshd, attention_mask=None, qkv_format="bshd", attn_mask_type="no_mask", window_size=(-1, -1)
+                                q_bshd,
+                                k_bshd,
+                                v_bshd,
+                                attention_mask=None,
+                                qkv_format="bshd",
+                                attn_mask_type="no_mask",
+                                window_size=(-1, -1),
                             )
-                            a = a_bshd.view(B, S, D) if a_bshd.dim() == 3 else a_bshd.transpose(1, 2).contiguous().view(B, S, D)
+                            a = (
+                                a_bshd.view(B, S, D)
+                                if a_bshd.dim() == 3
+                                else a_bshd.transpose(1, 2)
+                                .contiguous()
+                                .view(B, S, D)
+                            )
                         except Exception:
                             return self.__forward_pt__(x, *args, **kwargs)
                         x2 = x + self.dropout(self.proj(a))
@@ -1347,10 +1637,7 @@ class Architecture:
 
     @staticmethod
     def _fuse_sequential_to_te(
-        root: nn.Module,
-        *args: Any,
-        params_dtype: torch.dtype,
-        **kwargs: Any
+        root: nn.Module, *args: Any, params_dtype: torch.dtype, **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         try:
             import transformer_engine.pytorch as te
@@ -1358,7 +1645,9 @@ class Architecture:
             return (root, 0)
         n_swapped = 0
         for name, child in list(root.named_children()):
-            new_child, k = Architecture._fuse_sequential_to_te(child, params_dtype=params_dtype)
+            new_child, k = Architecture._fuse_sequential_to_te(
+                child, params_dtype=params_dtype
+            )
             if k > 0:
                 setattr(root, name, new_child)
                 n_swapped += k
@@ -1373,18 +1662,33 @@ class Architecture:
                 nxt = child[i + 1] if i + 1 < len(child) else None
                 nxt2 = child[i + 2] if i + 2 < len(child) else None
                 nxt3 = child[i + 3] if i + 3 < len(child) else None
-                if (isinstance(cur, nn.LayerNorm) or cur.__class__.__name__ == "RMSNorm") and isinstance(nxt, nn.Linear):
+                if (
+                    isinstance(cur, nn.LayerNorm)
+                    or cur.__class__.__name__ == "RMSNorm"
+                ) and isinstance(nxt, nn.Linear):
                     ln = cur
                     fc = nxt
-                    act_name = "gelu" if isinstance(nxt2, nn.GELU) else "relu" if isinstance(nxt2, nn.ReLU) else None
+                    act_name = (
+                        "gelu"
+                        if isinstance(nxt2, nn.GELU)
+                        else "relu"
+                        if isinstance(nxt2, nn.ReLU)
+                        else None
+                    )
                     if act_name is not None and isinstance(nxt3, nn.Linear):
-                        hidden = int(ln.normalized_shape[0]) if isinstance(ln, nn.LayerNorm) else int(getattr(ln, "weight").shape[0])
+                        hidden = (
+                            int(ln.normalized_shape[0])
+                            if isinstance(ln, nn.LayerNorm)
+                            else int(getattr(ln, "weight").shape[0])
+                        )
                         mlp = te.LayerNormMLP(
                             hidden,
                             int(fc.out_features),
                             eps=float(getattr(ln, "eps", 1e-05)),
                             bias=fc.bias is not None and nxt3.bias is not None,
-                            normalization="LayerNorm" if isinstance(ln, nn.LayerNorm) else "RMSNorm",
+                            normalization="LayerNorm"
+                            if isinstance(ln, nn.LayerNorm)
+                            else "RMSNorm",
                             activation=act_name,
                             params_dtype=params_dtype,
                         )
@@ -1392,19 +1696,41 @@ class Architecture:
                             with torch.no_grad():
                                 if isinstance(ln, nn.LayerNorm):
                                     if hasattr(mlp, "layernorm"):
-                                        if ln.weight is not None and hasattr(mlp.layernorm, "weight"):
-                                            mlp.layernorm.weight.copy_(ln.weight)
-                                        if ln.bias is not None and hasattr(mlp.layernorm, "bias"):
+                                        if ln.weight is not None and hasattr(
+                                            mlp.layernorm, "weight"
+                                        ):
+                                            mlp.layernorm.weight.copy_(
+                                                ln.weight
+                                            )
+                                        if ln.bias is not None and hasattr(
+                                            mlp.layernorm, "bias"
+                                        ):
                                             mlp.layernorm.bias.copy_(ln.bias)
-                                elif hasattr(mlp, "layernorm") and hasattr(ln, "weight"):
+                                elif hasattr(mlp, "layernorm") and hasattr(
+                                    ln, "weight"
+                                ):
                                     mlp.layernorm.weight.copy_(ln.weight)
-                                if hasattr(mlp, "fc1") and hasattr(fc, "weight"):
+                                if hasattr(mlp, "fc1") and hasattr(
+                                    fc, "weight"
+                                ):
                                     mlp.fc1.weight.copy_(fc.weight)
-                                    if fc.bias is not None and hasattr(mlp.fc1, "bias") and (mlp.fc1.bias is not None):
+                                    if (
+                                        fc.bias is not None
+                                        and hasattr(mlp.fc1, "bias")
+                                        and (mlp.fc1.bias is not None)
+                                    ):
                                         mlp.fc1.bias.copy_(fc.bias)
-                                if hasattr(mlp, "fc2") and isinstance(nxt3, nn.Linear) and hasattr(nxt3, "weight"):
+                                if (
+                                    hasattr(mlp, "fc2")
+                                    and isinstance(nxt3, nn.Linear)
+                                    and hasattr(nxt3, "weight")
+                                ):
                                     mlp.fc2.weight.copy_(nxt3.weight)
-                                    if nxt3.bias is not None and hasattr(mlp.fc2, "bias") and (mlp.fc2.bias is not None):
+                                    if (
+                                        nxt3.bias is not None
+                                        and hasattr(mlp.fc2, "bias")
+                                        and (mlp.fc2.bias is not None)
+                                    ):
                                         mlp.fc2.bias.copy_(nxt3.bias)
                         except Exception:
                             pass
@@ -1413,27 +1739,47 @@ class Architecture:
                         changed = True
                         n_swapped += 1
                         continue
-                    hidden = int(ln.normalized_shape[0]) if isinstance(ln, nn.LayerNorm) else int(getattr(ln, "weight").shape[0])
+                    hidden = (
+                        int(ln.normalized_shape[0])
+                        if isinstance(ln, nn.LayerNorm)
+                        else int(getattr(ln, "weight").shape[0])
+                    )
                     lnlin = te.LayerNormLinear(
                         int(fc.in_features),
                         int(fc.out_features),
                         eps=float(getattr(ln, "eps", 1e-05)),
                         bias=fc.bias is not None,
-                        normalization="LayerNorm" if isinstance(ln, nn.LayerNorm) else "RMSNorm",
+                        normalization="LayerNorm"
+                        if isinstance(ln, nn.LayerNorm)
+                        else "RMSNorm",
                         params_dtype=params_dtype,
                     )
                     try:
                         with torch.no_grad():
                             if isinstance(ln, nn.LayerNorm):
-                                if ln.weight is not None and hasattr(lnlin, "layernorm") and hasattr(lnlin.layernorm, "weight"):
+                                if (
+                                    ln.weight is not None
+                                    and hasattr(lnlin, "layernorm")
+                                    and hasattr(lnlin.layernorm, "weight")
+                                ):
                                     lnlin.layernorm.weight.copy_(ln.weight)
-                                if ln.bias is not None and hasattr(lnlin.layernorm, "bias"):
+                                if ln.bias is not None and hasattr(
+                                    lnlin.layernorm, "bias"
+                                ):
                                     lnlin.layernorm.bias.copy_(ln.bias)
-                            elif hasattr(lnlin, "layernorm") and hasattr(ln, "weight"):
+                            elif hasattr(lnlin, "layernorm") and hasattr(
+                                ln, "weight"
+                            ):
                                 lnlin.layernorm.weight.copy_(ln.weight)
-                            if hasattr(lnlin, "linear") and hasattr(lnlin.linear, "weight"):
+                            if hasattr(lnlin, "linear") and hasattr(
+                                lnlin.linear, "weight"
+                            ):
                                 lnlin.linear.weight.copy_(fc.weight)
-                                if fc.bias is not None and hasattr(lnlin.linear, "bias") and (lnlin.linear.bias is not None):
+                                if (
+                                    fc.bias is not None
+                                    and hasattr(lnlin.linear, "bias")
+                                    and (lnlin.linear.bias is not None)
+                                ):
                                     lnlin.linear.bias.copy_(fc.bias)
                     except Exception:
                         pass
@@ -1466,12 +1812,21 @@ class Architecture:
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
         params_dtype = Architecture._infer_optimal_dtype(dev)
-        model, n_fused = Architecture._fuse_sequential_to_te(model, params_dtype=params_dtype)
+        model, n_fused = Architecture._fuse_sequential_to_te(
+            model, params_dtype=params_dtype
+        )
         model, n_basic = Architecture._apply_te_module(
-            model, apply_te_linear=True, apply_te_layer_norm=True, apply_te_rms_norm=True, filter_linear=None, params_dtype=params_dtype
+            model,
+            apply_te_linear=True,
+            apply_te_layer_norm=True,
+            apply_te_rms_norm=True,
+            filter_linear=None,
+            params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = Architecture._apply_te_attention(model, params_dtype=params_dtype)
+            model, attn_swapped = Architecture._apply_te_attention(
+                model, params_dtype=params_dtype
+            )
         except Exception:
             attn_swapped = 0
         n_total = (n_fused or 0) + (n_basic or 0) + (attn_swapped or 0)
@@ -1482,7 +1837,7 @@ class Architecture:
         return (
             model,
             n_total > 0,
-            f"TE applied (swapped {n_total}, dtype={params_dtype}, fp8={'on' if fp8_ok else 'off'}, backend={te_backend})",
+            f"TE applied (swapped {n_total}, dtype={params_dtype}, fp8={('on' if fp8_ok else 'off')}, backend={te_backend})",
         )
 
     @staticmethod
@@ -1495,9 +1850,21 @@ class Architecture:
         ok, reason = is_float8_supported(device)
         if not ok:
             return (model, False, reason)
-        _dev_for_dtype = torch.device(device) if device is not None else get_device()
-        _prefer_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() if _dev_for_dtype.type != "cpu" else is_cpu_bf16_supported()
-        params_dtype = torch.bfloat16 if _prefer_bf16 else (torch.float16 if _dev_for_dtype.type == "cuda" else torch.float32)
+        _dev_for_dtype = (
+            torch.device(device) if device is not None else get_device()
+        )
+        _prefer_bf16 = (
+            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            if _dev_for_dtype.type != "cpu"
+            else is_cpu_bf16_supported()
+        )
+        params_dtype = (
+            torch.bfloat16
+            if _prefer_bf16
+            else torch.float16
+            if _dev_for_dtype.type == "cuda"
+            else torch.float32
+        )
 
         def _try_te() -> Any:
             try:
@@ -1506,7 +1873,8 @@ class Architecture:
                     apply_te_linear=True,
                     apply_te_layer_norm=True,
                     apply_te_rms_norm=True,
-                    filter_linear=lambda lyr, name: lyr.in_features % 16 == 0 and lyr.out_features % 16 == 0,
+                    filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                    and lyr.out_features % 16 == 0,
                     params_dtype=params_dtype,
                 )
                 if n > 0:
@@ -1521,6 +1889,7 @@ class Architecture:
         def _try_ao() -> Any:
             try:
                 from torchao.float8 import convert_to_float8_training
+
                 res = convert_to_float8_training(model)
                 m2 = res or model
                 setattr(m2, "__fp8_training_ao__", True)
@@ -1530,7 +1899,11 @@ class Architecture:
             except Exception as e:
                 return (model, False, f"torchao convert failed: {e}")
 
-        order = ("te", "torchao") if prefer in ("auto", "te") else ("torchao", "te")
+        order = (
+            ("te", "torchao")
+            if prefer in ("auto", "te")
+            else ("torchao", "te")
+        )
         for backend in order:
             m2, ok2, why = _try_te() if backend == "te" else _try_ao()
             if ok2:
@@ -1553,9 +1926,21 @@ class Architecture:
         ok, reason = is_float8_supported(device)
         if not ok:
             return (model, False, reason)
-        _dev_for_dtype = torch.device(device) if device is not None else get_device()
-        _prefer_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported() if _dev_for_dtype.type != "cpu" else is_cpu_bf16_supported()
-        params_dtype = torch.bfloat16 if _prefer_bf16 else (torch.float16 if _dev_for_dtype.type == "cuda" else torch.float32)
+        _dev_for_dtype = (
+            torch.device(device) if device is not None else get_device()
+        )
+        _prefer_bf16 = (
+            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+            if _dev_for_dtype.type != "cpu"
+            else is_cpu_bf16_supported()
+        )
+        params_dtype = (
+            torch.bfloat16
+            if _prefer_bf16
+            else torch.float16
+            if _dev_for_dtype.type == "cuda"
+            else torch.float32
+        )
 
         def _try_te_swap() -> Any:
             try:
@@ -1564,32 +1949,52 @@ class Architecture:
                     apply_te_linear=True,
                     apply_te_layer_norm=True,
                     apply_te_rms_norm=True,
-                    filter_linear=lambda lyr, name: lyr.in_features % 16 == 0 and lyr.out_features % 16 == 0,
+                    filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                    and lyr.out_features % 16 == 0,
                     params_dtype=params_dtype,
                 )
                 if n > 0:
                     setattr(m2, "__fp8_inference_te__", True)
                     if logger:
-                        logger(f"[FP8][TE] swapped {n} modules; using te.fp8_autocast")
+                        logger(
+                            f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
+                        )
                     return (m2, True, f"TE swap ({n})")
                 return (model, False, "no eligible Linear (dims%16)")
             except Exception as e:
                 return (model, False, f"TE swap failed: {e}")
 
         def _try_te_present() -> Any:
-            te_present = any(getattr(m.__class__, "__module__", "").startswith("transformer_engine") for m in model.modules())
+            te_present = any(
+                (
+                    getattr(m.__class__, "__module__", "").startswith(
+                        "transformer_engine"
+                    )
+                    for m in model.modules()
+                )
+            )
             if te_present:
                 setattr(model, "__fp8_inference_te__", True)
                 if logger:
-                    logger("[FP8][TE] te.* already present; using te.fp8_autocast")
+                    logger(
+                        "[FP8][TE] te.* already present; using te.fp8_autocast"
+                    )
                 return (model, True, "TE present")
             return (model, False, "TE layers not present")
 
         def _try_ao() -> Any:
             try:
-                from torchao.quantization import quantize_, Float8WeightOnlyConfig, Float8DynamicActivationFloat8WeightConfig
+                from torchao.quantization import (
+                    Float8DynamicActivationFloat8WeightConfig,
+                    Float8WeightOnlyConfig,
+                    quantize_,
+                )
 
-                cfg = Float8DynamicActivationFloat8WeightConfig() if dynamic_activations else Float8WeightOnlyConfig()
+                cfg = (
+                    Float8DynamicActivationFloat8WeightConfig()
+                    if dynamic_activations
+                    else Float8WeightOnlyConfig()
+                )
                 quantize_(model, cfg)
                 setattr(model, "__fp8_inference_ao__", True)
                 if logger:
@@ -1598,9 +2003,19 @@ class Architecture:
             except Exception as e:
                 return (model, False, f"AO failed: {e}")
 
-        order = ("te_swap", "te_present", "ao") if prefer in ("auto", "te") else ("ao", "te_present", "te_swap")
+        order = (
+            ("te_swap", "te_present", "ao")
+            if prefer in ("auto", "te")
+            else ("ao", "te_present", "te_swap")
+        )
         for step in order:
-            m2, ok2, why = {"te_swap": _try_te_swap, "te_present": _try_te_present, "ao": _try_ao}[step]()
+            if step == "te_swap" and (not te_swap):
+                continue
+            m2, ok2, why = {
+                "te_swap": _try_te_swap,
+                "te_present": _try_te_present,
+                "ao": _try_ao,
+            }[step]()
             if ok2:
                 if logger:
                     logger(f"[FP8] inference enabled via {why} ({reason})")
@@ -1623,35 +2038,50 @@ class Architecture:
             if logger:
                 logger(f"[INT8] {msg}")
             return (model, False, msg)
-        try:
-            base_cfg = QAT.initialize(
-                model,
-                mode="qat-int8",
-                dynamic_activations=bool(dynamic_activations),
-                group_size=int(group_size),
-                logger=logger,
-            )
-            setattr(model, "__int8_training_qat__", True)
-            if logger:
-                logger(f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}")
-            return (model, True, "QAT-prepare")
-        except Exception as e:
-            if logger:
-                logger(f"[INT8][QAT] prepare failed: {e} — fallback to PTQ")
-        try:
-            m2, ok, why = ptq(
-                model,
-                mode="int8",
-                dynamic_activations=bool(dynamic_activations),
-                group_size=int(group_size),
-                logger=logger,
-            )
-            if ok:
-                setattr(m2, "__int8_training_ptq__", True)
-                return (m2, True, f"PTQ({why})")
-            return (model, False, f"PTQ failed: {why}")
-        except Exception as e:
-            return (model, False, f"INT8 training path unavailable: {e}")
+        target_device = torch.device(device) if device is not None else None
+        if target_device is not None:
+            with contextlib.suppress(Exception):
+                model.to(target_device)
+        prefer_norm = str(prefer).strip().lower()
+        use_qat = prefer_norm in ("auto", "qat")
+        use_ptq = prefer_norm in ("auto", "ptq")
+        if use_qat:
+            try:
+                base_cfg = QAT.initialize(
+                    model,
+                    mode="qat-int8",
+                    dynamic_activations=bool(dynamic_activations),
+                    group_size=int(group_size),
+                    logger=logger,
+                )
+                setattr(model, "__int8_training_qat__", True)
+                if logger:
+                    logger(
+                        f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
+                    )
+                return (model, True, "QAT-prepare")
+            except Exception as e:
+                if logger:
+                    logger(f"[INT8][QAT] prepare failed: {e}")
+                last_err = e
+        else:
+            last_err = RuntimeError("QAT disabled by prefer")
+        if use_ptq:
+            try:
+                m2, ok, why = ptq(
+                    model,
+                    mode="int8",
+                    dynamic_activations=bool(dynamic_activations),
+                    group_size=int(group_size),
+                    logger=logger,
+                )
+                if ok:
+                    setattr(m2, "__int8_training_ptq__", True)
+                    return (m2, True, f"PTQ({why})")
+                return (model, False, f"PTQ failed: {why}")
+            except Exception as e:
+                return (model, False, f"INT8 training path unavailable: {e}")
+        return (model, False, f"INT8 training disabled: {last_err}")
 
     @staticmethod
     def enable_int8_prediction(
@@ -1659,7 +2089,6 @@ class Architecture:
         device: Optional[Union[torch.device, str]] = None,
         logger: Optional[Callable[[str], None]] = None,
         dynamic_activations: bool = True,
-        group_size: int = 128,
         prefer: str = "auto",
     ) -> Tuple[nn.Module, bool, str]:
         if quantize_ is None:
@@ -1667,6 +2096,17 @@ class Architecture:
             if logger:
                 logger(f"[INT8] {msg}")
             return (model, False, msg)
+        prefer_norm = str(prefer).strip().lower()
+        if prefer_norm not in ("auto", "ao"):
+            return (
+                model,
+                False,
+                f"INT8 inference prefer={prefer} not supported",
+            )
+        target_device = torch.device(device) if device is not None else None
+        if target_device is not None:
+            with contextlib.suppress(Exception):
+                model.to(target_device)
         try:
             if dynamic_activations:
                 cfg = Int8DynamicActivationInt8WeightConfig()
@@ -1693,9 +2133,12 @@ class DataLoader:
         **kwargs: Any,
     ) -> None:
         from ..pipeline.collate import H2DController
+
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
-            raise TypeError("toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances.")
+            raise TypeError(
+                "toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances."
+            )
         self._node = node_obj
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))
@@ -1704,7 +2147,9 @@ class DataLoader:
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
             try:
-                self._iterable = H2DController(base, device=self._device, depth=self._prefetch_factor)
+                self._iterable = H2DController(
+                    base, device=self._device, depth=self._prefetch_factor
+                )
             except TypeError:
                 self._iterable = base
         else:

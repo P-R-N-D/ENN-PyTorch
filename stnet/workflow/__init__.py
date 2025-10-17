@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Any
@@ -81,20 +80,19 @@ def predict(*args: Any, **kwargs: Any) -> Any:
 to_tflite = to_litert
 to_tf = to_tensorflow
 to_trt = to_tensorrt
-
 __all__ = [
-    'Config',
-    'PatchParameters',
-    'new_model',
-    'load_model',
-    'save_model',
-    'to_onnx',
-    'to_tensorrt',
-    'to_coreml',
-    'to_litert',
-    'to_executorch',
-    'to_script',
-    'to_tensorflow',
-    'train',
-    'predict',
+    "Config",
+    "PatchParameters",
+    "new_model",
+    "load_model",
+    "save_model",
+    "to_onnx",
+    "to_tensorrt",
+    "to_coreml",
+    "to_litert",
+    "to_executorch",
+    "to_script",
+    "to_tensorflow",
+    "train",
+    "predict",
 ]

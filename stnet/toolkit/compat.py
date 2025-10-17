@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
@@ -14,6 +13,7 @@ from torch import nn
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except Exception:
+
     class _SDPEnum:
         MATH = object()
         FLASH_ATTENTION = object()
@@ -23,56 +23,70 @@ except Exception:
     SDPBackend = _SDPEnum
 
     @contextmanager
-    def sdpa_kernel(*_args: Any, **_kwargs: Any) -> Iterator[None]:
+    def sdpa_kernel(*args: Any, **kwargs: Any) -> Iterator[None]:
+        if args or kwargs:
+            _ = (args, kwargs)
+            del _
         yield
 
 
 def patch_torch() -> None:
     if not hasattr(nn, "RMSNorm"):
+
         class _RMSNorm(nn.Module):
-            def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+            def __init__(self, d_model: int, eps: float = 1e-06) -> None:
                 super().__init__()
                 self.eps = float(eps)
                 self.weight = nn.Parameter(torch.ones(d_model))
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
-                inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+                inv_rms = (
+                    x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
+                )
                 return x * inv_rms * self.weight
 
         setattr(nn, "RMSNorm", _RMSNorm)
-
     if not hasattr(torch, "fmin"):
+
         def _fmin(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             a, b = torch.broadcast_tensors(a, b)
             a_nan = torch.isnan(a)
             b_nan = torch.isnan(b)
-            return torch.where(a_nan & ~b_nan, b, torch.where(b_nan & ~a_nan, a, torch.minimum(a, b)))
+            return torch.where(
+                a_nan & ~b_nan,
+                b,
+                torch.where(b_nan & ~a_nan, a, torch.minimum(a, b)),
+            )
 
         setattr(torch, "fmin", _fmin)
-
     if not hasattr(torch, "nanmin"):
-        def _nanmin(x: torch.Tensor, dim: int | None = None, keepdim: bool = False) -> Any:
+
+        def _nanmin(
+            x: torch.Tensor, dim: int | None = None, keepdim: bool = False
+        ) -> Any:
             mask = torch.isfinite(x)
             xp = torch.where(mask, x, torch.full_like(x, float("inf")))
             if dim is None:
                 return xp.min()
             values, indices = xp.min(dim=dim, keepdim=keepdim)
-            return values, indices
+            return (values, indices)
 
         setattr(torch, "nanmin", _nanmin)
-
     if not hasattr(torch, "nanmax"):
-        def _nanmax(x: torch.Tensor, dim: int | None = None, keepdim: bool = False) -> Any:
+
+        def _nanmax(
+            x: torch.Tensor, dim: int | None = None, keepdim: bool = False
+        ) -> Any:
             mask = torch.isfinite(x)
             xp = torch.where(mask, x, torch.full_like(x, float("-inf")))
             if dim is None:
                 return xp.max()
             values, indices = xp.max(dim=dim, keepdim=keepdim)
-            return values, indices
+            return (values, indices)
 
         setattr(torch, "nanmax", _nanmax)
-
     if not hasattr(torch, "nansum"):
+
         def _nansum(
             x: torch.Tensor,
             dim: int | tuple[int, ...] | None = None,

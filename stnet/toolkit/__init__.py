@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from .capability import get_device, get_runtime_config, resolve_sdpa_backends
 from .compat import SDPBackend, _to_sdpa_backends, patch_torch, sdpa_kernel
 from .optimization import (
     AdamW,
@@ -10,8 +10,11 @@ from .optimization import (
     ScaledDotProductAttention,
     attention_flops_bshd,
 )
-from .preprocessing import IncrementalPCA, StandardScaler, VarianceThreshold
-from .capability import get_device, get_runtime_config, resolve_sdpa_backends
+from ..architecture.module import (
+    IncrementalPCA,
+    StandardScaler,
+    VarianceThreshold,
+)
 
 __all__ = [
     "Autocast",
@@ -31,5 +34,4 @@ __all__ = [
     "StandardScaler",
     "IncrementalPCA",
 ]
-
 patch_torch()

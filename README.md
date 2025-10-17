@@ -1,7 +1,7 @@
 # STNet-PyTorch
 
 ## Overview
-This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level workflow API for model construction, training, inference, and export utilities.
+This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level workflow API for model construction, training, inference, and export utilities. The workflow manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
 - **Configurable architecture** – `stnet.architecture.network.Config` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer.
@@ -39,27 +39,41 @@ vendor accelerators (`intel`, `ucx`), storage pipelines (`gds`), and Arrow GPU a
 
 ## Quick start
 ```python
-from stnet.workflow import Config, new_model, save_model, load_model, train, predict, to_script
+import torch
+from stnet.workflow import (
+    Config,
+    new_model,
+    save_model,
+    load_model,
+    train,
+    predict,
+    to_script,
+)
 
 config = Config(data_definition="spatiotemporal", depth=64, heads=4)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
-# Prepare a mapping from sample keys to feature/label tensors.
-# Features must flatten to the configured input dimension; labels match `out_shape`.
-training_batch = {
-    ("segment", 0): (features_tensor, labels_tensor),
-    # ... add more key -> (features, labels) pairs ...
-}
+features = torch.randn(32, model.in_dim)
+labels = torch.randn(32, *model.out_shape)
 
-trained = train(model, training_batch, epochs=1, batch_size=8)
-preds = predict(trained, {("segment", 0): (features_tensor, None)})
+dataset = {"X": features, "Y": labels}
+trained = train(model, dataset, epochs=1, batch_size=8)
+
+infer_batch = {"X": features, "Y": torch.zeros_like(labels)}
+predictions = predict(trained, infer_batch)
 
 save_path = save_model(trained, "checkpoints/stnet.pt")
 restored = load_model(save_path)
 
 scripted = to_script(restored)  # TorchScript export
 ```
+During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
+
 The workflow helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
+
+## Validating with `raw_data.xlsx`
+
+The repository includes `raw_data.xlsx`, the same workbook used to validate schema alignment, feature scaling, adaptive loss balancing, FLOP/I/O tracking, status bar updates, and join synchronization. Open `notebook.ipynb` for a step-by-step walkthrough that loads the workbook with Polars, constructs training tensors, calls `stnet.workflow.train`, and streams predictions with `stnet.workflow.predict` before exporting them back to Excel. You can run the notebook or adapt the code into your own scripts to reproduce the verification pipeline.
 
 ## Exporting for inference
 Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `export` extra to enable the full conversion toolkit.

@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import collections
 import math
 import os
 import time
@@ -9,11 +7,27 @@ import warnings
 from collections import deque
 from contextlib import nullcontext, suppress
 from functools import partial
-from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Iterable,
+    Iterator,
+    Mapping,
+    Optional,
+    Tuple,
+    Union,
+)
 
 import numpy as np
 import torch
-from torchdata.nodes import IterableWrapper, ParallelMapper, PinMemory, Prefetcher
+from torchdata.nodes import (
+    IterableWrapper,
+    ParallelMapper,
+    PinMemory,
+    Prefetcher,
+)
 
 from ..connection.socket import ArrowFlight
 from ..toolkit.capability import apply_threading_defaults
@@ -24,9 +38,15 @@ from .distributed import is_initialized
 
 def _world_info() -> Tuple[int, int, int, bool]:
     rank = int(os.environ.get("RANK", os.environ.get("PMI_RANK", "0")))
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")))
-    world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE", "1")))
-    return rank, local_rank, world_size, world_size > 1
+    local_rank = int(
+        os.environ.get(
+            "LOCAL_RANK", os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")
+        )
+    )
+    world_size = int(
+        os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE", "1"))
+    )
+    return (rank, local_rank, world_size, world_size > 1)
 
 
 class H2DController(Iterator[Any]):
@@ -49,7 +69,11 @@ class H2DController(Iterator[Any]):
         graph_warmup: int = 2,
     ) -> None:
         self._it = iter(iterable)
-        self._dev = torch.device(device) if not isinstance(device, torch.device) else device
+        self._dev = (
+            torch.device(device)
+            if not isinstance(device, torch.device)
+            else device
+        )
         self._backend = self._dev.type
         self._depth_min = int(max(1, depth_min))
         self._depth_max = int(max(self._depth_min, depth_max))
@@ -57,7 +81,9 @@ class H2DController(Iterator[Any]):
         self._pin_if_needed = bool(pin_if_needed)
         self._use_record_stream = bool(use_record_stream)
         self._amp_dtype = amp_dtype
-        self._max_bytes = max_bytes if isinstance(max_bytes, int) and max_bytes > 0 else None
+        self._max_bytes = (
+            max_bytes if isinstance(max_bytes, int) and max_bytes > 0 else None
+        )
         self._bytes_in_q = 0
         self._autotune = bool(autotune)
         self._tune_interval = max(10, int(tune_interval))
@@ -80,7 +106,10 @@ class H2DController(Iterator[Any]):
     def _init_streams(self) -> list[Any]:
         try:
             if self._backend == "cuda":
-                return [torch.cuda.Stream(device=self._dev) for _ in range(self._slots)]
+                return [
+                    torch.cuda.Stream(device=self._dev)
+                    for _ in range(self._slots)
+                ]
             if self._backend == "xpu" and hasattr(torch, "xpu"):
                 stream_type = getattr(torch.xpu, "Stream", None)
                 if stream_type is not None:
@@ -95,18 +124,22 @@ class H2DController(Iterator[Any]):
 
     def _map(self, obj: Any, fn: Callable[[Any], Any]) -> Any:
         if isinstance(obj, (list, tuple)):
-            return type(obj)(self._map(item, fn) for item in obj)
+            return type(obj)((self._map(item, fn) for item in obj))
         if isinstance(obj, dict):
             return {key: self._map(value, fn) for key, value in obj.items()}
         return fn(obj)
 
     def _bytes(self, obj: Any) -> int:
         if isinstance(obj, torch.Tensor):
-            return int(getattr(obj, "nbytes", obj.numel() * max(1, obj.element_size())))
+            return int(
+                getattr(
+                    obj, "nbytes", obj.numel() * max(1, obj.element_size())
+                )
+            )
         if isinstance(obj, (list, tuple)):
-            return sum(self._bytes(item) for item in obj)
+            return sum((self._bytes(item) for item in obj))
         if isinstance(obj, dict):
-            return sum(self._bytes(value) for value in obj.values())
+            return sum((self._bytes(value) for value in obj.values()))
         return 0
 
     def _should_pin(self, tensor: Any) -> bool:
@@ -116,7 +149,11 @@ class H2DController(Iterator[Any]):
             return False
         if self._backend not in {"cuda", "xpu", "mps"}:
             return False
-        if self._pin_if_needed and hasattr(tensor, "is_pinned") and tensor.is_pinned():
+        if (
+            self._pin_if_needed
+            and hasattr(tensor, "is_pinned")
+            and tensor.is_pinned()
+        ):
             return False
         return self._pin_if_needed
 
@@ -132,7 +169,9 @@ class H2DController(Iterator[Any]):
     def _to_device(self, obj: Any) -> Any:
         def _move(tensor: Any) -> Any:
             if isinstance(tensor, torch.Tensor):
-                kwargs: Dict[str, Any] = {"non_blocking": self._backend in {"cuda", "xpu", "mps"}}
+                kwargs: Dict[str, Any] = {
+                    "non_blocking": self._backend in {"cuda", "xpu", "mps"}
+                }
                 if self._amp_dtype is not None:
                     kwargs["dtype"] = self._amp_dtype
                 return tensor.to(self._dev, **kwargs)
@@ -151,16 +190,27 @@ class H2DController(Iterator[Any]):
 
     def _copy_into(self, dst: Any, src: Any) -> Any:
         def _copy(dst_obj: Any, src_obj: Any) -> Any:
-            if isinstance(dst_obj, torch.Tensor) and isinstance(src_obj, torch.Tensor):
+            if isinstance(dst_obj, torch.Tensor) and isinstance(
+                src_obj, torch.Tensor
+            ):
                 dtype = self._amp_dtype or src_obj.dtype
                 if dst_obj.dtype != dtype:
                     src_obj = src_obj.to(dtype=dtype)
-                dst_obj.copy_(src_obj, non_blocking=self._backend in {"cuda", "xpu", "mps"})
+                dst_obj.copy_(
+                    src_obj,
+                    non_blocking=self._backend in {"cuda", "xpu", "mps"},
+                )
                 return dst_obj
-            if isinstance(dst_obj, (list, tuple)) and isinstance(src_obj, (list, tuple)):
-                return type(dst_obj)(_copy(d, s) for d, s in zip(dst_obj, src_obj))
+            if isinstance(dst_obj, (list, tuple)) and isinstance(
+                src_obj, (list, tuple)
+            ):
+                return type(dst_obj)(
+                    (_copy(d, s) for d, s in zip(dst_obj, src_obj))
+                )
             if isinstance(dst_obj, dict) and isinstance(src_obj, dict):
-                return {key: _copy(dst_obj[key], src_obj[key]) for key in dst_obj}
+                return {
+                    key: _copy(dst_obj[key], src_obj[key]) for key in dst_obj
+                }
             return dst_obj
 
         return _copy(dst, src)
@@ -191,7 +241,9 @@ class H2DController(Iterator[Any]):
         with self._stream_ctx(stream):
             if self._graph_enabled:
                 if self._static is None:
-                    self._static = self._allocate_static_like(self._to_device(batch))
+                    self._static = self._allocate_static_like(
+                        self._to_device(batch)
+                    )
                 moved = self._copy_into(self._static, self._to_device(batch))
             else:
                 moved = self._to_device(batch)
@@ -203,7 +255,10 @@ class H2DController(Iterator[Any]):
 
     def _preload(self) -> None:
         while len(self._queue) < self._queue.maxlen:
-            if self._max_bytes is not None and self._bytes_in_q >= self._max_bytes:
+            if (
+                self._max_bytes is not None
+                and self._bytes_in_q >= self._max_bytes
+            ):
                 break
             try:
                 batch = next(self._it)
@@ -231,12 +286,20 @@ class H2DController(Iterator[Any]):
         now = time.perf_counter()
         if self._last_yield_ts is not None:
             elapsed = now - self._last_yield_ts
-            self._ema_compute = 0.9 * self._ema_compute + 0.1 * elapsed if self._ema_compute > 0 else elapsed
+            self._ema_compute = (
+                0.9 * self._ema_compute + 0.1 * elapsed
+                if self._ema_compute > 0
+                else elapsed
+            )
         moved, slot = self._queue.popleft()
         self._bytes_in_q -= min(self._bytes_in_q, self._bytes(moved))
         producer = self._streams[slot] if self._streams else None
         consumer = self._current_stream()
-        if producer is not None and consumer is not None and hasattr(consumer, "wait_stream"):
+        if (
+            producer is not None
+            and consumer is not None
+            and hasattr(consumer, "wait_stream")
+        ):
             consumer.wait_stream(producer)
         if self._use_record_stream and consumer is not None:
             self._record_stream(moved, consumer)
@@ -251,7 +314,10 @@ class H2DController(Iterator[Any]):
 
     def _record_stream(self, obj: Any, stream: Any) -> None:
         def _rec(item: Any) -> None:
-            if isinstance(item, torch.Tensor) and item.device.type == self._backend:
+            if (
+                isinstance(item, torch.Tensor)
+                and item.device.type == self._backend
+            ):
                 with suppress(Exception):
                     item.record_stream(stream)
                 return
@@ -275,9 +341,11 @@ class H2DController(Iterator[Any]):
         steps = float(max(1, self._tune_interval))
         starve_ratio = float(self._starved) / steps
         avg_copy = self._copy_time_acc / steps
-        avg_compute = max(1e-6, self._ema_compute)
-        want_up = starve_ratio > 0.30 or avg_copy > 0.30 * avg_compute
-        want_down = starve_ratio < 0.05 and len(self._queue) >= self._queue.maxlen - 1
+        avg_compute = max(1e-06, self._ema_compute)
+        want_up = starve_ratio > 0.3 or avg_copy > 0.3 * avg_compute
+        want_down = (
+            starve_ratio < 0.05 and len(self._queue) >= self._queue.maxlen - 1
+        )
         if want_up and self._queue.maxlen < self._depth_max:
             self._set_depth(self._queue.maxlen + 1)
         elif want_down and self._queue.maxlen > self._depth_min:
@@ -296,7 +364,9 @@ class H2DController(Iterator[Any]):
 
     def graphs_capture(self, capture_fn: Callable[[Any], Any]) -> bool:
         if not self._graph_enabled:
-            raise RuntimeError("graphs_capture requires enable_graphs=True and a CUDA backend.")
+            raise RuntimeError(
+                "graphs_capture requires enable_graphs=True and a CUDA backend."
+            )
         if not self._queue:
             self._preload()
         moved, _ = self._queue[0]
@@ -352,9 +422,11 @@ def _map_dtype(obj: Any, *, dtype: Optional[torch.dtype]) -> Any:
     if isinstance(obj, torch.Tensor):
         return obj.to(dtype=dtype, copy=False)
     if isinstance(obj, (list, tuple)):
-        return type(obj)(_map_dtype(item, dtype=dtype) for item in obj)
+        return type(obj)((_map_dtype(item, dtype=dtype) for item in obj))
     if isinstance(obj, dict):
-        return {key: _map_dtype(value, dtype=dtype) for key, value in obj.items()}
+        return {
+            key: _map_dtype(value, dtype=dtype) for key, value in obj.items()
+        }
     return obj
 
 
@@ -382,7 +454,16 @@ class _Keep:
     def cleanup(self) -> None:
         for obj in self._objs:
             cleaned = False
-            for name in ("cleanup", "close", "shutdown", "stop", "terminate", "join", "disconnect", "release"):
+            for name in (
+                "cleanup",
+                "close",
+                "shutdown",
+                "stop",
+                "terminate",
+                "join",
+                "disconnect",
+                "release",
+            ):
                 if hasattr(obj, name):
                     with suppress(Exception):
                         getattr(obj, name)()
@@ -396,7 +477,13 @@ class _Keep:
 
 
 class BatchStream:
-    def __init__(self, mmts: MemoryMappedTensorStream, start: int, end: int, batch_size: int) -> None:
+    def __init__(
+        self,
+        mmts: MemoryMappedTensorStream,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> None:
         self._mmts = mmts
         self._start = int(start)
         self._end = int(end)
@@ -426,13 +513,22 @@ def to_batch(
 ) -> Dict[str, Any]:
     features = batch["X"]
     labels = batch["Y"]
-    if flatten_features and isinstance(features, torch.Tensor) and features.dim() >= 2:
+    if (
+        flatten_features
+        and isinstance(features, torch.Tensor)
+        and (features.dim() >= 2)
+    ):
         features = features.flatten(start_dim=1)
     labels_tensor = _ensure_tensor(labels)
-    if labels_dtype is not None and getattr(labels_tensor, "dtype", None) != labels_dtype:
+    if (
+        labels_dtype is not None
+        and getattr(labels_tensor, "dtype", None) != labels_dtype
+    ):
         labels_tensor = labels_tensor.to(dtype=labels_dtype)
     if sanitize and torch.is_floating_point(labels_tensor):
-        labels_tensor = torch.nan_to_num(labels_tensor, nan=0.0, posinf=1_000_000.0, neginf=-1_000_000.0)
+        labels_tensor = torch.nan_to_num(
+            labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
+        )
     return {"X": features, "Y": labels_tensor}
 
 
@@ -455,10 +551,20 @@ def fetch(
 ) -> Any:
     if isinstance(sample, (list, tuple)):
         return [
-            to_batch(item, labels_dtype=labels_dtype, sanitize=sanitize, flatten_features=flatten_features)
+            to_batch(
+                item,
+                labels_dtype=labels_dtype,
+                sanitize=sanitize,
+                flatten_features=flatten_features,
+            )
             for item in sample
         ]
-    return to_batch(sample, labels_dtype=labels_dtype, sanitize=sanitize, flatten_features=flatten_features)
+    return to_batch(
+        sample,
+        labels_dtype=labels_dtype,
+        sanitize=sanitize,
+        flatten_features=flatten_features,
+    )
 
 
 def stream(
@@ -475,8 +581,16 @@ def stream(
     io_backend: str = "auto",
     **loader_options: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
-    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
+    device_obj = (
+        torch.device(device)
+        if not isinstance(device, torch.device)
+        else device
+    )
     backend = io_backend or "auto"
+    if not isinstance(backend, str):
+        raise TypeError(
+            "io_backend must be a string such as 'auto', 'local', or 'flight'"
+        )
     backend = backend.lower()
     if backend == "auto" and device_obj.type == "cpu":
         backend = "local"
@@ -506,6 +620,7 @@ def stream(
             node=wrapped,
             prefetch_factor=prefetch_factor,
             non_blocking=bool(non_blocking_copy),
+            **loader_options,
         )
 
     def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
@@ -523,7 +638,9 @@ def stream(
         if train_end <= train_start and total:
             train_end = total
         keep = _Keep(reader_tr)
-        node_tr = IterableWrapper(BatchStream(reader_tr, train_start, train_end, int(batch_size)))
+        node_tr = IterableWrapper(
+            BatchStream(reader_tr, train_start, train_end, int(batch_size))
+        )
         train_loader = _wrap_node(node_tr)
         val_loader: Optional[Any] = None
         if val_frac > 0 and train_end < total:
@@ -539,9 +656,11 @@ def stream(
             val_end = int(getattr(val_range, "stop", total))
             if val_end <= val_start:
                 val_end = total
-            node_vl = IterableWrapper(BatchStream(reader_vl, val_start, val_end, int(batch_size)))
+            node_vl = IterableWrapper(
+                BatchStream(reader_vl, val_start, val_end, int(batch_size))
+            )
             val_loader = _wrap_node(node_vl)
-        return train_loader, val_loader, keep
+        return (train_loader, val_loader, keep)
 
     def _flight_impl() -> Tuple[Any, Optional[Any], _Keep]:
         rank, local_rank, _, is_ddp = _world_info()
@@ -569,16 +688,26 @@ def stream(
         keep = _Keep(reader_tr, reader_vl)
         try:
             if not is_ddp or local_rank == 0:
-                server, uri = ArrowFlight.start_server_standby(host="0.0.0.0", port=0)
+                server, uri = ArrowFlight.start_server_standby(
+                    host="0.0.0.0", port=0
+                )
                 keep.add(server)
-                ArrowFlight.reg_mmt_dataset(server, name_train, reader_tr, int(batch_size), "train")
+                ArrowFlight.reg_mmt_dataset(
+                    server, name_train, reader_tr, int(batch_size), "train"
+                )
                 if reader_vl is not None:
-                    ArrowFlight.reg_mmt_dataset(server, name_val, reader_vl, int(batch_size), "val")
+                    ArrowFlight.reg_mmt_dataset(
+                        server, name_val, reader_vl, int(batch_size), "val"
+                    )
                 if is_initialized():
-                    ArrowFlight.MQ.publish(ArrowFlight.server_key(node_id), uri)
+                    ArrowFlight.MQ.publish(
+                        ArrowFlight.server_key(node_id), uri
+                    )
                 uri0 = uri
             else:
-                uri0 = ArrowFlight.MQ.wait(ArrowFlight.server_key(node_id), timeout_s=120.0)
+                uri0 = ArrowFlight.MQ.wait(
+                    ArrowFlight.server_key(node_id), timeout_s=120.0
+                )
             client = ArrowFlight.Client(uri0)
             keep.add(client)
             label_shape = list(meta.get("label_shape", []))
@@ -586,27 +715,45 @@ def stream(
             def _iter(name: str) -> Iterator[Dict[str, torch.Tensor]]:
                 reader = client.reader(name)
                 for record_batch in reader:
-                    batch_size_rb = int(getattr(record_batch, "num_rows", 0)) or int(len(record_batch.column(0)))
+                    batch_size_rb = int(
+                        getattr(record_batch, "num_rows", 0)
+                    ) or int(len(record_batch.column(0)))
                     features_arr = record_batch.column(0)
                     features_np = features_arr.to_numpy(zero_copy_only=False)
                     if not isinstance(features_np, np.ndarray):
                         features_np = np.array(features_np, copy=True)
-                    if getattr(features_np, "flags", None) is None or (not features_np.flags.writeable) or (not features_np.flags.c_contiguous):
+                    if (
+                        getattr(features_np, "flags", None) is None
+                        or not features_np.flags.writeable
+                        or (not features_np.flags.c_contiguous)
+                    ):
                         features_np = np.ascontiguousarray(features_np).copy()
                     if features_np.dtype != np.float32:
-                        features_np = features_np.astype(np.float32, copy=False)
-                    features_tensor = torch.from_numpy(features_np).view(batch_size_rb, -1)
+                        features_np = features_np.astype(
+                            np.float32, copy=False
+                        )
+                    features_tensor = torch.from_numpy(features_np).view(
+                        batch_size_rb, -1
+                    )
                     labels_arr = record_batch.column(1)
                     labels_np = labels_arr.to_numpy(zero_copy_only=False)
                     if not isinstance(labels_np, np.ndarray):
                         labels_np = np.array(labels_np, copy=True)
-                    if getattr(labels_np, "flags", None) is None or (not labels_np.flags.writeable) or (not labels_np.flags.c_contiguous):
+                    if (
+                        getattr(labels_np, "flags", None) is None
+                        or not labels_np.flags.writeable
+                        or (not labels_np.flags.c_contiguous)
+                    ):
                         labels_np = np.ascontiguousarray(labels_np).copy()
                     labels_tensor = torch.from_numpy(labels_np)
                     if label_shape:
-                        labels_tensor = labels_tensor.reshape(batch_size_rb, -1).view(batch_size_rb, *label_shape)
+                        labels_tensor = labels_tensor.reshape(
+                            batch_size_rb, -1
+                        ).view(batch_size_rb, *label_shape)
                     else:
-                        labels_tensor = labels_tensor.reshape(batch_size_rb, -1)
+                        labels_tensor = labels_tensor.reshape(
+                            batch_size_rb, -1
+                        )
                     yield {"X": features_tensor, "Y": labels_tensor}
 
             node_tr = IterableWrapper(_iter(name_train))
@@ -616,7 +763,7 @@ def stream(
                 val_loader = _wrap_node(node_vl)
             else:
                 val_loader = None
-            return train_loader, val_loader, keep
+            return (train_loader, val_loader, keep)
         except Exception:
             keep.cleanup()
             raise

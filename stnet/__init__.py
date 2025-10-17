@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Any
@@ -21,35 +20,34 @@ MultipleQuantileLoss = architecture.MultipleQuantileLoss
 StandardNormalLoss = architecture.StandardNormalLoss
 StudentsTLoss = architecture.StudentsTLoss
 DataFidelityLoss = architecture.DataFidelityLoss
-
 __all__ = [
-    'Model',
-    'Config',
-    'PatchParameters',
-    'train',
-    'predict',
-    'new_model',
-    'load_model',
-    'save_model',
-    'to_onnx',
-    'to_coreml',
-    'to_litert',
-    'to_executorch',
-    'to_script',
-    'to_tensorflow',
-    'SpatialSubnet',
-    'TemporalSubnet',
-    'SpatioTemporalNet',
-    'PatchAttention',
-    'CrossTransformer',
-    'Meta',
-    'MetaNet',
-    'GeGLU',
-    'SwiGLU',
-    'MultipleQuantileLoss',
-    'StandardNormalLoss',
-    'StudentsTLoss',
-    'DataFidelityLoss',
+    "Model",
+    "Config",
+    "PatchParameters",
+    "train",
+    "predict",
+    "new_model",
+    "load_model",
+    "save_model",
+    "to_onnx",
+    "to_coreml",
+    "to_litert",
+    "to_executorch",
+    "to_script",
+    "to_tensorflow",
+    "SpatialSubnet",
+    "TemporalSubnet",
+    "SpatioTemporalNet",
+    "PatchAttention",
+    "CrossTransformer",
+    "Meta",
+    "MetaNet",
+    "GeGLU",
+    "SwiGLU",
+    "MultipleQuantileLoss",
+    "StandardNormalLoss",
+    "StudentsTLoss",
+    "DataFidelityLoss",
 ]
 
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -23,6 +22,7 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
 
+
 _TORCH2NAME: Dict[torch.dtype, str] = {
     torch.float32: "float32",
     torch.float64: "float64",
@@ -35,7 +35,6 @@ _TORCH2NAME: Dict[torch.dtype, str] = {
     torch.uint8: "uint8",
     torch.bool: "bool",
 }
-
 _NAME2TORCH: Dict[str, torch.dtype] = {
     "float32": torch.float32,
     "float64": torch.float64,
@@ -74,7 +73,12 @@ class MemoryMappedTensorStream:
         batch_size: int = 1,
         val_frac: Optional[float] = None,
     ) -> MemoryMappedTensorStream:
-        return cls(memmap_dir, split=split, val_frac=val_frac, batch_size=int(batch_size))
+        return cls(
+            memmap_dir,
+            split=split,
+            val_frac=val_frac,
+            batch_size=int(batch_size),
+        )
 
     @staticmethod
     def materialize(
@@ -86,7 +90,9 @@ class MemoryMappedTensorStream:
         shuffle: bool = False,
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
-        features = torch.as_tensor(data["features"]).detach().cpu().contiguous()
+        features = (
+            torch.as_tensor(data["features"]).detach().cpu().contiguous()
+        )
         labels = torch.as_tensor(data["labels"]).detach().cpu().contiguous()
         if features.shape[0] != labels.shape[0]:
             raise ValueError("features/labels N mismatch")
@@ -100,8 +106,12 @@ class MemoryMappedTensorStream:
             labels = labels.index_select(0, perm)
         feat_path = os.path.join(memmap_dir, "features.mmt")
         label_path = os.path.join(memmap_dir, "labels.mmt")
-        MemoryMappedTensor.from_tensor(features.view(count, feat_dim), filename=feat_path, existsok=True)
-        MemoryMappedTensor.from_tensor(labels.view(count, label_flat), filename=label_path, existsok=True)
+        MemoryMappedTensor.from_tensor(
+            features.view(count, feat_dim), filename=feat_path, existsok=True
+        )
+        MemoryMappedTensor.from_tensor(
+            labels.view(count, label_flat), filename=label_path, existsok=True
+        )
         meta = {
             "N": count,
             "feature_dim": feat_dim,
@@ -112,12 +122,16 @@ class MemoryMappedTensorStream:
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
         }
-        with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
+        with open(
+            os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8"
+        ) as handle:
             json.dump(meta, handle)
 
     def _load_meta(self) -> Dict[str, Any]:
         if self._meta is None:
-            with open(os.path.join(self.dir, "meta.json"), "r", encoding="utf-8") as handle:
+            with open(
+                os.path.join(self.dir, "meta.json"), "r", encoding="utf-8"
+            ) as handle:
                 self._meta = json.load(handle)
         return self._meta
 
@@ -125,7 +139,9 @@ class MemoryMappedTensorStream:
         meta = self._load_meta()
         total = int(meta["N"])
         val_fraction = float(
-            self._val_frac_override if self._val_frac_override is not None else meta.get("fractions", [1.0, 0.0])[-1]
+            self._val_frac_override
+            if self._val_frac_override is not None
+            else meta.get("fractions", [1.0, 0.0])[-1]
         )
         val_count = int(round(total * val_fraction))
         train_count = total - val_count
@@ -140,49 +156,97 @@ class MemoryMappedTensorStream:
         total = int(meta["N"])
         feat_dim = int(meta["feature_dim"])
         label_shape = list(meta["label_shape"])
-        label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-        feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
-        label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+        label_flat = (
+            int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+        )
+        feat_path = os.path.join(
+            self.dir, meta.get("features_filename", "features.mmt")
+        )
+        label_path = os.path.join(
+            self.dir, meta.get("labels_filename", "labels.mmt")
+        )
         feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
         label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
-        feat_mmt = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
-        label_mmt = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
+        feat_mmt = MemoryMappedTensor.from_filename(
+            feat_path, dtype=feat_dtype, shape=(total, feat_dim)
+        )
+        label_mmt = MemoryMappedTensor.from_filename(
+            label_path, dtype=label_dtype, shape=(total, label_flat)
+        )
         for index in self._indices():
             feat = feat_mmt[index]
             label = label_mmt[index].view(*label_shape)
-            feat_tensor = feat if isinstance(feat, torch.Tensor) else torch.as_tensor(feat)
-            label_tensor = label if isinstance(label, torch.Tensor) else torch.as_tensor(label)
-            yield feat_tensor, label_tensor
+            feat_tensor = (
+                feat
+                if isinstance(feat, torch.Tensor)
+                else torch.as_tensor(feat)
+            )
+            label_tensor = (
+                label
+                if isinstance(label, torch.Tensor)
+                else torch.as_tensor(label)
+            )
+            yield (feat_tensor, label_tensor)
 
     def __len__(self) -> int:
         return len(self._indices())
 
-    def batch_range(self, start: int, end: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def batch_range(
+        self, start: int, end: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         meta = self._load_meta()
         total = int(meta["N"])
         feat_dim = int(meta["feature_dim"])
         label_shape = list(meta["label_shape"])
-        label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-        feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
-        label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+        label_flat = (
+            int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+        )
+        feat_path = os.path.join(
+            self.dir, meta.get("features_filename", "features.mmt")
+        )
+        label_path = os.path.join(
+            self.dir, meta.get("labels_filename", "labels.mmt")
+        )
         feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
         label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
-        feat_mmt = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
-        label_mmt = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
+        feat_mmt = MemoryMappedTensor.from_filename(
+            feat_path, dtype=feat_dtype, shape=(total, feat_dim)
+        )
+        label_mmt = MemoryMappedTensor.from_filename(
+            label_path, dtype=label_dtype, shape=(total, label_flat)
+        )
         features = feat_mmt[start:end]
         labels = label_mmt[start:end].view(-1, *label_shape)
-        features_tensor = features if isinstance(features, torch.Tensor) else torch.as_tensor(features)
-        labels_tensor = labels if isinstance(labels, torch.Tensor) else torch.as_tensor(labels)
-        return features_tensor, labels_tensor
+        features_tensor = (
+            features
+            if isinstance(features, torch.Tensor)
+            else torch.as_tensor(features)
+        )
+        labels_tensor = (
+            labels
+            if isinstance(labels, torch.Tensor)
+            else torch.as_tensor(labels)
+        )
+        return (features_tensor, labels_tensor)
 
     @staticmethod
-    def to_record_batch(features: torch.Tensor, labels: torch.Tensor) -> pa.RecordBatch:
+    def to_record_batch(
+        features: torch.Tensor, labels: torch.Tensor
+    ) -> pa.RecordBatch:
         batch = int(features.shape[0])
         feat_dim = int(features.view(batch, -1).shape[1])
         label_flat = int(labels.view(batch, -1).shape[1])
-        feat_array = pa.FixedSizeListArray.from_arrays(pa.array(np.asarray(features.contiguous().view(-1).cpu().numpy())), feat_dim)
-        label_array = pa.FixedSizeListArray.from_arrays(pa.array(np.asarray(labels.contiguous().view(-1).cpu().numpy())), label_flat)
-        return pa.record_batch([feat_array, label_array], names=["features", "labels"])
+        feat_array = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.asarray(features.contiguous().view(-1).cpu().numpy())),
+            feat_dim,
+        )
+        label_array = pa.FixedSizeListArray.from_arrays(
+            pa.array(np.asarray(labels.contiguous().view(-1).cpu().numpy())),
+            label_flat,
+        )
+        return pa.record_batch(
+            [feat_array, label_array], names=["features", "labels"]
+        )
 
 
 class Batch(IterableWrapper):
@@ -213,7 +277,9 @@ class Batch(IterableWrapper):
         if part not in {"train", "val"}:
             raise ValueError("part must be 'train' or 'val'")
         train_count = int(math.floor(total * train_frac))
-        start, end = (0, train_count) if part == "train" else (train_count, total)
+        start, end = (
+            (0, train_count) if part == "train" else (train_count, total)
+        )
         indices = list(range(start, end))
         if shuffle:
             rng = random.Random(int(seed))
@@ -228,7 +294,7 @@ class Batch(IterableWrapper):
             if len(current) == batch_len:
                 batches.append(current)
                 current = []
-        if current and not drop_last:
+        if current and (not drop_last):
             batches.append(current)
 
         def _iter() -> Iterator[List[int]]:
