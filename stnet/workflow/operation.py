@@ -1003,6 +1003,35 @@ def epochs(
         torch, "Event"
     )
     grad_accum_steps = max(1, int(grad_accum_steps))
+    ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
+    init_state_path = (
+        os.path.join(init_ckpt_dir, "dataloader.json")
+        if init_ckpt_dir
+        else None
+    )
+    state_train: Dict[str, Any] = {}
+    state_val: Dict[str, Any] = {}
+    if os.path.isfile(ckpt_state_path):
+        dl_state_path = ckpt_state_path
+    elif init_state_path and os.path.isfile(init_state_path):
+        dl_state_path = init_state_path
+    else:
+        dl_state_path = None
+    if dl_state_path:
+        try:
+            with open(dl_state_path, "r", encoding="utf-8") as _f:
+                _dl = json.load(_f)
+        except (OSError, json.JSONDecodeError):
+            _dl = {}
+        if isinstance(_dl, dict):
+            maybe_train = _dl.get("train", {})
+            maybe_val = _dl.get("val", {})
+            if isinstance(maybe_train, dict):
+                state_train = maybe_train
+            if isinstance(maybe_val, dict):
+                state_val = maybe_val
+    restore_dl_state = bool(state_train) or bool(state_val)
+
     for epoch in range(epochs):
         io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -1019,30 +1048,13 @@ def epochs(
             shuffle=True,
             io_backend="flight",
         )
-        ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
-        init_state_path = (
-            os.path.join(init_ckpt_dir, "dataloader.json")
-            if init_ckpt_dir
-            else None
-        )
-        dl_state_path: Optional[str] = None
-        if os.path.isfile(ckpt_state_path):
-            dl_state_path = ckpt_state_path
-        elif init_state_path and os.path.isfile(init_state_path):
-            dl_state_path = init_state_path
-        if dl_state_path:
-            try:
-                with open(dl_state_path, "r", encoding="utf-8") as _f:
-                    _dl = json.load(_f)
-            except (OSError, json.JSONDecodeError):
-                _dl = {}
-            state_train = _dl.get("train", {}) if isinstance(_dl, dict) else {}
-            state_val = _dl.get("val", {}) if isinstance(_dl, dict) else {}
+        if restore_dl_state:
             with contextlib.suppress((RuntimeError, ValueError, TypeError)):
                 train_loader.load_state_dict(state_train)
             if val_loader is not None:
                 with contextlib.suppress((RuntimeError, ValueError, TypeError)):
                     val_loader.load_state_dict(state_val)
+            restore_dl_state = False
         first_param = next(iter(model.parameters()), None)
         param_dtype = (
             first_param.dtype if first_param is not None else torch.float32
