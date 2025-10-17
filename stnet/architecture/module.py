@@ -506,7 +506,10 @@ class PatchEmbedding(nn.Module):
             or any((s <= 0 for s in stride[: self.ndim]))
         ):
             raise ValueError(
-                f"stride must have length >= {self.ndim} with positive values, got {stride}"
+                (
+                    "stride must have length >= "
+                    f"{self.ndim} with positive values, got {stride}"
+                )
             )
         match self.ndim:
             case 1:
@@ -1446,7 +1449,10 @@ class DataFidelityLoss(nn.Module):
                             )
                     case "finufft":
                         raise NotImplementedError(
-                            "FINUFFT path: wire with finufft.nufft*d* or Plan if you need CPU NUFFT."
+                            (
+                                "FINUFFT path: wire with finufft.nufft*d* "
+                                "or Plan if you need CPU NUFFT."
+                            )
                         )
                     case _:
                         raise ValueError(

@@ -727,8 +727,13 @@ def stream(
                     features_np = _ARROW.to_numpy(
                         features_arr, zero_copy_only=False
                     )
-                    if isinstance(features_np, np.ndarray) and features_np.dtype == object:
-                        features_np = np.array(features_arr.to_pylist(), dtype=np.float32)
+                    if (
+                        isinstance(features_np, np.ndarray)
+                        and features_np.dtype == object
+                    ):
+                        features_np = np.array(
+                            features_arr.to_pylist(), dtype=np.float32
+                        )
                     if not isinstance(features_np, np.ndarray):
                         features_np = np.array(features_np, copy=True)
                     if (
@@ -748,8 +753,13 @@ def stream(
                     labels_np = _ARROW.to_numpy(
                         labels_arr, zero_copy_only=False
                     )
-                    if isinstance(labels_np, np.ndarray) and labels_np.dtype == object:
-                        labels_np = np.array(labels_arr.to_pylist(), dtype=np.float32)
+                    if (
+                        isinstance(labels_np, np.ndarray)
+                        and labels_np.dtype == object
+                    ):
+                        labels_np = np.array(
+                            labels_arr.to_pylist(), dtype=np.float32
+                        )
                     if not isinstance(labels_np, np.ndarray):
                         labels_np = np.array(labels_np, copy=True)
                     if (
@@ -790,7 +800,10 @@ def stream(
         if backend != "auto":
             raise
         warnings.warn(
-            f"Arrow Flight backend unavailable ({exc}). Falling back to local memory-mapped loader.",
+            (
+                "Arrow Flight backend unavailable"
+                f" ({exc}). Falling back to the local memory-mapped loader."
+            ),
             RuntimeWarning,
         )
         return _local_impl()
