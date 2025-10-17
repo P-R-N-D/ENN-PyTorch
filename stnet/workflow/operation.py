@@ -929,7 +929,8 @@ def epochs(
         if local_rank == 0
         else None
     )
-    use_timer = device.type in ("cuda", "xpu", "mps") and hasattr(
+    device_type = getattr(device, "type", "cpu")
+    use_timer = device_type in ("cuda", "xpu", "mps") and hasattr(
         torch, "Event"
     )
     grad_accum_steps = max(1, int(grad_accum_steps))
@@ -1008,7 +1009,9 @@ def epochs(
                         else torch.as_tensor(label)
                     )
                     t_ready = time.perf_counter_ns()
-                    if use_timer and getattr(device, "type", None) == "cuda":
+                    if use_timer and getattr(
+                        device, "type", "cpu"
+                    ) in ("cuda", "xpu", "mps"):
                         h2d_start = torch.Event(
                             device=device, enable_timing=True
                         )
@@ -1043,7 +1046,9 @@ def epochs(
                         (step_idx + 1) % grad_accum_steps == 0
                         or step_idx + 1 == total_batches
                     )
-                    if use_timer and getattr(device, "type", None) == "cuda":
+                    if use_timer and getattr(
+                        device, "type", "cpu"
+                    ) in ("cuda", "xpu", "mps"):
                         ev_start = torch.Event(
                             device=device, enable_timing=True
                         )
@@ -1078,7 +1083,9 @@ def epochs(
                         train_step_flops = float(
                             train_counter.get_total_flops()
                         )
-                    if use_timer and getattr(device, "type", None) == "cuda":
+                    if use_timer and getattr(
+                        device, "type", "cpu"
+                    ) in ("cuda", "xpu", "mps"):
                         ev_end.record()
                         ev_end.synchronize()
                         elapsed_comp = (
@@ -1496,9 +1503,10 @@ def infer(
         io_time: float = 0.0
         comp_time: float = 0.0
         total_flops: float = 0.0
-        if device.type == "cuda":
+        device_type = getattr(device, "type", "cpu")
+        if device_type == "cuda":
             torch.cuda.empty_cache()
-        use_timer = device.type in ("cuda", "xpu", "mps") and hasattr(
+        use_timer = device_type in ("cuda", "xpu", "mps") and hasattr(
             torch, "Event"
         )
         t_fetch_start = time.perf_counter_ns()
@@ -1526,7 +1534,9 @@ def infer(
                     torch.bfloat16,
                 ):
                     X = X.to(dtype=torch.float32)
-                if use_timer and getattr(device, "type", None) == "cuda":
+                if use_timer and getattr(
+                    device, "type", "cpu"
+                ) in ("cuda", "xpu", "mps"):
                     ev_h2d_s = torch.Event(device=device, enable_timing=True)
                     ev_h2d_e = torch.Event(device=device, enable_timing=True)
                     ev_h2d_s.record()
@@ -1545,7 +1555,9 @@ def infer(
                 io_time += wait_s + h2d_s
                 with contextlib.suppress(Exception):
                     io_bytes += float(X.element_size() * X.nelement())
-                if use_timer and getattr(device, "type", None) == "cuda":
+                if use_timer and getattr(
+                    device, "type", "cpu"
+                ) in ("cuda", "xpu", "mps"):
                     ev_start = torch.Event(device=device, enable_timing=True)
                     ev_end = torch.Event(device=device, enable_timing=True)
                     ev_start.record()
@@ -1569,7 +1581,9 @@ def infer(
                             loss_weights=None,
                         )
                 preds.append(y_hat_out.detach().cpu())
-                if use_timer and getattr(device, "type", None) == "cuda":
+                if use_timer and getattr(
+                    device, "type", "cpu"
+                ) in ("cuda", "xpu", "mps"):
                     ev_end.record()
                     ev_end.synchronize()
                     comp_time += float(ev_start.elapsed_time(ev_end)) / 1000.0
