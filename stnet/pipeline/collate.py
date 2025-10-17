@@ -582,6 +582,7 @@ def stream(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
+    io_backend: str = "auto",
     **loader_options: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     device_obj = (
@@ -589,6 +590,12 @@ def stream(
         if not isinstance(device, torch.device)
         else device
     )
+    backend = io_backend or "auto"
+    if not isinstance(backend, str):
+        raise TypeError(
+            "io_backend must be a string such as 'auto', 'local', or 'flight'"
+        )
+    backend = backend.lower()
     threads = apply_threading_defaults()
     map_fn = partial(
         fetch,
@@ -774,9 +781,14 @@ def stream(
             keep.cleanup()
             raise
 
+    if backend == "local":
+        return _local_impl()
+
     try:
         return _flight_impl()
     except Exception as exc:
+        if backend != "auto":
+            raise
         warnings.warn(
             f"Arrow Flight backend unavailable ({exc}). Falling back to local memory-mapped loader.",
             RuntimeWarning,
