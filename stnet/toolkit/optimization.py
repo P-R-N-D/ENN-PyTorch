@@ -20,7 +20,6 @@ from typing import (
 
 import torch
 from torch import nn, optim
-from torchdata.nodes import BaseNode, Loader
 
 from .capability import (
     get_device,
@@ -137,6 +136,49 @@ def _consume_manual_flops() -> float:
 
 _NVTX_SOFT_COUNTER: float = 0.0
 _NVTX_FLOPS_GETTER: Optional[Callable[[], float]] = None
+
+
+@dataclass
+class LossWeightOptimizer:
+    momentum: float = 0.9
+    min_weight: float = 0.05
+    max_weight: float = 0.95
+    eps: float = 1e-06
+    top_avg: float = 1.0
+    bottom_avg: float = 1.0
+
+    def weights(self) -> Tuple[float, float]:
+        top = max(self.eps, self.top_avg)
+        bottom = max(self.eps, self.bottom_avg)
+        total = top + bottom
+        if total <= 0.0:
+            return (0.5, 0.5)
+        ratio_top = top / total
+        ratio_bottom = bottom / total
+        ratio_top = float(min(max(ratio_top, self.min_weight), self.max_weight))
+        ratio_bottom = float(
+            min(max(ratio_bottom, self.min_weight), self.max_weight)
+        )
+        norm = ratio_top + ratio_bottom
+        if norm <= 0.0:
+            return (0.5, 0.5)
+        return (ratio_top / norm, ratio_bottom / norm)
+
+    def update(
+        self,
+        top_loss: Optional[torch.Tensor],
+        bottom_loss: Optional[torch.Tensor],
+    ) -> None:
+        if top_loss is not None:
+            top_val = float(top_loss.detach().abs().mean().item())
+            self.top_avg = self.momentum * self.top_avg + (
+                1.0 - self.momentum
+            ) * max(top_val, self.eps)
+        if bottom_loss is not None:
+            bottom_val = float(bottom_loss.detach().abs().mean().item())
+            self.bottom_avg = self.momentum * self.bottom_avg + (
+                1.0 - self.momentum
+            ) * max(bottom_val, self.eps)
 
 
 class _FlopHookSession:
@@ -1016,7 +1058,7 @@ class GatedMultiScaleRetention(nn.Module):
         return self._fallback(x, attn_mask=attn_mask, state=state, **kwargs)
 
 
-class Autocast:
+class TunedAMP:
     @staticmethod
     def float(device: Union[torch.device, str, None] = None) -> Any:
         dev = torch.device(device) if device is not None else get_device()
@@ -1091,7 +1133,7 @@ class Autocast:
         return nullcontext()
 
 
-class AdamW:
+class TunedAdamW:
     @staticmethod
     def float(
         model_or_params: Union[
@@ -1340,7 +1382,7 @@ class QAT:
             logger("[QAT] converted to quantized model")
 
 
-class Architecture:
+class ModuleTuner:
     @staticmethod
     def _infer_optimal_dtype(dev: torch.device) -> torch.dtype:
         if dev.type == "cuda":
@@ -1441,7 +1483,7 @@ class Architecture:
                 except Exception:
                     pass
             if not replaced:
-                _, k = Architecture._apply_te_module(
+                _, k = ModuleTuner._apply_te_module(
                     child,
                     apply_te_linear=apply_te_linear,
                     apply_te_layer_norm=apply_te_layer_norm,
@@ -1465,7 +1507,7 @@ class Architecture:
             return (root, 0)
         n_swapped = 0
         for fqname, child in list(root.named_children()):
-            new_child, k = Architecture._apply_te_attention(
+            new_child, k = ModuleTuner._apply_te_attention(
                 child, params_dtype=params_dtype
             )
             if k:
@@ -1665,7 +1707,7 @@ class Architecture:
             return (root, 0)
         n_swapped = 0
         for name, child in list(root.named_children()):
-            new_child, k = Architecture._fuse_sequential_to_te(
+            new_child, k = ModuleTuner._fuse_sequential_to_te(
                 child, params_dtype=params_dtype
             )
             if k > 0:
@@ -1831,11 +1873,11 @@ class Architecture:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Architecture._infer_optimal_dtype(dev)
-        model, n_fused = Architecture._fuse_sequential_to_te(
+        params_dtype = ModuleTuner._infer_optimal_dtype(dev)
+        model, n_fused = ModuleTuner._fuse_sequential_to_te(
             model, params_dtype=params_dtype
         )
-        model, n_basic = Architecture._apply_te_module(
+        model, n_basic = ModuleTuner._apply_te_module(
             model,
             apply_te_linear=True,
             apply_te_layer_norm=True,
@@ -1844,7 +1886,7 @@ class Architecture:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = Architecture._apply_te_attention(
+            model, attn_swapped = ModuleTuner._apply_te_attention(
                 model, params_dtype=params_dtype
             )
         except Exception:
@@ -1888,7 +1930,7 @@ class Architecture:
 
         def _try_te() -> Any:
             try:
-                swapped_model, n = Architecture._apply_te_module(
+                swapped_model, n = ModuleTuner._apply_te_module(
                     model,
                     apply_te_linear=True,
                     apply_te_layer_norm=True,
@@ -1964,7 +2006,7 @@ class Architecture:
 
         def _try_te_swap() -> Any:
             try:
-                m2, n = Architecture._apply_te_module(
+                m2, n = ModuleTuner._apply_te_module(
                     model,
                     apply_te_linear=True,
                     apply_te_layer_norm=True,
@@ -2140,46 +2182,3 @@ class Architecture:
         except Exception as e:
             return (model, False, f"AO failed: {e}")
 
-
-class DataLoader:
-    def __init__(
-        self,
-        *args: Any,
-        device: torch.device,
-        node: "BaseNode" | None = None,
-        dataset: "BaseNode" | None = None,
-        prefetch_factor: int = 2,
-        non_blocking: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        from ..pipeline.collate import H2DController
-
-        node_obj = node or dataset
-        if not isinstance(node_obj, BaseNode):
-            raise TypeError(
-                "toolkit.optimization.DataLoader supports only torchdata.nodes.BaseNode instances."
-            )
-        self._node = node_obj
-        self._device = device
-        self._prefetch_factor = max(1, int(prefetch_factor or 2))
-        self._non_blocking = bool(non_blocking)
-        base = Loader(self._node)
-        dev_t = getattr(self._device, "type", "cpu")
-        if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
-            try:
-                self._iterable = H2DController(
-                    base, device=self._device, depth=self._prefetch_factor
-                )
-            except TypeError:
-                self._iterable = base
-        else:
-            self._iterable = base
-
-    def __iter__(self) -> Any:
-        return iter(self._iterable)
-
-    def __len__(self) -> Any:
-        try:
-            return int(_get_node_length(self._node))
-        except Exception:
-            return 1

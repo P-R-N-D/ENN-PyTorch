@@ -7,6 +7,7 @@ from . import architecture
 Model = architecture.Model
 Config = architecture.Config
 PatchParameters = architecture.PatchParameters
+coerce_config = architecture.coerce_config
 SpatialSubnet = architecture.SpatialSubnet
 TemporalSubnet = architecture.TemporalSubnet
 SpatioTemporalNet = architecture.SpatioTemporalNet
@@ -24,6 +25,7 @@ __all__ = [
     "Model",
     "Config",
     "PatchParameters",
+    "coerce_config",
     "train",
     "predict",
     "new_model",

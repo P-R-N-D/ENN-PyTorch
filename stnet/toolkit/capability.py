@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import contextlib
 import math
+import multiprocessing
 import os
+import socket
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 
 @dataclass
@@ -23,6 +30,170 @@ _RUNTIME_CONFIG = _RuntimeConfig()
 
 def get_runtime_config() -> _RuntimeConfig:
     return _RUNTIME_CONFIG
+
+
+def is_main_loadable() -> bool:
+    main_mod = sys.modules.get("__main__")
+    if main_mod is None:
+        return False
+    main_path = getattr(main_mod, "__file__", None)
+    if not main_path:
+        return False
+    try:
+        main_path = os.fspath(main_path)
+    except TypeError:
+        return False
+    if isinstance(main_path, str) and main_path.startswith("<") and main_path.endswith(">"):
+        return False
+    return os.path.exists(main_path)
+
+
+def initialize_python_path() -> None:
+    try:
+        package_dir = Path(__file__).resolve().parents[1]
+    except Exception:
+        return
+    project_dir = package_dir.parent
+    candidates: List[str] = []
+    seen: set[str] = set()
+    for entry in (package_dir, project_dir):
+        try:
+            resolved = os.fspath(entry)
+        except TypeError:
+            continue
+        if not resolved:
+            continue
+        if not Path(resolved).exists():
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        candidates.append(resolved)
+    if not candidates:
+        return
+    separator = os.pathsep
+    current = os.environ.get("PYTHONPATH", "")
+    paths = [path for path in current.split(separator) if path]
+    for candidate in candidates:
+        if candidate not in paths:
+            paths.insert(0, candidate)
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+    os.environ["PYTHONPATH"] = separator.join(paths)
+
+
+def optimal_start_method() -> str:
+    current = mp.get_start_method(allow_none=True)
+    if current is not None:
+        return str(current)
+    for method in ("forkserver", "spawn"):
+        try:
+            multiprocessing.get_context(method)
+        except ValueError:
+            continue
+        return method
+    raise RuntimeError("No supported multiprocessing start method (tried forkserver, spawn).")
+
+
+def set_multiprocessing_env() -> None:
+    try:
+        mp.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
+    if mp.get_start_method(allow_none=True) is not None:
+        return
+    last_error: Optional[BaseException] = None
+    for method in ("forkserver", "spawn"):
+        try:
+            multiprocessing.get_context(method)
+        except ValueError as exc:
+            last_error = exc
+            continue
+        try:
+            for module in (multiprocessing, mp):
+                module.set_start_method(method, force=True)
+        except (RuntimeError, ValueError) as exc:
+            last_error = exc
+            continue
+        return
+    raise RuntimeError(
+        "Unable to configure multiprocessing start method (tried forkserver, spawn)."
+    ) from last_error
+
+
+def default_temp() -> str:
+    return (
+        os.environ.get("TEMP", "C:\\Windows\\Temp")
+        if sys.platform.startswith("win")
+        else "/tmp"
+        if os.path.isdir("/tmp")
+        else "/var/tmp"
+    )
+
+
+def new_dir(prefix: str) -> str:
+    base = default_temp()
+    os.makedirs(base, exist_ok=True)
+    directory = os.path.join(base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
+def is_port_available(host: str, port: int) -> bool:
+    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind((host, port))
+            return True
+        except OSError:
+            return False
+
+
+def get_available_addr(endpoint: Optional[str]) -> str:
+    default_host, default_port = ("127.0.0.1", 29500)
+    if not endpoint:
+        host, port = (default_host, default_port)
+    elif ":" in endpoint:
+        host, port_str = endpoint.split(":", 1)
+        port = int(port_str)
+    else:
+        host, port = (endpoint, default_port)
+    if port <= 0 or (port != 0 and not is_port_available(host, port)):
+        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+            sock.bind((host, 0))
+            _, free_port = sock.getsockname()
+        port = int(free_port)
+    return f"{host}:{port}"
+
+
+def get_world_size(device: Optional[torch.device] = None) -> int:
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_world_size())
+    except Exception:
+        pass
+
+    dev = device
+    if dev is None:
+        with contextlib.suppress(Exception):
+            dev = get_device()
+    if dev is None:
+        dev = torch.device("cpu")
+    if dev.type == "cuda":
+        try:
+            return int(torch.cuda.device_count())
+        except Exception:
+            return 1
+    if dev.type == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None:
+            with contextlib.suppress(Exception):
+                count = int(xpu.device_count())
+                if count > 0:
+                    return count
+        return 1
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count, 4))
 
 
 def resolve_sdpa_backends() -> List[object]:

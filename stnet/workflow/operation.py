@@ -4,15 +4,13 @@ import contextlib
 import gc
 import json
 import math
-import multiprocessing
 import os
 import shutil
 import socket
 import sys
 import time
 import warnings
-from pathlib import Path
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, replace
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
@@ -35,21 +33,28 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..architecture.network import Config, Model
-from ..pipeline.collate import stream
+from ..architecture.network import Config, Model, coerce_config
+from ..pipeline.collate import loader, postprocess, preprocess
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
     apply_threading_defaults,
+    get_available_addr,
     get_device,
+    initialize_python_path,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
+    new_dir,
     optimal_procs,
+    optimal_start_method,
+    set_multiprocessing_env,
+    get_world_size,
 )
 from ..toolkit.optimization import (
-    AdamW,
-    Architecture,
-    Autocast,
+    TunedAMP,
     FlopCounter,
+    LossWeightOptimizer,
+    ModuleTuner,
+    TunedAdamW,
     fsdp_no_sync,
 )
 
@@ -107,51 +112,6 @@ _SIZEOF = {
 }
 
 
-@dataclass
-class AdaptiveLossBalancer:
-    momentum: float = 0.9
-    min_weight: float = 0.05
-    max_weight: float = 0.95
-    eps: float = 1e-06
-    top_avg: float = 1.0
-    bottom_avg: float = 1.0
-
-    def weights(self) -> Tuple[float, float]:
-        top = max(self.eps, self.top_avg)
-        bottom = max(self.eps, self.bottom_avg)
-        total = top + bottom
-        if total <= 0.0:
-            return (0.5, 0.5)
-        ratio_top = top / total
-        ratio_bottom = bottom / total
-        ratio_top = float(
-            min(max(ratio_top, self.min_weight), self.max_weight)
-        )
-        ratio_bottom = float(
-            min(max(ratio_bottom, self.min_weight), self.max_weight)
-        )
-        norm = ratio_top + ratio_bottom
-        if norm <= 0.0:
-            return (0.5, 0.5)
-        return (ratio_top / norm, ratio_bottom / norm)
-
-    def update(
-        self,
-        top_loss: Optional[torch.Tensor],
-        bottom_loss: Optional[torch.Tensor],
-    ) -> None:
-        if top_loss is not None:
-            top_val = float(top_loss.detach().abs().mean().item())
-            self.top_avg = self.momentum * self.top_avg + (
-                1.0 - self.momentum
-            ) * max(top_val, self.eps)
-        if bottom_loss is not None:
-            bottom_val = float(bottom_loss.detach().abs().mean().item())
-            self.bottom_avg = self.momentum * self.bottom_avg + (
-                1.0 - self.momentum
-            ) * max(bottom_val, self.eps)
-
-
 def _canonical_dtype(x: torch.dtype | str) -> str:
     if isinstance(x, torch.dtype):
         s = str(x).lower()
@@ -187,102 +147,6 @@ def _size(dtype: torch.dtype | str) -> int:
     return _SIZEOF[n]
 
 
-def _ensure_package_path() -> None:
-    pkg_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    project_root = os.path.dirname(pkg_root)
-    candidates = []
-    for path in (project_root, pkg_root):
-        if path and os.path.isdir(path):
-            if path not in sys.path:
-                sys.path.insert(0, path)
-            candidates.append(path)
-    if not candidates:
-        return
-    existing = os.environ.get("PYTHONPATH", "")
-    paths = [p for p in existing.split(os.pathsep) if p]
-    for path in candidates:
-        if path not in paths:
-            paths.insert(0, path)
-    os.environ["PYTHONPATH"] = os.pathsep.join(paths)
-
-
-def _has_loadable_main() -> bool:
-    main_mod = sys.modules.get("__main__")
-    if main_mod is None:
-        return False
-    main_path = getattr(main_mod, "__file__", None)
-    if not main_path:
-        return False
-    try:
-        main_path = os.fspath(main_path)
-    except TypeError:
-        return False
-    if main_path.startswith("<") and main_path.endswith(">"):
-        return False
-    return os.path.exists(main_path)
-
-
-def _register_python_path() -> None:
-    try:
-        package_dir = Path(__file__).resolve().parents[1]
-    except Exception:
-        return
-    project_dir = package_dir.parent
-    candidates: list[str] = []
-    seen: set[str] = set()
-    for entry in (package_dir, project_dir):
-        try:
-            resolved = os.fspath(entry)
-        except TypeError:
-            continue
-        if not resolved:
-            continue
-        if not Path(resolved).exists():
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        candidates.append(resolved)
-    if not candidates:
-        return
-    separator = os.pathsep
-    current = os.environ.get("PYTHONPATH", "")
-    paths = [path for path in current.split(separator) if path]
-    for candidate in candidates:
-        if candidate not in paths:
-            paths.insert(0, candidate)
-        if candidate not in sys.path:
-            sys.path.insert(0, candidate)
-    os.environ["PYTHONPATH"] = separator.join(paths)
-
-
-def _mp_env() -> None:
-    try:
-        mp.set_sharing_strategy("file_system")
-    except RuntimeError:
-        pass
-    _ensure_package_path()
-    start_method = "spawn" if str(sys.platform).lower().startswith("win") else "forkserver"
-    if not _has_loadable_main():
-        start_method = "fork"
-    for _mod in (multiprocessing, mp):
-        try:
-            _mod.set_start_method(start_method, force=True)
-        except RuntimeError:
-            pass
-        except ValueError:
-            pass
-
-
-def _start_method() -> str:
-    cur = mp.get_start_method(allow_none=True)
-    if cur is not None:
-        return str(cur)
-    if str(sys.platform).lower().startswith("win"):
-        return "spawn"
-    return "forkserver" if _has_loadable_main() else "fork"
-
-
 def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
     return tqdm(
         total=total,
@@ -296,63 +160,6 @@ def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
         leave=False,
         file=sys.stdout,
     )
-
-
-def _default_temp() -> str:
-    return (
-        os.environ.get("TEMP", "C:\\Windows\\Temp")
-        if sys.platform.startswith("win")
-        else "/tmp"
-        if os.path.isdir("/tmp")
-        else "/var/tmp"
-    )
-
-
-def _new_dir(prefix: str) -> str:
-    base = _default_temp()
-    os.makedirs(base, exist_ok=True)
-    d = os.path.join(base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}")
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def _is_port_available(host: str, port: int) -> bool:
-    with contextlib.closing(
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    ) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host, port))
-            return True
-        except OSError:
-            return False
-
-
-def _establish(ep: Optional[str]) -> str:
-    default_host, default_port = ("127.0.0.1", 29500)
-    if not ep:
-        host, port = (default_host, default_port)
-    elif ":" in ep:
-        host, p = ep.split(":", 1)
-        port = int(p)
-    else:
-        host, port = (ep, default_port)
-    if port <= 0 or (port != 0 and (not _is_port_available(host, port))):
-        with contextlib.closing(
-            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        ) as sock:
-            sock.bind((host, 0))
-            _, free_port = sock.getsockname()
-        port = int(free_port)
-    return f"{host}:{port}"
-
-
-def _world_size(device: torch.device) -> int:
-    if device.type == "cuda":
-        return torch.cuda.device_count()
-    if device.type == "xpu":
-        return torch.xpu.device_count()
-    return min(os.cpu_count() or 1, 4)
 
 
 def _backend_type(device: torch.device) -> str:
@@ -385,170 +192,6 @@ def _meta(memmap_dir: str) -> Dict[str, Any]:
     meta_path = os.path.join(memmap_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def _preprocess(
-    data: Dict[Tuple, torch.Tensor]
-) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
-    def _to_tuple(x: Any) -> Any:
-        if isinstance(x, tuple):
-            return x
-        if isinstance(x, list):
-            return tuple(x)
-        if isinstance(x, torch.Tensor):
-            return tuple(x.flatten().detach().cpu().tolist())
-        if hasattr(x, "tolist"):
-            v = x.tolist()
-            return tuple(v if isinstance(v, (list, tuple)) else [v])
-        return (x,)
-
-    def _feat_row(x_tuple: Any) -> Any:
-        try:
-            vals = [float(v) for v in _to_tuple(x_tuple)]
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                f"_preprocess: feature tuples must contain only numeric values. Invalid value={x_tuple!r}"
-            ) from exc
-        return torch.as_tensor(vals, dtype=torch.float32)
-
-    def _lbl(y: Any) -> Any:
-        if isinstance(y, torch.Tensor):
-            return y
-        if hasattr(y, "to_tensor"):
-            return y.to_tensor()
-        return torch.as_tensor(y)
-
-    def _maybe_batch(
-        x_value: Any, y_value: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
-        def _feature_tensor(value: Any) -> torch.Tensor | None:
-            if isinstance(value, torch.Tensor):
-                return value
-            if hasattr(value, "to_tensor"):
-                try:
-                    return value.to_tensor()
-                except Exception:
-                    return None
-            if hasattr(value, "as_tensor"):
-                try:
-                    return value.as_tensor()
-                except Exception:
-                    return None
-            try:
-                return torch.as_tensor(value)
-            except Exception:
-                return None
-
-        x_tensor = _feature_tensor(x_value)
-        if x_tensor is None:
-            return None
-        try:
-            y_tensor = _lbl(y_value)
-        except Exception:
-            return None
-        if not isinstance(y_tensor, torch.Tensor):
-            return None
-        x_tensor = x_tensor.detach().to(dtype=torch.float32)
-        if x_tensor.dim() == 0:
-            x_tensor = x_tensor.reshape(1, 1)
-        elif x_tensor.dim() == 1:
-            x_tensor = x_tensor.reshape(-1, 1)
-        else:
-            batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
-            x_tensor = x_tensor.reshape(batch_dim, -1)
-        batch = int(x_tensor.shape[0])
-        y_tensor = y_tensor.detach()
-        if y_tensor.dim() == 0:
-            y_tensor = y_tensor.unsqueeze(0)
-        if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
-            y_tensor = y_tensor.unsqueeze(-1)
-        if y_tensor.shape[0] != batch:
-            return None
-        label_shape = tuple(y_tensor.shape[1:])
-        keys = [(int(i),) for i in range(batch)]
-        return (x_tensor, y_tensor, keys, label_shape)
-
-    if isinstance(data, dict) and "X" in data and ("Y" in data):
-        x, y = (data["X"], data["Y"])
-        batch_result = _maybe_batch(x, y)
-        if batch_result is not None:
-            return batch_result
-        xr, yt = (_feat_row(x).unsqueeze(0), _lbl(y))
-        if yt.dim() == 0 or yt.dim() == 1:
-            yt = yt.unsqueeze(0)
-        keys = [_to_tuple(x)]
-        label_shape = tuple(yt.shape[1:])
-        return (xr, yt, keys, label_shape)
-    if isinstance(data, (tuple, list)) and len(data) >= 2:
-        x, y = (data[0], data[1])
-        batch_result = _maybe_batch(x, y)
-        if batch_result is not None:
-            return batch_result
-        xr = _feat_row(x).unsqueeze(0)
-        yt = _lbl(y)
-        if yt.dim() == 0:
-            yt = yt.unsqueeze(0)
-        elif yt.shape[0] != 1:
-            yt = yt.unsqueeze(0)
-        keys = [_to_tuple(x)]
-        label_shape = tuple(yt.shape[1:])
-        return (xr, yt, keys, label_shape)
-    if isinstance(data, dict) and len(data) > 0:
-        items = list(data.items())
-        if any((isinstance(k, str) for k, _ in items)):
-            raise TypeError(
-                "_preprocess: keys in a multi-sample dict must be tuples. Provide single samples as {'X': ..., 'Y': ...}."
-            )
-        keys: List[Tuple] = [_to_tuple(k) for k, _ in items]
-        feats = torch.stack([_feat_row(k) for k in keys], dim=0)
-        lbl_list = [_lbl(v) for _, v in items]
-        if all((t.shape == lbl_list[0].shape for t in lbl_list)):
-            labels = torch.stack(lbl_list, dim=0)
-        else:
-            labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
-        label_shape = tuple(labels.shape[1:])
-        return (feats, labels, keys, label_shape)
-    raise ValueError(
-        "_preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
-    )
-
-
-def _postprocess(
-    keys: List[Tuple], preds: torch.Tensor | Sequence[torch.Tensor]
-) -> Dict[Tuple, torch.Tensor]:
-    if isinstance(preds, torch.Tensor):
-        if preds.dim() == 0:
-            preds = preds.unsqueeze(0)
-        if preds.shape[0] != len(keys):
-            raise ValueError(
-                f"preds batch={preds.shape[0]} != len(keys)={len(keys)}"
-            )
-        rows = [preds[i].detach().cpu() for i in range(len(keys))]
-    else:
-        if len(preds) != len(keys):
-            raise ValueError(
-                f"len(preds)={len(preds)} != len(keys)={len(keys)}"
-            )
-        rows = [
-            p.detach().cpu()
-            if isinstance(p, torch.Tensor)
-            else torch.as_tensor(p)
-            for p in preds
-        ]
-    fixed_keys: List[Tuple] = []
-    seen = set()
-    for i, k in enumerate(keys):
-        if not isinstance(k, tuple):
-            try:
-                k = tuple(k)
-            except TypeError:
-                k = (k,)
-        k_out = k
-        if k in seen:
-            k_out = k + (i,)
-        seen.add(k_out)
-        fixed_keys.append(k_out)
-    return {k: v for k, v in zip(fixed_keys, rows)}
 
 
 @torch.no_grad()
@@ -621,11 +264,11 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Model:
-    _register_python_path()
-    feats, labels, _, label_shape = _preprocess(data)
+    initialize_python_path()
+    feats, labels, _, label_shape = preprocess(data)
     mp.allow_connection_pickling()
-    _mp_env()
-    memmap_dir = _new_dir("memmap_ds")
+    set_multiprocessing_env()
+    memmap_dir = new_dir("memmap_ds")
     MemoryMappedTensorStream.materialize(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
@@ -633,8 +276,8 @@ def train(
         val_frac=float(val_frac),
         shuffle=False,
     )
-    ckpt_dir = _new_dir("ckpt_dcp")
-    init_dir = _new_dir("init_dcp")
+    ckpt_dir = new_dir("ckpt_dcp")
+    init_dir = new_dir("init_dcp")
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=pattern_to_ignore)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -645,7 +288,7 @@ def train(
                 init_dir, sync_files=True, overwrite=True
             ),
         )
-    _ = _establish(rdzv_endpoint)
+    _ = get_available_addr(rdzv_endpoint)
     apply_threading_defaults()
     caps = optimal_procs()
     nprocs = caps["nproc_per_node"]
@@ -658,11 +301,11 @@ def train(
         max_nodes=max_nodes,
         nproc_per_node=nprocs,
         rdzv_backend=rdzv_backend,
-        rdzv_endpoint=_establish(rdzv_endpoint),
+        rdzv_endpoint=get_available_addr(rdzv_endpoint),
         run_id=run_id,
         max_restarts=0,
         monitor_interval=5,
-        start_method=_start_method(),
+        start_method=optimal_start_method(),
     )
     parameters = (
         memmap_dir,
@@ -738,12 +381,8 @@ def epochs(
     torch.distributed.init_process_group(backend=_backend_type(device))
     if device.type == "cuda":
         torch.cuda.empty_cache()
-    cfg = (
-        Config(**cfg_dict)
-        if isinstance(cfg_dict, dict)
-        else cfg_dict or Config()
-    )
-    cfg = Config(**{**asdict(cfg), "device": device})
+    cfg = coerce_config(cfg_dict if isinstance(cfg_dict, dict) else cfg_dict)
+    cfg = replace(cfg, device=device)
     model = Model(in_dim, out_shape, config=cfg)
     if init_ckpt_dir is not None and os.path.isdir(init_ckpt_dir):
         with warnings.catch_warnings():
@@ -797,7 +436,7 @@ def epochs(
         if is_main:
             warnings.warn(msg)
 
-    model, _, _ = Architecture.use_te_module(model, device=device)
+    model, _, _ = ModuleTuner.use_te_module(model, device=device)
     _ensure_uniform_param_dtype(
         model,
         prefer=torch.bfloat16
@@ -805,15 +444,11 @@ def epochs(
         and torch.cuda.is_bf16_supported()
         else None,
     )
-    model, _fp8_training_enabled, _ = Architecture.enable_float8_training(
+    model, _fp8_training_enabled, _ = ModuleTuner.enable_float8_training(
         model, device=device, prefer="te", logger=_float8_log
     )
     model.train()
-    world = (
-        torch.distributed.get_world_size()
-        if torch.distributed.is_initialized()
-        else 1
-    )
+    world = get_world_size(device)
     mesh = init_device_mesh(
         "cuda" if device.type == "cuda" else device.type, (world,)
     )
@@ -939,7 +574,7 @@ def epochs(
         )
         handle.set_requires_gradient_sync(True)
     net_params = [p for p in model.parameters()]
-    optimizer = AdamW.float(
+    optimizer = TunedAdamW.float(
         net_params,
         lr=base_lr,
         weight_decay=weight_decay,
@@ -952,7 +587,7 @@ def epochs(
     def _dl_ckpt(p: Any) -> Any:
         return os.path.join(p, "dataloader.json")
 
-    train_loader0, val_loader0, keep0 = stream(
+    train_loader0, val_loader0, keep0 = loader(
         memmap_dir=memmap_dir,
         device=device,
         batch_size=batch_size,
@@ -975,7 +610,7 @@ def epochs(
         return torch.as_tensor(obj)
 
     for _step_idx, _raw in enumerate(train_loader0):
-        _feat0, _label0, *_ = _preprocess(_raw)
+        _feat0, _label0, *_ = preprocess(_raw)
         if hasattr(model, "update_x_stats"):
             try:
                 model.update_x_stats(_feat0)
@@ -1030,7 +665,7 @@ def epochs(
         tile_size=loss_tile_size,
         reduction="mean",
     )
-    loss_controller = AdaptiveLossBalancer()
+    loss_controller = LossWeightOptimizer()
     if keep0 is not None:
         keep0.cleanup()
     total_steps = epochs * steps_per_epoch
@@ -1112,7 +747,7 @@ def epochs(
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
         flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-        train_loader, val_loader, keep = stream(
+        train_loader, val_loader, keep = loader(
             memmap_dir=memmap_dir,
             device=device,
             batch_size=batch_size,
@@ -1143,7 +778,7 @@ def epochs(
                 train_step_count = 0
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
-                    feat, label, *_ = _preprocess(_raw)
+                    feat, label, *_ = preprocess(_raw)
                     X = (
                         feat
                         if isinstance(feat, torch.Tensor)
@@ -1218,7 +853,7 @@ def epochs(
                         with flop_counter_train.step(
                             display=False
                         ) as train_counter:
-                            with Autocast.float(device):
+                            with TunedAMP.float(device):
                                 Y_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
@@ -1288,12 +923,12 @@ def epochs(
                 s = torch.zeros((), device=device, dtype=torch.float32)
                 m = 0
                 val_loss_weights = loss_controller.weights()
-                with torch.no_grad(), Autocast.float(device):
+                with torch.no_grad(), TunedAMP.float(device):
                     t_fetch_start = time.perf_counter_ns()
                     with _join_context(model):
                         v_step_count = 0
                         for step_idx, _raw in enumerate(val_loader):
-                            feat, label, *_ = _preprocess(_raw)
+                            feat, label, *_ = preprocess(_raw)
                             X = (
                                 feat
                                 if isinstance(feat, torch.Tensor)
@@ -1497,14 +1132,14 @@ def predict(
     prefetch_factor: Optional[int] = 1,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
-    _register_python_path()
-    _mp_env()
-    tmp_dir = _new_dir("infer")
+    initialize_python_path()
+    set_multiprocessing_env()
+    tmp_dir = new_dir("infer")
     dcp_dir = os.path.join(tmp_dir, "dcp")
     memmap_dir = os.path.join(tmp_dir, "memmap")
     device = get_device()
     mp.allow_connection_pickling()
-    nprocs = _world_size(device) if device.type in ("cuda", "xpu") else 1
+    nprocs = get_world_size(device) if device.type in ("cuda", "xpu") else 1
     rank_hint = int(os.environ.get("LOCAL_RANK", 0))
     try:
         with warnings.catch_warnings():
@@ -1543,7 +1178,7 @@ def predict(
                 else torch.as_tensor(v).view(*dummy_shape)
                 for k, v in data.items()
             }
-        feats, labels, keys, label_shape = _preprocess(data)
+        feats, labels, keys, label_shape = preprocess(data)
         MemoryMappedTensorStream.materialize(
             {"features": feats, "labels": labels},
             memmap_dir=memmap_dir,
@@ -1570,7 +1205,7 @@ def predict(
             nprocs=nprocs,
             join=True,
             daemon=False,
-            start_method=_start_method(),
+            start_method=optimal_start_method(),
         )
         out: Dict[Tuple, torch.Tensor] = dict(ret_dict)
         return out
@@ -1602,11 +1237,7 @@ def infer(
     except (RuntimeError, AttributeError, AssertionError):
         pass
     device = get_device()
-    cfg = (
-        Config(**cfg_dict)
-        if isinstance(cfg_dict, dict)
-        else cfg_dict or Config()
-    )
+    cfg = coerce_config(cfg_dict if isinstance(cfg_dict, dict) else cfg_dict)
     model = Model(in_dim, out_shape, config=cfg)
     if model_ckpt_dir is not None and os.path.isdir(model_ckpt_dir):
         with warnings.catch_warnings():
@@ -1626,7 +1257,7 @@ def infer(
     def _float8_log(msg: str) -> None:
         warnings.warn(msg)
 
-    model, _, _ = Architecture.use_te_module(model, device=device)
+    model, _, _ = ModuleTuner.use_te_module(model, device=device)
     _ensure_uniform_param_dtype(
         model,
         prefer=torch.bfloat16
@@ -1634,7 +1265,7 @@ def infer(
         and torch.cuda.is_bf16_supported()
         else None,
     )
-    model, _, _ = Architecture.enable_float8_prediction(
+    model, _, _ = ModuleTuner.enable_float8_prediction(
         model,
         device=device,
         prefer="te",
@@ -1642,7 +1273,7 @@ def infer(
         dynamic_activations=True,
     )
     model.eval()
-    train_loader, _, keep = stream(
+    train_loader, _, keep = loader(
         memmap_dir=memmap_dir,
         device=device,
         batch_size=batch_size,
@@ -1668,9 +1299,9 @@ def infer(
         )
         t_fetch_start = time.perf_counter_ns()
         preds: List[torch.Tensor] = []
-        with torch.no_grad(), Autocast.float(device):
+        with torch.no_grad(), TunedAMP.float(device):
             for _step_idx, _raw in enumerate(train_loader):
-                feat, _label, *_ = _preprocess(_raw)
+                feat, _label, *_ = preprocess(_raw)
                 X = (
                     feat
                     if isinstance(feat, torch.Tensor)
@@ -1761,7 +1392,7 @@ def infer(
         status_bar.close()
     flat = torch.cat(preds, dim=0)
     pred_struct = Model.unflatten_labels(flat, out_shape)
-    ret = _postprocess(keys, pred_struct)
+    ret = postprocess(keys, pred_struct)
     ret_dict.update(ret)
     if keep is not None:
         keep.cleanup()
