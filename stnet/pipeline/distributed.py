@@ -141,6 +141,34 @@ def _gather_all(obj: Any) -> List[Any]:
     return buffer
 
 
+def _format_flight_host(host: Any, fallback: Any | None = None, *, default: str = "127.0.0.1") -> str:
+    candidate: str = ""
+
+    def _coerce(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if value is None:
+            return ""
+        coerced = str(value).strip()
+        return coerced
+
+    candidate = _coerce(host)
+    if not candidate:
+        candidate = _coerce(fallback)
+    if not candidate:
+        candidate = default
+
+    try:
+        parsed = ipaddress.ip_address(candidate.strip("[]"))
+    except ValueError:
+        return candidate
+
+    compressed = parsed.compressed
+    if parsed.version == 6:
+        return f"[{compressed}]"
+    return compressed
+
+
 def _mq_addr(
     kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any
 ) -> str:
@@ -431,21 +459,8 @@ class IOController:
                 leader_info["flight_port"] = remote_port
                 endpoint_host = leader_info.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
-                    endpoint_host = leader_info.get("host") or info.get("host") or host
-                if isinstance(endpoint_host, str):
-                    candidate = endpoint_host.strip()
-                else:
-                    candidate = str(endpoint_host)
-                if not candidate:
-                    candidate = host
-                try:
-                    parsed_ip = ipaddress.ip_address(candidate.strip("[]"))
-                except ValueError:
-                    formatted_host = candidate
-                else:
-                    formatted_host = parsed_ip.compressed
-                    if parsed_ip.version == 6:
-                        formatted_host = f"[{formatted_host}]"
+                    endpoint_host = leader_info.get("host") or info.get("host")
+                formatted_host = _format_flight_host(endpoint_host, fallback=host)
                 endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
                     try:
@@ -495,4 +510,5 @@ class IOController:
     def flight_endpoint(self) -> str | None:
         if not self.is_node_leader:
             return None
-        return f"grpc+tcp://{self._my_ip}:{self._flight_port}"
+        formatted_host = _format_flight_host(self._my_ip, fallback=self._bind_host)
+        return f"grpc+tcp://{formatted_host}:{self._flight_port}"
