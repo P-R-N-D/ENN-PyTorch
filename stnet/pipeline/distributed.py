@@ -276,11 +276,15 @@ class IOController:
         def _cache_leader(host: str, info: Dict[str, Any]) -> Dict[str, Any]:
             leader_info = self._leaders.setdefault(host, dict(info))
             ip_value = info.get("ip") if isinstance(info, dict) else None
-            if ip_value:
+            if isinstance(ip_value, str):
+                sanitized_ip = ip_value.strip()
+                if sanitized_ip and sanitized_ip not in {"0.0.0.0", "::"}:
+                    leader_info["ip"] = sanitized_ip
+            elif ip_value:
                 leader_info["ip"] = ip_value
             host_value = info.get("host") if isinstance(info, dict) else None
-            if host_value:
-                leader_info["host"] = host_value
+            if isinstance(host_value, str) and host_value.strip():
+                leader_info["host"] = host_value.strip()
             else:
                 leader_info.setdefault("host", host)
             return leader_info
