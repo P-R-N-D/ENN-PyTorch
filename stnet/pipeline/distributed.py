@@ -299,10 +299,13 @@ class IOController:
                     continue
                 remote_port = _wait_for_flight_port(host)
                 if remote_port is None:
-                    self._leaders.setdefault(host, {})["flight_port"] = None
+                    leader_info = self._leaders.setdefault(host, {})
+                    leader_info["flight_port"] = None
                     continue
-                self._leaders.setdefault(host, {})["flight_port"] = remote_port
-                endpoint = f"grpc+tcp://{info['ip']}:{remote_port}"
+                leader_info = self._leaders.setdefault(host, {})
+                leader_info["flight_port"] = remote_port
+                endpoint_host = leader_info.get("ip", info["ip"])
+                endpoint = f"grpc+tcp://{endpoint_host}:{remote_port}"
                 for attempt in range(10):
                     try:
                         self._clients[host] = FlightModule.connect(endpoint)
