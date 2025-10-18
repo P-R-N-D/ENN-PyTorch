@@ -1,21 +1,29 @@
+import pytest
+
 from stnet.pipeline import distributed
 
 
-def test_ipv6_zone_id_is_stripped_and_bracketed():
-    host = distributed._format_flight_host("fe80::1%eth0", fallback="backup")
-    assert host == "[fe80::1]"
+@pytest.mark.parametrize(
+    "candidate,expected",
+    [
+        ("fe80::1%eth0", "[fe80::1]"),
+        ("[2001:db8::1%en0]", "[2001:db8::1]"),
+    ],
+)
+def test_ipv6_zone_id_is_stripped(candidate: str, expected: str) -> None:
+    host = distributed._format_flight_host(candidate, fallback="backup")
+    assert host == expected
 
 
-def test_bracketed_ipv6_zone_id_is_sanitized():
-    host = distributed._format_flight_host("[2001:db8::1%en0]", fallback="backup")
-    assert host == "[2001:db8::1]"
-
-
-def test_invalid_zone_identifier_falls_back():
-    host = distributed._format_flight_host("host%en0", fallback="backup")
+@pytest.mark.parametrize(
+    "candidate",
+    ["host%en0", "[invalid]", "2001:db8::zz"],
+)
+def test_invalid_candidates_fall_back(candidate: str) -> None:
+    host = distributed._format_flight_host(candidate, fallback="backup")
     assert host == "backup"
 
 
-def test_hostname_without_ip_passthrough():
+def test_hostname_without_ip_passthrough() -> None:
     host = distributed._format_flight_host("example.com", fallback="ignored")
     assert host == "example.com"

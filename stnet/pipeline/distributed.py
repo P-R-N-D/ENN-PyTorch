@@ -144,6 +144,16 @@ def _gather_all(obj: Any) -> List[Any]:
 def _format_flight_host(
     host: Any, fallback: Any | None = None, *, default: str = "127.0.0.1"
 ) -> str:
+    """Return a sanitized host string for Arrow Flight endpoints.
+
+    The function prefers the provided ``host`` value, falling back to ``fallback``
+    and then ``default`` while ensuring that we only surface usable addresses.
+    IPv6 literals are wrapped in brackets and zone identifiers are removed.  If a
+    value resembles a hostname (e.g. ``example.com``) instead of an IP literal we
+    return it as-is so the caller can rely on DNS resolution.  Values that look
+    like malformed IP addresses (for example, bracketed strings that fail to
+    parse) are ignored in favour of the next candidate.
+    """
     def _coerce(value: Any) -> str:
         if isinstance(value, str):
             return value.strip()
@@ -175,9 +185,9 @@ def _format_flight_host(
         try:
             parsed = ipaddress.ip_address(zone_stripped)
         except ValueError:
-            if zone_removed:
+            if zone_removed or candidate != stripped or ":" in zone_stripped:
                 continue
-            return candidate
+            return stripped
         if not allow_loopback and (parsed.is_unspecified or parsed.is_loopback):
             continue
         compressed = parsed.compressed
