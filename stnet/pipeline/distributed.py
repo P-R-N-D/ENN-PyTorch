@@ -275,6 +275,22 @@ class IOController:
                     return None
 
         def _cache_leader(host: str, info: Mapping[str, Any] | None) -> Dict[str, Any]:
+            def _sanitize_ip(value: Any) -> Optional[str]:
+                if isinstance(value, str):
+                    candidate = value.strip()
+                elif value is None:
+                    return None
+                else:
+                    return None
+                if not candidate:
+                    return None
+                lowered = candidate.lower()
+                if lowered in {"0.0.0.0", "::", "::1"}:
+                    return None
+                if candidate.startswith("127."):
+                    return None
+                return candidate
+
             if isinstance(info, dict):
                 info_dict: Dict[str, Any] = info
             elif info is None:
@@ -308,11 +324,9 @@ class IOController:
                     leader_info[key] = value
 
             ip_value = info_dict.get("ip")
-            sanitized_ip: Optional[str] = None
-            if isinstance(ip_value, str):
-                sanitized_ip = ip_value.strip()
-                if sanitized_ip and sanitized_ip not in {"0.0.0.0", "::"}:
-                    leader_info["ip"] = sanitized_ip
+            sanitized_ip = _sanitize_ip(ip_value)
+            if sanitized_ip:
+                leader_info["ip"] = sanitized_ip
             elif ip_value:
                 leader_info["ip"] = ip_value
             host_value = info_dict.get("host")
@@ -323,7 +337,13 @@ class IOController:
             else:
                 resolved_host = leader_info.get("host") or host
                 leader_info.setdefault("host", resolved_host)
-            has_valid_ip = isinstance(leader_info.get("ip"), str) and leader_info["ip"] not in {"", "0.0.0.0", "::"}
+            cached_ip = leader_info.get("ip")
+            cached_sanitized_ip = _sanitize_ip(cached_ip)
+            if isinstance(cached_ip, str) and not cached_sanitized_ip:
+                leader_info.pop("ip", None)
+            elif cached_sanitized_ip:
+                leader_info["ip"] = cached_sanitized_ip
+            has_valid_ip = bool(_sanitize_ip(leader_info.get("ip")))
             if (not has_valid_ip) and resolved_host:
                 try:
                     resolved_ip = socket.gethostbyname(resolved_host)
@@ -331,7 +351,7 @@ class IOController:
                     resolved_ip = None
                 if isinstance(resolved_ip, str):
                     resolved_ip = resolved_ip.strip()
-                if resolved_ip and resolved_ip not in {"0.0.0.0", "::"}:
+                if _sanitize_ip(resolved_ip):
                     leader_info["ip"] = resolved_ip
             self._leaders[host] = leader_info
             return leader_info
