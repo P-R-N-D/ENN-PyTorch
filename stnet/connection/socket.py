@@ -8,7 +8,6 @@ import time
 from typing import Any, Iterator, Tuple
 
 from ..pipeline.dataset import MemoryMappedTensorStream
-from .queue import DistributedQueue
 from ..toolkit.capability import get_available_addr
 from ..toolkit.compat import patch_arrow
 
@@ -17,23 +16,13 @@ _ARROW = patch_arrow()
 pa = _ARROW.module
 flight = _ARROW.flight
 if flight is None:
-    raise ImportError("pyarrow.flight is required for ArrowFlight support")
+    raise ImportError("pyarrow.flight is required for Endpoint support")
 
 
-class ArrowFlight:
-    MQ = DistributedQueue()
-
-    @staticmethod
-    def node_id(rank: int, local_rank: int) -> int:
-        return int(rank) - int(local_rank)
-
+class Endpoint:
     @staticmethod
     def resource_key(memmap_dir: str, split: str) -> str:
         return f"{os.path.basename(memmap_dir.rstrip(os.sep))}/{split}"
-
-    @staticmethod
-    def server_key(node_id: int) -> str:
-        return f"flight://node/{node_id}"
 
     @staticmethod
     def _canon_name(value: Any) -> str:
@@ -64,21 +53,21 @@ class ArrowFlight:
             parts: list[str] = []
             for part in path:
                 try:
-                    parts.append(ArrowFlight._bytes_of(part).decode("utf-8"))
+                    parts.append(Endpoint._bytes_of(part).decode("utf-8"))
                 except Exception:
                     parts.append(str(part))
-            return ArrowFlight._canon_name("/".join(parts))
+            return Endpoint._canon_name("/".join(parts))
         command = getattr(descriptor, "command", None)
         if command is not None:
             try:
-                return ArrowFlight._canon_name(ArrowFlight._bytes_of(command))
+                return Endpoint._canon_name(Endpoint._bytes_of(command))
             except Exception:
-                return ArrowFlight._canon_name(command)
-        return ArrowFlight._canon_name(descriptor)
+                return Endpoint._canon_name(command)
+        return Endpoint._canon_name(descriptor)
 
     @staticmethod
     def _build_descriptor(name: str) -> flight.FlightDescriptor:
-        canonical = ArrowFlight._canon_name(name)
+        canonical = Endpoint._canon_name(name)
         parts = [
             segment.encode("utf-8")
             for segment in canonical.split("/")
@@ -103,7 +92,7 @@ class ArrowFlight:
             del _
             with self._lock:
                 for name, reader in self._datasets.items():
-                    canonical = ArrowFlight._canon_name(name)
+                    canonical = Endpoint._canon_name(name)
                     parts = [
                         segment.encode("utf-8")
                         for segment in canonical.split("/")
@@ -128,8 +117,8 @@ class ArrowFlight:
         ) -> flight.FlightInfo:
             _ = context
             del _
-            name = ArrowFlight._name_from_descriptor(descriptor)
-            key = ArrowFlight._canon_name(name)
+            name = Endpoint._name_from_descriptor(descriptor)
+            key = Endpoint._canon_name(name)
             with self._lock:
                 reader = self._datasets.get(key)
                 if reader is None:
@@ -157,14 +146,14 @@ class ArrowFlight:
         ) -> flight.RecordBatchStream:
             _ = context
             del _
-            name = ArrowFlight._canon_name(ticket.ticket)
+            name = Endpoint._canon_name(ticket.ticket)
             with self._lock:
                 reader = self._datasets[name]
             return flight.RecordBatchStream(reader)
 
         def add_reader(self, name: str, reader: pa.RecordBatchReader) -> None:
             with self._lock:
-                key = ArrowFlight._canon_name(name)
+                key = Endpoint._canon_name(name)
                 self._datasets[key] = reader
 
     class Client:
@@ -180,7 +169,7 @@ class ArrowFlight:
             timeout_s: float = 30.0,
             poll_interval_s: float = 0.05,
         ) -> pa.RecordBatchReader:
-            descriptor = ArrowFlight._build_descriptor(name)
+            descriptor = Endpoint._build_descriptor(name)
             deadline = time.time() + float(timeout_s)
             last_error: BaseException | None = None
             while time.time() < deadline:
@@ -204,7 +193,7 @@ class ArrowFlight:
     @staticmethod
     def start_server_standby(
         *, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 10.0
-    ) -> Tuple[ArrowFlight.Server, str]:
+    ) -> Tuple[Endpoint.Server, str]:
         resolved = get_available_addr(f"{host}:{port}" if host else None)
         if ":" in resolved:
             host, port_str = resolved.rsplit(":", 1)
@@ -218,7 +207,7 @@ class ArrowFlight:
         except Exception:
             location_obj = None
         location = location_obj if location_obj is not None else f"grpc://{host}:{port}"
-        server = ArrowFlight.Server(location=location)
+        server = Endpoint.Server(location=location)
         thread_error: list[BaseException] = []
         bound = threading.Event()
 
@@ -313,7 +302,7 @@ class ArrowFlight:
 
     @staticmethod
     def reg_mmt_dataset(
-        server: ArrowFlight.Server,
+        server: Endpoint.Server,
         name: str,
         mmts: MemoryMappedTensorStream,
         batch_size: int,
@@ -338,22 +327,20 @@ class ArrowFlight:
         rest = list(generator)
         schema = first.schema
         reader = pa.RecordBatchReader.from_batches(schema, [first, *rest])
-        server.add_reader(ArrowFlight._canon_name(name), reader)
+        server.add_reader(Endpoint._canon_name(name), reader)
 
-
-class FlightModule:
     @staticmethod
     def connect(
         endpoint: str | Tuple[str, int] | flight.Location,
         *,
         wait_ready_s: float = 5.0,
         poll_interval_s: float = 0.05,
-    ) -> ArrowFlight.Client:
+    ) -> Endpoint.Client:
         deadline = time.time() + float(wait_ready_s)
         last_error: Exception | None = None
         while time.time() < deadline:
             try:
-                client = ArrowFlight.Client(endpoint)
+                client = Endpoint.Client(endpoint)
                 list(client._client.list_flights())
                 return client
             except Exception as exc:
@@ -364,13 +351,9 @@ class FlightModule:
         ) from last_error
 
 
-def open_flight_client(
-    uri: str | Tuple[str, int] | flight.Location
-) -> flight.FlightClient:
+def client(uri: str | Tuple[str, int] | flight.Location) -> flight.FlightClient:
     return flight.FlightClient(uri)
 
 
-def start_flight_server(
-    host: str = "0.0.0.0", port: int = 0
-) -> Tuple[ArrowFlight.Server, str]:
-    return ArrowFlight.start_server_standby(host=host, port=port)
+def server(host: str = "0.0.0.0", port: int = 0) -> Tuple[Endpoint.Server, str]:
+    return Endpoint.start_server_standby(host=host, port=port)

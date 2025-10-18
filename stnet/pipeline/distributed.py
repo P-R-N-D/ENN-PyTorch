@@ -14,10 +14,10 @@ from typing import Any, Dict, List, Optional
 import torch.distributed as dist
 
 try:
-    from ..connection.socket import ArrowFlight, FlightModule
+    from ..connection.socket import Endpoint
 except ImportError:
 
-    class _ArrowFlightUnavailable:
+    class _EndpointUnavailable:
         @staticmethod
         def start_server_standby(*args: Any, **kwargs: Any) -> Any:
             details = " with args/kwargs" if args or kwargs else ""
@@ -26,13 +26,12 @@ except ImportError:
                 f"{details}. Install pyarrow[flight] to enable it."
             )
 
-    class FlightModule:
         @staticmethod
         def connect(*args: Any, **kwargs: Any) -> None:
             details = " with args/kwargs" if args or kwargs else ""
             raise RuntimeError(f"Arrow Flight module is unavailable{details}.")
 
-    ArrowFlight = _ArrowFlightUnavailable()
+    Endpoint = _EndpointUnavailable()
 
 from ..toolkit.capability import get_available_addr, get_world_size
 
@@ -222,7 +221,7 @@ class MessageQueueConfig:
                 import zmq
             except Exception as exc:
                 raise RuntimeError(
-                    "pyzmq is required. Install it with `pip install pyzmq`."
+                    "pyzmq is required. Install it with `pip install stnet-pytorch[queue]` or `pip install pyzmq`."
                 ) from exc
         self._zmq = zmq.Context.instance()
         up_addr = _mq_addr("up")
@@ -460,7 +459,7 @@ class IOController:
             else:
                 bind_host = resolved
                 bind_port = int(self._flight_port)
-            server, uri = ArrowFlight.start_server_standby(
+            server, uri = Endpoint.start_server_standby(
                 host=bind_host,
                 port=bind_port,
                 wait_ready_s=15.0,
@@ -493,7 +492,7 @@ class IOController:
                 endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
                     try:
-                        self._clients[host] = FlightModule.connect(endpoint)
+                        self._clients[host] = Endpoint.connect(endpoint)
                         break
                     except Exception:
                         if attempt == 9:

@@ -21,7 +21,7 @@ class _ZMQProxy:
                 import zmq
             except Exception as exc:
                 raise RuntimeError(
-                    "pyzmq is required. Install pyzmq to use MessageQueue."
+                    "pyzmq is required. Install it with `pip install stnet-pytorch[queue]` or `pip install pyzmq` to use MessageQueue."
                 ) from exc
             type(self)._module = zmq
         return getattr(self._module, name)

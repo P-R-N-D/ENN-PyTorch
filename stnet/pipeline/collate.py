@@ -38,7 +38,7 @@ from torchdata.nodes import (
 
 from torch.distributed import distributed_c10d
 
-from ..connection.socket import ArrowFlight
+from ..connection.socket import Endpoint
 from ..toolkit.capability import apply_threading_defaults, get_world_size
 from ..toolkit.compat import has_arrow_flight, patch_arrow
 from .dataset import BatchStream, MemoryMappedTensorStream
@@ -972,9 +972,8 @@ def loader(
 
     def _flight_impl() -> Tuple[Any, Optional[Any], _Keep]:
         rank, local_rank, _, is_ddp = _world_info()
-        node_id = ArrowFlight.node_id(rank, local_rank)
-        name_train = ArrowFlight.resource_key(memmap_dir, "train")
-        name_val = ArrowFlight.resource_key(memmap_dir, "val")
+        name_train = Endpoint.resource_key(memmap_dir, "train")
+        name_val = Endpoint.resource_key(memmap_dir, "val")
         reader_tr = MemoryMappedTensorStream.from_dir(
             memmap_dir,
             split="train",
@@ -1000,15 +999,15 @@ def loader(
                 host = "127.0.0.1"
             uri_value = ""
             if not is_ddp or local_rank == 0:
-                server, uri_value = ArrowFlight.start_server_standby(
+                server, uri_value = Endpoint.start_server_standby(
                     host=host, port=0
                 )
                 keep.add(server)
-                ArrowFlight.reg_mmt_dataset(
+                Endpoint.reg_mmt_dataset(
                     server, name_train, reader_tr, int(batch_size), "train"
                 )
                 if reader_vl is not None:
-                    ArrowFlight.reg_mmt_dataset(
+                    Endpoint.reg_mmt_dataset(
                         server, name_val, reader_vl, int(batch_size), "val"
                     )
                 name_train, uri_value = _new_flight(
@@ -1024,7 +1023,7 @@ def loader(
                     name_val, uri_value = _new_flight(
                         "val", name_val, uri_value
                     )
-            client = ArrowFlight.Client(uri_value)
+            client = Endpoint.Client(uri_value)
             keep.add(client)
             label_shape = list(meta.get("label_shape", []))
 
