@@ -678,8 +678,8 @@ class H2DController(Iterator[Any]):
 class Loader:
     def __init__(
         self,
-        *args: Any,
         device: torch.device,
+        *args: Any,
         node: BaseNode | None = None,
         dataset: BaseNode | None = None,
         prefetch_factor: int = 2,
@@ -749,7 +749,7 @@ def _torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> Any:
     return mapping.get(dtype, np.float32)
 
 
-def _map_dtype(obj: Any, *, dtype: Optional[torch.dtype]) -> Any:
+def _map_dtype(obj: Any, dtype: Optional[torch.dtype], *args: Any, **kwargs: Any) -> Any:
     if dtype is None:
         return obj
     if isinstance(obj, torch.Tensor):
@@ -811,10 +811,11 @@ class _Keep:
 
 def to_batch(
     batch: Mapping[str, Any],
-    *,
+    *args: Any,
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     features = batch["X"]
     labels = batch["Y"]
@@ -849,10 +850,11 @@ def to_tensor(obj: Any) -> torch.Tensor:
 
 def fetch(
     sample: Any,
-    *,
+    *args: Any,
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
+    **kwargs: Any,
 ) -> Any:
     if isinstance(sample, (list, tuple)):
         return [
@@ -877,14 +879,14 @@ def loader(
     device: Union[str, torch.device],
     batch_size: int,
     val_frac: float,
-    *,
+    *args: Any,
     prefetch_factor: int = 2,
     non_blocking_copy: bool = True,
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
     io_backend: str = "auto",
-    **loader_options: Any,
+    **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     device_obj = (
         torch.device(device)
@@ -928,7 +930,7 @@ def loader(
             node=wrapped,
             prefetch_factor=prefetch_factor,
             non_blocking=bool(non_blocking_copy),
-            **loader_options,
+            **kwargs,
         )
 
     def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
@@ -1119,4 +1121,3 @@ def loader(
             RuntimeWarning,
         )
         return _local_impl()
-
