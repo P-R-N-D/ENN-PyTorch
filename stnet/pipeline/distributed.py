@@ -215,10 +215,11 @@ class IOController:
         self._leaders: Dict[str, Dict[str, Any]] = {}
 
     def start(self) -> IOController:
+        host_name = _hostname()
         infos = _gather_all(
             {
                 "rank": self.rank,
-                "host": _hostname(),
+                "host": host_name,
                 "local_rank": self.local_rank,
                 "ip": self._my_ip,
             }
@@ -254,10 +255,15 @@ class IOController:
                 self._bind_host = parsed.hostname
             if parsed.port:
                 self._flight_port = int(parsed.port)
+            publish_key(f"flight_port:{host_name}", str(self._flight_port))
             for host, info in leaders.items():
-                if host == _hostname():
+                if host == host_name:
                     continue
-                endpoint = f"grpc+tcp://{info['ip']}:{self._flight_port}"
+                try:
+                    remote_port = int(wait_key(f"flight_port:{host}"))
+                except Exception:
+                    continue
+                endpoint = f"grpc+tcp://{info['ip']}:{remote_port}"
                 try:
                     self._clients[host] = FlightModule.connect(endpoint)
                 except Exception:
