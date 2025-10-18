@@ -141,32 +141,40 @@ def _gather_all(obj: Any) -> List[Any]:
     return buffer
 
 
-def _format_flight_host(host: Any, fallback: Any | None = None, *, default: str = "127.0.0.1") -> str:
-    candidate: str = ""
-
+def _format_flight_host(
+    host: Any, fallback: Any | None = None, *, default: str = "127.0.0.1"
+) -> str:
     def _coerce(value: Any) -> str:
         if isinstance(value, str):
             return value.strip()
         if value is None:
             return ""
-        coerced = str(value).strip()
-        return coerced
+        return str(value).strip()
 
-    candidate = _coerce(host)
-    if not candidate:
-        candidate = _coerce(fallback)
-    if not candidate:
-        candidate = default
+    preferred = _coerce(host)
+    fallback_value = _coerce(fallback)
+    default_value = _coerce(default) or "127.0.0.1"
 
-    try:
-        parsed = ipaddress.ip_address(candidate.strip("[]"))
-    except ValueError:
-        return candidate
+    for candidate, allow_loopback in (
+        (preferred, False),
+        (fallback_value, False),
+        (default_value, True),
+    ):
+        if not candidate:
+            continue
+        stripped = candidate.strip("[]")
+        try:
+            parsed = ipaddress.ip_address(stripped)
+        except ValueError:
+            return candidate
+        if not allow_loopback and (parsed.is_unspecified or parsed.is_loopback):
+            continue
+        compressed = parsed.compressed
+        if parsed.version == 6:
+            return f"[{compressed}]"
+        return compressed
 
-    compressed = parsed.compressed
-    if parsed.version == 6:
-        return f"[{compressed}]"
-    return compressed
+    return default_value
 
 
 def _mq_addr(
