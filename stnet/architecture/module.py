@@ -158,7 +158,7 @@ def _student_t_cdf_loc_scale(
 
 
 class _ScalerBase:
-    def __init__(self, *, device: str = "cpu", dtype: Any = torch.float64) -> None:
+    def __init__(self, *args: Any, device: str = "cpu", dtype: Any = torch.float64, **kwargs: Any) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
         self.reset()
@@ -225,7 +225,7 @@ class VarianceThreshold(_ScalerBase):
 class StandardScaler(_ScalerBase):
     def __init__(
         self,
-        *,
+        *args: Any,
         with_mean: bool = True,
         with_std: bool = True,
         eps: float = 1e-08,
@@ -318,7 +318,7 @@ class StandardScaler(_ScalerBase):
 
     @torch.no_grad()
     def transform(
-        self, X: Tensor, *, clip: bool = False, clip_sigma: float | None = None
+        self, X: Tensor, *args: Any, clip: bool = False, clip_sigma: float | None = None, **kwargs: Any
     ) -> Tensor:
         if self.mean_ is None or self.scale_ is None:
             raise RuntimeError("Call finalize() before transform().")
@@ -364,7 +364,7 @@ class IncrementalPCA(_ScalerBase):
     def __init__(
         self,
         n_components: int,
-        *,
+        *args: Any,
         method: str = "cov",
         center: bool = True,
         **kwargs: Any,
@@ -1658,12 +1658,13 @@ class PatchAttention(nn.Module):
         self,
         d_model: int,
         nhead: int,
-        *,
+        *args: Any,
         coord_dim: int = 3,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         if d_model % nhead != 0:
@@ -1751,12 +1752,13 @@ class SpatialSubnet(nn.Module):
         d_model: int,
         nhead: int,
         depth: int,
-        *,
+        *args: Any,
         coord_dim: int = 3,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         drops = _stochastic_depth_scheduler(drop_path, depth)
@@ -1824,11 +1826,12 @@ class TemporalSubnet(nn.Module):
         d_model: int,
         nhead: int,
         depth: int,
-        *,
+        *args: Any,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         drops = _stochastic_depth_scheduler(drop_path, depth)
@@ -1861,11 +1864,12 @@ class CrossTransformer(nn.Module):
         self,
         d_model: int,
         nhead: int,
-        *,
+        *args: Any,
         dropout: float = 0.0,
         norm_type: str = "layernorm",
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.cross_s = GatedCrossAttention(
@@ -1933,11 +1937,12 @@ class MetaNet(nn.Module):
         d_model: int,
         nhead: int,
         depth: int,
-        *,
+        *args: Any,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         drops = _stochastic_depth_scheduler(drop_path, depth)
@@ -1965,7 +1970,7 @@ class MetaNet(nn.Module):
 
 class SpatioTemporalNet(nn.Module):
     def __init__(
-        self, in_dim: int, out_shape: Sequence[int], *, config: Config
+        self, in_dim: int, out_shape: Sequence[int], config: Config, *args: Any, **kwargs: Any
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -2098,7 +2103,7 @@ class SpatioTemporalNet(nn.Module):
         )
 
     def decode(
-        self, tokens: torch.Tensor, *, apply_norm: bool = False
+        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
     ) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
