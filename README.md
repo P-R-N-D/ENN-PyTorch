@@ -71,10 +71,6 @@ During training and inference the progress bar reports MB/s, TFLOPS, elapsed tim
 
 The workflow helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
 
-## Validating with `raw_data.xlsx`
-
-The repository includes `raw_data.xlsx`, the same workbook used to validate schema alignment, feature scaling, adaptive loss balancing, FLOP/I/O tracking, status bar updates, and join synchronization. Open `notebook.ipynb` for a step-by-step walkthrough that loads the workbook with Polars, constructs training tensors, calls `stnet.workflow.train`, and streams predictions with `stnet.workflow.predict` before exporting them back to Excel. You can run the notebook or adapt the code into your own scripts to reproduce the verification pipeline.
-
 ## Exporting for inference
 Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `export` extra to enable the full conversion toolkit.
 
