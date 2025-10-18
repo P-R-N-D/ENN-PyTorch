@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import ipaddress
 import os
 import socket
 import time
@@ -276,20 +277,28 @@ class IOController:
 
         def _cache_leader(host: str, info: Mapping[str, Any] | None) -> Dict[str, Any]:
             def _sanitize_ip(value: Any) -> Optional[str]:
-                if isinstance(value, str):
-                    candidate = value.strip()
-                elif value is None:
+                if not isinstance(value, str):
                     return None
-                else:
-                    return None
+                candidate = value.strip()
                 if not candidate:
                     return None
-                lowered = candidate.lower()
-                if lowered in {"0.0.0.0", "::", "::1"}:
+                stripped = candidate
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    stripped = stripped[1:-1].strip()
+                    if not stripped:
+                        return None
+                if "%" in stripped:
+                    base, _, _ = stripped.partition("%")
+                    stripped = base.strip()
+                    if not stripped:
+                        return None
+                try:
+                    parsed = ipaddress.ip_address(stripped)
+                except ValueError:
                     return None
-                if candidate.startswith("127."):
+                if parsed.is_unspecified or parsed.is_loopback:
                     return None
-                return candidate
+                return str(parsed)
 
             if isinstance(info, dict):
                 info_dict: Dict[str, Any] = info
