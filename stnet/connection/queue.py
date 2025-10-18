@@ -67,9 +67,10 @@ class Publisher(Protocol):
     def publish(
         self,
         payload: bytes,
-        *,
+        *args: Any,
         headers: Optional[Dict[str, str]] = None,
         key: Optional[str] = None,
+        **kwargs: Any,
     ) -> int:
         if False:
             raise RuntimeError(payload, headers, key)
@@ -77,7 +78,7 @@ class Publisher(Protocol):
 
 
 class Subscriber(Protocol):
-    def recv(self, *, timeout: Optional[float] = None) -> Optional[Message]:
+    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
         if False:
             raise RuntimeError(timeout)
         raise NotImplementedError
@@ -95,9 +96,10 @@ class CompatQueue(Publisher, Subscriber):
     def publish(
         self,
         payload: bytes,
-        *,
+        *args: Any,
         headers: Optional[Dict[str, str]] = None,
         key: Optional[str] = None,
+        **kwargs: Any,
     ) -> int:
         self._offset += 1
         message = Message(
@@ -111,7 +113,7 @@ class CompatQueue(Publisher, Subscriber):
         self._queue.put(message)
         return self._offset
 
-    def recv(self, *, timeout: Optional[float] = None) -> Optional[Message]:
+    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
         try:
             if timeout is None:
                 return self._queue.get()
@@ -128,9 +130,10 @@ class MessageQueue(Publisher, Subscriber):
     def __init__(
         self,
         topic: str,
-        *,
+        *args: Any,
         pub_bind: Optional[str] = None,
         sub_connect: Optional[str] = None,
+        **kwargs: Any,
     ) -> None:
         self._context = zmq.Context.instance()
         self._topic = topic.encode("utf-8")
@@ -146,9 +149,10 @@ class MessageQueue(Publisher, Subscriber):
     def publish(
         self,
         payload: bytes,
-        *,
+        *args: Any,
         headers: Optional[Dict[str, str]] = None,
         key: Optional[str] = None,
+        **kwargs: Any,
     ) -> int:
         self._offset += 1
         message = Message(
@@ -162,7 +166,7 @@ class MessageQueue(Publisher, Subscriber):
         self._pub.send_multipart([self._topic, message.to_bytes()])
         return self._offset
 
-    def recv(self, *, timeout: Optional[float] = None) -> Optional[Message]:
+    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
         poller = zmq.Poller()
         poller.register(self._sub, zmq.POLLIN)
         timeout_ms = int(timeout * 1000) if timeout is not None else None
@@ -212,13 +216,3 @@ class DistributedQueue:
                 if time.time() - start > float(timeout_s):
                     raise TimeoutError(f"DistributedQueue wait timeout: {key}")
                 time.sleep(0.05)
-
-
-__all__ = [
-    "Message",
-    "Publisher",
-    "Subscriber",
-    "CompatQueue",
-    "MessageQueue",
-    "DistributedQueue",
-]
