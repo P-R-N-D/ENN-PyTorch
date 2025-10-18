@@ -1466,9 +1466,9 @@ class DataFidelityLoss(nn.Module):
 class LinearCombinationLoss(nn.Module):
     def __init__(
         self,
-        *args: Any,
         coefficient: Sequence[float],
         loss: Sequence[nn.Module],
+        *args: Any,
         offset: float = 0.0,
         **kwargs: Any,
     ) -> None:
