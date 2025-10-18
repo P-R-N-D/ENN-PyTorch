@@ -13,18 +13,18 @@ license-files = ["LICENSE*"]
 authors = [{ name = "Kim Jeseok" }]
 keywords = ["transformer", "spatio-temporal", "pytorch", "fp8", "training"]
 dependencies = [
-  "torch>=2.6",
+  "torch>=2.1",
   "torchvision>=0.16",
   "torchdata>=0.11",
   "tensordict>=0.10.0",
   "numpy>=1.24",
   "netifaces>=0.11",
   "pyarrow[flight]>=10",
-  "pyzmq>=25",
   "tqdm>=4.66"
 ]
 
 [project.optional-dependencies]
+queue = ["pyzmq>=25"]
 ao = ["torchao>=0.5"]
 gds = ["cupy>=12.1", "kvikio>=23.8"]
 te = ["transformer-engine[pytorch]>=2.0"]

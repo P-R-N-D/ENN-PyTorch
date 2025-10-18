@@ -3,10 +3,10 @@ from __future__ import annotations
 
 from .memory import CudaIpc, GpuDirectStorage, MemoryMap, SharedMemory, Ucxx
 from .queue import CompatQueue, DistributedQueue, MessageQueue
-from .socket import ArrowFlight
+from .socket import Endpoint
 
 __all__ = [
-    "ArrowFlight",
+    "Endpoint",
     "DistributedQueue",
     "MemoryMap",
     "SharedMemory",

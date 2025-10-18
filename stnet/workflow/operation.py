@@ -21,11 +21,13 @@ from torch.distributed.checkpoint import (
     load,
     save,
 )
+from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
     get_optimizer_state_dict,
     set_model_state_dict,
+    set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
@@ -583,6 +585,33 @@ def epochs(
         logger=None,
     )
 
+    if init_ckpt_dir is not None and os.path.isdir(init_ckpt_dir):
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=pattern_to_ignore)
+            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+            try:
+                load(
+                    state_dict={"optimizer": optim_sd},
+                    storage_reader=FileSystemReader(init_ckpt_dir),
+                )
+            except (
+                FileNotFoundError,
+                ValueError,
+                KeyError,
+                RuntimeError,
+                CheckpointException,
+            ) as exc:
+                msg = str(exc)
+                if "optimizer" not in msg.lower():
+                    raise
+            else:
+                set_optimizer_state_dict(
+                    model,
+                    optimizer,
+                    optim_sd,
+                    options=StateDictOptions(strict=False),
+                )
+
     def _dl_ckpt(p: Any) -> Any:
         return os.path.join(p, "dataloader.json")
 
@@ -689,12 +718,20 @@ def epochs(
             1.0 + math.cos(math.pi * t / max(1, main_steps))
         )
 
-    def _join_context(m: torch.nn.Module) -> contextlib.AbstractContextManager:
-        join_hook = getattr(m, "join_hook", None)
-        is_joinable = join_hook is not None
+    def _join_context(
+        m: torch.nn.Module, opt: Optional[torch.optim.Optimizer]
+    ) -> contextlib.AbstractContextManager:
+        joinables = []
+        if Join is None:
+            return contextlib.nullcontext()
+        for maybe_joinable in (m, opt):
+            if maybe_joinable is None:
+                continue
+            if getattr(maybe_joinable, "join_hook", None) is not None:
+                joinables.append(maybe_joinable)
         return (
-            Join([m], throw_on_early_termination=True)
-            if Join is not None and is_joinable
+            Join(joinables, throw_on_early_termination=True)
+            if joinables
             else contextlib.nullcontext()
         )
 
@@ -773,7 +810,7 @@ def epochs(
             model.train()
             optimizer.zero_grad(set_to_none=True)
             t_fetch_start = time.perf_counter_ns()
-            with _join_context(model):
+            with _join_context(model, optimizer):
                 train_step_count = 0
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
@@ -924,7 +961,7 @@ def epochs(
                 val_loss_weights = loss_controller.weights()
                 with torch.no_grad(), TunedAMP.float(device):
                     t_fetch_start = time.perf_counter_ns()
-                    with _join_context(model):
+                    with _join_context(model, optimizer):
                         v_step_count = 0
                         for step_idx, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)

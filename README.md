@@ -23,7 +23,9 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    Additional extras include `ao`, `gds`, `te`, `intel`, `ucx`, `arrow_cuda`, and `scale` as defined in `pyproject.toml`.
 
 ## Dependencies
-- `torch>=2.6`
+The core runtime depends on:
+
+- `torch>=2.1`
 - `torchvision>=0.16`
 - `torchdata>=0.11`
 - `tensordict>=0.10.0`
@@ -31,11 +33,11 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 - `netifaces>=0.11`
 - `pyarrow[flight]>=10`
   - add `pyarrow[cuda]` (or install the `arrow_cuda` extra) when GPU-accelerated Arrow Flight is required
-- `pyzmq>=25`
 - `tqdm>=4.66`
 
 Optional extras listed in `pyproject.toml` cover exporter stacks (`export`), advanced optimization toolchains (`ao`, `te`, `scale`),
-vendor accelerators (`intel`, `ucx`), storage pipelines (`gds`), and Arrow GPU acceleration (`arrow_cuda`).
+vendor accelerators (`intel`, `ucx`), storage pipelines (`gds`), Arrow GPU acceleration (`arrow_cuda`), and queue backends (`queue`).
+Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message queue helpers are required.
 
 ## Quick start
 ```python
