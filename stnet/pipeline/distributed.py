@@ -293,18 +293,27 @@ class IOController:
             if parsed.port:
                 self._flight_port = int(parsed.port)
             publish_key(f"flight_port:{host_name}", str(self._flight_port))
-            self._leaders.setdefault(host_name, {})["flight_port"] = self._flight_port
+            leader_info = self._leaders.setdefault(
+                host_name, {"ip": self._my_ip, "host": host_name}
+            )
+            leader_info.setdefault("ip", self._my_ip)
+            leader_info.setdefault("host", host_name)
+            leader_info["flight_port"] = self._flight_port
             for host, info in leaders.items():
                 if host == host_name:
                     continue
                 remote_port = _wait_for_flight_port(host)
                 if remote_port is None:
-                    leader_info = self._leaders.setdefault(host, {})
+                    leader_info = self._leaders.setdefault(host, dict(info))
+                    leader_info.setdefault("ip", info.get("ip", "127.0.0.1"))
+                    leader_info.setdefault("host", host)
                     leader_info["flight_port"] = None
                     continue
-                leader_info = self._leaders.setdefault(host, {})
+                leader_info = self._leaders.setdefault(host, dict(info))
+                leader_info.setdefault("ip", info.get("ip", "127.0.0.1"))
+                leader_info.setdefault("host", host)
                 leader_info["flight_port"] = remote_port
-                endpoint_host = leader_info.get("ip", info["ip"])
+                endpoint_host = leader_info.get("ip", info.get("ip", "127.0.0.1"))
                 endpoint = f"grpc+tcp://{endpoint_host}:{remote_port}"
                 for attempt in range(10):
                     try:
@@ -319,7 +328,12 @@ class IOController:
             local_port = _wait_for_flight_port(host_name)
             if local_port is not None:
                 self._flight_port = local_port
-            self._leaders.setdefault(host_name, {})["flight_port"] = self._flight_port
+            leader_info = self._leaders.setdefault(
+                host_name, {"ip": self._my_ip, "host": host_name}
+            )
+            leader_info.setdefault("ip", self._my_ip)
+            leader_info.setdefault("host", host_name)
+            leader_info["flight_port"] = self._flight_port
         return self
 
     def push_local_up(self, payload: bytes | memoryview) -> None:
