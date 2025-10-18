@@ -6,7 +6,7 @@ import socket
 import time
 from urllib.parse import urlparse
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import torch.distributed as dist
 
@@ -59,19 +59,32 @@ def _rank() -> int:
     return dist.get_rank()
 
 
-def wait_key(key: str, timeout_s: float = 30.0) -> str:
+def wait_key(key: str, timeout_s: Optional[float] = 30.0) -> str:
     if not is_initialized():
         raise RuntimeError("distributed not initialized")
     store = dist.distributed_c10d._get_default_store()
-    start = time.time()
+    if timeout_s is None:
+        value: bytes = store.get(key)
+        return value.decode("utf-8")
+    if timeout_s <= 0:
+        result = store.wait([key], timeout=0.0)
+        if not result or not result[0]:
+            raise TimeoutError(f"timeout waiting for key: {key}")
+        value = store.get(key)
+        return value.decode("utf-8")
+    deadline = time.time() + timeout_s
+    remaining = timeout_s
     while True:
         try:
-            value: bytes = store.get(key)
+            result = store.wait([key], timeout=max(remaining, 0.0))
+        except Exception as exc:  # pragma: no cover - backend specific errors
+            raise TimeoutError(f"timeout waiting for key: {key}") from exc
+        if result and result[0]:
+            value = store.get(key)
             return value.decode("utf-8")
-        except Exception:
-            if time.time() - start > timeout_s:
-                raise TimeoutError(f"timeout waiting for key: {key}")
-            time.sleep(0.05)
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise TimeoutError(f"timeout waiting for key: {key}")
 
 
 def publish_key(key: str, value: str) -> None:
@@ -234,7 +247,7 @@ class IOController:
                 (item for item in entries if item["local_rank"] == 0),
                 sorted(entries, key=lambda val: val["rank"])[0],
             )
-            leaders[host] = leader
+            leaders[host] = dict(leader)
         self._leaders = leaders
         if self.is_node_leader:
             resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
@@ -256,18 +269,31 @@ class IOController:
             if parsed.port:
                 self._flight_port = int(parsed.port)
             publish_key(f"flight_port:{host_name}", str(self._flight_port))
+            self._leaders.setdefault(host_name, {})["flight_port"] = self._flight_port
             for host, info in leaders.items():
                 if host == host_name:
                     continue
+                remote_port: int | None = None
                 try:
-                    remote_port = int(wait_key(f"flight_port:{host}"))
-                except Exception:
+                    port_str = wait_key(f"flight_port:{host}", timeout_s=5.0)
+                    remote_port = int(port_str)
+                except TimeoutError:
+                    self._leaders.setdefault(host, {})["flight_port"] = None
                     continue
+                except (TypeError, ValueError):
+                    self._leaders.setdefault(host, {})["flight_port"] = None
+                    continue
+                self._leaders.setdefault(host, {})["flight_port"] = remote_port
                 endpoint = f"grpc+tcp://{info['ip']}:{remote_port}"
-                try:
-                    self._clients[host] = FlightModule.connect(endpoint)
-                except Exception:
-                    continue
+                for attempt in range(5):
+                    try:
+                        self._clients[host] = FlightModule.connect(endpoint)
+                        break
+                    except Exception:
+                        if attempt == 4:
+                            self._clients.pop(host, None)
+                            break
+                        time.sleep(0.5 * (attempt + 1))
         return self
 
     def push_local_up(self, payload: bytes | memoryview) -> None:
