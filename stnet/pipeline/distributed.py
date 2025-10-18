@@ -249,6 +249,30 @@ class IOController:
             )
             leaders[host] = dict(leader)
         self._leaders = leaders
+        def _wait_for_flight_port(
+            target_host: str,
+            *,
+            total_timeout_s: float = 60.0,
+            poll_timeout_s: float = 2.0,
+        ) -> int | None:
+            if total_timeout_s is not None and total_timeout_s <= 0:
+                total_timeout_s = 0.0
+            deadline = None if total_timeout_s is None else time.time() + total_timeout_s
+            while True:
+                try:
+                    port_value = wait_key(
+                        f"flight_port:{target_host}",
+                        timeout_s=poll_timeout_s,
+                    )
+                except TimeoutError:
+                    if deadline is not None and time.time() >= deadline:
+                        return None
+                    continue
+                try:
+                    return int(port_value)
+                except (TypeError, ValueError):
+                    return None
+
         if self.is_node_leader:
             resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
             if ":" in resolved:
@@ -273,27 +297,26 @@ class IOController:
             for host, info in leaders.items():
                 if host == host_name:
                     continue
-                remote_port: int | None = None
-                try:
-                    port_str = wait_key(f"flight_port:{host}", timeout_s=5.0)
-                    remote_port = int(port_str)
-                except TimeoutError:
-                    self._leaders.setdefault(host, {})["flight_port"] = None
-                    continue
-                except (TypeError, ValueError):
+                remote_port = _wait_for_flight_port(host)
+                if remote_port is None:
                     self._leaders.setdefault(host, {})["flight_port"] = None
                     continue
                 self._leaders.setdefault(host, {})["flight_port"] = remote_port
                 endpoint = f"grpc+tcp://{info['ip']}:{remote_port}"
-                for attempt in range(5):
+                for attempt in range(10):
                     try:
                         self._clients[host] = FlightModule.connect(endpoint)
                         break
                     except Exception:
-                        if attempt == 4:
+                        if attempt == 9:
                             self._clients.pop(host, None)
                             break
-                        time.sleep(0.5 * (attempt + 1))
+                        time.sleep(min(0.5 * (attempt + 1), 5.0))
+        else:
+            local_port = _wait_for_flight_port(host_name)
+            if local_port is not None:
+                self._flight_port = local_port
+            self._leaders.setdefault(host_name, {})["flight_port"] = self._flight_port
         return self
 
     def push_local_up(self, payload: bytes | memoryview) -> None:
