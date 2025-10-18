@@ -432,7 +432,21 @@ class IOController:
                 endpoint_host = leader_info.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
                     endpoint_host = leader_info.get("host") or info.get("host") or host
-                endpoint = f"grpc+tcp://{endpoint_host}:{remote_port}"
+                if isinstance(endpoint_host, str):
+                    candidate = endpoint_host.strip()
+                else:
+                    candidate = str(endpoint_host)
+                if not candidate:
+                    candidate = host
+                try:
+                    parsed_ip = ipaddress.ip_address(candidate.strip("[]"))
+                except ValueError:
+                    formatted_host = candidate
+                else:
+                    formatted_host = parsed_ip.compressed
+                    if parsed_ip.version == 6:
+                        formatted_host = f"[{formatted_host}]"
+                endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
                     try:
                         self._clients[host] = FlightModule.connect(endpoint)
