@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import ipaddress
 import os
 import socket
@@ -300,6 +301,40 @@ class IOController:
                     return None
                 return str(parsed)
 
+            def _resolve_ip_from_host(hostname: Any) -> Optional[str]:
+                if not isinstance(hostname, str):
+                    return None
+                candidate = hostname.strip()
+                if not candidate:
+                    return None
+                addrinfo: List[tuple[Any, ...]] | None = None
+                try:
+                    addrinfo = socket.getaddrinfo(
+                        candidate,
+                        None,
+                        family=socket.AF_UNSPEC,
+                        type=socket.SOCK_STREAM,
+                    )
+                except socket.gaierror:
+                    return None
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        addrinfo = socket.getaddrinfo(candidate, None)
+                if not addrinfo:
+                    return None
+                for resolved in addrinfo:
+                    try:
+                        sockaddr = resolved[4]
+                    except Exception:
+                        sockaddr = None
+                    if not sockaddr:
+                        continue
+                    addr = sockaddr[0]
+                    sanitized = _sanitize_ip(addr)
+                    if sanitized:
+                        return sanitized
+                return None
+
             if isinstance(info, dict):
                 info_dict: Dict[str, Any] = info
             elif info is None:
@@ -354,13 +389,8 @@ class IOController:
                 leader_info["ip"] = cached_sanitized_ip
             has_valid_ip = bool(_sanitize_ip(leader_info.get("ip")))
             if (not has_valid_ip) and resolved_host:
-                try:
-                    resolved_ip = socket.gethostbyname(resolved_host)
-                except Exception:
-                    resolved_ip = None
-                if isinstance(resolved_ip, str):
-                    resolved_ip = resolved_ip.strip()
-                if _sanitize_ip(resolved_ip):
+                resolved_ip = _resolve_ip_from_host(resolved_host)
+                if resolved_ip:
                     leader_info["ip"] = resolved_ip
             self._leaders[host] = leader_info
             return leader_info
