@@ -276,6 +276,7 @@ class IOController:
         def _cache_leader(host: str, info: Dict[str, Any]) -> Dict[str, Any]:
             leader_info = self._leaders.setdefault(host, dict(info))
             ip_value = info.get("ip") if isinstance(info, dict) else None
+            sanitized_ip: Optional[str] = None
             if isinstance(ip_value, str):
                 sanitized_ip = ip_value.strip()
                 if sanitized_ip and sanitized_ip not in {"0.0.0.0", "::"}:
@@ -283,10 +284,23 @@ class IOController:
             elif ip_value:
                 leader_info["ip"] = ip_value
             host_value = info.get("host") if isinstance(info, dict) else None
+            resolved_host: Optional[str] = None
             if isinstance(host_value, str) and host_value.strip():
-                leader_info["host"] = host_value.strip()
+                resolved_host = host_value.strip()
+                leader_info["host"] = resolved_host
             else:
-                leader_info.setdefault("host", host)
+                resolved_host = leader_info.get("host") or host
+                leader_info.setdefault("host", resolved_host)
+            has_valid_ip = isinstance(leader_info.get("ip"), str) and leader_info["ip"] not in {"", "0.0.0.0", "::"}
+            if (not has_valid_ip) and resolved_host:
+                try:
+                    resolved_ip = socket.gethostbyname(resolved_host)
+                except Exception:
+                    resolved_ip = None
+                if isinstance(resolved_ip, str):
+                    resolved_ip = resolved_ip.strip()
+                if resolved_ip and resolved_ip not in {"0.0.0.0", "::"}:
+                    leader_info["ip"] = resolved_ip
             return leader_info
 
         if self.is_node_leader:
