@@ -165,9 +165,10 @@ class Endpoint:
         def reader(
             self,
             name: str,
-            *,
+            *args: Any,
             timeout_s: float = 30.0,
             poll_interval_s: float = 0.05,
+            **kwargs: Any,
         ) -> pa.RecordBatchReader:
             descriptor = Endpoint._build_descriptor(name)
             deadline = time.time() + float(timeout_s)
@@ -192,7 +193,7 @@ class Endpoint:
 
     @staticmethod
     def start_server_standby(
-        *, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 10.0
+        *args: Any, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 10.0, **kwargs: Any
     ) -> Tuple[Endpoint.Server, str]:
         resolved = get_available_addr(f"{host}:{port}" if host else None)
         if ":" in resolved:
@@ -332,9 +333,10 @@ class Endpoint:
     @staticmethod
     def connect(
         endpoint: str | Tuple[str, int] | flight.Location,
-        *,
+        *args: Any,
         wait_ready_s: float = 5.0,
         poll_interval_s: float = 0.05,
+        **kwargs: Any,
     ) -> Endpoint.Client:
         deadline = time.time() + float(wait_ready_s)
         last_error: Exception | None = None
