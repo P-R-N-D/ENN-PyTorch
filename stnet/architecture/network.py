@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import inspect
@@ -104,8 +105,8 @@ class Model(nn.Module):
         self,
         in_dim: int,
         out_shape: Sequence[int],
-        *args: Any,
         config: Config,
+        *args: Any,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -617,9 +618,10 @@ class Model(nn.Module):
     @staticmethod
     def flatten_labels(
         labels: Sequence[torch.Tensor],
-        *,
+        *args: Any,
         dtype: Optional[torch.dtype] = None,
         pin_memory: bool = False,
+        **kwargs: Any,
     ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         out = torch.stack([l.reshape(-1) for l in labels], dim=0)
         if dtype is not None:
@@ -633,4 +635,3 @@ class Model(nn.Module):
         flat: torch.Tensor, shape: Sequence[int]
     ) -> torch.Tensor:
         return flat.view(flat.shape[0], *shape)
-
