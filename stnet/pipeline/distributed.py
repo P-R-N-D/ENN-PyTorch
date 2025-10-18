@@ -273,6 +273,18 @@ class IOController:
                 except (TypeError, ValueError):
                     return None
 
+        def _cache_leader(host: str, info: Dict[str, Any]) -> Dict[str, Any]:
+            leader_info = self._leaders.setdefault(host, dict(info))
+            ip_value = info.get("ip") if isinstance(info, dict) else None
+            if ip_value:
+                leader_info["ip"] = ip_value
+            host_value = info.get("host") if isinstance(info, dict) else None
+            if host_value:
+                leader_info["host"] = host_value
+            else:
+                leader_info.setdefault("host", host)
+            return leader_info
+
         if self.is_node_leader:
             resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
             if ":" in resolved:
@@ -293,27 +305,23 @@ class IOController:
             if parsed.port:
                 self._flight_port = int(parsed.port)
             publish_key(f"flight_port:{host_name}", str(self._flight_port))
-            leader_info = self._leaders.setdefault(
+            leader_info = _cache_leader(
                 host_name, {"ip": self._my_ip, "host": host_name}
             )
-            leader_info.setdefault("ip", self._my_ip)
-            leader_info.setdefault("host", host_name)
             leader_info["flight_port"] = self._flight_port
             for host, info in leaders.items():
                 if host == host_name:
                     continue
                 remote_port = _wait_for_flight_port(host)
                 if remote_port is None:
-                    leader_info = self._leaders.setdefault(host, dict(info))
-                    leader_info.setdefault("ip", info.get("ip", "127.0.0.1"))
-                    leader_info.setdefault("host", host)
+                    leader_info = _cache_leader(host, info)
                     leader_info["flight_port"] = None
                     continue
-                leader_info = self._leaders.setdefault(host, dict(info))
-                leader_info.setdefault("ip", info.get("ip", "127.0.0.1"))
-                leader_info.setdefault("host", host)
+                leader_info = _cache_leader(host, info)
                 leader_info["flight_port"] = remote_port
-                endpoint_host = leader_info.get("ip", info.get("ip", "127.0.0.1"))
+                endpoint_host = leader_info.get("ip")
+                if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
+                    endpoint_host = leader_info.get("host") or info.get("host") or host
                 endpoint = f"grpc+tcp://{endpoint_host}:{remote_port}"
                 for attempt in range(10):
                     try:
@@ -328,11 +336,9 @@ class IOController:
             local_port = _wait_for_flight_port(host_name)
             if local_port is not None:
                 self._flight_port = local_port
-            leader_info = self._leaders.setdefault(
+            leader_info = _cache_leader(
                 host_name, {"ip": self._my_ip, "host": host_name}
             )
-            leader_info.setdefault("ip", self._my_ip)
-            leader_info.setdefault("host", host_name)
             leader_info["flight_port"] = self._flight_port
         return self
 
