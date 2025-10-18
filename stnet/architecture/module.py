@@ -172,7 +172,7 @@ class _ScalerBase:
 
 class VarianceThreshold(_ScalerBase):
     def __init__(
-        self, threshold: float = 0.0, unbiased: bool = True, **kwargs: Any
+        self, *args: Any, threshold: float = 0.0, unbiased: bool = True, **kwargs: Any
     ) -> None:
         super().__init__(**kwargs)
         self.threshold = float(threshold)
