@@ -5,6 +5,7 @@ import os
 import socket
 import time
 from urllib.parse import urlparse
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -273,9 +274,20 @@ class IOController:
                 except (TypeError, ValueError):
                     return None
 
-        def _cache_leader(host: str, info: Dict[str, Any]) -> Dict[str, Any]:
-            leader_info = self._leaders.setdefault(host, dict(info))
-            ip_value = info.get("ip") if isinstance(info, dict) else None
+        def _cache_leader(host: str, info: Mapping[str, Any] | None) -> Dict[str, Any]:
+            if isinstance(info, dict):
+                info_dict: Dict[str, Any] = info
+            elif info is None:
+                info_dict = {}
+            elif isinstance(info, Mapping):
+                info_dict = dict(info)
+            else:
+                try:
+                    info_dict = dict(info)  # type: ignore[arg-type]
+                except Exception:
+                    info_dict = {}
+            leader_info = self._leaders.setdefault(host, dict(info_dict))
+            ip_value = info_dict.get("ip")
             sanitized_ip: Optional[str] = None
             if isinstance(ip_value, str):
                 sanitized_ip = ip_value.strip()
@@ -283,7 +295,7 @@ class IOController:
                     leader_info["ip"] = sanitized_ip
             elif ip_value:
                 leader_info["ip"] = ip_value
-            host_value = info.get("host") if isinstance(info, dict) else None
+            host_value = info_dict.get("host")
             resolved_host: Optional[str] = None
             if isinstance(host_value, str) and host_value.strip():
                 resolved_host = host_value.strip()
