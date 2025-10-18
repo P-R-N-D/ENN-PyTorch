@@ -345,7 +345,7 @@ class H2DController(Iterator[Any]):
         self,
         iterable: Iterable[Any],
         device: Optional[Union[str, torch.device]],
-        *,
+        *args: Any,
         depth: int = 2,
         slots: int = 2,
         pin_if_needed: bool = True,
@@ -358,6 +358,7 @@ class H2DController(Iterator[Any]):
         depth_max: int = 8,
         enable_graphs: bool = False,
         graph_warmup: int = 2,
+        **kwargs: Any,
     ) -> None:
         self._it = iter(iterable)
         self._dev = (
