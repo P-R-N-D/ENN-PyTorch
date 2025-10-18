@@ -162,10 +162,21 @@ def _format_flight_host(
     ):
         if not candidate:
             continue
-        stripped = candidate.strip("[]")
+        stripped = candidate.strip("[]").strip()
+        if not stripped:
+            continue
+        zone_stripped = stripped
+        zone_removed = False
+        if "%" in zone_stripped:
+            zone_stripped = zone_stripped.split("%", 1)[0].strip()
+            zone_removed = True
+        if not zone_stripped:
+            continue
         try:
-            parsed = ipaddress.ip_address(stripped)
+            parsed = ipaddress.ip_address(zone_stripped)
         except ValueError:
+            if zone_removed:
+                continue
             return candidate
         if not allow_loopback and (parsed.is_unspecified or parsed.is_loopback):
             continue
