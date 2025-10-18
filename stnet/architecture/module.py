@@ -1,5 +1,5 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import math
 from dataclasses import dataclass
 from math import prod
@@ -12,8 +12,8 @@ from torch.distributions import Normal, StudentT
 
 from ..toolkit.compat import patch_torch
 from ..toolkit.optimization import (
-    GatedMultiScaleRetention,
-    ScaledDotProductAttention,
+    TunedDPA,
+    TunedMSR,
 )
 
 
@@ -1630,7 +1630,7 @@ class GatedCrossAttention(nn.Module):
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.gate = nn.Parameter(torch.zeros(1))
-        self.sdpa = ScaledDotProductAttention()
+        self.sdpa = TunedDPA()
 
     def forward(
         self,
@@ -1799,7 +1799,7 @@ class TemporalRetNet(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = _norm(norm_type, d_model)
-        self.msr = GatedMultiScaleRetention(d_model, nhead)
+        self.msr = TunedMSR(d_model, nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = _norm(norm_type, d_model)

@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import os
+import socket
 import threading
 import time
-from typing import Any, Iterator, Optional, Tuple
+from typing import Any, Iterator, Tuple
 
 from ..pipeline.dataset import MemoryMappedTensorStream
 from .queue import DistributedQueue
+from ..toolkit.capability import get_available_addr
 from ..toolkit.compat import patch_arrow
 
 
@@ -15,7 +17,7 @@ _ARROW = patch_arrow()
 pa = _ARROW.module
 flight = _ARROW.flight
 if flight is None:
-    raise RuntimeError("pyarrow.flight is required for ArrowFlight support")
+    raise ImportError("pyarrow.flight is required for ArrowFlight support")
 
 
 class ArrowFlight:
@@ -201,11 +203,31 @@ class ArrowFlight:
 
     @staticmethod
     def start_server_standby(
-        *, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 2.0
+        *, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 10.0
     ) -> Tuple[ArrowFlight.Server, str]:
-        server = ArrowFlight.Server(location=f"grpc://{host}:{port}")
+        resolved = get_available_addr(f"{host}:{port}" if host else None)
+        if ":" in resolved:
+            host, port_str = resolved.rsplit(":", 1)
+            port = int(port_str)
+        else:
+            host = resolved
+            port = 0
+        location_obj = None
+        try:
+            location_obj = flight.Location.for_grpc_tcp(host, port)
+        except Exception:
+            location_obj = None
+        location = location_obj if location_obj is not None else f"grpc://{host}:{port}"
+        server = ArrowFlight.Server(location=location)
         thread_error: list[BaseException] = []
         bound = threading.Event()
+
+        advertise_host = host
+        if advertise_host in ("", "0.0.0.0", "::"):
+            try:
+                advertise_host = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                advertise_host = "127.0.0.1"
 
         def _serve() -> None:
             try:
@@ -244,13 +266,33 @@ class ArrowFlight:
             raise RuntimeError(
                 f"Arrow Flight server did not bind to a port on {host}"
             )
-        uri = f"grpc://{host}:{actual_port}"
+        advertise_location = None
+        try:
+            advertise_location = flight.Location.for_grpc_tcp(
+                advertise_host, actual_port
+            )
+        except Exception:
+            advertise_location = None
+        if advertise_location is not None:
+            uri_bytes = getattr(advertise_location, "uri", None)
+            if isinstance(uri_bytes, (bytes, bytearray)):
+                uri = uri_bytes.decode("utf-8", "ignore")
+            else:
+                uri = f"grpc+tcp://{advertise_host}:{actual_port}"
+        else:
+            uri = f"grpc+tcp://{advertise_host}:{actual_port}"
+        for key in ("NO_PROXY", "no_proxy"):
+            current = os.environ.get(key, "")
+            entries = [entry.strip() for entry in current.split(",") if entry.strip()]
+            if advertise_host and advertise_host not in entries:
+                entries.append(advertise_host)
+                os.environ[key] = ",".join(entries)
         deadline = time.time() + float(wait_ready_s)
         ready = False
         last_error: Exception | None = None
         while time.time() < deadline:
             try:
-                with flight.FlightClient(uri) as client:
+                with flight.FlightClient(advertise_location or uri) as client:
                     list(client.list_flights())
                 ready = True
                 break
@@ -297,6 +339,29 @@ class ArrowFlight:
         schema = first.schema
         reader = pa.RecordBatchReader.from_batches(schema, [first, *rest])
         server.add_reader(ArrowFlight._canon_name(name), reader)
+
+
+class FlightModule:
+    @staticmethod
+    def connect(
+        endpoint: str | Tuple[str, int] | flight.Location,
+        *,
+        wait_ready_s: float = 5.0,
+        poll_interval_s: float = 0.05,
+    ) -> ArrowFlight.Client:
+        deadline = time.time() + float(wait_ready_s)
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                client = ArrowFlight.Client(endpoint)
+                list(client._client.list_flights())
+                return client
+            except Exception as exc:
+                last_error = exc
+                time.sleep(float(poll_interval_s))
+        raise RuntimeError(
+            f"Unable to connect to Arrow Flight endpoint: {endpoint}"
+        ) from last_error
 
 
 def open_flight_client(

@@ -1,5 +1,5 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
-
 import contextlib
 import importlib
 import logging
@@ -629,83 +629,6 @@ def fsdp_no_sync(m: torch.nn.Module, enable: bool) -> Any:
             if callable(ns):
                 stack.enter_context(ns())
         yield
-
-
-def _get_node_length(node: Any) -> Any:
-    try:
-        n = len(node)
-        if isinstance(n, int) and n >= 0:
-            return n
-    except Exception:
-        pass
-    for k in ("num_batches", "n_batches", "steps", "length"):
-        v = getattr(node, k, None)
-        if isinstance(v, int) and v >= 0:
-            return v
-    bs = getattr(node, "batch_size", None)
-    drop_last = bool(getattr(node, "drop_last", False))
-    for k in ("num_samples", "n_samples", "N", "size", "rows", "count"):
-        ns = getattr(node, k, None)
-        if isinstance(ns, int) and ns >= 0:
-            if isinstance(bs, int) and bs > 0:
-                return ns // bs if drop_last else int(math.ceil(ns / bs))
-            return max(ns, 1)
-    for k in ("indices", "_indices", "ids", "_ids", "index", "_index"):
-        idx = getattr(node, k, None)
-        try:
-            ns = len(idx)
-            if isinstance(bs, int) and bs > 0:
-                return ns // bs if drop_last else int(math.ceil(ns / bs))
-            return max(int(ns), 1)
-        except Exception:
-            pass
-    for name in (
-        "node",
-        "_node",
-        "source",
-        "_source",
-        "dataset",
-        "_dataset",
-        "parent",
-        "_parent",
-        "base",
-        "_base",
-        "reader",
-        "_reader",
-        "upstream",
-        "_upstream",
-    ):
-        up = getattr(node, name, None)
-        if up is not None:
-            try:
-                n = _get_node_length(up)
-                if isinstance(n, int) and n >= 0:
-                    return n
-            except Exception:
-                pass
-    steps = None
-    if not steps:
-        dataset = getattr(node, "dataset", None)
-        try:
-            n = len(dataset) if dataset is not None else None
-        except Exception:
-            n = None
-        bs = getattr(node, "batch_size", None)
-        if n is not None and bs:
-            steps = max(1, int(math.ceil(n / bs)))
-    if not steps:
-        sampler = getattr(node, "batch_sampler", None) or getattr(
-            node, "sampler", None
-        )
-        try:
-            steps = len(sampler) if sampler is not None else None
-        except Exception:
-            steps = None
-    if not steps:
-        steps = 1
-    return steps
-
-
 def compile(
     m: nn.Module,
     *args: Any,
@@ -784,7 +707,7 @@ def _is_contiguous_bshd(t: torch.Tensor) -> bool:
     )
 
 
-class ScaledDotProductAttention(torch.nn.Module):
+class TunedDPA(torch.nn.Module):
     def __init__(
         self,
         num_heads: Optional[int] = None,
@@ -976,7 +899,7 @@ class _GMSRFallback(nn.Module):
         return self.o_proj(y)
 
 
-class GatedMultiScaleRetention(nn.Module):
+class TunedMSR(nn.Module):
     def __init__(
         self, d_model: int, nhead: int, use_gate: bool = True
     ) -> None:

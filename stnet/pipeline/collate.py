@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import math
@@ -40,10 +41,89 @@ from torch.distributed import distributed_c10d
 from ..connection.socket import ArrowFlight
 from ..toolkit.capability import apply_threading_defaults, get_world_size
 from ..toolkit.compat import has_arrow_flight, patch_arrow
-from .dataset import MemoryMappedTensorStream
+from .dataset import BatchStream, MemoryMappedTensorStream
 
 
 _ARROW = patch_arrow()
+
+
+def get_node_length(node: Any) -> Any:
+    try:
+        n = len(node)
+        if isinstance(n, int) and n >= 0:
+            return n
+    except Exception:
+        pass
+    for key in ("num_batches", "n_batches", "steps", "length"):
+        value = getattr(node, key, None)
+        if isinstance(value, int) and value >= 0:
+            return value
+    batch_size = getattr(node, "batch_size", None)
+    drop_last = bool(getattr(node, "drop_last", False))
+    for key in ("num_samples", "n_samples", "N", "size", "rows", "count"):
+        num_samples = getattr(node, key, None)
+        if isinstance(num_samples, int) and num_samples >= 0:
+            if isinstance(batch_size, int) and batch_size > 0:
+                if drop_last:
+                    return num_samples // batch_size
+                return int(math.ceil(num_samples / batch_size))
+            return max(num_samples, 1)
+    for key in ("indices", "_indices", "ids", "_ids", "index", "_index"):
+        idx = getattr(node, key, None)
+        try:
+            num_samples = len(idx)
+            if isinstance(batch_size, int) and batch_size > 0:
+                if drop_last:
+                    return num_samples // batch_size
+                return int(math.ceil(num_samples / batch_size))
+            return max(int(num_samples), 1)
+        except Exception:
+            pass
+    for name in (
+        "node",
+        "_node",
+        "source",
+        "_source",
+        "dataset",
+        "_dataset",
+        "parent",
+        "_parent",
+        "base",
+        "_base",
+        "reader",
+        "_reader",
+        "upstream",
+        "_upstream",
+    ):
+        upstream = getattr(node, name, None)
+        if upstream is not None:
+            try:
+                length = get_node_length(upstream)
+                if isinstance(length, int) and length >= 0:
+                    return length
+            except Exception:
+                pass
+    steps = None
+    if not steps:
+        dataset = getattr(node, "dataset", None)
+        try:
+            n = len(dataset) if dataset is not None else None
+        except Exception:
+            n = None
+        batch_size = getattr(node, "batch_size", None)
+        if n is not None and batch_size:
+            steps = max(1, int(math.ceil(n / batch_size)))
+    if not steps:
+        sampler = getattr(node, "batch_sampler", None) or getattr(
+            node, "sampler", None
+        )
+        try:
+            steps = len(sampler) if sampler is not None else None
+        except Exception:
+            steps = None
+    if not steps:
+        steps = 1
+    return steps
 
 
 def preprocess(
@@ -631,10 +711,8 @@ class Loader:
         return iter(self._iterable)
 
     def __len__(self) -> Any:
-        from ..toolkit.optimization import _get_node_length
-
         try:
-            return int(_get_node_length(self._node))
+            return int(get_node_length(self._node))
         except Exception:
             return 1
 
@@ -685,12 +763,12 @@ def _map_dtype(obj: Any, *, dtype: Optional[torch.dtype]) -> Any:
     return obj
 
 
-def _flatten(objs: Iterable[Any]) -> Iterable[Any]:
+def flatten(objs: Iterable[Any]) -> Iterable[Any]:
     for obj in objs:
         if obj is None:
             continue
         if isinstance(obj, (list, tuple, set)):
-            for item in _flatten(obj):
+            for item in flatten(obj):
                 if item is not None:
                     yield item
             continue
@@ -701,10 +779,10 @@ class _Keep:
     __slots__ = ("_objs",)
 
     def __init__(self, *objs: Any) -> None:
-        self._objs = list(_flatten(objs))
+        self._objs = list(flatten(objs))
 
     def add(self, *objs: Any) -> None:
-        self._objs.extend(list(_flatten(objs)))
+        self._objs.extend(list(flatten(objs)))
 
     def cleanup(self) -> None:
         for obj in self._objs:
@@ -731,34 +809,6 @@ class _Keep:
                     obj()
 
 
-class BatchStream:
-    def __init__(
-        self,
-        mmts: MemoryMappedTensorStream,
-        start: int,
-        end: int,
-        batch_size: int,
-    ) -> None:
-        self._mmts = mmts
-        self._start = int(start)
-        self._end = int(end)
-        self._batch = max(1, int(batch_size))
-
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        index = int(self._start)
-        while index < self._end:
-            nxt = min(index + self._batch, self._end)
-            xb, yb = self._mmts.batch_range(index, nxt)
-            yield {"X": xb, "Y": yb}
-            index = nxt
-
-    def __len__(self) -> int:
-        if self._end <= self._start:
-            return 0
-        span = self._end - self._start
-        return int(math.ceil(span / float(self._batch)))
-
-
 def to_batch(
     batch: Mapping[str, Any],
     *,
@@ -774,7 +824,7 @@ def to_batch(
         and (features.dim() >= 2)
     ):
         features = features.flatten(start_dim=1)
-    labels_tensor = _ensure_tensor(labels)
+    labels_tensor = to_tensor(labels)
     if (
         labels_dtype is not None
         and getattr(labels_tensor, "dtype", None) != labels_dtype
@@ -787,7 +837,7 @@ def to_batch(
     return {"X": features, "Y": labels_tensor}
 
 
-def _ensure_tensor(obj: Any) -> torch.Tensor:
+def to_tensor(obj: Any) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
         return obj
     if hasattr(obj, "to_tensor"):

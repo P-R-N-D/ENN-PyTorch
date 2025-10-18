@@ -1,25 +1,37 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import os
 import socket
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 import torch.distributed as dist
 
-from ..connection.socket import ArrowFlight
-from ..toolkit.capability import get_world_size
-
 try:
-    from ..connection.socket import FlightModule
+    from ..connection.socket import ArrowFlight, FlightModule
 except ImportError:
+
+    class _ArrowFlightUnavailable:
+        @staticmethod
+        def start_server_standby(*args: Any, **kwargs: Any) -> Any:
+            details = " with args/kwargs" if args or kwargs else ""
+            raise RuntimeError(
+                "Arrow Flight server is unavailable"
+                f"{details}. Install pyarrow[flight] to enable it."
+            )
 
     class FlightModule:
         @staticmethod
         def connect(*args: Any, **kwargs: Any) -> None:
             details = " with args/kwargs" if args or kwargs else ""
             raise RuntimeError(f"Arrow Flight module is unavailable{details}.")
+
+    ArrowFlight = _ArrowFlightUnavailable()
+
+from ..toolkit.capability import get_available_addr, get_world_size
 
 
 GRPC_DEFAULT_PORT = 5005
@@ -196,6 +208,7 @@ class IOController:
         self.is_node_leader: bool = self.local_rank == 0
         self._mq = MessageQueueConfig(local_rank=self.local_rank)
         self._flight_port: int = GRPC_DEFAULT_PORT
+        self._bind_host: str = "0.0.0.0"
         self._my_ip: str = _infer_local_ip()
         self._server: Any | None = None
         self._clients: Dict[str, Any] = {}
@@ -223,9 +236,24 @@ class IOController:
             leaders[host] = leader
         self._leaders = leaders
         if self.is_node_leader:
-            self._server = ArrowFlight(
-                location=f"grpc+tcp://0.0.0.0:{self._flight_port}", datasets={}
+            resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
+            if ":" in resolved:
+                bind_host, port_str = resolved.rsplit(":", 1)
+                bind_port = int(port_str)
+            else:
+                bind_host = resolved
+                bind_port = int(self._flight_port)
+            server, uri = ArrowFlight.start_server_standby(
+                host=bind_host,
+                port=bind_port,
+                wait_ready_s=15.0,
             )
+            self._server = server
+            parsed = urlparse(uri if isinstance(uri, str) else str(uri))
+            if parsed.hostname:
+                self._bind_host = parsed.hostname
+            if parsed.port:
+                self._flight_port = int(parsed.port)
             for host, info in leaders.items():
                 if host == _hostname():
                     continue
