@@ -6,12 +6,11 @@ import json
 import math
 import os
 import shutil
-import socket
 import sys
 import time
 import warnings
 from dataclasses import asdict, replace
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed
@@ -288,7 +287,7 @@ def train(
                 init_dir, sync_files=True, overwrite=True
             ),
         )
-    _ = get_available_addr(rdzv_endpoint)
+    rdzv_endpoint = get_available_addr(rdzv_endpoint)
     apply_threading_defaults()
     caps = optimal_procs()
     nprocs = caps["nproc_per_node"]
@@ -301,7 +300,7 @@ def train(
         max_nodes=max_nodes,
         nproc_per_node=nprocs,
         rdzv_backend=rdzv_backend,
-        rdzv_endpoint=get_available_addr(rdzv_endpoint),
+        rdzv_endpoint=rdzv_endpoint,
         run_id=run_id,
         max_restarts=0,
         monitor_interval=5,
@@ -502,7 +501,7 @@ def epochs(
         def __len__(self) -> int:  # type: ignore[override]
             return len(self._params)
 
-        def __iter__(self):  # type: ignore[override]
+        def __iter__(self) -> Iterator[torch.nn.Parameter]:  # type: ignore[override]
             return iter(self._params)
 
         def __getitem__(self, index: int) -> torch.nn.Parameter:  # type: ignore[override]

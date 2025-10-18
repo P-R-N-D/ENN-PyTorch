@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -252,6 +253,34 @@ class MemoryMappedTensorStream:
         return pa.record_batch(
             [feat_array, label_array], names=["features", "labels"]
         )
+
+
+class BatchStream:
+    def __init__(
+        self,
+        mmts: MemoryMappedTensorStream,
+        start: int,
+        end: int,
+        batch_size: int,
+    ) -> None:
+        self._mmts = mmts
+        self._start = int(start)
+        self._end = int(end)
+        self._batch = max(1, int(batch_size))
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        index = int(self._start)
+        while index < self._end:
+            nxt = min(index + self._batch, self._end)
+            xb, yb = self._mmts.batch_range(index, nxt)
+            yield {"X": xb, "Y": yb}
+            index = nxt
+
+    def __len__(self) -> int:
+        if self._end <= self._start:
+            return 0
+        span = self._end - self._start
+        return int(math.ceil(span / float(self._batch)))
 
 
 class Batch(IterableWrapper):

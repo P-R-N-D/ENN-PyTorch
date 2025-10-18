@@ -5,10 +5,10 @@ from .compat import SDPBackend, TorchCompat, _to_sdpa_backends, patch_torch, sdp
 from .optimization import (
     TunedAMP,
     FlopCounter,
-    GatedMultiScaleRetention,
+    TunedMSR,
     LossWeightOptimizer,
     ModuleTuner,
-    ScaledDotProductAttention,
+    TunedDPA,
     TunedAdamW,
     attention_flops_bshd,
 )
@@ -20,8 +20,8 @@ from ..architecture.module import (
 
 __all__ = [
     "TunedAMP",
-    "ScaledDotProductAttention",
-    "GatedMultiScaleRetention",
+    "TunedDPA",
+    "TunedMSR",
     "TunedAdamW",
     "ModuleTuner",
     "LossWeightOptimizer",
