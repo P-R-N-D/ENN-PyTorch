@@ -286,7 +286,24 @@ class IOController:
                     info_dict = dict(info)  # type: ignore[arg-type]
                 except Exception:
                     info_dict = {}
-            leader_info = self._leaders.setdefault(host, dict(info_dict))
+
+            existing = self._leaders.get(host)
+            if isinstance(existing, dict):
+                leader_info = existing
+            elif isinstance(existing, Mapping):
+                leader_info = dict(existing)
+            elif existing is None:
+                leader_info = {}
+            else:
+                try:
+                    leader_info = dict(existing)  # type: ignore[arg-type]
+                except Exception:
+                    leader_info = {}
+
+            for key, value in info_dict.items():
+                if key not in {"ip", "host"} and key not in leader_info:
+                    leader_info[key] = value
+
             ip_value = info_dict.get("ip")
             sanitized_ip: Optional[str] = None
             if isinstance(ip_value, str):
@@ -313,6 +330,7 @@ class IOController:
                     resolved_ip = resolved_ip.strip()
                 if resolved_ip and resolved_ip not in {"0.0.0.0", "::"}:
                     leader_info["ip"] = resolved_ip
+            self._leaders[host] = leader_info
             return leader_info
 
         if self.is_node_leader:
