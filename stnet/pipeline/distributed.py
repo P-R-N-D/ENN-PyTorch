@@ -301,7 +301,10 @@ class IOController:
                     leader_info = {}
 
             for key, value in info_dict.items():
-                if key not in {"ip", "host"} and key not in leader_info:
+                if key in {"ip", "host"}:
+                    continue
+                existing_value = leader_info.get(key, ...)
+                if existing_value is ... or existing_value != value:
                     leader_info[key] = value
 
             ip_value = info_dict.get("ip")
