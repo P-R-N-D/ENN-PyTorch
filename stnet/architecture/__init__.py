@@ -23,7 +23,7 @@ from .module import (
     _norm,
     _stochastic_depth_scheduler,
 )
-from .network import Config, Model, PatchParameters
+from .network import Config, Model, PatchParameters, coerce_config
 
 __all__ = [
     "sdpa_kernel",
@@ -31,6 +31,7 @@ __all__ = [
     "Model",
     "Config",
     "PatchParameters",
+    "coerce_config",
     "SpatialSubnet",
     "TemporalSubnet",
     "SpatioTemporalNet",

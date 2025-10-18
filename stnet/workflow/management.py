@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import json
 import os
 import shutil
@@ -19,7 +18,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..architecture.network import Config, Model
+from ..architecture.network import Config, Model, coerce_config
 
 
 def _require(module: str, pip_hint: str | None = None) -> None:
@@ -37,16 +36,7 @@ def new_model(
     out_shape: Sequence[int],
     config: Config | Dict[str, Any] | None,
 ) -> Model:
-    if config is None:
-        cfg = Config()
-    elif isinstance(config, dict):
-        allowed = set(inspect.signature(Config).parameters.keys())
-        filtered = {k: v for k, v in config.items() if k in allowed}
-        cfg = Config(**filtered)
-    elif isinstance(config, Config):
-        cfg = config
-    else:
-        raise TypeError("config must be Config or dict or None")
+    cfg = coerce_config(config)
     return Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
 
 
@@ -83,13 +73,7 @@ def load_model(
     use_out_shape = tuple(
         out_shape if out_shape is not None else meta_out_shape or ()
     )
-    use_config = (
-        config
-        if config is not None
-        else Config(**meta_cfg)
-        if isinstance(meta_cfg, dict)
-        else Config()
-    )
+    use_config = coerce_config(config if config is not None else meta_cfg)
     model = new_model(use_in_dim, use_out_shape, use_config)
     sd = (
         obj["state_dict"]

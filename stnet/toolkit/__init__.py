@@ -3,11 +3,13 @@ from __future__ import annotations
 from .capability import get_device, get_runtime_config, resolve_sdpa_backends
 from .compat import SDPBackend, TorchCompat, _to_sdpa_backends, patch_torch, sdpa_kernel
 from .optimization import (
-    AdamW,
-    Autocast,
+    TunedAMP,
     FlopCounter,
     GatedMultiScaleRetention,
+    LossWeightOptimizer,
+    ModuleTuner,
     ScaledDotProductAttention,
+    TunedAdamW,
     attention_flops_bshd,
 )
 from ..architecture.module import (
@@ -17,10 +19,12 @@ from ..architecture.module import (
 )
 
 __all__ = [
-    "Autocast",
+    "TunedAMP",
     "ScaledDotProductAttention",
     "GatedMultiScaleRetention",
-    "AdamW",
+    "TunedAdamW",
+    "ModuleTuner",
+    "LossWeightOptimizer",
     "attention_flops_bshd",
     "FlopCounter",
     "get_device",

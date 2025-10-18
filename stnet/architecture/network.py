@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import inspect
+from dataclasses import dataclass, field, replace
 from math import prod
-from typing import Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 import torch
 import torch.distributed as dist
@@ -45,8 +46,41 @@ class Config:
 
 
 from ..toolkit.compat import patch_torch
-from ..toolkit.optimization import Autocast, compile
+from ..toolkit.optimization import TunedAMP, compile
 from .module import Meta, MetaNet, SpatioTemporalNet
+
+
+def _coerce_patch(value: Any) -> PatchParameters:
+    if isinstance(value, PatchParameters):
+        return value
+    if value is None:
+        return PatchParameters()
+    if isinstance(value, dict):
+        allowed = set(inspect.signature(PatchParameters).parameters.keys())
+        filtered = {k: v for k, v in value.items() if k in allowed}
+        return PatchParameters(**filtered)
+    raise TypeError(
+        "patch configuration must be PatchParameters, dict, or None"
+    )
+
+
+def coerce_config(
+    config: Config | Dict[str, Any] | None,
+) -> Config:
+    if config is None:
+        return Config()
+    if isinstance(config, Config):
+        patch = _coerce_patch(getattr(config, "patch", None))
+        if patch is getattr(config, "patch", None):
+            return config
+        return replace(config, patch=patch)
+    if isinstance(config, dict):
+        allowed = set(inspect.signature(Config).parameters.keys())
+        filtered = {k: v for k, v in config.items() if k in allowed}
+        if "patch" in filtered:
+            filtered["patch"] = _coerce_patch(filtered["patch"])
+        return Config(**filtered)
+    raise TypeError("config must be Config, dict, or None")
 
 _TORCH_COMPAT = patch_torch()
 
@@ -398,7 +432,7 @@ class Model(nn.Module):
                 x_slice = features[s:e].to(
                     device, dtype=base_dtype, non_blocking=True
                 )
-                with Autocast.float(device):
+                with TunedAMP.float(device):
                     out: Meta = self.local_net(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
@@ -411,7 +445,7 @@ class Model(nn.Module):
                 x_slice = features[s:e].to(
                     device, dtype=base_dtype, non_blocking=True
                 )
-                with torch.no_grad(), Autocast.float(device):
+                with torch.no_grad(), TunedAMP.float(device):
                     out = self.local_net(x_slice)
                 token_chunks.append(
                     out.tokens
@@ -435,7 +469,7 @@ class Model(nn.Module):
             assembled = assembled + bl
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
         with torch.no_grad() if infer_mode else torch.enable_grad():
-            with Autocast.float(device):
+            with TunedAMP.float(device):
                 refined_tokens = self.global_net(tokens_centered)
         residual_context = self.local_net.decode(refined_tokens, apply_norm=True)
         residual = residual_context.view(b, -1)

@@ -9,6 +9,7 @@ from typing import Any, Dict, List
 import torch.distributed as dist
 
 from ..connection.socket import ArrowFlight
+from ..toolkit.capability import get_world_size
 
 try:
     from ..connection.socket import FlightModule
@@ -38,7 +39,7 @@ def _require_dist() -> None:
 
 def _world_size() -> int:
     _require_dist()
-    return dist.get_world_size()
+    return get_world_size()
 
 
 def _rank() -> int:

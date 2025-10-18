@@ -15,8 +15,10 @@ from typing import (
     Dict,
     Iterable,
     Iterator,
+    List,
     Mapping,
     Optional,
+    Sequence,
     Tuple,
     Union,
 )
@@ -25,7 +27,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torchdata.nodes import (
+    BaseNode,
     IterableWrapper,
+    Loader as TorchDataLoader,
     ParallelMapper,
     PinMemory,
     Prefetcher,
@@ -34,13 +38,178 @@ from torchdata.nodes import (
 from torch.distributed import distributed_c10d
 
 from ..connection.socket import ArrowFlight
-from ..toolkit.capability import apply_threading_defaults
+from ..toolkit.capability import apply_threading_defaults, get_world_size
 from ..toolkit.compat import has_arrow_flight, patch_arrow
-from ..toolkit.optimization import DataLoader
 from .dataset import MemoryMappedTensorStream
 
 
 _ARROW = patch_arrow()
+
+
+def preprocess(
+    data: Dict[Tuple, torch.Tensor]
+) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
+    def _to_tuple(x: Any) -> Any:
+        if isinstance(x, tuple):
+            return x
+        if isinstance(x, list):
+            return tuple(x)
+        if isinstance(x, torch.Tensor):
+            return tuple(x.flatten().detach().cpu().tolist())
+        if hasattr(x, "tolist"):
+            v = x.tolist()
+            return tuple(v if isinstance(v, (list, tuple)) else [v])
+        return (x,)
+
+    def _feat_row(x_tuple: Any) -> Any:
+        try:
+            vals = [float(v) for v in _to_tuple(x_tuple)]
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "preprocess: feature tuples must contain only numeric values. "
+                f"Invalid value={x_tuple!r}"
+            ) from exc
+        return torch.as_tensor(vals, dtype=torch.float32)
+
+    def _lbl(y: Any) -> Any:
+        if isinstance(y, torch.Tensor):
+            return y
+        if hasattr(y, "to_tensor"):
+            return y.to_tensor()
+        return torch.as_tensor(y)
+
+    def _maybe_batch(
+        x_value: Any, y_value: Any
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
+        def _feature_tensor(value: Any) -> torch.Tensor | None:
+            if isinstance(value, torch.Tensor):
+                return value
+            if hasattr(value, "to_tensor"):
+                try:
+                    return value.to_tensor()
+                except Exception:
+                    return None
+            if hasattr(value, "as_tensor"):
+                try:
+                    return value.as_tensor()
+                except Exception:
+                    return None
+            try:
+                return torch.as_tensor(value)
+            except Exception:
+                return None
+
+        x_tensor = _feature_tensor(x_value)
+        if x_tensor is None:
+            return None
+        try:
+            y_tensor = _lbl(y_value)
+        except Exception:
+            return None
+        if not isinstance(y_tensor, torch.Tensor):
+            return None
+        x_tensor = x_tensor.detach().to(dtype=torch.float32)
+        if x_tensor.dim() == 0:
+            x_tensor = x_tensor.reshape(1, 1)
+        elif x_tensor.dim() == 1:
+            x_tensor = x_tensor.reshape(-1, 1)
+        else:
+            batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
+            x_tensor = x_tensor.reshape(batch_dim, -1)
+        batch = int(x_tensor.shape[0])
+        y_tensor = y_tensor.detach()
+        if y_tensor.dim() == 0:
+            y_tensor = y_tensor.unsqueeze(0)
+        if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
+            y_tensor = y_tensor.unsqueeze(-1)
+        if y_tensor.shape[0] != batch:
+            return None
+        label_shape = tuple(y_tensor.shape[1:])
+        keys = [(int(i),) for i in range(batch)]
+        return (x_tensor, y_tensor, keys, label_shape)
+
+    if isinstance(data, dict) and "X" in data and ("Y" in data):
+        x, y = (data["X"], data["Y"])
+        batch_result = _maybe_batch(x, y)
+        if batch_result is not None:
+            return batch_result
+        xr, yt = (_feat_row(x).unsqueeze(0), _lbl(y))
+        if yt.dim() == 0 or yt.dim() == 1:
+            yt = yt.unsqueeze(0)
+        keys = [_to_tuple(x)]
+        label_shape = tuple(yt.shape[1:])
+        return (xr, yt, keys, label_shape)
+    if isinstance(data, (tuple, list)) and len(data) >= 2:
+        x, y = (data[0], data[1])
+        batch_result = _maybe_batch(x, y)
+        if batch_result is not None:
+            return batch_result
+        xr = _feat_row(x).unsqueeze(0)
+        yt = _lbl(y)
+        if yt.dim() == 0:
+            yt = yt.unsqueeze(0)
+        elif yt.shape[0] != 1:
+            yt = yt.unsqueeze(0)
+        keys = [_to_tuple(x)]
+        label_shape = tuple(yt.shape[1:])
+        return (xr, yt, keys, label_shape)
+    if isinstance(data, dict) and len(data) > 0:
+        items = list(data.items())
+        if any((isinstance(k, str) for k, _ in items)):
+            raise TypeError(
+                "preprocess: keys in a multi-sample dict must be tuples. "
+                "Provide single samples as {'X': ..., 'Y': ...}."
+            )
+        keys: List[Tuple] = [_to_tuple(k) for k, _ in items]
+        feats = torch.stack([_feat_row(k) for k in keys], dim=0)
+        lbl_list = [_lbl(v) for _, v in items]
+        if all((t.shape == lbl_list[0].shape for t in lbl_list)):
+            labels = torch.stack(lbl_list, dim=0)
+        else:
+            labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
+        label_shape = tuple(labels.shape[1:])
+        return (feats, labels, keys, label_shape)
+    raise ValueError(
+        "preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
+    )
+
+
+def postprocess(
+    keys: List[Tuple], preds: torch.Tensor | Sequence[torch.Tensor]
+) -> Dict[Tuple, torch.Tensor]:
+    if isinstance(preds, torch.Tensor):
+        if preds.dim() == 0:
+            preds = preds.unsqueeze(0)
+        if preds.shape[0] != len(keys):
+            raise ValueError(
+                f"preds batch={preds.shape[0]} != len(keys)={len(keys)}"
+            )
+        rows = [preds[i].detach().cpu() for i in range(len(keys))]
+    else:
+        if len(preds) != len(keys):
+            raise ValueError(
+                f"len(preds)={len(preds)} != len(keys)={len(keys)}"
+            )
+        rows = [
+            p.detach().cpu()
+            if isinstance(p, torch.Tensor)
+            else torch.as_tensor(p)
+            for p in preds
+        ]
+    fixed_keys: List[Tuple] = []
+    seen = set()
+    for i, k in enumerate(keys):
+        if not isinstance(k, tuple):
+            try:
+                k = tuple(k)
+            except TypeError:
+                k = (k,)
+        k_out = k
+        if k in seen:
+            k_out = k + (i,)
+        seen.add(k_out)
+        fixed_keys.append(k_out)
+    return {k: v for k, v in zip(fixed_keys, rows)}
 
 
 def _world_info() -> Tuple[int, int, int, bool]:
@@ -50,16 +219,22 @@ def _world_info() -> Tuple[int, int, int, bool]:
             "LOCAL_RANK", os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")
         )
     )
-    world_size = int(
-        os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE", "1"))
-    )
-    return (rank, local_rank, world_size, world_size > 1)
+    world_env = os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE"))
+    world: Optional[int] = None
+    if world_env is not None:
+        with suppress(ValueError):
+            world = int(world_env)
+    if world is None:
+        with suppress(Exception):
+            world = int(get_world_size())
+    world = world or 1
+    return (rank, local_rank, world, world > 1)
 
 
 def _negotiate() -> Tuple[int, bool]:
     if not (dist.is_available() and dist.is_initialized()):
         return (0, True)
-    world = dist.get_world_size()
+    world = get_world_size()
     rank = dist.get_rank()
     hostname = socket.gethostname()
     hosts: list[str] = ["" for _ in range(world)]
@@ -420,6 +595,50 @@ class H2DController(Iterator[Any]):
         self._graph.replay()
 
 
+class Loader:
+    def __init__(
+        self,
+        *args: Any,
+        device: torch.device,
+        node: BaseNode | None = None,
+        dataset: BaseNode | None = None,
+        prefetch_factor: int = 2,
+        non_blocking: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        node_obj = node or dataset
+        if not isinstance(node_obj, BaseNode):
+            raise TypeError(
+                "pipeline.collate.Loader supports only torchdata.nodes.BaseNode instances."
+            )
+        self._node = node_obj
+        self._device = device
+        self._prefetch_factor = max(1, int(prefetch_factor or 2))
+        self._non_blocking = bool(non_blocking)
+        base = TorchDataLoader(self._node)
+        dev_t = getattr(self._device, "type", "cpu")
+        if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
+            try:
+                self._iterable = H2DController(
+                    base, device=self._device, depth=self._prefetch_factor
+                )
+            except TypeError:
+                self._iterable = base
+        else:
+            self._iterable = base
+
+    def __iter__(self) -> Any:
+        return iter(self._iterable)
+
+    def __len__(self) -> Any:
+        from ..toolkit.optimization import _get_node_length
+
+        try:
+            return int(_get_node_length(self._node))
+        except Exception:
+            return 1
+
+
 def _torch_dtype_to_arrow_dtype(dtype: torch.dtype) -> str:
     mapping = {
         torch.float32: "float32",
@@ -603,7 +822,7 @@ def fetch(
     )
 
 
-def stream(
+def loader(
     memmap_dir: str,
     device: Union[str, torch.device],
     batch_size: int,
@@ -641,7 +860,7 @@ def stream(
         flatten_features=flatten_features,
     )
 
-    def _wrap_node(node: IterableWrapper) -> DataLoader:
+    def _wrap_node(node: IterableWrapper) -> Loader:
         wrapped: Any = ParallelMapper(
             node,
             map_fn=map_fn,
@@ -654,7 +873,7 @@ def stream(
         wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
         if device_obj.type in {"cuda", "xpu", "mps"}:
             wrapped = PinMemory(wrapped, pin_memory_device=device_obj.type)
-        return DataLoader(
+        return Loader(
             device=device_obj,
             node=wrapped,
             prefetch_factor=prefetch_factor,
