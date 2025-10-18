@@ -59,10 +59,11 @@ class MemoryMappedTensorStream:
     def __init__(
         self,
         memmap_dir: str,
-        *,
+        *args: Any,
         split: str = "train",
         val_frac: Optional[float] = None,
         batch_size: Optional[int] = None,
+        **kwargs: Any,
     ) -> None:
         self.dir = memmap_dir
         self.split = split
@@ -74,10 +75,11 @@ class MemoryMappedTensorStream:
     def from_dir(
         cls,
         memmap_dir: str,
-        *,
+        *args: Any,
         split: str = "train",
         batch_size: int = 1,
         val_frac: Optional[float] = None,
+        **kwargs: Any,
     ) -> MemoryMappedTensorStream:
         return cls(
             memmap_dir,
@@ -89,11 +91,12 @@ class MemoryMappedTensorStream:
     @staticmethod
     def materialize(
         data: Dict[str, Any],
-        *,
+        *args: Any,
         memmap_dir: str,
         train_frac: float = 1.0,
         val_frac: float = 0.0,
         shuffle: bool = False,
+        **kwargs: Any,
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
         features = (
@@ -286,16 +289,17 @@ class BatchStream:
 class Batch(IterableWrapper):
     def __init__(
         self,
-        *,
         memmap_dir: str,
         part: str,
         batch_size: int,
         shuffle: bool,
         seed: int,
+        *args: Any,
         rank: int = 0,
         world_size: int = 1,
         drop_last: bool = False,
         fractions: Optional[Tuple[float, float]] = None,
+        **kwargs: Any,
     ) -> None:
         meta = _read_meta(memmap_dir)
         total = int(meta["N"])
