@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
-import math
 import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -270,7 +269,6 @@ class _FlopInstrumentation:
                     else int(weight.shape[1] * groups)
                 )
                 cin_per_group = max(1, cin_total // groups)
-                cout = int(weight.shape[0])
                 kernel = int(weight[0].numel()) // max(cin_per_group, 1)
                 return float(
                     out_elems
@@ -788,7 +786,7 @@ class TunedDPA(torch.nn.Module):
         v = self._to_optimal_dtype(v)
         try:
             _bwd = 2.0 if training else 0.0
-            fl = attention_flops_bshd(
+            attention_flops_bshd(
                 q,
                 bwd_factor=_bwd,
                 dropout_p=float(dropout_p),

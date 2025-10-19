@@ -129,11 +129,13 @@ class MemoryMappedTensorStream:
         )
         val_count = int(round(total * val_fraction))
         train_count = total - val_count
-        if self.split == "train":
-            return range(0, train_count)
-        if self.split == "val":
-            return range(train_count, total)
-        return range(0, total)
+        match self.split:
+            case "train":
+                return range(0, train_count)
+            case "val":
+                return range(train_count, total)
+            case _:
+                return range(0, total)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         meta = self._load_meta()

@@ -185,7 +185,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
             return int(torch.cuda.device_count())
         except Exception:
             return 1
-    if dev.type == "xpu":
+    elif dev.type == "xpu":
         xpu = getattr(torch, "xpu", None)
         if xpu is not None:
             with contextlib.suppress(Exception):

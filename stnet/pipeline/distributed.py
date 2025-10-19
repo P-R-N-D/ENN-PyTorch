@@ -230,12 +230,12 @@ class MessageQueueConfig:
             self._pull.bind(up_addr)
             self._pub = self._zmq.socket(zmq.PUB)
             self._pub.bind(down_addr)
-            return
-        self._push = self._zmq.socket(zmq.PUSH)
-        self._push.connect(up_addr)
-        self._sub = self._zmq.socket(zmq.SUB)
-        self._sub.connect(down_addr)
-        self._sub.setsockopt(zmq.SUBSCRIBE, b"")
+        else:
+            self._push = self._zmq.socket(zmq.PUSH)
+            self._push.connect(up_addr)
+            self._sub = self._zmq.socket(zmq.SUB)
+            self._sub.connect(down_addr)
+            self._sub.setsockopt(zmq.SUBSCRIBE, b"")
 
     def push_up(self, payload: bytes | memoryview) -> None:
         if self.local_rank == 0 or self._push is None:

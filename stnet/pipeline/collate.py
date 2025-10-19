@@ -364,7 +364,7 @@ def preprocess(
         keys = [_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
-    if isinstance(data, (tuple, list)) and len(data) >= 2:
+    elif isinstance(data, (tuple, list)) and len(data) >= 2:
         x, y = (data[0], data[1])
         batch_result = _maybe_batch(x, y)
         if batch_result is not None:
@@ -378,7 +378,7 @@ def preprocess(
         keys = [_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
-    if isinstance(data, dict) and len(data) > 0:
+    elif isinstance(data, dict) and len(data) > 0:
         items = list(data.items())
         if any((isinstance(k, str) for k, _ in items)):
             raise TypeError(
@@ -394,9 +394,10 @@ def preprocess(
             labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
         label_shape = tuple(labels.shape[1:])
         return (feats, labels, keys, label_shape)
-    raise ValueError(
-        "preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
-    )
+    else:
+        raise ValueError(
+            "preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
+        )
 
 
 def postprocess(
