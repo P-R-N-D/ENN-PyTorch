@@ -193,7 +193,11 @@ class Endpoint:
 
     @staticmethod
     def start_server_standby(
-        *args: Any, host: str = "0.0.0.0", port: int = 0, wait_ready_s: float = 10.0, **kwargs: Any
+        *args: Any,
+        host: str = "0.0.0.0",
+        port: int = 0,
+        wait_ready_s: float = 10.0,
+        **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
         resolved = get_available_addr(f"{host}:{port}" if host else None)
         if ":" in resolved:
