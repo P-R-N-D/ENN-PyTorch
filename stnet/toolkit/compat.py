@@ -24,10 +24,9 @@ except Exception:
     SDPBackend = _SDPEnum
 
     @contextmanager
-    def sdpa_kernel(*args: Any, **kwargs: Any) -> Iterator[None]:
-        if args or kwargs:
-            _ = (args, kwargs)
-            del _
+    def sdpa_kernel(*backends: Any) -> Iterator[None]:
+        _ = backends
+        del _
         yield
 
 
@@ -163,8 +162,9 @@ class TorchCompat:
             x: Any,
             dim: int | tuple[int, ...] | None = None,
             keepdim: bool = False,
-            *,
+            *args: Any,
             dtype: Any = None,
+            **kwargs: Any,
         ) -> Any:
             x_cast = x.to(dtype) if dtype is not None else x
             mask = torch_mod.isfinite(x_cast)
@@ -196,7 +196,7 @@ class ArrowCompat:
         self.module = module
         self.flight = flight
 
-    def to_numpy(self, array: Any, *, zero_copy_only: bool = True) -> Any:
+    def to_numpy(self, array: Any, *args: Any, zero_copy_only: bool = True, **kwargs: Any) -> Any:
         try:
             return array.to_numpy(zero_copy_only=zero_copy_only)
         except TypeError:
