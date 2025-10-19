@@ -41,10 +41,155 @@ from torch.distributed import distributed_c10d
 from ..connection.socket import Endpoint
 from ..toolkit.capability import apply_threading_defaults, get_world_size
 from ..toolkit.compat import has_arrow_flight, patch_arrow
-from .dataset import BatchStream, MemoryMappedTensorStream
-
-
 _ARROW = patch_arrow()
+
+
+_CANONICAL_DTYPE_MAP = {
+    "float64": {
+        "torch": torch.float64,
+        "numpy": np.float64,
+        "arrow": "float64",
+        "python": float,
+    },
+    "float32": {
+        "torch": torch.float32,
+        "numpy": np.float32,
+        "arrow": "float32",
+        "python": float,
+    },
+    "float16": {
+        "torch": torch.float16,
+        "numpy": np.float16,
+        "arrow": "float16",
+        "python": float,
+    },
+    "bfloat16": {
+        "torch": getattr(torch, "bfloat16", torch.float32),
+        "numpy": np.float32,
+        "arrow": "bfloat16",
+        "python": float,
+    },
+    "int64": {
+        "torch": torch.int64,
+        "numpy": np.int64,
+        "arrow": "int64",
+        "python": int,
+    },
+    "int32": {
+        "torch": torch.int32,
+        "numpy": np.int32,
+        "arrow": "int32",
+        "python": int,
+    },
+    "int16": {
+        "torch": torch.int16,
+        "numpy": np.int16,
+        "arrow": "int16",
+        "python": int,
+    },
+    "int8": {
+        "torch": torch.int8,
+        "numpy": np.int8,
+        "arrow": "int8",
+        "python": int,
+    },
+    "uint8": {
+        "torch": torch.uint8,
+        "numpy": np.uint8,
+        "arrow": "uint8",
+        "python": int,
+    },
+    "bool": {
+        "torch": torch.bool,
+        "numpy": np.bool_,
+        "arrow": "bool",
+        "python": bool,
+    },
+}
+
+_DTYPE_ALIASES = {
+    "float": "float32",
+    "float_": "float32",
+    "double": "float64",
+    "float32": "float32",
+    "float64": "float64",
+    "float16": "float16",
+    "half": "float16",
+    "halffloat": "float16",
+    "boolean": "bool",
+    "bool_": "bool",
+    "bool": "bool",
+    "bf16": "bfloat16",
+    "bfloat16": "bfloat16",
+    "f16": "float16",
+    "f32": "float32",
+    "f64": "float64",
+    "i8": "int8",
+    "i16": "int16",
+    "i32": "int32",
+    "i64": "int64",
+    "u8": "uint8",
+}
+
+
+def _canonical_dtype_name(src: Any) -> str:
+    if src is None:
+        raise TypeError("dtype cannot be None")
+    pa_mod = getattr(_ARROW, "module", None)
+    if isinstance(src, torch.dtype):
+        key = str(src)
+    elif isinstance(src, str):
+        key = src
+    elif isinstance(src, np.dtype):
+        key = src.name
+    else:
+        data_type_cls = getattr(pa_mod, "DataType", None) if pa_mod else None
+        if data_type_cls is not None and isinstance(src, data_type_cls):
+            try:
+                key = np.dtype(src.to_pandas_dtype()).name
+            except Exception:
+                key = str(src)
+        else:
+            try:
+                key = np.dtype(src).name
+            except Exception:
+                key = str(src)
+    key = key.strip().lower()
+    if key.startswith("torch."):
+        key = key.split(".", 1)[1]
+    if key.startswith("numpy."):
+        key = key.split(".", 1)[1]
+    key = key.lstrip("<>|=")
+    canonical = _DTYPE_ALIASES.get(key, key)
+    if canonical not in _CANONICAL_DTYPE_MAP:
+        raise TypeError(f"unsupported dtype: {src!r}")
+    return canonical
+
+
+def to_dtype(src: Any, platform: str) -> Any:
+    platform_key = str(platform).strip().lower()
+    platform_aliases = {
+        "torch": "torch",
+        "pytorch": "torch",
+        "numpy": "numpy",
+        "np": "numpy",
+        "arrow": "arrow",
+        "pyarrow": "arrow",
+        "python": "python",
+        "native": "python",
+        "name": "name",
+        "canonical": "name",
+    }
+    if platform_key not in platform_aliases:
+        raise ValueError(f"unsupported platform: {platform!r}")
+    normalized = platform_aliases[platform_key]
+    canonical = _canonical_dtype_name(src)
+    if normalized == "name":
+        return canonical
+    mapping = _CANONICAL_DTYPE_MAP.get(canonical)
+    if mapping is None or normalized not in mapping:
+        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
+    return mapping[normalized]
 
 
 def get_node_length(node: Any) -> Any:
@@ -718,52 +863,6 @@ class DataLoader:
             return 1
 
 
-def _torch_dtype_to_arrow_dtype(dtype: torch.dtype) -> str:
-    mapping = {
-        torch.float32: "float32",
-        torch.float64: "float64",
-        torch.float16: "float16",
-        getattr(torch, "bfloat16", object()): "bfloat16",
-        torch.int64: "int64",
-        torch.int32: "int32",
-        torch.int16: "int16",
-        torch.int8: "int8",
-        torch.uint8: "uint8",
-        torch.bool: "bool",
-    }
-    return mapping.get(dtype, "float32")
-
-
-def _torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> Any:
-    mapping = {
-        torch.float32: np.float32,
-        torch.float64: np.float64,
-        torch.float16: np.float16,
-        getattr(torch, "bfloat16", object()): np.float32,
-        torch.int64: np.int64,
-        torch.int32: np.int32,
-        torch.int16: np.int16,
-        torch.int8: np.int8,
-        torch.uint8: np.uint8,
-        torch.bool: np.uint8,
-    }
-    return mapping.get(dtype, np.float32)
-
-
-def _map_dtype(obj: Any, dtype: Optional[torch.dtype]) -> Any:
-    if dtype is None:
-        return obj
-    if isinstance(obj, torch.Tensor):
-        return obj.to(dtype=dtype, copy=False)
-    if isinstance(obj, (list, tuple)):
-        return type(obj)((_map_dtype(item, dtype=dtype) for item in obj))
-    if isinstance(obj, dict):
-        return {
-            key: _map_dtype(value, dtype=dtype) for key, value in obj.items()
-        }
-    return obj
-
-
 def flatten(objs: Iterable[Any]) -> Iterable[Any]:
     for obj in objs:
         if obj is None:
@@ -916,6 +1015,7 @@ def dataloader(
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
+    from .dataset import BatchStream, MemoryMappedTensorStream
 
     def _wrap_node(node: IterableWrapper) -> DataLoader:
         wrapped: Any = ParallelMapper(
@@ -999,6 +1099,12 @@ def dataloader(
         meta = reader_tr._load_meta()
         server = None
         keep = _Keep(reader_tr, reader_vl)
+        features_np_dtype = to_dtype(
+            meta.get("features_arrow_dtype", "float32"), "numpy"
+        )
+        labels_np_dtype = to_dtype(
+            meta.get("labels_arrow_dtype", "float32"), "numpy"
+        )
         try:
             host = "0.0.0.0"
             if not is_ddp:
@@ -1058,9 +1164,9 @@ def dataloader(
                         or (not features_np.flags.c_contiguous)
                     ):
                         features_np = np.ascontiguousarray(features_np).copy()
-                    if features_np.dtype != np.float32:
+                    if features_np.dtype != features_np_dtype:
                         features_np = features_np.astype(
-                            np.float32, copy=False
+                            features_np_dtype, copy=False
                         )
                     features_tensor = torch.from_numpy(features_np).view(
                         batch_size_rb, -1
@@ -1084,6 +1190,8 @@ def dataloader(
                         or (not labels_np.flags.c_contiguous)
                     ):
                         labels_np = np.ascontiguousarray(labels_np).copy()
+                    if labels_np.dtype != labels_np_dtype:
+                        labels_np = labels_np.astype(labels_np_dtype, copy=False)
                     labels_tensor = torch.from_numpy(labels_np)
                     if label_shape:
                         labels_tensor = labels_tensor.reshape(
@@ -1125,3 +1233,6 @@ def dataloader(
             RuntimeWarning,
         )
         return _local_impl()
+
+
+loader = dataloader

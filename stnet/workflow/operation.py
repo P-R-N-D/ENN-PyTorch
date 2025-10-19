@@ -37,7 +37,13 @@ from tqdm.auto import tqdm
 
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Config, Model, coerce_config
-from ..pipeline.collate import dataloader, postprocess, preprocess, to_tensor
+from ..pipeline.collate import (
+    dataloader,
+    postprocess,
+    preprocess,
+    to_dtype,
+    to_tensor,
+)
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
     apply_threading_defaults,
@@ -128,36 +134,8 @@ _SIZEOF = {
 }
 
 
-def _canonical_dtype(x: torch.dtype | str) -> str:
-    if isinstance(x, torch.dtype):
-        s = str(x).lower()
-    else:
-        s = str(x).strip().lower()
-    if s.startswith("torch."):
-        s = s.split(".", 1)[1]
-    s = s.lstrip("<>|=")
-    aliases = {
-        "float": "float32",
-        "double": "float64",
-        "half": "float16",
-        "halffloat": "float16",
-        "boolean": "bool",
-        "bool_": "bool",
-        "bf16": "bfloat16",
-        "f16": "float16",
-        "f32": "float32",
-        "f64": "float64",
-        "i8": "int8",
-        "i16": "int16",
-        "i32": "int32",
-        "i64": "int64",
-        "u8": "uint8",
-    }
-    return aliases.get(s, s)
-
-
 def _size(dtype: torch.dtype | str) -> int:
-    n = _canonical_dtype(dtype)
+    n = to_dtype(dtype, "name")
     if n not in _SIZEOF:
         raise TypeError(f"unsupported dtype: {dtype}")
     return _SIZEOF[n]

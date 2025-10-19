@@ -17,6 +17,7 @@ except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
 from ..toolkit.compat import patch_arrow
+from .collate import to_dtype
 
 
 _ARROW = patch_arrow()
@@ -27,32 +28,6 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     path = os.path.join(memmap_dir, "meta.json")
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-_TORCH2NAME: Dict[torch.dtype, str] = {
-    torch.float32: "float32",
-    torch.float64: "float64",
-    torch.float16: "float16",
-    getattr(torch, "bfloat16", torch.float32): "bfloat16",
-    torch.int64: "int64",
-    torch.int32: "int32",
-    torch.int16: "int16",
-    torch.int8: "int8",
-    torch.uint8: "uint8",
-    torch.bool: "bool",
-}
-_NAME2TORCH: Dict[str, torch.dtype] = {
-    "float32": torch.float32,
-    "float64": torch.float64,
-    "float16": torch.float16,
-    "bfloat16": getattr(torch, "bfloat16", torch.float32),
-    "int64": torch.int64,
-    "int32": torch.int32,
-    "int16": torch.int16,
-    "int8": torch.int8,
-    "uint8": torch.uint8,
-    "bool": torch.bool,
-}
 
 
 class MemoryMappedTensorStream:
@@ -125,8 +100,8 @@ class MemoryMappedTensorStream:
             "N": count,
             "feature_dim": feat_dim,
             "label_shape": label_shape,
-            "features_arrow_dtype": _TORCH2NAME[features.dtype],
-            "labels_arrow_dtype": _TORCH2NAME[labels.dtype],
+            "features_arrow_dtype": to_dtype(features.dtype, "arrow"),
+            "labels_arrow_dtype": to_dtype(labels.dtype, "arrow"),
             "fractions": [float(train_frac), float(val_frac)],
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
@@ -174,8 +149,8 @@ class MemoryMappedTensorStream:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
-        label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
+        feat_dtype = to_dtype(meta.get("features_arrow_dtype", "float32"), "torch")
+        label_dtype = to_dtype(meta.get("labels_arrow_dtype", "float32"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -216,8 +191,8 @@ class MemoryMappedTensorStream:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = _NAME2TORCH[meta.get("features_arrow_dtype", "float32")]
-        label_dtype = _NAME2TORCH[meta.get("labels_arrow_dtype", "float32")]
+        feat_dtype = to_dtype(meta.get("features_arrow_dtype", "float32"), "torch")
+        label_dtype = to_dtype(meta.get("labels_arrow_dtype", "float32"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
