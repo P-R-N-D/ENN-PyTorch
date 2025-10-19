@@ -136,19 +136,19 @@ class TorchIO:
         suffix = p.suffix.lower()
 
         if not suffix:
-            if p.exists() and p.is_file():
-                suffix = ".pt"
-            else:
-                p.mkdir(parents=True, exist_ok=True)
-                from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
+            if p.exists():
+                if p.is_file():
+                    suffix = ".pt"
+                elif p.is_dir():
+                    from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
 
-                opts_sd = StateDictOptions(full_state_dict=True)
-                m_sd = get_model_state_dict(model, options=opts_sd)
-                dcp_save(
-                    state_dict={"model": m_sd},
-                    storage_writer=FileSystemWriter(str(p)),
-                )
-                return p
+                    opts_sd = StateDictOptions(full_state_dict=True)
+                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    dcp_save(
+                        state_dict={"model": m_sd},
+                        storage_writer=FileSystemWriter(str(p)),
+                    )
+                    return p
 
         p.parent.mkdir(parents=True, exist_ok=True)
 
