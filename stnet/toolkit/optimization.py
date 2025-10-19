@@ -62,10 +62,10 @@ except Exception:
             class _ShimQATConfig:
                 def __init__(
                     self,
-                    *args: Any,
                     base_config: Any = None,
                     activation_config: Any = None,
                     weight_config: Any = None,
+                    *args: Any,
                     step: Any = "prepare",
                     **kwargs: Any,
                 ) -> None:
@@ -494,7 +494,7 @@ def _make_nvtx_counter(device: Optional[torch.device] = None) -> Any:
 
 
 class _FlopCounterStep:
-    def __init__(self, parent: FlopCounter, *, display: bool = False) -> None:
+    def __init__(self, parent: FlopCounter, *args: Any, display: bool = False, **kwargs: Any) -> None:
         self._parent = parent
         self._display = display
         self._torch_counter: Optional[_TorchFlopCounter] = None
@@ -539,11 +539,12 @@ class FlopCounter:
     def __init__(
         self,
         model: nn.Module,
-        *,
+        *args: Any,
         mode: str = "train",
         device: Optional[torch.device] = None,
         include_bias: bool = True,
         bwd_factor: Optional[float] = None,
+        **kwargs: Any,
     ) -> None:
         self._model = model
         self._mode = mode
@@ -577,7 +578,7 @@ class FlopCounter:
             self._hook_session = None
         return False
 
-    def step(self, *, display: bool = False) -> _FlopCounterStep:
+    def step(self, *args: Any, display: bool = False, **kwargs: Any) -> _FlopCounterStep:
         if self._hook_session is None:
             raise RuntimeError(
                 "FlopCounter hooks are not active. Use `with FlopCounter(...)` before measuring FLOPs."
@@ -629,12 +630,15 @@ def fsdp_no_sync(m: torch.nn.Module, enable: bool) -> Any:
             if callable(ns):
                 stack.enter_context(ns())
         yield
+
+
 def compile(
     m: nn.Module,
     *args: Any,
-    mode: str = "max-autotune"
-    if get_device().type == "cuda"
-    else "max-autotune-no-cudagraphs",
+    mode: str = (
+        "max-autotune" if get_device().type == "cuda"
+        else "max-autotune-no-cudagraphs"
+    ),
     fullgraph: bool = True,
     dynamic: bool = True,
     backend: str = "inductor",
@@ -869,7 +873,12 @@ class MSRCompat(nn.Module):
         self.norm = nn.LayerNorm(self.d_model)
 
     def forward(
-        self, x: torch.Tensor, *args: Any, **kwargs: Any
+        self,
+        x: torch.Tensor,
+        *args: Any,
+        attn_mask: Optional[torch.Tensor] = None,
+        state: Any = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         B, S, D = x.shape
         H, Dh = (self.nhead, self.head_dim)
@@ -1141,8 +1150,8 @@ class TunedAdamW:
             nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
         ],
         lr: float,
-        weight_decay: float = 0.0,
         *args: Any,
+        weight_decay: float = 0.0,
         dtype: Optional[str] = None,
         device: Optional[torch.device] = None,
         use_foreach: Optional[bool] = False,
@@ -1622,7 +1631,10 @@ class ModuleTuner:
 
     @staticmethod
     def _fuse_sequential_to_te(
-        root: nn.Module, *args: Any, params_dtype: torch.dtype, **kwargs: Any
+        root: nn.Module,
+        *args: Any,
+        params_dtype: torch.dtype,
+        **kwargs: Any,
     ) -> Tuple[nn.Module, int]:
         try:
             import transformer_engine.pytorch as te
@@ -2104,4 +2116,3 @@ class ModuleTuner:
             return (model, True, "torchao")
         except Exception as e:
             return (model, False, f"AO failed: {e}")
-
