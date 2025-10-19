@@ -6,7 +6,7 @@ import logging
 import math
 import os
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -30,10 +30,12 @@ except ImportError:  # pragma: no cover - optional dependency
 from .capability import (
     get_device,
     get_runtime_config,
+    initialize_sdpa_backends,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
     is_float8_supported,
-    resolve_sdpa_backends,
+    is_int8_supported,
+    optimal_optimizer_params,
 )
 
 try:
@@ -117,47 +119,363 @@ def joining(*joinables: Optional[object]) -> AbstractContextManager[None]:
     return Join(to_join, throw_on_early_termination=True)
 
 
-@dataclass
-class _FlopBucket:
-    total: float = 0.0
-    by_type: Dict[str, float] = field(default_factory=dict)
-
-    def add(self, typ: str, v: float) -> Any:
-        try:
-            fv = float(v)
-        except Exception:
-            return
-        if fv <= 0:
-            return
-        self.total += fv
-        self.by_type[typ] = self.by_type.get(typ, 0.0) + fv
-
-    def reset(self) -> Any:
-        self.total = 0.0
-        self.by_type.clear()
-
-
-_FLOP_BUCKET = _FlopBucket()
-_FLOP_TRACKING_DEPTH = 0
 _LOGGER = logging.getLogger(__name__)
 
 
-def _is_flop_tracking_active() -> bool:
-    return _FLOP_TRACKING_DEPTH > 0
+class _FlopInstrumentation:
+    def __init__(self) -> None:
+        self._manual_total = 0.0
+        self._manual_by_type: Dict[str, float] = {}
+        self._tracking_depth = 0
+        self._nvtx_soft_counter: float = 0.0
+        self._nvtx_getter: Optional[Callable[[], float]] = None
+
+    # bucket helpers -------------------------------------------------
+    def is_tracking_active(self) -> bool:
+        return self._tracking_depth > 0
+
+    def activate(self) -> None:
+        self._tracking_depth += 1
+
+    def deactivate(self) -> None:
+        self._tracking_depth = max(0, self._tracking_depth - 1)
+
+    def reset_manual(self) -> None:
+        self._manual_total = 0.0
+        self._manual_by_type.clear()
+
+    def consume_manual(self) -> float:
+        total = float(self._manual_total)
+        self.reset_manual()
+        return total
+
+    def add_manual(self, typ: str, value: float) -> None:
+        if self.is_tracking_active():
+            try:
+                fv = float(value)
+            except Exception:
+                return
+            if fv <= 0:
+                return
+            self._manual_total += fv
+            self._manual_by_type[typ] = self._manual_by_type.get(typ, 0.0) + fv
+
+    # NVTX helpers ---------------------------------------------------
+    def _nvtx_soft_add(self, value: float) -> None:
+        try:
+            self._nvtx_soft_counter += float(value) if float(value) > 0 else 0.0
+        except Exception:
+            pass
+
+    def _nvtx_soft_getter(self) -> float:
+        return float(self._nvtx_soft_counter)
+
+    def ensure_nvtx_getter(self) -> None:
+        if self._nvtx_getter is not None:
+            return
+        hook = os.environ.get("STF_NVTX_FLOPS_FN", "").strip()
+        if hook:
+            try:
+                self._nvtx_getter = _import_callable(hook)
+                return
+            except Exception:
+                pass
+        self._nvtx_getter = self._nvtx_soft_getter
+
+    def record_nvtx_soft(self, value: float) -> None:
+        self._nvtx_soft_add(value)
+
+    def make_nvtx_counter(self, device: Optional[torch.device] = None) -> Any:
+        try:
+            dev = device if device is not None else get_device()
+        except Exception:
+            dev = None
+        return self._nvtx_counter(dev)
+
+    # hook utilities -------------------------------------------------
+    def start_hooks(
+        self,
+        model: nn.Module,
+        mode: str = "train",
+        bwd_factor: Optional[float] = None,
+        include_bias: bool = True,
+    ) -> List[Any]:
+        effective_bwd = 0.0 if mode.lower() == "eval" else 2.0
+        _env = os.environ.get("STF_FLOP_BWD_FACTOR", "").strip()
+        if _env:
+            effective_bwd = float(_env)
+        if bwd_factor is not None:
+            effective_bwd = float(bwd_factor)
+        Linear = nn.Linear
+        target_types: List[type] = [Linear]
+        try:
+            import transformer_engine.pytorch as te
+
+            _te_linear = getattr(te, "Linear", None)
+            _te_ln_linear = getattr(te, "LayerNormLinear", None)
+        except Exception:
+            _te_linear = None
+            _te_ln_linear = None
+        for _t in (_te_linear, _te_ln_linear):
+            if _t is not None and _t not in target_types:
+                target_types.append(_t)
+        conv_types: List[type] = []
+        for _name in ("Conv1d", "Conv2d", "Conv3d"):
+            t = getattr(nn, _name, None)
+            if t is not None:
+                conv_types.append(t)
+
+        def _infer_linear_mkn(
+            inp: torch.Tensor, weight: Optional[torch.Tensor]
+        ) -> Tuple[int, int, int]:
+            K = (
+                int(weight.shape[-1])
+                if weight is not None and weight.ndim >= 2
+                else int(inp.shape[-1])
+            )
+            M = int(inp.numel() // max(K, 1))
+            N = (
+                int(weight.shape[0])
+                if weight is not None and weight.ndim >= 2
+                else int(getattr(inp, "shape", [0])[-1])
+            )
+            return (M, K, N)
+
+        def linear_flops(
+            inp: torch.Tensor, out: torch.Tensor, weight: Optional[torch.Tensor]
+        ) -> float:
+            M, K, N = _infer_linear_mkn(inp, weight)
+            if out is not None and out.numel() > 0 and (N > 0):
+                M = max(M, int(out.numel() // max(N, 1)))
+            if M <= 0 or K <= 0 or N <= 0:
+                return 0.0
+            bias_cost = 1.0 * M * N if include_bias else 0.0
+            fwd = 2.0 * M * K * N + bias_cost
+            return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
+
+        def conv_flops(
+            inp: torch.Tensor,
+            out: torch.Tensor,
+            weight: Optional[torch.Tensor],
+            groups: int = 1,
+        ) -> float:
+            if weight is None or weight.ndim < 3:
+                return 0.0
+            try:
+                out_elems = int(out.numel())
+                groups = max(1, int(groups))
+                cin_total = (
+                    int(inp.shape[1])
+                    if isinstance(inp, torch.Tensor) and inp.ndim >= 2
+                    else int(weight.shape[1] * groups)
+                )
+                cin_per_group = max(1, cin_total // groups)
+                cout = int(weight.shape[0])
+                kernel = int(weight[0].numel()) // max(cin_per_group, 1)
+                return float(
+                    out_elems
+                    * (2.0 * cin_per_group * kernel)
+                    * (1.0 + max(0.0, float(effective_bwd)))
+                )
+            except Exception:
+                return 0.0
+
+        handles: List[Any] = []
+        self.activate()
+
+        def _hook_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any) -> None:
+            weight = getattr(mod, "weight", None)
+            if weight is None:
+                inner_linear = getattr(mod, "linear", None)
+                weight = getattr(inner_linear, "weight", None)
+            x = inp[0] if inp else None
+            if not isinstance(x, torch.Tensor) or weight is None:
+                return
+            val = linear_flops(x, out, weight)
+            if val > 0.0:
+                self.add_manual(type(mod).__name__, val)
+
+        def _hook_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any) -> None:
+            weight = getattr(mod, "weight", None)
+            x = inp[0] if inp else None
+            if not isinstance(x, torch.Tensor) or weight is None:
+                return
+            groups = getattr(mod, "groups", 1)
+            val = conv_flops(x, out, weight, groups=groups)
+            if val > 0.0:
+                self.add_manual(type(mod).__name__, val)
+
+        try:
+            for m in model.modules():
+                if isinstance(m, tuple(target_types)):
+                    handles.append(m.register_forward_hook(_hook_linear))
+                elif any(isinstance(m, t) for t in conv_types):
+                    handles.append(m.register_forward_hook(_hook_conv))
+            return handles
+        except Exception:
+            self.stop_hooks(handles)
+            raise
+
+    def stop_hooks(self, handles: Sequence[Any]) -> None:
+        for h in list(handles):
+            try:
+                h.remove()
+            except Exception:
+                pass
+        self.deactivate()
+
+    def _torch_counter(self, display: bool = False) -> Any:
+        class _TorchScope(contextlib.AbstractContextManager):
+            def __init__(self, show: bool) -> None:
+                try:
+                    from torch.utils.flop_counter import FlopCounterMode as _TorchMode
+
+                    self._impl = _TorchMode(display=show)
+                except Exception:
+                    self._impl = None
+
+            def __enter__(self) -> "_TorchScope":
+                if self._impl is not None:
+                    self._impl.__enter__()
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                if self._impl is not None:
+                    self._impl.__exit__(exc_type, exc, tb)
+                return False
+
+            def get_total_flops(self) -> float:
+                if self._impl is None:
+                    return 0.0
+                try:
+                    return float(self._impl.get_total_flops())
+                except Exception:
+                    return 0.0
+
+        return _TorchScope(bool(display))
+
+    def _nvtx_counter(self, device: Optional[torch.device]) -> Any:
+        class _NvtxScope(contextlib.AbstractContextManager):
+            def __init__(self, getter: Optional[Callable[[], float]]) -> None:
+                self._getter = getter
+                self._start = 0.0
+                self._end = 0.0
+
+            def __enter__(self) -> "_NvtxScope":
+                if self._getter is None:
+                    return self
+                try:
+                    self._start = float(self._getter())
+                except Exception:
+                    self._start = 0.0
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                if self._getter is None:
+                    return False
+                try:
+                    self._end = float(self._getter())
+                except Exception:
+                    self._end = self._start
+                return False
+
+            def get_total_flops(self) -> float:
+                if self._getter is None:
+                    return 0.0
+                end = self._end
+                if not end > self._start:
+                    try:
+                        end = float(self._getter())
+                    except Exception:
+                        end = self._start
+                return max(0.0, float(end) - float(self._start))
+
+        if device is None or getattr(device, "type", None) != "cuda":
+            return _NvtxScope(None)
+        self.ensure_nvtx_getter()
+        getter = self._nvtx_getter or self._nvtx_soft_getter
+        return _NvtxScope(getter)
+
+    def step_scope(self, device: Optional[torch.device], display: bool = False) -> Any:
+        instrumentation = self
+
+        class _StepScope(contextlib.AbstractContextManager):
+            def __init__(self) -> None:
+                self.manual_total = 0.0
+                self.torch_total = 0.0
+                self.nvtx_total = 0.0
+                self.total = 0.0
+                self._torch_scope: Any = None
+                self._nvtx_scope: Any = None
+
+            def __enter__(self) -> "_StepScope":
+                instrumentation.reset_manual()
+                self._torch_scope = instrumentation._torch_counter(display)
+                self._nvtx_scope = instrumentation.make_nvtx_counter(device)
+                self._torch_scope.__enter__()
+                self._nvtx_scope.__enter__()
+                return self
+
+            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                manual = instrumentation.consume_manual()
+                if manual > 0.0:
+                    instrumentation.record_nvtx_soft(manual)
+                self.manual_total = manual
+                if self._torch_scope is not None:
+                    self._torch_scope.__exit__(exc_type, exc, tb)
+                    try:
+                        self.torch_total = float(self._torch_scope.get_total_flops())
+                    except Exception:
+                        self.torch_total = 0.0
+                if self._nvtx_scope is not None:
+                    self._nvtx_scope.__exit__(exc_type, exc, tb)
+                    try:
+                        self.nvtx_total = float(self._nvtx_scope.get_total_flops())
+                    except Exception:
+                        self.nvtx_total = 0.0
+                self.total = max(self.manual_total, self.torch_total, self.nvtx_total)
+                return False
+
+            def get_total_flops(self) -> float:
+                return float(self.total)
+
+        return _StepScope()
+
+    # public helpers -------------------------------------------------
+    def attention_flops_bshd(
+        self,
+        q: torch.Tensor,
+        *args: Any,
+        bwd_factor: float = 2.0,
+        dropout_p: float = 0.0,
+        training: bool = False,
+        include_softmax_scale_dropout: bool = True,
+        **kwargs: Any,
+    ) -> float:
+        try:
+            B = int(q.shape[0])
+            S = int(q.shape[1])
+            H = int(q.shape[2])
+            d = int(q.shape[3])
+        except Exception:
+            return 0.0
+        if B <= 0 or S <= 0 or H <= 0 or (d <= 0):
+            return 0.0
+        matmul = 4.0 * B * H * S**2 * d
+        misc = 0.0
+        if include_softmax_scale_dropout:
+            misc_coeff = 6.0
+            if training and float(dropout_p) > 0.0:
+                misc_coeff += 1.0
+            misc = misc_coeff * (B * H * S**2)
+        fwd = matmul + misc
+        total = float(fwd * (1.0 + max(0.0, float(bwd_factor))))
+        if total > 0.0:
+            self.add_manual("Attention", total)
+        return total
 
 
-def _reset_manual_flops() -> None:
-    _FLOP_BUCKET.reset()
-
-
-def _consume_manual_flops() -> float:
-    total = float(_FLOP_BUCKET.total)
-    _FLOP_BUCKET.reset()
-    return total
-
-
-_NVTX_SOFT_COUNTER: float = 0.0
-_NVTX_FLOPS_GETTER: Optional[Callable[[], float]] = None
+FLOP_INSTRUMENTATION = _FlopInstrumentation()
 
 
 @dataclass
@@ -203,168 +521,6 @@ class LossWeightOptimizer:
             ) * max(bottom_val, self.eps)
 
 
-class _FlopHookSession:
-    def __init__(self, handles: List[Any]) -> None:
-        self._handles = list(handles)
-        self._active = False
-        self._initial_count = len(self._handles)
-
-    def _set_active(self, value: bool) -> None:
-        global _FLOP_TRACKING_DEPTH
-        if value and (not self._active):
-            _FLOP_TRACKING_DEPTH += 1
-            self._active = True
-        elif not value and self._active:
-            _FLOP_TRACKING_DEPTH = max(0, _FLOP_TRACKING_DEPTH - 1)
-            self._active = False
-
-    def close(self) -> Any:
-        self._set_active(False)
-        for h in self._handles:
-            try:
-                h.remove()
-            except Exception:
-                pass
-        self._handles.clear()
-
-    def __enter__(self) -> "_FlopHookSession":
-        self._set_active(True)
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type or exc or tb:
-            pass
-        self.close()
-        return False
-
-    @property
-    def handle_count(self) -> int:
-        return self._initial_count
-
-
-def _create_flop_hook_session(
-    model: nn.Module,
-    mode: str = "train",
-    bwd_factor: Optional[float] = None,
-    include_bias: bool = True,
-) -> _FlopHookSession:
-    effective_bwd = 0.0 if mode.lower() == "eval" else 2.0
-    _env = os.environ.get("STF_FLOP_BWD_FACTOR", "").strip()
-    if _env:
-        effective_bwd = float(_env)
-    if bwd_factor is not None:
-        effective_bwd = float(bwd_factor)
-    Linear = nn.Linear
-    target_types: List[type] = [Linear]
-    try:
-        import transformer_engine.pytorch as te
-
-        _te_linear = getattr(te, "Linear", None)
-        _te_ln_linear = getattr(te, "LayerNormLinear", None)
-    except Exception:
-        _te_linear = None
-        _te_ln_linear = None
-    for _t in (_te_linear, _te_ln_linear):
-        if _t is not None and _t not in target_types:
-            target_types.append(_t)
-    conv_types: List[type] = []
-    for _name in ("Conv1d", "Conv2d", "Conv3d"):
-        t = getattr(nn, _name, None)
-        if t is not None:
-            conv_types.append(t)
-
-    def _infer_linear_mkn(
-        inp: torch.Tensor, weight: Optional[torch.Tensor]
-    ) -> Tuple[int, int, int]:
-        K = (
-            int(weight.shape[-1])
-            if weight is not None and weight.ndim >= 2
-            else int(inp.shape[-1])
-        )
-        M = int(inp.numel() // max(K, 1))
-        N = (
-            int(weight.shape[0])
-            if weight is not None and weight.ndim >= 2
-            else int(getattr(inp, "shape", [0])[-1])
-        )
-        return (M, K, N)
-
-    def linear_flops(
-        inp: torch.Tensor, out: torch.Tensor, weight: Optional[torch.Tensor]
-    ) -> float:
-        M, K, N = _infer_linear_mkn(inp, weight)
-        if out is not None and out.numel() > 0 and (N > 0):
-            M = max(M, int(out.numel() // max(N, 1)))
-        if M <= 0 or K <= 0 or N <= 0:
-            return 0.0
-        bias_cost = 1.0 * M * N if include_bias else 0.0
-        fwd = 2.0 * M * K * N + bias_cost
-        return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
-
-    def conv_flops(
-        inp: torch.Tensor,
-        out: torch.Tensor,
-        weight: Optional[torch.Tensor],
-        groups: int = 1,
-    ) -> float:
-        if weight is None or weight.ndim < 3:
-            return 0.0
-        try:
-            out_elems = int(out.numel())
-            groups = max(1, int(groups))
-            cin_total = (
-                int(inp.shape[1])
-                if isinstance(inp, torch.Tensor) and inp.ndim >= 2
-                else int(weight.shape[1] * groups)
-            )
-            cin_per_group = max(1, cin_total // groups)
-            k_elems = int(math.prod(weight.shape[2:]))
-            per_out = 2.0 * cin_per_group * k_elems
-            bias_cost = out_elems if include_bias else 0.0
-            fwd = per_out * out_elems + bias_cost
-            return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
-        except Exception:
-            return 0.0
-
-    def _hook_linear(
-        mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor
-    ) -> Any:
-        try:
-            x = inp[0]
-            w = getattr(mod, "weight", None)
-            if w is None:
-                inner = getattr(mod, "linear", None)
-                w = (
-                    getattr(inner, "weight", None)
-                    if inner is not None
-                    else None
-                )
-            val = linear_flops(x, out, w)
-            _FLOP_BUCKET.add(type(mod).__name__, val)
-        except Exception:
-            pass
-
-    def _hook_conv(
-        mod: nn.Module, inp: Sequence[torch.Tensor], out: torch.Tensor
-    ) -> Any:
-        try:
-            x = inp[0]
-            w = getattr(mod, "weight", None)
-            groups = int(getattr(mod, "groups", 1))
-            val = conv_flops(x, out, w, groups=groups)
-            _FLOP_BUCKET.add(type(mod).__name__, val)
-        except Exception:
-            pass
-
-    handles: List[Any] = []
-    for m in model.modules():
-        if any((isinstance(m, t) for t in target_types)):
-            handles.append(m.register_forward_hook(_hook_linear))
-        if any((isinstance(m, t) for t in conv_types)):
-            handles.append(m.register_forward_hook(_hook_conv))
-    return _FlopHookSession(handles)
-
-
 def _import_callable(spec: str) -> Callable:
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("Empty spec for callable import")
@@ -395,168 +551,6 @@ def _import_callable(spec: str) -> Callable:
         raise TypeError(f"{mod_name}:{fn_part} is not callable or not found")
     return fn
 
-
-def _nvtx_soft_add(v: float) -> None:
-    global _NVTX_SOFT_COUNTER
-    try:
-        _NVTX_SOFT_COUNTER += float(v) if float(v) > 0 else 0.0
-    except Exception:
-        pass
-
-
-def _nvtx_soft_getter() -> float:
-    return float(_NVTX_SOFT_COUNTER)
-
-
-def _ensure_nvtx_flops_getter() -> None:
-    global _NVTX_FLOPS_GETTER
-    if _NVTX_FLOPS_GETTER is not None:
-        return
-    hook = os.environ.get("STF_NVTX_FLOPS_FN", "").strip()
-    if hook:
-        try:
-            _NVTX_FLOPS_GETTER = _import_callable(hook)
-            return
-        except Exception:
-            pass
-    _NVTX_FLOPS_GETTER = _nvtx_soft_getter
-
-
-class _NoOpNvtxCounter:
-    def __enter__(self) -> "_NoOpNvtxCounter":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type or exc or tb:
-            pass
-        return False
-
-    def get_total_flops(self) -> float:
-        return 0.0
-
-
-class _NvtxCounter:
-    def __init__(self, getter: Callable[[], float]) -> None:
-        self._getter = getter
-        self._start: float = 0.0
-        self._end: float = 0.0
-
-    def __enter__(self) -> "_NvtxCounter":
-        try:
-            self._start = float(self._getter())
-        except Exception:
-            self._start = 0.0
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type or exc or tb:
-            pass
-        try:
-            self._end = float(self._getter())
-        except Exception:
-            self._end = self._start
-        return False
-
-    def get_total_flops(self) -> float:
-        end = float(self._end)
-        if not end > self._start:
-            try:
-                end = float(self._getter())
-            except Exception:
-                end = self._start
-        return max(0.0, float(end) - float(self._start))
-
-
-class _TorchFlopCounter:
-    def __init__(self, display: bool = False) -> None:
-        try:
-            from torch.utils.flop_counter import (
-                FlopCounterMode as _TorchFlopCounterMode,
-            )
-
-            self._impl = _TorchFlopCounterMode(display=display)
-        except Exception:
-            self._impl = None
-
-    def __enter__(self) -> "_TorchFlopCounter":
-        if self._impl is not None:
-            self._impl.__enter__()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type or exc or tb:
-            pass
-        if self._impl is not None:
-            self._impl.__exit__(exc_type, exc, tb)
-        return False
-
-    def get_total_flops(self) -> float:
-        if self._impl is None:
-            return 0.0
-        try:
-            return float(self._impl.get_total_flops())
-        except Exception:
-            return 0.0
-
-
-def _make_nvtx_counter(device: Optional[torch.device] = None) -> Any:
-    try:
-        dev = device if device is not None else get_device()
-    except Exception:
-        dev = None
-    if dev is None or getattr(dev, "type", None) != "cuda":
-        return _NoOpNvtxCounter()
-    _ensure_nvtx_flops_getter()
-    getter = (
-        _NVTX_FLOPS_GETTER
-        if _NVTX_FLOPS_GETTER is not None
-        else _nvtx_soft_getter
-    )
-    return _NvtxCounter(getter)
-
-
-class _FlopCounterStep:
-    def __init__(self, parent: FlopCounter, *args: Any, display: bool = False, **kwargs: Any) -> None:
-        self._parent = parent
-        self._display = display
-        self._torch_counter: Optional[_TorchFlopCounter] = None
-        self._nvtx_counter: Any = None
-        self.manual_total = 0.0
-        self.torch_total = 0.0
-        self.nvtx_total = 0.0
-        self.total = 0.0
-
-    def __enter__(self) -> _FlopCounterStep:
-        _reset_manual_flops()
-        self._torch_counter = _TorchFlopCounter(display=self._display)
-        self._torch_counter.__enter__()
-        self._nvtx_counter = _make_nvtx_counter(self._parent.device)
-        self._nvtx_counter.__enter__()
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        manual = _consume_manual_flops()
-        if manual > 0.0:
-            _nvtx_soft_add(manual)
-        self.manual_total = manual
-        if self._torch_counter is not None:
-            self._torch_counter.__exit__(exc_type, exc, tb)
-            self.torch_total = self._torch_counter.get_total_flops()
-            self._torch_counter = None
-        if self._nvtx_counter is not None:
-            self._nvtx_counter.__exit__(exc_type, exc, tb)
-            try:
-                self.nvtx_total = float(self._nvtx_counter.get_total_flops())
-            except Exception:
-                self.nvtx_total = 0.0
-            self._nvtx_counter = None
-        self.total = max(self.manual_total, self.torch_total, self.nvtx_total)
-        return False
-
-    def get_total_flops(self) -> float:
-        return float(self.total)
-
-
 class FlopCounter:
     def __init__(
         self,
@@ -573,39 +567,39 @@ class FlopCounter:
         self._device = device
         self._include_bias = include_bias
         self._bwd_factor = bwd_factor
-        self._hook_session: Optional[_FlopHookSession] = None
+        self._handles: List[Any] = []
         self._hook_count = 0
+        self._active = False
 
     @property
     def device(self) -> Optional[torch.device]:
         return self._device
 
     def __enter__(self) -> FlopCounter:
-        self._hook_session = _create_flop_hook_session(
+        self._handles = FLOP_INSTRUMENTATION.start_hooks(
             self._model,
             mode=self._mode,
             bwd_factor=self._bwd_factor,
             include_bias=self._include_bias,
         )
-        self._hook_session.__enter__()
-        self._hook_count = self._hook_session.handle_count
-        _reset_manual_flops()
+        self._hook_count = len(self._handles)
+        FLOP_INSTRUMENTATION.reset_manual()
+        self._active = True
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if exc_type or exc or tb:
-            pass
-        if self._hook_session is not None:
-            self._hook_session.__exit__(exc_type, exc, tb)
-            self._hook_session = None
+        if self._active:
+            FLOP_INSTRUMENTATION.stop_hooks(self._handles)
+            self._handles = []
+            self._active = False
         return False
 
-    def step(self, *args: Any, display: bool = False, **kwargs: Any) -> _FlopCounterStep:
-        if self._hook_session is None:
+    def step(self, *args: Any, display: bool = False, **kwargs: Any) -> Any:
+        if not self._active:
             raise RuntimeError(
                 "FlopCounter hooks are not active. Use `with FlopCounter(...)` before measuring FLOPs."
             )
-        return _FlopCounterStep(self, display=display)
+        return FLOP_INSTRUMENTATION.step_scope(self._device, display=display)
 
     @property
     def hook_count(self) -> int:
@@ -621,24 +615,15 @@ def attention_flops_bshd(
     include_softmax_scale_dropout: bool = True,
     **kwargs: Any,
 ) -> float:
-    try:
-        B = int(q.shape[0])
-        S = int(q.shape[1])
-        H = int(q.shape[2])
-        d = int(q.shape[3])
-    except Exception:
-        return 0.0
-    if B <= 0 or S <= 0 or H <= 0 or (d <= 0):
-        return 0.0
-    matmul = 4.0 * B * H * S**2 * d
-    misc = 0.0
-    if include_softmax_scale_dropout:
-        misc_coeff = 6.0
-        if training and float(dropout_p) > 0.0:
-            misc_coeff += 1.0
-        misc = misc_coeff * (B * H * S**2)
-    fwd = matmul + misc
-    return float(fwd * (1.0 + max(0.0, float(bwd_factor))))
+    return FLOP_INSTRUMENTATION.attention_flops_bshd(
+        q,
+        *args,
+        bwd_factor=bwd_factor,
+        dropout_p=dropout_p,
+        training=training,
+        include_softmax_scale_dropout=include_softmax_scale_dropout,
+        **kwargs,
+    )
 
 
 @contextlib.contextmanager
@@ -693,7 +678,7 @@ def compile(
                     inner_exc,
                     exc_info=True,
                 )
-        except Exception as exc:
+        except Exception:
             _LOGGER.warning(
                 "module.compile failed for %s; returning original module",
                 m.__class__.__name__,
@@ -709,7 +694,7 @@ def compile(
                 dynamic=dynamic,
                 backend=backend,
             )
-        except Exception as exc:
+        except Exception:
             _LOGGER.warning(
                 "torch.compile failed for %s; returning original module",
                 m.__class__.__name__,
@@ -809,7 +794,6 @@ class TunedDPA(torch.nn.Module):
                 dropout_p=float(dropout_p),
                 training=bool(training),
             )
-            _FLOP_BUCKET.add("Attention", fl)
         except Exception:
             pass
         dropout_val = float(dropout_p) if training else 0.0
@@ -846,7 +830,7 @@ class TunedDPA(torch.nn.Module):
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
-        backends = resolve_sdpa_backends()
+        backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
             try:
@@ -925,8 +909,8 @@ class MSRCompat(nn.Module):
             gate = torch.nn.functional.silu(self.g_proj(x))
             manual_flops += float(B * S * D)
             y = y * gate
-        if manual_flops > 0.0 and _is_flop_tracking_active():
-            _FLOP_BUCKET.add("MSRCompat", manual_flops)
+        if manual_flops > 0.0:
+            FLOP_INSTRUMENTATION.add_manual("MSRCompat", manual_flops)
         return self.o_proj(y)
 
 
@@ -1156,9 +1140,7 @@ class TunedAdamW:
                 logger(
                     f"[OPT] FP8 optimizers not supported ({why}) — fallback"
                 )
-        from .capability import optimizer_flags
-
-        flags: Dict[str, bool] = optimizer_flags(
+        flags: Dict[str, bool] = optimal_optimizer_params(
             dev, use_foreach=use_foreach, use_fused=use_fused
         )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
@@ -1209,27 +1191,31 @@ class TunedAdamW:
                         AdamW4bit,
                         AdamW8bit,
                     )
-                match dtype:
-                    case "int8":
+                if dtype == "int8":
+                    ok_int8, reason_int8 = is_int8_supported(dev)
+                    if ok_int8:
                         opt = AdamW8bit(
                             params, lr=lr, weight_decay=weight_decay
                         )
                         if logger:
-                            logger("[OPT] TorchAO AdamW8bit")
+                            note = f" — {reason_int8}" if reason_int8 else ""
+                            logger(f"[OPT] TorchAO AdamW8bit{note}")
                         return opt
-                    case _:
-                        opt = AdamW4bit(
-                            params, lr=lr, weight_decay=weight_decay
+                    if logger:
+                        logger(
+                            f"[OPT] INT8 optimizers not supported ({reason_int8}) — fallback"
                         )
-                        if logger:
-                            logger("[OPT] TorchAO AdamW4bit")
-                        return opt
+                else:
+                    opt = AdamW4bit(
+                        params, lr=lr, weight_decay=weight_decay
+                    )
+                    if logger:
+                        logger("[OPT] TorchAO AdamW4bit")
+                    return opt
             except Exception as e:
                 if logger:
                     logger(f"[OPT] TorchAO low-bit optimizer unavailable: {e}")
-        from .capability import optimizer_flags
-
-        flags: Dict[str, bool] = optimizer_flags(
+        flags: Dict[str, bool] = optimal_optimizer_params(
             dev, use_foreach=use_foreach, use_fused=use_fused
         )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)

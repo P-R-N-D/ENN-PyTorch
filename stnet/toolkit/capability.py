@@ -197,7 +197,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
     return max(1, min(cpu_count, 4))
 
 
-def resolve_sdpa_backends() -> List[object]:
+def initialize_sdpa_backends() -> List[object]:
     names = _RUNTIME_CONFIG.sdpa_backends or []
     if not names:
         return []
@@ -318,7 +318,7 @@ def get_device(
     return device
 
 
-def optimizer_flags(
+def optimal_optimizer_params(
     device: torch.device, use_foreach: Optional[bool], use_fused: bool
 ) -> Dict[str, bool]:
     devt = device.type
@@ -332,24 +332,27 @@ def optimizer_flags(
     return flags
 
 
-def _is_cuda_cc_equal_or_over_90(
-    device: Optional[Union[torch.device, str]] = None
-) -> Tuple[bool, str]:
-    dev = torch.device(device) if device is not None else get_device()
-    if dev.type != "cuda" or not torch.cuda.is_available():
-        return (False, "CUDA unavailable")
-    major, minor = torch.cuda.get_device_capability(dev)
-    ok = major >= 9
-    return (ok, f"sm_{major}{minor}")
+def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return (0, 0)
+    try:
+        major, minor = torch.cuda.get_device_capability(device)
+    except Exception:
+        return (0, 0)
+    return (int(major), int(minor))
 
 
 def is_float8_supported(
     device: Optional[Union[torch.device, str]] = None
 ) -> Tuple[bool, str]:
     dev = torch.device(device) if device is not None else get_device()
-    ok_cc, cc = _is_cuda_cc_equal_or_over_90(dev)
-    if dev.type != "cuda" or not ok_cc:
-        return (False, f"FP8 requires sm_90+ (found {dev.type}, cc={cc})")
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return (False, f"FP8 requires CUDA (found {dev.type})")
+    major, minor = cuda_compute_capability(dev)
+    if major <= 0:
+        return (False, "Unable to query CUDA compute capability")
+    if major < 9:
+        return (False, f"FP8 requires sm_90+ (found sm_{major}{minor})")
     try:
         import transformer_engine.pytorch as te
 
@@ -359,12 +362,31 @@ def is_float8_supported(
         return (False, "transformer_engine not found")
 
 
+def is_int8_supported(
+    device: Optional[Union[torch.device, str]] = None
+) -> Tuple[bool, str]:
+    dev = torch.device(device) if device is not None else get_device()
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return (False, f"INT8 requires CUDA (found {dev.type})")
+    major, minor = cuda_compute_capability(dev)
+    if major <= 0:
+        return (False, "Unable to query CUDA compute capability")
+    if major < 7:
+        return (False, f"INT8 requires sm_70+ (found sm_{major}{minor})")
+    try:
+        import torchao.quantization  # noqa: F401
+
+        return (True, "torchao.quantization")
+    except Exception:
+        return (True, f"sm_{major}{minor}")
+
+
 def optimal_procs() -> dict:
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     return {"nproc_per_node": n_gpu or 1, "device": "cuda" if n_gpu else "cpu"}
 
 
-def _cpu_count() -> int:
+def cpu_count() -> int:
     try:
         return len(os.sched_getaffinity(0))
     except Exception:
@@ -372,7 +394,7 @@ def _cpu_count() -> int:
 
 
 def optimal_threads() -> dict:
-    n_cpu = _cpu_count()
+    n_cpu = cpu_count()
     n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
     intra = max(1, min(n_cpu, int(round(0.8 * n_cpu))))
     inter = max(1, min(4, int(math.sqrt(intra))))
@@ -390,7 +412,7 @@ def optimal_threads() -> dict:
     }
 
 
-def apply_threading_defaults() -> dict:
+def optimize_threads() -> dict:
     threads = optimal_threads()
     os.environ.setdefault("OMP_NUM_THREADS", str(threads["intraop"]))
     os.environ.setdefault("MKL_NUM_THREADS", str(threads["intraop"]))

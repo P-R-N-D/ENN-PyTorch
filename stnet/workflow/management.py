@@ -5,7 +5,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -104,6 +103,15 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
+def _model_config_dict(model: Model) -> Dict[str, Any]:
+    cfg_obj = getattr(model, "_Model__config", None)
+    if isinstance(cfg_obj, ModelConfig):
+        return asdict(cfg_obj)
+    if isinstance(cfg_obj, dict):
+        return dict(cfg_obj)
+    return asdict(ModelConfig())
+
+
 
 
 class TorchIO:
@@ -139,34 +147,22 @@ class TorchIO:
             sd = model.state_dict()
             cpu_sd = {k: _to_cpu_if_tensor(v) for k, v in sd.items()}
             save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
-            cfg_obj = getattr(model, "_Model__config", None)
-            cfg_dict = (
-                asdict(cfg_obj)
-                if isinstance(cfg_obj, ModelConfig)
-                else asdict(ModelConfig())
-            )
             meta = {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
                 "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-                "config": cfg_dict,
+                "config": _model_config_dict(model),
                 "pytorch_version": torch.__version__,
                 "extra": extra or {},
             }
             p.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
             return p
 
-        cfg_obj = getattr(model, "_Model__config", None)
-        cfg_dict = (
-            asdict(cfg_obj)
-            if isinstance(cfg_obj, ModelConfig)
-            else asdict(ModelConfig())
-        )
         payload: Dict[str, Any] = {
             "version": 1,
             "in_dim": int(getattr(model, "in_dim", 0)),
             "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-            "config": cfg_dict,
+            "config": _model_config_dict(model),
             "state_dict": model.state_dict(),
             "pytorch_version": torch.__version__,
         }
@@ -218,25 +214,39 @@ class Converter:
             output_names = ["preds_flat"]
             dynamic_axes = (
                 {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
-                if dynamic_batch else None
+                if dynamic_batch
+                else None
             )
             export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
-            fallback_errors = (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
+            fallback_errors = (
+                (RuntimeError,)
+                if export_error is RuntimeError
+                else (RuntimeError, export_error)
+            )
+            common_kwargs = {
+                "export_params": True,
+                "opset_version": opset_version,
+                "do_constant_folding": True,
+                "input_names": input_names,
+                "output_names": output_names,
+                "dynamic_axes": dynamic_axes,
+            }
+            onnx_path.parent.mkdir(parents=True, exist_ok=True)
             try:
                 torch.onnx.export(
-                    wrapper, sample, str(onnx_path),
-                    dynamo=True, export_params=True,
-                    opset_version=opset_version, do_constant_folding=True,
-                    input_names=input_names, output_names=output_names,
-                    dynamic_axes=dynamic_axes,
+                    wrapper,
+                    sample,
+                    str(onnx_path),
+                    dynamo=True,
+                    **common_kwargs,
                 )
             except fallback_errors:
                 torch.onnx.export(
-                    wrapper, sample, str(onnx_path),
-                    dynamo=False, export_params=True,
-                    opset_version=opset_version, do_constant_folding=True,
-                    input_names=input_names, output_names=output_names,
-                    dynamic_axes=dynamic_axes,
+                    wrapper,
+                    sample,
+                    str(onnx_path),
+                    dynamo=False,
+                    **common_kwargs,
                 )
             return onnx_path
 
@@ -266,9 +276,15 @@ class Converter:
                 "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
                 "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
             }
-            level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+            level = opt_map.get(
+                optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
+            platform = (target_platform or "").lower()
             disabled_optimizers = (
-                ["NchwcTransformer"] if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and target_platform != "amd64" else None
+                ["NchwcTransformer"]
+                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                and platform not in {"", "amd64"}
+                else None
             )
             optimized_onnx_path: Optional[Path] = None
             if save_optimized_onnx_model:
@@ -277,10 +293,14 @@ class Converter:
                 so_onnx.optimized_model_filepath = str(optimized_onnx_path)
                 so_onnx.graph_optimization_level = level
                 if optimization_style.lower() == "runtime":
-                    so_onnx.add_session_config_entry("optimization.minimal_build_optimizations", "apply")
-                _ = ort.InferenceSession(
-                    str(onnx_path), sess_options=so_onnx,
-                    providers=["CPUExecutionProvider"], disabled_optimizers=disabled_optimizers
+                    so_onnx.add_session_config_entry(
+                        "optimization.minimal_build_optimizations", "apply"
+                    )
+                ort.InferenceSession(
+                    str(onnx_path),
+                    sess_options=so_onnx,
+                    providers=["CPUExecutionProvider"],
+                    disabled_optimizers=disabled_optimizers,
                 )
             so = ort.SessionOptions()
             so.optimized_model_filepath = str(ort_path)
@@ -419,11 +439,16 @@ class NnefConverter:
             "--input-model", str(onnx_path), "--output-model", str(dst),
             "--input-shapes", json.dumps(input_shapes),
         ]
-        if bool(opts.get("keep_io_names", True)): cmd.append("--keep-io-names")
-        if bool(opts.get("io_transpose", False)): cmd.append("--io-transpose")
-        if bool(opts.get("fold_constants", True)): cmd.append("--fold-constants")
-        if bool(opts.get("optimize", True)): cmd.append("--optimize")
-        if bool(opts.get("compress", True)): cmd.append("--compress")
+        toggles = (
+            ("keep_io_names", "--keep-io-names", True),
+            ("io_transpose", "--io-transpose", False),
+            ("fold_constants", "--fold-constants", True),
+            ("optimize", "--optimize", True),
+            ("compress", "--compress", True),
+        )
+        for key, flag, default in toggles:
+            if bool(opts.get(key, default)):
+                cmd.append(flag)
         _run_cmd(cmd, "nnef convert")
         return (dst,)
 
@@ -464,12 +489,16 @@ class CoreMLConverter:
 class LiteRTConverter:
     name = "litert"
     def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+        sample_input = opts.get("sample_input")
+        opset_version = int(opts.get("opset_version", 18))
+        dynamic_batch = bool(opts.get("dynamic_batch", True))
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
         onnx_path = Converter._OnnxLayer.ensure(
-            model, onnx_path,
-            sample_input=opts.get("sample_input"),
-            opset_version=int(opts.get("opset_version", 18)),
-            dynamic_batch=bool(opts.get("dynamic_batch", True)),
+            model,
+            onnx_path,
+            sample_input=sample_input,
+            opset_version=opset_version,
+            dynamic_batch=dynamic_batch,
         )
         if bool(opts.get("prefer_onnx2tf", True)):
             try:
@@ -495,6 +524,7 @@ class LiteRTConverter:
         import tensorflow as tf  # noqa: F401 (required by converter)
         model_onnx = onnx.load(str(onnx_path))
         from tempfile import TemporaryDirectory
+
         with TemporaryDirectory() as tmpd:
             saved_model_dir = Path(tmpd) / "saved_model"
             prepare(model_onnx).export_graph(str(saved_model_dir))
