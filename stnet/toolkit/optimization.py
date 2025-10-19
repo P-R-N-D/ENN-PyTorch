@@ -5,6 +5,7 @@ import importlib
 import logging
 import math
 import os
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -20,6 +21,11 @@ from typing import (
 
 import torch
 from torch import nn, optim
+
+try:
+    from torch.distributed.algorithms.join import Join
+except ImportError:  # pragma: no cover - optional dependency
+    Join = None  # type: ignore[assignment]
 
 from .capability import (
     get_device,
@@ -93,6 +99,22 @@ except Exception:
                 CONVERT = "convert"
 
             QATConfig, QATStep = (_NullQATConfig, _NullQATStep)
+
+
+def joining(*joinables: Optional[object]) -> AbstractContextManager[None]:
+    """Return a join context for any joinable modules or optimizers."""
+
+    if Join is None:
+        return contextlib.nullcontext()
+    to_join = []
+    for obj in joinables:
+        if obj is None:
+            continue
+        if getattr(obj, "join_hook", None) is not None:
+            to_join.append(obj)
+    if not to_join:
+        return contextlib.nullcontext()
+    return Join(to_join, throw_on_early_termination=True)
 
 
 @dataclass
@@ -620,7 +642,7 @@ def attention_flops_bshd(
 
 
 @contextlib.contextmanager
-def fsdp_no_sync(m: torch.nn.Module, enable: bool) -> Any:
+def no_synchronization(m: torch.nn.Module, enable: bool) -> Any:
     if not enable or not torch.distributed.is_initialized():
         yield
         return

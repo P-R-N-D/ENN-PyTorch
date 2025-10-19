@@ -30,7 +30,7 @@ import torch.distributed as dist
 from torchdata.nodes import (
     BaseNode,
     IterableWrapper,
-    Loader as TorchDataLoader,
+    Loader,
     ParallelMapper,
     PinMemory,
     Prefetcher,
@@ -676,7 +676,7 @@ class H2DController(Iterator[Any]):
         self._graph.replay()
 
 
-class Loader:
+class DataLoader:
     def __init__(
         self,
         device: torch.device,
@@ -690,13 +690,13 @@ class Loader:
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
             raise TypeError(
-                "pipeline.collate.Loader supports only torchdata.nodes.BaseNode instances."
+                "pipeline.collate.DataLoader supports only torchdata.nodes.BaseNode instances."
             )
         self._node = node_obj
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))
         self._non_blocking = bool(non_blocking)
-        base = TorchDataLoader(self._node)
+        base = Loader(self._node)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
             try:
@@ -879,7 +879,7 @@ def fetch(
     )
 
 
-def loader(
+def dataloader(
     memmap_dir: str,
     device: Union[str, torch.device],
     batch_size: int,
@@ -917,7 +917,7 @@ def loader(
         flatten_features=flatten_features,
     )
 
-    def _wrap_node(node: IterableWrapper) -> Loader:
+    def _wrap_node(node: IterableWrapper) -> DataLoader:
         wrapped: Any = ParallelMapper(
             node,
             map_fn=map_fn,
@@ -930,7 +930,7 @@ def loader(
         wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
         if device_obj.type in {"cuda", "xpu", "mps"}:
             wrapped = PinMemory(wrapped, pin_memory_device=device_obj.type)
-        return Loader(
+        return DataLoader(
             device=device_obj,
             node=wrapped,
             prefetch_factor=prefetch_factor,
@@ -1120,7 +1120,7 @@ def loader(
         warnings.warn(
             (
                 "Arrow Flight backend unavailable"
-                f" ({exc}). Falling back to the local memory-mapped loader."
+                f" ({exc}). Falling back to the local memory-mapped dataloader."
             ),
             RuntimeWarning,
         )
