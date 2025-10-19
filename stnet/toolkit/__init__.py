@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from .capability import get_device, get_runtime_config, resolve_sdpa_backends
