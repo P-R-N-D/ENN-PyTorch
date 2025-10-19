@@ -19,17 +19,27 @@ except ImportError:
 
     class _EndpointUnavailable:
         @staticmethod
-        def start_server_standby(*args: Any, **kwargs: Any) -> Any:
-            details = " with args/kwargs" if args or kwargs else ""
+        def start_server_standby(
+            *args: Any,
+            host: str = "0.0.0.0",
+            port: int = 0,
+            wait_ready_s: float = 10.0,
+            **kwargs: Any,
+        ) -> Any:
             raise RuntimeError(
-                "Arrow Flight server is unavailable"
-                f"{details}. Install pyarrow[flight] to enable it."
+                "Arrow Flight server is unavailable. "
+                "Install pyarrow[flight] to enable it."
             )
 
         @staticmethod
-        def connect(*args: Any, **kwargs: Any) -> None:
-            details = " with args/kwargs" if args or kwargs else ""
-            raise RuntimeError(f"Arrow Flight module is unavailable{details}.")
+        def connect(
+            endpoint: Any,
+            *args: Any,
+            wait_ready_s: float = 5.0,
+            poll_interval_s: float = 0.05,
+            **kwargs: Any,
+        ) -> None:
+            raise RuntimeError("Arrow Flight module is unavailable.")
 
     Endpoint = _EndpointUnavailable()
 
@@ -141,18 +151,9 @@ def _gather_all(obj: Any) -> List[Any]:
 
 
 def _format_flight_host(
-    host: Any, fallback: Any | None = None, *, default: str = "127.0.0.1"
+    host: Any, fallback: Any | None = None, *args: Any, default: str = "127.0.0.1", **kwargs: Any
 ) -> str:
-    """Return a sanitized host string for Arrow Flight endpoints.
 
-    The function prefers the provided ``host`` value, falling back to ``fallback``
-    and then ``default`` while ensuring that we only surface usable addresses.
-    IPv6 literals are wrapped in brackets and zone identifiers are removed.  If a
-    value resembles a hostname (e.g. ``example.com``) instead of an IP literal we
-    return it as-is so the caller can rely on DNS resolution.  Values that look
-    like malformed IP addresses (for example, bracketed strings that fail to
-    parse) are ignored in favour of the next candidate.
-    """
     def _coerce(value: Any) -> str:
         if isinstance(value, str):
             return value.strip()
@@ -197,9 +198,7 @@ def _format_flight_host(
     return default_value
 
 
-def _mq_addr(
-    kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any
-) -> str:
+def _mq_addr(kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs: Any) -> str:
     os.makedirs(base_path, exist_ok=True)
     return f"ipc://{base_path}/stf_{_hostname()}_{kind}.ipc"
 
@@ -310,9 +309,10 @@ class IOController:
         self._leaders = leaders
         def _wait_for_flight_port(
             target_host: str,
-            *,
+            *args: Any,
             total_timeout_s: float = 60.0,
             poll_timeout_s: float = 2.0,
+            **kwargs: Any,
         ) -> int | None:
             if total_timeout_s is not None and total_timeout_s <= 0:
                 total_timeout_s = 0.0
