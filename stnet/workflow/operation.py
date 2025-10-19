@@ -10,6 +10,7 @@ import shutil
 import sys
 import time
 import warnings
+from functool import partial
 from dataclasses import asdict, replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -36,7 +37,7 @@ from tqdm.auto import tqdm
 
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Config, Model, coerce_config
-from ..pipeline.collate import loader, postprocess, preprocess
+from ..pipeline.collate import loader, postprocess, preprocess, to_tensor
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
     apply_threading_defaults,
@@ -87,6 +88,22 @@ pattern_to_ignore = "|".join(
     (f"({sentence})" for sentence in sentences_to_ignore)
 )
 
+_DL_STATE_FILE = "dataloader.json"
+
+def dl_state_path(directory: str) -> str:
+    return os.path.join(directory, _DL_STATE_FILE)
+
+def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
+    is_main = True
+    try:
+        is_main = (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_rank() == 0
+        )
+    except Exception:
+        pass
+    if (not only_main_rank) or is_main:
+        warnings.warn(msg)
 
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
@@ -428,16 +445,6 @@ def epochs(
             )
             val_frac = actual_val_frac
 
-    def _float8_log(msg: str) -> None:
-        try:
-            import torch.distributed as dist
-
-            is_main = dist.is_initialized() and dist.get_rank() == 0
-        except (ImportError, RuntimeError):
-            is_main = True
-        if is_main:
-            warnings.warn(msg)
-
     model, _, _ = ModuleTuner.use_te_module(model, device=device)
     _ensure_uniform_param_dtype(
         model,
@@ -613,9 +620,6 @@ def epochs(
                     options=StateDictOptions(strict=False),
                 )
 
-    def _dl_ckpt(p: Any) -> Any:
-        return os.path.join(p, "dataloader.json")
-
     train_loader0, val_loader0, keep0 = loader(
         memmap_dir=memmap_dir,
         device=device,
@@ -629,21 +633,14 @@ def epochs(
     val_steps = len(val_loader0) if val_loader0 is not None else 0
     steps_per_epoch = max(1, train_steps + val_steps)
 
-    def _as_tensor(obj: Any) -> Any:
-        if isinstance(obj, torch.Tensor):
-            return obj
-        if hasattr(obj, "to_tensor"):
-            return obj.to_tensor()
-        return torch.as_tensor(obj)
-
     for _step_idx, _raw in enumerate(train_loader0):
         _feat0, _label0, *_ = preprocess(_raw)
         if hasattr(model, "update_x_stats"):
             try:
                 model.update_x_stats(_feat0)
             except (RuntimeError, ValueError, TypeError):
-                model.update_x_stats(_as_tensor(_feat0).detach().cpu())
-        _label0 = _as_tensor(_label0)
+                model.update_x_stats(to_tensor(_feat0).detach().cpu())
+        _label0 = to_tensor(_label0)
         _Y0_flat = _label0.view(_label0.shape[0], -1)
         model.update_y_stats(_Y0_flat)
     model.finalize_y_stats()
@@ -748,12 +745,8 @@ def epochs(
         torch, "Event"
     )
     grad_accum_steps = max(1, int(grad_accum_steps))
-    ckpt_state_path = os.path.join(ckpt_dir, "dataloader.json")
-    init_state_path = (
-        os.path.join(init_ckpt_dir, "dataloader.json")
-        if init_ckpt_dir
-        else None
-    )
+    ckpt_state_path = dl_state_path(ckpt_dir)
+    init_state_path = dl_state_path(init_ckpt_dir) if init_ckpt_dir else None
     state_train: Dict[str, Any] = {}
     state_val: Dict[str, Any] = {}
     if os.path.isfile(ckpt_state_path):
@@ -812,11 +805,7 @@ def epochs(
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
                     feat, label, *_ = preprocess(_raw)
-                    X = (
-                        feat
-                        if isinstance(feat, torch.Tensor)
-                        else torch.as_tensor(feat)
-                    )
+                    X = to_tensor(feat)
                     X = torch.atleast_2d(X)
                     if X.dim() != 2:
                         raise RuntimeError(
@@ -826,11 +815,7 @@ def epochs(
                         raise RuntimeError(
                             f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                         )
-                    Y = (
-                        label
-                        if isinstance(label, torch.Tensor)
-                        else torch.as_tensor(label)
-                    )
+                    Y = to_tensor(label)
                     t_ready = time.perf_counter_ns()
                     if use_timer and getattr(
                         device, "type", "cpu"
@@ -962,11 +947,7 @@ def epochs(
                         v_step_count = 0
                         for step_idx, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
-                            X = (
-                                feat
-                                if isinstance(feat, torch.Tensor)
-                                else torch.as_tensor(feat)
-                            )
+                            X = to_tensor(feat)
                             X = torch.atleast_2d(X)
                             if X.dim() != 2:
                                 raise RuntimeError(
@@ -976,11 +957,7 @@ def epochs(
                                 raise RuntimeError(
                                     f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                                 )
-                            Y = (
-                                label
-                                if isinstance(label, torch.Tensor)
-                                else torch.as_tensor(label)
-                            )
+                            Y = to_tensor(label)
                             t_ready = time.perf_counter_ns()
                             if (
                                 use_timer
@@ -1141,11 +1118,7 @@ def epochs(
                 if val_loader is not None
                 else {},
             }
-            with open(
-                os.path.join(ckpt_dir, "dataloader.json"),
-                "w",
-                encoding="utf-8",
-            ) as _f:
+            with open(dl_state_path(ckpt_dir), "w", encoding="utf-8") as _f:
                 json.dump(_dl, _f)
     torch.distributed.barrier(
         device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
@@ -1287,9 +1260,6 @@ def infer(
             )
     model.to(device, non_blocking=True).eval()
 
-    def _float8_log(msg: str) -> None:
-        warnings.warn(msg)
-
     model, _, _ = ModuleTuner.use_te_module(model, device=device)
     _ensure_uniform_param_dtype(
         model,
@@ -1302,7 +1272,7 @@ def infer(
         model,
         device=device,
         prefer="te",
-        logger=_float8_log,
+        logger=partial(_float8_log, only_main_rank=False),
         dynamic_activations=True,
     )
     model.eval()
@@ -1333,11 +1303,7 @@ def infer(
         with torch.no_grad(), TunedAMP.float(device):
             for _step_idx, _raw in enumerate(train_loader):
                 feat, _label, *_ = preprocess(_raw)
-                X = (
-                    feat
-                    if isinstance(feat, torch.Tensor)
-                    else torch.as_tensor(feat)
-                )
+                X = to_tensor(feat)
                 X = torch.atleast_2d(X)
                 if X.dim() != 2:
                     raise RuntimeError(
