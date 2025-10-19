@@ -1233,6 +1233,3 @@ def dataloader(
             RuntimeWarning,
         )
         return _local_impl()
-
-
-loader = dataloader
