@@ -750,7 +750,7 @@ def _torch_dtype_to_numpy_dtype(dtype: torch.dtype) -> Any:
     return mapping.get(dtype, np.float32)
 
 
-def _map_dtype(obj: Any, dtype: Optional[torch.dtype], *args: Any, **kwargs: Any) -> Any:
+def _map_dtype(obj: Any, dtype: Optional[torch.dtype]) -> Any:
     if dtype is None:
         return obj
     if isinstance(obj, torch.Tensor):
@@ -935,7 +935,6 @@ def loader(
             node=wrapped,
             prefetch_factor=prefetch_factor,
             non_blocking=bool(non_blocking_copy),
-            **kwargs,
         )
 
     def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
