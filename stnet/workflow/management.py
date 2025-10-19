@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -120,7 +119,10 @@ class TorchIO:
     @staticmethod
     def is_native_target(path: str | Path) -> bool:
         p = Path(path)
-        return p.suffix.lower() in TorchIO.NATIVE_EXTS or p.is_dir()
+        suffix = p.suffix.lower()
+        if suffix:
+            return suffix in TorchIO.NATIVE_EXTS
+        return True
 
     @staticmethod
     def save(
@@ -131,16 +133,26 @@ class TorchIO:
         **opts: Any,
     ) -> Path:
         p = Path(path)
+        suffix = p.suffix.lower()
+
+        if not suffix:
+            if p.exists():
+                if p.is_file():
+                    suffix = ".pt"
+                elif p.is_dir():
+                    from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
+
+                    opts_sd = StateDictOptions(full_state_dict=True)
+                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    dcp_save(
+                        state_dict={"model": m_sd},
+                        storage_writer=FileSystemWriter(str(p)),
+                    )
+                    return p
+
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        if p.is_dir() and not p.suffix:
-            from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
-            opts_sd = StateDictOptions(full_state_dict=True)
-            m_sd = get_model_state_dict(model, options=opts_sd)
-            dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
-            return p
-
-        if p.suffix.lower() == ".safetensors":
+        if suffix == ".safetensors":
             _require("safetensors", "pip install safetensors")
             from safetensors.torch import save_file as save_tensors
 
@@ -521,7 +533,7 @@ class LiteRTConverter:
         _require("onnx-tf", "pip install onnx-tf")
         import onnx
         from onnx_tf.backend import prepare
-        import tensorflow as tf  # noqa: F401 (required by converter)
+        import tensorflow as tf
         model_onnx = onnx.load(str(onnx_path))
         from tempfile import TemporaryDirectory
 
@@ -548,13 +560,12 @@ class LiteRTConverter:
         return (dst,)
 
 
-# Register converters (extension -> name mapping)
 Converter.register("onnx", (".onnx",), OnnxConverter())
 Converter.register("ort", (".ort",), OrtConverter())
 Converter.register("tensorrt", (".engine",), TensorRTConverter())
 Converter.register("nnef", (".nnef",), NnefConverter())
 Converter.register("coreml", (".mlmodel",), CoreMLConverter())
-Converter.register("litert", (".tflite",), LiteRTConverter())  # keep .tflite extension, name is LiteRT
+Converter.register("litert", (".tflite",), LiteRTConverter())
 
 
 def new_model(

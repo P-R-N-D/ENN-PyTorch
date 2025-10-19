@@ -115,23 +115,24 @@ class Model(nn.Module):
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
-            if hasattr(torch, "cuda") and torch.cuda.is_available():
-                dev = "cuda"
-            elif (
-                getattr(torch.backends, "mps", None)
-                and torch.backends.mps.is_available()
-            ):
-                dev = "mps"
-            elif (
-                hasattr(torch, "is_vulkan_available")
-                and torch.is_vulkan_available()
-            ):
-                dev = "vulkan"
-            elif hasattr(torch, "xpu") and torch.xpu.is_available():
-                dev = "xpu"
-            else:
-                dev = "cpu"
-            self._device = torch.device(dev)
+            match True:
+                case _ if hasattr(torch, "cuda") and torch.cuda.is_available():
+                    device_name = "cuda"
+                case _ if (
+                    getattr(torch.backends, "mps", None)
+                    and torch.backends.mps.is_available()
+                ):
+                    device_name = "mps"
+                case _ if (
+                    hasattr(torch, "is_vulkan_available")
+                    and torch.is_vulkan_available()
+                ):
+                    device_name = "vulkan"
+                case _ if hasattr(torch, "xpu") and torch.xpu.is_available():
+                    device_name = "xpu"
+                case _:
+                    device_name = "cpu"
+            self._device = torch.device(device_name)
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
@@ -165,8 +166,9 @@ class Model(nn.Module):
         except Exception:
             pass
         mode = str(getattr(config, "compile_mode", "default"))
-        try:
-            if bool(getattr(config, "use_compilation", False)):
+        use_compilation = bool(getattr(config, "use_compilation", False))
+        if use_compilation:
+            try:
                 self.local_net = compile(
                     self.local_net,
                     mode=mode,
@@ -174,17 +176,15 @@ class Model(nn.Module):
                     dynamic=False,
                     backend="inductor",
                 )
-            if bool(getattr(config, "use_compilation", False)):
-                compiled_global = compile(
+                self.global_net = compile(
                     self.global_net,
                     mode=mode,
                     fullgraph=False,
                     dynamic=False,
                     backend="inductor",
                 )
-                self.global_net = compiled_global
-        except Exception:
-            pass
+            except Exception:
+                pass
         self.__config = config
         self._label_dim = int(prod(out_shape))
         self.register_buffer(

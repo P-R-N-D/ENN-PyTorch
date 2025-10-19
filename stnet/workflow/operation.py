@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -194,7 +193,7 @@ class OpsConfig:
         )
 
 
-def make_ops_config(
+def new_ops_config(
     mode: OpsMode, base: Dict[str, Any] | None, /, *args, **kwargs
 ) -> OpsConfig:
     data: Dict[str, Any] = dict(base or {})
@@ -323,19 +322,18 @@ def _set_backend(device: torch.device) -> None:
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
-        return
-    if device.type == "xpu":
+    elif device.type == "xpu":
         torch.xpu.set_device(rank)
-        return
-    try:
-        import netifaces
+    else:
+        try:
+            import netifaces
 
-        gws = netifaces.gateways()
-        inet = gws["default"][netifaces.AF_INET][1]
-        os.environ["GLOO_SOCKET_IFNAME"] = inet
-        os.environ["TP_SOCKET_IFNAME"] = inet
-    except (ImportError, KeyError, OSError):
-        pass
+            gws = netifaces.gateways()
+            inet = gws["default"][netifaces.AF_INET][1]
+            os.environ["GLOO_SOCKET_IFNAME"] = inet
+            os.environ["TP_SOCKET_IFNAME"] = inet
+        except (ImportError, KeyError, OSError):
+            pass
 
 
 def _meta(memmap_dir: str) -> Dict[str, Any]:
@@ -485,7 +483,7 @@ def train(
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = make_ops_config(
+    ops = new_ops_config(
         "train",
         base,
         *args,
@@ -573,7 +571,7 @@ def predict(
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = make_ops_config(
+    ops = new_ops_config(
         mode,
         base,
         *args,
