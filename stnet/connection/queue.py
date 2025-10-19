@@ -78,7 +78,12 @@ class Publisher(Protocol):
 
 
 class Subscriber(Protocol):
-    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
+    def recv(
+        self,
+        *args: Any,
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Optional[Message]:
         if False:
             raise RuntimeError(timeout)
         raise NotImplementedError
@@ -113,7 +118,12 @@ class CompatQueue(Publisher, Subscriber):
         self._queue.put(message)
         return self._offset
 
-    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
+    def recv(
+        self,
+        *args: Any,
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Optional[Message]:
         try:
             if timeout is None:
                 return self._queue.get()
@@ -166,7 +176,12 @@ class MessageQueue(Publisher, Subscriber):
         self._pub.send_multipart([self._topic, message.to_bytes()])
         return self._offset
 
-    def recv(self, *args: Any, timeout: Optional[float] = None, **kwargs: Any) -> Optional[Message]:
+    def recv(
+        self,
+        *args: Any,
+        timeout: Optional[float] = None,
+        **kwargs: Any,
+    ) -> Optional[Message]:
         poller = zmq.Poller()
         poller.register(self._sub, zmq.POLLIN)
         timeout_ms = int(timeout * 1000) if timeout is not None else None
