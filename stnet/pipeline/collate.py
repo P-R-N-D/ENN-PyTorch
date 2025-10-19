@@ -779,11 +779,15 @@ def flatten(objs: Iterable[Any]) -> Iterable[Any]:
 class _Keep:
     __slots__ = ("_objs",)
 
-    def __init__(self, *objs: Any) -> None:
-        self._objs = list(flatten(objs))
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._objs = list(flatten(args))
+        if kwargs:
+            self._objs.extend(list(flatten(kwargs.values())))
 
-    def add(self, *objs: Any) -> None:
-        self._objs.extend(list(flatten(objs)))
+    def add(self, *args: Any, **kwargs: Any) -> None:
+        self._objs.extend(list(flatten(args)))
+        if kwargs:
+            self._objs.extend(list(flatten(kwargs.values())))
 
     def cleanup(self) -> None:
         for obj in self._objs:
