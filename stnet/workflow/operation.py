@@ -10,7 +10,7 @@ import shutil
 import sys
 import time
 import warnings
-from functool import partial
+from functools import partial
 from dataclasses import asdict, replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -37,7 +37,7 @@ from tqdm.auto import tqdm
 
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Config, Model, coerce_config
-from ..pipeline.collate import loader, postprocess, preprocess, to_tensor
+from ..pipeline.collate import dataloader, postprocess, preprocess, to_tensor
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
     apply_threading_defaults,
@@ -58,7 +58,8 @@ from ..toolkit.optimization import (
     LossWeightOptimizer,
     ModuleTuner,
     TunedAdamW,
-    fsdp_no_sync,
+    joining,
+    no_synchronization,
 )
 
 try:
@@ -75,10 +76,6 @@ try:
     from torch.distributed.run import LaunchConfig, elastic_launch
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
-try:
-    from torch.distributed.algorithms.join import Join
-except ImportError:
-    Join = None
 sentences_to_ignore = [
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.*",
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
@@ -620,7 +617,7 @@ def epochs(
                     options=StateDictOptions(strict=False),
                 )
 
-    train_loader0, val_loader0, keep0 = loader(
+    train_loader0, val_loader0, keep0 = dataloader(
         memmap_dir=memmap_dir,
         device=device,
         batch_size=batch_size,
@@ -714,23 +711,6 @@ def epochs(
             1.0 + math.cos(math.pi * t / max(1, main_steps))
         )
 
-    def _join_context(
-        m: torch.nn.Module, opt: Optional[torch.optim.Optimizer]
-    ) -> contextlib.AbstractContextManager:
-        joinables = []
-        if Join is None:
-            return contextlib.nullcontext()
-        for maybe_joinable in (m, opt):
-            if maybe_joinable is None:
-                continue
-            if getattr(maybe_joinable, "join_hook", None) is not None:
-                joinables.append(maybe_joinable)
-        return (
-            Join(joinables, throw_on_early_termination=True)
-            if joinables
-            else contextlib.nullcontext()
-        )
-
     sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_scheduler)
     scaler = torch.amp.GradScaler(
         enabled=device.type == "cuda" and (not torch.cuda.is_bf16_supported())
@@ -775,7 +755,7 @@ def epochs(
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
         flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-        train_loader, val_loader, keep = loader(
+        train_loader, val_loader, keep = dataloader(
             memmap_dir=memmap_dir,
             device=device,
             batch_size=batch_size,
@@ -800,7 +780,7 @@ def epochs(
             model.train()
             optimizer.zero_grad(set_to_none=True)
             t_fetch_start = time.perf_counter_ns()
-            with _join_context(model, optimizer):
+            with joining(model, optimizer):
                 train_step_count = 0
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
@@ -864,7 +844,7 @@ def epochs(
                         ev_start.record()
                     else:
                         t_comp_start = time.perf_counter_ns()
-                    with fsdp_no_sync(
+                    with no_synchronization(
                         model,
                         enable=grad_accum_steps > 1 and (not should_sync),
                     ):
@@ -943,7 +923,7 @@ def epochs(
                 val_loss_weights = loss_controller.weights()
                 with torch.no_grad(), TunedAMP.float(device):
                     t_fetch_start = time.perf_counter_ns()
-                    with _join_context(model, optimizer):
+                    with joining(model, optimizer):
                         v_step_count = 0
                         for step_idx, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
@@ -1276,7 +1256,7 @@ def infer(
         dynamic_activations=True,
     )
     model.eval()
-    train_loader, _, keep = loader(
+    train_loader, _, keep = dataloader(
         memmap_dir=memmap_dir,
         device=device,
         batch_size=batch_size,
@@ -1348,7 +1328,7 @@ def infer(
                     ev_start.record()
                 else:
                     t0 = time.perf_counter_ns()
-                with fsdp_no_sync(model, enable=True):
+                with no_synchronization(model, enable=True):
                     with flop_counter.step(display=False) as step_counter:
                         with contextlib.suppress(Exception):
                             mark_step = getattr(
