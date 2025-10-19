@@ -7,17 +7,13 @@ netifaces>=0.11
 pyarrow[flight]>=10
 tqdm>=4.66
 
-#torchao>=0.5
-#cupy>=12.1
-#kvikio>=23.8
-#transformer-engine[pytorch]>=2.0
-#intel-extension-for-pytorch>=2.3
-#ucxx-cu12>=0.45.0
-#pyzmq>=25
-#onnx>=1.14
-#onnx-tf>=1.10.0
-#onnx2tf>=1.18.0
-#coremltools>=6.3
-#tensorrt>=10.0
-#executorch>=0.4
-#torchscale>=0.3.0
+# Optional extras (install via `pip install -e .[extra]`):
+# queue: pyzmq>=25
+# ao: torchao>=0.5
+# gds: cupy>=12.1, kvikio>=23.8
+# te: transformer-engine[pytorch]>=2.0
+# intel: intel-extension-for-pytorch>=2.3
+# ucx: ucxx-cu12>=0.45.0
+# arrow_cuda: pyarrow[cuda]>=10
+# export: onnx>=1.14, onnx-tf>=1.10.0, onnx2tf>=1.18.0, coremltools>=6.3, tensorrt>=10.0, executorch>=0.4
+# scale: torchscale>=0.3.0

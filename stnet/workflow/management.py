@@ -21,7 +21,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..architecture.network import Config, Model, coerce_config
+from ..architecture.network import Model, ModelConfig, coerce_config
 
 
 class MissingDependencyError(ImportError):
@@ -140,7 +140,11 @@ class TorchIO:
             cpu_sd = {k: _to_cpu_if_tensor(v) for k, v in sd.items()}
             save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
             cfg_obj = getattr(model, "_Model__config", None)
-            cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
+            cfg_dict = (
+                asdict(cfg_obj)
+                if isinstance(cfg_obj, ModelConfig)
+                else asdict(ModelConfig())
+            )
             meta = {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
@@ -153,7 +157,11 @@ class TorchIO:
             return p
 
         cfg_obj = getattr(model, "_Model__config", None)
-        cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
+        cfg_dict = (
+            asdict(cfg_obj)
+            if isinstance(cfg_obj, ModelConfig)
+            else asdict(ModelConfig())
+        )
         payload: Dict[str, Any] = {
             "version": 1,
             "in_dim": int(getattr(model, "in_dim", 0)),
@@ -522,7 +530,7 @@ Converter.register("litert", (".tflite",), LiteRTConverter())  # keep .tflite ex
 def new_model(
     in_dim: int,
     out_shape: Sequence[int],
-    config: Config | Dict[str, Any] | None,
+    config: ModelConfig | Dict[str, Any] | None,
 ) -> Model:
     cfg = coerce_config(config)
     return Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
@@ -532,7 +540,7 @@ def load_model(
     checkpoint_path: str,
     in_dim: Optional[int] = None,
     out_shape: Optional[Sequence[int]] = None,
-    config: Config | Dict[str, Any] | None = None,
+    config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[str] = None,
 ) -> Model:
 

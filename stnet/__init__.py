@@ -4,10 +4,12 @@ from __future__ import annotations
 from typing import Any
 
 from . import architecture
+from .workflow import OpsConfig
 
 Model = architecture.Model
-Config = architecture.Config
-PatchParameters = architecture.PatchParameters
+ModelConfig = architecture.ModelConfig
+PatchConfig = architecture.PatchConfig
+BuildConfig = architecture.BuildConfig
 coerce_config = architecture.coerce_config
 SpatialSubnet = architecture.SpatialSubnet
 TemporalSubnet = architecture.TemporalSubnet
@@ -24,8 +26,10 @@ StudentsTLoss = architecture.StudentsTLoss
 DataFidelityLoss = architecture.DataFidelityLoss
 __all__ = [
     "Model",
-    "Config",
-    "PatchParameters",
+    "ModelConfig",
+    "PatchConfig",
+    "BuildConfig",
+    "OpsConfig",
     "coerce_config",
     "train",
     "predict",

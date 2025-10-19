@@ -12,7 +12,7 @@ from torch import nn
 
 
 @dataclass(frozen=True)
-class PatchParameters:
+class PatchConfig:
     is_square: bool = False
     patch_size_1d: int = 16
     grid_size_2d: Optional[Union[int, Tuple[int, int], List[int]]] = None
@@ -25,7 +25,7 @@ class PatchParameters:
 
 
 @dataclass
-class Config:
+class ModelConfig:
     device: Optional[torch.device | str] = None
     microbatch: int = 64
     dropout: float = 0.1
@@ -39,7 +39,7 @@ class Config:
     spatial_latent_tokens: int = 64
     temporal_latent_tokens: int = 64
     data_definition: str = "spatiotemporal"
-    patch: PatchParameters = field(default_factory=PatchParameters)
+    patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     use_compilation: bool = False
     compile_mode: str = "default"
@@ -51,37 +51,37 @@ from ..toolkit.optimization import TunedAMP, compile
 from .module import Meta, MetaNet, SpatioTemporalNet
 
 
-def _coerce_patch(value: Any) -> PatchParameters:
-    if isinstance(value, PatchParameters):
+def _coerce_patch(value: Any) -> PatchConfig:
+    if isinstance(value, PatchConfig):
         return value
     if value is None:
-        return PatchParameters()
+        return PatchConfig()
     if isinstance(value, dict):
-        allowed = set(inspect.signature(PatchParameters).parameters.keys())
+        allowed = set(inspect.signature(PatchConfig).parameters.keys())
         filtered = {k: v for k, v in value.items() if k in allowed}
-        return PatchParameters(**filtered)
+        return PatchConfig(**filtered)
     raise TypeError(
-        "patch configuration must be PatchParameters, dict, or None"
+        "patch configuration must be PatchConfig, dict, or None"
     )
 
 
 def coerce_config(
-    config: Config | Dict[str, Any] | None,
-) -> Config:
+    config: ModelConfig | Dict[str, Any] | None,
+) -> ModelConfig:
     if config is None:
-        return Config()
-    if isinstance(config, Config):
+        return ModelConfig()
+    if isinstance(config, ModelConfig):
         patch = _coerce_patch(getattr(config, "patch", None))
         if patch is getattr(config, "patch", None):
             return config
         return replace(config, patch=patch)
     if isinstance(config, dict):
-        allowed = set(inspect.signature(Config).parameters.keys())
+        allowed = set(inspect.signature(ModelConfig).parameters.keys())
         filtered = {k: v for k, v in config.items() if k in allowed}
         if "patch" in filtered:
             filtered["patch"] = _coerce_patch(filtered["patch"])
-        return Config(**filtered)
-    raise TypeError("config must be Config, dict, or None")
+        return ModelConfig(**filtered)
+    raise TypeError("config must be ModelConfig, dict, or None")
 
 _TORCH_COMPAT = patch_torch()
 
@@ -105,7 +105,7 @@ class Model(nn.Module):
         self,
         in_dim: int,
         out_shape: Sequence[int],
-        config: Config,
+        config: ModelConfig,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)

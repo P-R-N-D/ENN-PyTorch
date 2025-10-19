@@ -4,9 +4,9 @@
 This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level workflow API for model construction, training, inference, and export utilities. The workflow manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.architecture.network.Config` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer.
+- **Configurable architecture** – `stnet.architecture.network.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized.
 - **Data definition aliases** – `_normalize_data_definition` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+- **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). Configuration dataclasses (`ModelConfig`, `PatchConfig`) and runtime orchestration (`OpsConfig`) are available from the same namespace for ergonomic imports.
 - **Architecture utilities** – `stnet.architecture.module` houses reusable building blocks including `StochasticDepth`, `_norm`, `_stochastic_depth_scheduler`, and the model definitions so dependents import everything from a single entry point.
 
 ## Installation
@@ -43,7 +43,7 @@ Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message
 ```python
 import torch
 from stnet.workflow import (
-    Config,
+    ModelConfig,
     new_model,
     save_model,
     load_model,
@@ -52,7 +52,7 @@ from stnet.workflow import (
     to_script,
 )
 
-config = Config(data_definition="spatiotemporal", depth=64, heads=4)
+config = ModelConfig(data_definition="spatiotemporal", depth=64, heads=4)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
 features = torch.randn(32, model.in_dim)
