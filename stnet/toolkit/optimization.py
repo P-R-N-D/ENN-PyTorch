@@ -848,7 +848,7 @@ class TunedDPA(torch.nn.Module):
         return x
 
 
-class _GMSRFallback(nn.Module):
+class MSRCompat(nn.Module):
     def __init__(
         self, d_model: int, nhead: int, use_gate: bool = True
     ) -> None:
@@ -895,7 +895,7 @@ class _GMSRFallback(nn.Module):
             manual_flops += float(B * S * D)
             y = y * gate
         if manual_flops > 0.0 and _is_flop_tracking_active():
-            _FLOP_BUCKET.add("GMSR_Fallback", manual_flops)
+            _FLOP_BUCKET.add("MSRCompat", manual_flops)
         return self.o_proj(y)
 
 
@@ -922,7 +922,7 @@ class TunedMSR(nn.Module):
             self._ts_ok = True
         except Exception:
             self._ts_ok = False
-            self._fallback = _GMSRFallback(
+            self._fallback = MSRCompat(
                 self.d_model, self.nhead, use_gate=self.use_gate
             )
         self._rope_theta = 10000.0

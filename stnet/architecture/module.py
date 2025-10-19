@@ -174,7 +174,7 @@ class VarianceThreshold(_ScalerBase):
     def __init__(
         self, *args: Any, threshold: float = 0.0, unbiased: bool = True, **kwargs: Any
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.threshold = float(threshold)
         self.unbiased = bool(unbiased)
 
@@ -231,7 +231,7 @@ class StandardScaler(_ScalerBase):
         eps: float = 1e-08,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.with_mean = bool(with_mean)
         self.with_std = bool(with_std)
         self.eps = float(eps)
@@ -369,7 +369,7 @@ class IncrementalPCA(_ScalerBase):
         center: bool = True,
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
+        super().__init__(*args, **kwargs)
         self.n_components = int(n_components)
         self.method = str(method)
         self.center = bool(center)
