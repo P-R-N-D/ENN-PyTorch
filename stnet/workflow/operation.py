@@ -623,8 +623,6 @@ def epochs(
         val_frac=val_frac,
         prefetch_factor=prefetch_factor,
         non_blocking_copy=bool(overlap_h2d),
-        seed=seed,
-        shuffle=True,
         io_backend="auto",
     )
     train_steps = len(train_loader0)
@@ -791,8 +789,6 @@ def epochs(
             val_frac=val_frac,
             prefetch_factor=prefetch_factor,
             non_blocking_copy=bool(overlap_h2d),
-            seed=seed,
-            shuffle=True,
             io_backend="auto",
         )
         if restore_dl_state:
@@ -1317,8 +1313,6 @@ def infer(
         val_frac=0.0,
         prefetch_factor=prefetch_factor,
         non_blocking_copy=True,
-        seed=seed,
-        shuffle=False,
         io_backend="auto",
     )
     status_bar = _status_bar("Prediction", len(train_loader), device)
