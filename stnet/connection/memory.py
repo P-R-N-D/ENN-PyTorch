@@ -105,7 +105,7 @@ class SharedMemory:
     ) -> None:
         if shared_memory is None:
             raise RuntimeError(
-                "multiprocessing.shared_memory is not available on this platform"
+                "multiprocessing.shared_memory is not available on this system"
             )
         self._shm = shared_memory.SharedMemory(
             name=name, create=create, size=size
