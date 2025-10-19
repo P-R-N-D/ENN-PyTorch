@@ -106,8 +106,6 @@ class Model(nn.Module):
         in_dim: int,
         out_shape: Sequence[int],
         config: Config,
-        *args: Any,
-        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
