@@ -158,7 +158,13 @@ def _student_t_cdf_loc_scale(
 
 
 class _ScalerBase:
-    def __init__(self, *args: Any, device: str = "cpu", dtype: Any = torch.float64, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        device: str = "cpu",
+        dtype: Any = torch.float64,
+        **kwargs: Any,
+    ) -> None:
         self.device = torch.device(device)
         self.dtype = dtype
         self.reset()
@@ -172,9 +178,15 @@ class _ScalerBase:
 
 class VarianceThreshold(_ScalerBase):
     def __init__(
-        self, *args: Any, threshold: float = 0.0, unbiased: bool = True, **kwargs: Any
+        self,
+        threshold: float = 0.0,
+        unbiased: bool = True,
+        *args: Any,
+        device: str = "cpu",
+        dtype: Any = torch.float64,
+        **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(device=device, dtype=dtype)
         self.threshold = float(threshold)
         self.unbiased = bool(unbiased)
 
@@ -225,13 +237,15 @@ class VarianceThreshold(_ScalerBase):
 class StandardScaler(_ScalerBase):
     def __init__(
         self,
-        *args: Any,
         with_mean: bool = True,
         with_std: bool = True,
         eps: float = 1e-08,
+        *args: Any,
+        device: str = "cpu",
+        dtype: Any = torch.float64,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(device=device, dtype=dtype)
         self.with_mean = bool(with_mean)
         self.with_std = bool(with_std)
         self.eps = float(eps)
@@ -318,7 +332,12 @@ class StandardScaler(_ScalerBase):
 
     @torch.no_grad()
     def transform(
-        self, X: Tensor, *args: Any, clip: bool = False, clip_sigma: float | None = None, **kwargs: Any
+        self,
+        X: Tensor,
+        *args: Any,
+        clip: bool = False,
+        clip_sigma: float | None = None,
+        **kwargs: Any,
     ) -> Tensor:
         if self.mean_ is None or self.scale_ is None:
             raise RuntimeError("Call finalize() before transform().")
@@ -364,12 +383,14 @@ class IncrementalPCA(_ScalerBase):
     def __init__(
         self,
         n_components: int,
-        *args: Any,
         method: str = "cov",
         center: bool = True,
+        *args: Any,
+        device: str = "cpu",
+        dtype: Any = torch.float64,
         **kwargs: Any,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(device=device, dtype=dtype)
         self.n_components = int(n_components)
         self.method = str(method)
         self.center = bool(center)
@@ -1970,7 +1991,7 @@ class MetaNet(nn.Module):
 
 class SpatioTemporalNet(nn.Module):
     def __init__(
-        self, in_dim: int, out_shape: Sequence[int], config: Config, *args: Any, **kwargs: Any
+        self, in_dim: int, out_shape: Sequence[int], config: Config
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
