@@ -39,7 +39,7 @@ from torchdata.nodes import (
 from torch.distributed import distributed_c10d
 
 from ..connection.socket import Endpoint
-from ..toolkit.capability import apply_threading_defaults, get_world_size
+from ..toolkit.capability import get_world_size, optimize_threads
 from ..toolkit.compat import has_arrow_flight, patch_arrow
 _ARROW = patch_arrow()
 
@@ -1008,7 +1008,7 @@ def dataloader(
         backend = "flight" if has_arrow_flight() else "local"
     else:
         backend = backend_normalized
-    threads = apply_threading_defaults()
+    threads = optimize_threads()
     map_fn = partial(
         fetch,
         labels_dtype=labels_dtype,

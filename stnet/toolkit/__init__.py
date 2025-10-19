@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from .capability import get_device, get_runtime_config, resolve_sdpa_backends
+from .capability import (
+    get_device,
+    get_runtime_config,
+    initialize_sdpa_backends,
+)
 from .compat import SDPBackend, TorchCompat, _to_sdpa_backends, patch_torch, sdpa_kernel
 from .optimization import (
     TunedAMP,
@@ -30,7 +34,7 @@ __all__ = [
     "FlopCounter",
     "get_device",
     "get_runtime_config",
-    "resolve_sdpa_backends",
+    "initialize_sdpa_backends",
     "patch_torch",
     "TorchCompat",
     "SDPBackend",

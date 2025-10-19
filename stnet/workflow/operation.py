@@ -48,17 +48,17 @@ from ..architecture.network import Model, ModelConfig, coerce_config
 from ..pipeline.collate import dataloader, postprocess, preprocess, to_tensor
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
-    apply_threading_defaults,
     get_available_addr,
     get_device,
+    get_world_size,
     initialize_python_path,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
     new_dir,
     optimal_procs,
     optimal_start_method,
+    optimize_threads,
     set_multiprocessing_env,
-    get_world_size,
 )
 from ..toolkit.optimization import (
     TunedAMP,
@@ -221,26 +221,28 @@ def dl_state_path(directory: str) -> str:
 
 
 def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
-    is_main = True
+    if not only_main_rank:
+        warnings.warn(msg)
+        return
     try:
-        is_main = (
-            torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
-        )
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return
     except Exception:
         pass
-    if (not only_main_rank) or is_main:
-        warnings.warn(msg)
+    warnings.warn(msg)
 
 
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
-        keys = list(state.keys())
+        keys = []
+        for key in state.keys():
+            s = str(key)
+            if s.endswith("._extra_state") or s.endswith("_extra_state"):
+                keys.append(key)
     except (AttributeError, TypeError):
         return state
-    for k in list(keys):
-        s = str(k)
-        if s.endswith("._extra_state") or s.endswith("_extra_state"):
-            state.pop(k, None)
+    for key in keys:
+        state.pop(key, None)
     return state
 
 
@@ -287,18 +289,21 @@ def _canonical_dtype(x: torch.dtype | str) -> str:
 
 
 def _size(dtype: torch.dtype | str) -> int:
-    n = _canonical_dtype(dtype)
-    if n not in _SIZEOF:
-        raise TypeError(f"unsupported dtype: {dtype}")
-    return _SIZEOF[n]
+    try:
+        return _SIZEOF[_canonical_dtype(dtype)]
+    except KeyError as exc:
+        raise TypeError(f"unsupported dtype: {dtype}") from exc
 
 
 def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
+    device_label = dev.type.upper()
     return tqdm(
         total=total,
-        desc=f"{activity} ({dev.type.upper()})",
+        desc=f"{activity} ({device_label})",
         unit="0.00 MB/s, 0.00 TFLOPS",
-        bar_format="{desc}{bar} {percentage:3.0f}% ({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
+        bar_format=(
+            "{desc}{bar} {percentage:3.0f}% ({unit}) Elapsed: {elapsed}, Remaining: {remaining}"
+        ),
         colour="green",
         position=0,
         leave=False,
@@ -318,18 +323,19 @@ def _set_backend(device: torch.device) -> None:
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
-    elif device.type == "xpu":
+        return
+    if device.type == "xpu":
         torch.xpu.set_device(rank)
-    else:
-        try:
-            import netifaces
+        return
+    try:
+        import netifaces
 
-            gws = netifaces.gateways()
-            inet = gws["default"][netifaces.AF_INET][1]
-            os.environ["GLOO_SOCKET_IFNAME"] = inet
-            os.environ["TP_SOCKET_IFNAME"] = inet
-        except (ImportError, KeyError, OSError):
-            pass
+        gws = netifaces.gateways()
+        inet = gws["default"][netifaces.AF_INET][1]
+        os.environ["GLOO_SOCKET_IFNAME"] = inet
+        os.environ["TP_SOCKET_IFNAME"] = inet
+    except (ImportError, KeyError, OSError):
+        pass
 
 
 def _meta(memmap_dir: str) -> Dict[str, Any]:
@@ -431,7 +437,7 @@ def train(
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
     rdzv_endpoint = get_available_addr(rdzv_endpoint)
-    apply_threading_defaults()
+    optimize_threads()
     nprocs = optimal_procs()["nproc_per_node"]
     cfg_obj = getattr(model, "_Model__config", None)
     cfg_dict: Dict[str, Any] = (
