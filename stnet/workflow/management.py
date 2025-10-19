@@ -36,6 +36,12 @@ def _require(module: str, pip_hint: str | None = None) -> None:
         raise MissingDependencyError(f"{module} is required for this operation{hint}") from err
 
 
+def _to_cpu_if_tensor(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu")
+    return value
+
+
 def _run_cmd(cmd: Sequence[str], desc: str) -> None:
     try:
         subprocess.run(list(cmd), check=True)
@@ -131,10 +137,7 @@ class TorchIO:
             from safetensors.torch import save_file as save_tensors
 
             sd = model.state_dict()
-            cpu_sd = {
-                k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
-                for k, v in sd.items()
-            }
+            cpu_sd = {k: _to_cpu_if_tensor(v) for k, v in sd.items()}
             save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
             cfg_obj = getattr(model, "_Model__config", None)
             cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
