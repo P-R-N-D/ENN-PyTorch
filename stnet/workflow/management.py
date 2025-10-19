@@ -131,7 +131,11 @@ class TorchIO:
             from safetensors.torch import save_file as save_tensors
 
             sd = model.state_dict()
-            save_tensors(sd, str(p), metadata={"format": "safetensors-v1"})
+            cpu_sd = {
+                k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+                for k, v in sd.items()
+            }
+            save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
             cfg_obj = getattr(model, "_Model__config", None)
             cfg_dict = asdict(cfg_obj) if isinstance(cfg_obj, Config) else asdict(Config())
             meta = {
