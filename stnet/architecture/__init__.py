@@ -24,14 +24,15 @@ from .module import (
     _norm,
     _stochastic_depth_scheduler,
 )
-from .network import Config, Model, PatchParameters, coerce_config
+from .network import Model, ModelConfig, PatchConfig, coerce_config
 
 __all__ = [
     "sdpa_kernel",
     "SDPBackend",
     "Model",
-    "Config",
-    "PatchParameters",
+    "ModelConfig",
+    "PatchConfig",
+    "BuildConfig",
     "coerce_config",
     "SpatialSubnet",
     "TemporalSubnet",
@@ -52,3 +53,4 @@ __all__ = [
 ]
 ZLoss: TypeAlias = StandardNormalLoss
 TLoss: TypeAlias = StudentsTLoss
+BuildConfig: TypeAlias = ModelConfig

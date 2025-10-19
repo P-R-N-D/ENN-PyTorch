@@ -61,7 +61,7 @@ def _stochastic_depth_scheduler(max_rate: float, depth: int) -> list[float]:
 
 _TORCH_COMPAT = patch_torch()
 if TYPE_CHECKING:
-    from .network import Config
+    from .network import ModelConfig
 
 
 def _canon_dims(
@@ -1991,7 +1991,7 @@ class MetaNet(nn.Module):
 
 class SpatioTemporalNet(nn.Module):
     def __init__(
-        self, in_dim: int, out_shape: Sequence[int], config: Config
+        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)

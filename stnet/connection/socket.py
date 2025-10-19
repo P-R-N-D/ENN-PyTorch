@@ -5,11 +5,20 @@ import os
 import socket
 import threading
 import time
-from typing import Any, Iterator, Tuple
+from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import get_available_addr
 from ..toolkit.compat import patch_arrow
+
+
+if TYPE_CHECKING:
+    from ..pipeline.dataset import MemoryMappedTensorStream
+
+
+def _memory_mapped_tensor_stream() -> type["MemoryMappedTensorStream"]:
+    from ..pipeline.dataset import MemoryMappedTensorStream
+
+    return MemoryMappedTensorStream
 
 
 _ARROW = patch_arrow()
@@ -309,7 +318,7 @@ class Endpoint:
     def reg_mmt_dataset(
         server: Endpoint.Server,
         name: str,
-        mmts: MemoryMappedTensorStream,
+        mmts: "MemoryMappedTensorStream",
         batch_size: int,
         split: str,
     ) -> None:
@@ -321,10 +330,11 @@ class Endpoint:
 
         def _batches() -> Iterator[pa.RecordBatch]:
             index = start
+            mmts_cls = _memory_mapped_tensor_stream()
             while index < end:
                 nxt = min(index + int(batch_size), end)
                 xb, yb = mmts.batch_range(index, nxt)
-                yield MemoryMappedTensorStream.to_record_batch(xb, yb)
+                yield mmts_cls.to_record_batch(xb, yb)
                 index = nxt
 
         generator = _batches()

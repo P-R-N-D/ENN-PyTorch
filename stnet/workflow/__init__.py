@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..architecture.network import Config, PatchParameters
+from ..architecture.network import ModelConfig, PatchConfig
+from .operation import OpsConfig
 
 
 def new_model(*args: Any, **kwargs: Any) -> Any:
@@ -42,8 +43,9 @@ def predict(*args: Any, **kwargs: Any) -> Any:
 
 
 __all__ = [
-    "Config",
-    "PatchParameters",
+    "ModelConfig",
+    "PatchConfig",
+    "OpsConfig",
     "new_model",
     "load_model",
     "save_model",
