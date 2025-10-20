@@ -18,7 +18,7 @@ from .config import (
     model_config,
     patch_config,
 )
-from .module import GlobalEncoder, LocalProcessor, Meta
+from .module import GlobalEncoder, LocalProcessor, Payload
 
 
 _TORCH_COMPAT = patch_torch()
@@ -87,7 +87,7 @@ class Model(nn.Module):
             mlp_ratio=float(getattr(config, "mlp_ratio", 4.0)),
             dropout=float(getattr(config, "dropout", 0.0)),
             drop_path=float(getattr(config, "drop_path", 0.0)),
-            norm_type=str(getattr(config, "normalize_method", "layernorm")),
+            norm_type=str(getattr(config, "normalization_method", "layernorm")),
         ).to(self._device)
         self.global_net = global_net
         self.microbatch = int(config.microbatch)
@@ -104,8 +104,8 @@ class Model(nn.Module):
         except Exception:
             pass
         mode = str(getattr(config, "compile_mode", "default"))
-        use_compilation = bool(getattr(config, "use_compilation", False))
-        if use_compilation:
+        enable_compilation = bool(getattr(config, "enable_compilation", False))
+        if enable_compilation:
             try:
                 self.local_net = compile(
                     self.local_net,
@@ -370,7 +370,7 @@ class Model(nn.Module):
                     device, dtype=base_dtype, non_blocking=True
                 )
                 with TunedAMP.float(device):
-                    out: Meta = self.local_net(x_slice)
+                    out: Payload = self.local_net(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
         else:
