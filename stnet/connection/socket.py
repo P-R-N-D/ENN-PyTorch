@@ -13,13 +13,13 @@ from ..toolkit.compat import patch_arrow
 
 
 if TYPE_CHECKING:
-    from ..pipeline.dataset import MemoryMappedTensorStream
+    from ..pipeline.dataset import SampleReader
 
 
-def _memory_mapped_tensor_stream() -> type["MemoryMappedTensorStream"]:
-    from ..pipeline.dataset import MemoryMappedTensorStream
+def _memory_mapped_tensor_stream() -> type["SampleReader"]:
+    from ..pipeline.dataset import SampleReader
 
-    return MemoryMappedTensorStream
+    return SampleReader
 
 
 _ARROW = patch_arrow()
@@ -318,7 +318,7 @@ class Endpoint:
     def reg_mmt_dataset(
         server: Endpoint.Server,
         name: str,
-        mmts: "MemoryMappedTensorStream",
+        mmts: "SampleReader",
         batch_size: int,
         split: str,
     ) -> None:

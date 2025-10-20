@@ -30,7 +30,7 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
-class MemoryMappedTensorStream:
+class SampleReader:
     def __init__(
         self,
         memmap_dir: str,
@@ -55,7 +55,7 @@ class MemoryMappedTensorStream:
         batch_size: int = 1,
         val_frac: Optional[float] = None,
         **kwargs: Any,
-    ) -> MemoryMappedTensorStream:
+    ) -> SampleReader:
         return cls(
             memmap_dir,
             split=split,
@@ -235,10 +235,10 @@ class MemoryMappedTensorStream:
         )
 
 
-class BatchStream:
+class BatchReader:
     def __init__(
         self,
-        mmts: MemoryMappedTensorStream,
+        mmts: SampleReader,
         start: int,
         end: int,
         batch_size: int,
@@ -263,7 +263,7 @@ class BatchStream:
         return int(math.ceil(span / float(self._batch)))
 
 
-class Batch(IterableWrapper):
+class BatchSampler(IterableWrapper):
     def __init__(
         self,
         memmap_dir: str,

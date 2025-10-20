@@ -20,6 +20,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
     Union,
 )
@@ -192,7 +193,15 @@ def to_dtype(src: Any, platform: str) -> Any:
     return mapping[normalized]
 
 
-def get_node_length(node: Any) -> Any:
+def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
+    if node is None:
+        return 1
+    if _seen is None:
+        _seen = set()
+    obj_id = id(node)
+    if obj_id in _seen:
+        return 1
+    _seen.add(obj_id)
     try:
         n = len(node)
         if isinstance(n, int) and n >= 0:
@@ -243,7 +252,7 @@ def get_node_length(node: Any) -> Any:
         upstream = getattr(node, name, None)
         if upstream is not None:
             try:
-                length = get_node_length(upstream)
+                length = get_node_length(upstream, _seen)
                 if isinstance(length, int) and length >= 0:
                     return length
             except Exception:
@@ -486,7 +495,7 @@ def _new_flight(split: str, name: str, uri: str) -> Tuple[str, str]:
     return (published_name, published_uri)
 
 
-class H2DController(Iterator[Any]):
+class DevicePrefetcher(Iterator[Any]):
     def __init__(
         self,
         iterable: Iterable[Any],
@@ -709,7 +718,7 @@ class H2DController(Iterator[Any]):
             slot = self._rr % self._slots
             self._enqueue(batch, slot)
 
-    def __iter__(self) -> H2DController:
+    def __iter__(self) -> DevicePrefetcher:
         return self
 
     def __next__(self) -> Any:
@@ -844,9 +853,9 @@ class DataLoader:
         self._non_blocking = bool(non_blocking)
         base = Loader(self._node)
         dev_t = getattr(self._device, "type", "cpu")
-        if dev_t in ("cuda", "mps", "xpu") and H2DController is not None:
+        if dev_t in ("cuda", "mps", "xpu") and DevicePrefetcher is not None:
             try:
-                self._iterable = H2DController(
+                self._iterable = DevicePrefetcher(
                     base, device=self._device, depth=self._prefetch_factor
                 )
             except TypeError:
@@ -914,35 +923,6 @@ class _Keep:
                     obj()
 
 
-def to_batch(
-    batch: Mapping[str, Any],
-    *args: Any,
-    labels_dtype: Optional[torch.dtype] = None,
-    sanitize: bool = False,
-    flatten_features: bool = False,
-    **kwargs: Any,
-) -> Dict[str, Any]:
-    features = batch["X"]
-    labels = batch["Y"]
-    if (
-        flatten_features
-        and isinstance(features, torch.Tensor)
-        and (features.dim() >= 2)
-    ):
-        features = features.flatten(start_dim=1)
-    labels_tensor = to_tensor(labels)
-    if (
-        labels_dtype is not None
-        and getattr(labels_tensor, "dtype", None) != labels_dtype
-    ):
-        labels_tensor = labels_tensor.to(dtype=labels_dtype)
-    if sanitize and torch.is_floating_point(labels_tensor):
-        labels_tensor = torch.nan_to_num(
-            labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
-        )
-    return {"X": features, "Y": labels_tensor}
-
-
 def to_tensor(obj: Any) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
         return obj
@@ -961,22 +941,35 @@ def fetch(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Any:
+    def _to_batch(batch: Mapping[str, Any]) -> Dict[str, Any]:
+        features = batch["X"]
+        labels = batch["Y"]
+        if (
+            flatten_features
+            and isinstance(features, torch.Tensor)
+            and (features.dim() >= 2)
+        ):
+            features = features.flatten(start_dim=1)
+        labels_tensor = to_tensor(labels)
+        if (
+            labels_dtype is not None
+            and getattr(labels_tensor, "dtype", None) != labels_dtype
+        ):
+            labels_tensor = labels_tensor.to(dtype=labels_dtype)
+        if sanitize and torch.is_floating_point(labels_tensor):
+            labels_tensor = torch.nan_to_num(
+                labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
+            )
+        return {"X": features, "Y": labels_tensor}
+
     if isinstance(sample, (list, tuple)):
         return [
-            to_batch(
-                item,
-                labels_dtype=labels_dtype,
-                sanitize=sanitize,
-                flatten_features=flatten_features,
-            )
+            _to_batch(item) if isinstance(item, Mapping) else item
             for item in sample
         ]
-    return to_batch(
-        sample,
-        labels_dtype=labels_dtype,
-        sanitize=sanitize,
-        flatten_features=flatten_features,
-    )
+    if isinstance(sample, Mapping):
+        return _to_batch(sample)
+    return sample
 
 
 def dataloader(
@@ -1016,7 +1009,7 @@ def dataloader(
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
-    from .dataset import BatchStream, MemoryMappedTensorStream
+    from .dataset import BatchReader, SampleReader
 
     def _wrap_node(node: IterableWrapper) -> DataLoader:
         wrapped: Any = ParallelMapper(
@@ -1039,7 +1032,7 @@ def dataloader(
         )
 
     def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
-        reader_tr = MemoryMappedTensorStream.from_dir(
+        reader_tr = SampleReader.from_dir(
             memmap_dir,
             split="train",
             batch_size=int(batch_size),
@@ -1054,12 +1047,12 @@ def dataloader(
             train_end = total
         keep = _Keep(reader_tr)
         node_tr = IterableWrapper(
-            BatchStream(reader_tr, train_start, train_end, int(batch_size))
+            BatchReader(reader_tr, train_start, train_end, int(batch_size))
         )
         train_loader = _wrap_node(node_tr)
         val_loader: Optional[Any] = None
         if val_frac > 0 and train_end < total:
-            reader_vl = MemoryMappedTensorStream.from_dir(
+            reader_vl = SampleReader.from_dir(
                 memmap_dir,
                 split="val",
                 batch_size=int(batch_size),
@@ -1072,7 +1065,7 @@ def dataloader(
             if val_end <= val_start:
                 val_end = total
             node_vl = IterableWrapper(
-                BatchStream(reader_vl, val_start, val_end, int(batch_size))
+                BatchReader(reader_vl, val_start, val_end, int(batch_size))
             )
             val_loader = _wrap_node(node_vl)
         return (train_loader, val_loader, keep)
@@ -1081,14 +1074,14 @@ def dataloader(
         rank, local_rank, _, is_ddp = _world_info()
         name_train = Endpoint.resource_key(memmap_dir, "train")
         name_val = Endpoint.resource_key(memmap_dir, "val")
-        reader_tr = MemoryMappedTensorStream.from_dir(
+        reader_tr = SampleReader.from_dir(
             memmap_dir,
             split="train",
             batch_size=int(batch_size),
             val_frac=val_frac,
         )
         reader_vl = (
-            MemoryMappedTensorStream.from_dir(
+            SampleReader.from_dir(
                 memmap_dir,
                 split="val",
                 batch_size=int(batch_size),
