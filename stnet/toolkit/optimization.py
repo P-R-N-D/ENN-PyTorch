@@ -142,9 +142,14 @@ class _FlopProfiler:
         self._manual_total = 0.0
         self._manual_by_type.clear()
 
-    def consume_manual(self) -> float:
+    def consume_manual_breakdown(self) -> Tuple[float, Dict[str, float]]:
         total = float(self._manual_total)
+        breakdown = {k: float(v) for k, v in self._manual_by_type.items()}
         self.reset_manual()
+        return (total, breakdown)
+
+    def consume_manual(self) -> float:
+        total, _ = self.consume_manual_breakdown()
         return total
 
     def add_manual(self, typ: str, value: float) -> None:
@@ -397,6 +402,7 @@ class _FlopProfiler:
         class _StepScope(contextlib.AbstractContextManager):
             def __init__(self) -> None:
                 self.manual_total = 0.0
+                self.manual_breakdown: Dict[str, float] = {}
                 self.torch_total = 0.0
                 self.nvtx_total = 0.0
                 self.total = 0.0
@@ -412,10 +418,11 @@ class _FlopProfiler:
                 return self
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-                manual = instrumentation.consume_manual()
+                manual, breakdown = instrumentation.consume_manual_breakdown()
                 if manual > 0.0:
                     instrumentation.record_nvtx_soft(manual)
                 self.manual_total = manual
+                self.manual_breakdown = breakdown
                 if self._torch_scope is not None:
                     self._torch_scope.__exit__(exc_type, exc, tb)
                     try:
@@ -433,6 +440,9 @@ class _FlopProfiler:
 
             def get_total_flops(self) -> float:
                 return float(self.total)
+
+            def get_manual_breakdown(self) -> Dict[str, float]:
+                return dict(self.manual_breakdown)
 
         return _StepScope()
 
@@ -907,7 +917,7 @@ class MSRCompat(nn.Module):
             manual_flops += float(B * S * D)
             y = y * gate
         if manual_flops > 0.0:
-            FLOP_PROFILER.add_manual("MSRCompat", manual_flops)
+            FLOP_PROFILER.add_manual("Retention", manual_flops)
         return self.o_proj(y)
 
 

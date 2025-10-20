@@ -177,18 +177,98 @@ def _size(dtype: torch.dtype | str) -> int:
 
 def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
     device_label = dev.type.upper()
-    return tqdm(
+    bar = tqdm(
         total=total,
         desc=f"{activity} ({device_label})",
-        unit="0.00 MB/s, 0.00 TFLOPS",
+        unit="step",
         bar_format=(
-            "{desc}{bar} {percentage:3.0f}% ({unit}) Elapsed: {elapsed}, Remaining: {remaining}"
+            "{desc}{bar} {percentage:3.0f}% {postfix} Elapsed: {elapsed}, Remaining: {remaining}"
         ),
         colour="green",
         position=0,
         leave=False,
         file=sys.stdout,
     )
+    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=False)
+    return bar
+
+
+def _loader_length(loader: Any) -> int:
+    if loader is None:
+        return 0
+    try:
+        length = len(loader)
+    except Exception:
+        return 0
+    if isinstance(length, int) and length >= 0:
+        return length
+    try:
+        return int(length)
+    except Exception:
+        return 0
+
+
+def _format_metrics_postfix(
+    mbps: float,
+    tflops: float,
+    *,
+    comp_elapsed: Optional[float] = None,
+    flop_breakdown: Optional[Dict[str, float]] = None,
+) -> str:
+    postfix = f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS"
+    if comp_elapsed is None or not flop_breakdown:
+        return postfix
+    manual_total = 0.0
+    attn_total = 0.0
+    ret_total = 0.0
+    for name, value in flop_breakdown.items():
+        try:
+            fv = float(value)
+        except Exception:
+            continue
+        if fv <= 0.0:
+            continue
+        manual_total += fv
+        if name == "Attention":
+            attn_total += fv
+        if name in {"Retention", "MSRCompat"}:
+            ret_total += fv
+    if manual_total <= 0.0:
+        return postfix
+    attn_pct = (attn_total / manual_total) * 100.0 if attn_total > 0.0 else 0.0
+    ret_pct = (ret_total / manual_total) * 100.0 if ret_total > 0.0 else 0.0
+    comp_sec = max(float(comp_elapsed), 1e-06)
+    attn_rate = attn_total / comp_sec / 1_000_000_000_000.0
+    ret_rate = ret_total / comp_sec / 1_000_000_000_000.0
+    postfix += (
+        f" | Attn {attn_pct:.0f}%/{attn_rate:.2f}T | Ret {ret_pct:.0f}%/{ret_rate:.2f}T"
+    )
+    return postfix
+
+
+def _advance_status_bar(
+    status_bar: Optional[tqdm],
+    increment: int,
+    mbps: float,
+    tflops: float,
+    *,
+    comp_elapsed: Optional[float] = None,
+    flop_breakdown: Optional[Dict[str, float]] = None,
+) -> None:
+    if status_bar is None or increment <= 0:
+        return
+    target_total = status_bar.n + increment
+    current_total = status_bar.total or 0
+    if target_total > current_total:
+        status_bar.total = target_total
+    postfix = _format_metrics_postfix(
+        mbps,
+        tflops,
+        comp_elapsed=comp_elapsed,
+        flop_breakdown=flop_breakdown,
+    )
+    status_bar.set_postfix_str(postfix, refresh=False)
+    status_bar.update(increment)
 
 
 def _backend_type(device: torch.device) -> str:
@@ -498,7 +578,19 @@ def main_train(*args: Any) -> Optional[Model]:
 
     device = get_device()
     _set_backend(device)
-    torch.distributed.init_process_group(backend=_backend_type(device))
+    backend = _backend_type(device)
+    init_kwargs: Dict[str, Any] = {"backend": backend}
+    if backend in {"nccl", "xccl"}:
+        device_id: Optional[int] = None
+        if device.type == "cuda":
+            with contextlib.suppress(Exception):
+                device_id = int(torch.cuda.current_device())
+        elif device.type == "xpu":
+            with contextlib.suppress(Exception):
+                device_id = int(torch.xpu.current_device())
+        if device_id is not None:
+            init_kwargs["device_ids"] = [device_id]
+    torch.distributed.init_process_group(**init_kwargs)
     if device.type == "cuda":
         torch.cuda.empty_cache()
     cfg = coerce_model_config(
@@ -732,7 +824,8 @@ def main_train(*args: Any) -> Optional[Model]:
         non_blocking_copy=bool(ops.overlap_h2d),
         io_backend="auto",
     )
-    for _step_idx, _raw in enumerate(train_loader0):
+    train_step_count = 0
+    for train_step_count, _raw in enumerate(train_loader0, start=1):
         _feat0, _label0, *_ = preprocess(_raw)
         if hasattr(model, "update_x_stats"):
             with contextlib.suppress(Exception):
@@ -789,8 +882,10 @@ def main_train(*args: Any) -> Optional[Model]:
         reduction="mean",
     )
     loss_controller = LossWeightController()
-    train_steps = len(train_loader0)
-    val_steps = len(val_loader0) if val_loader0 is not None else 0
+    train_steps = _loader_length(train_loader0)
+    if train_step_count > 0:
+        train_steps = max(train_steps, train_step_count)
+    val_steps = _loader_length(val_loader0)
     steps_per_epoch = max(1, train_steps + val_steps)
     total_steps = ops.epochs * steps_per_epoch
     if ops.warmup_ratio > 0.0:
@@ -864,6 +959,7 @@ def main_train(*args: Any) -> Optional[Model]:
                 with contextlib.suppress(Exception):
                     val_loader.load_state_dict(state_val)
             restore_dl_state = False
+        flop_breakdown_epoch: Dict[str, float] = {}
         io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
         io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -886,6 +982,7 @@ def main_train(*args: Any) -> Optional[Model]:
             comp_time,
             io_bytes,
             flops,
+            flop_breakdown_epoch,
         )
         if val_loader is not None:
             test(
@@ -902,6 +999,7 @@ def main_train(*args: Any) -> Optional[Model]:
                 comp_time,
                 io_bytes,
                 flops,
+                flop_breakdown_epoch,
             )
         if keep is not None:
             keep.cleanup()
@@ -915,11 +1013,37 @@ def main_train(*args: Any) -> Optional[Model]:
         io_time /= world
         flops /= world
         io_bytes /= world
+        aggregated_breakdown: Dict[str, float]
+        if torch.distributed.is_initialized():
+            gathered: List[Dict[str, float]] = [dict() for _ in range(world)]
+            torch.distributed.all_gather_object(gathered, flop_breakdown_epoch)
+            merged: Dict[str, float] = {}
+            for entry in gathered:
+                if not isinstance(entry, dict):
+                    continue
+                for key, value in entry.items():
+                    try:
+                        merged[key] = merged.get(key, 0.0) + float(value)
+                    except Exception:
+                        continue
+            aggregated_breakdown = merged
+        else:
+            aggregated_breakdown = dict(flop_breakdown_epoch)
+        if world > 0:
+            aggregated_breakdown = {
+                key: value / world for key, value in aggregated_breakdown.items()
+            }
         if local_rank == 0 and status_bar is not None:
             mbps = float(io_bytes / io_time.clamp_min(1e-06) / 1_000_000.0)
             tflops = float(flops / comp_time.clamp_min(1e-06) / 1_000_000_000_000.0)
-            status_bar.unit = f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS"
-            status_bar.refresh()
+            comp_elapsed_mean = float(comp_time.item())
+            postfix = _format_metrics_postfix(
+                mbps,
+                tflops,
+                comp_elapsed=comp_elapsed_mean,
+                flop_breakdown=aggregated_breakdown,
+            )
+            status_bar.set_postfix_str(postfix, refresh=True)
     if local_rank == 0:
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=pattern_to_ignore)
@@ -1056,6 +1180,7 @@ def learn(
     comp_time: torch.Tensor,
     io_bytes: torch.Tensor,
     flops: torch.Tensor,
+    flop_breakdown: Dict[str, float],
 ) -> None:
     flop_counter_train = FlopCounter(model, mode="train", device=device)
     use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
@@ -1154,6 +1279,17 @@ def learn(
                 flops += torch.tensor(
                     train_step_flops, device=device, dtype=torch.float64
                 )
+                breakdown_getter = getattr(
+                    train_counter, "get_manual_breakdown", None
+                )
+                if callable(breakdown_getter):
+                    for name, value in breakdown_getter().items():
+                        try:
+                            flop_breakdown[name] = flop_breakdown.get(name, 0.0) + float(
+                                value
+                            )
+                        except Exception:
+                            continue
                 if should_sync:
                     scaler.step(optimizer)
                     scaler.update()
@@ -1168,8 +1304,14 @@ def learn(
                     tflops_cur = (
                         flop_total / max(comp_elapsed, 1e-06) / 1_000_000_000_000.0
                     )
-                    status_bar.unit = f"{mbps_cur:.2f} MB/s, {tflops_cur:.2f} TFLOPS"
-                    status_bar.update(1)
+                    _advance_status_bar(
+                        status_bar,
+                        1,
+                        mbps_cur,
+                        tflops_cur,
+                        comp_elapsed=comp_elapsed,
+                        flop_breakdown=flop_breakdown,
+                    )
                 t_fetch_start = time.perf_counter_ns()
 
 
@@ -1187,6 +1329,7 @@ def test(
     comp_time: torch.Tensor,
     io_bytes: torch.Tensor,
     flops: torch.Tensor,
+    flop_breakdown: Dict[str, float],
 ) -> None:
     if val_loader is None:
         return
@@ -1279,19 +1422,37 @@ def test(
                     flops += torch.tensor(
                         max(0.0, v_step_flops), device=device, dtype=torch.float64
                     )
+                    breakdown_getter = getattr(
+                        val_counter, "get_manual_breakdown", None
+                    )
+                    if callable(breakdown_getter):
+                        for name, value in breakdown_getter().items():
+                            try:
+                                flop_breakdown[name] = flop_breakdown.get(name, 0.0) + float(
+                                    value
+                                )
+                            except Exception:
+                                continue
                     if status_bar is not None:
                         io_elapsed = float(io_time.item())
                         io_transferred = float(io_bytes.item())
                         comp_elapsed = float(comp_time.item())
                         flop_total = float(flops.item())
-                        mbps_cur = io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
+                        mbps_cur = (
+                            io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
+                        )
                         tflops_cur = (
-                            flop_total / max(comp_elapsed, 1e-06) / 1_000_000_000_000.0
+                            flop_total / max(comp_elapsed, 1e-06)
+                            / 1_000_000_000_000.0
                         )
-                        status_bar.unit = (
-                            f"{mbps_cur:.2f} MB/s, {tflops_cur:.2f} TFLOPS"
+                        _advance_status_bar(
+                            status_bar,
+                            1,
+                            mbps_cur,
+                            tflops_cur,
+                            comp_elapsed=comp_elapsed,
+                            flop_breakdown=flop_breakdown,
                         )
-                        status_bar.update(1)
                     t_fetch_start = time.perf_counter_ns()
 
 
@@ -1386,8 +1547,7 @@ def infer(
             total_flops += max(0.0, step_flops)
             mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
             tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-            status_bar.unit = f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS"
-            status_bar.update(1)
+            _advance_status_bar(status_bar, 1, mbps, tflops)
             t_fetch_start = time.perf_counter_ns()
     with contextlib.suppress(Exception):
         status_bar.close()
