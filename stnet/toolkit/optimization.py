@@ -121,7 +121,7 @@ def joining(*joinables: Optional[object]) -> AbstractContextManager[None]:
 _LOGGER = logging.getLogger(__name__)
 
 
-class _FlopInstrumentation:
+class _FlopProfiler:
     def __init__(self) -> None:
         self._manual_total = 0.0
         self._manual_by_type: Dict[str, float] = {}
@@ -473,7 +473,7 @@ class _FlopInstrumentation:
         return total
 
 
-FLOP_INSTRUMENTATION = _FlopInstrumentation()
+FLOP_PROFILER = _FlopProfiler()
 
 
 @dataclass
@@ -574,20 +574,20 @@ class FlopCounter:
         return self._device
 
     def __enter__(self) -> FlopCounter:
-        self._handles = FLOP_INSTRUMENTATION.start_hooks(
+        self._handles = FLOP_PROFILER.start_hooks(
             self._model,
             mode=self._mode,
             bwd_factor=self._bwd_factor,
             include_bias=self._include_bias,
         )
         self._hook_count = len(self._handles)
-        FLOP_INSTRUMENTATION.reset_manual()
+        FLOP_PROFILER.reset_manual()
         self._active = True
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         if self._active:
-            FLOP_INSTRUMENTATION.stop_hooks(self._handles)
+            FLOP_PROFILER.stop_hooks(self._handles)
             self._handles = []
             self._active = False
         return False
@@ -597,7 +597,7 @@ class FlopCounter:
             raise RuntimeError(
                 "FlopCounter hooks are not active. Use `with FlopCounter(...)` before measuring FLOPs."
             )
-        return FLOP_INSTRUMENTATION.step_scope(self._device, display=display)
+        return FLOP_PROFILER.step_scope(self._device, display=display)
 
     @property
     def hook_count(self) -> int:
@@ -613,7 +613,7 @@ def attention_flops_bshd(
     include_softmax_scale_dropout: bool = True,
     **kwargs: Any,
 ) -> float:
-    return FLOP_INSTRUMENTATION.attention_flops_bshd(
+    return FLOP_PROFILER.attention_flops_bshd(
         q,
         *args,
         bwd_factor=bwd_factor,
@@ -908,7 +908,7 @@ class MSRCompat(nn.Module):
             manual_flops += float(B * S * D)
             y = y * gate
         if manual_flops > 0.0:
-            FLOP_INSTRUMENTATION.add_manual("MSRCompat", manual_flops)
+            FLOP_PROFILER.add_manual("MSRCompat", manual_flops)
         return self.o_proj(y)
 
 

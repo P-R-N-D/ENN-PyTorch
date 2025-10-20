@@ -1767,7 +1767,7 @@ class PatchAttention(nn.Module):
         return x
 
 
-class SpatialSubnet(nn.Module):
+class SpatialEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1841,7 +1841,7 @@ class TemporalRetNet(nn.Module):
         return (x, state)
 
 
-class TemporalSubnet(nn.Module):
+class TemporalEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1952,7 +1952,40 @@ class Meta:
     context_shape: Tuple[int, ...]
 
 
-class MetaNet(nn.Module):
+class MetaNetBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.norm1 = _norm(norm_type, d_model)
+        self.msr = TunedMSR(d_model, nhead)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self.norm2 = _norm(norm_type, d_model)
+        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        state: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[dict]]:
+        h = self.msr(self.norm1(x), attn_mask=causal_mask, state=state)
+        x = x + self.drop_path(self.dropout(h))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        return x, state
+
+
+class GlobalEncoder(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1969,7 +2002,7 @@ class MetaNet(nn.Module):
         drops = _stochastic_depth_scheduler(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
-                TemporalRetNet(
+                MetaNetBlock(
                     d_model,
                     nhead,
                     mlp_ratio=mlp_ratio,
@@ -1983,13 +2016,13 @@ class MetaNet(nn.Module):
         self.norm = _norm(norm_type, d_model)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        state = None
+        state: Optional[dict] = None
         for blk in self.blocks:
             tokens, state = blk(tokens, causal_mask=None, state=state)
         return self.norm(tokens)
 
 
-class SpatioTemporalNet(nn.Module):
+class LocalProcessor(nn.Module):
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -2021,7 +2054,7 @@ class SpatioTemporalNet(nn.Module):
             ),
             persistent=False,
         )
-        self.spatial_subnet = SpatialSubnet(
+        self.spatial_encoder = SpatialEncoder(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.spatial_depth)),
@@ -2031,7 +2064,7 @@ class SpatioTemporalNet(nn.Module):
             drop_path=self.drop_path,
             norm_type=self.norm_type,
         )
-        self.temporal_subnet = TemporalSubnet(
+        self.temporal_encoder = TemporalEncoder(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.temporal_depth)),
@@ -2096,8 +2129,8 @@ class SpatioTemporalNet(nn.Module):
             B, self.temporal_tokens, self.d_model
         )
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
-        spatial_out = self.spatial_subnet(spatial_tokens, coords)
-        temporal_out = self.temporal_subnet(temporal_tokens)
+        spatial_out = self.spatial_encoder(spatial_tokens, coords)
+        temporal_out = self.temporal_encoder(temporal_tokens)
         mode = self.data_definition
         if mode == "sxs":
             tokens = spatial_out

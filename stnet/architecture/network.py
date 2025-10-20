@@ -18,7 +18,7 @@ from .config import (
     model_config,
     patch_config,
 )
-from .module import Meta, MetaNet, SpatioTemporalNet
+from .module import GlobalEncoder, LocalProcessor, Meta
 
 
 _TORCH_COMPAT = patch_torch()
@@ -77,10 +77,10 @@ class Model(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.local_net = SpatioTemporalNet(
+        self.local_net = LocalProcessor(
             self.in_dim, self.out_shape, config=config
         ).to(self._device)
-        global_net = MetaNet(
+        global_net = GlobalEncoder(
             int(config.depth),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
