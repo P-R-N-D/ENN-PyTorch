@@ -5,9 +5,9 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 
 ## Key components
 - **Configurable architecture** – `stnet.architecture.network.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized.
-- **Data definition aliases** – `_normalize_data_definition` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
+- **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
 - **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). Configuration dataclasses (`ModelConfig`, `PatchConfig`) and runtime orchestration (`OpsConfig`) are available from the same namespace for ergonomic imports.
-- **Architecture utilities** – `stnet.architecture.module` houses reusable building blocks including `StochasticDepth`, `_norm`, `_stochastic_depth_scheduler`, and the model definitions so dependents import everything from a single entry point.
+- **Architecture utilities** – `stnet.architecture.module` houses reusable building blocks including `StochasticDepth`, `norm_layer`, `schedule_stochastic_depth`, and the model definitions so dependents import everything from a single entry point.
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
@@ -52,7 +52,7 @@ from stnet.workflow import (
     to_script,
 )
 
-config = ModelConfig(data_definition="spatiotemporal", depth=64, heads=4)
+config = ModelConfig(modeling_type="spatiotemporal", depth=64, heads=4)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
 features = torch.randn(32, model.in_dim)
@@ -72,6 +72,10 @@ scripted = to_script(restored)  # TorchScript export
 During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
 
 The workflow helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
+
+### Sample workbook configuration
+
+When following `notebook.ipynb` to materialize features from `raw_data.xlsx`, the CUDA profile keeps the model depth at 1152 with larger microbatches while the CPU path dials the depth back to 512 and halves the microbatch size to remain memory efficient. Both flows share the same tokenizer geometry so predictions remain shape-compatible across devices.
 
 ## Exporting for inference
 Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `export` extra to enable the full conversion toolkit.

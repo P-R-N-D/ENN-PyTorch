@@ -141,29 +141,96 @@ def new_dir(prefix: str) -> str:
 
 
 def is_port_available(host: str, port: int) -> bool:
-    with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind((host, port))
-            return True
-        except OSError:
-            return False
+    if port <= 0:
+        return False
+    try:
+        infos = socket.getaddrinfo(
+            host,
+            port,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return False
+    for family, socktype, proto, _, sockaddr in infos:
+        with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind(sockaddr)
+                return True
+            except OSError:
+                continue
+    return False
 
 
 def get_available_addr(endpoint: Optional[str]) -> str:
-    default_host, default_port = ("127.0.0.1", 29500)
-    if not endpoint:
-        host, port = (default_host, default_port)
-    elif ":" in endpoint:
-        host, port_str = endpoint.split(":", 1)
-        port = int(port_str)
+    import ipaddress
+
+    default_host = "127.0.0.1"
+
+    def _normalize(endpoint_str: str) -> Tuple[str, int]:
+        value = endpoint_str.strip()
+        if not value:
+            return default_host, 0
+        if value.startswith("["):
+            if "]" not in value:
+                raise ValueError(f"invalid endpoint: {endpoint_str}")
+            closing = value.index("]")
+            host_part = value[1:closing]
+            remainder = value[closing + 1 :]
+            if remainder.startswith(":") and remainder[1:]:
+                return host_part, int(remainder[1:])
+            if remainder in ("", ":"):
+                return host_part, 0
+            raise ValueError(f"invalid endpoint: {endpoint_str}")
+        host_part, sep, port_part = value.rpartition(":")
+        if sep and port_part.isdigit():
+            return host_part or default_host, int(port_part)
+        return value, 0
+
+    host: str
+    port: int
+    if endpoint is None:
+        host, port = default_host, 0
     else:
-        host, port = (endpoint, default_port)
-    if port <= 0 or (port != 0 and not is_port_available(host, port)):
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            sock.bind((host, 0))
-            _, free_port = sock.getsockname()
-        port = int(free_port)
+        host, port = _normalize(str(endpoint))
+
+    if port <= 0 or not is_port_available(host, port):
+        last_error: Optional[BaseException] = None
+        try:
+            infos = socket.getaddrinfo(
+                host,
+                0,
+                socket.AF_UNSPEC,
+                socket.SOCK_STREAM,
+            )
+        except socket.gaierror as exc:
+            raise RuntimeError(f"unable to resolve host for endpoint: {host}") from exc
+        for family, socktype, proto, _, sockaddr in infos:
+            with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                try:
+                    sock.bind(sockaddr)
+                    port = int(sock.getsockname()[1])
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    continue
+        else:
+            if last_error is not None:
+                raise RuntimeError(
+                    f"unable to identify an available port for host: {host}"
+                ) from last_error
+            raise RuntimeError(
+                f"unable to identify an available port for host: {host}"
+            )
+
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        addr = None
+    if addr is not None and addr.version == 6:
+        return f"[{host}]:{port}"
     return f"{host}:{port}"
 
 

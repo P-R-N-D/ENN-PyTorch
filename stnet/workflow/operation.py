@@ -281,7 +281,7 @@ def train(
     seed: int = 42,
     max_nodes: int = 1,
     rdzv_backend: Optional[str] = "c10d",
-    rdzv_endpoint: Optional[str] = "127.0.0.1:29500",
+    rdzv_endpoint: Optional[str] = None,
     prefetch_factor: Optional[int] = 1,
     grad_accum_steps: int = 1,
     overlap_h2d: bool = True,
@@ -313,7 +313,8 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
-    rdzv_endpoint = get_available_addr(rdzv_endpoint)
+    resolved_rdzv = rdzv_endpoint if rdzv_endpoint else "127.0.0.1"
+    rdzv_endpoint = get_available_addr(resolved_rdzv)
     optimize_threads()
     nprocs = optimal_procs()["nproc_per_node"]
     cfg_obj = getattr(model, "_Model__config", None)
@@ -475,7 +476,24 @@ def predict(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def main_train(local_rank: int, ops: OpsConfig) -> Optional[Model]:
+def main_train(*args: Any) -> Optional[Model]:
+    if not args:
+        raise TypeError("main_train requires an OpsConfig argument")
+    if len(args) == 1 and isinstance(args[0], OpsConfig):
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        ops = args[0]
+    elif len(args) >= 2 and isinstance(args[1], OpsConfig):
+        local_rank = int(args[0])
+        ops = args[1]
+    else:
+        raise TypeError("main_train expects (OpsConfig,) or (local_rank, OpsConfig) arguments")
+
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
+        elif hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
+
     device = get_device()
     _set_backend(device)
     torch.distributed.init_process_group(backend=_backend_type(device))
@@ -940,11 +958,25 @@ def main_train(local_rank: int, ops: OpsConfig) -> Optional[Model]:
     return None
 
 
-def main_predict(
-    local_rank: int,
-    ops: OpsConfig,
-    ret_sink: Optional[Dict[Any, Any]] = None,
-) -> Optional[Model]:
+def main_predict(*args: Any) -> Optional[Model]:
+    if not args:
+        raise TypeError("main_predict requires at least an OpsConfig argument")
+
+    ret_sink: Optional[Dict[Any, Any]] = None
+    if len(args) == 1 and isinstance(args[0], OpsConfig):
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        ops = args[0]
+    elif len(args) >= 2 and isinstance(args[1], OpsConfig):
+        local_rank = int(args[0])
+        ops = args[1]
+        if len(args) >= 3:
+            ret_sink = args[2]
+    else:
+        raise TypeError(
+            "main_predict expects (OpsConfig,), (local_rank, OpsConfig), or "
+            "(local_rank, OpsConfig, ret_sink) arguments"
+        )
+
     with contextlib.suppress(Exception):
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))

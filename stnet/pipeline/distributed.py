@@ -453,12 +453,9 @@ class IOController:
 
         if self.is_node_leader:
             resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
-            if ":" in resolved:
-                bind_host, port_str = resolved.rsplit(":", 1)
-                bind_port = int(port_str)
-            else:
-                bind_host = resolved
-                bind_port = int(self._flight_port)
+            parsed_bind = urlparse(f"tcp://{resolved}")
+            bind_host = parsed_bind.hostname or self._bind_host
+            bind_port = parsed_bind.port or int(self._flight_port)
             server, uri = Endpoint.start_server_standby(
                 host=bind_host,
                 port=bind_port,

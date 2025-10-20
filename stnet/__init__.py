@@ -17,9 +17,11 @@ coerce_patch_config = architecture.coerce_patch_config
 SpatialEncoder = architecture.SpatialEncoder
 TemporalEncoder = architecture.TemporalEncoder
 LocalProcessor = architecture.LocalProcessor
-PatchAttention = architecture.PatchAttention
+SpatialEncoderLayer = architecture.SpatialEncoderLayer
+TemporalEncoderLayer = architecture.TemporalEncoderLayer
+GlobalEncoderLayer = architecture.GlobalEncoderLayer
 CrossTransformer = architecture.CrossTransformer
-Meta = architecture.Meta
+Payload = architecture.Payload
 GlobalEncoder = architecture.GlobalEncoder
 GeGLU = architecture.GeGLU
 SwiGLU = architecture.SwiGLU
@@ -48,9 +50,11 @@ __all__ = [
     "SpatialEncoder",
     "TemporalEncoder",
     "LocalProcessor",
-    "PatchAttention",
+    "SpatialEncoderLayer",
+    "TemporalEncoderLayer",
+    "GlobalEncoderLayer",
     "CrossTransformer",
-    "Meta",
+    "Payload",
     "GlobalEncoder",
     "GeGLU",
     "SwiGLU",

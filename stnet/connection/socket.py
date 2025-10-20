@@ -5,6 +5,7 @@ import os
 import socket
 import threading
 import time
+from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
 from ..toolkit.capability import get_available_addr
@@ -209,23 +210,22 @@ class Endpoint:
         **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
         resolved = get_available_addr(f"{host}:{port}" if host else None)
-        if ":" in resolved:
-            host, port_str = resolved.rsplit(":", 1)
-            port = int(port_str)
-        else:
-            host = resolved
-            port = 0
+        parsed_endpoint = urlparse(f"grpc://{resolved}")
+        resolved_host = parsed_endpoint.hostname or (host or "0.0.0.0")
+        resolved_port = parsed_endpoint.port or port or 0
         location_obj = None
         try:
-            location_obj = flight.Location.for_grpc_tcp(host, port)
+            location_obj = flight.Location.for_grpc_tcp(resolved_host, resolved_port)
         except Exception:
             location_obj = None
-        location = location_obj if location_obj is not None else f"grpc://{host}:{port}"
+        location = (
+            location_obj if location_obj is not None else parsed_endpoint.geturl()
+        )
         server = Endpoint.Server(location=location)
         thread_error: list[BaseException] = []
         bound = threading.Event()
 
-        advertise_host = host
+        advertise_host = resolved_host
         if advertise_host in ("", "0.0.0.0", "::"):
             try:
                 advertise_host = socket.gethostbyname(socket.gethostname())
@@ -245,7 +245,7 @@ class Endpoint:
 
         def _wait_for_bind() -> int:
             while time.time() < deadline:
-                actual = getattr(server, "port", 0) or port
+                actual = getattr(server, "port", 0) or resolved_port
                 if actual not in (None, 0):
                     bound.set()
                     return actual

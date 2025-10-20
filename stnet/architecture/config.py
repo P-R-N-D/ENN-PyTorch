@@ -35,19 +35,19 @@ class ModelConfig:
     device: Optional[torch.device | str] = None
     microbatch: int = 64
     dropout: float = 0.1
-    normalize_method: str = "layernorm"
+    normalization_method: str = "layernorm"
     depth: int = 128
     heads: int = 4
     spatial_depth: int = 4
     temporal_depth: int = 4
     mlp_ratio: float = 4.0
     drop_path: float = 0.0
-    spatial_latent_tokens: int = 64
-    temporal_latent_tokens: int = 64
-    data_definition: str = "spatiotemporal"
+    spatial_latents: int = 64
+    temporal_latents: int = 64
+    modeling_type: str = "spatiotemporal"
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
-    use_compilation: bool = False
+    enable_compilation: bool = False
     compile_mode: str = "default"
     loss_space: str = "z"
 
@@ -225,8 +225,10 @@ def coerce_model_config(
         minimum=0.0,
         maximum=1.0,
     )
-    args["normalize_method"] = str(
-        filtered.get("normalize_method", getattr(defaults, "normalize_method"))
+    args["normalization_method"] = str(
+        filtered.get(
+            "normalization_method", getattr(defaults, "normalization_method")
+        )
     )
     args["depth"] = _sanitize_int(
         filtered.get("depth", getattr(defaults, "depth")),
@@ -259,30 +261,28 @@ def coerce_model_config(
         minimum=0.0,
         maximum=1.0,
     )
-    args["spatial_latent_tokens"] = _sanitize_int(
-        filtered.get(
-            "spatial_latent_tokens", getattr(defaults, "spatial_latent_tokens")
-        ),
-        name="spatial_latent_tokens",
+    args["spatial_latents"] = _sanitize_int(
+        filtered.get("spatial_latents", getattr(defaults, "spatial_latents")),
+        name="spatial_latents",
         minimum=1,
     )
-    args["temporal_latent_tokens"] = _sanitize_int(
-        filtered.get(
-            "temporal_latent_tokens", getattr(defaults, "temporal_latent_tokens")
-        ),
-        name="temporal_latent_tokens",
+    args["temporal_latents"] = _sanitize_int(
+        filtered.get("temporal_latents", getattr(defaults, "temporal_latents")),
+        name="temporal_latents",
         minimum=1,
     )
-    args["data_definition"] = str(
-        filtered.get("data_definition", getattr(defaults, "data_definition"))
+    args["modeling_type"] = str(
+        filtered.get("modeling_type", getattr(defaults, "modeling_type"))
     )
     args["use_linear_branch"] = _sanitize_bool(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
     )
-    args["use_compilation"] = _sanitize_bool(
-        filtered.get("use_compilation", getattr(defaults, "use_compilation")),
-        name="use_compilation",
+    args["enable_compilation"] = _sanitize_bool(
+        filtered.get(
+            "enable_compilation", getattr(defaults, "enable_compilation")
+        ),
+        name="enable_compilation",
     )
     args["compile_mode"] = str(
         filtered.get("compile_mode", getattr(defaults, "compile_mode"))
