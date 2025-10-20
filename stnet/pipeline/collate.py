@@ -866,22 +866,21 @@ def dataloader(
         thread_max_concurrent = io_workers
         wrapped: BaseNode = ParallelMapper(
             node,
-            map_fn=_passthrough,
+            map_fn=map_fn,
             num_workers=io_workers,
             in_order=False,
             method="thread",
             max_concurrent=thread_max_concurrent,
-            prebatch=None,
+            prebatch=prebatch,
         )
         proc_max_concurrent = proc_workers
         wrapped = ParallelMapper(
             wrapped,
-            map_fn=map_fn,
+            map_fn=partial(_passthrough),
             num_workers=proc_workers,
             in_order=False,
             method="process",
             max_concurrent=proc_max_concurrent,
-            prebatch=prebatch,
         )
         wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
         if device_obj.type in {"cuda", "xpu", "mps"}:
