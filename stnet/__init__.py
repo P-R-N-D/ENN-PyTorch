@@ -14,13 +14,13 @@ model_config = architecture.model_config
 patch_config = architecture.patch_config
 coerce_model_config = architecture.coerce_model_config
 coerce_patch_config = architecture.coerce_patch_config
-SpatialSubnet = architecture.SpatialSubnet
-TemporalSubnet = architecture.TemporalSubnet
-SpatioTemporalNet = architecture.SpatioTemporalNet
+SpatialEncoder = architecture.SpatialEncoder
+TemporalEncoder = architecture.TemporalEncoder
+LocalProcessor = architecture.LocalProcessor
 PatchAttention = architecture.PatchAttention
 CrossTransformer = architecture.CrossTransformer
 Meta = architecture.Meta
-MetaNet = architecture.MetaNet
+GlobalEncoder = architecture.GlobalEncoder
 GeGLU = architecture.GeGLU
 SwiGLU = architecture.SwiGLU
 MultipleQuantileLoss = architecture.MultipleQuantileLoss
@@ -45,13 +45,13 @@ __all__ = [
     "load_model",
     "save_model",
     "joining",
-    "SpatialSubnet",
-    "TemporalSubnet",
-    "SpatioTemporalNet",
+    "SpatialEncoder",
+    "TemporalEncoder",
+    "LocalProcessor",
     "PatchAttention",
     "CrossTransformer",
     "Meta",
-    "MetaNet",
+    "GlobalEncoder",
     "GeGLU",
     "SwiGLU",
     "MultipleQuantileLoss",
