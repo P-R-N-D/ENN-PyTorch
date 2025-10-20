@@ -59,7 +59,7 @@ def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
     return [step * float(index + 1) for index in range(depth)]
 
 
-_TORCH_COMPAT = patch_torch()
+patch_torch()
 if TYPE_CHECKING:
     from .network import ModelConfig
 

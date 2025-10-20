@@ -5,7 +5,7 @@ from typing import TypeAlias
 
 from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
 
-_TORCH_COMPAT = patch_torch()
+patch_torch()
 from .config import (
     ModelConfig,
     PatchConfig,

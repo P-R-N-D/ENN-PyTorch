@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import torch
 
@@ -112,7 +112,7 @@ def _sanitize_tuple_ints(
     if isinstance(value, int):
         ivalue = _sanitize_int(value, name=name, minimum=1)
         if keep_scalar:
-            return ivalue  # type: ignore[return-value]
+            return cast(Union[int, Tuple[int, ...]], ivalue)
         return tuple([ivalue] * dims)
     if isinstance(value, (list, tuple)):
         if len(value) != dims:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib
 import math
 import multiprocessing
 import os
@@ -441,8 +442,7 @@ def is_int8_supported(
     if major < 7:
         return (False, f"INT8 requires sm_70+ (found sm_{major}{minor})")
     try:
-        import torchao.quantization  # noqa: F401
-
+        importlib.import_module("torchao.quantization")
         return (True, "torchao.quantization")
     except Exception:
         return (True, f"sm_{major}{minor}")

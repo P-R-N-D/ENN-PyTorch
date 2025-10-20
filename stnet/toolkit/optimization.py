@@ -22,9 +22,11 @@ import torch
 from torch import nn, optim
 
 try:
-    from torch.distributed.algorithms.join import Join
-except ImportError:  # pragma: no cover - optional dependency
-    Join = None  # type: ignore[assignment]
+    from torch.distributed.algorithms.join import Join as _TorchJoin
+except ImportError:
+    _TorchJoin = None
+
+Join: type[AbstractContextManager[None]] | None = _TorchJoin
 
 from .capability import (
     get_device,
@@ -103,8 +105,6 @@ except Exception:
 
 
 def joining(*joinables: Optional[object]) -> AbstractContextManager[None]:
-    """Return a join context for any joinable modules or optimizers."""
-
     if Join is None:
         return contextlib.nullcontext()
     to_join = []
@@ -129,7 +129,6 @@ class _FlopProfiler:
         self._nvtx_soft_counter: float = 0.0
         self._nvtx_getter: Optional[Callable[[], float]] = None
 
-    # bucket helpers -------------------------------------------------
     def is_tracking_active(self) -> bool:
         return self._tracking_depth > 0
 
@@ -159,7 +158,6 @@ class _FlopProfiler:
             self._manual_total += fv
             self._manual_by_type[typ] = self._manual_by_type.get(typ, 0.0) + fv
 
-    # NVTX helpers ---------------------------------------------------
     def _nvtx_soft_add(self, value: float) -> None:
         try:
             self._nvtx_soft_counter += float(value) if float(value) > 0 else 0.0
@@ -191,7 +189,6 @@ class _FlopProfiler:
             dev = None
         return self._nvtx_counter(dev)
 
-    # hook utilities -------------------------------------------------
     def start_hooks(
         self,
         model: nn.Module,
@@ -439,7 +436,6 @@ class _FlopProfiler:
 
         return _StepScope()
 
-    # public helpers -------------------------------------------------
     def attention_flops_bshd(
         self,
         q: torch.Tensor,
