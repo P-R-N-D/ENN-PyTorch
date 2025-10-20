@@ -369,7 +369,7 @@ def train(
         **default_kwargs,
         **kwargs,
     )
-    elastic_launch(lc, main)(None, ops)
+    elastic_launch(lc, main)(ops)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=pattern_to_ignore)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
