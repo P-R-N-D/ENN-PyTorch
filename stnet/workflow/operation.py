@@ -8,14 +8,12 @@ import shutil
 import sys
 import time
 import warnings
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, replace
 from typing import (
     Any,
-    ClassVar,
     Dict,
     Iterator,
     List,
-    Literal,
     Optional,
     Sequence,
     Tuple,
@@ -43,7 +41,8 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..architecture.network import Model, ModelConfig, coerce_config
+from ..architecture.network import Model
+from ..architecture.config import ModelConfig, coerce_model_config
 from ..pipeline.collate import dataloader, postprocess, preprocess, to_tensor
 from ..pipeline.dataset import MemoryMappedTensorStream
 from ..toolkit.capability import (
@@ -82,127 +81,7 @@ try:
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-OpsMode = Literal["train", "predict", "infer"]
-
-
-def _as_tuple_ints(xs: Sequence[int]) -> Tuple[int, ...]:
-    return tuple(int(x) for x in xs)
-
-
-@dataclass(frozen=True)
-class OpsConfig:
-    mode: OpsMode
-    in_dim: int
-    out_shape: Tuple[int, ...]
-    cfg_dict: Dict[str, Any]
-    memmap_dir: Optional[str] = None
-    ckpt_dir: Optional[str] = None
-    init_ckpt_dir: Optional[str] = None
-    epochs: int = 5
-    batch_size: Optional[int] = None
-    val_frac: float = 0.1
-    base_lr: float = 1e-3
-    weight_decay: float = 1e-4
-    warmup_ratio: float = 0.0
-    eta_min: float = 0.0
-    seed: int = 42
-    prefetch_factor: Optional[int] = 1
-    grad_accum_steps: int = 1
-    overlap_h2d: bool = True
-    loss_tile_dim: Optional[int] = None
-    loss_tile_size: Optional[int] = None
-    loss_mask_mode: str = "none"
-    loss_mask_value: Optional[float] = None
-    model_ckpt_dir: Optional[str] = None
-    keys: Optional[List[Tuple[Any, ...]]] = None
-    TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
-        "epochs",
-        "batch_size",
-        "val_frac",
-        "base_lr",
-        "weight_decay",
-        "warmup_ratio",
-        "eta_min",
-        "seed",
-        "prefetch_factor",
-        "grad_accum_steps",
-        "overlap_h2d",
-        "loss_tile_dim",
-        "loss_tile_size",
-        "loss_mask_mode",
-        "loss_mask_value",
-    )
-    PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = (
-        "batch_size",
-        "seed",
-        "prefetch_factor",
-    )
-
-    @staticmethod
-    def from_partial(mode: OpsMode, **kw: Any) -> "OpsConfig":
-        for k in ("in_dim", "out_shape", "cfg_dict"):
-            if k not in kw or kw[k] is None:
-                raise ValueError(f"OpsConfig missing required key: {k}")
-        in_dim = int(kw["in_dim"])
-        out_shape = _as_tuple_ints(kw["out_shape"])
-        cfg_dict = dict(kw["cfg_dict"])
-        if mode == "train":
-            for k in ("memmap_dir", "ckpt_dir"):
-                if k not in kw or kw[k] is None:
-                    raise ValueError(f"OpsConfig(train) missing required key: {k}")
-            batch_size = int(kw.get("batch_size", 128))
-            return OpsConfig(
-                mode="train",
-                in_dim=in_dim,
-                out_shape=out_shape,
-                cfg_dict=cfg_dict,
-                memmap_dir=str(kw["memmap_dir"]),
-                ckpt_dir=str(kw["ckpt_dir"]),
-                init_ckpt_dir=kw.get("init_ckpt_dir"),
-                epochs=int(kw.get("epochs", 5)),
-                batch_size=batch_size,
-                val_frac=float(kw.get("val_frac", 0.1)),
-                base_lr=float(kw.get("base_lr", 1e-3)),
-                weight_decay=float(kw.get("weight_decay", 1e-4)),
-                warmup_ratio=float(kw.get("warmup_ratio", 0.0)),
-                eta_min=float(kw.get("eta_min", 0.0)),
-                seed=int(kw.get("seed", 42)),
-                prefetch_factor=kw.get("prefetch_factor", 1),
-                grad_accum_steps=int(kw.get("grad_accum_steps", 1)),
-                overlap_h2d=bool(kw.get("overlap_h2d", True)),
-                loss_tile_dim=kw.get("loss_tile_dim"),
-                loss_tile_size=kw.get("loss_tile_size"),
-                loss_mask_mode=str(kw.get("loss_mask_mode", "none")),
-                loss_mask_value=kw.get("loss_mask_value"),
-            )
-        for k in ("memmap_dir", "keys"):
-            if k not in kw or kw[k] is None:
-                raise ValueError(f"OpsConfig({mode}) missing required key: {k}")
-        batch_size = int(kw.get("batch_size", 512))
-        return OpsConfig(
-            mode="predict" if mode == "predict" else "infer",
-            in_dim=in_dim,
-            out_shape=out_shape,
-            cfg_dict=cfg_dict,
-            memmap_dir=str(kw["memmap_dir"]),
-            model_ckpt_dir=kw.get("model_ckpt_dir"),
-            keys=list(kw["keys"]),
-            batch_size=batch_size,
-            seed=int(kw.get("seed", 7)),
-            prefetch_factor=kw.get("prefetch_factor", 1),
-        )
-
-
-def new_ops_config(
-    mode: OpsMode, base: Dict[str, Any] | None, /, *args, **kwargs
-) -> OpsConfig:
-    data: Dict[str, Any] = dict(base or {})
-    order = OpsConfig.TRAIN_POS_ORDER if mode == "train" else OpsConfig.PRED_POS_ORDER
-    for name, val in zip(order, args):
-        data[name] = val
-    data.update(kwargs)
-    actual_mode = data.pop("mode", mode)
-    return OpsConfig.from_partial(mode=actual_mode, **data)
+from .config import OpsConfig, OpsMode, coerce_ops_config, ops_config
 
 
 sentences_to_ignore = [
@@ -438,11 +317,11 @@ def train(
     optimize_threads()
     nprocs = optimal_procs()["nproc_per_node"]
     cfg_obj = getattr(model, "_Model__config", None)
-    cfg_dict: Dict[str, Any] = (
-        asdict(cfg_obj)
-        if isinstance(cfg_obj, ModelConfig)
-        else asdict(ModelConfig())
-    )
+    if isinstance(cfg_obj, (ModelConfig, dict)):
+        cfg_model = coerce_model_config(cfg_obj)
+    else:
+        cfg_model = ModelConfig()
+    cfg_dict: Dict[str, Any] = asdict(cfg_model)
     lc = LaunchConfig(
         min_nodes=1,
         max_nodes=max_nodes,
@@ -483,7 +362,7 @@ def train(
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = new_ops_config(
+    ops = ops_config(
         "train",
         base,
         *args,
@@ -530,11 +409,11 @@ def predict(
             storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
         )
     cfg_obj = getattr(model, "_Model__config", None)
-    cfg_dict = (
-        asdict(cfg_obj)
-        if isinstance(cfg_obj, ModelConfig)
-        else asdict(ModelConfig())
-    )
+    if isinstance(cfg_obj, (ModelConfig, dict)):
+        cfg_model = coerce_model_config(cfg_obj)
+    else:
+        cfg_model = ModelConfig()
+    cfg_dict = asdict(cfg_model)
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
@@ -571,7 +450,7 @@ def predict(
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = new_ops_config(
+    ops = ops_config(
         mode,
         base,
         *args,
@@ -603,6 +482,7 @@ def main(
 ) -> Optional[Model]:
     if ops is None:
         raise ValueError("ops must be provided")
+    ops = coerce_ops_config(ops)
     if local_rank is None:
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if ops.mode == "train":
@@ -611,7 +491,7 @@ def main(
         torch.distributed.init_process_group(backend=_backend_type(device))
         if device.type == "cuda":
             torch.cuda.empty_cache()
-        cfg = coerce_config(
+        cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
@@ -1074,7 +954,7 @@ def main(
         elif hasattr(torch, "xpu") and torch.xpu.is_available():
             torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
     device = get_device()
-    cfg = coerce_config(
+    cfg = coerce_model_config(
         ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
     )
     model = Model(ops.in_dim, ops.out_shape, config=cfg)
