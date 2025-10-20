@@ -42,155 +42,8 @@ from torch.distributed import distributed_c10d
 from ..connection.socket import Endpoint
 from ..toolkit.capability import get_world_size, optimize_threads
 from ..toolkit.compat import has_arrow_flight, patch_arrow
+from .datatype import convert, to_tensor
 _ARROW = patch_arrow()
-
-
-_CANONICAL_DTYPE_MAP = {
-    "float64": {
-        "torch": torch.float64,
-        "numpy": np.float64,
-        "arrow": "float64",
-        "python": float,
-    },
-    "float32": {
-        "torch": torch.float32,
-        "numpy": np.float32,
-        "arrow": "float32",
-        "python": float,
-    },
-    "float16": {
-        "torch": torch.float16,
-        "numpy": np.float16,
-        "arrow": "float16",
-        "python": float,
-    },
-    "bfloat16": {
-        "torch": getattr(torch, "bfloat16", torch.float32),
-        "numpy": np.float32,
-        "arrow": "bfloat16",
-        "python": float,
-    },
-    "int64": {
-        "torch": torch.int64,
-        "numpy": np.int64,
-        "arrow": "int64",
-        "python": int,
-    },
-    "int32": {
-        "torch": torch.int32,
-        "numpy": np.int32,
-        "arrow": "int32",
-        "python": int,
-    },
-    "int16": {
-        "torch": torch.int16,
-        "numpy": np.int16,
-        "arrow": "int16",
-        "python": int,
-    },
-    "int8": {
-        "torch": torch.int8,
-        "numpy": np.int8,
-        "arrow": "int8",
-        "python": int,
-    },
-    "uint8": {
-        "torch": torch.uint8,
-        "numpy": np.uint8,
-        "arrow": "uint8",
-        "python": int,
-    },
-    "bool": {
-        "torch": torch.bool,
-        "numpy": np.bool_,
-        "arrow": "bool",
-        "python": bool,
-    },
-}
-
-_DTYPE_ALIASES = {
-    "float": "float32",
-    "float_": "float32",
-    "double": "float64",
-    "float32": "float32",
-    "float64": "float64",
-    "float16": "float16",
-    "half": "float16",
-    "halffloat": "float16",
-    "boolean": "bool",
-    "bool_": "bool",
-    "bool": "bool",
-    "bf16": "bfloat16",
-    "bfloat16": "bfloat16",
-    "f16": "float16",
-    "f32": "float32",
-    "f64": "float64",
-    "i8": "int8",
-    "i16": "int16",
-    "i32": "int32",
-    "i64": "int64",
-    "u8": "uint8",
-}
-
-
-def _canonical_dtype_name(src: Any) -> str:
-    if src is None:
-        raise TypeError("dtype cannot be None")
-    pa_mod = getattr(_ARROW, "module", None)
-    if isinstance(src, torch.dtype):
-        key = str(src)
-    elif isinstance(src, str):
-        key = src
-    elif isinstance(src, np.dtype):
-        key = src.name
-    else:
-        data_type_cls = getattr(pa_mod, "DataType", None) if pa_mod else None
-        if data_type_cls is not None and isinstance(src, data_type_cls):
-            try:
-                key = np.dtype(src.to_pandas_dtype()).name
-            except Exception:
-                key = str(src)
-        else:
-            try:
-                key = np.dtype(src).name
-            except Exception:
-                key = str(src)
-    key = key.strip().lower()
-    if key.startswith("torch."):
-        key = key.split(".", 1)[1]
-    if key.startswith("numpy."):
-        key = key.split(".", 1)[1]
-    key = key.lstrip("<>|=")
-    canonical = _DTYPE_ALIASES.get(key, key)
-    if canonical not in _CANONICAL_DTYPE_MAP:
-        raise TypeError(f"unsupported dtype: {src!r}")
-    return canonical
-
-
-def to_dtype(src: Any, platform: str) -> Any:
-    platform_key = str(platform).strip().lower()
-    platform_aliases = {
-        "torch": "torch",
-        "pytorch": "torch",
-        "numpy": "numpy",
-        "np": "numpy",
-        "arrow": "arrow",
-        "pyarrow": "arrow",
-        "python": "python",
-        "native": "python",
-        "name": "name",
-        "canonical": "name",
-    }
-    if platform_key not in platform_aliases:
-        raise ValueError(f"unsupported platform: {platform!r}")
-    normalized = platform_aliases[platform_key]
-    canonical = _canonical_dtype_name(src)
-    if normalized == "name":
-        return canonical
-    mapping = _CANONICAL_DTYPE_MAP.get(canonical)
-    if mapping is None or normalized not in mapping:
-        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
-    return mapping[normalized]
 
 
 def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
@@ -921,18 +774,6 @@ class _Keep:
             if callable(obj):
                 with suppress(Exception):
                     obj()
-
-
-def to_tensor(obj: Any) -> torch.Tensor:
-    if isinstance(obj, torch.Tensor):
-        return obj
-    if hasattr(obj, "to_tensor"):
-        return obj.to_tensor()
-    if hasattr(obj, "as_tensor"):
-        return obj.as_tensor()
-    return torch.as_tensor(obj)
-
-
 def fetch(
     sample: Any,
     *args: Any,
@@ -1012,23 +853,35 @@ def dataloader(
     from .dataset import BatchReader, SampleReader
 
     def _wrap_node(node: IterableWrapper) -> DataLoader:
-        wrapped: Any = ParallelMapper(
+        io_workers = max(1, int(threads["dataloader_workers"]))
+        prebatch = max(1, int(threads["prefetch_factor"]))
+        cpu_total = os.cpu_count() or io_workers
+        cpu_budget = max(1, cpu_total - 1) if cpu_total > 1 else 1
+        proc_target = max(io_workers, 2)
+        proc_workers = max(1, min(cpu_budget, proc_target))
+
+        def _passthrough(item: Any) -> Any:
+            return item
+
+        thread_max_concurrent = io_workers
+        wrapped: BaseNode = ParallelMapper(
             node,
-            map_fn=(lambda x: x) fetch,
-            num_workers=threads["dataloader_workers"],
-            method="thread",
+            map_fn=_passthrough,
+            num_workers=io_workers,
             in_order=False,
-            max_concurrent=threads["dataloader_workers"],
+            method="thread",
+            max_concurrent=thread_max_concurrent,
+            prebatch=None,
         )
-        wrapped: Any = ParallelMapper(
+        proc_max_concurrent = proc_workers
+        wrapped = ParallelMapper(
             wrapped,
             map_fn=map_fn,
-            num_workers=2,
-            method="process",
+            num_workers=proc_workers,
             in_order=False,
-            max_concurrent=2,
-            prebatch=threads["prefetch_factor"],
-            threads["prefetch_factor"],
+            method="process",
+            max_concurrent=proc_max_concurrent,
+            prebatch=prebatch,
         )
         wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
         if device_obj.type in {"cuda", "xpu", "mps"}:
@@ -1102,10 +955,10 @@ def dataloader(
         meta = reader_tr._load_meta()
         server = None
         keep = _Keep(reader_tr, reader_vl)
-        features_np_dtype = to_dtype(
+        features_np_dtype = convert(
             meta.get("features_arrow_dtype", "float32"), "numpy"
         )
-        labels_np_dtype = to_dtype(
+        labels_np_dtype = convert(
             meta.get("labels_arrow_dtype", "float32"), "numpy"
         )
         try:
