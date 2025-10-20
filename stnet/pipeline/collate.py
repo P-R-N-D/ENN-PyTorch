@@ -46,6 +46,10 @@ from .datatype import convert, to_tensor
 _ARROW = patch_arrow()
 
 
+def identity(item: Any) -> Any:
+    return item
+
+
 def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
     if node is None:
         return 1
@@ -860,9 +864,6 @@ def dataloader(
         proc_target = max(io_workers, 2)
         proc_workers = max(1, min(cpu_budget, proc_target))
 
-        def _passthrough(item: Any) -> Any:
-            return item
-
         thread_max_concurrent = io_workers
         wrapped: BaseNode = ParallelMapper(
             node,
@@ -876,7 +877,7 @@ def dataloader(
         proc_max_concurrent = proc_workers
         wrapped = ParallelMapper(
             wrapped,
-            map_fn=partial(_passthrough),
+            map_fn=identity,
             num_workers=proc_workers,
             in_order=False,
             method="process",
