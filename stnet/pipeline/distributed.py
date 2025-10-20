@@ -7,9 +7,9 @@ import os
 import socket
 import time
 from urllib.parse import urlparse
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import torch.distributed as dist
 
@@ -89,7 +89,7 @@ def wait_key(key: str, timeout_s: Optional[float] = 30.0) -> str:
     while True:
         try:
             result = store.wait([key], timeout=max(remaining, 0.0))
-        except Exception as exc:  # pragma: no cover - backend specific errors
+        except Exception as exc:
             raise TimeoutError(f"timeout waiting for key: {key}") from exc
         if result and result[0]:
             value = store.get(key)
@@ -398,10 +398,14 @@ class IOController:
             elif isinstance(info, Mapping):
                 info_dict = dict(info)
             else:
-                try:
-                    info_dict = dict(info)  # type: ignore[arg-type]
-                except Exception:
-                    info_dict = {}
+                info_dict = {}
+                if isinstance(info, Iterable):
+                    for item in cast(Iterable[Tuple[Any, Any]], info):
+                        try:
+                            key, value = item
+                        except Exception:
+                            continue
+                        info_dict[key] = value
 
             existing = self._leaders.get(host)
             if isinstance(existing, dict):
@@ -411,10 +415,14 @@ class IOController:
             elif existing is None:
                 leader_info = {}
             else:
-                try:
-                    leader_info = dict(existing)  # type: ignore[arg-type]
-                except Exception:
-                    leader_info = {}
+                leader_info = {}
+                if isinstance(existing, Iterable):
+                    for item in cast(Iterable[Tuple[Any, Any]], existing):
+                        try:
+                            key, value = item
+                        except Exception:
+                            continue
+                        leader_info[key] = value
 
             for key, value in info_dict.items():
                 if key in {"ip", "host"}:

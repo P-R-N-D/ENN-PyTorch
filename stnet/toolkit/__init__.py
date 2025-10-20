@@ -6,7 +6,13 @@ from .capability import (
     get_runtime_config,
     initialize_sdpa_backends,
 )
-from .compat import SDPBackend, TorchCompat, _to_sdpa_backends, patch_torch, sdpa_kernel
+from .compat import (
+    SDPBackend,
+    TorchCompat,
+    _to_sdpa_backends,
+    patch_torch,
+    sdpa_kernel,
+)
 from .optimization import (
     TunedAMP,
     FlopCounter,
@@ -44,4 +50,4 @@ __all__ = [
     "StandardScaler",
     "IncrementalPCA",
 ]
-_TORCH_COMPAT = patch_torch()
+patch_torch()

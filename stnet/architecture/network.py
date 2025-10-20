@@ -10,18 +10,11 @@ from torch import nn
 
 from ..toolkit.compat import patch_torch
 from ..toolkit.optimization import TunedAMP, compile
-from .config import (
-    ModelConfig,
-    PatchConfig,
-    coerce_model_config,
-    coerce_patch_config,
-    model_config,
-    patch_config,
-)
+from .config import ModelConfig
 from .module import GlobalEncoder, LocalProcessor, Payload
 
 
-_TORCH_COMPAT = patch_torch()
+patch_torch()
 
 
 class LossWeightController(Protocol):
@@ -33,8 +26,6 @@ class LossWeightController(Protocol):
         top_loss: Optional[torch.Tensor],
         bottom_loss: Optional[torch.Tensor],
     ) -> None:
-        if False:
-            raise RuntimeError(top_loss, bottom_loss)
         raise NotImplementedError
 
 
@@ -53,23 +44,16 @@ class Model(nn.Module):
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
-            match True:
-                case _ if hasattr(torch, "cuda") and torch.cuda.is_available():
-                    device_name = "cuda"
-                case _ if (
-                    getattr(torch.backends, "mps", None)
-                    and torch.backends.mps.is_available()
-                ):
-                    device_name = "mps"
-                case _ if (
-                    hasattr(torch, "is_vulkan_available")
-                    and torch.is_vulkan_available()
-                ):
-                    device_name = "vulkan"
-                case _ if hasattr(torch, "xpu") and torch.xpu.is_available():
-                    device_name = "xpu"
-                case _:
-                    device_name = "cpu"
+            if torch.cuda.is_available():
+                device_name = "cuda"
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                device_name = "mps"
+            elif getattr(torch, "is_vulkan_available", None) and torch.is_vulkan_available():
+                device_name = "vulkan"
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                device_name = "xpu"
+            else:
+                device_name = "cpu"
             self._device = torch.device(device_name)
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
