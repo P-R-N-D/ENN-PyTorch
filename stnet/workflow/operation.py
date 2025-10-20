@@ -44,7 +44,8 @@ from tqdm.auto import tqdm
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Model
 from ..architecture.config import ModelConfig, coerce_model_config
-from ..pipeline.collate import dataloader, fetch, postprocess, preprocess, to_tensor
+from ..pipeline.collate import dataloader, postprocess, preprocess
+from ..pipeline.datatype import to_tensor
 from ..pipeline.dataset import SampleReader
 from ..toolkit.capability import (
     get_available_addr,
