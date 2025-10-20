@@ -780,10 +780,13 @@ class TunedDPA(torch.nn.Module):
         q = self._to_optimal_dtype(q)
         k = self._to_optimal_dtype(k)
         v = self._to_optimal_dtype(v)
+        q_bshd = q.contiguous()
+        k_bshd = k.contiguous()
+        v_bshd = v.contiguous()
         try:
             _bwd = 2.0 if training else 0.0
             attention_flops_bshd(
-                q,
+                q_bshd,
                 bwd_factor=_bwd,
                 dropout_p=float(dropout_p),
                 training=bool(training),
@@ -799,14 +802,14 @@ class TunedDPA(torch.nn.Module):
             and (not kwargs)
         )
         if use_te:
-            q_bhsd = q.permute(0, 2, 1, 3).contiguous()
-            k_bhsd = k.permute(0, 2, 1, 3).contiguous()
-            v_bhsd = v.permute(0, 2, 1, 3).contiguous()
+            q_te = q_bshd.permute(0, 2, 1, 3).contiguous()
+            k_te = k_bshd.permute(0, 2, 1, 3).contiguous()
+            v_te = v_bshd.permute(0, 2, 1, 3).contiguous()
             try:
                 out_te = self._te_attn(
-                    q_bhsd,
-                    k_bhsd,
-                    v_bhsd,
+                    q_te,
+                    k_te,
+                    v_te,
                     attn_mask=None,
                     attention_dropout=dropout_val,
                     is_causal=bool(is_causal),
@@ -816,9 +819,6 @@ class TunedDPA(torch.nn.Module):
                 use_te = False
             else:
                 return out_te.permute(0, 2, 1, 3).contiguous()
-        q_bhsd = q.permute(0, 2, 1, 3).contiguous()
-        k_bhsd = k.permute(0, 2, 1, 3).contiguous()
-        v_bhsd = v.permute(0, 2, 1, 3).contiguous()
         sdpa_kwargs = {
             "attn_mask": attn_mask,
             "dropout_p": dropout_val,
@@ -834,13 +834,13 @@ class TunedDPA(torch.nn.Module):
         if backends:
             with sdpa_kernel(backends):
                 sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
+                    q_bshd, k_bshd, v_bshd, **sdpa_kwargs
                 )
         if sdpa_out is None:
             sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
+                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
             )
-        return sdpa_out.permute(0, 2, 1, 3).contiguous()
+        return sdpa_out.contiguous()
 
     @staticmethod
     def _to_optimal_dtype(x: torch.Tensor) -> torch.Tensor:
