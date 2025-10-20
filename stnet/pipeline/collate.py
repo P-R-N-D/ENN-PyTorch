@@ -1014,12 +1014,21 @@ def dataloader(
     def _wrap_node(node: IterableWrapper) -> DataLoader:
         wrapped: Any = ParallelMapper(
             node,
-            map_fn=map_fn,
+            map_fn=(lambda x: x) fetch,
             num_workers=threads["dataloader_workers"],
             method="thread",
             in_order=False,
             max_concurrent=threads["dataloader_workers"],
+        )
+        wrapped: Any = ParallelMapper(
+            wrapped,
+            map_fn=map_fn,
+            num_workers=2,
+            method="process",
+            in_order=False,
+            max_concurrent=2,
             prebatch=threads["prefetch_factor"],
+            threads["prefetch_factor"],
         )
         wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
         if device_obj.type in {"cuda", "xpu", "mps"}:
