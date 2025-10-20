@@ -580,16 +580,6 @@ def main_train(*args: Any) -> Optional[Model]:
     _set_backend(device)
     backend = _backend_type(device)
     init_kwargs: Dict[str, Any] = {"backend": backend}
-    if backend in {"nccl", "xccl"}:
-        device_id: Optional[int] = None
-        if device.type == "cuda":
-            with contextlib.suppress(Exception):
-                device_id = int(torch.cuda.current_device())
-        elif device.type == "xpu":
-            with contextlib.suppress(Exception):
-                device_id = int(torch.xpu.current_device())
-        if device_id is not None:
-            init_kwargs["device_ids"] = [device_id]
     torch.distributed.init_process_group(**init_kwargs)
     if device.type == "cuda":
         torch.cuda.empty_cache()
