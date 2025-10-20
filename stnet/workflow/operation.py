@@ -81,7 +81,7 @@ try:
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from .config import OpsConfig, OpsMode, coerce_ops_config, ops_config
+from .config import OpsConfig, OpsMode, ops_config
 
 
 sentences_to_ignore = [
@@ -369,7 +369,7 @@ def train(
         **default_kwargs,
         **kwargs,
     )
-    elastic_launch(lc, main)(ops)
+    elastic_launch(lc, main_train)(ops)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=pattern_to_ignore)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -461,7 +461,7 @@ def predict(
     manager = mp.Manager()
     ret_dict = manager.dict()
     mp.start_processes(
-        main,
+        main_predict,
         args=(ops, ret_dict),
         nprocs=nprocs,
         join=True,
@@ -1004,24 +1004,6 @@ def main_predict(
     if keep is not None:
         keep.cleanup()
     return None
-
-
-def main(
-    local_rank: Optional[int] = None,
-    ops: OpsConfig | None = None,
-    ret_sink: Optional[Dict[Any, Any]] = None,
-) -> Optional[Model]:
-    if ops is None:
-        raise ValueError("ops must be provided")
-    ops = coerce_ops_config(ops)
-    if local_rank is None:
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    else:
-        local_rank = int(local_rank)
-    if ops.mode == "train":
-        return main_train(local_rank, ops)
-    return main_predict(local_rank, ops, ret_sink)
-
 def learn(
     model: Model,
     device: torch.device,
