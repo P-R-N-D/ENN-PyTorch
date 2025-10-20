@@ -473,7 +473,7 @@ FLOP_PROFILER = _FlopProfiler()
 
 
 @dataclass
-class LossWeightOptimizer:
+class LossWeightController:
     momentum: float = 0.9
     min_weight: float = 0.05
     max_weight: float = 0.95

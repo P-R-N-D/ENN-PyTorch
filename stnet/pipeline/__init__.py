@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from .collate import Loader, postprocess, preprocess, to_batch
-from .dataset import Batch, MemoryMappedTensorStream
+from .collate import Loader, fetch, postprocess, preprocess
+from .dataset import BatchSampler, SampleReader
 from .distributed import IOController
 
 __all__ = [
-    "Batch",
-    "to_batch",
+    "BatchSampler",
+    "fetch",
     "Loader",
     "preprocess",
     "postprocess",
     "IOController",
-    "MemoryMappedTensorStream",
+    "SampleReader",
 ]

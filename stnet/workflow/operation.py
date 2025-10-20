@@ -44,8 +44,8 @@ from tqdm.auto import tqdm
 from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Model
 from ..architecture.config import ModelConfig, coerce_model_config
-from ..pipeline.collate import dataloader, postprocess, preprocess, to_tensor
-from ..pipeline.dataset import MemoryMappedTensorStream
+from ..pipeline.collate import dataloader, fetch, postprocess, preprocess, to_tensor
+from ..pipeline.dataset import SampleReader
 from ..toolkit.capability import (
     get_available_addr,
     get_device,
@@ -62,7 +62,7 @@ from ..toolkit.capability import (
 from ..toolkit.optimization import (
     TunedAMP,
     FlopCounter,
-    LossWeightOptimizer,
+    LossWeightController,
     ModuleTuner,
     TunedAdamW,
     joining,
@@ -297,7 +297,7 @@ def train(
     mp.allow_connection_pickling()
     set_multiprocessing_env()
     memmap_dir = new_dir("memmap_ds")
-    MemoryMappedTensorStream.materialize(
+    SampleReader.materialize(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
         train_frac=1.0 - float(val_frac),
@@ -427,7 +427,7 @@ def predict(
             for k, v in data.items()
         }
     feats, labels, keys, label_shape = preprocess(data)
-    MemoryMappedTensorStream.materialize(
+    SampleReader.materialize(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
         train_frac=1.0,
@@ -787,7 +787,7 @@ def main_train(*args: Any) -> Optional[Model]:
         tile_size=ops.loss_tile_size,
         reduction="mean",
     )
-    loss_controller = LossWeightOptimizer()
+    loss_controller = LossWeightController()
     train_steps = len(train_loader0)
     val_steps = len(val_loader0) if val_loader0 is not None else 0
     steps_per_epoch = max(1, train_steps + val_steps)
@@ -1047,7 +1047,7 @@ def learn(
     sched: torch.optim.lr_scheduler.LRScheduler,
     train_loader,
     status_bar: Optional[tqdm],
-    loss_controller: LossWeightOptimizer,
+    loss_controller: LossWeightController,
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
     grad_accum_steps: int,
@@ -1179,7 +1179,7 @@ def test(
     param_dtype: torch.dtype,
     val_loader,
     status_bar: Optional[tqdm],
-    loss_controller: LossWeightOptimizer,
+    loss_controller: LossWeightController,
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
     io_time: torch.Tensor,

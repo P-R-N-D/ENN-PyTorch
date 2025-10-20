@@ -17,7 +17,7 @@ from .module import GlobalEncoder, LocalProcessor, Payload
 patch_torch()
 
 
-class LossWeightController(Protocol):
+class LossWeightPolicy(Protocol):
     def weights(self) -> Tuple[float, float]:
         ...
 
@@ -319,7 +319,7 @@ class Model(nn.Module):
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
         loss_weights: Optional[
-            Union[Tuple[float, float], LossWeightController]
+            Union[Tuple[float, float], LossWeightPolicy]
         ] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -414,7 +414,7 @@ class Model(nn.Module):
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
         ):
-            controller: Optional[LossWeightController] = None
+            controller: Optional[LossWeightPolicy] = None
             weights: Tuple[float, float]
             if loss_weights is None:
                 weights = (1.0, 0.0)
@@ -424,7 +424,7 @@ class Model(nn.Module):
                     raise ValueError("loss_weights requires two values")
                 weights = (float(seq[0]), float(seq[1]))
             else:
-                controller = cast(LossWeightController, loss_weights)
+                controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
             total = y_hat_out.new_tensor(0.0, dtype=y_hat_out.dtype)
             top_component: Optional[torch.Tensor] = None
