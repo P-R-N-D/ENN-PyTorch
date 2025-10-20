@@ -19,7 +19,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..architecture.network import Model, ModelConfig, coerce_config
+from ..architecture.network import Model
+from ..architecture.config import ModelConfig, coerce_model_config
 
 
 class MissingDependencyError(ImportError):
@@ -105,9 +106,9 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
 def _model_config_dict(model: Model) -> Dict[str, Any]:
     cfg_obj = getattr(model, "_Model__config", None)
     if isinstance(cfg_obj, ModelConfig):
-        return asdict(cfg_obj)
+        return asdict(coerce_model_config(cfg_obj))
     if isinstance(cfg_obj, dict):
-        return dict(cfg_obj)
+        return asdict(coerce_model_config(cfg_obj))
     return asdict(ModelConfig())
 
 
@@ -573,7 +574,7 @@ def new_model(
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
 ) -> Model:
-    cfg = coerce_config(config)
+    cfg = coerce_model_config(config)
     return Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
 
 
@@ -603,7 +604,9 @@ def load_model(
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
         use_out_shape = tuple(int(x) for x in (out_shape if out_shape is not None else meta.get("out_shape") or ()))
-        use_config = coerce_config(config if config is not None else meta.get("config"))
+        use_config = coerce_model_config(
+            config if config is not None else meta.get("config")
+        )
         model = new_model(use_in_dim, use_out_shape, use_config)
         _require("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
@@ -617,7 +620,7 @@ def load_model(
     meta_cfg = obj.get("config") if isinstance(obj, dict) else None
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
     use_out_shape = tuple(out_shape if out_shape is not None else meta_out_shape or ())
-    use_config = coerce_config(config if config is not None else meta_cfg)
+    use_config = coerce_model_config(config if config is not None else meta_cfg)
     model = new_model(use_in_dim, use_out_shape, use_config)
     sd = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
     model.load_state_dict(sd)

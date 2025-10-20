@@ -6,6 +6,14 @@ from typing import TypeAlias
 from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
 
 _TORCH_COMPAT = patch_torch()
+from .config import (
+    ModelConfig,
+    PatchConfig,
+    model_config,
+    patch_config,
+    coerce_model_config,
+    coerce_patch_config,
+)
 from .module import (
     CrossTransformer,
     DataFidelityLoss,
@@ -24,7 +32,7 @@ from .module import (
     _norm,
     _stochastic_depth_scheduler,
 )
-from .network import Model, ModelConfig, PatchConfig, coerce_config
+from .network import Model
 
 __all__ = [
     "sdpa_kernel",
@@ -33,7 +41,10 @@ __all__ = [
     "ModelConfig",
     "PatchConfig",
     "BuildConfig",
-    "coerce_config",
+    "model_config",
+    "patch_config",
+    "coerce_model_config",
+    "coerce_patch_config",
     "SpatialSubnet",
     "TemporalSubnet",
     "SpatioTemporalNet",

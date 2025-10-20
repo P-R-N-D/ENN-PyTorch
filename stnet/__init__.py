@@ -4,13 +4,16 @@ from __future__ import annotations
 from typing import Any
 
 from . import architecture
-from .workflow import OpsConfig
+from .workflow import OpsConfig, ops_config, coerce_ops_config
 
 Model = architecture.Model
 ModelConfig = architecture.ModelConfig
 PatchConfig = architecture.PatchConfig
 BuildConfig = architecture.BuildConfig
-coerce_config = architecture.coerce_config
+model_config = architecture.model_config
+patch_config = architecture.patch_config
+coerce_model_config = architecture.coerce_model_config
+coerce_patch_config = architecture.coerce_patch_config
 SpatialSubnet = architecture.SpatialSubnet
 TemporalSubnet = architecture.TemporalSubnet
 SpatioTemporalNet = architecture.SpatioTemporalNet
@@ -30,7 +33,12 @@ __all__ = [
     "PatchConfig",
     "BuildConfig",
     "OpsConfig",
-    "coerce_config",
+    "ops_config",
+    "coerce_ops_config",
+    "model_config",
+    "patch_config",
+    "coerce_model_config",
+    "coerce_patch_config",
     "train",
     "predict",
     "new_model",

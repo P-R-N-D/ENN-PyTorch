@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..architecture.network import ModelConfig, PatchConfig
-from .operation import OpsConfig
+from ..architecture.config import ModelConfig, PatchConfig
+from .config import OpsConfig, coerce_ops_config, ops_config
 
 
 def new_model(*args: Any, **kwargs: Any) -> Any:
@@ -46,6 +46,8 @@ __all__ = [
     "ModelConfig",
     "PatchConfig",
     "OpsConfig",
+    "ops_config",
+    "coerce_ops_config",
     "new_model",
     "load_model",
     "save_model",
