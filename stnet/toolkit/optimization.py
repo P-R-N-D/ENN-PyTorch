@@ -824,6 +824,9 @@ class TunedDPA(torch.nn.Module):
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
+        q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
+        k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
+        v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
@@ -834,13 +837,13 @@ class TunedDPA(torch.nn.Module):
         if backends:
             with sdpa_kernel(backends):
                 sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                    q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                    q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
                 )
         if sdpa_out is None:
             sdpa_out = torch.nn.functional.scaled_dot_product_attention(
-                q_bshd, k_bshd, v_bshd, **sdpa_kwargs
+                q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
             )
-        return sdpa_out.contiguous()
+        return sdpa_out.permute(0, 2, 1, 3).contiguous()
 
     @staticmethod
     def _to_optimal_dtype(x: torch.Tensor) -> torch.Tensor:
