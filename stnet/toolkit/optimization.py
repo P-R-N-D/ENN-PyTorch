@@ -6,6 +6,7 @@ import logging
 import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -40,6 +41,128 @@ else:
     FSDPModule = object
 
 JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
+
+
+def _infer_linear_mkn(
+    inp: torch.Tensor, weight: Optional[torch.Tensor]
+) -> Tuple[int, int, int]:
+    if weight is not None and weight.ndim >= 2:
+        k_dim = int(weight.shape[-1])
+        n_dim = int(weight.shape[0])
+    else:
+        k_dim = int(inp.shape[-1])
+        n_dim = int(getattr(inp, "shape", [0])[-1])
+    m_dim = int(inp.numel() // max(k_dim, 1))
+    return (m_dim, k_dim, n_dim)
+
+
+def _compute_linear_flops(
+    inp: torch.Tensor,
+    out: Any,
+    weight: Optional[torch.Tensor],
+    include_bias: bool,
+    effective_bwd: float,
+) -> float:
+    m_dim, k_dim, n_dim = _infer_linear_mkn(inp, weight)
+    if isinstance(out, torch.Tensor) and out.numel() > 0 and n_dim > 0:
+        m_dim = max(m_dim, int(out.numel() // max(n_dim, 1)))
+    if m_dim <= 0 or k_dim <= 0 or n_dim <= 0:
+        return 0.0
+    bias_cost = m_dim * n_dim if include_bias else 0.0
+    fwd = 2.0 * m_dim * k_dim * n_dim + bias_cost
+    return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
+
+
+def _compute_conv_flops(
+    inp: torch.Tensor,
+    out: Any,
+    weight: Optional[torch.Tensor],
+    groups: int,
+    effective_bwd: float,
+) -> float:
+    if weight is None or weight.ndim < 3:
+        return 0.0
+    try:
+        out_elems = int(out.numel()) if isinstance(out, torch.Tensor) else 0
+        groups = max(1, int(groups))
+        if isinstance(inp, torch.Tensor) and inp.ndim >= 2:
+            cin_total = int(inp.shape[1])
+        else:
+            cin_total = int(weight.shape[1] * groups)
+        cin_per_group = max(1, cin_total // groups)
+        kernel = int(weight[0].numel()) // max(cin_per_group, 1)
+        return float(
+            out_elems
+            * (2.0 * cin_per_group * kernel)
+            * (1.0 + max(0.0, float(effective_bwd)))
+        )
+    except Exception:
+        return 0.0
+
+
+def _linear_forward_hook(
+    mod: nn.Module,
+    inp: Tuple[Any, ...],
+    out: Any,
+    *,
+    profiler: "_FlopProfiler",
+    include_bias: bool,
+    effective_bwd: float,
+) -> None:
+    weight = getattr(mod, "weight", None)
+    if weight is None:
+        inner_linear = getattr(mod, "linear", None)
+        weight = getattr(inner_linear, "weight", None)
+    x = inp[0] if inp else None
+    if not isinstance(x, torch.Tensor) or weight is None:
+        return
+    val = _compute_linear_flops(x, out, weight, include_bias, effective_bwd)
+    if val > 0.0:
+        profiler.add_manual(type(mod).__name__, val)
+
+
+def _conv_forward_hook(
+    mod: nn.Module,
+    inp: Tuple[Any, ...],
+    out: Any,
+    *,
+    profiler: "_FlopProfiler",
+    effective_bwd: float,
+) -> None:
+    weight = getattr(mod, "weight", None)
+    x = inp[0] if inp else None
+    if not isinstance(x, torch.Tensor) or weight is None:
+        return
+    groups = getattr(mod, "groups", 1)
+    val = _compute_conv_flops(x, out, weight, groups, effective_bwd)
+    if val > 0.0:
+        profiler.add_manual(type(mod).__name__, val)
+
+
+def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
+    return torch.stack((x, x), dim=-1).reshape(x.shape[0], -1)
+
+
+def is_transformer_engine_enabled(model: torch.nn.Module) -> bool:
+    te_flags = (
+        getattr(model, "__fp8_inference_te__", False),
+        getattr(model, "__fp8_training_te__", False),
+        getattr(model, "__te_fp8_default__", False),
+    )
+    if any(te_flags):
+        return True
+
+    for module in model.modules():
+        mod_name = getattr(module.__class__, "__module__", "")
+        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+            return True
+    return False
+
+
+def no_gradation(model: torch.nn.Module) -> AbstractContextManager[None]:
+    if is_transformer_engine_enabled(model):
+        return torch.no_grad()
+    return torch.inference_mode()
 
 
 def _has_join_hook(obj: Any | None) -> bool:
@@ -243,91 +366,26 @@ class _FlopProfiler:
             if t is not None:
                 conv_types.append(t)
 
-        def _infer_linear_mkn(
-            inp: torch.Tensor, weight: Optional[torch.Tensor]
-        ) -> Tuple[int, int, int]:
-            K = (
-                int(weight.shape[-1])
-                if weight is not None and weight.ndim >= 2
-                else int(inp.shape[-1])
-            )
-            M = int(inp.numel() // max(K, 1))
-            N = (
-                int(weight.shape[0])
-                if weight is not None and weight.ndim >= 2
-                else int(getattr(inp, "shape", [0])[-1])
-            )
-            return (M, K, N)
-
-        def linear_flops(
-            inp: torch.Tensor, out: torch.Tensor, weight: Optional[torch.Tensor]
-        ) -> float:
-            M, K, N = _infer_linear_mkn(inp, weight)
-            if out is not None and out.numel() > 0 and (N > 0):
-                M = max(M, int(out.numel() // max(N, 1)))
-            if M <= 0 or K <= 0 or N <= 0:
-                return 0.0
-            bias_cost = 1.0 * M * N if include_bias else 0.0
-            fwd = 2.0 * M * K * N + bias_cost
-            return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
-
-        def conv_flops(
-            inp: torch.Tensor,
-            out: torch.Tensor,
-            weight: Optional[torch.Tensor],
-            groups: int = 1,
-        ) -> float:
-            if weight is None or weight.ndim < 3:
-                return 0.0
-            try:
-                out_elems = int(out.numel())
-                groups = max(1, int(groups))
-                cin_total = (
-                    int(inp.shape[1])
-                    if isinstance(inp, torch.Tensor) and inp.ndim >= 2
-                    else int(weight.shape[1] * groups)
-                )
-                cin_per_group = max(1, cin_total // groups)
-                kernel = int(weight[0].numel()) // max(cin_per_group, 1)
-                return float(
-                    out_elems
-                    * (2.0 * cin_per_group * kernel)
-                    * (1.0 + max(0.0, float(effective_bwd)))
-                )
-            except Exception:
-                return 0.0
-
         handles: List[Any] = []
         self.activate()
-
-        def _hook_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any) -> None:
-            weight = getattr(mod, "weight", None)
-            if weight is None:
-                inner_linear = getattr(mod, "linear", None)
-                weight = getattr(inner_linear, "weight", None)
-            x = inp[0] if inp else None
-            if not isinstance(x, torch.Tensor) or weight is None:
-                return
-            val = linear_flops(x, out, weight)
-            if val > 0.0:
-                self.add_manual(type(mod).__name__, val)
-
-        def _hook_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any) -> None:
-            weight = getattr(mod, "weight", None)
-            x = inp[0] if inp else None
-            if not isinstance(x, torch.Tensor) or weight is None:
-                return
-            groups = getattr(mod, "groups", 1)
-            val = conv_flops(x, out, weight, groups=groups)
-            if val > 0.0:
-                self.add_manual(type(mod).__name__, val)
+        linear_hook = partial(
+            _linear_forward_hook,
+            profiler=self,
+            include_bias=include_bias,
+            effective_bwd=effective_bwd,
+        )
+        conv_hook = partial(
+            _conv_forward_hook,
+            profiler=self,
+            effective_bwd=effective_bwd,
+        )
 
         try:
             for m in model.modules():
                 if isinstance(m, tuple(target_types)):
-                    handles.append(m.register_forward_hook(_hook_linear))
+                    handles.append(m.register_forward_hook(linear_hook))
                 elif any(isinstance(m, t) for t in conv_types):
-                    handles.append(m.register_forward_hook(_hook_conv))
+                    handles.append(m.register_forward_hook(conv_hook))
             return handles
         except Exception:
             self.stop_hooks(handles)
@@ -980,12 +1038,8 @@ class TunedMSR(nn.Module):
             0, 1, half, device=device, dtype=torch.float32
         )
         freqs = torch.einsum("n,d->nd", t, inv_freq)
-
-        def _dup(x: Any) -> Any:
-            return torch.stack((x, x), dim=-1).reshape(x.shape[0], -1)
-
-        sin = _dup(torch.sin(freqs)).to(dtype)[None, None, :, :]
-        cos = _dup(torch.cos(freqs)).to(dtype)[None, None, :, :]
+        sin = _duplicate_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
+        cos = _duplicate_last_dim(torch.cos(freqs)).to(dtype)[None, None, :, :]
         L = seq_len
         i = torch.arange(L, device=device)
         j = torch.arange(L, device=device)
@@ -1870,6 +1924,121 @@ class ModuleTuner:
         )
 
     @staticmethod
+    def _try_enable_te_training(
+        model: nn.Module,
+        params_dtype: torch.dtype,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            swapped_model, n = ModuleTuner._apply_te_module(
+                model,
+                apply_te_linear=True,
+                apply_te_layer_norm=True,
+                apply_te_rms_norm=True,
+                filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                and lyr.out_features % 16 == 0,
+                params_dtype=params_dtype,
+            )
+            if n > 0:
+                setattr(swapped_model, "__fp8_training_te__", True)
+                if logger:
+                    logger(f"[FP8][TE] swapped {n} modules")
+                return (swapped_model, True, f"TE (swapped {n})")
+            return (model, False, "TE present but no eligible modules")
+        except Exception as exc:
+            return (model, False, f"TE swap failed: {exc}")
+
+    @staticmethod
+    def _try_enable_ao_training(
+        model: nn.Module,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            from torchao.float8 import convert_to_float8_training
+
+            res = convert_to_float8_training(model)
+            converted = res or model
+            setattr(converted, "__fp8_training_ao__", True)
+            if logger:
+                logger("[FP8][AO] convert_to_float8_training ok")
+            return (converted, True, "torchao.float8")
+        except Exception as exc:
+            return (model, False, f"torchao convert failed: {exc}")
+
+    @staticmethod
+    def _try_enable_te_inference_swap(
+        model: nn.Module,
+        params_dtype: torch.dtype,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            swapped, n = ModuleTuner._apply_te_module(
+                model,
+                apply_te_linear=True,
+                apply_te_layer_norm=True,
+                apply_te_rms_norm=True,
+                filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
+                and lyr.out_features % 16 == 0,
+                params_dtype=params_dtype,
+            )
+            if n > 0:
+                setattr(swapped, "__fp8_inference_te__", True)
+                if logger:
+                    logger(
+                        f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
+                    )
+                return (swapped, True, f"TE swap ({n})")
+            return (model, False, "no eligible Linear (dims%16)")
+        except Exception as exc:
+            return (model, False, f"TE swap failed: {exc}")
+
+    @staticmethod
+    def _try_use_existing_te(
+        model: nn.Module,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        te_present = any(
+            (
+                getattr(module.__class__, "__module__", "").startswith(
+                    "transformer_engine"
+                )
+                for module in model.modules()
+            )
+        )
+        if te_present:
+            setattr(model, "__fp8_inference_te__", True)
+            if logger:
+                logger("[FP8][TE] te.* already present; using te.fp8_autocast")
+            return (model, True, "TE present")
+        return (model, False, "TE layers not present")
+
+    @staticmethod
+    def _try_enable_ao_inference(
+        model: nn.Module,
+        dynamic_activations: bool,
+        logger: Optional[Callable[[str], None]],
+    ) -> Tuple[nn.Module, bool, str]:
+        try:
+            from torchao.quantization import (
+                Float8DynamicActivationFloat8WeightConfig,
+                Float8WeightOnlyConfig,
+                quantize_,
+            )
+
+            cfg = (
+                Float8DynamicActivationFloat8WeightConfig()
+                if dynamic_activations
+                else Float8WeightOnlyConfig()
+            )
+            quantize_(model, cfg)
+            setattr(model, "__fp8_inference_ao__", True)
+            if logger:
+                logger(f"[FP8][AO] applied {cfg.__class__.__name__}")
+            return (model, True, "torchao")
+        except Exception as exc:
+            return (model, False, f"AO failed: {exc}")
+
+    @staticmethod
     def enable_float8_training(
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
@@ -1895,46 +2064,18 @@ class ModuleTuner:
             else torch.float32
         )
 
-        def _try_te() -> Any:
-            try:
-                swapped_model, n = ModuleTuner._apply_te_module(
-                    model,
-                    apply_te_linear=True,
-                    apply_te_layer_norm=True,
-                    apply_te_rms_norm=True,
-                    filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
-                    and lyr.out_features % 16 == 0,
-                    params_dtype=params_dtype,
-                )
-                if n > 0:
-                    setattr(swapped_model, "__fp8_training_te__", True)
-                    if logger:
-                        logger(f"[FP8][TE] swapped {n} modules")
-                    return (swapped_model, True, f"TE (swapped {n})")
-                return (model, False, "TE present but no eligible modules")
-            except Exception as e:
-                return (model, False, f"TE swap failed: {e}")
-
-        def _try_ao() -> Any:
-            try:
-                from torchao.float8 import convert_to_float8_training
-
-                res = convert_to_float8_training(model)
-                m2 = res or model
-                setattr(m2, "__fp8_training_ao__", True)
-                if logger:
-                    logger("[FP8][AO] convert_to_float8_training ok")
-                return (m2, True, "torchao.float8")
-            except Exception as e:
-                return (model, False, f"torchao convert failed: {e}")
-
         order = (
             ("te", "torchao")
             if prefer in ("auto", "te")
             else ("torchao", "te")
         )
         for backend in order:
-            m2, ok2, why = _try_te() if backend == "te" else _try_ao()
+            if backend == "te":
+                m2, ok2, why = ModuleTuner._try_enable_te_training(
+                    model, params_dtype, logger
+                )
+            else:
+                m2, ok2, why = ModuleTuner._try_enable_ao_training(model, logger)
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
@@ -1971,67 +2112,6 @@ class ModuleTuner:
             else torch.float32
         )
 
-        def _try_te_swap() -> Any:
-            try:
-                m2, n = ModuleTuner._apply_te_module(
-                    model,
-                    apply_te_linear=True,
-                    apply_te_layer_norm=True,
-                    apply_te_rms_norm=True,
-                    filter_linear=lambda lyr, _: lyr.in_features % 16 == 0
-                    and lyr.out_features % 16 == 0,
-                    params_dtype=params_dtype,
-                )
-                if n > 0:
-                    setattr(m2, "__fp8_inference_te__", True)
-                    if logger:
-                        logger(
-                            f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
-                        )
-                    return (m2, True, f"TE swap ({n})")
-                return (model, False, "no eligible Linear (dims%16)")
-            except Exception as e:
-                return (model, False, f"TE swap failed: {e}")
-
-        def _try_te_present() -> Any:
-            te_present = any(
-                (
-                    getattr(m.__class__, "__module__", "").startswith(
-                        "transformer_engine"
-                    )
-                    for m in model.modules()
-                )
-            )
-            if te_present:
-                setattr(model, "__fp8_inference_te__", True)
-                if logger:
-                    logger(
-                        "[FP8][TE] te.* already present; using te.fp8_autocast"
-                    )
-                return (model, True, "TE present")
-            return (model, False, "TE layers not present")
-
-        def _try_ao() -> Any:
-            try:
-                from torchao.quantization import (
-                    Float8DynamicActivationFloat8WeightConfig,
-                    Float8WeightOnlyConfig,
-                    quantize_,
-                )
-
-                cfg = (
-                    Float8DynamicActivationFloat8WeightConfig()
-                    if dynamic_activations
-                    else Float8WeightOnlyConfig()
-                )
-                quantize_(model, cfg)
-                setattr(model, "__fp8_inference_ao__", True)
-                if logger:
-                    logger(f"[FP8][AO] applied {cfg.__class__.__name__}")
-                return (model, True, "torchao")
-            except Exception as e:
-                return (model, False, f"AO failed: {e}")
-
         order = (
             ("te_swap", "te_present", "ao")
             if prefer in ("auto", "te")
@@ -2040,11 +2120,16 @@ class ModuleTuner:
         for step in order:
             if step == "te_swap" and (not te_swap):
                 continue
-            m2, ok2, why = {
-                "te_swap": _try_te_swap,
-                "te_present": _try_te_present,
-                "ao": _try_ao,
-            }[step]()
+            if step == "te_swap":
+                m2, ok2, why = ModuleTuner._try_enable_te_inference_swap(
+                    model, params_dtype, logger
+                )
+            elif step == "te_present":
+                m2, ok2, why = ModuleTuner._try_use_existing_te(model, logger)
+            else:
+                m2, ok2, why = ModuleTuner._try_enable_ao_inference(
+                    model, dynamic_activations, logger
+                )
             if ok2:
                 if logger:
                     logger(f"[FP8] inference enabled via {why} ({reason})")

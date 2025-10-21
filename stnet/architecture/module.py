@@ -59,6 +59,23 @@ def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
     return [step * float(index + 1) for index in range(depth)]
 
 
+def reshape_for_heads(
+    tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
+) -> torch.Tensor:
+    return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
+
+
+def expand_mask_like_prediction(
+    mask: torch.Tensor, prediction: torch.Tensor
+) -> torch.Tensor:
+    try:
+        if mask.shape != prediction.shape:
+            mask = mask.expand_as(prediction)
+    except Exception:
+        pass
+    return mask
+
+
 patch_torch()
 if TYPE_CHECKING:
     from .network import ModelConfig
@@ -1546,20 +1563,12 @@ class TiledLoss(nn.Module):
     def _make_mask(
         self, pred: torch.Tensor, target: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        def _ensure_shape(mask: torch.Tensor) -> torch.Tensor:
-            try:
-                if mask.shape != pred.shape:
-                    mask = mask.expand_as(pred)
-            except Exception:
-                pass
-            return mask
-
         match self.mask_mode:
             case "none":
                 return None
             case "finite":
                 try:
-                    return _ensure_shape(torch.isfinite(target))
+                    return expand_mask_like_prediction(torch.isfinite(target), pred)
                 except Exception:
                     return None
             case "neq":
@@ -1571,7 +1580,7 @@ class TiledLoss(nn.Module):
                         dtype=target.dtype,
                         device=target.device,
                     )
-                    return _ensure_shape(target != base)
+                    return expand_mask_like_prediction(target != base, pred)
                 except Exception:
                     return None
             case _:
@@ -1668,11 +1677,11 @@ class GatedCrossAttention(nn.Module):
         qn = self.q_proj(self.norm_q(q))
         kv = self.kv_proj(kv)
         k, v = kv.chunk(2, dim=-1)
-
-        def split(x: torch.Tensor) -> torch.Tensor:
-            return x.view(B, -1, self.nhead, self.head_dim).transpose(1, 2)
-
-        qh, kh, vh = (split(qn), split(k), split(v))
+        qh, kh, vh = (
+            reshape_for_heads(qn, B, self.nhead, self.head_dim),
+            reshape_for_heads(k, B, self.nhead, self.head_dim),
+            reshape_for_heads(v, B, self.nhead, self.head_dim),
+        )
         yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
         y = self.out_proj(self.dropout(y))
@@ -1747,10 +1756,11 @@ class SpatialEncoderLayer(nn.Module):
         qkv = self.qkv(self.norm1(x))
         q, k, v = qkv.chunk(3, dim=-1)
 
-        def _split(t: torch.Tensor) -> torch.Tensor:
-            return t.view(B, N, self.nhead, self.head_dim).transpose(1, 2)
-
-        qh, kh, vh = (_split(q), _split(k), _split(v))
+        qh, kh, vh = (
+            reshape_for_heads(q, B, self.nhead, self.head_dim),
+            reshape_for_heads(k, B, self.nhead, self.head_dim),
+            reshape_for_heads(v, B, self.nhead, self.head_dim),
+        )
         rel = coords.unsqueeze(2) - coords.unsqueeze(1)
         rel_bias = self.rel_bias(rel).permute(0, 3, 1, 2)
         rel_value = (

@@ -6,12 +6,24 @@ import os
 import shutil
 import subprocess
 import warnings
+import contextlib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Protocol
 
 import torch
 from torch import nn
+
+try:
+    from torch.serialization import add_safe_globals as _add_safe_globals
+except ImportError:  # pragma: no cover - PyTorch < 2.6
+    _add_safe_globals = None
+
+if _add_safe_globals is not None:  # pragma: no cover - defensive runtime guard
+    with contextlib.suppress(Exception):
+        import torch.torch_version as _torch_version
+
+        _add_safe_globals([_torch_version.TorchVersion])
 
 from torch.distributed.checkpoint import FileSystemReader, load as dcp_load
 from torch.distributed.checkpoint.state_dict import (

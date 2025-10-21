@@ -5,6 +5,7 @@ import os
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from importlib import import_module, util
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -28,6 +29,88 @@ except Exception:
         _ = backends
         del _
         yield
+
+
+def _fmin_impl(torch_mod: Any, a: Any, b: Any) -> Any:
+    a, b = torch_mod.broadcast_tensors(a, b)
+    a_nan = torch_mod.isnan(a)
+    b_nan = torch_mod.isnan(b)
+    return torch_mod.where(
+        a_nan & ~b_nan,
+        b,
+        torch_mod.where(b_nan & ~a_nan, a, torch_mod.minimum(a, b)),
+    )
+
+
+def _nanmin_impl(
+    torch_mod: Any,
+    x: Any,
+    dim: int | None = None,
+    keepdim: bool = False,
+) -> Any:
+    mask = torch_mod.isfinite(x)
+    xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("inf")))
+    if dim is None:
+        if not bool(mask.any()):
+            return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
+        return xp.min()
+    values, indices = xp.min(dim=dim, keepdim=keepdim)
+    any_valid = mask.any(dim=dim, keepdim=keepdim)
+    values = torch_mod.where(
+        any_valid,
+        values,
+        torch_mod.full_like(values, float("nan")),
+    )
+    indices = torch_mod.where(
+        any_valid,
+        indices,
+        torch_mod.zeros_like(indices),
+    )
+    return (values, indices)
+
+
+def _nanmax_impl(
+    torch_mod: Any,
+    x: Any,
+    dim: int | None = None,
+    keepdim: bool = False,
+) -> Any:
+    mask = torch_mod.isfinite(x)
+    xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("-inf")))
+    if dim is None:
+        if not bool(mask.any()):
+            return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
+        return xp.max()
+    values, indices = xp.max(dim=dim, keepdim=keepdim)
+    any_valid = mask.any(dim=dim, keepdim=keepdim)
+    values = torch_mod.where(
+        any_valid,
+        values,
+        torch_mod.full_like(values, float("nan")),
+    )
+    indices = torch_mod.where(
+        any_valid,
+        indices,
+        torch_mod.zeros_like(indices),
+    )
+    return (values, indices)
+
+
+def _nansum_impl(
+    torch_mod: Any,
+    x: Any,
+    dim: int | tuple[int, ...] | None = None,
+    keepdim: bool = False,
+    *args: Any,
+    dtype: Any = None,
+    **kwargs: Any,
+) -> Any:
+    _ = args, kwargs
+    x_cast = x.to(dtype) if dtype is not None else x
+    mask = torch_mod.isfinite(x_cast)
+    zero = torch_mod.zeros((), device=x_cast.device, dtype=x_cast.dtype)
+    x_masked = torch_mod.where(mask, x_cast, zero)
+    return torch_mod.sum(x_masked, dim=dim, keepdim=keepdim)
 
 
 _TORCH_COMPAT: TorchCompat | None = None
@@ -75,106 +158,22 @@ class TorchCompat:
     def _ensure_fmin(self) -> None:
         if hasattr(self.module, "fmin"):
             return
-        torch_mod = self.module
-
-        def _fmin(a: Any, b: Any) -> Any:
-            a, b = torch_mod.broadcast_tensors(a, b)
-            a_nan = torch_mod.isnan(a)
-            b_nan = torch_mod.isnan(b)
-            return torch_mod.where(
-                a_nan & ~b_nan,
-                b,
-                torch_mod.where(b_nan & ~a_nan, a, torch_mod.minimum(a, b)),
-            )
-
-        setattr(self.module, "fmin", _fmin)
+        setattr(self.module, "fmin", partial(_fmin_impl, self.module))
 
     def _ensure_nanmin(self) -> None:
         if hasattr(self.module, "nanmin"):
             return
-        torch_mod = self.module
-
-        def _nanmin(
-            x: Any,
-            dim: int | None = None,
-            keepdim: bool = False,
-        ) -> Any:
-            mask = torch_mod.isfinite(x)
-            xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("inf")))
-            if dim is None:
-                if not bool(mask.any()):
-                    return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
-                return xp.min()
-            values, indices = xp.min(dim=dim, keepdim=keepdim)
-            any_valid = mask.any(dim=dim, keepdim=keepdim)
-            values = torch_mod.where(
-                any_valid,
-                values,
-                torch_mod.full_like(values, float("nan")),
-            )
-            indices = torch_mod.where(
-                any_valid,
-                indices,
-                torch_mod.zeros_like(indices),
-            )
-            return (values, indices)
-
-        setattr(self.module, "nanmin", _nanmin)
+        setattr(self.module, "nanmin", partial(_nanmin_impl, self.module))
 
     def _ensure_nanmax(self) -> None:
         if hasattr(self.module, "nanmax"):
             return
-        torch_mod = self.module
-
-        def _nanmax(
-            x: Any,
-            dim: int | None = None,
-            keepdim: bool = False,
-        ) -> Any:
-            mask = torch_mod.isfinite(x)
-            xp = torch_mod.where(mask, x, torch_mod.full_like(x, float("-inf")))
-            if dim is None:
-                if not bool(mask.any()):
-                    return torch_mod.full((), float("nan"), device=x.device, dtype=x.dtype)
-                return xp.max()
-            values, indices = xp.max(dim=dim, keepdim=keepdim)
-            any_valid = mask.any(dim=dim, keepdim=keepdim)
-            values = torch_mod.where(
-                any_valid,
-                values,
-                torch_mod.full_like(values, float("nan")),
-            )
-            indices = torch_mod.where(
-                any_valid,
-                indices,
-                torch_mod.zeros_like(indices),
-            )
-            return (values, indices)
-
-        setattr(self.module, "nanmax", _nanmax)
+        setattr(self.module, "nanmax", partial(_nanmax_impl, self.module))
 
     def _ensure_nansum(self) -> None:
         if hasattr(self.module, "nansum"):
             return
-        torch_mod = self.module
-
-        def _nansum(
-            x: Any,
-            dim: int | tuple[int, ...] | None = None,
-            keepdim: bool = False,
-            *args: Any,
-            dtype: Any = None,
-            **kwargs: Any,
-        ) -> Any:
-            x_cast = x.to(dtype) if dtype is not None else x
-            mask = torch_mod.isfinite(x_cast)
-            zero = torch_mod.zeros(
-                (), device=x_cast.device, dtype=x_cast.dtype
-            )
-            x_masked = torch_mod.where(mask, x_cast, zero)
-            return torch_mod.sum(x_masked, dim=dim, keepdim=keepdim)
-
-        setattr(self.module, "nansum", _nansum)
+        setattr(self.module, "nansum", partial(_nansum_impl, self.module))
 
 
 def patch_torch(

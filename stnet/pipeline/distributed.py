@@ -43,7 +43,11 @@ except ImportError:
 
     Endpoint = _EndpointUnavailable()
 
-from ..toolkit.capability import get_available_addr, get_world_size
+from ..toolkit.capability import (
+    get_available_addr,
+    get_preferred_ip,
+    get_world_size,
+)
 
 
 GRPC_DEFAULT_PORT = 5005
@@ -137,10 +141,303 @@ def _hostname() -> str:
 
 
 def _infer_local_ip() -> str:
+    hostname = _hostname()
+    ip_value = get_preferred_ip(hostname, allow_loopback=True)
+    return ip_value or "127.0.0.1"
+
+
+def _coerce_host_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _sanitize_ip_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    stripped = candidate
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1].strip()
+        if not stripped:
+            return None
+    if "%" in stripped:
+        base, _, _ = stripped.partition("%")
+        stripped = base.strip()
+        if not stripped:
+            return None
     try:
-        return socket.gethostbyname(_hostname())
+        parsed = ipaddress.ip_address(stripped)
+    except ValueError:
+        return None
+    if parsed.is_unspecified or parsed.is_loopback:
+        return None
+    return str(parsed)
+
+
+def _resolve_ip_from_host_value(hostname: Any) -> Optional[str]:
+    if not isinstance(hostname, str):
+        return None
+    candidate = hostname.strip()
+    if not candidate:
+        return None
+    addrinfo: List[tuple[Any, ...]] | None = None
+    try:
+        addrinfo = socket.getaddrinfo(
+            candidate,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return None
     except Exception:
-        return "127.0.0.1"
+        with contextlib.suppress(Exception):
+            addrinfo = socket.getaddrinfo(candidate, None)
+    if not addrinfo:
+        return None
+    for resolved in addrinfo:
+        try:
+            sockaddr = resolved[4]
+        except Exception:
+            sockaddr = None
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        sanitized = _sanitize_ip_value(addr)
+        if sanitized:
+            return sanitized
+    return None
+
+
+def _as_dict(
+    candidate: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None
+) -> Dict[str, Any]:
+    if isinstance(candidate, dict):
+        return dict(candidate)
+    if isinstance(candidate, Mapping):
+        return dict(candidate)
+    result: Dict[str, Any] = {}
+    if isinstance(candidate, Iterable):
+        for item in cast(Iterable[Tuple[Any, Any]], candidate):
+            try:
+                key, value = item
+            except Exception:
+                continue
+            result[key] = value
+    return result
+
+
+def _merge_leader_info(
+    existing: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
+    info: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
+    host: str,
+) -> Dict[str, Any]:
+    info_dict = _as_dict(info)
+    leader_info = _as_dict(existing)
+
+    for key, value in info_dict.items():
+        if key in {"ip", "host"}:
+            continue
+        existing_value = leader_info.get(key, ...)
+        if existing_value is ... or existing_value != value:
+            leader_info[key] = value
+
+    ip_value = info_dict.get("ip")
+    sanitized_ip = _sanitize_ip_value(ip_value)
+    if sanitized_ip:
+        leader_info["ip"] = sanitized_ip
+    elif ip_value:
+        leader_info["ip"] = ip_value
+
+    host_value = info_dict.get("host")
+    resolved_host = host_value.strip() if isinstance(host_value, str) else ""
+    if resolved_host:
+        leader_info["host"] = resolved_host
+    else:
+        leader_info.setdefault("host", host)
+
+    cached_ip = leader_info.get("ip")
+    cached_sanitized_ip = _sanitize_ip_value(cached_ip)
+    if isinstance(cached_ip, str) and not cached_sanitized_ip:
+        leader_info.pop("ip", None)
+    elif cached_sanitized_ip:
+        leader_info["ip"] = cached_sanitized_ip
+
+    has_valid_ip = bool(_sanitize_ip_value(leader_info.get("ip")))
+    target_host = leader_info.get("host") or host
+    if (not has_valid_ip) and target_host:
+        resolved_ip = _resolve_ip_from_host_value(target_host)
+        if resolved_ip:
+            leader_info["ip"] = resolved_ip
+    return leader_info
+
+
+def _wait_for_flight_port_value(
+    target_host: str,
+    *,
+    total_timeout_s: float | None = 60.0,
+    poll_timeout_s: float = 2.0,
+) -> Optional[int]:
+    if total_timeout_s is not None and total_timeout_s <= 0:
+        total_timeout_s = 0.0
+    deadline = None if total_timeout_s is None else time.time() + total_timeout_s
+    while True:
+        try:
+            port_value = wait_key(
+                f"flight_port:{target_host}",
+                timeout_s=poll_timeout_s,
+            )
+        except TimeoutError:
+            if deadline is not None and time.time() >= deadline:
+                return None
+            continue
+        try:
+            return int(port_value)
+        except (TypeError, ValueError):
+            return None
+
+
+def _coerce_host_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _sanitize_ip_value(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip()
+    if not candidate:
+        return None
+    stripped = candidate
+    if stripped.startswith("[") and stripped.endswith("]"):
+        stripped = stripped[1:-1].strip()
+        if not stripped:
+            return None
+    if "%" in stripped:
+        base, _, _ = stripped.partition("%")
+        stripped = base.strip()
+        if not stripped:
+            return None
+    try:
+        parsed = ipaddress.ip_address(stripped)
+    except ValueError:
+        return None
+    if parsed.is_unspecified or parsed.is_loopback:
+        return None
+    return str(parsed)
+
+
+def _resolve_ip_from_host_value(hostname: Any) -> Optional[str]:
+    if not isinstance(hostname, str):
+        return None
+    candidate = hostname.strip()
+    if not candidate:
+        return None
+    addrinfo = None
+    try:
+        addrinfo = socket.getaddrinfo(
+            candidate,
+            None,
+            family=socket.AF_UNSPEC,
+            type=socket.SOCK_STREAM,
+        )
+    except socket.gaierror:
+        return None
+    except Exception:
+        with contextlib.suppress(Exception):
+            addrinfo = socket.getaddrinfo(candidate, None)
+    if not addrinfo:
+        return None
+    for resolved in addrinfo:
+        try:
+            sockaddr = resolved[4]
+        except Exception:
+            sockaddr = None
+        if not sockaddr:
+            continue
+        addr = sockaddr[0]
+        sanitized = _sanitize_ip_value(addr)
+        if sanitized:
+            return sanitized
+    return None
+
+
+def _merge_leader_info(
+    existing: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
+    info: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
+    host: str,
+) -> Dict[str, Any]:
+    info_dict = _as_dict(info)
+    leader_info = _as_dict(existing)
+
+    for key, value in info_dict.items():
+        if key in {"ip", "host"}:
+            continue
+        existing_value = leader_info.get(key, ...)
+        if existing_value is ... or existing_value != value:
+            leader_info[key] = value
+
+    ip_value = info_dict.get("ip")
+    sanitized_ip = _sanitize_ip_value(ip_value)
+    if sanitized_ip:
+        leader_info["ip"] = sanitized_ip
+    elif ip_value:
+        leader_info["ip"] = ip_value
+
+    host_value = info_dict.get("host")
+    resolved_host = host_value.strip() if isinstance(host_value, str) else ""
+    if resolved_host:
+        leader_info["host"] = resolved_host
+    else:
+        leader_info.setdefault("host", host)
+
+    cached_ip = leader_info.get("ip")
+    cached_sanitized_ip = _sanitize_ip_value(cached_ip)
+    if isinstance(cached_ip, str) and not cached_sanitized_ip:
+        leader_info.pop("ip", None)
+    elif cached_sanitized_ip:
+        leader_info["ip"] = cached_sanitized_ip
+
+    has_valid_ip = bool(_sanitize_ip_value(leader_info.get("ip")))
+    target_host = leader_info.get("host") or host
+    if (not has_valid_ip) and target_host:
+        resolved_ip = _resolve_ip_from_host_value(target_host)
+        if resolved_ip:
+            leader_info["ip"] = resolved_ip
+    return leader_info
+
+
+def _wait_for_flight_port_value(
+    target_host: str,
+    *,
+    total_timeout_s: float | None = 60.0,
+    poll_timeout_s: float = 2.0,
+) -> Optional[int]:
+    if total_timeout_s is not None and total_timeout_s <= 0:
+        total_timeout_s = 0.0
+    deadline = None if total_timeout_s is None else time.time() + total_timeout_s
+    while True:
+        try:
+            port_value = wait_key(
+                f"flight_port:{target_host}",
+                timeout_s=poll_timeout_s,
+            )
+        except TimeoutError:
+            if deadline is not None and time.time() >= deadline:
+                return None
+            continue
+        try:
+            return int(port_value)
+        except (TypeError, ValueError):
+            return None
 
 
 def _gather_all(obj: Any) -> List[Any]:
@@ -154,16 +451,9 @@ def _format_flight_host(
     host: Any, fallback: Any | None = None, *args: Any, default: str = "127.0.0.1", **kwargs: Any
 ) -> str:
 
-    def _coerce(value: Any) -> str:
-        if isinstance(value, str):
-            return value.strip()
-        if value is None:
-            return ""
-        return str(value).strip()
-
-    preferred = _coerce(host)
-    fallback_value = _coerce(fallback)
-    default_value = _coerce(default) or "127.0.0.1"
+    preferred = _coerce_host_value(host)
+    fallback_value = _coerce_host_value(fallback)
+    default_value = _coerce_host_value(default) or "127.0.0.1"
 
     for candidate, allow_loopback in (
         (preferred, False),
@@ -307,158 +597,6 @@ class IOController:
             )
             leaders[host] = dict(leader)
         self._leaders = leaders
-        def _wait_for_flight_port(
-            target_host: str,
-            *args: Any,
-            total_timeout_s: float = 60.0,
-            poll_timeout_s: float = 2.0,
-            **kwargs: Any,
-        ) -> int | None:
-            if total_timeout_s is not None and total_timeout_s <= 0:
-                total_timeout_s = 0.0
-            deadline = None if total_timeout_s is None else time.time() + total_timeout_s
-            while True:
-                try:
-                    port_value = wait_key(
-                        f"flight_port:{target_host}",
-                        timeout_s=poll_timeout_s,
-                    )
-                except TimeoutError:
-                    if deadline is not None and time.time() >= deadline:
-                        return None
-                    continue
-                try:
-                    return int(port_value)
-                except (TypeError, ValueError):
-                    return None
-
-        def _cache_leader(host: str, info: Mapping[str, Any] | None) -> Dict[str, Any]:
-            def _sanitize_ip(value: Any) -> Optional[str]:
-                if not isinstance(value, str):
-                    return None
-                candidate = value.strip()
-                if not candidate:
-                    return None
-                stripped = candidate
-                if stripped.startswith("[") and stripped.endswith("]"):
-                    stripped = stripped[1:-1].strip()
-                    if not stripped:
-                        return None
-                if "%" in stripped:
-                    base, _, _ = stripped.partition("%")
-                    stripped = base.strip()
-                    if not stripped:
-                        return None
-                try:
-                    parsed = ipaddress.ip_address(stripped)
-                except ValueError:
-                    return None
-                if parsed.is_unspecified or parsed.is_loopback:
-                    return None
-                return str(parsed)
-
-            def _resolve_ip_from_host(hostname: Any) -> Optional[str]:
-                if not isinstance(hostname, str):
-                    return None
-                candidate = hostname.strip()
-                if not candidate:
-                    return None
-                addrinfo: List[tuple[Any, ...]] | None = None
-                try:
-                    addrinfo = socket.getaddrinfo(
-                        candidate,
-                        None,
-                        family=socket.AF_UNSPEC,
-                        type=socket.SOCK_STREAM,
-                    )
-                except socket.gaierror:
-                    return None
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        addrinfo = socket.getaddrinfo(candidate, None)
-                if not addrinfo:
-                    return None
-                for resolved in addrinfo:
-                    try:
-                        sockaddr = resolved[4]
-                    except Exception:
-                        sockaddr = None
-                    if not sockaddr:
-                        continue
-                    addr = sockaddr[0]
-                    sanitized = _sanitize_ip(addr)
-                    if sanitized:
-                        return sanitized
-                return None
-
-            if isinstance(info, dict):
-                info_dict: Dict[str, Any] = info
-            elif info is None:
-                info_dict = {}
-            elif isinstance(info, Mapping):
-                info_dict = dict(info)
-            else:
-                info_dict = {}
-                if isinstance(info, Iterable):
-                    for item in cast(Iterable[Tuple[Any, Any]], info):
-                        try:
-                            key, value = item
-                        except Exception:
-                            continue
-                        info_dict[key] = value
-
-            existing = self._leaders.get(host)
-            if isinstance(existing, dict):
-                leader_info = existing
-            elif isinstance(existing, Mapping):
-                leader_info = dict(existing)
-            elif existing is None:
-                leader_info = {}
-            else:
-                leader_info = {}
-                if isinstance(existing, Iterable):
-                    for item in cast(Iterable[Tuple[Any, Any]], existing):
-                        try:
-                            key, value = item
-                        except Exception:
-                            continue
-                        leader_info[key] = value
-
-            for key, value in info_dict.items():
-                if key in {"ip", "host"}:
-                    continue
-                existing_value = leader_info.get(key, ...)
-                if existing_value is ... or existing_value != value:
-                    leader_info[key] = value
-
-            ip_value = info_dict.get("ip")
-            sanitized_ip = _sanitize_ip(ip_value)
-            if sanitized_ip:
-                leader_info["ip"] = sanitized_ip
-            elif ip_value:
-                leader_info["ip"] = ip_value
-            host_value = info_dict.get("host")
-            resolved_host: Optional[str] = None
-            if isinstance(host_value, str) and host_value.strip():
-                resolved_host = host_value.strip()
-                leader_info["host"] = resolved_host
-            else:
-                resolved_host = leader_info.get("host") or host
-                leader_info.setdefault("host", resolved_host)
-            cached_ip = leader_info.get("ip")
-            cached_sanitized_ip = _sanitize_ip(cached_ip)
-            if isinstance(cached_ip, str) and not cached_sanitized_ip:
-                leader_info.pop("ip", None)
-            elif cached_sanitized_ip:
-                leader_info["ip"] = cached_sanitized_ip
-            has_valid_ip = bool(_sanitize_ip(leader_info.get("ip")))
-            if (not has_valid_ip) and resolved_host:
-                resolved_ip = _resolve_ip_from_host(resolved_host)
-                if resolved_ip:
-                    leader_info["ip"] = resolved_ip
-            self._leaders[host] = leader_info
-            return leader_info
-
         if self.is_node_leader:
             resolved = get_available_addr(f"{self._bind_host}:{self._flight_port}")
             parsed_bind = urlparse(f"tcp://{resolved}")
@@ -476,23 +614,29 @@ class IOController:
             if parsed.port:
                 self._flight_port = int(parsed.port)
             publish_key(f"flight_port:{host_name}", str(self._flight_port))
-            leader_info = _cache_leader(
-                host_name, {"ip": self._my_ip, "host": host_name}
+            leader_info = _merge_leader_info(
+                self._leaders.get(host_name),
+                {"ip": self._my_ip, "host": host_name},
+                host_name,
             )
             leader_info["flight_port"] = self._flight_port
+            self._leaders[host_name] = leader_info
             for host, info in leaders.items():
                 if host == host_name:
                     continue
-                remote_port = _wait_for_flight_port(host)
+                remote_port = _wait_for_flight_port_value(host)
+                merged = _merge_leader_info(
+                    self._leaders.get(host), info, host
+                )
                 if remote_port is None:
-                    leader_info = _cache_leader(host, info)
-                    leader_info["flight_port"] = None
+                    merged["flight_port"] = None
+                    self._leaders[host] = merged
                     continue
-                leader_info = _cache_leader(host, info)
-                leader_info["flight_port"] = remote_port
-                endpoint_host = leader_info.get("ip")
+                merged["flight_port"] = remote_port
+                self._leaders[host] = merged
+                endpoint_host = merged.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
-                    endpoint_host = leader_info.get("host") or info.get("host")
+                    endpoint_host = merged.get("host") or info.get("host")
                 formatted_host = _format_flight_host(endpoint_host, fallback=host)
                 endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
@@ -505,13 +649,16 @@ class IOController:
                             break
                         time.sleep(min(0.5 * (attempt + 1), 5.0))
         else:
-            local_port = _wait_for_flight_port(host_name)
+            local_port = _wait_for_flight_port_value(host_name)
             if local_port is not None:
                 self._flight_port = local_port
-            leader_info = _cache_leader(
-                host_name, {"ip": self._my_ip, "host": host_name}
+            leader_info = _merge_leader_info(
+                self._leaders.get(host_name),
+                {"ip": self._my_ip, "host": host_name},
+                host_name,
             )
             leader_info["flight_port"] = self._flight_port
+            self._leaders[host_name] = leader_info
         return self
 
     def push_local_up(self, payload: bytes | memoryview) -> None:
