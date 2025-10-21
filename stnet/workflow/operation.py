@@ -452,7 +452,7 @@ def train(
         **default_kwargs,
         **kwargs,
     )
-    elastic_launch(lc, main_train)(ops)
+    elastic_launch(lc, main)(ops)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=pattern_to_ignore)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -544,7 +544,7 @@ def predict(
     manager = mp.Manager()
     ret_dict = manager.dict()
     mp.start_processes(
-        main_predict,
+        main,
         args=(ops, ret_dict),
         nprocs=nprocs,
         join=True,
@@ -558,258 +558,34 @@ def predict(
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def main_train(*args: Any) -> Optional[Model]:
-    if not args:
-        raise TypeError("main_train requires an OpsConfig argument")
-    if len(args) == 1 and isinstance(args[0], OpsConfig):
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        ops = args[0]
-    elif len(args) >= 2 and isinstance(args[1], OpsConfig):
-        local_rank = int(args[0])
-        ops = args[1]
-    else:
-        raise TypeError("main_train expects (OpsConfig,) or (local_rank, OpsConfig) arguments")
-
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
-
-    device = get_device()
-    _set_backend(device)
-    backend = _backend_type(device)
-    init_kwargs: Dict[str, Any] = {"backend": backend}
-    torch.distributed.init_process_group(**init_kwargs)
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-    cfg = coerce_model_config(
-        ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
-    )
-    cfg = replace(cfg, device=device)
-    model = Model(ops.in_dim, ops.out_shape, config=cfg)
-    if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=pattern_to_ignore)
-            opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
-            m_sd = get_model_state_dict(model, options=opts_sd)
-            m_sd = _prune_dcp_state_keys(m_sd)
-            load(
-                state_dict={"model": m_sd},
-                storage_reader=FileSystemReader(ops.init_ckpt_dir),
-            )
-            set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
-            )
-    meta_info = _meta(ops.memmap_dir or "")
-    meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
-    if meta_feature_dim != int(ops.in_dim):
-        raise RuntimeError(
-            "dataset feature_dim mismatch: "
-            f"meta={meta_feature_dim}, expected in_dim={ops.in_dim}"
-        )
-    meta_label_shape = tuple(
-        int(x) for x in meta_info.get("label_shape", list(ops.out_shape))
-    )
-    if tuple(meta_label_shape) != tuple(ops.out_shape):
-        raise RuntimeError(
-            "dataset label_shape mismatch: "
-            f"meta={meta_label_shape}, expected out_shape={tuple(ops.out_shape)}"
-        )
-    fractions = meta_info.get("fractions", [1.0, 0.0])
-    if isinstance(fractions, (list, tuple)) and len(fractions) >= 2:
-        actual_val_frac = float(fractions[-1])
-        if not math.isclose(
-            actual_val_frac,
-            float(ops.val_frac),
-            rel_tol=0.001,
-            abs_tol=0.001,
-        ):
-            warnings.warn(
-                "val_frac=%s differs from memmap metadata (%s); "
-                "using metadata value for loaders" % (ops.val_frac, actual_val_frac)
-            )
-            ops = replace(ops, val_frac=actual_val_frac)
-    model, _, _ = ModuleTuner.use_te_module(model, device=device)
-    _ensure_uniform_param_dtype(
-        model,
-        prefer=(
-            torch.bfloat16
-            if getattr(device, "type", None) == "cuda"
-            and torch.cuda.is_bf16_supported()
-            else None
-        ),
-    )
-    model, _, _ = ModuleTuner.enable_float8_training(
-        model, device=device, prefer="te", logger=_float8_log
-    )
-    model.train()
-    world = get_world_size(device)
-    mesh = init_device_mesh(
-        "cuda" if device.type == "cuda" else device.type, (world,)
-    )
-    match device.type:
-        case "cuda":
-            param_dtype = (
-                torch.bfloat16 if is_cuda_bf16_supported() else torch.float16
-            )
-            reduce_dtype = torch.float32
-            cast_forward_inputs = True
-        case "xpu":
-            param_dtype = torch.bfloat16
-            reduce_dtype = torch.float32
-            cast_forward_inputs = False
-        case "mps":
-            param_dtype = torch.float16
-            reduce_dtype = param_dtype
-            cast_forward_inputs = False
-        case "cpu":
-            param_dtype = (
-                torch.bfloat16 if is_cpu_bf16_supported() else torch.float32
-            )
-            reduce_dtype = torch.float32
-            cast_forward_inputs = False if is_cpu_bf16_supported() else True
-        case _:
-            param_dtype = torch.float32
-            reduce_dtype = torch.float32
-            cast_forward_inputs = True
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-        output_dtype=None,
-        cast_forward_inputs=cast_forward_inputs,
-    )
-    ignored_params: List[torch.nn.Parameter] = []
-    for module in model.modules():
-        if isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
-            for p in module.parameters(recurse=False):
-                ignored_params.append(p)
-        for name in ("alpha_t", "alpha_s", "gem_p", "cls_query", "cls"):
-            if hasattr(module, name):
-                p = getattr(module, name)
-                if isinstance(p, torch.nn.Parameter):
-                    ignored_params.append(p)
-
-    class _IdentityParamSet(Sequence[torch.nn.Parameter]):
-        def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
-            self._params = tuple(params)
-            self._ids = {id(p) for p in self._params}
-
-        def __len__(self) -> int:
-            return len(self._params)
-
-        def __iter__(self) -> Iterator[torch.nn.Parameter]:
-            return iter(self._params)
-
-        def __getitem__(self, index: int) -> torch.nn.Parameter:
-            return self._params[index]
-
-        def __contains__(self, item: object) -> bool:
-            return isinstance(item, torch.nn.Parameter) and (id(item) in self._ids)
-
-    ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
-
-    def _per_module_ignored_params(
-        module: torch.nn.Module,
-    ) -> Optional[_IdentityParamSet]:
-        if len(ignored_param_registry) == 0:
-            return None
-        params = [
-            param
-            for param in module.parameters(recurse=True)
-            if param in ignored_param_registry
-        ]
-        return _IdentityParamSet(tuple(params)) if params else None
-
-    wrapped: set[int] = set()
-
-    def _fsdp_wrap(target: Optional[torch.nn.Module]) -> Optional[torch.nn.Module]:
-        nonlocal model
-        if target is None or id(target) in wrapped:
-            return target
-        wrapped.add(id(target))
-        per_mod_ignored = _per_module_ignored_params(target)
-        sharded = fully_shard(
-            target,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
-            ignored_params=per_mod_ignored or None,
-        )
-        sharded.set_requires_gradient_sync(True)
-        if target is model:
-            model = sharded
-        return sharded
-
-    def _collect_block_modules(
-        root: Optional[torch.nn.Module],
-    ) -> List[torch.nn.Module]:
-        if root is None:
-            return []
-        blocks: List[torch.nn.Module] = []
-        seen: set[int] = set()
-        for module in root.modules():
-            block_list = getattr(module, "blocks", None)
-            if isinstance(block_list, torch.nn.ModuleList):
-                for block in block_list:
-                    if isinstance(block, torch.nn.Module) and id(block) not in seen:
-                        seen.add(id(block))
-                        blocks.append(block)
-        return blocks
-
-    try:
-        for submodule in _collect_block_modules(
-            getattr(model, "local_net", None)
-        ) + _collect_block_modules(getattr(model, "global_net", None)):
-            _fsdp_wrap(submodule)
-        _fsdp_wrap(model)
-    except (RuntimeError, ValueError, TypeError):
-        model = fully_shard(
-            model,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            ignored_params=(
-                ignored_param_registry if len(ignored_param_registry) > 0 else None
-            ),
-            reshard_after_forward=False,
-        )
-        model.set_requires_gradient_sync(True)
-    net_params = [p for p in model.parameters()]
-    optimizer = TunedAdamW.float(
-        net_params,
-        lr=ops.base_lr,
-        weight_decay=ops.weight_decay,
-        use_fp8=(device.type == "cuda"),
-        use_foreach=False,
-        use_fused=False,
-        logger=None,
-    )
-    if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=pattern_to_ignore)
-            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-            try:
-                load(
-                    state_dict={"optimizer": optim_sd},
-                    storage_reader=FileSystemReader(ops.init_ckpt_dir),
-                )
-            except (
-                FileNotFoundError,
-                ValueError,
-                KeyError,
-                RuntimeError,
-                CheckpointException,
-            ) as exc:
-                if "optimizer" not in str(exc).lower():
-                    raise
-            else:
-                set_optimizer_state_dict(
-                    model,
-                    optimizer,
-                    optim_sd,
-                    options=StateDictOptions(strict=False),
-                )
-    train_loader0, val_loader0, keep0 = dataloader(
+def epoch(
+    *,
+    model: Model,
+    device: torch.device,
+    ops: OpsConfig,
+    param_dtype: torch.dtype,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.amp.GradScaler,
+    sched: torch.optim.lr_scheduler.LRScheduler,
+    loss_controller: LossWeightController,
+    top_loss: TiledLoss,
+    bottom_loss: TiledLoss,
+    status_bar: Optional[tqdm],
+    grad_accum_steps: int,
+    restore_state: bool,
+    state_train: Dict[str, Any],
+    state_val: Dict[str, Any],
+) -> Tuple[
+    Any,
+    Any,
+    Any,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Dict[str, float],
+]:
+    train_loader, val_loader, keep = dataloader(
         memmap_dir=ops.memmap_dir,
         device=device,
         batch_size=int(ops.batch_size or 128),
@@ -818,270 +594,70 @@ def main_train(*args: Any) -> Optional[Model]:
         non_blocking_copy=bool(ops.overlap_h2d),
         io_backend="auto",
     )
-    train_step_count = 0
-    for train_step_count, _raw in enumerate(train_loader0, start=1):
-        _feat0, _label0, *_ = preprocess(_raw)
-        if hasattr(model, "update_x_stats"):
-            with contextlib.suppress(Exception):
-                model.update_x_stats(_feat0)
-        _label0 = to_torch(_label0)
-        _Y0_flat = _label0.view(_label0.shape[0], -1)
-        model.update_y_stats(_Y0_flat)
-    model.finalize_y_stats()
-    if hasattr(model, "finalize_x_stats"):
-        model.finalize_x_stats()
-    if keep0 is not None:
-        keep0.cleanup()
-    _t = StudentsTLoss(
-        confidence=0.99,
-        metric="t_value",
-        two_tailed=True,
-        df=4,
-        mu_mode="error",
-        std_mode="pooled",
-        ddof=1,
-        clamp_max=8.0,
-        detach_stats=True,
-        dim=-1,
-        reduction="none",
-    )
-    _z = StandardNormalLoss(
-        confidence=0.99,
-        metric="z_value",
-        two_tailed=True,
-        penalty="softplus",
-        tau=1.0,
-        mu_mode="error",
-        std_mode="pooled",
-        ddof=1,
-        clamp_max=8.0,
-        detach_stats=True,
-        dim=-1,
-        reduction="none",
-    )
-    top_loss = TiledLoss(
-        _t,
-        mask_mode=ops.loss_mask_mode,
-        mask_value=ops.loss_mask_value,
-        tile_dim=ops.loss_tile_dim,
-        tile_size=ops.loss_tile_size,
-        reduction="mean",
-    )
-    bottom_loss = TiledLoss(
-        _z,
-        mask_mode=ops.loss_mask_mode,
-        mask_value=ops.loss_mask_value,
-        tile_dim=ops.loss_tile_dim,
-        tile_size=ops.loss_tile_size,
-        reduction="mean",
-    )
-    loss_controller = LossWeightController()
-    train_steps = _loader_length(train_loader0)
-    if train_step_count > 0:
-        train_steps = max(train_steps, train_step_count)
-    val_steps = _loader_length(val_loader0)
-    steps_per_epoch = max(1, train_steps + val_steps)
-    total_steps = ops.epochs * steps_per_epoch
-    if ops.warmup_ratio > 0.0:
-        warmup_steps = max(1, int(total_steps * ops.warmup_ratio))
-        main_steps = max(1, total_steps - warmup_steps)
-    else:
-        warmup_steps = 0
-        main_steps = max(1, total_steps)
-    base = float(ops.base_lr)
-    emin = float(ops.eta_min)
-    start_factor = 0.001
-
-    def _scheduler(step: int) -> float:
-        if warmup_steps > 0 and step < warmup_steps:
-            return start_factor + (1.0 - start_factor) * (
-                step / max(1, warmup_steps)
-            )
-        t = step - warmup_steps
-        frac_min = emin / base if base > 0.0 else 0.0
-        return frac_min + (1.0 - frac_min) * 0.5 * (
-            1.0 + math.cos(math.pi * t / max(1, main_steps))
-        )
-
-    sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_scheduler)
-    scaler = torch.amp.GradScaler(
-        enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
-    )
-    ckpt_state_path = dl_state_path(ops.ckpt_dir or "")
-    init_state_path = (
-        dl_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
-    )
-    state_train: Dict[str, Any] = {}
-    state_val: Dict[str, Any] = {}
-    _dlp = (
-        ckpt_state_path
-        if os.path.isfile(ckpt_state_path)
-        else (
-            init_state_path
-            if init_state_path and os.path.isfile(init_state_path)
-            else None
-        )
-    )
-    restore_dl_state = False
-    if _dlp:
+    if restore_state:
         with contextlib.suppress(Exception):
-            _dl_json = json.load(open(_dlp, "r", encoding="utf-8"))
-            if isinstance(_dl_json, dict):
-                state_train = _dl_json.get("train", {}) or {}
-                state_val = _dl_json.get("val", {}) or {}
-                restore_dl_state = bool(state_train) or bool(state_val)
-    status_bar = (
-        _status_bar("Training", total_steps, device) if local_rank == 0 else None
-    )
-    last_train_loader = None
-    last_val_loader = None
-    for epoch in range(int(ops.epochs)):
-        train_loader, val_loader, keep = dataloader(
-            memmap_dir=ops.memmap_dir,
-            device=device,
-            batch_size=int(ops.batch_size or 128),
-            val_frac=float(ops.val_frac),
-            prefetch_factor=ops.prefetch_factor,
-            non_blocking_copy=bool(ops.overlap_h2d),
-            io_backend="auto",
-        )
-        last_train_loader, last_val_loader = train_loader, val_loader
-        if restore_dl_state:
+            train_loader.load_state_dict(state_train)
+        if val_loader is not None:
             with contextlib.suppress(Exception):
-                train_loader.load_state_dict(state_train)
-            if val_loader is not None:
-                with contextlib.suppress(Exception):
-                    val_loader.load_state_dict(state_val)
-            restore_dl_state = False
-        flop_breakdown_epoch: Dict[str, float] = {}
-        io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
-        comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
-        io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
-        flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-        learn(
+                val_loader.load_state_dict(state_val)
+    flop_breakdown_epoch: Dict[str, float] = {}
+    io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
+    comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
+    io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
+    flops = torch.tensor(0.0, device=device, dtype=torch.float64)
+    learn(
+        model,
+        device,
+        ops.in_dim,
+        param_dtype,
+        optimizer,
+        scaler,
+        sched,
+        train_loader,
+        status_bar,
+        loss_controller,
+        top_loss,
+        bottom_loss,
+        grad_accum_steps,
+        io_time,
+        comp_time,
+        io_bytes,
+        flops,
+        flop_breakdown_epoch,
+    )
+    if val_loader is not None:
+        test(
             model,
             device,
             ops.in_dim,
             param_dtype,
             optimizer,
-            scaler,
-            sched,
-            train_loader,
+            val_loader,
             status_bar,
             loss_controller,
             top_loss,
             bottom_loss,
-            int(ops.grad_accum_steps),
             io_time,
             comp_time,
             io_bytes,
             flops,
             flop_breakdown_epoch,
         )
-        if val_loader is not None:
-            test(
-                model,
-                device,
-                ops.in_dim,
-                param_dtype,
-                optimizer,
-                val_loader,
-                status_bar,
-                loss_controller,
-                top_loss,
-                bottom_loss,
-                io_time,
-                comp_time,
-                io_bytes,
-                flops,
-                flop_breakdown_epoch,
-            )
-        if keep is not None:
-            keep.cleanup()
-        torch.distributed.barrier(
-            device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
-        )
-        for t in (comp_time, io_time, flops, io_bytes):
-            torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-        world = max(1, get_world_size(device))
-        comp_time /= world
-        io_time /= world
-        flops /= world
-        io_bytes /= world
-        aggregated_breakdown: Dict[str, float]
-        if torch.distributed.is_initialized():
-            gathered: List[Dict[str, float]] = [dict() for _ in range(world)]
-            torch.distributed.all_gather_object(gathered, flop_breakdown_epoch)
-            merged: Dict[str, float] = {}
-            for entry in gathered:
-                if not isinstance(entry, dict):
-                    continue
-                for key, value in entry.items():
-                    try:
-                        merged[key] = merged.get(key, 0.0) + float(value)
-                    except Exception:
-                        continue
-            aggregated_breakdown = merged
-        else:
-            aggregated_breakdown = dict(flop_breakdown_epoch)
-        if world > 0:
-            aggregated_breakdown = {
-                key: value / world for key, value in aggregated_breakdown.items()
-            }
-        if local_rank == 0 and status_bar is not None:
-            mbps = float(io_bytes / io_time.clamp_min(1e-06) / 1_000_000.0)
-            tflops = float(flops / comp_time.clamp_min(1e-06) / 1_000_000_000_000.0)
-            comp_elapsed_mean = float(comp_time.item())
-            postfix = _format_metrics_postfix(
-                mbps,
-                tflops,
-                comp_elapsed=comp_elapsed_mean,
-                flop_breakdown=aggregated_breakdown,
-            )
-            status_bar.set_postfix_str(postfix, refresh=True)
-    if local_rank == 0:
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=pattern_to_ignore)
-            opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            model_sd = get_model_state_dict(model, options=opts_sd)
-            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-            writer = FileSystemWriter(
-                ops.ckpt_dir or "", sync_files=True, overwrite=True
-            )
-            save(
-                state_dict={"model": model_sd, "optimizer": optim_sd},
-                storage_writer=writer,
-            )
-        with contextlib.suppress(Exception):
-            _dl = {
-                "train": (
-                    last_train_loader.state_dict()
-                    if last_train_loader is not None
-                    else {}
-                ),
-                "val": (
-                    last_val_loader.state_dict()
-                    if last_val_loader is not None
-                    else {}
-                ),
-            }
-            with open(
-                dl_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
-            ) as _f:
-                json.dump(_dl, _f)
-    torch.distributed.barrier(
-        device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
+    return (
+        train_loader,
+        val_loader,
+        keep,
+        io_time,
+        comp_time,
+        io_bytes,
+        flops,
+        flop_breakdown_epoch,
     )
-    with contextlib.suppress(Exception):
-        if local_rank == 0 and status_bar is not None:
-            status_bar.close()
-    torch.distributed.destroy_process_group()
-    return None
 
 
-def main_predict(*args: Any) -> Optional[Model]:
+def main(*args: Any) -> Optional[Model]:
     if not args:
-        raise TypeError("main_predict requires at least an OpsConfig argument")
+        raise TypeError("main requires at least an OpsConfig argument")
 
     ret_sink: Optional[Dict[Any, Any]] = None
     if len(args) == 1 and isinstance(args[0], OpsConfig):
@@ -1094,69 +670,567 @@ def main_predict(*args: Any) -> Optional[Model]:
             ret_sink = args[2]
     else:
         raise TypeError(
-            "main_predict expects (OpsConfig,), (local_rank, OpsConfig), or "
+            "main expects (OpsConfig,), (local_rank, OpsConfig), or "
             "(local_rank, OpsConfig, ret_sink) arguments"
         )
 
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
-        elif hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
-    device = get_device()
-    cfg = coerce_model_config(
-        ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
-    )
-    model = Model(ops.in_dim, ops.out_shape, config=cfg)
-    if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=pattern_to_ignore)
-            opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            m_sd = get_model_state_dict(model, options=opts_sd)
-            m_sd = _prune_dcp_state_keys(m_sd)
-            load(
-                state_dict={"model": m_sd},
-                storage_reader=FileSystemReader(ops.model_ckpt_dir),
+    if ops.mode == "train":
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
+
+        device = get_device()
+        _set_backend(device)
+        backend = _backend_type(device)
+        init_kwargs: Dict[str, Any] = {"backend": backend}
+        torch.distributed.init_process_group(**init_kwargs)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        cfg = coerce_model_config(
+            ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
+        )
+        cfg = replace(cfg, device=device)
+        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
+                m_sd = get_model_state_dict(model, options=opts_sd)
+                m_sd = _prune_dcp_state_keys(m_sd)
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=FileSystemReader(ops.init_ckpt_dir),
+                )
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
+        meta_info = _meta(ops.memmap_dir or "")
+        meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
+        if meta_feature_dim != int(ops.in_dim):
+            raise RuntimeError(
+                "dataset feature_dim mismatch: "
+                f"meta={meta_feature_dim}, expected in_dim={ops.in_dim}"
             )
-            set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-    model.to(device, non_blocking=True).eval()
-    model, _, _ = ModuleTuner.use_te_module(model, device=device)
-    _ensure_uniform_param_dtype(
-        model,
-        prefer=(
-            torch.bfloat16
-            if (
-                getattr(device, "type", None) == "cuda"
+        meta_label_shape = tuple(
+            int(x) for x in meta_info.get("label_shape", list(ops.out_shape))
+        )
+        if tuple(meta_label_shape) != tuple(ops.out_shape):
+            raise RuntimeError(
+                "dataset label_shape mismatch: "
+                f"meta={meta_label_shape}, expected out_shape={tuple(ops.out_shape)}"
+            )
+        fractions = meta_info.get("fractions", [1.0, 0.0])
+        if isinstance(fractions, (list, tuple)) and len(fractions) >= 2:
+            actual_val_frac = float(fractions[-1])
+            if not math.isclose(
+                actual_val_frac,
+                float(ops.val_frac),
+                rel_tol=0.001,
+                abs_tol=0.001,
+            ):
+                warnings.warn(
+                    "val_frac=%s differs from memmap metadata (%s); "
+                    "using metadata value for loaders"
+                    % (ops.val_frac, actual_val_frac)
+                )
+                ops = replace(ops, val_frac=actual_val_frac)
+        model, _, _ = ModuleTuner.use_te_module(model, device=device)
+        _ensure_uniform_param_dtype(
+            model,
+            prefer=(
+                torch.bfloat16
+                if getattr(device, "type", None) == "cuda"
                 and torch.cuda.is_bf16_supported()
+                else None
+            ),
+        )
+        model, _, _ = ModuleTuner.enable_float8_training(
+            model, device=device, prefer="te", logger=_float8_log
+        )
+        model.train()
+        world = get_world_size(device)
+        mesh = init_device_mesh(
+            "cuda" if device.type == "cuda" else device.type, (world,)
+        )
+        match device.type:
+            case "cuda":
+                param_dtype = (
+                    torch.bfloat16 if is_cuda_bf16_supported() else torch.float16
+                )
+                reduce_dtype = torch.float32
+                cast_forward_inputs = True
+            case "xpu":
+                param_dtype = torch.bfloat16
+                reduce_dtype = torch.float32
+                cast_forward_inputs = False
+            case "mps":
+                param_dtype = torch.float16
+                reduce_dtype = param_dtype
+                cast_forward_inputs = False
+            case "cpu":
+                param_dtype = (
+                    torch.bfloat16 if is_cpu_bf16_supported() else torch.float32
+                )
+                reduce_dtype = torch.float32
+                cast_forward_inputs = False if is_cpu_bf16_supported() else True
+            case _:
+                param_dtype = torch.float32
+                reduce_dtype = torch.float32
+                cast_forward_inputs = True
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=reduce_dtype,
+            output_dtype=None,
+            cast_forward_inputs=cast_forward_inputs,
+        )
+        ignored_params: List[torch.nn.Parameter] = []
+        for module in model.modules():
+            if isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
+                for p in module.parameters(recurse=False):
+                    ignored_params.append(p)
+            for name in ("alpha_t", "alpha_s", "gem_p", "cls_query", "cls"):
+                if hasattr(module, name):
+                    p = getattr(module, name)
+                    if isinstance(p, torch.nn.Parameter):
+                        ignored_params.append(p)
+
+        class _IdentityParamSet(Sequence[torch.nn.Parameter]):
+            def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
+                self._params = tuple(params)
+                self._ids = {id(p) for p in self._params}
+
+            def __len__(self) -> int:
+                return len(self._params)
+
+            def __iter__(self) -> Iterator[torch.nn.Parameter]:
+                return iter(self._params)
+
+            def __getitem__(self, index: int) -> torch.nn.Parameter:
+                return self._params[index]
+
+            def __contains__(self, item: object) -> bool:
+                return isinstance(item, torch.nn.Parameter) and (
+                    id(item) in self._ids
+                )
+
+        ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
+
+        def _per_module_ignored_params(
+            module: torch.nn.Module,
+        ) -> Optional[_IdentityParamSet]:
+            if len(ignored_param_registry) == 0:
+                return None
+            params = [
+                param
+                for param in module.parameters(recurse=True)
+                if param in ignored_param_registry
+            ]
+            return _IdentityParamSet(tuple(params)) if params else None
+
+        wrapped: set[int] = set()
+
+        def _fsdp_wrap(
+            target: Optional[torch.nn.Module],
+        ) -> Optional[torch.nn.Module]:
+            nonlocal model
+            if target is None or id(target) in wrapped:
+                return target
+            wrapped.add(id(target))
+            per_mod_ignored = _per_module_ignored_params(target)
+            sharded = fully_shard(
+                target,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=False,
+                ignored_params=per_mod_ignored or None,
             )
+            sharded.set_requires_gradient_sync(True)
+            if target is model:
+                model = sharded
+            return sharded
+
+        def _collect_block_modules(
+            root: Optional[torch.nn.Module],
+        ) -> List[torch.nn.Module]:
+            if root is None:
+                return []
+            blocks: List[torch.nn.Module] = []
+            seen: set[int] = set()
+            for module in root.modules():
+                block_list = getattr(module, "blocks", None)
+                if isinstance(block_list, torch.nn.ModuleList):
+                    for block in block_list:
+                        if isinstance(block, torch.nn.Module) and id(block) not in seen:
+                            seen.add(id(block))
+                            blocks.append(block)
+            return blocks
+
+        try:
+            for submodule in _collect_block_modules(
+                getattr(model, "local_net", None)
+            ) + _collect_block_modules(getattr(model, "global_net", None)):
+                _fsdp_wrap(submodule)
+            _fsdp_wrap(model)
+        except (RuntimeError, ValueError, TypeError):
+            model = fully_shard(
+                model,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                ignored_params=(
+                    ignored_param_registry if len(ignored_param_registry) > 0 else None
+                ),
+                reshard_after_forward=False,
+            )
+            model.set_requires_gradient_sync(True)
+        net_params = [p for p in model.parameters()]
+        optimizer = TunedAdamW.float(
+            net_params,
+            lr=ops.base_lr,
+            weight_decay=ops.weight_decay,
+            use_fp8=(device.type == "cuda"),
+            use_foreach=False,
+            use_fused=False,
+            logger=None,
+        )
+        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+                try:
+                    load(
+                        state_dict={"optimizer": optim_sd},
+                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
+                    )
+                except (
+                    FileNotFoundError,
+                    ValueError,
+                    KeyError,
+                    RuntimeError,
+                    CheckpointException,
+                ) as exc:
+                    if "optimizer" not in str(exc).lower():
+                        raise
+                else:
+                    set_optimizer_state_dict(
+                        model,
+                        optimizer,
+                        optim_sd,
+                        options=StateDictOptions(strict=False),
+                    )
+        train_loader0, val_loader0, keep0 = dataloader(
+            memmap_dir=ops.memmap_dir,
+            device=device,
+            batch_size=int(ops.batch_size or 128),
+            val_frac=float(ops.val_frac),
+            prefetch_factor=ops.prefetch_factor,
+            non_blocking_copy=bool(ops.overlap_h2d),
+            io_backend="auto",
+        )
+        train_step_count = 0
+        for train_step_count, _raw in enumerate(train_loader0, start=1):
+            _feat0, _label0, *_ = preprocess(_raw)
+            if hasattr(model, "update_x_stats"):
+                with contextlib.suppress(Exception):
+                    model.update_x_stats(_feat0)
+            _label0 = to_torch(_label0)
+            _Y0_flat = _label0.view(_label0.shape[0], -1)
+            model.update_y_stats(_Y0_flat)
+        model.finalize_y_stats()
+        if hasattr(model, "finalize_x_stats"):
+            model.finalize_x_stats()
+        if keep0 is not None:
+            keep0.cleanup()
+        _t = StudentsTLoss(
+            confidence=0.99,
+            metric="t_value",
+            two_tailed=True,
+            df=4,
+            mu_mode="error",
+            std_mode="pooled",
+            ddof=1,
+            clamp_max=8.0,
+            detach_stats=True,
+            dim=-1,
+            reduction="none",
+        )
+        _z = StandardNormalLoss(
+            confidence=0.99,
+            metric="z_value",
+            two_tailed=True,
+            penalty="softplus",
+            tau=1.0,
+            mu_mode="error",
+            std_mode="pooled",
+            ddof=1,
+            clamp_max=8.0,
+            detach_stats=True,
+            dim=-1,
+            reduction="none",
+        )
+        top_loss = TiledLoss(
+            _t,
+            mask_mode=ops.loss_mask_mode,
+            mask_value=ops.loss_mask_value,
+            tile_dim=ops.loss_tile_dim,
+            tile_size=ops.loss_tile_size,
+            reduction="mean",
+        )
+        bottom_loss = TiledLoss(
+            _z,
+            mask_mode=ops.loss_mask_mode,
+            mask_value=ops.loss_mask_value,
+            tile_dim=ops.loss_tile_dim,
+            tile_size=ops.loss_tile_size,
+            reduction="mean",
+        )
+        loss_controller = LossWeightController()
+        train_steps = _loader_length(train_loader0)
+        if train_step_count > 0:
+            train_steps = max(train_steps, train_step_count)
+        val_steps = _loader_length(val_loader0)
+        steps_per_epoch = max(1, train_steps + val_steps)
+        total_steps = ops.epochs * steps_per_epoch
+        if ops.warmup_ratio > 0.0:
+            warmup_steps = max(1, int(total_steps * ops.warmup_ratio))
+            main_steps = max(1, total_steps - warmup_steps)
+        else:
+            warmup_steps = 0
+            main_steps = max(1, total_steps)
+        base = float(ops.base_lr)
+        emin = float(ops.eta_min)
+        start_factor = 0.001
+
+        def _scheduler(step: int) -> float:
+            if warmup_steps > 0 and step < warmup_steps:
+                return start_factor + (1.0 - start_factor) * (
+                    step / max(1, warmup_steps)
+                )
+            t = step - warmup_steps
+            frac_min = emin / base if base > 0.0 else 0.0
+            return frac_min + (1.0 - frac_min) * 0.5 * (
+                1.0 + math.cos(math.pi * t / max(1, main_steps))
+            )
+
+        sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_scheduler)
+        scaler = torch.amp.GradScaler(
+            enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
+        )
+        ckpt_state_path = dl_state_path(ops.ckpt_dir or "")
+        init_state_path = (
+            dl_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
+        )
+        state_train: Dict[str, Any] = {}
+        state_val: Dict[str, Any] = {}
+        _dlp = (
+            ckpt_state_path
+            if os.path.isfile(ckpt_state_path)
+            else (
+                init_state_path
+                if init_state_path and os.path.isfile(init_state_path)
+                else None
+            )
+        )
+        restore_dl_state = False
+        if _dlp:
+            with contextlib.suppress(Exception):
+                _dl_json = json.load(open(_dlp, "r", encoding="utf-8"))
+                if isinstance(_dl_json, dict):
+                    state_train = _dl_json.get("train", {}) or {}
+                    state_val = _dl_json.get("val", {}) or {}
+                    restore_dl_state = bool(state_train) or bool(state_val)
+        status_bar = (
+            _status_bar("Training", total_steps, device) if local_rank == 0 else None
+        )
+        last_train_loader = None
+        last_val_loader = None
+        for _ in range(int(ops.epochs)):
+            (
+                train_loader,
+                val_loader,
+                keep,
+                io_time,
+                comp_time,
+                io_bytes,
+                flops,
+                flop_breakdown_epoch,
+            ) = epoch(
+                model=model,
+                device=device,
+                ops=ops,
+                param_dtype=param_dtype,
+                optimizer=optimizer,
+                scaler=scaler,
+                sched=sched,
+                loss_controller=loss_controller,
+                top_loss=top_loss,
+                bottom_loss=bottom_loss,
+                status_bar=status_bar,
+                grad_accum_steps=int(ops.grad_accum_steps),
+                restore_state=restore_dl_state,
+                state_train=state_train,
+                state_val=state_val,
+            )
+            last_train_loader, last_val_loader = train_loader, val_loader
+            restore_dl_state = False
+            if keep is not None:
+                keep.cleanup()
+            torch.distributed.barrier(
+                device_ids=[local_rank]
+                if device.type in ("cuda", "xpu")
+                else None
+            )
+            for t in (comp_time, io_time, flops, io_bytes):
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+            world = max(1, get_world_size(device))
+            comp_time /= world
+            io_time /= world
+            flops /= world
+            io_bytes /= world
+            if torch.distributed.is_initialized():
+                gathered: List[Dict[str, float]] = [dict() for _ in range(world)]
+                torch.distributed.all_gather_object(gathered, flop_breakdown_epoch)
+                merged: Dict[str, float] = {}
+                for entry in gathered:
+                    if not isinstance(entry, dict):
+                        continue
+                    for key, value in entry.items():
+                        try:
+                            merged[key] = merged.get(key, 0.0) + float(value)
+                        except Exception:
+                            continue
+                aggregated_breakdown = merged
+            else:
+                aggregated_breakdown = dict(flop_breakdown_epoch)
+            if world > 0:
+                aggregated_breakdown = {
+                    key: value / world for key, value in aggregated_breakdown.items()
+                }
+            if local_rank == 0 and status_bar is not None:
+                mbps = float(io_bytes / io_time.clamp_min(1e-06) / 1_000_000.0)
+                tflops = float(
+                    flops / comp_time.clamp_min(1e-06) / 1_000_000_000_000.0
+                )
+                comp_elapsed_mean = float(comp_time.item())
+                postfix = _format_metrics_postfix(
+                    mbps,
+                    tflops,
+                    comp_elapsed=comp_elapsed_mean,
+                    flop_breakdown=aggregated_breakdown,
+                )
+                status_bar.set_postfix_str(postfix, refresh=False)
+            torch.distributed.barrier(
+                device_ids=[local_rank]
+                if device.type in ("cuda", "xpu")
+                else None
+            )
+        if local_rank == 0:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                model_sd = get_model_state_dict(model, options=opts_sd)
+                optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+                writer = FileSystemWriter(
+                    ops.ckpt_dir or "", sync_files=True, overwrite=True
+                )
+                save(
+                    state_dict={"model": model_sd, "optimizer": optim_sd},
+                    storage_writer=writer,
+                )
+            with contextlib.suppress(Exception):
+                _dl = {
+                    "train": (
+                        last_train_loader.state_dict()
+                        if last_train_loader is not None
+                        else {}
+                    ),
+                    "val": (
+                        last_val_loader.state_dict()
+                        if last_val_loader is not None
+                        else {}
+                    ),
+                }
+                with open(
+                    dl_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
+                ) as _f:
+                    json.dump(_dl, _f)
+        torch.distributed.barrier(
+            device_ids=[local_rank]
+            if device.type in ("cuda", "xpu")
             else None
-        ),
-    )
-    model, _, _ = ModuleTuner.enable_float8_prediction(
-        model,
-        device=device,
-        prefer="te",
-        logger=_float8_log,
-        dynamic_activations=True,
-    )
-    model.eval()
-    data_loader, _, keep = dataloader(
-        memmap_dir=ops.memmap_dir or "",
-        device=device,
-        batch_size=int(ops.batch_size or 512),
-        val_frac=0.0,
-        prefetch_factor=ops.prefetch_factor,
-        non_blocking_copy=True,
-        io_backend="auto",
-    )
-    flat = infer(model, device, ops.in_dim, ops.out_shape, data_loader)
-    pred_struct = Model.unflatten_labels(flat, ops.out_shape)
-    ret = postprocess(ops.keys or [], pred_struct)
-    if ret_sink is not None:
-        ret_sink.update(ret)
-    if keep is not None:
-        keep.cleanup()
-    return None
+        )
+        with contextlib.suppress(Exception):
+            if local_rank == 0 and status_bar is not None:
+                status_bar.close()
+        torch.distributed.destroy_process_group()
+        return None
+
+    if ops.mode in ("predict", "infer"):
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available():
+                torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
+            elif hasattr(torch, "xpu") and torch.xpu.is_available():
+                torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
+        device = get_device()
+        cfg = coerce_model_config(
+            ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
+        )
+        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+        if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                m_sd = get_model_state_dict(model, options=opts_sd)
+                m_sd = _prune_dcp_state_keys(m_sd)
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=FileSystemReader(ops.model_ckpt_dir),
+                )
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
+        model.to(device, non_blocking=True).eval()
+        model, _, _ = ModuleTuner.use_te_module(model, device=device)
+        _ensure_uniform_param_dtype(
+            model,
+            prefer=(
+                torch.bfloat16
+                if (
+                    getattr(device, "type", None) == "cuda"
+                    and torch.cuda.is_bf16_supported()
+                )
+                else None
+            ),
+        )
+        model, _, _ = ModuleTuner.enable_float8_prediction(
+            model,
+            device=device,
+            prefer="te",
+            logger=_float8_log,
+            dynamic_activations=True,
+        )
+        model.eval()
+        data_loader, _, keep = dataloader(
+            memmap_dir=ops.memmap_dir or "",
+            device=device,
+            batch_size=int(ops.batch_size or 512),
+            val_frac=0.0,
+            prefetch_factor=ops.prefetch_factor,
+            non_blocking_copy=True,
+            io_backend="auto",
+        )
+        flat = infer(model, device, ops.in_dim, ops.out_shape, data_loader)
+        pred_struct = Model.unflatten_labels(flat, ops.out_shape)
+        ret = postprocess(ops.keys or [], pred_struct)
+        if ret_sink is not None:
+            ret_sink.update(ret)
+        if keep is not None:
+            keep.cleanup()
+        return None
+
+    raise ValueError(f"unsupported ops mode: {ops.mode}")
+
 def learn(
     model: Model,
     device: torch.device,
