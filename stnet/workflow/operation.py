@@ -45,7 +45,7 @@ from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..architecture.network import Model
 from ..architecture.config import ModelConfig, coerce_model_config
 from ..pipeline.collate import dataloader, postprocess, preprocess
-from ..pipeline.datatype import to_tensor
+from ..pipeline.datatype import to_torch
 from ..pipeline.dataset import SampleReader
 from ..toolkit.capability import (
     get_available_addr,
@@ -824,7 +824,7 @@ def main_train(*args: Any) -> Optional[Model]:
         if hasattr(model, "update_x_stats"):
             with contextlib.suppress(Exception):
                 model.update_x_stats(_feat0)
-        _label0 = to_tensor(_label0)
+        _label0 = to_torch(_label0)
         _Y0_flat = _label0.view(_label0.shape[0], -1)
         model.update_y_stats(_Y0_flat)
     model.finalize_y_stats()
@@ -1189,7 +1189,7 @@ def learn(
             total_batches = len(train_loader)
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
-                X = to_tensor(feat)
+                X = to_torch(feat)
                 X = torch.atleast_2d(X)
                 if X.dim() != 2:
                     raise RuntimeError(
@@ -1199,7 +1199,7 @@ def learn(
                     raise RuntimeError(
                         f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                     )
-                Y = to_tensor(label)
+                Y = to_torch(label)
                 t_ready = time.perf_counter_ns()
                 if use_timer:
                     h2d_s_ev, h2d_e_ev = (
@@ -1340,7 +1340,7 @@ def test(
             with joining(model=model, optimizer=optimizer):
                 for step_idx, _raw in enumerate(val_loader):
                     feat, label, *_ = preprocess(_raw)
-                    X = to_tensor(feat)
+                    X = to_torch(feat)
                     X = torch.atleast_2d(X)
                     if X.dim() != 2:
                         raise RuntimeError(
@@ -1350,7 +1350,7 @@ def test(
                         raise RuntimeError(
                             f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                         )
-                    Y = to_tensor(label)
+                    Y = to_torch(label)
                     t_ready = time.perf_counter_ns()
                     if use_timer:
                         h2d_s_ev, h2d_e_ev = (
@@ -1473,7 +1473,7 @@ def infer(
     with flop_counter, torch.no_grad(), TunedAMP.float(device):
         for _idx, _raw in enumerate(data_loader):
             feat, _label, *_ = preprocess(_raw)
-            X = to_tensor(feat)
+            X = to_torch(feat)
             X = torch.atleast_2d(X)
             if X.dim() != 2:
                 raise RuntimeError(

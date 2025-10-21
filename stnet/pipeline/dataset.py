@@ -17,7 +17,7 @@ except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
 from ..toolkit.compat import patch_arrow
-from .datatype import convert
+from .datatype import to
 
 
 _ARROW = patch_arrow()
@@ -100,8 +100,8 @@ class SampleReader:
             "N": count,
             "feature_dim": feat_dim,
             "label_shape": label_shape,
-            "features_arrow_dtype": convert(features.dtype, "arrow"),
-            "labels_arrow_dtype": convert(labels.dtype, "arrow"),
+            "features_arrow_dtype": to(features.dtype, "arrow"),
+            "labels_arrow_dtype": to(labels.dtype, "arrow"),
             "fractions": [float(train_frac), float(val_frac)],
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
@@ -151,8 +151,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = convert(meta.get("features_arrow_dtype", "float32"), "torch")
-        label_dtype = convert(meta.get("labels_arrow_dtype", "float32"), "torch")
+        feat_dtype = to(meta.get("features_arrow_dtype", "float32"), "torch")
+        label_dtype = to(meta.get("labels_arrow_dtype", "float32"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -193,8 +193,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = convert(meta.get("features_arrow_dtype", "float32"), "torch")
-        label_dtype = convert(meta.get("labels_arrow_dtype", "float32"), "torch")
+        feat_dtype = to(meta.get("features_arrow_dtype", "float32"), "torch")
+        label_dtype = to(meta.get("labels_arrow_dtype", "float32"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
