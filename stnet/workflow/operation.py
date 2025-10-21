@@ -669,7 +669,9 @@ def epoch(
                                 local_loss=bottom_loss,
                                 loss_weights=loss_controller.weights(),
                             )
-                        scaler.scale(loss_val).backward()
+                        accum_scale = max(1, grad_accum_steps)
+                        loss_for_backprop = loss_val / float(accum_scale)
+                        scaler.scale(loss_for_backprop).backward()
                         if should_sync:
                             scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(
