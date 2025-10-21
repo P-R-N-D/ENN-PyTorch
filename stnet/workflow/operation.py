@@ -67,8 +67,8 @@ from ..toolkit.optimization import (
     LossWeightController,
     ModuleTuner,
     TunedAdamW,
+    inference,
     joining,
-    no_gradation,
     no_synchronization,
 )
 
@@ -88,12 +88,12 @@ except ImportError:
 from .config import OpsConfig, OpsMode, ops_config
 
 
-sentences_to_ignore = [
+ignored_sentences = [
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.*",
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
     "TypedStorage is deprecated.*",
 ]
-pattern_to_ignore = "|".join((f"({sentence})" for sentence in sentences_to_ignore))
+ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 
 _DL_STATE_FILE = "dataloader.json"
 
@@ -303,7 +303,6 @@ def _meta(memmap_dir: str) -> Dict[str, Any]:
         return json.load(f)
 
 
-@torch.no_grad()
 def recompute_y_stats(model: Any, loader: Any) -> None:
     dev = next(model.parameters()).device
     model.y_min.fill_(float("inf"))
@@ -313,11 +312,12 @@ def recompute_y_stats(model: Any, loader: Any) -> None:
     model.y_count.zero_()
     model.y_stats_ready.fill_(False)
     model.eval()
-    for X, Y in loader:
-        if Y is None:
-            continue
-        model.update_y_stats(Y.to(dev))
-    model.finalize_y_stats()
+    with inference(model):
+        for X, Y in loader:
+            if Y is None:
+                continue
+            model.update_y_stats(Y.to(dev))
+        model.finalize_y_stats()
 
 
 def _ensure_uniform_param_dtype(
@@ -388,7 +388,7 @@ def train(
     ckpt_dir = new_dir("ckpt_dcp")
     init_dir = new_dir("init_dcp")
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=pattern_to_ignore)
+        warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
         save(
@@ -455,7 +455,7 @@ def train(
     )
     elastic_launch(lc, main)(ops)
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=pattern_to_ignore)
+        warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
         m_sd = _prune_dcp_state_keys(m_sd)
@@ -485,7 +485,7 @@ def predict(
     device = get_device()
     mp.allow_connection_pickling()
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=pattern_to_ignore)
+        warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
         save(
@@ -660,6 +660,8 @@ def main(*args: Any) -> Optional[Model]:
     if not args:
         raise TypeError("main requires at least an OpsConfig argument")
 
+    initialize_python_path()
+
     ret_sink: Optional[Dict[Any, Any]] = None
     if len(args) == 1 and isinstance(args[0], OpsConfig):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -696,7 +698,7 @@ def main(*args: Any) -> Optional[Model]:
         model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
                 m_sd = get_model_state_dict(model, options=opts_sd)
                 m_sd = _prune_dcp_state_keys(m_sd)
@@ -897,7 +899,7 @@ def main(*args: Any) -> Optional[Model]:
         )
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                warnings.filterwarnings("ignore", message=ignored_pattern)
                 optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
                 try:
                     load(
@@ -1128,7 +1130,7 @@ def main(*args: Any) -> Optional[Model]:
             )
         if local_rank == 0:
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 model_sd = get_model_state_dict(model, options=opts_sd)
                 optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
@@ -1180,7 +1182,7 @@ def main(*args: Any) -> Optional[Model]:
         model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=pattern_to_ignore)
+                warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
                 m_sd = _prune_dcp_state_keys(m_sd)
@@ -1410,7 +1412,7 @@ def test(
     )
     with flop_counter_val:
         model.eval()
-        with no_gradation(model), TunedAMP.float(device):
+        with inference(model), TunedAMP.float(device):
             t_fetch_start = time.perf_counter_ns()
             with joining(model=model, optimizer=optimizer):
                 for step_idx, _raw in enumerate(val_loader):
@@ -1545,7 +1547,7 @@ def infer(
     total_flops: float = 0.0
     t_fetch_start = time.perf_counter_ns()
     preds: List[torch.Tensor] = []
-    with flop_counter, no_gradation(model), TunedAMP.float(device):
+    with flop_counter, inference(model), TunedAMP.float(device):
         for _idx, _raw in enumerate(data_loader):
             feat, _label, *_ = preprocess(_raw)
             X = to_torch(feat)

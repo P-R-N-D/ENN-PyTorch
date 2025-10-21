@@ -600,20 +600,20 @@ class PatchEmbedding(nn.Module):
             match self.ndim:
                 case 1:
                     if self.grid is None:
-                        l = fdim
-                        k = self.patch[0]
-                        need = (l + k - 1) // k * k
+                        length = fdim
+                        kernel = self.patch[0]
+                        need = (length + kernel - 1) // kernel * kernel
                         if fdim < need:
                             x = torch.nn.functional.pad(x, (0, need - fdim))
                         return x.view(b, 1, -1)
-                    (l,) = self.grid
-                    if fdim < l:
-                        x = torch.nn.functional.pad(x, (0, l - fdim))
-                    elif fdim > l:
+                    (grid_length,) = self.grid
+                    if fdim < grid_length:
+                        x = torch.nn.functional.pad(x, (0, grid_length - fdim))
+                    elif fdim > grid_length:
                         raise ValueError(
-                            f"[B,F] grid(L={l}) but F={fdim} > L."
+                            f"[B,F] grid(L={grid_length}) but F={fdim} > L."
                         )
-                    return x.view(b, 1, l)
+                    return x.view(b, 1, grid_length)
                 case 2:
                     if self.grid is None:
                         side = int(math.ceil(math.sqrt(fdim)))
@@ -678,9 +678,9 @@ class PatchEmbedding(nn.Module):
         y = self.proj(x)
         match self.ndim:
             case 1:
-                b, d, l = y.shape
-                tokens = y.transpose(1, 2).contiguous().view(b, l, d)
-                meta = (l, 1, 1)
+                b, d, length = y.shape
+                tokens = y.transpose(1, 2).contiguous().view(b, length, d)
+                meta = (length, 1, 1)
             case 2:
                 b, d, h, w = y.shape
                 tokens = y.permute(0, 2, 3, 1).contiguous().view(b, h * w, d)
@@ -752,9 +752,11 @@ class SinusoidalEncoding(nn.Module):
             pw = self._to_1d(w, self.d_axis, device).view(1, 1, w, self.d_axis)
             chunks.append(pw.expand(t, h, w, self.d_axis))
         if "l" in self.axes:
-            l = t
-            pl = self._to_1d(l, self.d_axis, device).view(l, 1, 1, self.d_axis)
-            chunks.append(pl.expand(l, 1, 1, self.d_axis))
+            length_axis = t
+            pl = self._to_1d(length_axis, self.d_axis, device).view(
+                length_axis, 1, 1, self.d_axis
+            )
+            chunks.append(pl.expand(length_axis, 1, 1, self.d_axis))
         pe = (
             torch.cat(chunks, dim=-1)
             .view(-1, self.d_axis * len(self.axes))

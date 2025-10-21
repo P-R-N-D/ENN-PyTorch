@@ -24,6 +24,17 @@ from typing import (
 import torch
 from torch import nn, optim
 
+from .capability import (
+    get_device,
+    get_runtime_config,
+    initialize_sdpa_backends,
+    is_cpu_bf16_supported,
+    is_cuda_bf16_supported,
+    is_float8_supported,
+    is_int8_supported,
+    optimal_optimizer_params,
+)
+
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
 except ImportError:
@@ -139,8 +150,117 @@ def _conv_forward_hook(
         profiler.add_manual(type(mod).__name__, val)
 
 
+def _attention_forward_hook(
+    mod: nn.Module,
+    inp: Tuple[Any, ...],
+    out: Any,
+    *,
+    profiler: "_FlopProfiler",
+    metadata: Dict[str, Any],
+) -> None:
+    if not inp:
+        return
+    q = inp[0]
+    if not isinstance(q, torch.Tensor):
+        return
+    fmt = str(metadata.get("format", "bshd")).lower()
+    try:
+        if fmt == "bshd":
+            batch = int(q.shape[0])
+            seq_len = int(q.shape[1])
+            num_heads = int(metadata.get("num_heads", q.shape[2]))
+            head_dim = int(metadata.get("head_dim", q.shape[3]))
+        elif fmt == "sbd":
+            seq_len = int(q.shape[0])
+            batch = int(q.shape[1])
+            embed_dim = int(q.shape[2])
+            num_heads = int(
+                metadata.get(
+                    "num_heads",
+                    getattr(mod, "num_attention_heads", getattr(mod, "num_heads", 0)),
+                )
+            )
+            if num_heads <= 0:
+                return
+            head_dim = int(metadata.get("head_dim", embed_dim // max(num_heads, 1)))
+        else:
+            return
+    except Exception:
+        return
+    dropout_attr = metadata.get("dropout_attr")
+    dropout_default = float(metadata.get("dropout", 0.0))
+    if dropout_attr and hasattr(mod, dropout_attr):
+        try:
+            dropout_p = float(getattr(mod, dropout_attr))
+        except Exception:
+            dropout_p = dropout_default
+    else:
+        dropout_p = dropout_default
+    include_softmax = bool(metadata.get("include_softmax", True))
+    bwd_factor = metadata.get("bwd_factor")
+    if bwd_factor is None:
+        bwd_factor_val = 2.0 if mod.training else 0.0
+    else:
+        try:
+            bwd_factor_val = float(bwd_factor)
+        except Exception:
+            bwd_factor_val = 2.0 if mod.training else 0.0
+    total = _estimate_attention_flops(
+        batch,
+        seq_len,
+        num_heads,
+        head_dim,
+        bwd_factor=bwd_factor_val,
+        dropout_p=float(dropout_p),
+        training=bool(mod.training),
+        include_softmax_scale_dropout=include_softmax,
+    )
+    if total > 0.0:
+        profiler.add_manual("Attention", total)
+
+
 def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((x, x), dim=-1).reshape(x.shape[0], -1)
+
+
+def _estimate_attention_flops(
+    batch: int,
+    seq_len: int,
+    num_heads: int,
+    head_dim: int,
+    *,
+    bwd_factor: float,
+    dropout_p: float,
+    training: bool,
+    include_softmax_scale_dropout: bool,
+) -> float:
+    if batch <= 0 or seq_len <= 0 or num_heads <= 0 or head_dim <= 0:
+        return 0.0
+    matmul = 4.0 * batch * num_heads * seq_len**2 * head_dim
+    misc = 0.0
+    if include_softmax_scale_dropout:
+        misc_coeff = 6.0
+        if training and dropout_p > 0.0:
+            misc_coeff += 1.0
+        misc = misc_coeff * (batch * num_heads * seq_len**2)
+    fwd = matmul + misc
+    return float(fwd * (1.0 + max(0.0, float(bwd_factor))))
+
+
+def _retention_manual_flops(
+    batch: int,
+    seq_len: int,
+    *,
+    num_heads: int,
+    head_dim: int,
+    use_gate: bool,
+) -> float:
+    if batch <= 0 or seq_len <= 0 or num_heads <= 0 or head_dim <= 0:
+        return 0.0
+    rolling = max(seq_len - 1, 0) * batch * num_heads * head_dim * 2
+    projection = batch * seq_len * num_heads * head_dim
+    gate = batch * seq_len * num_heads * head_dim if use_gate else 0
+    return float(rolling + projection + gate)
 
 
 def is_transformer_engine_enabled(model: torch.nn.Module) -> bool:
@@ -159,8 +279,86 @@ def is_transformer_engine_enabled(model: torch.nn.Module) -> bool:
     return False
 
 
-def no_gradation(model: torch.nn.Module) -> AbstractContextManager[None]:
-    if is_transformer_engine_enabled(model):
+def _is_inference_compiled(model: torch.nn.Module) -> bool:
+    compile_attrs = (
+        "_is_compiled_for_inference",
+        "__is_compiled_for_inference__",
+        "__compiled_for_serving__",
+        "__serving_compiled__",
+        "_is_serialized_for_serving",
+    )
+    if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
+        return True
+
+    jit = getattr(torch, "jit", None)
+    script_like_types: List[type] = []
+    if jit is not None:
+        for name in ("ScriptModule", "RecursiveScriptModule", "TopLevelTracedModule"):
+            typ = getattr(jit, name, None)
+            if isinstance(typ, type):
+                script_like_types.append(typ)
+        for mod_name in ("_script", "_trace"):
+            submod = getattr(jit, mod_name, None)
+            if submod is None:
+                continue
+            for name in ("RecursiveScriptModule", "TopLevelTracedModule"):
+                typ = getattr(submod, name, None)
+                if isinstance(typ, type):
+                    script_like_types.append(typ)
+
+    if any(isinstance(model, typ) for typ in script_like_types):
+        return True
+
+    try:
+        modules = tuple(model.modules())
+    except Exception:
+        modules = ()
+
+    for module in modules:
+        if module is model:
+            continue
+        if any(bool(getattr(module, attr, False)) for attr in compile_attrs):
+            return True
+        if any(isinstance(module, typ) for typ in script_like_types):
+            return True
+    return False
+
+
+def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
+    indicator_attrs = (
+        "_aot_autograd_graph",
+        "_aot_autograd_cache",
+        "_aot_compiled_autograd",
+        "_aot_autograd_traced_module",
+        "__aot_autograd__",
+        "__compiled_with_aot_autograd__",
+    )
+    if any(getattr(model, attr, None) for attr in indicator_attrs):
+        return True
+
+    try:
+        modules = tuple(model.modules())
+    except Exception:
+        modules = ()
+
+    for module in modules:
+        if module is model:
+            continue
+        if any(getattr(module, attr, None) for attr in indicator_attrs):
+            return True
+        class_name = module.__class__.__name__
+        module_name = getattr(module.__class__, "__module__", "")
+        if "AOTAutograd" in class_name or "aot_autograd" in module_name:
+            return True
+    return False
+
+
+def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
+    if (
+        is_transformer_engine_enabled(model)
+        or _is_inference_compiled(model)
+        or _is_aot_autograd_enabled(model)
+    ):
         return torch.no_grad()
     return torch.inference_mode()
 
@@ -169,17 +367,6 @@ def _has_join_hook(obj: Any | None) -> bool:
     if obj is None:
         return False
     return getattr(obj, "join_hook", None) is not None
-
-from .capability import (
-    get_device,
-    get_runtime_config,
-    initialize_sdpa_backends,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int8_supported,
-    optimal_optimizer_params,
-)
 
 try:
     from torchao.quantization import (
@@ -380,12 +567,25 @@ class _FlopProfiler:
             effective_bwd=effective_bwd,
         )
 
+        linear_types = tuple(target_types)
         try:
             for m in model.modules():
-                if isinstance(m, tuple(target_types)):
+                if isinstance(m, linear_types):
                     handles.append(m.register_forward_hook(linear_hook))
                 elif any(isinstance(m, t) for t in conv_types):
                     handles.append(m.register_forward_hook(conv_hook))
+                else:
+                    meta = getattr(m, "__stf_attention_profile__", None)
+                    if isinstance(meta, dict):
+                        handles.append(
+                            m.register_forward_hook(
+                                partial(
+                                    _attention_forward_hook,
+                                    profiler=self,
+                                    metadata=meta,
+                                )
+                            )
+                        )
             return handles
         except Exception:
             self.stop_hooks(handles)
@@ -532,23 +732,22 @@ class _FlopProfiler:
         **kwargs: Any,
     ) -> float:
         try:
-            B = int(q.shape[0])
-            S = int(q.shape[1])
-            H = int(q.shape[2])
-            d = int(q.shape[3])
+            batch = int(q.shape[0])
+            seq_len = int(q.shape[1])
+            num_heads = int(q.shape[2])
+            head_dim = int(q.shape[3])
         except Exception:
             return 0.0
-        if B <= 0 or S <= 0 or H <= 0 or (d <= 0):
-            return 0.0
-        matmul = 4.0 * B * H * S**2 * d
-        misc = 0.0
-        if include_softmax_scale_dropout:
-            misc_coeff = 6.0
-            if training and float(dropout_p) > 0.0:
-                misc_coeff += 1.0
-            misc = misc_coeff * (B * H * S**2)
-        fwd = matmul + misc
-        total = float(fwd * (1.0 + max(0.0, float(bwd_factor))))
+        total = _estimate_attention_flops(
+            batch,
+            seq_len,
+            num_heads,
+            head_dim,
+            bwd_factor=bwd_factor,
+            dropout_p=float(dropout_p),
+            training=bool(training),
+            include_softmax_scale_dropout=include_softmax_scale_dropout,
+        )
         if total > 0.0:
             self.add_manual("Attention", total)
         return total
@@ -972,7 +1171,13 @@ class MSRCompat(nn.Module):
         H, Dh = (self.nhead, self.head_dim)
         q = self.q_proj(x).view(B, S, H, Dh)
         v = self.v_proj(x).view(B, S, H, Dh)
-        manual_flops = float(max(S - 1, 0) * B * H * Dh * 2)
+        manual_flops = _retention_manual_flops(
+            B,
+            S,
+            num_heads=H,
+            head_dim=Dh,
+            use_gate=self.use_gate and self.g_proj is not None,
+        )
         lam = (
             torch.sigmoid(self._beta)
             .view(1, H, 1)
@@ -984,12 +1189,10 @@ class MSRCompat(nn.Module):
             prev = lam * prev + v[:, t]
             s_list.append(prev)
         s = torch.stack(s_list, dim=1).contiguous()
-        manual_flops += float(B * S * D)
         y = (q * s).contiguous().view(B, S, D)
         y = self.norm(y)
         if self.use_gate and self.g_proj is not None:
             gate = torch.nn.functional.silu(self.g_proj(x))
-            manual_flops += float(B * S * D)
             y = y * gate
         if manual_flops > 0.0:
             FLOP_PROFILER.add_manual("Retention", manual_flops)
@@ -1065,12 +1268,27 @@ class TunedMSR(nn.Module):
         state: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
+        try:
+            B, S, D = x.shape
+        except ValueError:
+            manual_flops = 0.0
+        else:
+            manual_flops = _retention_manual_flops(
+                B,
+                S,
+                num_heads=self.nhead,
+                head_dim=max(1, D // max(self.nhead, 1)),
+                use_gate=self.use_gate,
+            )
         if self._ts_ok:
             _, S, _ = x.shape
             rel_pos = self._build_rel_pos(S, x.device, x.dtype)
-            return self._ts_msr(
+            out = self._ts_msr(
                 x, rel_pos, chunkwise_recurrent=False, incremental_state=state
             )
+            if manual_flops > 0.0:
+                FLOP_PROFILER.add_manual("Retention", manual_flops)
+            return out
         return self._fallback(x, attn_mask=attn_mask, state=state, **kwargs)
 
 
@@ -1445,7 +1663,9 @@ class ModuleTuner:
                             bias=child.bias is not None,
                             params_dtype=params_dtype,
                         )
-                        with torch.no_grad():
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(inference(new))
+                            stack.enter_context(inference(child))
                             new.weight.copy_(child.weight)
                             if (
                                 child.bias is not None
@@ -1469,7 +1689,9 @@ class ModuleTuner:
                 new = te.LayerNorm(
                     hidden, eps=float(child.eps), params_dtype=params_dtype
                 )
-                with torch.no_grad():
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(inference(new))
+                    stack.enter_context(inference(child))
                     if child.weight is not None:
                         new.weight.copy_(child.weight)
                     if child.bias is not None:
@@ -1493,7 +1715,9 @@ class ModuleTuner:
                         eps=float(getattr(child, "eps", 1e-06)),
                         params_dtype=params_dtype,
                     )
-                    with torch.no_grad():
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(inference(new))
+                        stack.enter_context(inference(child))
                         new.weight.copy_(child.weight)
                     setattr(root, fqname, new)
                     n_swapped += 1
@@ -1549,7 +1773,9 @@ class ModuleTuner:
                         attn_mask_type="no_mask",
                         window_size=(-1, -1),
                     )
-                    with torch.no_grad():
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(inference(te_mha))
+                        stack.enter_context(inference(child))
                         if getattr(child, "in_proj_weight", None) is not None:
                             te_mha.in_proj_weight.copy_(child.in_proj_weight)
                         if getattr(child, "in_proj_bias", None) is not None:
@@ -1560,6 +1786,12 @@ class ModuleTuner:
                             and te_mha.out_proj.bias is not None
                         ):
                             te_mha.out_proj.bias.copy_(child.out_proj.bias)
+                    te_mha.__stf_attention_profile__ = {
+                        "format": "sbd",
+                        "num_heads": num_heads,
+                        "head_dim": int(embed_dim // max(num_heads, 1)),
+                        "dropout_attr": "attention_dropout",
+                    }
                     setattr(root, fqname, te_mha)
                     n_swapped += 1
                     replaced = True
@@ -1595,6 +1827,12 @@ class ModuleTuner:
                     )
                 if not hasattr(child, "__sdpa_pt__"):
                     child.__sdpa_pt__ = child._sdpa
+                te_dpa.__stf_attention_profile__ = {
+                    "format": "bshd",
+                    "num_heads": nhead,
+                    "head_dim": head_dim,
+                    "dropout_attr": "attention_dropout",
+                }
 
                 def _te_sdpa(
                     self,
@@ -1776,7 +2014,12 @@ class ModuleTuner:
                             params_dtype=params_dtype,
                         )
                         try:
-                            with torch.no_grad():
+                            with contextlib.ExitStack() as stack:
+                                stack.enter_context(inference(mlp))
+                                stack.enter_context(inference(ln))
+                                stack.enter_context(inference(fc))
+                                if isinstance(nxt3, nn.Linear):
+                                    stack.enter_context(inference(nxt3))
                                 if isinstance(ln, nn.LayerNorm):
                                     if hasattr(mlp, "layernorm"):
                                         if ln.weight is not None and hasattr(
@@ -1838,7 +2081,10 @@ class ModuleTuner:
                         params_dtype=params_dtype,
                     )
                     try:
-                        with torch.no_grad():
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(inference(lnlin))
+                            stack.enter_context(inference(ln))
+                            stack.enter_context(inference(fc))
                             if isinstance(ln, nn.LayerNorm):
                                 if (
                                     ln.weight is not None

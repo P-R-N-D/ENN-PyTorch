@@ -6,15 +6,15 @@ from typing import TypeAlias
 from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
-from .config import (
+from .config import (  # noqa: E402  # requires torch patches before import
     ModelConfig,
     PatchConfig,
     model_config,
     patch_config,
     coerce_model_config,
     coerce_patch_config,
-)
-from .module import (
+)  # noqa: E402  # requires torch patches before import
+from .module import (  # noqa: E402  # requires torch patches before import
     CrossTransformer,
     DataFidelityLoss,
     GeGLU,
@@ -33,8 +33,8 @@ from .module import (
     TemporalEncoderLayer,
     norm_layer,
     schedule_stochastic_depth,
-)
-from .network import Model
+)  # noqa: E402  # requires torch patches before import
+from .network import Model  # noqa: E402  # requires torch patches before import
 
 __all__ = [
     "sdpa_kernel",
