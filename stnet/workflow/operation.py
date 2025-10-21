@@ -573,81 +573,289 @@ def epoch(
     bottom_loss: TiledLoss,
     status_bar: Optional[tqdm],
     grad_accum_steps: int,
-    restore_state: bool,
-    state_train: Dict[str, Any],
-    state_val: Dict[str, Any],
+    train_loader: Any,
+    val_loader: Any,
 ) -> Tuple[
-    Any,
-    Any,
-    Any,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
     Dict[str, float],
 ]:
-    train_loader, val_loader, keep = dataloader(
-        memmap_dir=ops.memmap_dir,
-        device=device,
-        batch_size=int(ops.batch_size or 128),
-        val_frac=float(ops.val_frac),
-        prefetch_factor=ops.prefetch_factor,
-        non_blocking_copy=bool(ops.overlap_h2d),
-        io_backend="auto",
-    )
-    if restore_state:
-        with contextlib.suppress(Exception):
-            train_loader.load_state_dict(state_train)
-        if val_loader is not None:
-            with contextlib.suppress(Exception):
-                val_loader.load_state_dict(state_val)
+    if train_loader is None:
+        raise RuntimeError("epoch requires a training dataloader")
+    in_dim = int(ops.in_dim)
     flop_breakdown_epoch: Dict[str, float] = {}
     io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
     flops = torch.tensor(0.0, device=device, dtype=torch.float64)
-    learn(
-        model,
-        device,
-        ops.in_dim,
-        param_dtype,
-        optimizer,
-        scaler,
-        sched,
-        train_loader,
-        status_bar,
-        loss_controller,
-        top_loss,
-        bottom_loss,
-        grad_accum_steps,
-        io_time,
-        comp_time,
-        io_bytes,
-        flops,
-        flop_breakdown_epoch,
+
+    flop_counter_train = FlopCounter(model, mode="train", device=device)
+    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
+        torch, "Event"
     )
+    with flop_counter_train:
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        t_fetch_start = time.perf_counter_ns()
+        with joining(model=model, optimizer=optimizer):
+            total_batches = len(train_loader)
+            for step_idx, _raw in enumerate(train_loader):
+                feat, label, *_ = preprocess(_raw)
+                X = to_torch(feat)
+                X = torch.atleast_2d(X)
+                if X.dim() != 2:
+                    raise RuntimeError(
+                        f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
+                    )
+                if X.shape[1] != in_dim:
+                    raise RuntimeError(
+                        f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
+                    )
+                Y = to_torch(label)
+                t_ready = time.perf_counter_ns()
+                if use_timer:
+                    h2d_s_ev, h2d_e_ev = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    h2d_s_ev.record()
+                    X = X.to(device, non_blocking=True)
+                    Y = Y.to(device, non_blocking=True)
+                    h2d_e_ev.record()
+                    h2d_e_ev.synchronize()
+                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                else:
+                    t_h2d_s = time.perf_counter_ns()
+                    X = X.to(device, non_blocking=True)
+                    Y = Y.to(device, non_blocking=True)
+                    t_h2d_e = time.perf_counter_ns()
+                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
+                io_time += torch.tensor(
+                    wait_s + h2d_s, device=device, dtype=torch.float64
+                )
+                with contextlib.suppress(Exception):
+                    io_bytes += torch.tensor(
+                        X.element_size() * X.nelement()
+                        + Y.element_size() * Y.nelement(),
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                should_sync = ((step_idx + 1) % max(1, grad_accum_steps) == 0) or (
+                    step_idx + 1 == total_batches
+                )
+                if use_timer:
+                    ev_s, ev_e = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    ev_s.record()
+                else:
+                    t_comp_s = time.perf_counter_ns()
+                with no_synchronization(
+                    model, enable=(grad_accum_steps > 1 and (not should_sync))
+                ):
+                    with flop_counter_train.step(display=False) as train_counter:
+                        with TunedAMP.float(device):
+                            Y_flat = Y.reshape(Y.shape[0], -1).to(
+                                device, dtype=param_dtype
+                            )
+                            y_hat, loss_val = model(
+                                X,
+                                labels_flat=Y_flat,
+                                global_loss=top_loss,
+                                local_loss=bottom_loss,
+                                loss_weights=loss_controller.weights(),
+                            )
+                        scaler.scale(loss_val).backward()
+                        if should_sync:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), max_norm=float("inf")
+                            )
+                            scaler.step(optimizer)
+                            scaler.update()
+                            optimizer.zero_grad(set_to_none=True)
+                            sched.step()
+                        with contextlib.suppress(Exception):
+                            step_flops = float(train_counter.get_total_flops())
+                        flops += torch.tensor(
+                            max(0.0, step_flops), device=device, dtype=torch.float64
+                        )
+                        breakdown_getter = getattr(
+                            train_counter, "get_manual_breakdown", None
+                        )
+                        if callable(breakdown_getter):
+                            for name, value in breakdown_getter().items():
+                                try:
+                                    flop_breakdown_epoch[name] = flop_breakdown_epoch.get(
+                                        name, 0.0
+                                    ) + float(value)
+                                except Exception:
+                                    continue
+                if use_timer:
+                    ev_e.record()
+                    ev_e.synchronize()
+                    comp_time += torch.tensor(
+                        float(ev_s.elapsed_time(ev_e)) / 1000.0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                else:
+                    comp_time += torch.tensor(
+                        (time.perf_counter_ns() - t_comp_s) / 1_000_000_000.0,
+                        device=device,
+                        dtype=torch.float64,
+                    )
+                with contextlib.suppress(Exception):
+                    mark_step = getattr(
+                        getattr(torch, "compiler", None),
+                        "cudagraph_mark_step_end",
+                        None,
+                    )
+                    if callable(mark_step):
+                        mark_step()
+                if status_bar is not None:
+                    io_elapsed = float(io_time.item())
+                    io_transferred = float(io_bytes.item())
+                    comp_elapsed = float(comp_time.item())
+                    flop_total = float(flops.item())
+                    mbps_cur = io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
+                    tflops_cur = (
+                        flop_total / max(comp_elapsed, 1e-06) / 1_000_000_000_000.0
+                    )
+                    _advance_status_bar(
+                        status_bar,
+                        1,
+                        mbps_cur,
+                        tflops_cur,
+                        comp_elapsed=comp_elapsed,
+                        flop_breakdown=flop_breakdown_epoch,
+                    )
+                t_fetch_start = time.perf_counter_ns()
+
     if val_loader is not None:
-        test(
-            model,
-            device,
-            ops.in_dim,
-            param_dtype,
-            optimizer,
-            val_loader,
-            status_bar,
-            loss_controller,
-            top_loss,
-            bottom_loss,
-            io_time,
-            comp_time,
-            io_bytes,
-            flops,
-            flop_breakdown_epoch,
-        )
+        flop_counter_val = FlopCounter(model, mode="eval", device=device)
+        with flop_counter_val:
+            model.eval()
+            with inference(model), TunedAMP.float(device):
+                t_fetch_start = time.perf_counter_ns()
+                with joining(model=model, optimizer=optimizer):
+                    for step_idx, _raw in enumerate(val_loader):
+                        feat, label, *_ = preprocess(_raw)
+                        X = to_torch(feat)
+                        X = torch.atleast_2d(X)
+                        if X.dim() != 2:
+                            raise RuntimeError(
+                                f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
+                            )
+                        if X.shape[1] != in_dim:
+                            raise RuntimeError(
+                                f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
+                            )
+                        Y = to_torch(label)
+                        t_ready = time.perf_counter_ns()
+                        if use_timer:
+                            h2d_s_ev, h2d_e_ev = (
+                                torch.Event(device=device, enable_timing=True),
+                                torch.Event(device=device, enable_timing=True),
+                            )
+                            h2d_s_ev.record()
+                            X = X.to(device, non_blocking=True)
+                            Y = Y.to(device, non_blocking=True)
+                            h2d_e_ev.record()
+                            h2d_e_ev.synchronize()
+                            h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                        else:
+                            t_h2d_s = time.perf_counter_ns()
+                            X = X.to(device, non_blocking=True)
+                            Y = Y.to(device, non_blocking=True)
+                            t_h2d_e = time.perf_counter_ns()
+                            h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                        wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
+                        io_time += torch.tensor(
+                            wait_s + h2d_s, device=device, dtype=torch.float64
+                        )
+                        with contextlib.suppress(Exception):
+                            io_bytes += torch.tensor(
+                                X.element_size() * X.nelement()
+                                + Y.element_size() * Y.nelement(),
+                                device=device,
+                                dtype=torch.float64,
+                            )
+                        if use_timer:
+                            ev_s, ev_e = (
+                                torch.Event(device=device, enable_timing=True),
+                                torch.Event(device=device, enable_timing=True),
+                            )
+                            ev_s.record()
+                        else:
+                            t_comp_s = time.perf_counter_ns()
+                        with flop_counter_val.step(display=False) as val_counter:
+                            Yv_flat = Y.reshape(Y.shape[0], -1).to(
+                                device, dtype=param_dtype
+                            )
+                            _y, _loss_val = model(
+                                X,
+                                labels_flat=Yv_flat,
+                                global_loss=top_loss,
+                                local_loss=bottom_loss,
+                                loss_weights=loss_controller.weights(),
+                            )
+                        if use_timer:
+                            ev_e.record()
+                            ev_e.synchronize()
+                            comp_time += torch.tensor(
+                                float(ev_s.elapsed_time(ev_e)) / 1000.0,
+                                device=device,
+                                dtype=torch.float64,
+                            )
+                        else:
+                            comp_time += torch.tensor(
+                                (time.perf_counter_ns() - t_comp_s) / 1_000_000_000.0,
+                                device=device,
+                                dtype=torch.float64,
+                            )
+                        with contextlib.suppress(Exception):
+                            v_step_flops = float(val_counter.get_total_flops())
+                        flops += torch.tensor(
+                            max(0.0, v_step_flops), device=device, dtype=torch.float64
+                        )
+                        breakdown_getter = getattr(
+                            val_counter, "get_manual_breakdown", None
+                        )
+                        if callable(breakdown_getter):
+                            for name, value in breakdown_getter().items():
+                                try:
+                                    flop_breakdown_epoch[name] = flop_breakdown_epoch.get(
+                                        name, 0.0
+                                    ) + float(value)
+                                except Exception:
+                                    continue
+                        if status_bar is not None:
+                            io_elapsed = float(io_time.item())
+                            io_transferred = float(io_bytes.item())
+                            comp_elapsed = float(comp_time.item())
+                            flop_total = float(flops.item())
+                            mbps_cur = (
+                                io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
+                            )
+                            tflops_cur = (
+                                flop_total / max(comp_elapsed, 1e-06)
+                                / 1_000_000_000_000.0
+                            )
+                            _advance_status_bar(
+                                status_bar,
+                                1,
+                                mbps_cur,
+                                tflops_cur,
+                                comp_elapsed=comp_elapsed,
+                                flop_breakdown=flop_breakdown_epoch,
+                            )
+                        t_fetch_start = time.perf_counter_ns()
     return (
-        train_loader,
-        val_loader,
-        keep,
         io_time,
         comp_time,
         io_bytes,
@@ -989,37 +1197,6 @@ def main(*args: Any) -> Optional[Model]:
             reduction="mean",
         )
         loss_controller = LossWeightController()
-        train_steps = _loader_length(train_loader0)
-        if train_step_count > 0:
-            train_steps = max(train_steps, train_step_count)
-        val_steps = _loader_length(val_loader0)
-        steps_per_epoch = max(1, train_steps + val_steps)
-        total_steps = ops.epochs * steps_per_epoch
-        if ops.warmup_ratio > 0.0:
-            warmup_steps = max(1, int(total_steps * ops.warmup_ratio))
-            main_steps = max(1, total_steps - warmup_steps)
-        else:
-            warmup_steps = 0
-            main_steps = max(1, total_steps)
-        base = float(ops.base_lr)
-        emin = float(ops.eta_min)
-        start_factor = 0.001
-
-        def _scheduler(step: int) -> float:
-            if warmup_steps > 0 and step < warmup_steps:
-                return start_factor + (1.0 - start_factor) * (
-                    step / max(1, warmup_steps)
-                )
-            t = step - warmup_steps
-            frac_min = emin / base if base > 0.0 else 0.0
-            return frac_min + (1.0 - frac_min) * 0.5 * (
-                1.0 + math.cos(math.pi * t / max(1, main_steps))
-            )
-
-        sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_scheduler)
-        scaler = torch.amp.GradScaler(
-            enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
-        )
         ckpt_state_path = dl_state_path(ops.ckpt_dir or "")
         init_state_path = (
             dl_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
@@ -1043,91 +1220,149 @@ def main(*args: Any) -> Optional[Model]:
                     state_train = _dl_json.get("train", {}) or {}
                     state_val = _dl_json.get("val", {}) or {}
                     restore_dl_state = bool(state_train) or bool(state_val)
-        status_bar = (
-            _status_bar("Training", total_steps, device) if local_rank == 0 else None
-        )
-        last_train_loader = None
-        last_val_loader = None
-        for _ in range(int(ops.epochs)):
-            (
-                train_loader,
-                val_loader,
-                keep,
-                io_time,
-                comp_time,
-                io_bytes,
-                flops,
-                flop_breakdown_epoch,
-            ) = epoch(
-                model=model,
+        train_loader: Any = None
+        val_loader: Any = None
+        keep: Any = None
+        status_bar: Optional[tqdm] = None
+        try:
+            train_loader, val_loader, keep = dataloader(
+                memmap_dir=ops.memmap_dir,
                 device=device,
-                ops=ops,
-                param_dtype=param_dtype,
-                optimizer=optimizer,
-                scaler=scaler,
-                sched=sched,
-                loss_controller=loss_controller,
-                top_loss=top_loss,
-                bottom_loss=bottom_loss,
-                status_bar=status_bar,
-                grad_accum_steps=int(ops.grad_accum_steps),
-                restore_state=restore_dl_state,
-                state_train=state_train,
-                state_val=state_val,
+                batch_size=int(ops.batch_size or 128),
+                val_frac=float(ops.val_frac),
+                prefetch_factor=ops.prefetch_factor,
+                non_blocking_copy=bool(ops.overlap_h2d),
+                io_backend="auto",
             )
-            last_train_loader, last_val_loader = train_loader, val_loader
-            restore_dl_state = False
+            if restore_dl_state:
+                with contextlib.suppress(Exception):
+                    train_loader.load_state_dict(state_train)
+                if val_loader is not None:
+                    with contextlib.suppress(Exception):
+                        val_loader.load_state_dict(state_val)
+                restore_dl_state = False
+
+            train_steps = _loader_length(train_loader)
+            if train_step_count > 0:
+                train_steps = max(train_steps, train_step_count)
+            val_steps = _loader_length(val_loader)
+            steps_per_epoch = max(1, train_steps + val_steps)
+            total_steps = max(1, int(ops.epochs) * steps_per_epoch)
+            if ops.warmup_ratio > 0.0:
+                warmup_steps = max(1, int(total_steps * ops.warmup_ratio))
+                main_steps = max(1, total_steps - warmup_steps)
+            else:
+                warmup_steps = 0
+                main_steps = max(1, total_steps)
+            base = float(ops.base_lr)
+            emin = float(ops.eta_min)
+            start_factor = 0.001
+
+            def _scheduler(step: int) -> float:
+                if warmup_steps > 0 and step < warmup_steps:
+                    return start_factor + (1.0 - start_factor) * (
+                        step / max(1, warmup_steps)
+                    )
+                t = step - warmup_steps
+                frac_min = emin / base if base > 0.0 else 0.0
+                return frac_min + (1.0 - frac_min) * 0.5 * (
+                    1.0 + math.cos(math.pi * t / max(1, main_steps))
+                )
+
+            sched = torch.optim.lr_scheduler.LambdaLR(
+                optimizer, lr_lambda=_scheduler
+            )
+            scaler = torch.amp.GradScaler(
+                enabled=(
+                    device.type == "cuda" and (not torch.cuda.is_bf16_supported())
+                )
+            )
+            status_bar = (
+                _status_bar("Training", total_steps, device)
+                if local_rank == 0
+                else None
+            )
+
+            for _ in range(int(ops.epochs)):
+                (
+                    io_time,
+                    comp_time,
+                    io_bytes,
+                    flops,
+                    flop_breakdown_epoch,
+                ) = epoch(
+                    model=model,
+                    device=device,
+                    ops=ops,
+                    param_dtype=param_dtype,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    sched=sched,
+                    loss_controller=loss_controller,
+                    top_loss=top_loss,
+                    bottom_loss=bottom_loss,
+                    status_bar=status_bar,
+                    grad_accum_steps=int(ops.grad_accum_steps),
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                )
+                torch.distributed.barrier(
+                    device_ids=[local_rank]
+                    if device.type in ("cuda", "xpu")
+                    else None
+                )
+                for t in (comp_time, io_time, flops, io_bytes):
+                    torch.distributed.all_reduce(
+                        t, op=torch.distributed.ReduceOp.SUM
+                    )
+                world = max(1, get_world_size(device))
+                comp_time /= world
+                io_time /= world
+                flops /= world
+                io_bytes /= world
+                if torch.distributed.is_initialized():
+                    gathered: List[Dict[str, float]] = [dict() for _ in range(world)]
+                    torch.distributed.all_gather_object(
+                        gathered, flop_breakdown_epoch
+                    )
+                    merged: Dict[str, float] = {}
+                    for entry in gathered:
+                        if not isinstance(entry, dict):
+                            continue
+                        for key, value in entry.items():
+                            try:
+                                merged[key] = merged.get(key, 0.0) + float(value)
+                            except Exception:
+                                continue
+                    aggregated_breakdown = merged
+                else:
+                    aggregated_breakdown = dict(flop_breakdown_epoch)
+                if world > 0:
+                    aggregated_breakdown = {
+                        key: value / world
+                        for key, value in aggregated_breakdown.items()
+                    }
+                if local_rank == 0 and status_bar is not None:
+                    mbps = float(io_bytes / io_time.clamp_min(1e-06) / 1_000_000.0)
+                    tflops = float(
+                        flops / comp_time.clamp_min(1e-06) / 1_000_000_000_000.0
+                    )
+                    comp_elapsed_mean = float(comp_time.item())
+                    postfix = _format_metrics_postfix(
+                        mbps,
+                        tflops,
+                        comp_elapsed=comp_elapsed_mean,
+                        flop_breakdown=aggregated_breakdown,
+                    )
+                    status_bar.set_postfix_str(postfix, refresh=False)
+                torch.distributed.barrier(
+                    device_ids=[local_rank]
+                    if device.type in ("cuda", "xpu")
+                    else None
+                )
+        finally:
             if keep is not None:
                 keep.cleanup()
-            torch.distributed.barrier(
-                device_ids=[local_rank]
-                if device.type in ("cuda", "xpu")
-                else None
-            )
-            for t in (comp_time, io_time, flops, io_bytes):
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-            world = max(1, get_world_size(device))
-            comp_time /= world
-            io_time /= world
-            flops /= world
-            io_bytes /= world
-            if torch.distributed.is_initialized():
-                gathered: List[Dict[str, float]] = [dict() for _ in range(world)]
-                torch.distributed.all_gather_object(gathered, flop_breakdown_epoch)
-                merged: Dict[str, float] = {}
-                for entry in gathered:
-                    if not isinstance(entry, dict):
-                        continue
-                    for key, value in entry.items():
-                        try:
-                            merged[key] = merged.get(key, 0.0) + float(value)
-                        except Exception:
-                            continue
-                aggregated_breakdown = merged
-            else:
-                aggregated_breakdown = dict(flop_breakdown_epoch)
-            if world > 0:
-                aggregated_breakdown = {
-                    key: value / world for key, value in aggregated_breakdown.items()
-                }
-            if local_rank == 0 and status_bar is not None:
-                mbps = float(io_bytes / io_time.clamp_min(1e-06) / 1_000_000.0)
-                tflops = float(
-                    flops / comp_time.clamp_min(1e-06) / 1_000_000_000_000.0
-                )
-                comp_elapsed_mean = float(comp_time.item())
-                postfix = _format_metrics_postfix(
-                    mbps,
-                    tflops,
-                    comp_elapsed=comp_elapsed_mean,
-                    flop_breakdown=aggregated_breakdown,
-                )
-                status_bar.set_postfix_str(postfix, refresh=False)
-            torch.distributed.barrier(
-                device_ids=[local_rank]
-                if device.type in ("cuda", "xpu")
-                else None
-            )
         if local_rank == 0:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -1144,13 +1379,13 @@ def main(*args: Any) -> Optional[Model]:
             with contextlib.suppress(Exception):
                 _dl = {
                     "train": (
-                        last_train_loader.state_dict()
-                        if last_train_loader is not None
+                        train_loader.state_dict()
+                        if train_loader is not None
                         else {}
                     ),
                     "val": (
-                        last_val_loader.state_dict()
-                        if last_val_loader is not None
+                        val_loader.state_dict()
+                        if val_loader is not None
                         else {}
                     ),
                 }
@@ -1223,7 +1458,95 @@ def main(*args: Any) -> Optional[Model]:
             non_blocking_copy=True,
             io_backend="auto",
         )
-        flat = infer(model, device, ops.in_dim, ops.out_shape, data_loader)
+        status_bar = _status_bar("Prediction", len(data_loader), device)
+        flop_counter = FlopCounter(model, mode="eval", device=device)
+        use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
+            torch, "Event"
+        )
+        io_bytes: float = 0.0
+        io_time: float = 0.0
+        comp_time: float = 0.0
+        total_flops: float = 0.0
+        t_fetch_start = time.perf_counter_ns()
+        preds: List[torch.Tensor] = []
+        with flop_counter, inference(model), TunedAMP.float(device):
+            for _idx, _raw in enumerate(data_loader):
+                feat, _label, *_ = preprocess(_raw)
+                X = to_torch(feat)
+                X = torch.atleast_2d(X)
+                if X.dim() != 2:
+                    raise RuntimeError(
+                        f"infer: feats.ndim={X.dim()} (expect 2), shape={tuple(X.shape)}"
+                    )
+                if X.shape[1] != int(ops.in_dim):
+                    raise AssertionError(
+                        "infer: feature dim mismatch — "
+                        f"feats.shape[1]={X.shape[1]} != in_dim={ops.in_dim}."
+                    )
+                if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                    X = X.to(dtype=torch.float32)
+                if use_timer:
+                    ev_h2d_s, ev_h2d_e = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    ev_h2d_s.record()
+                    X = X.to(device, non_blocking=True)
+                    ev_h2d_e.record()
+                    ev_h2d_e.synchronize()
+                    h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
+                else:
+                    t_h2d_s = time.perf_counter_ns()
+                    X = X.to(device, non_blocking=True)
+                    t_h2d_e = time.perf_counter_ns()
+                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
+                io_time += wait_s + h2d_s
+                with contextlib.suppress(Exception):
+                    io_bytes += float(X.element_size() * X.nelement())
+                if use_timer:
+                    ev_s, ev_e = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    ev_s.record()
+                else:
+                    t0 = time.perf_counter_ns()
+                with no_synchronization(model, enable=True):
+                    with flop_counter.step(display=False) as step_counter:
+                        with contextlib.suppress(Exception):
+                            mark_step = getattr(
+                                getattr(torch, "compiler", None),
+                                "cudagraph_mark_step_begin",
+                                None,
+                            )
+                            if callable(mark_step):
+                                mark_step()
+                        y_hat, _ = model(
+                            X,
+                            labels_flat=None,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                        )
+                preds.append(y_hat.detach().cpu())
+                if use_timer:
+                    ev_e.record()
+                    ev_e.synchronize()
+                    comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
+                else:
+                    t1 = time.perf_counter_ns()
+                    comp_time += (t1 - t0) / 1_000_000_000.0
+                with contextlib.suppress(Exception):
+                    step_flops = float(step_counter.get_total_flops())
+                total_flops += max(0.0, step_flops)
+                mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
+                tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
+                _advance_status_bar(status_bar, 1, mbps, tflops)
+                t_fetch_start = time.perf_counter_ns()
+        with contextlib.suppress(Exception):
+            status_bar.close()
+        flat = torch.cat(preds, dim=0)
         pred_struct = Model.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
@@ -1233,396 +1556,3 @@ def main(*args: Any) -> Optional[Model]:
         return None
 
     raise ValueError(f"unsupported ops mode: {ops.mode}")
-
-def learn(
-    model: Model,
-    device: torch.device,
-    in_dim: int,
-    param_dtype: torch.dtype,
-    optimizer: torch.optim.Optimizer,
-    scaler: torch.amp.GradScaler,
-    sched: torch.optim.lr_scheduler.LRScheduler,
-    train_loader,
-    status_bar: Optional[tqdm],
-    loss_controller: LossWeightController,
-    top_loss: TiledLoss,
-    bottom_loss: TiledLoss,
-    grad_accum_steps: int,
-    io_time: torch.Tensor,
-    comp_time: torch.Tensor,
-    io_bytes: torch.Tensor,
-    flops: torch.Tensor,
-    flop_breakdown: Dict[str, float],
-) -> None:
-    flop_counter_train = FlopCounter(model, mode="train", device=device)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-        torch, "Event"
-    )
-    with flop_counter_train:
-        model.train()
-        optimizer.zero_grad(set_to_none=True)
-        t_fetch_start = time.perf_counter_ns()
-        with joining(model=model, optimizer=optimizer):
-            total_batches = len(train_loader)
-            for step_idx, _raw in enumerate(train_loader):
-                feat, label, *_ = preprocess(_raw)
-                X = to_torch(feat)
-                X = torch.atleast_2d(X)
-                if X.dim() != 2:
-                    raise RuntimeError(
-                        f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
-                    )
-                if X.shape[1] != in_dim:
-                    raise RuntimeError(
-                        f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
-                    )
-                Y = to_torch(label)
-                t_ready = time.perf_counter_ns()
-                if use_timer:
-                    h2d_s_ev, h2d_e_ev = (
-                        torch.Event(device=device, enable_timing=True),
-                        torch.Event(device=device, enable_timing=True),
-                    )
-                    h2d_s_ev.record()
-                    X = X.to(device, non_blocking=True)
-                    Y = Y.to(device, non_blocking=True)
-                    h2d_e_ev.record()
-                    h2d_e_ev.synchronize()
-                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                else:
-                    t_h2d_s = time.perf_counter_ns()
-                    X = X.to(device, non_blocking=True)
-                    Y = Y.to(device, non_blocking=True)
-                    t_h2d_e = time.perf_counter_ns()
-                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
-                io_time += torch.tensor(
-                    wait_s + h2d_s, device=device, dtype=torch.float64
-                )
-                with contextlib.suppress(Exception):
-                    io_bytes += torch.tensor(
-                        X.element_size() * X.nelement()
-                        + Y.element_size() * Y.nelement(),
-                        device=device,
-                        dtype=torch.float64,
-                    )
-                should_sync = ((step_idx + 1) % max(1, grad_accum_steps) == 0) or (
-                    step_idx + 1 == total_batches
-                )
-                if use_timer:
-                    ev_s, ev_e = (
-                        torch.Event(device=device, enable_timing=True),
-                        torch.Event(device=device, enable_timing=True),
-                    )
-                    ev_s.record()
-                else:
-                    t_comp_s = time.perf_counter_ns()
-                with no_synchronization(
-                    model, enable=(grad_accum_steps > 1 and (not should_sync))
-                ):
-                    with flop_counter_train.step(display=False) as train_counter:
-                        with TunedAMP.float(device):
-                            Y_flat = Y.reshape(Y.shape[0], -1).to(
-                                device, dtype=param_dtype
-                            )
-                            _, loss_val = model(
-                                X,
-                                labels_flat=Y_flat,
-                                global_loss=top_loss,
-                                local_loss=bottom_loss,
-                                loss_weights=loss_controller,
-                            )
-                        if loss_val is None:
-                            raise RuntimeError(
-                                "model returned None loss during training step"
-                            )
-                        scale_loss = loss_val / float(max(1, grad_accum_steps))
-                        scaler.scale(scale_loss).backward()
-                    train_step_flops = float(train_counter.get_total_flops())
-                if use_timer:
-                    ev_e.record()
-                    ev_e.synchronize()
-                    elapsed_comp = float(ev_s.elapsed_time(ev_e)) / 1000.0
-                else:
-                    elapsed_comp = (time.perf_counter_ns() - t_comp_s) / 1_000_000_000.0
-                comp_time += torch.tensor(
-                    elapsed_comp, device=device, dtype=torch.float64
-                )
-                flops += torch.tensor(
-                    train_step_flops, device=device, dtype=torch.float64
-                )
-                breakdown_getter = getattr(
-                    train_counter, "get_manual_breakdown", None
-                )
-                if callable(breakdown_getter):
-                    for name, value in breakdown_getter().items():
-                        try:
-                            flop_breakdown[name] = flop_breakdown.get(name, 0.0) + float(
-                                value
-                            )
-                        except Exception:
-                            continue
-                if should_sync:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    optimizer.zero_grad(set_to_none=True)
-                    sched.step()
-                if status_bar is not None:
-                    io_elapsed = float(io_time.item())
-                    io_transferred = float(io_bytes.item())
-                    comp_elapsed = float(comp_time.item())
-                    flop_total = float(flops.item())
-                    mbps_cur = io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
-                    tflops_cur = (
-                        flop_total / max(comp_elapsed, 1e-06) / 1_000_000_000_000.0
-                    )
-                    _advance_status_bar(
-                        status_bar,
-                        1,
-                        mbps_cur,
-                        tflops_cur,
-                        comp_elapsed=comp_elapsed,
-                        flop_breakdown=flop_breakdown,
-                    )
-                t_fetch_start = time.perf_counter_ns()
-
-
-def test(
-    model: Model,
-    device: torch.device,
-    in_dim: int,
-    param_dtype: torch.dtype,
-    optimizer: torch.optim.Optimizer | None,
-    val_loader,
-    status_bar: Optional[tqdm],
-    loss_controller: LossWeightController,
-    top_loss: TiledLoss,
-    bottom_loss: TiledLoss,
-    io_time: torch.Tensor,
-    comp_time: torch.Tensor,
-    io_bytes: torch.Tensor,
-    flops: torch.Tensor,
-    flop_breakdown: Dict[str, float],
-) -> None:
-    if val_loader is None:
-        return
-    flop_counter_val = FlopCounter(model, mode="eval", device=device)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-        torch, "Event"
-    )
-    with flop_counter_val:
-        model.eval()
-        with inference(model), TunedAMP.float(device):
-            t_fetch_start = time.perf_counter_ns()
-            with joining(model=model, optimizer=optimizer):
-                for step_idx, _raw in enumerate(val_loader):
-                    feat, label, *_ = preprocess(_raw)
-                    X = to_torch(feat)
-                    X = torch.atleast_2d(X)
-                    if X.dim() != 2:
-                        raise RuntimeError(
-                            f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
-                        )
-                    if X.shape[1] != in_dim:
-                        raise RuntimeError(
-                            f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
-                        )
-                    Y = to_torch(label)
-                    t_ready = time.perf_counter_ns()
-                    if use_timer:
-                        h2d_s_ev, h2d_e_ev = (
-                            torch.Event(device=device, enable_timing=True),
-                            torch.Event(device=device, enable_timing=True),
-                        )
-                        h2d_s_ev.record()
-                        X = X.to(device, non_blocking=True)
-                        Y = Y.to(device, non_blocking=True)
-                        h2d_e_ev.record()
-                        h2d_e_ev.synchronize()
-                        h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                    else:
-                        t_h2d_s = time.perf_counter_ns()
-                        X = X.to(device, non_blocking=True)
-                        Y = Y.to(device, non_blocking=True)
-                        t_h2d_e = time.perf_counter_ns()
-                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                    wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
-                    io_time += torch.tensor(
-                        wait_s + h2d_s, device=device, dtype=torch.float64
-                    )
-                    with contextlib.suppress(Exception):
-                        io_bytes += torch.tensor(
-                            X.element_size() * X.nelement()
-                            + Y.element_size() * Y.nelement(),
-                            device=device,
-                            dtype=torch.float64,
-                        )
-                    if use_timer:
-                        ev_s, ev_e = (
-                            torch.Event(device=device, enable_timing=True),
-                            torch.Event(device=device, enable_timing=True),
-                        )
-                        ev_s.record()
-                    else:
-                        t_comp_s = time.perf_counter_ns()
-                    with flop_counter_val.step(display=False) as val_counter:
-                        Yv_flat = Y.reshape(Y.shape[0], -1).to(
-                            device, dtype=param_dtype
-                        )
-                        _y, _loss_val = model(
-                            X,
-                            labels_flat=Yv_flat,
-                            global_loss=top_loss,
-                            local_loss=bottom_loss,
-                            loss_weights=loss_controller.weights(),
-                        )
-                    if use_timer:
-                        ev_e.record()
-                        ev_e.synchronize()
-                        comp_time += torch.tensor(
-                            float(ev_s.elapsed_time(ev_e)) / 1000.0,
-                            device=device,
-                            dtype=torch.float64,
-                        )
-                    else:
-                        comp_time += torch.tensor(
-                            (time.perf_counter_ns() - t_comp_s) / 1_000_000_000.0,
-                            device=device,
-                            dtype=torch.float64,
-                        )
-                    with contextlib.suppress(Exception):
-                        v_step_flops = float(val_counter.get_total_flops())
-                    flops += torch.tensor(
-                        max(0.0, v_step_flops), device=device, dtype=torch.float64
-                    )
-                    breakdown_getter = getattr(
-                        val_counter, "get_manual_breakdown", None
-                    )
-                    if callable(breakdown_getter):
-                        for name, value in breakdown_getter().items():
-                            try:
-                                flop_breakdown[name] = flop_breakdown.get(name, 0.0) + float(
-                                    value
-                                )
-                            except Exception:
-                                continue
-                    if status_bar is not None:
-                        io_elapsed = float(io_time.item())
-                        io_transferred = float(io_bytes.item())
-                        comp_elapsed = float(comp_time.item())
-                        flop_total = float(flops.item())
-                        mbps_cur = (
-                            io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
-                        )
-                        tflops_cur = (
-                            flop_total / max(comp_elapsed, 1e-06)
-                            / 1_000_000_000_000.0
-                        )
-                        _advance_status_bar(
-                            status_bar,
-                            1,
-                            mbps_cur,
-                            tflops_cur,
-                            comp_elapsed=comp_elapsed,
-                            flop_breakdown=flop_breakdown,
-                        )
-                    t_fetch_start = time.perf_counter_ns()
-
-
-def infer(
-    model: Model,
-    device: torch.device,
-    in_dim: int,
-    out_shape: Sequence[int],
-    data_loader,
-) -> torch.Tensor:
-    status_bar = _status_bar("Prediction", len(data_loader), device)
-    flop_counter = FlopCounter(model, mode="eval", device=device)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-        torch, "Event"
-    )
-    io_bytes: float = 0.0
-    io_time: float = 0.0
-    comp_time: float = 0.0
-    total_flops: float = 0.0
-    t_fetch_start = time.perf_counter_ns()
-    preds: List[torch.Tensor] = []
-    with flop_counter, inference(model), TunedAMP.float(device):
-        for _idx, _raw in enumerate(data_loader):
-            feat, _label, *_ = preprocess(_raw)
-            X = to_torch(feat)
-            X = torch.atleast_2d(X)
-            if X.dim() != 2:
-                raise RuntimeError(
-                    f"infer: feats.ndim={X.dim()} (expect 2), shape={tuple(X.shape)}"
-                )
-            if X.shape[1] != int(in_dim):
-                raise AssertionError(
-                    "infer: feature dim mismatch — "
-                    f"feats.shape[1]={X.shape[1]} != in_dim={in_dim}."
-                )
-            if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                X = X.to(dtype=torch.float32)
-            if use_timer:
-                ev_h2d_s, ev_h2d_e = (
-                    torch.Event(device=device, enable_timing=True),
-                    torch.Event(device=device, enable_timing=True),
-                )
-                ev_h2d_s.record()
-                X = X.to(device, non_blocking=True)
-                ev_h2d_e.record()
-                ev_h2d_e.synchronize()
-                h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
-            else:
-                t_h2d_s = time.perf_counter_ns()
-                X = X.to(device, non_blocking=True)
-                t_h2d_e = time.perf_counter_ns()
-                h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-            wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
-            io_time += wait_s + h2d_s
-            with contextlib.suppress(Exception):
-                io_bytes += float(X.element_size() * X.nelement())
-            if use_timer:
-                ev_s, ev_e = (
-                    torch.Event(device=device, enable_timing=True),
-                    torch.Event(device=device, enable_timing=True),
-                )
-                ev_s.record()
-            else:
-                t0 = time.perf_counter_ns()
-            with no_synchronization(model, enable=True):
-                with flop_counter.step(display=False) as step_counter:
-                    with contextlib.suppress(Exception):
-                        mark_step = getattr(
-                            getattr(torch, "compiler", None),
-                            "cudagraph_mark_step_begin",
-                            None,
-                        )
-                        if callable(mark_step):
-                            mark_step()
-                    y_hat, _ = model(
-                        X,
-                        labels_flat=None,
-                        global_loss=None,
-                        local_loss=None,
-                        loss_weights=None,
-                    )
-            preds.append(y_hat.detach().cpu())
-            if use_timer:
-                ev_e.record()
-                ev_e.synchronize()
-                comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
-            else:
-                t1 = time.perf_counter_ns()
-                comp_time += (t1 - t0) / 1_000_000_000.0
-            with contextlib.suppress(Exception):
-                step_flops = float(step_counter.get_total_flops())
-            total_flops += max(0.0, step_flops)
-            mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
-            tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-            _advance_status_bar(status_bar, 1, mbps, tflops)
-            t_fetch_start = time.perf_counter_ns()
-    with contextlib.suppress(Exception):
-        status_bar.close()
-    flat = torch.cat(preds, dim=0)
-    return flat
