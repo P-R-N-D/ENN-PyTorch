@@ -83,25 +83,30 @@ def _canon_dims(
     return out
 
 
+_MODELING_TYPE_ALIASES: dict[str, str] = {
+    "ss": "sxs",
+    "spatial": "sxs",
+    "sxs": "sxs",
+    "tt": "txt",
+    "temporal": "txt",
+    "txt": "txt",
+    "txs": "txs",
+    "st": "sxt",
+    "ts": "sxt",
+    "sxt": "sxt",
+    "spatiotemporal": "sxt",
+    "spatio-temporal": "sxt",
+    "temporospatial": "sxt",
+    "temporo-spatial": "sxt",
+}
+
+
 def _normalize_modeling_type(value: Any) -> str:
     mode = str(value).strip().lower()
-    if mode in {"ss", "spatial", "sxs"}:
-        return "sxs"
-    if mode in {"tt", "temporal", "txt"}:
-        return "txt"
-    if mode in {"txs"}:
-        return "txs"
-    if mode in {
-        "st",
-        "ts",
-        "sxt",
-        "spatiotemporal",
-        "spatio-temporal",
-        "temporospatial",
-        "temporo-spatial",
-    }:
-        return "sxt"
-    raise ValueError(f"Unsupported modeling type '{value}'")
+    normalized = _MODELING_TYPE_ALIASES.get(mode)
+    if normalized is None:
+        raise ValueError(f"Unsupported modeling type '{value}'")
+    return normalized
 
 
 def _stable_std(

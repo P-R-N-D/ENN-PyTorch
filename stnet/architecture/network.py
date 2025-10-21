@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, List, Optional, Protocol, Sequence, Tuple, cast
+from typing import Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 import torch
 import torch.distributed as dist

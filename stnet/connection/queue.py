@@ -72,9 +72,7 @@ class Publisher(Protocol):
         key: Optional[str] = None,
         **kwargs: Any,
     ) -> int:
-        if False:
-            raise RuntimeError(payload, headers, key)
-        raise NotImplementedError
+        ...
 
 
 class Subscriber(Protocol):
@@ -84,12 +82,10 @@ class Subscriber(Protocol):
         timeout: Optional[float] = None,
         **kwargs: Any,
     ) -> Optional[Message]:
-        if False:
-            raise RuntimeError(timeout)
-        raise NotImplementedError
+        ...
 
     def __iter__(self) -> Iterator[Message]:
-        raise NotImplementedError
+        ...
 
 
 class CompatQueue(Publisher, Subscriber):

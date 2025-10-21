@@ -7,6 +7,7 @@ import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -15,6 +16,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    TypeAlias,
     Union,
 )
 
@@ -27,6 +29,23 @@ except ImportError:
     _TorchJoin = None
 
 Join: type[AbstractContextManager[None]] | None = _TorchJoin
+
+if TYPE_CHECKING:
+    from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.nn.parallel import DistributedDataParallel as DDP
+else:
+    DDP = object
+    FSDP = object
+    FSDPModule = object
+
+JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
+
+
+def _has_join_hook(obj: Any | None) -> bool:
+    if obj is None:
+        return False
+    return getattr(obj, "join_hook", None) is not None
 
 from .capability import (
     get_device,
@@ -104,18 +123,16 @@ except Exception:
             QATConfig, QATStep = (_NullQATConfig, _NullQATStep)
 
 
-def joining(*joinables: Optional[object]) -> AbstractContextManager[None]:
+def joining(
+    model: JoinableModel,
+    optimizer: optim.Optimizer | None = None,
+) -> AbstractContextManager[None]:
     if Join is None:
         return contextlib.nullcontext()
-    to_join = []
-    for obj in joinables:
-        if obj is None:
-            continue
-        if getattr(obj, "join_hook", None) is not None:
-            to_join.append(obj)
-    if not to_join:
+    joinables = tuple(obj for obj in (model, optimizer) if _has_join_hook(obj))
+    if not joinables:
         return contextlib.nullcontext()
-    return Join(to_join, throw_on_early_termination=True)
+    return Join(joinables, throw_on_early_termination=True)
 
 
 _LOGGER = logging.getLogger(__name__)
