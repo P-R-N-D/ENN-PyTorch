@@ -42,7 +42,7 @@ from torch.distributed import distributed_c10d
 from ..connection.socket import Endpoint
 from ..toolkit.capability import get_world_size, optimize_threads
 from ..toolkit.compat import has_arrow_flight, patch_arrow
-from .datatype import convert, to_tensor
+from .datatype import to, to_torch
 _ARROW = patch_arrow()
 
 
@@ -165,6 +165,8 @@ def preprocess(
     def _lbl(y: Any) -> Any:
         if isinstance(y, torch.Tensor):
             return y
+        if hasattr(y, "to_torch"):
+            return y.to_torch()
         if hasattr(y, "to_tensor"):
             return y.to_tensor()
         return torch.as_tensor(y)
@@ -175,6 +177,11 @@ def preprocess(
         def _feature_tensor(value: Any) -> torch.Tensor | None:
             if isinstance(value, torch.Tensor):
                 return value
+            if hasattr(value, "to_torch"):
+                try:
+                    return value.to_torch()
+                except Exception:
+                    return None
             if hasattr(value, "to_tensor"):
                 try:
                     return value.to_tensor()
@@ -795,7 +802,7 @@ def fetch(
             and (features.dim() >= 2)
         ):
             features = features.flatten(start_dim=1)
-        labels_tensor = to_tensor(labels)
+        labels_tensor = to_torch(labels)
         if (
             labels_dtype is not None
             and getattr(labels_tensor, "dtype", None) != labels_dtype
@@ -955,10 +962,10 @@ def dataloader(
         meta = reader_tr._load_meta()
         server = None
         keep = _Keep(reader_tr, reader_vl)
-        features_np_dtype = convert(
+        features_np_dtype = to(
             meta.get("features_arrow_dtype", "float32"), "numpy"
         )
-        labels_np_dtype = convert(
+        labels_np_dtype = to(
             meta.get("labels_arrow_dtype", "float32"), "numpy"
         )
         try:

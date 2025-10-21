@@ -133,7 +133,7 @@ def _canonical_dtype_name(src: Any) -> str:
     return canonical
 
 
-def convert(src: Any, platform: str) -> Any:
+def to(src: Any, platform: str) -> Any:
     platform_key = str(platform).strip().lower()
     platform_aliases = {
         "torch": "torch",
@@ -159,9 +159,11 @@ def convert(src: Any, platform: str) -> Any:
     return mapping[normalized]
 
 
-def to_tensor(obj: Any) -> torch.Tensor:
+def to_torch(obj: Any) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
         return obj
+    if hasattr(obj, "to_torch"):
+        return obj.to_torch()
     if hasattr(obj, "to_tensor"):
         return obj.to_tensor()
     if hasattr(obj, "as_tensor"):
