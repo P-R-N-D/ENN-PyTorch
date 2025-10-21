@@ -63,6 +63,13 @@ def _preprocess_to_tuple(x: Any) -> Tuple:
     return (x,)
 
 
+def _ensure_finite_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
+    if torch.is_floating_point(tensor) or torch.is_complex(tensor):
+        if not torch.isfinite(tensor).all():
+            raise ValueError(f"{name} tensor contains non-finite values")
+    return tensor
+
+
 def _preprocess_feature_row(x_tuple: Any) -> torch.Tensor:
     try:
         values = [float(v) for v in _preprocess_to_tuple(x_tuple)]
@@ -71,7 +78,11 @@ def _preprocess_feature_row(x_tuple: Any) -> torch.Tensor:
             "preprocess: feature tuples must contain only numeric values. "
             f"Invalid value={x_tuple!r}"
         ) from exc
-    return torch.as_tensor(values, dtype=torch.float32)
+    for value in values:
+        if not math.isfinite(value):
+            raise ValueError("preprocess: feature tuples must be finite")
+    tensor = torch.as_tensor(values, dtype=torch.float32)
+    return _ensure_finite_tensor(tensor, "feature")
 
 
 def _preprocess_label_tensor(y: Any) -> torch.Tensor:
@@ -114,7 +125,9 @@ def _preprocess_maybe_batch(
         return None
     if not isinstance(y_tensor, torch.Tensor):
         return None
-    x_tensor = x_tensor.detach().to(dtype=torch.float32)
+    x_tensor = _ensure_finite_tensor(
+        x_tensor.detach().to(dtype=torch.float32), "feature"
+    )
     if x_tensor.dim() == 0:
         x_tensor = x_tensor.reshape(1, 1)
     elif x_tensor.dim() == 1:
@@ -124,6 +137,7 @@ def _preprocess_maybe_batch(
         x_tensor = x_tensor.reshape(batch_dim, -1)
     batch = int(x_tensor.shape[0])
     y_tensor = y_tensor.detach()
+    y_tensor = _ensure_finite_tensor(y_tensor, "label")
     if y_tensor.dim() == 0:
         y_tensor = y_tensor.unsqueeze(0)
     if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
@@ -232,7 +246,7 @@ def preprocess(
             return batch_result
         xr, yt = (
             _preprocess_feature_row(x).unsqueeze(0),
-            _preprocess_label_tensor(y),
+            _ensure_finite_tensor(_preprocess_label_tensor(y), "label"),
         )
         if yt.dim() == 0 or yt.dim() == 1:
             yt = yt.unsqueeze(0)
@@ -245,7 +259,7 @@ def preprocess(
         if batch_result is not None:
             return batch_result
         xr = _preprocess_feature_row(x).unsqueeze(0)
-        yt = _preprocess_label_tensor(y)
+        yt = _ensure_finite_tensor(_preprocess_label_tensor(y), "label")
         if yt.dim() == 0:
             yt = yt.unsqueeze(0)
         elif yt.shape[0] != 1:
@@ -262,11 +276,15 @@ def preprocess(
             )
         keys: List[Tuple] = [_preprocess_to_tuple(k) for k, _ in items]
         feats = torch.stack([_preprocess_feature_row(k) for k in keys], dim=0)
-        lbl_list = [_preprocess_label_tensor(v) for _, v in items]
+        lbl_list = [
+            _ensure_finite_tensor(_preprocess_label_tensor(v), "label")
+            for _, v in items
+        ]
         if all((t.shape == lbl_list[0].shape for t in lbl_list)):
             labels = torch.stack(lbl_list, dim=0)
         else:
             labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
+        labels = _ensure_finite_tensor(labels, "label")
         label_shape = tuple(labels.shape[1:])
         return (feats, labels, keys, label_shape)
     else:

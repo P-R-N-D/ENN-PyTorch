@@ -52,36 +52,63 @@ def is_main_loadable() -> bool:
 
 
 def initialize_python_path() -> None:
+    separator = os.pathsep
+    current_env = os.environ.get("PYTHONPATH", "")
+    env_paths = [path for path in current_env.split(separator) if path]
+    paths: List[str] = list(env_paths)
+    seen: set[str] = set(env_paths)
+
+    def _ensure_front(candidate: Path | str | None) -> None:
+        if candidate is None:
+            return
+        try:
+            path_str = os.fspath(candidate)
+        except TypeError:
+            return
+        if not path_str:
+            return
+        if path_str in seen:
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+            return
+        seen.add(path_str)
+        paths.insert(0, path_str)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+    def _ensure_env(entry: str) -> None:
+        if entry in seen:
+            return
+        seen.add(entry)
+        paths.append(entry)
+
     try:
         package_dir = Path(__file__).resolve().parents[1]
     except Exception:
-        return
-    project_dir = package_dir.parent
-    candidates: List[str] = []
-    seen: set[str] = set()
-    for entry in (package_dir, project_dir):
+        package_dir = None
+    project_dir = package_dir.parent if package_dir is not None else None
+    main_dir: Path | None = None
+    main_module = sys.modules.get("__main__")
+    if main_module is not None:
+        main_file = getattr(main_module, "__file__", None)
+        if main_file:
+            with contextlib.suppress(Exception):
+                main_dir = Path(main_file).resolve().parent
+
+    for candidate in (package_dir, project_dir, main_dir):
+        _ensure_front(candidate)
+
+    for entry in list(sys.path):
+        if not entry:
+            continue
         try:
-            resolved = os.fspath(entry)
+            entry_str = os.fspath(entry)
         except TypeError:
             continue
-        if not resolved:
+        if not entry_str:
             continue
-        if not Path(resolved).exists():
-            continue
-        if resolved in seen:
-            continue
-        seen.add(resolved)
-        candidates.append(resolved)
-    if not candidates:
-        return
-    separator = os.pathsep
-    current = os.environ.get("PYTHONPATH", "")
-    paths = [path for path in current.split(separator) if path]
-    for candidate in candidates:
-        if candidate not in paths:
-            paths.insert(0, candidate)
-        if candidate not in sys.path:
-            sys.path.insert(0, candidate)
+        _ensure_env(entry_str)
+
     os.environ["PYTHONPATH"] = separator.join(paths)
 
 

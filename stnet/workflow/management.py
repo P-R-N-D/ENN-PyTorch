@@ -34,6 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from ..architecture.network import Model
 from ..architecture.config import ModelConfig, coerce_model_config
+from ..toolkit.optimization import inference
 
 
 class MissingDependencyError(ImportError):
@@ -89,7 +90,7 @@ def _infer_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) 
         dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
         model.eval()
-        with torch.no_grad():
+        with inference(model):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             y_flat, _ = model(sample, labels_flat=None, net_loss=None)
@@ -211,7 +212,11 @@ class TorchIO:
             _require("safetensors", "pip install safetensors")
             from safetensors.torch import load_file as load_tensors
             return load_tensors(str(p), device=map_location or "cpu")
-        return torch.load(str(p), map_location=map_location or "cpu", weights_only=True)
+        load_kwargs = {"map_location": map_location or "cpu"}
+        try:
+            return torch.load(str(p), weights_only=True, **load_kwargs)
+        except TypeError:
+            return torch.load(str(p), **load_kwargs)
 
 
 class ConverterBase(Protocol):
@@ -486,7 +491,7 @@ class CoreMLConverter:
         import coremltools as ct
         sample = _pad_sample(model, opts.get("sample_input"))
         wrapper = _ExportCompat(model).eval()
-        with torch.no_grad():
+        with inference(wrapper):
             scripted = torch.jit.trace(wrapper, sample)
         cu_map = {
             "ALL": getattr(ct.ComputeUnit, "ALL", None),

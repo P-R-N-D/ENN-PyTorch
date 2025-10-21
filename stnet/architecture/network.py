@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 from math import prod
 from typing import Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
@@ -9,7 +10,7 @@ import torch.distributed as dist
 from torch import nn
 
 from ..toolkit.compat import patch_torch
-from ..toolkit.optimization import TunedAMP, compile
+from ..toolkit.optimization import TunedAMP, compile, inference
 from .config import ModelConfig
 from .module import GlobalEncoder, LocalProcessor, Payload
 
@@ -167,58 +168,58 @@ class Model(nn.Module):
             "standard" if str(method).lower() == "standard" else "none"
         )
 
-    @torch.no_grad()
     def update_x_stats(self, X: torch.Tensor) -> None:
         if X is None:
             return
-        x = torch.as_tensor(X).detach()
-        x = torch.atleast_2d(x)
-        if x.dim() != 2:
-            x = x.view(x.shape[0], -1)
-        x64 = x.to(dtype=torch.float64, device="cpu")
-        if self._x_sum is None or self._x_sum.shape[0] != x64.shape[1]:
-            D = int(x64.shape[1])
-            self._x_sum = torch.zeros(D, dtype=torch.float64)
-            self._x_sum2 = torch.zeros(D, dtype=torch.float64)
-            self._x_count = torch.zeros((), dtype=torch.int64)
-        xnz = torch.nan_to_num(x64, nan=0.0)
-        self._x_sum += xnz.sum(dim=0)
-        self._x_sum2 += (xnz * xnz).sum(dim=0)
-        self._x_count += int(x64.shape[0])
+        with inference(self):
+            x = torch.as_tensor(X).detach()
+            x = torch.atleast_2d(x)
+            if x.dim() != 2:
+                x = x.view(x.shape[0], -1)
+            x64 = x.to(dtype=torch.float64, device="cpu")
+            if self._x_sum is None or self._x_sum.shape[0] != x64.shape[1]:
+                D = int(x64.shape[1])
+                self._x_sum = torch.zeros(D, dtype=torch.float64)
+                self._x_sum2 = torch.zeros(D, dtype=torch.float64)
+                self._x_count = torch.zeros((), dtype=torch.int64)
+            xnz = torch.nan_to_num(x64, nan=0.0)
+            self._x_sum += xnz.sum(dim=0)
+            self._x_sum2 += (xnz * xnz).sum(dim=0)
+            self._x_count += int(x64.shape[0])
 
-    @torch.no_grad()
     def finalize_x_stats(self) -> None:
-        if (
-            self._x_sum is None
-            or self._x_sum2 is None
-            or self._x_count is None
-            or (int(self._x_count.item()) == 0)
-        ):
-            self.x_stats_ready.fill_(False)
-            return
-        dev = next(self.parameters()).device
-        s = self._x_sum.to(device=dev)
-        s2 = self._x_sum2.to(device=dev)
-        c = torch.tensor(
-            float(int(self._x_count.item())), dtype=torch.float64, device=dev
-        )
-        if dist.is_initialized():
-            dist.all_reduce(s, op=dist.ReduceOp.SUM)
-            dist.all_reduce(s2, op=dist.ReduceOp.SUM)
-            dist.all_reduce(c, op=dist.ReduceOp.SUM)
-        s = s.cpu()
-        s2 = s2.cpu()
-        c = float(c.cpu().item())
-        c = max(1.0, c)
-        mean = (s / c).to(torch.float32)
-        var = s2 / c - mean.to(torch.float64).pow(2)
-        std = torch.sqrt(var.clamp_min(self._x_eps**2)).to(torch.float32)
-        self.x_mean.data.copy_(mean)
-        self.x_std.data.copy_(std)
-        self.x_stats_ready.data.fill_(True)
-        self._x_sum = None
-        self._x_sum2 = None
-        self._x_count = None
+        with inference(self):
+            if (
+                self._x_sum is None
+                or self._x_sum2 is None
+                or self._x_count is None
+                or (int(self._x_count.item()) == 0)
+            ):
+                self.x_stats_ready.fill_(False)
+                return
+            dev = next(self.parameters()).device
+            s = self._x_sum.to(device=dev)
+            s2 = self._x_sum2.to(device=dev)
+            c = torch.tensor(
+                float(int(self._x_count.item())), dtype=torch.float64, device=dev
+            )
+            if dist.is_initialized():
+                dist.all_reduce(s, op=dist.ReduceOp.SUM)
+                dist.all_reduce(s2, op=dist.ReduceOp.SUM)
+                dist.all_reduce(c, op=dist.ReduceOp.SUM)
+            s = s.cpu()
+            s2 = s2.cpu()
+            c = float(c.cpu().item())
+            c = max(1.0, c)
+            mean = (s / c).to(torch.float32)
+            var = s2 / c - mean.to(torch.float64).pow(2)
+            std = torch.sqrt(var.clamp_min(self._x_eps**2)).to(torch.float32)
+            self.x_mean.data.copy_(mean)
+            self.x_std.data.copy_(std)
+            self.x_stats_ready.data.fill_(True)
+            self._x_sum = None
+            self._x_sum2 = None
+            self._x_count = None
 
     def _normalize_inputs(self, X: torch.Tensor) -> torch.Tensor:
         if self._input_scale_method != "standard" or not bool(
@@ -231,67 +232,67 @@ class Model(nn.Module):
         )
         return (X - mu) / sd
 
-    @torch.no_grad()
     def update_y_stats(self, y_raw: torch.Tensor) -> None:
-        y = (
-            y_raw.detach()
-            .view(y_raw.shape[0], -1)
-            .to(device=self.y_min.device, dtype=torch.float32)
-        )
-        _, d = y.shape
-        if d != self._label_dim:
-            raise ValueError(
-                f"Target flattened dim {d} != model label_dim {self._label_dim}"
+        with inference(self):
+            y = (
+                y_raw.detach()
+                .view(y_raw.shape[0], -1)
+                .to(device=self.y_min.device, dtype=torch.float32)
             )
-        _min_res = torch.nanmin(y, dim=0)
-        _max_res = torch.nanmax(y, dim=0)
-        batch_min = getattr(
-            _min_res,
-            "values",
-            _min_res[0] if isinstance(_min_res, (tuple, list)) else _min_res,
-        )
-        batch_max = getattr(
-            _max_res,
-            "values",
-            _max_res[0] if isinstance(_max_res, (tuple, list)) else _max_res,
-        )
-        batch_sum = torch.nansum(y, dim=0, dtype=torch.float64)
-        batch_sum2 = torch.nansum(y.to(torch.float64) ** 2, dim=0)
-        batch_cnt = torch.sum(torch.isfinite(y), dim=0, dtype=torch.float64)
-        if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(batch_min, op=dist.ReduceOp.MIN)
-            dist.all_reduce(batch_max, op=dist.ReduceOp.MAX)
-            dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_sum2, op=dist.ReduceOp.SUM)
-            dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
-        self.y_min.copy_(torch.fmin(self.y_min, batch_min))
-        self.y_max.copy_(torch.fmax(self.y_max, batch_max))
-        self.y_sum.add_(batch_sum)
-        self.y_sum2.add_(batch_sum2)
-        self.y_count.add_(batch_cnt)
+            _, d = y.shape
+            if d != self._label_dim:
+                raise ValueError(
+                    f"Target flattened dim {d} != model label_dim {self._label_dim}"
+                )
+            _min_res = torch.nanmin(y, dim=0)
+            _max_res = torch.nanmax(y, dim=0)
+            batch_min = getattr(
+                _min_res,
+                "values",
+                _min_res[0] if isinstance(_min_res, (tuple, list)) else _min_res,
+            )
+            batch_max = getattr(
+                _max_res,
+                "values",
+                _max_res[0] if isinstance(_max_res, (tuple, list)) else _max_res,
+            )
+            batch_sum = torch.nansum(y, dim=0, dtype=torch.float64)
+            batch_sum2 = torch.nansum(y.to(torch.float64) ** 2, dim=0)
+            batch_cnt = torch.sum(torch.isfinite(y), dim=0, dtype=torch.float64)
+            if dist.is_available() and dist.is_initialized():
+                dist.all_reduce(batch_min, op=dist.ReduceOp.MIN)
+                dist.all_reduce(batch_max, op=dist.ReduceOp.MAX)
+                dist.all_reduce(batch_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(batch_sum2, op=dist.ReduceOp.SUM)
+                dist.all_reduce(batch_cnt, op=dist.ReduceOp.SUM)
+            self.y_min.copy_(torch.fmin(self.y_min, batch_min))
+            self.y_max.copy_(torch.fmax(self.y_max, batch_max))
+            self.y_sum.add_(batch_sum)
+            self.y_sum2.add_(batch_sum2)
+            self.y_count.add_(batch_cnt)
 
-    @torch.no_grad()
     def finalize_y_stats(self) -> None:
-        valid = self.y_count > 0
-        y_mean = torch.zeros_like(
-            self.y_sum, dtype=torch.float64, device=self.y_sum.device
-        )
-        var = torch.zeros_like(self.y_sum2, device=self.y_sum2.device)
-        y_mean[valid] = self.y_sum[valid] / self.y_count[valid]
-        var[valid] = (
-            self.y_sum2[valid] / self.y_count[valid] - y_mean[valid] ** 2
-        )
-        y_std = torch.sqrt(
-            torch.clamp(
-                var,
-                min=float(self.y_eps.item()) ** 2
-                if hasattr(self, "y_eps")
-                else 1e-12,
+        with inference(self):
+            valid = self.y_count > 0
+            y_mean = torch.zeros_like(
+                self.y_sum, dtype=torch.float64, device=self.y_sum.device
             )
-        )
-        self.y_mean.copy_(y_mean.to(torch.float32))
-        self.y_std.copy_(y_std.to(torch.float32))
-        self.y_stats_ready.fill_(bool((self.y_count > 0).any().item()))
+            var = torch.zeros_like(self.y_sum2, device=self.y_sum2.device)
+            y_mean[valid] = self.y_sum[valid] / self.y_count[valid]
+            var[valid] = (
+                self.y_sum2[valid] / self.y_count[valid] - y_mean[valid] ** 2
+            )
+            y_std = torch.sqrt(
+                torch.clamp(
+                    var,
+                    min=float(self.y_eps.item()) ** 2
+                    if hasattr(self, "y_eps")
+                    else 1e-12,
+                )
+            )
+            self.y_mean.copy_(y_mean.to(torch.float32))
+            self.y_std.copy_(y_std.to(torch.float32))
+            self.y_stats_ready.fill_(bool((self.y_count > 0).any().item()))
 
     def has_valid_y_stats(self) -> bool:
         try:
@@ -366,7 +367,9 @@ class Model(nn.Module):
                 x_slice = features[s:e].to(
                     device, dtype=base_dtype, non_blocking=True
                 )
-                with torch.no_grad(), TunedAMP.float(device):
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(inference(self.local_net))
+                    stack.enter_context(TunedAMP.float(device))
                     out = self.local_net(x_slice)
                 token_chunks.append(
                     out.tokens
@@ -389,7 +392,10 @@ class Model(nn.Module):
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
-        with torch.no_grad() if infer_mode else torch.enable_grad():
+        grad_context = (
+            inference(self.global_net) if infer_mode else torch.enable_grad()
+        )
+        with grad_context:
             with TunedAMP.float(device):
                 refined_tokens = self.global_net(tokens_centered)
         residual_context = self.local_net.decode(refined_tokens, apply_norm=True)
@@ -543,7 +549,7 @@ class Model(nn.Module):
         pin_memory: bool = False,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-        out = torch.stack([l.reshape(-1) for l in labels], dim=0)
+        out = torch.stack([label.reshape(-1) for label in labels], dim=0)
         if dtype is not None:
             out = out.to(dtype=dtype)
         if pin_memory and out.device.type == "cpu":

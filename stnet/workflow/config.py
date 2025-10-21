@@ -64,16 +64,48 @@ class OpsConfig:
 
     @staticmethod
     def from_partial(mode: OpsMode, **kw: Any) -> "OpsConfig":
+        kw = dict(kw)
         for k in ("in_dim", "out_shape", "cfg_dict"):
             if k not in kw or kw[k] is None:
                 raise ValueError(f"OpsConfig missing required key: {k}")
         in_dim = int(kw["in_dim"])
         out_shape = _as_tuple_ints(kw["out_shape"])
         cfg_dict = dict(kw["cfg_dict"])
+        common_keys = {
+            "in_dim",
+            "out_shape",
+            "cfg_dict",
+        }
         if mode == "train":
             for k in ("memmap_dir", "ckpt_dir"):
                 if k not in kw or kw[k] is None:
                     raise ValueError(f"OpsConfig(train) missing required key: {k}")
+            allowed = common_keys | {
+                "memmap_dir",
+                "ckpt_dir",
+                "init_ckpt_dir",
+                "epochs",
+                "batch_size",
+                "val_frac",
+                "base_lr",
+                "weight_decay",
+                "warmup_ratio",
+                "eta_min",
+                "seed",
+                "prefetch_factor",
+                "grad_accum_steps",
+                "overlap_h2d",
+                "loss_tile_dim",
+                "loss_tile_size",
+                "loss_mask_mode",
+                "loss_mask_value",
+            }
+            unsupported = set(kw) - allowed
+            if unsupported:
+                raise ValueError(
+                    "OpsConfig(train) received unsupported parameters: "
+                    f"{sorted(unsupported)}"
+                )
             batch_size = int(kw.get("batch_size", 128))
             return OpsConfig(
                 mode="train",
@@ -102,6 +134,19 @@ class OpsConfig:
         for k in ("memmap_dir", "keys"):
             if k not in kw or kw[k] is None:
                 raise ValueError(f"OpsConfig({mode}) missing required key: {k}")
+        allowed = common_keys | {
+            "memmap_dir",
+            "keys",
+            "model_ckpt_dir",
+            "batch_size",
+            "seed",
+            "prefetch_factor",
+        }
+        unsupported = set(kw) - allowed
+        if unsupported:
+            raise ValueError(
+                f"OpsConfig({mode}) received unsupported parameters: {sorted(unsupported)}"
+            )
         batch_size = int(kw.get("batch_size", 512))
         return OpsConfig(
             mode="predict" if mode == "predict" else "infer",
