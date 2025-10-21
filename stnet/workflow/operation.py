@@ -50,6 +50,7 @@ from ..pipeline.dataset import SampleReader
 from ..toolkit.capability import (
     get_available_addr,
     get_device,
+    get_preferred_ip,
     get_world_size,
     initialize_python_path,
     is_cpu_bf16_supported,
@@ -67,6 +68,7 @@ from ..toolkit.optimization import (
     ModuleTuner,
     TunedAdamW,
     joining,
+    no_gradation,
     no_synchronization,
 )
 
@@ -110,8 +112,6 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
     except Exception:
         pass
     warnings.warn(msg)
-
-
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
         keys = []
@@ -395,7 +395,8 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
-    resolved_rdzv = rdzv_endpoint if rdzv_endpoint else "127.0.0.1"
+    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
     rdzv_endpoint = get_available_addr(resolved_rdzv)
     optimize_threads()
     nprocs = optimal_procs()["nproc_per_node"]
@@ -1409,7 +1410,7 @@ def test(
     )
     with flop_counter_val:
         model.eval()
-        with torch.no_grad(), TunedAMP.float(device):
+        with no_gradation(model), TunedAMP.float(device):
             t_fetch_start = time.perf_counter_ns()
             with joining(model=model, optimizer=optimizer):
                 for step_idx, _raw in enumerate(val_loader):
@@ -1544,7 +1545,7 @@ def infer(
     total_flops: float = 0.0
     t_fetch_start = time.perf_counter_ns()
     preds: List[torch.Tensor] = []
-    with flop_counter, torch.no_grad(), TunedAMP.float(device):
+    with flop_counter, no_gradation(model), TunedAMP.float(device):
         for _idx, _raw in enumerate(data_loader):
             feat, _label, *_ = preprocess(_raw)
             X = to_torch(feat)

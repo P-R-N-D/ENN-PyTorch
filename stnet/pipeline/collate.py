@@ -40,7 +40,7 @@ from torchdata.nodes import (
 from torch.distributed import distributed_c10d
 
 from ..connection.socket import Endpoint
-from ..toolkit.capability import get_world_size, optimize_threads
+from ..toolkit.capability import get_preferred_ip, get_world_size, optimize_threads
 from ..toolkit.compat import has_arrow_flight, patch_arrow
 from .datatype import to, to_torch
 _ARROW = patch_arrow()
@@ -48,6 +48,91 @@ _ARROW = patch_arrow()
 
 def identity(item: Any) -> Any:
     return item
+
+
+def _preprocess_to_tuple(x: Any) -> Tuple:
+    if isinstance(x, tuple):
+        return x
+    if isinstance(x, list):
+        return tuple(x)
+    if isinstance(x, torch.Tensor):
+        return tuple(x.flatten().detach().cpu().tolist())
+    if hasattr(x, "tolist"):
+        values = x.tolist()
+        return tuple(values if isinstance(values, (list, tuple)) else [values])
+    return (x,)
+
+
+def _preprocess_feature_row(x_tuple: Any) -> torch.Tensor:
+    try:
+        values = [float(v) for v in _preprocess_to_tuple(x_tuple)]
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "preprocess: feature tuples must contain only numeric values. "
+            f"Invalid value={x_tuple!r}"
+        ) from exc
+    return torch.as_tensor(values, dtype=torch.float32)
+
+
+def _preprocess_label_tensor(y: Any) -> torch.Tensor:
+    if isinstance(y, torch.Tensor):
+        return y
+    if hasattr(y, "to_torch"):
+        return y.to_torch()
+    if hasattr(y, "to_tensor"):
+        return y.to_tensor()
+    return torch.as_tensor(y)
+
+
+def _preprocess_feature_tensor(value: Any) -> Optional[torch.Tensor]:
+    if isinstance(value, torch.Tensor):
+        return value
+    if hasattr(value, "to_torch"):
+        with suppress(Exception):
+            return value.to_torch()
+    if hasattr(value, "to_tensor"):
+        with suppress(Exception):
+            return value.to_tensor()
+    if hasattr(value, "as_tensor"):
+        with suppress(Exception):
+            return value.as_tensor()
+    try:
+        return torch.as_tensor(value)
+    except Exception:
+        return None
+
+
+def _preprocess_maybe_batch(
+    x_value: Any, y_value: Any
+) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
+    x_tensor = _preprocess_feature_tensor(x_value)
+    if not isinstance(x_tensor, torch.Tensor):
+        return None
+    try:
+        y_tensor = _preprocess_label_tensor(y_value)
+    except Exception:
+        return None
+    if not isinstance(y_tensor, torch.Tensor):
+        return None
+    x_tensor = x_tensor.detach().to(dtype=torch.float32)
+    if x_tensor.dim() == 0:
+        x_tensor = x_tensor.reshape(1, 1)
+    elif x_tensor.dim() == 1:
+        x_tensor = x_tensor.reshape(-1, 1)
+    else:
+        batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
+        x_tensor = x_tensor.reshape(batch_dim, -1)
+    batch = int(x_tensor.shape[0])
+    y_tensor = y_tensor.detach()
+    if y_tensor.dim() == 0:
+        y_tensor = y_tensor.unsqueeze(0)
+    if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
+        y_tensor = y_tensor.unsqueeze(-1)
+    if y_tensor.shape[0] != batch:
+        return None
+    label_shape = tuple(y_tensor.shape[1:])
+    keys = [(int(i),) for i in range(batch)]
+    return (x_tensor, y_tensor, keys, label_shape)
 
 
 def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
@@ -140,115 +225,32 @@ def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
 def preprocess(
     data: Dict[Tuple, torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
-    def _to_tuple(x: Any) -> Any:
-        if isinstance(x, tuple):
-            return x
-        if isinstance(x, list):
-            return tuple(x)
-        if isinstance(x, torch.Tensor):
-            return tuple(x.flatten().detach().cpu().tolist())
-        if hasattr(x, "tolist"):
-            v = x.tolist()
-            return tuple(v if isinstance(v, (list, tuple)) else [v])
-        return (x,)
-
-    def _feat_row(x_tuple: Any) -> Any:
-        try:
-            vals = [float(v) for v in _to_tuple(x_tuple)]
-        except (TypeError, ValueError) as exc:
-            raise TypeError(
-                "preprocess: feature tuples must contain only numeric values. "
-                f"Invalid value={x_tuple!r}"
-            ) from exc
-        return torch.as_tensor(vals, dtype=torch.float32)
-
-    def _lbl(y: Any) -> Any:
-        if isinstance(y, torch.Tensor):
-            return y
-        if hasattr(y, "to_torch"):
-            return y.to_torch()
-        if hasattr(y, "to_tensor"):
-            return y.to_tensor()
-        return torch.as_tensor(y)
-
-    def _maybe_batch(
-        x_value: Any, y_value: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
-        def _feature_tensor(value: Any) -> torch.Tensor | None:
-            if isinstance(value, torch.Tensor):
-                return value
-            if hasattr(value, "to_torch"):
-                try:
-                    return value.to_torch()
-                except Exception:
-                    return None
-            if hasattr(value, "to_tensor"):
-                try:
-                    return value.to_tensor()
-                except Exception:
-                    return None
-            if hasattr(value, "as_tensor"):
-                try:
-                    return value.as_tensor()
-                except Exception:
-                    return None
-            try:
-                return torch.as_tensor(value)
-            except Exception:
-                return None
-
-        x_tensor = _feature_tensor(x_value)
-        if x_tensor is None:
-            return None
-        try:
-            y_tensor = _lbl(y_value)
-        except Exception:
-            return None
-        if not isinstance(y_tensor, torch.Tensor):
-            return None
-        x_tensor = x_tensor.detach().to(dtype=torch.float32)
-        if x_tensor.dim() == 0:
-            x_tensor = x_tensor.reshape(1, 1)
-        elif x_tensor.dim() == 1:
-            x_tensor = x_tensor.reshape(-1, 1)
-        else:
-            batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
-            x_tensor = x_tensor.reshape(batch_dim, -1)
-        batch = int(x_tensor.shape[0])
-        y_tensor = y_tensor.detach()
-        if y_tensor.dim() == 0:
-            y_tensor = y_tensor.unsqueeze(0)
-        if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
-            y_tensor = y_tensor.unsqueeze(-1)
-        if y_tensor.shape[0] != batch:
-            return None
-        label_shape = tuple(y_tensor.shape[1:])
-        keys = [(int(i),) for i in range(batch)]
-        return (x_tensor, y_tensor, keys, label_shape)
-
     if isinstance(data, dict) and "X" in data and ("Y" in data):
         x, y = (data["X"], data["Y"])
-        batch_result = _maybe_batch(x, y)
+        batch_result = _preprocess_maybe_batch(x, y)
         if batch_result is not None:
             return batch_result
-        xr, yt = (_feat_row(x).unsqueeze(0), _lbl(y))
+        xr, yt = (
+            _preprocess_feature_row(x).unsqueeze(0),
+            _preprocess_label_tensor(y),
+        )
         if yt.dim() == 0 or yt.dim() == 1:
             yt = yt.unsqueeze(0)
-        keys = [_to_tuple(x)]
+        keys = [_preprocess_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
     elif isinstance(data, (tuple, list)) and len(data) >= 2:
         x, y = (data[0], data[1])
-        batch_result = _maybe_batch(x, y)
+        batch_result = _preprocess_maybe_batch(x, y)
         if batch_result is not None:
             return batch_result
-        xr = _feat_row(x).unsqueeze(0)
-        yt = _lbl(y)
+        xr = _preprocess_feature_row(x).unsqueeze(0)
+        yt = _preprocess_label_tensor(y)
         if yt.dim() == 0:
             yt = yt.unsqueeze(0)
         elif yt.shape[0] != 1:
             yt = yt.unsqueeze(0)
-        keys = [_to_tuple(x)]
+        keys = [_preprocess_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
     elif isinstance(data, dict) and len(data) > 0:
@@ -258,9 +260,9 @@ def preprocess(
                 "preprocess: keys in a multi-sample dict must be tuples. "
                 "Provide single samples as {'X': ..., 'Y': ...}."
             )
-        keys: List[Tuple] = [_to_tuple(k) for k, _ in items]
-        feats = torch.stack([_feat_row(k) for k in keys], dim=0)
-        lbl_list = [_lbl(v) for _, v in items]
+        keys: List[Tuple] = [_preprocess_to_tuple(k) for k, _ in items]
+        feats = torch.stack([_preprocess_feature_row(k) for k in keys], dim=0)
+        lbl_list = [_preprocess_label_tensor(v) for _, v in items]
         if all((t.shape == lbl_list[0].shape for t in lbl_list)):
             labels = torch.stack(lbl_list, dim=0)
         else:
@@ -311,6 +313,31 @@ def postprocess(
     return {k: v for k, v in zip(fixed_keys, rows)}
 
 
+def _convert_mapping_to_batch(
+    batch: Mapping[str, Any],
+    *,
+    flatten_features: bool,
+    labels_dtype: Optional[torch.dtype],
+    sanitize: bool,
+) -> Dict[str, Any]:
+    features = batch["X"]
+    labels = batch["Y"]
+    if (
+        flatten_features
+        and isinstance(features, torch.Tensor)
+        and (features.dim() >= 2)
+    ):
+        features = features.flatten(start_dim=1)
+    labels_tensor = to_torch(labels)
+    if labels_dtype is not None and getattr(labels_tensor, "dtype", None) != labels_dtype:
+        labels_tensor = labels_tensor.to(dtype=labels_dtype)
+    if sanitize and torch.is_floating_point(labels_tensor):
+        labels_tensor = torch.nan_to_num(
+            labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
+        )
+    return {"X": features, "Y": labels_tensor}
+
+
 def _world_info() -> Tuple[int, int, int, bool]:
     rank = int(os.environ.get("RANK", os.environ.get("PMI_RANK", "0")))
     local_rank = int(
@@ -357,6 +384,275 @@ def _new_flight(split: str, name: str, uri: str) -> Tuple[str, str]:
     value = store.get(key).decode("utf-8")
     published_name, published_uri = value.split("|", 1)
     return (published_name, published_uri)
+
+
+def _wrap_data_node(
+    node: IterableWrapper,
+    *,
+    device: torch.device,
+    threads: Dict[str, int],
+    prefetch_factor: int,
+    non_blocking_copy: bool,
+    map_fn: Callable[[Any], Any],
+) -> "DataLoader":
+    io_workers = max(1, int(threads["dataloader_workers"]))
+    prebatch = max(1, int(threads["prefetch_factor"]))
+    cpu_total = os.cpu_count() or io_workers
+    cpu_budget = max(1, cpu_total - 1) if cpu_total > 1 else 1
+    proc_target = max(io_workers, 2)
+    proc_workers = max(1, min(cpu_budget, proc_target))
+
+    thread_max_concurrent = io_workers
+    wrapped: BaseNode = ParallelMapper(
+        node,
+        map_fn=map_fn,
+        num_workers=io_workers,
+        in_order=False,
+        method="thread",
+        max_concurrent=thread_max_concurrent,
+        prebatch=prebatch,
+    )
+    proc_max_concurrent = proc_workers
+    wrapped = ParallelMapper(
+        wrapped,
+        map_fn=identity,
+        num_workers=proc_workers,
+        in_order=False,
+        method="process",
+        max_concurrent=proc_max_concurrent,
+    )
+    wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
+    if device.type in {"cuda", "xpu", "mps"}:
+        wrapped = PinMemory(wrapped, pin_memory_device=device.type)
+    return DataLoader(
+        device=device,
+        node=wrapped,
+        prefetch_factor=prefetch_factor,
+        non_blocking=bool(non_blocking_copy),
+    )
+
+
+def _build_local_loaders(
+    memmap_dir: str,
+    batch_size: int,
+    val_frac: float,
+    *,
+    device: torch.device,
+    threads: Dict[str, int],
+    prefetch_factor: int,
+    non_blocking_copy: bool,
+    map_fn: Callable[[Any], Any],
+    batch_reader_cls: type,
+    sample_reader_cls: type,
+) -> Tuple[Any, Optional[Any], _Keep]:
+    reader_tr = sample_reader_cls.from_dir(
+        memmap_dir,
+        split="train",
+        batch_size=int(batch_size),
+        val_frac=val_frac,
+    )
+    meta = reader_tr._load_meta()
+    total = int(meta.get("N", 0))
+    train_range = reader_tr._indices()
+    train_start = int(getattr(train_range, "start", 0))
+    train_end = int(getattr(train_range, "stop", total if total else 0))
+    if train_end <= train_start and total:
+        train_end = total
+    keep = _Keep(reader_tr)
+    node_tr = IterableWrapper(
+        batch_reader_cls(reader_tr, train_start, train_end, int(batch_size))
+    )
+    train_loader = _wrap_data_node(
+        node_tr,
+        device=device,
+        threads=threads,
+        prefetch_factor=prefetch_factor,
+        non_blocking_copy=non_blocking_copy,
+        map_fn=map_fn,
+    )
+    val_loader: Optional[Any] = None
+    if val_frac > 0 and train_end < total:
+        reader_vl = sample_reader_cls.from_dir(
+            memmap_dir,
+            split="val",
+            batch_size=int(batch_size),
+            val_frac=val_frac,
+        )
+        keep.add(reader_vl)
+        val_range = reader_vl._indices()
+        val_start = int(getattr(val_range, "start", train_end))
+        val_end = int(getattr(val_range, "stop", total))
+        if val_end <= val_start:
+            val_end = total
+        node_vl = IterableWrapper(
+            batch_reader_cls(reader_vl, val_start, val_end, int(batch_size))
+        )
+        val_loader = _wrap_data_node(
+            node_vl,
+            device=device,
+            threads=threads,
+            prefetch_factor=prefetch_factor,
+            non_blocking_copy=non_blocking_copy,
+            map_fn=map_fn,
+        )
+    return (train_loader, val_loader, keep)
+
+
+def _iterate_flight_batches(
+    client: Endpoint.Client,
+    name: str,
+    *,
+    features_np_dtype: Any,
+    labels_np_dtype: Any,
+    label_shape: Sequence[int],
+) -> Iterator[Dict[str, torch.Tensor]]:
+    reader = client.reader(name, timeout_s=120.0)
+    for record_batch in reader:
+        batch_size_rb = int(getattr(record_batch, "num_rows", 0)) or int(
+            len(record_batch.column(0))
+        )
+        features_arr = record_batch.column(0)
+        features_np = _ARROW.to_numpy(features_arr, zero_copy_only=False)
+        if isinstance(features_np, np.ndarray) and features_np.dtype == object:
+            features_np = np.array(features_arr.to_pylist(), dtype=np.float32)
+        if not isinstance(features_np, np.ndarray):
+            features_np = np.array(features_np, copy=True)
+        if (
+            getattr(features_np, "flags", None) is None
+            or not features_np.flags.writeable
+            or (not features_np.flags.c_contiguous)
+        ):
+            features_np = np.ascontiguousarray(features_np).copy()
+        if features_np.dtype != features_np_dtype:
+            features_np = features_np.astype(features_np_dtype, copy=False)
+        features_tensor = torch.from_numpy(features_np).view(batch_size_rb, -1)
+
+        labels_arr = record_batch.column(1)
+        labels_np = _ARROW.to_numpy(labels_arr, zero_copy_only=False)
+        if isinstance(labels_np, np.ndarray) and labels_np.dtype == object:
+            labels_np = np.array(labels_arr.to_pylist(), dtype=np.float32)
+        if not isinstance(labels_np, np.ndarray):
+            labels_np = np.array(labels_np, copy=True)
+        if (
+            getattr(labels_np, "flags", None) is None
+            or not labels_np.flags.writeable
+            or (not labels_np.flags.c_contiguous)
+        ):
+            labels_np = np.ascontiguousarray(labels_np).copy()
+        if labels_np.dtype != labels_np_dtype:
+            labels_np = labels_np.astype(labels_np_dtype, copy=False)
+        labels_tensor = torch.from_numpy(labels_np)
+        if label_shape:
+            labels_tensor = labels_tensor.reshape(batch_size_rb, -1).view(
+                batch_size_rb, *label_shape
+            )
+        else:
+            labels_tensor = labels_tensor.reshape(batch_size_rb, -1)
+        yield {"X": features_tensor, "Y": labels_tensor}
+
+
+def _build_flight_loaders(
+    memmap_dir: str,
+    batch_size: int,
+    val_frac: float,
+    *,
+    device: torch.device,
+    threads: Dict[str, int],
+    prefetch_factor: int,
+    non_blocking_copy: bool,
+    map_fn: Callable[[Any], Any],
+    batch_reader_cls: type,
+    sample_reader_cls: type,
+) -> Tuple[Any, Optional[Any], _Keep]:
+    rank, local_rank, _, is_ddp = _world_info()
+    name_train = Endpoint.resource_key(memmap_dir, "train")
+    name_val = Endpoint.resource_key(memmap_dir, "val")
+    reader_tr = sample_reader_cls.from_dir(
+        memmap_dir,
+        split="train",
+        batch_size=int(batch_size),
+        val_frac=val_frac,
+    )
+    reader_vl = (
+        sample_reader_cls.from_dir(
+            memmap_dir,
+            split="val",
+            batch_size=int(batch_size),
+            val_frac=val_frac,
+        )
+        if val_frac > 0
+        else None
+    )
+    meta = reader_tr._load_meta()
+    keep = _Keep(reader_tr, reader_vl)
+    features_np_dtype = to(meta.get("features_arrow_dtype", "float32"), "numpy")
+    labels_np_dtype = to(meta.get("labels_arrow_dtype", "float32"), "numpy")
+    try:
+        loopback_host = get_preferred_ip("localhost", allow_loopback=True)
+        host = "0.0.0.0" if is_ddp else (loopback_host or "127.0.0.1")
+        uri_value = ""
+        if not is_ddp or local_rank == 0:
+            server, uri_value = Endpoint.start_server_standby(host=host, port=0)
+            keep.add(server)
+            Endpoint.reg_mmt_dataset(
+                server, name_train, reader_tr, int(batch_size), "train"
+            )
+            if reader_vl is not None:
+                Endpoint.reg_mmt_dataset(
+                    server, name_val, reader_vl, int(batch_size), "val"
+                )
+            name_train, uri_value = _new_flight("train", name_train, uri_value)
+            if reader_vl is not None:
+                name_val, uri_value = _new_flight("val", name_val, uri_value)
+        else:
+            name_train, uri_value = _new_flight("train", name_train, "")
+            if reader_vl is not None:
+                name_val, uri_value = _new_flight("val", name_val, uri_value)
+        client = Endpoint.Client(uri_value)
+        keep.add(client)
+        label_shape = list(meta.get("label_shape", []))
+
+        node_tr = IterableWrapper(
+            _iterate_flight_batches(
+                client,
+                name_train,
+                features_np_dtype=features_np_dtype,
+                labels_np_dtype=labels_np_dtype,
+                label_shape=label_shape,
+            )
+        )
+        train_loader = _wrap_data_node(
+            node_tr,
+            device=device,
+            threads=threads,
+            prefetch_factor=prefetch_factor,
+            non_blocking_copy=non_blocking_copy,
+            map_fn=map_fn,
+        )
+        if reader_vl is not None:
+            node_vl = IterableWrapper(
+                _iterate_flight_batches(
+                    client,
+                    name_val,
+                    features_np_dtype=features_np_dtype,
+                    labels_np_dtype=labels_np_dtype,
+                    label_shape=label_shape,
+                )
+            )
+            val_loader = _wrap_data_node(
+                node_vl,
+                device=device,
+                threads=threads,
+                prefetch_factor=prefetch_factor,
+                non_blocking_copy=non_blocking_copy,
+                map_fn=map_fn,
+            )
+        else:
+            val_loader = None
+        return (train_loader, val_loader, keep)
+    except Exception:
+        keep.cleanup()
+        raise
 
 
 class DevicePrefetcher(Iterator[Any]):
@@ -468,63 +764,59 @@ class DevicePrefetcher(Iterator[Any]):
             return False
         return self._pin_if_needed
 
-    def _pin_cpu(self, obj: Any) -> Any:
-        def _pin(tensor: Any) -> Any:
-            if self._should_pin(tensor):
-                with suppress(Exception):
-                    return tensor.pin_memory()
-            return tensor
+    def _pin_tensor(self, tensor: Any) -> Any:
+        if self._should_pin(tensor):
+            with suppress(Exception):
+                return tensor.pin_memory()
+        return tensor
 
-        return self._map(obj, _pin)
+    def _pin_cpu(self, obj: Any) -> Any:
+        return self._map(obj, self._pin_tensor)
+
+    def _move_tensor(self, tensor: Any) -> Any:
+        if isinstance(tensor, torch.Tensor):
+            kwargs: Dict[str, Any] = {
+                "non_blocking": self._backend in {"cuda", "xpu", "mps"}
+            }
+            if self._amp_dtype is not None:
+                kwargs["dtype"] = self._amp_dtype
+            return tensor.to(self._dev, **kwargs)
+        return tensor
 
     def _to_device(self, obj: Any) -> Any:
-        def _move(tensor: Any) -> Any:
-            if isinstance(tensor, torch.Tensor):
-                kwargs: Dict[str, Any] = {
-                    "non_blocking": self._backend in {"cuda", "xpu", "mps"}
-                }
-                if self._amp_dtype is not None:
-                    kwargs["dtype"] = self._amp_dtype
-                return tensor.to(self._dev, **kwargs)
-            return tensor
+        return self._map(obj, self._move_tensor)
 
-        return self._map(obj, _move)
+    def _allocate_tensor_like(self, tensor: Any) -> Any:
+        if isinstance(tensor, torch.Tensor):
+            dtype = self._amp_dtype or tensor.dtype
+            return torch.empty(tensor.shape, device=self._dev, dtype=dtype)
+        return tensor
 
     def _allocate_static_like(self, obj: Any) -> Any:
-        def _alloc(tensor: Any) -> Any:
-            if isinstance(tensor, torch.Tensor):
-                dtype = self._amp_dtype or tensor.dtype
-                return torch.empty(tensor.shape, device=self._dev, dtype=dtype)
-            return tensor
+        return self._map(obj, self._allocate_tensor_like)
 
-        return self._map(obj, _alloc)
+    def _copy_structure(self, dst_obj: Any, src_obj: Any) -> Any:
+        if isinstance(dst_obj, torch.Tensor) and isinstance(src_obj, torch.Tensor):
+            dtype = self._amp_dtype or src_obj.dtype
+            src_tensor = src_obj.to(dtype=dtype) if dst_obj.dtype != dtype else src_obj
+            dst_obj.copy_(
+                src_tensor,
+                non_blocking=self._backend in {"cuda", "xpu", "mps"},
+            )
+            return dst_obj
+        if isinstance(dst_obj, (list, tuple)) and isinstance(src_obj, (list, tuple)):
+            return type(dst_obj)(
+                (self._copy_structure(d, s) for d, s in zip(dst_obj, src_obj))
+            )
+        if isinstance(dst_obj, dict) and isinstance(src_obj, dict):
+            return {
+                key: self._copy_structure(dst_obj[key], src_obj[key])
+                for key in dst_obj.keys() & src_obj.keys()
+            }
+        return dst_obj
 
     def _copy_into(self, dst: Any, src: Any) -> Any:
-        def _copy(dst_obj: Any, src_obj: Any) -> Any:
-            if isinstance(dst_obj, torch.Tensor) and isinstance(
-                src_obj, torch.Tensor
-            ):
-                dtype = self._amp_dtype or src_obj.dtype
-                if dst_obj.dtype != dtype:
-                    src_obj = src_obj.to(dtype=dtype)
-                dst_obj.copy_(
-                    src_obj,
-                    non_blocking=self._backend in {"cuda", "xpu", "mps"},
-                )
-                return dst_obj
-            if isinstance(dst_obj, (list, tuple)) and isinstance(
-                src_obj, (list, tuple)
-            ):
-                return type(dst_obj)(
-                    (_copy(d, s) for d, s in zip(dst_obj, src_obj))
-                )
-            if isinstance(dst_obj, dict) and isinstance(src_obj, dict):
-                return {
-                    key: _copy(dst_obj[key], src_obj[key]) for key in dst_obj
-                }
-            return dst_obj
-
-        return _copy(dst, src)
+        return self._copy_structure(dst, src)
 
     def _current_stream(self) -> Any:
         if self._backend == "cuda":
@@ -623,24 +915,21 @@ class DevicePrefetcher(Iterator[Any]):
         self._last_yield_ts = time.perf_counter()
         return moved
 
-    def _record_stream(self, obj: Any, stream: Any) -> None:
-        def _rec(item: Any) -> None:
-            if (
-                isinstance(item, torch.Tensor)
-                and item.device.type == self._backend
-            ):
-                with suppress(Exception):
-                    item.record_stream(stream)
-                return
-            if isinstance(item, (list, tuple)):
-                for sub in item:
-                    _rec(sub)
-                return
-            if isinstance(item, dict):
-                for sub in item.values():
-                    _rec(sub)
+    def _record_item_stream(self, item: Any, stream: Any) -> None:
+        if isinstance(item, torch.Tensor) and item.device.type == self._backend:
+            with suppress(Exception):
+                item.record_stream(stream)
+            return
+        if isinstance(item, (list, tuple)):
+            for sub in item:
+                self._record_item_stream(sub, stream)
+            return
+        if isinstance(item, dict):
+            for sub in item.values():
+                self._record_item_stream(sub, stream)
 
-        _rec(obj)
+    def _record_stream(self, obj: Any, stream: Any) -> None:
+        self._record_item_stream(obj, stream)
 
     def _set_depth(self, new_depth: int) -> None:
         depth = int(max(self._depth_min, min(self._depth_max, new_depth)))
@@ -793,34 +1082,19 @@ def fetch(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Any:
-    def _to_batch(batch: Mapping[str, Any]) -> Dict[str, Any]:
-        features = batch["X"]
-        labels = batch["Y"]
-        if (
-            flatten_features
-            and isinstance(features, torch.Tensor)
-            and (features.dim() >= 2)
-        ):
-            features = features.flatten(start_dim=1)
-        labels_tensor = to_torch(labels)
-        if (
-            labels_dtype is not None
-            and getattr(labels_tensor, "dtype", None) != labels_dtype
-        ):
-            labels_tensor = labels_tensor.to(dtype=labels_dtype)
-        if sanitize and torch.is_floating_point(labels_tensor):
-            labels_tensor = torch.nan_to_num(
-                labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
-            )
-        return {"X": features, "Y": labels_tensor}
-
+    converter = partial(
+        _convert_mapping_to_batch,
+        flatten_features=flatten_features,
+        labels_dtype=labels_dtype,
+        sanitize=sanitize,
+    )
     if isinstance(sample, (list, tuple)):
         return [
-            _to_batch(item) if isinstance(item, Mapping) else item
+            converter(item) if isinstance(item, Mapping) else item
             for item in sample
         ]
     if isinstance(sample, Mapping):
-        return _to_batch(sample)
+        return converter(sample)
     return sample
 
 
@@ -862,229 +1136,33 @@ def dataloader(
         flatten_features=flatten_features,
     )
     from .dataset import BatchReader, SampleReader
-
-    def _wrap_node(node: IterableWrapper) -> DataLoader:
-        io_workers = max(1, int(threads["dataloader_workers"]))
-        prebatch = max(1, int(threads["prefetch_factor"]))
-        cpu_total = os.cpu_count() or io_workers
-        cpu_budget = max(1, cpu_total - 1) if cpu_total > 1 else 1
-        proc_target = max(io_workers, 2)
-        proc_workers = max(1, min(cpu_budget, proc_target))
-
-        thread_max_concurrent = io_workers
-        wrapped: BaseNode = ParallelMapper(
-            node,
-            map_fn=map_fn,
-            num_workers=io_workers,
-            in_order=False,
-            method="thread",
-            max_concurrent=thread_max_concurrent,
-            prebatch=prebatch,
-        )
-        proc_max_concurrent = proc_workers
-        wrapped = ParallelMapper(
-            wrapped,
-            map_fn=identity,
-            num_workers=proc_workers,
-            in_order=False,
-            method="process",
-            max_concurrent=proc_max_concurrent,
-        )
-        wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
-        if device_obj.type in {"cuda", "xpu", "mps"}:
-            wrapped = PinMemory(wrapped, pin_memory_device=device_obj.type)
-        return DataLoader(
-            device=device_obj,
-            node=wrapped,
-            prefetch_factor=prefetch_factor,
-            non_blocking=bool(non_blocking_copy),
-        )
-
-    def _local_impl() -> Tuple[Any, Optional[Any], _Keep]:
-        reader_tr = SampleReader.from_dir(
-            memmap_dir,
-            split="train",
-            batch_size=int(batch_size),
-            val_frac=val_frac,
-        )
-        meta = reader_tr._load_meta()
-        total = int(meta.get("N", 0))
-        train_range = reader_tr._indices()
-        train_start = int(getattr(train_range, "start", 0))
-        train_end = int(getattr(train_range, "stop", total if total else 0))
-        if train_end <= train_start and total:
-            train_end = total
-        keep = _Keep(reader_tr)
-        node_tr = IterableWrapper(
-            BatchReader(reader_tr, train_start, train_end, int(batch_size))
-        )
-        train_loader = _wrap_node(node_tr)
-        val_loader: Optional[Any] = None
-        if val_frac > 0 and train_end < total:
-            reader_vl = SampleReader.from_dir(
-                memmap_dir,
-                split="val",
-                batch_size=int(batch_size),
-                val_frac=val_frac,
-            )
-            keep.add(reader_vl)
-            val_range = reader_vl._indices()
-            val_start = int(getattr(val_range, "start", train_end))
-            val_end = int(getattr(val_range, "stop", total))
-            if val_end <= val_start:
-                val_end = total
-            node_vl = IterableWrapper(
-                BatchReader(reader_vl, val_start, val_end, int(batch_size))
-            )
-            val_loader = _wrap_node(node_vl)
-        return (train_loader, val_loader, keep)
-
-    def _flight_impl() -> Tuple[Any, Optional[Any], _Keep]:
-        rank, local_rank, _, is_ddp = _world_info()
-        name_train = Endpoint.resource_key(memmap_dir, "train")
-        name_val = Endpoint.resource_key(memmap_dir, "val")
-        reader_tr = SampleReader.from_dir(
-            memmap_dir,
-            split="train",
-            batch_size=int(batch_size),
-            val_frac=val_frac,
-        )
-        reader_vl = (
-            SampleReader.from_dir(
-                memmap_dir,
-                split="val",
-                batch_size=int(batch_size),
-                val_frac=val_frac,
-            )
-            if val_frac > 0
-            else None
-        )
-        meta = reader_tr._load_meta()
-        server = None
-        keep = _Keep(reader_tr, reader_vl)
-        features_np_dtype = to(
-            meta.get("features_arrow_dtype", "float32"), "numpy"
-        )
-        labels_np_dtype = to(
-            meta.get("labels_arrow_dtype", "float32"), "numpy"
-        )
-        try:
-            host = "0.0.0.0"
-            if not is_ddp:
-                host = "127.0.0.1"
-            uri_value = ""
-            if not is_ddp or local_rank == 0:
-                server, uri_value = Endpoint.start_server_standby(
-                    host=host, port=0
-                )
-                keep.add(server)
-                Endpoint.reg_mmt_dataset(
-                    server, name_train, reader_tr, int(batch_size), "train"
-                )
-                if reader_vl is not None:
-                    Endpoint.reg_mmt_dataset(
-                        server, name_val, reader_vl, int(batch_size), "val"
-                    )
-                name_train, uri_value = _new_flight(
-                    "train", name_train, uri_value
-                )
-                if reader_vl is not None:
-                    name_val, uri_value = _new_flight(
-                        "val", name_val, uri_value
-                    )
-            else:
-                name_train, uri_value = _new_flight("train", name_train, "")
-                if reader_vl is not None:
-                    name_val, uri_value = _new_flight(
-                        "val", name_val, uri_value
-                    )
-            client = Endpoint.Client(uri_value)
-            keep.add(client)
-            label_shape = list(meta.get("label_shape", []))
-
-            def _iter(name: str) -> Iterator[Dict[str, torch.Tensor]]:
-                reader = client.reader(name, timeout_s=120.0)
-                for record_batch in reader:
-                    batch_size_rb = int(
-                        getattr(record_batch, "num_rows", 0)
-                    ) or int(len(record_batch.column(0)))
-                    features_arr = record_batch.column(0)
-                    features_np = _ARROW.to_numpy(
-                        features_arr, zero_copy_only=False
-                    )
-                    if (
-                        isinstance(features_np, np.ndarray)
-                        and features_np.dtype == object
-                    ):
-                        features_np = np.array(
-                            features_arr.to_pylist(), dtype=np.float32
-                        )
-                    if not isinstance(features_np, np.ndarray):
-                        features_np = np.array(features_np, copy=True)
-                    if (
-                        getattr(features_np, "flags", None) is None
-                        or not features_np.flags.writeable
-                        or (not features_np.flags.c_contiguous)
-                    ):
-                        features_np = np.ascontiguousarray(features_np).copy()
-                    if features_np.dtype != features_np_dtype:
-                        features_np = features_np.astype(
-                            features_np_dtype, copy=False
-                        )
-                    features_tensor = torch.from_numpy(features_np).view(
-                        batch_size_rb, -1
-                    )
-                    labels_arr = record_batch.column(1)
-                    labels_np = _ARROW.to_numpy(
-                        labels_arr, zero_copy_only=False
-                    )
-                    if (
-                        isinstance(labels_np, np.ndarray)
-                        and labels_np.dtype == object
-                    ):
-                        labels_np = np.array(
-                            labels_arr.to_pylist(), dtype=np.float32
-                        )
-                    if not isinstance(labels_np, np.ndarray):
-                        labels_np = np.array(labels_np, copy=True)
-                    if (
-                        getattr(labels_np, "flags", None) is None
-                        or not labels_np.flags.writeable
-                        or (not labels_np.flags.c_contiguous)
-                    ):
-                        labels_np = np.ascontiguousarray(labels_np).copy()
-                    if labels_np.dtype != labels_np_dtype:
-                        labels_np = labels_np.astype(labels_np_dtype, copy=False)
-                    labels_tensor = torch.from_numpy(labels_np)
-                    if label_shape:
-                        labels_tensor = labels_tensor.reshape(
-                            batch_size_rb, -1
-                        ).view(batch_size_rb, *label_shape)
-                    else:
-                        labels_tensor = labels_tensor.reshape(
-                            batch_size_rb, -1
-                        )
-                    yield {"X": features_tensor, "Y": labels_tensor}
-
-            node_tr = IterableWrapper(_iter(name_train))
-            train_loader = _wrap_node(node_tr)
-            if reader_vl is not None:
-                node_vl = IterableWrapper(_iter(name_val))
-                val_loader = _wrap_node(node_vl)
-            else:
-                val_loader = None
-            return (train_loader, val_loader, keep)
-        except Exception:
-            keep.cleanup()
-            raise
+    wrap_kwargs = dict(
+        device=device_obj,
+        threads=threads,
+        prefetch_factor=prefetch_factor,
+        non_blocking_copy=bool(non_blocking_copy),
+        map_fn=map_fn,
+        batch_reader_cls=BatchReader,
+        sample_reader_cls=SampleReader,
+    )
 
     if backend == "local":
-        return _local_impl()
+        return _build_local_loaders(
+            memmap_dir,
+            int(batch_size),
+            val_frac,
+            **wrap_kwargs,
+        )
     if backend != "flight":
         raise ValueError(f"Unsupported io_backend: {backend_input!r}")
 
     try:
-        return _flight_impl()
+        return _build_flight_loaders(
+            memmap_dir,
+            int(batch_size),
+            val_frac,
+            **wrap_kwargs,
+        )
     except Exception as exc:
         if not allow_fallback:
             raise
@@ -1095,4 +1173,9 @@ def dataloader(
             ),
             RuntimeWarning,
         )
-        return _local_impl()
+        return _build_local_loaders(
+            memmap_dir,
+            int(batch_size),
+            val_frac,
+            **wrap_kwargs,
+        )

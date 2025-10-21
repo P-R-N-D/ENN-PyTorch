@@ -312,8 +312,4 @@ class BatchSampler(IterableWrapper):
         if current and (not drop_last):
             batches.append(current)
 
-        def _iter() -> Iterator[List[int]]:
-            for chunk in batches:
-                yield list(chunk)
-
-        super().__init__(_iter())
+        super().__init__([list(chunk) for chunk in batches])

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import ipaddress
 import math
 import multiprocessing
 import os
@@ -164,37 +165,35 @@ def is_port_available(host: str, port: int) -> bool:
     return False
 
 
-def get_available_addr(endpoint: Optional[str]) -> str:
-    import ipaddress
-
-    default_host = "127.0.0.1"
-
-    def _normalize(endpoint_str: str) -> Tuple[str, int]:
-        value = endpoint_str.strip()
-        if not value:
-            return default_host, 0
-        if value.startswith("["):
-            if "]" not in value:
-                raise ValueError(f"invalid endpoint: {endpoint_str}")
-            closing = value.index("]")
-            host_part = value[1:closing]
-            remainder = value[closing + 1 :]
-            if remainder.startswith(":") and remainder[1:]:
-                return host_part, int(remainder[1:])
-            if remainder in ("", ":"):
-                return host_part, 0
+def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
+    value = endpoint_str.strip()
+    if not value:
+        return default_host, 0
+    if value.startswith("["):
+        if "]" not in value:
             raise ValueError(f"invalid endpoint: {endpoint_str}")
-        host_part, sep, port_part = value.rpartition(":")
-        if sep and port_part.isdigit():
-            return host_part or default_host, int(port_part)
-        return value, 0
+        closing = value.index("]")
+        host_part = value[1:closing]
+        remainder = value[closing + 1 :]
+        if remainder.startswith(":") and remainder[1:]:
+            return host_part, int(remainder[1:])
+        if remainder in ("", ":"):
+            return host_part, 0
+        raise ValueError(f"invalid endpoint: {endpoint_str}")
+    host_part, sep, port_part = value.rpartition(":")
+    if sep and port_part.isdigit():
+        return host_part or default_host, int(port_part)
+    return value, 0
 
+
+def get_available_addr(endpoint: Optional[str]) -> str:
+    default_host = "127.0.0.1"
     host: str
     port: int
     if endpoint is None:
         host, port = default_host, 0
     else:
-        host, port = _normalize(str(endpoint))
+        host, port = normalize_endpoint(str(endpoint), default_host)
 
     if port <= 0 or not is_port_available(host, port):
         last_error: Optional[BaseException] = None
@@ -233,6 +232,104 @@ def get_available_addr(endpoint: Optional[str]) -> str:
     if addr is not None and addr.version == 6:
         return f"[{host}]:{port}"
     return f"{host}:{port}"
+
+
+def get_preferred_ip(
+    hostname: Optional[str] = None,
+    *,
+    prefer_ipv6: bool = True,
+    allow_loopback: bool = True,
+) -> str:
+    names: List[str] = []
+    if hostname:
+        candidate = str(hostname).strip()
+        if candidate:
+            names.append(candidate)
+    try:
+        system_host = socket.gethostname()
+    except Exception:
+        system_host = ""
+    if system_host:
+        names.append(system_host)
+    if allow_loopback:
+        names.append("localhost")
+
+    buckets: Dict[
+        Tuple[str, int],
+        List[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]],
+    ] = {
+        ("global", 4): [],
+        ("global", 6): [],
+        ("loopback", 4): [],
+        ("loopback", 6): [],
+    }
+    seen: set[Tuple[int, str]] = set()
+
+    for name in names:
+        if not name:
+            continue
+        infos: List[Tuple[Any, ...]] = []
+        try:
+            infos = socket.getaddrinfo(
+                name,
+                None,
+                socket.AF_UNSPEC,
+                socket.SOCK_STREAM,
+            )
+        except socket.gaierror:
+            continue
+        except Exception:
+            with contextlib.suppress(Exception):
+                infos = socket.getaddrinfo(name, None)
+        for info in infos:
+            try:
+                sockaddr = info[4]
+            except Exception:
+                sockaddr = None
+            if not sockaddr:
+                continue
+            addr_text = sockaddr[0]
+            base, _, _ = addr_text.partition("%")
+            try:
+                parsed = ipaddress.ip_address(base)
+            except ValueError:
+                continue
+            if parsed.is_unspecified:
+                continue
+            key = (parsed.version, parsed.compressed)
+            if key in seen:
+                continue
+            seen.add(key)
+            bucket_key = ("loopback" if parsed.is_loopback else "global", parsed.version)
+            buckets.setdefault(bucket_key, []).append(parsed)
+
+    if prefer_ipv6:
+        order: Tuple[Tuple[str, int], ...] = (
+            ("global", 6),
+            ("global", 4),
+            ("loopback", 6),
+            ("loopback", 4),
+        )
+    else:
+        order = (
+            ("global", 4),
+            ("global", 6),
+            ("loopback", 4),
+            ("loopback", 6),
+        )
+
+    for bucket_key in order:
+        if not allow_loopback and bucket_key[0] == "loopback":
+            continue
+        bucket = buckets.get(bucket_key) or []
+        if bucket:
+            return bucket[0].compressed
+
+    fallback_ipv6_loop = "::1"
+    fallback_ipv4_loop = "127.0.0.1"
+    if allow_loopback:
+        return fallback_ipv6_loop if prefer_ipv6 else fallback_ipv4_loop
+    return "::" if prefer_ipv6 else "0.0.0.0"
 
 
 def get_world_size(device: Optional[torch.device] = None) -> int:

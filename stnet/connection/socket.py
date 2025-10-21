@@ -8,7 +8,7 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..toolkit.capability import get_available_addr
+from ..toolkit.capability import get_available_addr, get_preferred_ip
 from ..toolkit.compat import patch_arrow
 
 
@@ -199,6 +199,57 @@ class Endpoint:
             ) from last_error
 
     @staticmethod
+    def _serve_in_thread(
+        server: "Endpoint.Server", thread_error: list[BaseException]
+    ) -> None:
+        try:
+            server.serve()
+        except BaseException as exc:
+            thread_error.append(exc)
+            raise
+
+    @staticmethod
+    def _await_server_bind(
+        server: "Endpoint.Server",
+        resolved_port: int,
+        fallback_port: int,
+        deadline: float,
+        bound: threading.Event,
+        thread: threading.Thread,
+        thread_error: list[BaseException],
+    ) -> int:
+        while time.time() < deadline:
+            actual = getattr(server, "port", 0) or resolved_port
+            if actual not in (None, 0):
+                bound.set()
+                return actual
+            if thread_error:
+                raise RuntimeError(
+                    "Arrow Flight server thread failed during startup"
+                ) from thread_error[0]
+            if not thread.is_alive():
+                raise RuntimeError(
+                    "Arrow Flight server thread exited before binding to a port"
+                )
+            time.sleep(0.01)
+        return getattr(server, "port", 0) or fallback_port
+
+    @staticmethod
+    def _iter_batches(
+        mmts: "SampleReader",
+        batch_size: int,
+        start: int,
+        end: int,
+    ) -> Iterator[pa.RecordBatch]:
+        mmts_cls = _memory_mapped_tensor_stream()
+        index = start
+        while index < end:
+            nxt = min(index + int(batch_size), end)
+            xb, yb = mmts.batch_range(index, nxt)
+            yield mmts_cls.to_record_batch(xb, yb)
+            index = nxt
+
+    @staticmethod
     def start_server_standby(
         *args: Any,
         host: str = "0.0.0.0",
@@ -224,40 +275,27 @@ class Endpoint:
 
         advertise_host = resolved_host
         if advertise_host in ("", "0.0.0.0", "::"):
-            try:
-                advertise_host = socket.gethostbyname(socket.gethostname())
-            except Exception:
+            advertise_host = get_preferred_ip(allow_loopback=True)
+            if not advertise_host:
                 advertise_host = "127.0.0.1"
 
-        def _serve() -> None:
-            try:
-                server.serve()
-            except BaseException as exc:
-                thread_error.append(exc)
-                raise
-
-        thread = threading.Thread(target=_serve, daemon=True)
+        thread = threading.Thread(
+            target=Endpoint._serve_in_thread,
+            args=(server, thread_error),
+            daemon=True,
+        )
         thread.start()
         deadline = time.time() + float(wait_ready_s)
 
-        def _wait_for_bind() -> int:
-            while time.time() < deadline:
-                actual = getattr(server, "port", 0) or resolved_port
-                if actual not in (None, 0):
-                    bound.set()
-                    return actual
-                if thread_error:
-                    raise RuntimeError(
-                        "Arrow Flight server thread failed during startup"
-                    ) from thread_error[0]
-                if not thread.is_alive():
-                    raise RuntimeError(
-                        "Arrow Flight server thread exited before binding to a port"
-                    )
-                time.sleep(0.01)
-            return getattr(server, "port", 0) or port
-
-        actual_port = _wait_for_bind()
+        actual_port = Endpoint._await_server_bind(
+            server,
+            resolved_port,
+            port,
+            deadline,
+            bound,
+            thread,
+            thread_error,
+        )
         if not bound.is_set():
             if thread_error:
                 raise RuntimeError(
@@ -325,16 +363,7 @@ class Endpoint:
         train_end = int(total * float(fractions[0])) if fractions else total
         start, end = (0, train_end) if split == "train" else (train_end, total)
 
-        def _batches() -> Iterator[pa.RecordBatch]:
-            index = start
-            mmts_cls = _memory_mapped_tensor_stream()
-            while index < end:
-                nxt = min(index + int(batch_size), end)
-                xb, yb = mmts.batch_range(index, nxt)
-                yield mmts_cls.to_record_batch(xb, yb)
-                index = nxt
-
-        generator = _batches()
+        generator = Endpoint._iter_batches(mmts, batch_size, start, end)
         first = next(generator)
         rest = list(generator)
         schema = first.schema
