@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import mmap
 import os
+from types import TracebackType
 from typing import Any, Iterator, Optional
 
 import numpy as np
@@ -79,9 +80,12 @@ class MemoryMap:
     def __enter__(self) -> mmap.mmap:
         return self.open()
 
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if exc_type or exc or tb:
-            pass
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
         self.close()
 
     def to_arrow_buffer(self) -> "pa.Buffer":

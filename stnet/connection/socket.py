@@ -98,8 +98,7 @@ class Endpoint:
         def list_flights(
             self, context: Any, criteria: bytes | None
         ) -> Iterator[flight.FlightInfo]:
-            _ = (context, criteria)
-            del _
+            del context, criteria
             with self._lock:
                 for name, reader in self._datasets.items():
                     canonical = Endpoint._canon_name(name)
@@ -125,8 +124,7 @@ class Endpoint:
         def get_flight_info(
             self, context: Any, descriptor: flight.FlightDescriptor
         ) -> flight.FlightInfo:
-            _ = context
-            del _
+            del context
             name = Endpoint._name_from_descriptor(descriptor)
             key = Endpoint._canon_name(name)
             with self._lock:
@@ -154,8 +152,7 @@ class Endpoint:
         def do_get(
             self, context: Any, ticket: flight.Ticket
         ) -> flight.RecordBatchStream:
-            _ = context
-            del _
+            del context
             name = Endpoint._canon_name(ticket.ticket)
             with self._lock:
                 reader = self._datasets[name]

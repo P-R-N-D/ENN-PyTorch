@@ -723,19 +723,23 @@ def main_train(*args: Any) -> Optional[Model]:
 
     wrapped: set[int] = set()
 
-    def _fsdp_wrap(target: Optional[torch.nn.Module]) -> None:
+    def _fsdp_wrap(target: Optional[torch.nn.Module]) -> Optional[torch.nn.Module]:
+        nonlocal model
         if target is None or id(target) in wrapped:
-            return
+            return target
         wrapped.add(id(target))
         per_mod_ignored = _per_module_ignored_params(target)
-        handle = fully_shard(
+        sharded = fully_shard(
             target,
             mesh=mesh,
             mp_policy=mp_policy,
             reshard_after_forward=False,
             ignored_params=per_mod_ignored or None,
         )
-        handle.set_requires_gradient_sync(True)
+        sharded.set_requires_gradient_sync(True)
+        if target is model:
+            model = sharded
+        return sharded
 
     def _collect_block_modules(
         root: Optional[torch.nn.Module],
@@ -760,7 +764,7 @@ def main_train(*args: Any) -> Optional[Model]:
             _fsdp_wrap(submodule)
         _fsdp_wrap(model)
     except (RuntimeError, ValueError, TypeError):
-        handle = fully_shard(
+        model = fully_shard(
             model,
             mesh=mesh,
             mp_policy=mp_policy,
@@ -769,7 +773,7 @@ def main_train(*args: Any) -> Optional[Model]:
             ),
             reshard_after_forward=False,
         )
-        handle.set_requires_gradient_sync(True)
+        model.set_requires_gradient_sync(True)
     net_params = [p for p in model.parameters()]
     optimizer = TunedAdamW.float(
         net_params,
@@ -980,6 +984,7 @@ def main_train(*args: Any) -> Optional[Model]:
                 device,
                 ops.in_dim,
                 param_dtype,
+                optimizer,
                 val_loader,
                 status_bar,
                 loss_controller,
@@ -1180,7 +1185,7 @@ def learn(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         t_fetch_start = time.perf_counter_ns()
-        with joining(model, optimizer):
+        with joining(model=model, optimizer=optimizer):
             total_batches = len(train_loader)
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
@@ -1310,6 +1315,7 @@ def test(
     device: torch.device,
     in_dim: int,
     param_dtype: torch.dtype,
+    optimizer: torch.optim.Optimizer | None,
     val_loader,
     status_bar: Optional[tqdm],
     loss_controller: LossWeightController,
@@ -1331,7 +1337,7 @@ def test(
         model.eval()
         with torch.no_grad(), TunedAMP.float(device):
             t_fetch_start = time.perf_counter_ns()
-            with joining(model, None):
+            with joining(model=model, optimizer=optimizer):
                 for step_idx, _raw in enumerate(val_loader):
                     feat, label, *_ = preprocess(_raw)
                     X = to_tensor(feat)
