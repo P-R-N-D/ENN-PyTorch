@@ -22,7 +22,7 @@ from .functional import SwiGLU
 from .layers import (
     GlobalEncoderLayer,
     CrossAttention,
-    PointTransformer,
+    PatchAttention,
     StochasticDepth,
     TemporalEncoderLayer,
     norm_layer,
@@ -32,6 +32,47 @@ from .layers import (
 patch_torch()
 if TYPE_CHECKING:
     from .config import ModelConfig
+
+
+class PointTransformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        coord_dim: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self.norm1 = norm_layer(norm_type, self.d_model)
+        self.attn = PatchAttention(
+            self.d_model, nhead, coord_dim=coord_dim
+        )
+        self.norm2 = norm_layer(norm_type, self.d_model)
+        hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(
+            self.d_model, hid, out_dim=self.d_model, dropout=dropout
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if coords.shape[:2] != x.shape[:2]:
+            raise ValueError("coords must have shape (B, N, C)")
+        y = self.attn(self.norm1(x), coords, attn_mask=attn_mask)
+        x = x + self.drop_path(self.dropout(y))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        return x
 
 
 _MODELING_TYPE_ALIASES: dict[str, str] = {

@@ -28,7 +28,6 @@ from .layers import (
     CrossAttention,
     PatchAttention,
     PatchEmbedding,
-    PointTransformer,
     StochasticDepth,
     TemporalEncoderLayer,
     norm_layer,
@@ -44,6 +43,7 @@ from .modules import (
     SpatialEncoder,
     TemporalEncoder,
     TemporalEncoderBlock,
+    PointTransformer,
 )
 
 __all__ = [
