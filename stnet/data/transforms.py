@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from contextlib import suppress
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F

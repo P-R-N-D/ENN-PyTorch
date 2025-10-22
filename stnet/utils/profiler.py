@@ -290,7 +290,8 @@ class _FlopProfiler:
         self.ensure_nvtx_getter()
         getter = self._nvtx_getter or self._nvtx_soft_getter
         try:
-            import torch.cuda.nvtx as nvtx  # noqa: F401
+            import torch.cuda.nvtx as nvtx
+            getattr(nvtx, "__name__", None)
         except Exception:
             return contextlib.nullcontext()
 
