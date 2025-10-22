@@ -16,10 +16,10 @@ from torch import nn
 
 try:
     from torch.serialization import add_safe_globals as _add_safe_globals
-except ImportError:  # pragma: no cover - PyTorch < 2.6
+except ImportError:
     _add_safe_globals = None
 
-if _add_safe_globals is not None:  # pragma: no cover - defensive runtime guard
+if _add_safe_globals is not None:
     with contextlib.suppress(Exception):
         import torch.torch_version as _torch_version
 

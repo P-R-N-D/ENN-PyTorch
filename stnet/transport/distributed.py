@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
+from urllib.parse import urlparse
+
 import os
 import socket
 import time
-from urllib.parse import urlparse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, cast

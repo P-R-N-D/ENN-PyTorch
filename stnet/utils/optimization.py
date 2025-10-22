@@ -35,7 +35,7 @@ from .platform import (
     optimal_optimizer_params,
 )
 from .compat import patch_torch
-from .profiler import FLOP_PROFILER, FlopCounter, attention_flops_bshd
+from .profiler import FLOP_PROFILER, attention_flops_bshd
 
 patch_torch()
 
@@ -43,8 +43,6 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class AutoCast:
-    """Device-aware autocast helper with optional FP8/INT8 backends."""
-
     _fp8_backend: Optional[str] = None
     _int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
@@ -72,24 +70,24 @@ class AutoCast:
                     _LOGGER.debug("AutoCast FP8 TE unavailable: %s", reason)
                     continue
                 try:
-                    import transformer_engine.pytorch as te
+                    te = importlib.import_module("transformer_engine.pytorch")
 
                     if getattr(te, "fp8_autocast", None) is None:
                         raise AttributeError(
                             "transformer_engine.fp8_autocast missing"
                         )
-                except Exception as exc:  # pragma: no cover - backend optional
+                except Exception as exc:
                     _LOGGER.debug("AutoCast FP8 TE import failed: %s", exc)
                     continue
                 cls._fp8_backend = "te"
                 return "te"
             if backend == "ao":
                 try:
-                    from torchao import float8 as _float8_mod  # type: ignore
+                    _float8_mod = importlib.import_module("torchao.float8")
 
                     if getattr(_float8_mod, "fp8_autocast", None) is None:
                         raise AttributeError("torchao.float8.fp8_autocast missing")
-                except Exception as exc:  # pragma: no cover - backend optional
+                except Exception as exc:
                     _LOGGER.debug("AutoCast FP8 torchao import failed: %s", exc)
                     continue
                 cls._fp8_backend = "ao"
@@ -119,24 +117,25 @@ class AutoCast:
                     _LOGGER.debug("AutoCast INT8 TE unavailable: %s", reason)
                     continue
                 try:
-                    import transformer_engine.pytorch as te
+                    te = importlib.import_module("transformer_engine.pytorch")
 
                     if getattr(te, "int8_autocast", None) is None:
                         raise AttributeError(
                             "transformer_engine.int8_autocast missing"
                         )
-                except Exception as exc:  # pragma: no cover - backend optional
+                except Exception as exc:
                     _LOGGER.debug("AutoCast INT8 TE import failed: %s", exc)
                     continue
                 cls._int_backend = "te"
                 return "te"
             if backend == "ao":
                 try:
-                    from torchao.quantization import int8_autocast  # type: ignore
+                    quant_mod = importlib.import_module("torchao.quantization")
+                    int8_autocast = getattr(quant_mod, "int8_autocast", None)
 
                     if not callable(int8_autocast):
                         raise AttributeError("torchao.quantization.int8_autocast missing")
-                except Exception as exc:  # pragma: no cover - backend optional
+                except Exception as exc:
                     _LOGGER.debug("AutoCast INT8 torchao import failed: %s", exc)
                     continue
                 cls._int_backend = "ao"
@@ -252,14 +251,14 @@ class AutoCast:
         if not enabled:
             return contexts
         try:
-            import transformer_engine.pytorch as te
+            te = importlib.import_module("transformer_engine.pytorch")
 
             fp8_ctx = getattr(te, "fp8_autocast", None)
             if callable(fp8_ctx):
                 contexts.append(fp8_ctx(enabled=True))
             else:
                 raise AttributeError("transformer_engine.fp8_autocast missing")
-        except Exception as exc:  # pragma: no cover - backend optional
+        except Exception as exc:
             _LOGGER.debug("AutoCast FP8 TE failed: %s", exc)
             cls._fp8_backend = None
         return contexts
@@ -272,10 +271,14 @@ class AutoCast:
         if not enabled:
             return contexts
         try:
-            from torchao.float8 import fp8_autocast
+            fp8_mod = importlib.import_module("torchao.float8")
+            fp8_autocast = getattr(fp8_mod, "fp8_autocast", None)
 
-            contexts.append(fp8_autocast(enabled=True))
-        except Exception as exc:  # pragma: no cover - backend optional
+            if callable(fp8_autocast):
+                contexts.append(fp8_autocast(enabled=True))
+            else:
+                raise AttributeError("torchao.float8.fp8_autocast missing")
+        except Exception as exc:
             _LOGGER.debug("AutoCast FP8 torchao failed: %s", exc)
             cls._fp8_backend = None
         return contexts
@@ -292,22 +295,26 @@ class AutoCast:
         backend = cls._int_backend
         if backend == "te":
             try:
-                import transformer_engine.pytorch as te
+                te = importlib.import_module("transformer_engine.pytorch")
 
                 int_ctx = getattr(te, "int8_autocast", None)
                 if callable(int_ctx):
                     contexts.append(int_ctx(enabled=True))
                 else:
                     raise AttributeError("transformer_engine.int8_autocast missing")
-            except Exception as exc:  # pragma: no cover - backend optional
+            except Exception as exc:
                 _LOGGER.debug("AutoCast INT8 TE failed: %s", exc)
                 cls._int_backend = None
         elif backend == "ao":
             try:
-                from torchao.quantization import int8_autocast
+                quant_mod = importlib.import_module("torchao.quantization")
+                int8_autocast = getattr(quant_mod, "int8_autocast", None)
 
-                contexts.append(int8_autocast(enabled=True))
-            except Exception as exc:  # pragma: no cover - backend optional
+                if callable(int8_autocast):
+                    contexts.append(int8_autocast(enabled=True))
+                else:
+                    raise AttributeError("torchao.quantization.int8_autocast missing")
+            except Exception as exc:
                 _LOGGER.debug("AutoCast INT8 torchao failed: %s", exc)
                 cls._int_backend = None
         return contexts
@@ -464,12 +471,6 @@ def compile(
     options: Optional[Dict[str, Any]] = None,
     disable: bool = False,
 ) -> nn.Module:
-    """Best-effort wrapper around :func:`torch.compile`.
-
-    When compilation is unavailable or fails, the original module is returned
-    so callers do not need to guard every invocation.
-    """
-
     if disable:
         return module
     compile_fn = getattr(torch, "compile", None)
@@ -499,8 +500,6 @@ def no_synchronization(
     *,
     enable: bool = True,
 ) -> contextlib.AbstractContextManager[None]:
-    """Context manager that mirrors ``DistributedDataParallel.no_sync`` when available."""
-
     if not enable:
         yield
         return
@@ -674,17 +673,20 @@ def _has_join_hook(obj: Any | None) -> bool:
         return False
     return getattr(obj, "join_hook", None) is not None
 
+Int8DynamicActivationInt8WeightConfig: Any | None
+Int8WeightOnlyConfig: Any | None
+quantize_: Any | None
+
 try:
     from torchao.quantization import (
-        Float8DynamicActivationFloat8WeightConfig,
-        Float8WeightOnlyConfig,
-        Int4WeightOnlyConfig,
         Int8DynamicActivationInt8WeightConfig,
         Int8WeightOnlyConfig,
         quantize_,
     )
 except ImportError:
     quantize_ = None
+    Int8DynamicActivationInt8WeightConfig = None
+    Int8WeightOnlyConfig = None
 QATConfig = None
 QATStep = None
 try:
@@ -1342,15 +1344,10 @@ class Module:
     def _fuse_sequential_to_te(
         model: nn.Module, *, params_dtype: Optional[torch.dtype]
     ) -> Tuple[nn.Module, int]:
-        # Fusing composite modules into transformer_engine equivalents is
-        # opportunistic.  When the backend is not available or a sequence is
-        # not recognised we simply leave the module untouched so that the
-        # caller can continue with native PyTorch modules.
         try:
-            import transformer_engine.pytorch as te  # noqa: F401
+            importlib.import_module("transformer_engine.pytorch")
         except Exception:
             return (model, 0)
-        # No fusion patterns are implemented yet; return untouched.
         return (model, 0)
 
     @staticmethod
@@ -1405,9 +1402,6 @@ class Module:
     def _apply_te_attention(
         model: nn.Module, *, params_dtype: Optional[torch.dtype]
     ) -> Tuple[nn.Module, int]:
-        # DotProductAttention modules expose a `te_first` flag that prefers
-        # transformer_engine kernels when available.  Enabling that flag is
-        # sufficient for the modules defined in this package.
         swapped = 0
         for module in model.modules():
             if isinstance(module, DotProductAttention) and getattr(

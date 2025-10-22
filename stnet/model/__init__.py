@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from ..config import (  # noqa: E402  # requires torch patches before import
-    BuildConfig,
+from ..utils.compat import SDPBackend, patch_torch, sdpa_kernel
+
+patch_torch()
+
+from ..config import (
     ModelConfig,
     PatchConfig,
     coerce_model_config,
@@ -10,10 +13,7 @@ from ..config import (  # noqa: E402  # requires torch patches before import
     model_config,
     patch_config,
 )
-from ..utils.compat import SDPBackend, patch_torch, sdpa_kernel
-
-patch_torch()
-from .functional import (  # noqa: E402  # requires torch patches before import
+from .functional import (
     DataFidelityLoss,
     GeGLU,
     MultipleQuantileLoss,
@@ -22,8 +22,8 @@ from .functional import (  # noqa: E402  # requires torch patches before import
     StudentsTLoss,
     SwiGLU,
     TiledLoss,
-)  # noqa: E402  # requires torch patches before import
-from .layers import (  # noqa: E402  # requires torch patches before import
+)
+from .layers import (
     GlobalEncoderLayer,
     CrossAttention,
     PatchAttention,
@@ -33,8 +33,8 @@ from .layers import (  # noqa: E402  # requires torch patches before import
     TemporalEncoderLayer,
     norm_layer,
     schedule_stochastic_depth,
-)  # noqa: E402  # requires torch patches before import
-from .modules import (  # noqa: E402  # requires torch patches before import
+)
+from .modules import (
     CrossTransformer,
     GlobalEncoder,
     GlobalEncoderBlock,
@@ -44,7 +44,7 @@ from .modules import (  # noqa: E402  # requires torch patches before import
     SpatialEncoder,
     TemporalEncoder,
     TemporalEncoderBlock,
-)  # noqa: E402  # requires torch patches before import
+)
 
 __all__ = [
     "sdpa_kernel",

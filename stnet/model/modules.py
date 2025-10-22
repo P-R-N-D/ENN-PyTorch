@@ -22,8 +22,6 @@ from .functional import SwiGLU
 from .layers import (
     GlobalEncoderLayer,
     CrossAttention,
-    PatchAttention,
-    PatchEmbedding,
     PointTransformer,
     StochasticDepth,
     TemporalEncoderLayer,
@@ -32,7 +30,7 @@ from .layers import (
 )
 
 patch_torch()
-if TYPE_CHECKING:  # pragma: no cover - typing only
+if TYPE_CHECKING:
     from .config import ModelConfig
 
 

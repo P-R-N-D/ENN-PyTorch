@@ -175,8 +175,6 @@ def new_dir(prefix: str) -> str:
 
 
 class Network:
-    """Unified networking helper for host sanitation, resolution, and endpoints."""
-
     def __init__(
         self,
         *,
@@ -360,8 +358,6 @@ class Network:
 
     @staticmethod
     def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
-        """Check whether IPv4 and IPv6 sockets can bind locally."""
-
         ipv4_ok = False
         ipv6_ok = False
 
@@ -658,8 +654,6 @@ def initialize_master_addr(
     prefer_ipv6: bool = True,
     allow_loopback: bool = True,
 ) -> tuple[str, int]:
-    """Ensure MASTER_ADDR/MASTER_PORT favoring IPv6 when available."""
-
     default_host = get_preferred_ip(
         allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
     )
@@ -940,8 +934,6 @@ def optimize_threads() -> dict:
 
 
 class System:
-    """System-level helpers for runtime, device, and threading configuration."""
-
     RuntimeConfig = _RuntimeConfig
     get_runtime_config = staticmethod(get_runtime_config)
     is_main_loadable = staticmethod(is_main_loadable)
@@ -965,8 +957,6 @@ class System:
 
 
 class Distributed:
-    """Distributed-runtime helpers for networking and rendezvous setup."""
-
     Network = Network
     coerce_host = staticmethod(coerce_host)
     normalize_ip_literal = staticmethod(normalize_ip_literal)
