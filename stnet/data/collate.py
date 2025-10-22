@@ -40,7 +40,7 @@ from torchdata.nodes import (
 from torch.distributed import distributed_c10d
 
 from ..transport.socket import Endpoint
-from ..utils.capability import get_preferred_ip, get_world_size, optimize_threads
+from ..utils.platform import Distributed, System
 from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
 from ..utils.transform import (
@@ -99,7 +99,7 @@ def _world_info() -> Tuple[int, int, int, bool]:
             world = int(world_env)
     if world is None:
         with suppress(Exception):
-            world = int(get_world_size())
+            world = int(Distributed.get_world_size())
     world = world or 1
     return (rank, local_rank, world, world > 1)
 
@@ -107,7 +107,7 @@ def _world_info() -> Tuple[int, int, int, bool]:
 def _negotiate() -> Tuple[int, bool]:
     if not (dist.is_available() and dist.is_initialized()):
         return (0, True)
-    world = get_world_size()
+    world = Distributed.get_world_size()
     rank = dist.get_rank()
     hostname = socket.gethostname()
     hosts: list[str] = ["" for _ in range(world)]
@@ -335,7 +335,9 @@ def _build_flight_loaders(
     features_np_dtype = to(meta.get("features_arrow_dtype", "float32"), "numpy")
     labels_np_dtype = to(meta.get("labels_arrow_dtype", "float32"), "numpy")
     try:
-        loopback_host = get_preferred_ip("localhost", allow_loopback=True)
+        loopback_host = Distributed.get_preferred_ip(
+            "localhost", allow_loopback=True
+        )
         host = "0.0.0.0" if is_ddp else (loopback_host or "127.0.0.1")
         uri_value = ""
         if not is_ddp or local_rank == 0:
@@ -875,7 +877,7 @@ def dataloader(
         backend = "flight" if has_arrow_flight() else "local"
     else:
         backend = backend_normalized
-    threads = optimize_threads()
+    threads = System.optimize_threads()
     map_fn = partial(
         fetch,
         labels_dtype=labels_dtype,

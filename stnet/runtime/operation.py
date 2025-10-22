@@ -47,20 +47,7 @@ from ..nn.config import ModelConfig, coerce_model_config
 from ..data.collate import dataloader, postprocess, preprocess
 from ..utils.datatype import to_torch
 from ..data.dataset import SampleReader
-from ..utils.capability import (
-    get_available_addr,
-    get_device,
-    get_preferred_ip,
-    get_world_size,
-    initialize_python_path,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    new_dir,
-    optimal_procs,
-    optimal_start_method,
-    optimize_threads,
-    set_multiprocessing_env,
-)
+from ..utils.platform import Distributed, System
 from ..utils.optimization import (
     AdamW,
     AutoCast,
@@ -290,9 +277,21 @@ def _set_backend(device: torch.device) -> None:
             import netifaces
 
             gws = netifaces.gateways()
-            inet = gws["default"][netifaces.AF_INET][1]
-            os.environ["GLOO_SOCKET_IFNAME"] = inet
-            os.environ["TP_SOCKET_IFNAME"] = inet
+            iface: str | None = None
+            default_gateways = gws.get("default", {}) if isinstance(gws, dict) else {}
+            families = []
+            with contextlib.suppress(AttributeError):
+                families.append(netifaces.AF_INET6)
+            families.append(netifaces.AF_INET)
+            for family in families:
+                info = default_gateways.get(family)
+                if info and len(info) >= 2:
+                    iface = info[1]
+                    if iface:
+                        break
+            if iface:
+                os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+                os.environ.setdefault("TP_SOCKET_IFNAME", iface)
         except (ImportError, KeyError, OSError):
             pass
 
@@ -373,11 +372,11 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Model:
-    initialize_python_path()
+    System.initialize_python_path()
     feats, labels, _, label_shape = preprocess(data)
     mp.allow_connection_pickling()
-    set_multiprocessing_env()
-    memmap_dir = new_dir("memmap_ds")
+    System.set_multiprocessing_env()
+    memmap_dir = System.new_dir("memmap_ds")
     SampleReader.materialize(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
@@ -385,8 +384,8 @@ def train(
         val_frac=float(val_frac),
         shuffle=False,
     )
-    ckpt_dir = new_dir("ckpt_dcp")
-    init_dir = new_dir("init_dcp")
+    ckpt_dir = System.new_dir("ckpt_dcp")
+    init_dir = System.new_dir("init_dcp")
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -395,11 +394,12 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
-    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    default_rdzv_host = Distributed.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
-    rdzv_endpoint = get_available_addr(resolved_rdzv)
-    optimize_threads()
-    nprocs = optimal_procs()["nproc_per_node"]
+    rdzv_endpoint = Distributed.get_available_addr(resolved_rdzv)
+    master_addr, _master_port = Distributed.initialize_master_addr(rdzv_endpoint)
+    System.optimize_threads()
+    nprocs = System.optimal_procs()["nproc_per_node"]
     cfg_obj = getattr(model, "_Model__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
@@ -415,7 +415,8 @@ def train(
         run_id=run_id,
         max_restarts=0,
         monitor_interval=5,
-        start_method=optimal_start_method(),
+        start_method=System.optimal_start_method(),
+        local_addr=master_addr,
     )
     base = dict(
         memmap_dir=memmap_dir,
@@ -477,12 +478,12 @@ def predict(
     mode: OpsMode = "predict",
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
-    initialize_python_path()
-    set_multiprocessing_env()
-    tmp_dir = new_dir("infer")
+    System.initialize_python_path()
+    System.set_multiprocessing_env()
+    tmp_dir = System.new_dir("infer")
     dcp_dir = os.path.join(tmp_dir, "dcp")
     memmap_dir = os.path.join(tmp_dir, "memmap")
-    device = get_device()
+    device = System.get_device()
     mp.allow_connection_pickling()
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -550,7 +551,7 @@ def predict(
         nprocs=nprocs,
         join=True,
         daemon=False,
-        start_method=optimal_start_method(),
+        start_method=System.optimal_start_method(),
     )
     try:
         return dict(ret_dict)
@@ -674,9 +675,6 @@ def epoch(
                         scaler.scale(loss_for_backprop).backward()
                         if should_sync:
                             scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                model.parameters(), max_norm=float("inf")
-                            )
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad(set_to_none=True)
@@ -870,7 +868,7 @@ def main(*args: Any) -> Optional[Model]:
     if not args:
         raise TypeError("main requires at least an OpsConfig argument")
 
-    initialize_python_path()
+    System.initialize_python_path()
 
     ret_sink: Optional[Dict[Any, Any]] = None
     if len(args) == 1 and isinstance(args[0], OpsConfig):
@@ -894,7 +892,7 @@ def main(*args: Any) -> Optional[Model]:
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
 
-        device = get_device()
+        device = System.get_device()
         _set_backend(device)
         backend = _backend_type(device)
         init_kwargs: Dict[str, Any] = {"backend": backend}
@@ -970,7 +968,7 @@ def main(*args: Any) -> Optional[Model]:
         match device.type:
             case "cuda":
                 param_dtype = (
-                    torch.bfloat16 if is_cuda_bf16_supported() else torch.float16
+                    torch.bfloat16 if System.is_cuda_bf16_supported() else torch.float16
                 )
                 reduce_dtype = torch.float32
                 cast_forward_inputs = True
@@ -984,10 +982,10 @@ def main(*args: Any) -> Optional[Model]:
                 cast_forward_inputs = False
             case "cpu":
                 param_dtype = (
-                    torch.bfloat16 if is_cpu_bf16_supported() else torch.float32
+                    torch.bfloat16 if System.is_cpu_bf16_supported() else torch.float32
                 )
                 reduce_dtype = torch.float32
-                cast_forward_inputs = False if is_cpu_bf16_supported() else True
+                cast_forward_inputs = False if System.is_cpu_bf16_supported() else True
             case _:
                 param_dtype = torch.float32
                 reduce_dtype = torch.float32
@@ -1412,7 +1410,7 @@ def main(*args: Any) -> Optional[Model]:
                 torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
-        device = get_device()
+        device = System.get_device()
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )

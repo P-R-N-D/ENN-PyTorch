@@ -7,18 +7,12 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..utils.capability import Network, get_preferred_ip
+from ..utils.platform import Distributed
 from ..utils.compat import patch_arrow
 
 
 if TYPE_CHECKING:
     from ..data.dataset import SampleReader
-
-
-def _memory_mapped_tensor_stream() -> type["SampleReader"]:
-    from ..data.dataset import SampleReader
-
-    return SampleReader
 
 
 _ARROW = patch_arrow()
@@ -240,12 +234,13 @@ class Endpoint:
         start: int,
         end: int,
     ) -> Iterator[pa.RecordBatch]:
-        mmts_cls = _memory_mapped_tensor_stream()
+        from ..data.dataset import SampleReader
+
         index = start
         while index < end:
             nxt = min(index + int(batch_size), end)
             xb, yb = mmts.batch_range(index, nxt)
-            yield mmts_cls.to_record_batch(xb, yb)
+            yield SampleReader.to_record_batch(xb, yb)
             index = nxt
 
     @staticmethod
@@ -256,8 +251,67 @@ class Endpoint:
         wait_ready_s: float = 10.0,
         **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
-        locator = Network()
-        resolved = locator.allocate(f"{host}:{port}" if host else None)
+        locator = Distributed.Network()
+        host_text = Distributed.Network.coerce_host(host)
+        port = int(port)
+
+        probe_required = host_text in ("", "0.0.0.0", "::", "[::]")
+        ipv4_ok = False
+        ipv6_ok = False
+        if probe_required:
+            ipv4_ok, ipv6_ok = Distributed.probe_stack_support(allow_loopback=True)
+
+        candidates: list[str | None] = []
+        seen: set[str | None] = set()
+
+        def add_candidate(value: str | None) -> None:
+            if value in seen:
+                return
+            candidates.append(value)
+            seen.add(value)
+
+        def build_endpoint(candidate_host: str) -> str:
+            base = candidate_host.strip()
+            if base.startswith("[") and base.endswith("]"):
+                literal = base
+            elif ":" in base and base:
+                literal = f"[{base}]"
+            else:
+                literal = base or "0.0.0.0"
+            return f"{literal}:{port}"
+
+        if host_text:
+            if host_text in ("0.0.0.0",) and probe_required and ipv6_ok:
+                add_candidate(build_endpoint("::"))
+            add_candidate(build_endpoint(host_text))
+            if host_text in ("::", "[::]") and probe_required and not ipv6_ok:
+                add_candidate(build_endpoint("0.0.0.0"))
+        else:
+            if probe_required and ipv6_ok:
+                add_candidate(build_endpoint("::"))
+            if (probe_required and ipv4_ok) or not candidates:
+                add_candidate(build_endpoint("0.0.0.0"))
+
+        if not candidates:
+            add_candidate(None)
+        elif None not in seen:
+            add_candidate(None)
+
+        resolved = None
+        last_error: BaseException | None = None
+        for candidate in candidates:
+            try:
+                resolved = locator.allocate(candidate)
+                break
+            except BaseException as exc:
+                last_error = exc
+                continue
+
+        if resolved is None:
+            raise RuntimeError(
+                f"Unable to allocate network endpoint for host '{host_text or 'auto'}'"
+            ) from last_error
+
         parsed_endpoint = urlparse(f"grpc://{resolved}")
         resolved_host = parsed_endpoint.hostname or (host or "0.0.0.0")
         resolved_port = parsed_endpoint.port or port or 0
@@ -275,7 +329,7 @@ class Endpoint:
 
         advertise_host = resolved_host
         if advertise_host in ("", "0.0.0.0", "::"):
-            advertise_host = get_preferred_ip(allow_loopback=True)
+            advertise_host = Distributed.get_preferred_ip(allow_loopback=True)
             if not advertise_host:
                 advertise_host = "127.0.0.1"
 
@@ -311,7 +365,7 @@ class Endpoint:
             )
         except Exception:
             advertise_location = None
-        formatter = Network(
+        formatter = Distributed.Network(
             fallback=advertise_host,
             default=advertise_host,
             allow_loopback=True,
@@ -369,11 +423,13 @@ class Endpoint:
         train_end = int(total * float(fractions[0])) if fractions else total
         start, end = (0, train_end) if split == "train" else (train_end, total)
 
-        generator = Endpoint._iter_batches(mmts, batch_size, start, end)
-        first = next(generator)
-        rest = list(generator)
-        schema = first.schema
-        reader = pa.RecordBatchReader.from_batches(schema, [first, *rest])
+        batches = list(Endpoint._iter_batches(mmts, batch_size, start, end))
+        if not batches:
+            raise ValueError(
+                f"No record batches generated for dataset '{name}' and split '{split}'"
+            )
+        schema = batches[0].schema
+        reader = pa.RecordBatchReader.from_batches(schema, batches)
         server.add_reader(Endpoint._canon_name(name), reader)
 
     @staticmethod

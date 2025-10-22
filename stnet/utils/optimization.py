@@ -24,7 +24,7 @@ import torch
 import torch._dynamo
 from torch import nn, optim
 
-from .capability import (
+from .platform import (
     get_device,
     get_runtime_config,
     initialize_sdpa_backends,
@@ -38,6 +38,484 @@ from .compat import patch_torch
 from .profiler import FLOP_PROFILER, FlopCounter, attention_flops_bshd
 
 patch_torch()
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class AutoCast:
+    """Device-aware autocast helper with optional FP8/INT8 backends."""
+
+    _fp8_backend: Optional[str] = None
+    _int_backend: Optional[str] = None
+    _last_float_dtype: torch.dtype = torch.float32
+    _last_int_dtype: torch.dtype = torch.int64
+
+    @classmethod
+    def _resolve_fp8_backend(
+        cls,
+        preferred: Optional[str],
+        *,
+        device: Optional[torch.device] = None,
+    ) -> Optional[str]:
+        dev = device if device is not None else cls._resolve_device(None)
+        order: Tuple[str, ...]
+        if preferred == "te":
+            order = ("te", "ao")
+        elif preferred == "ao":
+            order = ("ao", "te")
+        else:
+            order = ("te", "ao")
+        for backend in order:
+            if backend == "te":
+                ok, reason = is_float8_supported(dev)
+                if not ok:
+                    _LOGGER.debug("AutoCast FP8 TE unavailable: %s", reason)
+                    continue
+                try:
+                    import transformer_engine.pytorch as te
+
+                    if getattr(te, "fp8_autocast", None) is None:
+                        raise AttributeError(
+                            "transformer_engine.fp8_autocast missing"
+                        )
+                except Exception as exc:  # pragma: no cover - backend optional
+                    _LOGGER.debug("AutoCast FP8 TE import failed: %s", exc)
+                    continue
+                cls._fp8_backend = "te"
+                return "te"
+            if backend == "ao":
+                try:
+                    from torchao import float8 as _float8_mod  # type: ignore
+
+                    if getattr(_float8_mod, "fp8_autocast", None) is None:
+                        raise AttributeError("torchao.float8.fp8_autocast missing")
+                except Exception as exc:  # pragma: no cover - backend optional
+                    _LOGGER.debug("AutoCast FP8 torchao import failed: %s", exc)
+                    continue
+                cls._fp8_backend = "ao"
+                return "ao"
+        cls._fp8_backend = None
+        return None
+
+    @classmethod
+    def _resolve_int_backend(
+        cls,
+        preferred: Optional[str],
+        *,
+        device: Optional[torch.device] = None,
+    ) -> Optional[str]:
+        dev = device if device is not None else cls._resolve_device(None)
+        order: Tuple[str, ...]
+        if preferred == "te":
+            order = ("te", "ao")
+        elif preferred == "ao":
+            order = ("ao", "te")
+        else:
+            order = ("te", "ao")
+        for backend in order:
+            if backend == "te":
+                ok, reason = is_int8_supported(dev)
+                if not ok:
+                    _LOGGER.debug("AutoCast INT8 TE unavailable: %s", reason)
+                    continue
+                try:
+                    import transformer_engine.pytorch as te
+
+                    if getattr(te, "int8_autocast", None) is None:
+                        raise AttributeError(
+                            "transformer_engine.int8_autocast missing"
+                        )
+                except Exception as exc:  # pragma: no cover - backend optional
+                    _LOGGER.debug("AutoCast INT8 TE import failed: %s", exc)
+                    continue
+                cls._int_backend = "te"
+                return "te"
+            if backend == "ao":
+                try:
+                    from torchao.quantization import int8_autocast  # type: ignore
+
+                    if not callable(int8_autocast):
+                        raise AttributeError("torchao.quantization.int8_autocast missing")
+                except Exception as exc:  # pragma: no cover - backend optional
+                    _LOGGER.debug("AutoCast INT8 torchao import failed: %s", exc)
+                    continue
+                cls._int_backend = "ao"
+                return "ao"
+        cls._int_backend = None
+        return None
+
+    @staticmethod
+    def _resolve_device(
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> torch.device:
+        if device is None:
+            return get_device()
+        if isinstance(device, torch.device):
+            return device
+        return torch.device(device)
+
+    @staticmethod
+    def _coerce_dtype(value: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
+        if isinstance(value, torch.dtype):
+            return value
+        if isinstance(value, str):
+            candidate = getattr(torch, value, None)
+            if isinstance(candidate, torch.dtype):
+                return candidate
+        return None
+
+    @staticmethod
+    def _distinct_dtypes(candidates: Iterable[torch.dtype]) -> Tuple[torch.dtype, ...]:
+        seen: Dict[torch.dtype, None] = {}
+        for dtype in candidates:
+            if isinstance(dtype, torch.dtype) and dtype not in seen:
+                seen[dtype] = None
+        return tuple(seen.keys())
+
+    @classmethod
+    def _float_amp_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+        dev_type = device.type
+        candidates: List[torch.dtype] = []
+        if dev_type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                candidates.append(torch.bfloat16)
+            candidates.append(torch.float16)
+            candidates.append(torch.float32)
+        elif dev_type == "xpu":
+            candidates.extend((torch.bfloat16, torch.float32))
+        elif dev_type == "mps":
+            candidates.extend((torch.float16, torch.float32))
+        elif dev_type == "cpu":
+            if is_cpu_bf16_supported():
+                candidates.append(torch.bfloat16)
+            candidates.extend((torch.float32, torch.float64))
+        else:
+            candidates.append(torch.float32)
+        if not candidates:
+            candidates.append(torch.float32)
+        return cls._distinct_dtypes(candidates)
+
+    @staticmethod
+    def _float8_dtypes() -> Tuple[torch.dtype, ...]:
+        names = (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+        )
+        values: List[torch.dtype] = []
+        for name in names:
+            candidate = getattr(torch, name, None)
+            if isinstance(candidate, torch.dtype):
+                values.append(candidate)
+        return tuple(values)
+
+    @classmethod
+    def _integer_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+        candidates: List[torch.dtype] = []
+        int8_ok, _ = is_int8_supported(device)
+        if int8_ok:
+            candidates.append(torch.int8)
+        candidates.extend((torch.int16, torch.int32, torch.int64))
+        return cls._distinct_dtypes(candidates or (torch.int64,))
+
+    @staticmethod
+    def _select_dtype(
+        requested: Optional[torch.dtype],
+        candidates: Tuple[torch.dtype, ...],
+        *,
+        fallback: torch.dtype,
+        logger: Optional[logging.Logger] = None,
+        context: str = "autocast",
+        device: Optional[torch.device] = None,
+    ) -> torch.dtype:
+        if requested is None:
+            return candidates[0] if candidates else fallback
+        if requested in candidates:
+            return requested
+        if logger is not None:
+            device_str = f" on {device.type}" if device is not None else ""
+            logger.debug(
+                "AutoCast %s fallback%s: requested %s not available; using %s",
+                context,
+                device_str,
+                str(requested).split(".")[-1],
+                str(candidates[0] if candidates else fallback).split(".")[-1],
+            )
+        return candidates[0] if candidates else fallback
+
+    @classmethod
+    def _te_fp8_context(
+        cls, device: torch.device, enabled: bool
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            import transformer_engine.pytorch as te
+
+            fp8_ctx = getattr(te, "fp8_autocast", None)
+            if callable(fp8_ctx):
+                contexts.append(fp8_ctx(enabled=True))
+            else:
+                raise AttributeError("transformer_engine.fp8_autocast missing")
+        except Exception as exc:  # pragma: no cover - backend optional
+            _LOGGER.debug("AutoCast FP8 TE failed: %s", exc)
+            cls._fp8_backend = None
+        return contexts
+
+    @classmethod
+    def _ao_fp8_context(
+        cls, enabled: bool
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            from torchao.float8 import fp8_autocast
+
+            contexts.append(fp8_autocast(enabled=True))
+        except Exception as exc:  # pragma: no cover - backend optional
+            _LOGGER.debug("AutoCast FP8 torchao failed: %s", exc)
+            cls._fp8_backend = None
+        return contexts
+
+    @classmethod
+    def _int8_context(
+        cls,
+        device: torch.device,
+        enabled: bool,
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        backend = cls._int_backend
+        if backend == "te":
+            try:
+                import transformer_engine.pytorch as te
+
+                int_ctx = getattr(te, "int8_autocast", None)
+                if callable(int_ctx):
+                    contexts.append(int_ctx(enabled=True))
+                else:
+                    raise AttributeError("transformer_engine.int8_autocast missing")
+            except Exception as exc:  # pragma: no cover - backend optional
+                _LOGGER.debug("AutoCast INT8 TE failed: %s", exc)
+                cls._int_backend = None
+        elif backend == "ao":
+            try:
+                from torchao.quantization import int8_autocast
+
+                contexts.append(int8_autocast(enabled=True))
+            except Exception as exc:  # pragma: no cover - backend optional
+                _LOGGER.debug("AutoCast INT8 torchao failed: %s", exc)
+                cls._int_backend = None
+        return contexts
+
+    @classmethod
+    def configure(cls, model: Optional[nn.Module]) -> None:
+        backend: Optional[str] = None
+        int_backend: Optional[str] = None
+        if isinstance(model, nn.Module):
+            if any(
+                getattr(model, attr, False)
+                for attr in ("__fp8_inference_te__", "__fp8_training_te__")
+            ):
+                backend = "te"
+            elif any(
+                getattr(model, attr, False)
+                for attr in ("__fp8_inference_ao__", "__fp8_training_ao__")
+            ):
+                backend = "ao"
+            if any(
+                getattr(model, attr, False)
+                for attr in (
+                    "__int8_training_te__",
+                    "__int8_inference_te__",
+                    "__te_int8_default__",
+                )
+            ):
+                int_backend = "te"
+            elif any(
+                getattr(model, attr, False)
+                for attr in (
+                    "__int8_training_qat__",
+                    "__int8_training_ptq__",
+                    "__int8_inference_ao__",
+                )
+            ):
+                int_backend = "ao"
+        cls._fp8_backend = backend
+        cls._int_backend = int_backend
+
+    @classmethod
+    @contextlib.contextmanager
+    def float(
+        cls,
+        device: Optional[Union[torch.device, str]] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        enabled: Optional[bool] = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        dev = cls._resolve_device(device)
+        requested_dtype = cls._coerce_dtype(dtype)
+        amp_candidates = cls._float_amp_candidates(dev)
+        amp_dtype = cls._select_dtype(
+            requested_dtype,
+            amp_candidates,
+            fallback=torch.float32,
+            logger=_LOGGER,
+            context="float",
+            device=dev,
+        )
+        enabled = True if enabled is None else bool(enabled)
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+
+        backend = cls._resolve_fp8_backend(cls._fp8_backend, device=dev)
+        float8_dtypes = cls._float8_dtypes()
+        wants_fp8 = False
+        if backend is not None and enabled:
+            if requested_dtype is None:
+                wants_fp8 = True
+            else:
+                wants_fp8 = requested_dtype in float8_dtypes
+        if wants_fp8:
+            if backend == "te":
+                contexts.extend(cls._te_fp8_context(dev, enabled))
+                if not contexts:
+                    backend = cls._resolve_fp8_backend("ao", device=dev)
+                    if backend == "ao":
+                        contexts.extend(cls._ao_fp8_context(enabled))
+            elif backend == "ao":
+                contexts.extend(cls._ao_fp8_context(enabled))
+            else:
+                _LOGGER.debug(
+                    "AutoCast FP8 backend '%s' unsupported; disabling", backend
+                )
+                cls._fp8_backend = None
+
+        try:
+            ctx = torch.amp.autocast(
+                device_type=dev.type,
+                dtype=amp_dtype,
+                enabled=enabled,
+            )
+            contexts.append(ctx)
+        except (RuntimeError, ValueError) as exc:
+            _LOGGER.debug(
+                "AutoCast.float torch.amp fallback on %s: %s", dev.type, exc
+            )
+            contexts.append(contextlib.nullcontext())
+            cls._last_float_dtype = amp_dtype
+        else:
+            cls._last_float_dtype = amp_dtype
+
+        with contextlib.ExitStack() as stack:
+            for ctx in contexts:
+                stack.enter_context(ctx)
+            yield
+
+    @classmethod
+    @contextlib.contextmanager
+    def integer(
+        cls,
+        device: Optional[Union[torch.device, str]] = None,
+        *,
+        dtype: Optional[torch.dtype] = None,
+        enabled: Optional[bool] = None,
+    ) -> contextlib.AbstractContextManager[None]:
+        dev = cls._resolve_device(device)
+        requested_dtype = cls._coerce_dtype(dtype)
+        int_candidates = cls._integer_candidates(dev)
+        int_dtype = cls._select_dtype(
+            requested_dtype,
+            int_candidates,
+            fallback=torch.int64,
+            logger=_LOGGER,
+            context="int",
+            device=dev,
+        )
+        use_enabled = True if enabled is None else bool(enabled)
+        backend = cls._resolve_int_backend(cls._int_backend, device=dev)
+        contexts = (
+            cls._int8_context(dev, use_enabled) if use_enabled and backend else []
+        )
+        if not contexts and use_enabled and backend == "te":
+            fallback_backend = cls._resolve_int_backend("ao", device=dev)
+            if fallback_backend == "ao":
+                contexts = cls._int8_context(dev, use_enabled)
+        if not contexts:
+            contexts.append(contextlib.nullcontext())
+
+        with contextlib.ExitStack() as stack:
+            for ctx in contexts:
+                stack.enter_context(ctx)
+            cls._last_int_dtype = int_dtype
+            yield
+
+
+def compile(
+    module: nn.Module,
+    *,
+    backend: Optional[str] = None,
+    mode: Optional[str] = None,
+    fullgraph: Optional[bool] = None,
+    dynamic: Optional[bool] = None,
+    options: Optional[Dict[str, Any]] = None,
+    disable: bool = False,
+) -> nn.Module:
+    """Best-effort wrapper around :func:`torch.compile`.
+
+    When compilation is unavailable or fails, the original module is returned
+    so callers do not need to guard every invocation.
+    """
+
+    if disable:
+        return module
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return module
+    kwargs: Dict[str, Any] = {}
+    if backend is not None:
+        kwargs["backend"] = backend
+    if mode is not None:
+        kwargs["mode"] = mode
+    if fullgraph is not None:
+        kwargs["fullgraph"] = bool(fullgraph)
+    if dynamic is not None:
+        kwargs["dynamic"] = bool(dynamic)
+    if options:
+        kwargs["options"] = dict(options)
+    try:
+        return compile_fn(module, **kwargs)
+    except Exception as exc:
+        _LOGGER.warning("torch.compile failed (%s); returning original module", exc)
+        return module
+
+
+@contextlib.contextmanager
+def no_synchronization(
+    model: nn.Module,
+    *,
+    enable: bool = True,
+) -> contextlib.AbstractContextManager[None]:
+    """Context manager that mirrors ``DistributedDataParallel.no_sync`` when available."""
+
+    if not enable:
+        yield
+        return
+    ctx = None
+    try:
+        no_sync = getattr(model, "no_sync", None)
+        if callable(no_sync):
+            ctx = no_sync()
+    except Exception:
+        ctx = None
+    if ctx is None:
+        yield
+        return
+    with ctx:
+        yield
 
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
@@ -271,9 +749,6 @@ def joining(
     if not joinables:
         return contextlib.nullcontext()
     return Join(joinables, throw_on_early_termination=True)
-
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class DotProductAttention(nn.Module):
@@ -1113,6 +1588,7 @@ class Module:
     ) -> Tuple[nn.Module, bool, str]:
         ok, reason = is_float8_supported(device)
         if not ok:
+            AutoCast.configure(model)
             return (model, False, reason)
         _dev_for_dtype = (
             torch.device(device) if device is not None else get_device()
@@ -1145,9 +1621,11 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
+                AutoCast.configure(m2)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {backend} path skipped: {why}")
+        AutoCast.configure(model)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
@@ -1161,6 +1639,7 @@ class Module:
     ) -> Tuple[nn.Module, bool, str]:
         ok, reason = is_float8_supported(device)
         if not ok:
+            AutoCast.configure(model)
             return (model, False, reason)
         _dev_for_dtype = (
             torch.device(device) if device is not None else get_device()
@@ -1199,9 +1678,11 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] inference enabled via {why} ({reason})")
+                AutoCast.configure(m2)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {step} skipped: {why}")
+        AutoCast.configure(model)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
