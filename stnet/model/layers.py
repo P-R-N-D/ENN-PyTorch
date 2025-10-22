@@ -425,7 +425,13 @@ class TemporalEncoderLayer(nn.Module):
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         h = self.msr(x, attn_mask=attn_mask, state=state)
-        return (h, state)
+        if isinstance(h, tuple):
+            out, new_state = h
+            if new_state is None:
+                new_state = state
+        else:
+            out, new_state = h, state
+        return out, new_state
 
 
 class GlobalEncoderLayer(nn.Module):
@@ -441,7 +447,13 @@ class GlobalEncoderLayer(nn.Module):
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         h = self.msr(x, attn_mask=attn_mask, state=state)
-        return h, state
+        if isinstance(h, tuple):
+            out, new_state = h
+            if new_state is None:
+                new_state = state
+        else:
+            out, new_state = h, state
+        return out, new_state
 
 
 __all__ = [
