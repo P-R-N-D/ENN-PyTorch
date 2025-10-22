@@ -102,6 +102,41 @@ class SpatialEncoder(nn.Module):
             x = blk(x, coords, attn_mask=attn_mask)
         return self.norm(x)
 
+class TemporalEncoderBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(norm_type, d_model)
+        self.retention = TemporalEncoderLayer(d_model, nhead)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self.norm2 = norm_layer(norm_type, d_model)
+        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        state: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[dict]]:
+        h, state = self.retention(
+            self.norm1(x), attn_mask=causal_mask, state=state
+        )
+        x = x + self.drop_path(self.dropout(h))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        return x, state
+
+
 class TemporalEncoder(nn.Module):
     def __init__(
         self,
