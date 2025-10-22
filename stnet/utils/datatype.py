@@ -6,7 +6,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from ..toolkit.compat import patch_arrow
+from .compat import patch_arrow
 
 _ARROW = patch_arrow()
 
@@ -162,11 +162,12 @@ def to(src: Any, platform: str) -> Any:
 def to_torch(obj: Any) -> torch.Tensor:
     if isinstance(obj, torch.Tensor):
         return obj
-    if hasattr(obj, "to_torch"):
+    elif hasattr(obj, "to_torch"):
         return obj.to_torch()
-    if hasattr(obj, "to_tensor"):
+    elif hasattr(obj, "to_tensor"):
         return obj.to_tensor()
-    if hasattr(obj, "as_tensor"):
+    elif hasattr(obj, "as_tensor"):
         return obj.as_tensor()
-    return torch.as_tensor(obj)
+    else:
+        return torch.as_tensor(obj)
 

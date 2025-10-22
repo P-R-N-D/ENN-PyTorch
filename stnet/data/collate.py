@@ -39,10 +39,18 @@ from torchdata.nodes import (
 
 from torch.distributed import distributed_c10d
 
-from ..connection.socket import Endpoint
-from ..toolkit.capability import get_preferred_ip, get_world_size, optimize_threads
-from ..toolkit.compat import has_arrow_flight, patch_arrow
-from .datatype import to, to_torch
+from ..transport.socket import Endpoint
+from ..utils.capability import get_preferred_ip, get_world_size, optimize_threads
+from ..utils.compat import has_arrow_flight, patch_arrow
+from ..utils.datatype import to, to_torch
+from ..utils.transform import (
+    _ensure_finite_tensor,
+    _preprocess_feature_row,
+    _preprocess_maybe_batch,
+    _preprocess_to_tuple,
+    postprocess,
+    preprocess,
+)
 _ARROW = patch_arrow()
 
 
@@ -50,285 +58,6 @@ def identity(item: Any) -> Any:
     return item
 
 
-def _preprocess_to_tuple(x: Any) -> Tuple:
-    if isinstance(x, tuple):
-        return x
-    if isinstance(x, list):
-        return tuple(x)
-    if isinstance(x, torch.Tensor):
-        return tuple(x.flatten().detach().cpu().tolist())
-    if hasattr(x, "tolist"):
-        values = x.tolist()
-        return tuple(values if isinstance(values, (list, tuple)) else [values])
-    return (x,)
-
-
-def _ensure_finite_tensor(tensor: torch.Tensor, name: str) -> torch.Tensor:
-    if torch.is_floating_point(tensor) or torch.is_complex(tensor):
-        if not torch.isfinite(tensor).all():
-            raise ValueError(f"{name} tensor contains non-finite values")
-    return tensor
-
-
-def _preprocess_feature_row(x_tuple: Any) -> torch.Tensor:
-    try:
-        values = [float(v) for v in _preprocess_to_tuple(x_tuple)]
-    except (TypeError, ValueError) as exc:
-        raise TypeError(
-            "preprocess: feature tuples must contain only numeric values. "
-            f"Invalid value={x_tuple!r}"
-        ) from exc
-    for value in values:
-        if not math.isfinite(value):
-            raise ValueError("preprocess: feature tuples must be finite")
-    tensor = torch.as_tensor(values, dtype=torch.float32)
-    return _ensure_finite_tensor(tensor, "feature")
-
-
-def _preprocess_label_tensor(y: Any) -> torch.Tensor:
-    if isinstance(y, torch.Tensor):
-        return y
-    if hasattr(y, "to_torch"):
-        return y.to_torch()
-    if hasattr(y, "to_tensor"):
-        return y.to_tensor()
-    return torch.as_tensor(y)
-
-
-def _preprocess_feature_tensor(value: Any) -> Optional[torch.Tensor]:
-    if isinstance(value, torch.Tensor):
-        return value
-    if hasattr(value, "to_torch"):
-        with suppress(Exception):
-            return value.to_torch()
-    if hasattr(value, "to_tensor"):
-        with suppress(Exception):
-            return value.to_tensor()
-    if hasattr(value, "as_tensor"):
-        with suppress(Exception):
-            return value.as_tensor()
-    try:
-        return torch.as_tensor(value)
-    except Exception:
-        return None
-
-
-def _preprocess_maybe_batch(
-    x_value: Any, y_value: Any
-) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]] | None:
-    x_tensor = _preprocess_feature_tensor(x_value)
-    if not isinstance(x_tensor, torch.Tensor):
-        return None
-    try:
-        y_tensor = _preprocess_label_tensor(y_value)
-    except Exception:
-        return None
-    if not isinstance(y_tensor, torch.Tensor):
-        return None
-    x_tensor = _ensure_finite_tensor(
-        x_tensor.detach().to(dtype=torch.float32), "feature"
-    )
-    if x_tensor.dim() == 0:
-        x_tensor = x_tensor.reshape(1, 1)
-    elif x_tensor.dim() == 1:
-        x_tensor = x_tensor.reshape(-1, 1)
-    else:
-        batch_dim = int(x_tensor.shape[0]) if x_tensor.shape else 1
-        x_tensor = x_tensor.reshape(batch_dim, -1)
-    batch = int(x_tensor.shape[0])
-    y_tensor = y_tensor.detach()
-    y_tensor = _ensure_finite_tensor(y_tensor, "label")
-    if y_tensor.dim() == 0:
-        y_tensor = y_tensor.unsqueeze(0)
-    if y_tensor.dim() == 1 and y_tensor.shape[0] == batch:
-        y_tensor = y_tensor.unsqueeze(-1)
-    if y_tensor.shape[0] != batch:
-        return None
-    label_shape = tuple(y_tensor.shape[1:])
-    keys = [(int(i),) for i in range(batch)]
-    return (x_tensor, y_tensor, keys, label_shape)
-
-
-def get_node_length(node: Any, _seen: Optional[Set[int]] = None) -> Any:
-    if node is None:
-        return 1
-    if _seen is None:
-        _seen = set()
-    obj_id = id(node)
-    if obj_id in _seen:
-        return 1
-    _seen.add(obj_id)
-    try:
-        n = len(node)
-        if isinstance(n, int) and n >= 0:
-            return n
-    except Exception:
-        pass
-    for key in ("num_batches", "n_batches", "steps", "length"):
-        value = getattr(node, key, None)
-        if isinstance(value, int) and value >= 0:
-            return value
-    batch_size = getattr(node, "batch_size", None)
-    drop_last = bool(getattr(node, "drop_last", False))
-    for key in ("num_samples", "n_samples", "N", "size", "rows", "count"):
-        num_samples = getattr(node, key, None)
-        if isinstance(num_samples, int) and num_samples >= 0:
-            if isinstance(batch_size, int) and batch_size > 0:
-                if drop_last:
-                    return num_samples // batch_size
-                return int(math.ceil(num_samples / batch_size))
-            return max(num_samples, 1)
-    for key in ("indices", "_indices", "ids", "_ids", "index", "_index"):
-        idx = getattr(node, key, None)
-        try:
-            num_samples = len(idx)
-            if isinstance(batch_size, int) and batch_size > 0:
-                if drop_last:
-                    return num_samples // batch_size
-                return int(math.ceil(num_samples / batch_size))
-            return max(int(num_samples), 1)
-        except Exception:
-            pass
-    for name in (
-        "node",
-        "_node",
-        "source",
-        "_source",
-        "dataset",
-        "_dataset",
-        "parent",
-        "_parent",
-        "base",
-        "_base",
-        "reader",
-        "_reader",
-        "upstream",
-        "_upstream",
-    ):
-        upstream = getattr(node, name, None)
-        if upstream is not None:
-            try:
-                length = get_node_length(upstream, _seen)
-                if isinstance(length, int) and length >= 0:
-                    return length
-            except Exception:
-                pass
-    steps = None
-    if not steps:
-        dataset = getattr(node, "dataset", None)
-        try:
-            n = len(dataset) if dataset is not None else None
-        except Exception:
-            n = None
-        batch_size = getattr(node, "batch_size", None)
-        if n is not None and batch_size:
-            steps = max(1, int(math.ceil(n / batch_size)))
-    if not steps:
-        sampler = getattr(node, "batch_sampler", None) or getattr(
-            node, "sampler", None
-        )
-        try:
-            steps = len(sampler) if sampler is not None else None
-        except Exception:
-            steps = None
-    if not steps:
-        steps = 1
-    return steps
-
-
-def preprocess(
-    data: Dict[Tuple, torch.Tensor]
-) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
-    if isinstance(data, dict) and "X" in data and ("Y" in data):
-        x, y = (data["X"], data["Y"])
-        batch_result = _preprocess_maybe_batch(x, y)
-        if batch_result is not None:
-            return batch_result
-        xr, yt = (
-            _preprocess_feature_row(x).unsqueeze(0),
-            _ensure_finite_tensor(_preprocess_label_tensor(y), "label"),
-        )
-        if yt.dim() == 0 or yt.dim() == 1:
-            yt = yt.unsqueeze(0)
-        keys = [_preprocess_to_tuple(x)]
-        label_shape = tuple(yt.shape[1:])
-        return (xr, yt, keys, label_shape)
-    elif isinstance(data, (tuple, list)) and len(data) >= 2:
-        x, y = (data[0], data[1])
-        batch_result = _preprocess_maybe_batch(x, y)
-        if batch_result is not None:
-            return batch_result
-        xr = _preprocess_feature_row(x).unsqueeze(0)
-        yt = _ensure_finite_tensor(_preprocess_label_tensor(y), "label")
-        if yt.dim() == 0:
-            yt = yt.unsqueeze(0)
-        elif yt.shape[0] != 1:
-            yt = yt.unsqueeze(0)
-        keys = [_preprocess_to_tuple(x)]
-        label_shape = tuple(yt.shape[1:])
-        return (xr, yt, keys, label_shape)
-    elif isinstance(data, dict) and len(data) > 0:
-        items = list(data.items())
-        if any((isinstance(k, str) for k, _ in items)):
-            raise TypeError(
-                "preprocess: keys in a multi-sample dict must be tuples. "
-                "Provide single samples as {'X': ..., 'Y': ...}."
-            )
-        keys: List[Tuple] = [_preprocess_to_tuple(k) for k, _ in items]
-        feats = torch.stack([_preprocess_feature_row(k) for k in keys], dim=0)
-        lbl_list = [
-            _ensure_finite_tensor(_preprocess_label_tensor(v), "label")
-            for _, v in items
-        ]
-        if all((t.shape == lbl_list[0].shape for t in lbl_list)):
-            labels = torch.stack(lbl_list, dim=0)
-        else:
-            labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
-        labels = _ensure_finite_tensor(labels, "label")
-        label_shape = tuple(labels.shape[1:])
-        return (feats, labels, keys, label_shape)
-    else:
-        raise ValueError(
-            "preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
-        )
-
-
-def postprocess(
-    keys: List[Tuple], preds: torch.Tensor | Sequence[torch.Tensor]
-) -> Dict[Tuple, torch.Tensor]:
-    if isinstance(preds, torch.Tensor):
-        if preds.dim() == 0:
-            preds = preds.unsqueeze(0)
-        if preds.shape[0] != len(keys):
-            raise ValueError(
-                f"preds batch={preds.shape[0]} != len(keys)={len(keys)}"
-            )
-        rows = [preds[i].detach().cpu() for i in range(len(keys))]
-    else:
-        if len(preds) != len(keys):
-            raise ValueError(
-                f"len(preds)={len(preds)} != len(keys)={len(keys)}"
-            )
-        rows = [
-            p.detach().cpu()
-            if isinstance(p, torch.Tensor)
-            else torch.as_tensor(p)
-            for p in preds
-        ]
-    fixed_keys: List[Tuple] = []
-    seen = set()
-    for i, k in enumerate(keys):
-        if not isinstance(k, tuple):
-            try:
-                k = tuple(k)
-            except TypeError:
-                k = (k,)
-        k_out = k
-        if k in seen:
-            k_out = k + (i,)
-        seen.add(k_out)
-        fixed_keys.append(k_out)
-    return {k: v for k, v in zip(fixed_keys, rows)}
 
 
 def _convert_mapping_to_batch(
@@ -1016,7 +745,7 @@ class DataLoader:
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
             raise TypeError(
-                "pipeline.collate.DataLoader supports only torchdata.nodes.BaseNode instances."
+                "data.collate.DataLoader supports only torchdata.nodes.BaseNode instances."
             )
         self._node = node_obj
         self._device = device

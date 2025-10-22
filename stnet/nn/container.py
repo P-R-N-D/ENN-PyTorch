@@ -9,8 +9,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from ..toolkit.compat import patch_torch
-from ..toolkit.optimization import TunedAMP, compile, inference
+from ..utils.compat import patch_torch
+from ..utils.optimization import AutoCast, compile, inference
 from .config import ModelConfig
 from .module import GlobalEncoder, LocalProcessor, Payload
 
@@ -354,7 +354,7 @@ class Model(nn.Module):
                 x_slice = features[s:e].to(
                     device, dtype=base_dtype, non_blocking=True
                 )
-                with TunedAMP.float(device):
+                with AutoCast.float(device):
                     out: Payload = self.local_net(x_slice)
                 token_chunks.append(out.tokens)
                 context_chunks.append(out.context)
@@ -369,7 +369,7 @@ class Model(nn.Module):
                 )
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(inference(self.local_net))
-                    stack.enter_context(TunedAMP.float(device))
+                    stack.enter_context(AutoCast.float(device))
                     out = self.local_net(x_slice)
                 token_chunks.append(
                     out.tokens
@@ -396,7 +396,7 @@ class Model(nn.Module):
             inference(self.global_net) if infer_mode else torch.enable_grad()
         )
         with grad_context:
-            with TunedAMP.float(device):
+            with AutoCast.float(device):
                 refined_tokens = self.global_net(tokens_centered)
         residual_context = self.local_net.decode(refined_tokens, apply_norm=True)
         residual = residual_context.view(b, -1)

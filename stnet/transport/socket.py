@@ -7,16 +7,16 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..toolkit.capability import get_available_addr, get_preferred_ip
-from ..toolkit.compat import patch_arrow
+from ..utils.capability import Network, get_preferred_ip
+from ..utils.compat import patch_arrow
 
 
 if TYPE_CHECKING:
-    from ..pipeline.dataset import SampleReader
+    from ..data.dataset import SampleReader
 
 
 def _memory_mapped_tensor_stream() -> type["SampleReader"]:
-    from ..pipeline.dataset import SampleReader
+    from ..data.dataset import SampleReader
 
     return SampleReader
 
@@ -46,9 +46,9 @@ class Endpoint:
     def _bytes_of(value: Any) -> bytes:
         if isinstance(value, (bytes, bytearray)):
             return bytes(value)
-        if isinstance(value, memoryview):
+        elif isinstance(value, memoryview):
             return value.tobytes()
-        if isinstance(value, str):
+        elif isinstance(value, str):
             return value.encode("utf-8")
         try:
             return bytes(value)
@@ -256,7 +256,8 @@ class Endpoint:
         wait_ready_s: float = 10.0,
         **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
-        resolved = get_available_addr(f"{host}:{port}" if host else None)
+        locator = Network()
+        resolved = locator.allocate(f"{host}:{port}" if host else None)
         parsed_endpoint = urlparse(f"grpc://{resolved}")
         resolved_host = parsed_endpoint.hostname or (host or "0.0.0.0")
         resolved_port = parsed_endpoint.port or port or 0
@@ -310,14 +311,20 @@ class Endpoint:
             )
         except Exception:
             advertise_location = None
+        formatter = Network(
+            fallback=advertise_host,
+            default=advertise_host,
+            allow_loopback=True,
+        )
+        advertise_uri_host = formatter.format(advertise_host)
         if advertise_location is not None:
             uri_bytes = getattr(advertise_location, "uri", None)
             if isinstance(uri_bytes, (bytes, bytearray)):
                 uri = uri_bytes.decode("utf-8", "ignore")
             else:
-                uri = f"grpc+tcp://{advertise_host}:{actual_port}"
+                uri = f"grpc+tcp://{advertise_uri_host}:{actual_port}"
         else:
-            uri = f"grpc+tcp://{advertise_host}:{actual_port}"
+            uri = f"grpc+tcp://{advertise_uri_host}:{actual_port}"
         for key in ("NO_PROXY", "no_proxy"):
             current = os.environ.get(key, "")
             entries = [entry.strip() for entry in current.split(",") if entry.strip()]

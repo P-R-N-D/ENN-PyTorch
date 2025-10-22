@@ -55,13 +55,14 @@ class ModelConfig:
 def _sanitize_bool(value: Any, *, name: str) -> bool:
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
+    elif isinstance(value, (int, float)):
         return bool(value)
-    if value in {"true", "True", "1"}:
+    elif value in {"true", "True", "1"}:
         return True
-    if value in {"false", "False", "0"}:
+    elif value in {"false", "False", "0"}:
         return False
-    raise TypeError(f"{name} must be a boolean-compatible value")
+    else:
+        raise TypeError(f"{name} must be a boolean-compatible value")
 
 
 def _sanitize_int(
@@ -109,17 +110,18 @@ def _sanitize_tuple_ints(
         if allow_none:
             return None
         raise TypeError(f"{name} cannot be None")
-    if isinstance(value, int):
+    elif isinstance(value, int):
         ivalue = _sanitize_int(value, name=name, minimum=1)
         if keep_scalar:
             return cast(Union[int, Tuple[int, ...]], ivalue)
         return tuple([ivalue] * dims)
-    if isinstance(value, (list, tuple)):
+    elif isinstance(value, (list, tuple)):
         if len(value) != dims:
             raise ValueError(f"{name} must have length {dims}, got {len(value)}")
         items = tuple(_sanitize_int(v, name=name, minimum=1) for v in value)
         return items
-    raise TypeError(f"{name} must be an int or sequence of {dims} integers")
+    else:
+        raise TypeError(f"{name} must be an int or sequence of {dims} integers")
 
 
 def coerce_patch_config(
