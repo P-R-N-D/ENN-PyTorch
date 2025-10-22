@@ -24,7 +24,7 @@ from .optimization import (
     Module,
 )
 from .profiler import FlopCounter, attention_flops_bshd
-from .transform import (
+from ..data.transforms import (
     IncrementalPCA,
     StandardScaler,
     VarianceThreshold,

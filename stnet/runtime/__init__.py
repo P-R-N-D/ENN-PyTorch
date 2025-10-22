@@ -3,8 +3,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..nn.config import ModelConfig, PatchConfig
-from .config import OpsConfig, coerce_ops_config, ops_config
+from ..config import (
+    ModelConfig,
+    OpsConfig,
+    PatchConfig,
+    coerce_ops_config,
+    ops_config,
+)
 
 
 def new_model(*args: Any, **kwargs: Any) -> Any:

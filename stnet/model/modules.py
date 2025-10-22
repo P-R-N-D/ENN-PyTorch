@@ -2,20 +2,426 @@
 from __future__ import annotations
 
 import contextlib
+import math
+from dataclasses import dataclass
 from math import prod
-from typing import Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
+from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
 from ..utils.compat import patch_torch
-from ..utils.optimization import AutoCast, compile, inference
-from .config import ModelConfig
-from .module import GlobalEncoder, LocalProcessor, Payload
+from ..utils.optimization import (
+    AutoCast,
+    compile,
+    inference,
+)
 
+from .functional import SwiGLU
+from .layers import (
+    GlobalEncoderLayer,
+    CrossAttention,
+    PatchAttention,
+    PatchEmbedding,
+    PointTransformer,
+    StochasticDepth,
+    TemporalEncoderLayer,
+    norm_layer,
+    schedule_stochastic_depth,
+)
 
 patch_torch()
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .config import ModelConfig
+
+
+_MODELING_TYPE_ALIASES: dict[str, str] = {
+    "ss": "sxs",
+    "spatial": "sxs",
+    "sxs": "sxs",
+    "tt": "txt",
+    "temporal": "txt",
+    "txt": "txt",
+    "txs": "txs",
+    "st": "sxt",
+    "ts": "sxt",
+    "sxt": "sxt",
+    "spatiotemporal": "sxt",
+    "spatio-temporal": "sxt",
+    "temporospatial": "sxt",
+    "temporo-spatial": "sxt",
+}
+
+def _normalize_modeling_type(value: Any) -> str:
+    mode = str(value).strip().lower()
+    normalized = _MODELING_TYPE_ALIASES.get(mode)
+    if normalized is None:
+        raise ValueError(f"Unsupported modeling type '{value}'")
+    return normalized
+
+class SpatialEncoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *args: Any,
+        coord_dim: int = 3,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        drops = schedule_stochastic_depth(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                PointTransformer(
+                    d_model,
+                    nhead,
+                    coord_dim=coord_dim,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(norm_type, d_model)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        coords: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        for blk in self.blocks:
+            x = blk(x, coords, attn_mask=attn_mask)
+        return self.norm(x)
+
+class TemporalEncoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *args: Any,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        drops = schedule_stochastic_depth(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                TemporalEncoderBlock(
+                    d_model,
+                    nhead,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(norm_type, d_model)
+
+    def forward(
+        self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        state = None
+        for blk in self.blocks:
+            x, state = blk(x, causal_mask=causal_mask, state=state)
+        return self.norm(x)
+
+class CrossTransformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.cross_s = CrossAttention(
+            d_model, nhead, dropout=dropout, norm_type=norm_type
+        )
+        self.cross_t = CrossAttention(
+            d_model, nhead, dropout=dropout, norm_type=norm_type
+        )
+        self.mix_norm = norm_layer(norm_type, 2 * d_model)
+        hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
+        self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+
+    def forward(
+        self,
+        spatial_tokens: torch.Tensor,
+        temporal_tokens: torch.Tensor,
+        mode: str = "spatiotemporal",
+    ) -> torch.Tensor:
+        mode_l = _normalize_modeling_type(mode)
+        s_context = self.cross_s(spatial_tokens, temporal_tokens)
+        t_context = self.cross_t(temporal_tokens, spatial_tokens)
+        if mode_l == "sxs":
+            return s_context
+        if mode_l == "txt":
+            return t_context
+        if mode_l == "txs":
+            base = torch.cat(
+                [
+                    t_context,
+                    s_context.mean(dim=1, keepdim=True).expand(
+                        -1, t_context.size(1), -1
+                    ),
+                ],
+                dim=-1,
+            )
+            fused = self.mix(self.mix_norm(base))
+            return t_context + self.drop_path(self.dropout(fused))
+        base = torch.cat(
+            [
+                s_context,
+                t_context.mean(dim=1, keepdim=True).expand(
+                    -1, s_context.size(1), -1
+                ),
+            ],
+            dim=-1,
+        )
+        fused = self.mix(self.mix_norm(base))
+        return s_context + self.drop_path(self.dropout(fused))
+
+@dataclass
+class Payload:
+    tokens: torch.Tensor
+    context: torch.Tensor
+    flat: torch.Tensor
+    offset: torch.Tensor
+    context_shape: Tuple[int, ...]
+
+class GlobalEncoderBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(norm_type, d_model)
+        self.retention = GlobalEncoderLayer(d_model, nhead)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self.norm2 = norm_layer(norm_type, d_model)
+        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        state: Optional[dict] = None,
+    ) -> Tuple[torch.Tensor, Optional[dict]]:
+        h, state = self.retention(
+            self.norm1(x), attn_mask=causal_mask, state=state
+        )
+        x = x + self.drop_path(self.dropout(h))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        return x, state
+
+class GlobalEncoder(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        depth: int,
+        *args: Any,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.0,
+        drop_path: float = 0.0,
+        norm_type: str = "layernorm",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        drops = schedule_stochastic_depth(drop_path, depth)
+        self.blocks = nn.ModuleList(
+            [
+                GlobalEncoderBlock(
+                    d_model,
+                    nhead,
+                    mlp_ratio=mlp_ratio,
+                    dropout=dropout,
+                    drop_path=drops[i],
+                    norm_type=norm_type,
+                )
+                for i in range(depth)
+            ]
+        )
+        self.norm = norm_layer(norm_type, d_model)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        state: Optional[dict] = None
+        for blk in self.blocks:
+            tokens, state = blk(tokens, causal_mask=None, state=state)
+        return self.norm(tokens)
+
+class LocalProcessor(nn.Module):
+    def __init__(
+        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.out_shape = tuple((int(v) for v in out_shape))
+        self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
+        self.d_model = int(config.depth)
+        self.nhead = int(config.heads)
+        self.modeling_type = _normalize_modeling_type(
+            config.modeling_type
+        )
+        self.spatial_tokens = max(1, int(config.spatial_latents))
+        self.temporal_tokens = max(1, int(config.temporal_latents))
+        self.mlp_ratio = float(config.mlp_ratio)
+        self.dropout = float(config.dropout)
+        self.drop_path = float(config.drop_path)
+        self.norm_type = str(config.normalization_method)
+        self.spatial_tokenizer = nn.Linear(
+            self.in_dim, self.spatial_tokens * self.d_model
+        )
+        self.temporal_tokenizer = nn.Linear(
+            self.in_dim, self.temporal_tokens * self.d_model
+        )
+        self.register_buffer(
+            "spatial_coords_template",
+            self._build_spatial_coords(
+                self.spatial_tokens, device=torch.device("cpu")
+            ),
+            persistent=False,
+        )
+        self.spatial_encoder = SpatialEncoder(
+            self.d_model,
+            self.nhead,
+            depth=max(1, int(config.spatial_depth)),
+            coord_dim=self.spatial_coords_template.shape[-1],
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+        )
+        self.temporal_encoder = TemporalEncoder(
+            self.d_model,
+            self.nhead,
+            depth=max(1, int(config.temporal_depth)),
+            mlp_ratio=self.mlp_ratio,
+            dropout=self.dropout,
+            drop_path=self.drop_path,
+            norm_type=self.norm_type,
+        )
+        self.perception = CrossTransformer(
+            self.d_model,
+            self.nhead,
+            dropout=self.dropout,
+            norm_type=self.norm_type,
+            mlp_ratio=self.mlp_ratio,
+            drop_path=self.drop_path,
+        )
+        self.norm = norm_layer(self.norm_type, self.d_model)
+        hid = int(self.d_model * max(1.0, self.mlp_ratio))
+        self.head = nn.Sequential(
+            norm_layer(self.norm_type, self.d_model),
+            nn.Linear(self.d_model, hid),
+            nn.SiLU(),
+            nn.Dropout(self.dropout),
+            nn.Linear(hid, self.out_dim),
+        )
+
+    @staticmethod
+    def _build_spatial_coords(
+        n_tokens: int, device: torch.device
+    ) -> torch.Tensor:
+        side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
+        coords: List[Tuple[float, float, float]] = []
+        for idx in range(n_tokens):
+            z = idx // (side * side)
+            rem = idx % (side * side)
+            y = rem // side
+            x = rem % side
+            if side == 1:
+                coords.append((0.0, 0.0, 0.0))
+            else:
+                coords.append(
+                    (
+                        x / (side - 1 if side > 1 else 1),
+                        y / (side - 1 if side > 1 else 1),
+                        z / (side - 1 if side > 1 else 1),
+                    )
+                )
+        return torch.tensor(coords, dtype=torch.float32, device=device)
+
+    def _spatial_coords(
+        self, batch: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        coords = self.spatial_coords_template.to(device=device, dtype=dtype)
+        return coords.unsqueeze(0).expand(batch, -1, -1)
+
+    def forward(self, x: torch.Tensor) -> Payload:
+        B = x.shape[0]
+        spatial_tokens = self.spatial_tokenizer(x).view(
+            B, self.spatial_tokens, self.d_model
+        )
+        temporal_tokens = self.temporal_tokenizer(x).view(
+            B, self.temporal_tokens, self.d_model
+        )
+        coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
+        spatial_out = self.spatial_encoder(spatial_tokens, coords)
+        temporal_out = self.temporal_encoder(temporal_tokens)
+        mode = self.modeling_type
+        if mode == "sxs":
+            tokens = spatial_out
+        elif mode == "txt":
+            tokens = temporal_out
+        elif mode == "txs":
+            tokens = self.perception(temporal_out, spatial_out, mode="txs")
+        elif mode == "sxt":
+            tokens = self.perception(spatial_out, temporal_out, mode="sxt")
+        else:
+            raise RuntimeError(f"Unhandled modeling type '{mode}'")
+        tokens = self.norm(tokens)
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled)
+        context = flat.view(B, *self.out_shape)
+        dims = tuple(range(1, context.ndim))
+        offset = context.mean(dim=dims, keepdim=True)
+        return Payload(
+            tokens=tokens,
+            context=context,
+            flat=flat,
+            offset=offset,
+            context_shape=self.out_shape,
+        )
+
+    def decode(
+        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
+    ) -> torch.Tensor:
+        if apply_norm:
+            tokens = self.norm(tokens)
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled)
+        return flat.view(tokens.shape[0], *self.out_shape)
 
 
 class LossWeightPolicy(Protocol):
@@ -30,7 +436,7 @@ class LossWeightPolicy(Protocol):
         raise NotImplementedError
 
 
-class Model(nn.Module):
+class Root(nn.Module):
     def __init__(
         self,
         in_dim: int,

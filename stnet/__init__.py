@@ -3,37 +3,47 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import nn
-from .runtime import OpsConfig, ops_config, coerce_ops_config
+from . import model as model_ns
+from .config import (
+    BuildConfig,
+    ModelConfig,
+    OpsConfig,
+    OpsMode,
+    PatchConfig,
+    coerce_model_config,
+    coerce_ops_config,
+    coerce_patch_config,
+    model_config,
+    ops_config,
+    patch_config,
+)
 
-Model = nn.Model
-ModelConfig = nn.ModelConfig
-PatchConfig = nn.PatchConfig
-BuildConfig = nn.BuildConfig
-model_config = nn.model_config
-patch_config = nn.patch_config
-coerce_model_config = nn.coerce_model_config
-coerce_patch_config = nn.coerce_patch_config
-SpatialEncoder = nn.SpatialEncoder
-TemporalEncoder = nn.TemporalEncoder
-LocalProcessor = nn.LocalProcessor
-SpatialEncoderLayer = nn.SpatialEncoderLayer
-TemporalEncoderLayer = nn.TemporalEncoderLayer
-GlobalEncoderLayer = nn.GlobalEncoderLayer
-CrossTransformer = nn.CrossTransformer
-Payload = nn.Payload
-GlobalEncoder = nn.GlobalEncoder
-GeGLU = nn.GeGLU
-SwiGLU = nn.SwiGLU
-MultipleQuantileLoss = nn.MultipleQuantileLoss
-StandardNormalLoss = nn.StandardNormalLoss
-StudentsTLoss = nn.StudentsTLoss
-DataFidelityLoss = nn.DataFidelityLoss
+Root = model_ns.Root
+SpatialEncoder = model_ns.SpatialEncoder
+TemporalEncoder = model_ns.TemporalEncoder
+LocalProcessor = model_ns.LocalProcessor
+PatchAttention = model_ns.PatchAttention
+CrossAttention = model_ns.CrossAttention
+PointTransformer = model_ns.PointTransformer
+TemporalEncoderLayer = model_ns.TemporalEncoderLayer
+TemporalEncoderBlock = model_ns.TemporalEncoderBlock
+GlobalEncoderLayer = model_ns.GlobalEncoderLayer
+GlobalEncoderBlock = model_ns.GlobalEncoderBlock
+CrossTransformer = model_ns.CrossTransformer
+Payload = model_ns.Payload
+GlobalEncoder = model_ns.GlobalEncoder
+GeGLU = model_ns.GeGLU
+SwiGLU = model_ns.SwiGLU
+MultipleQuantileLoss = model_ns.MultipleQuantileLoss
+StandardNormalLoss = model_ns.StandardNormalLoss
+StudentsTLoss = model_ns.StudentsTLoss
+DataFidelityLoss = model_ns.DataFidelityLoss
 __all__ = [
-    "Model",
+    "Root",
     "ModelConfig",
     "PatchConfig",
     "BuildConfig",
+    "OpsMode",
     "OpsConfig",
     "ops_config",
     "coerce_ops_config",
@@ -50,9 +60,13 @@ __all__ = [
     "SpatialEncoder",
     "TemporalEncoder",
     "LocalProcessor",
-    "SpatialEncoderLayer",
+    "PatchAttention",
+    "CrossAttention",
+    "PointTransformer",
     "TemporalEncoderLayer",
+    "TemporalEncoderBlock",
     "GlobalEncoderLayer",
+    "GlobalEncoderBlock",
     "CrossTransformer",
     "Payload",
     "GlobalEncoder",
