@@ -25,12 +25,14 @@ __all__ = [
     "BuildConfig",
     "coerce_patch_config",
     "coerce_model_config",
+    "coerce_build_config",
     "patch_config",
     "model_config",
+    "build_config",
     "OpsMode",
-    "OpsConfig",
-    "coerce_ops_config",
-    "ops_config",
+    "RuntimeConfig",
+    "coerce_runtime_config",
+    "runtime_config",
 ]
 
 
@@ -350,6 +352,10 @@ def model_config(
 BuildConfig: TypeAlias = ModelConfig
 
 
+build_config = model_config
+coerce_build_config = coerce_model_config
+
+
 def _as_tuple_ints(xs: Sequence[int]) -> Tuple[int, ...]:
     return tuple(int(x) for x in xs)
 
@@ -358,7 +364,7 @@ OpsMode = Literal["train", "predict", "infer"]
 
 
 @dataclass(frozen=True)
-class OpsConfig:
+class RuntimeConfig:
     mode: OpsMode
     in_dim: int
     out_shape: Tuple[int, ...]
@@ -407,11 +413,11 @@ class OpsConfig:
     )
 
     @staticmethod
-    def from_partial(mode: OpsMode, **kw: Any) -> "OpsConfig":
+    def from_partial(mode: OpsMode, **kw: Any) -> "RuntimeConfig":
         kw = dict(kw)
         for k in ("in_dim", "out_shape", "cfg_dict"):
             if k not in kw or kw[k] is None:
-                raise ValueError(f"OpsConfig missing required key: {k}")
+                raise ValueError(f"RuntimeConfig missing required key: {k}")
         in_dim = int(kw["in_dim"])
         out_shape = _as_tuple_ints(kw["out_shape"])
         cfg_dict = dict(kw["cfg_dict"])
@@ -423,7 +429,7 @@ class OpsConfig:
         if mode == "train":
             for k in ("memmap_dir", "ckpt_dir"):
                 if k not in kw or kw[k] is None:
-                    raise ValueError(f"OpsConfig(train) missing required key: {k}")
+                    raise ValueError(f"RuntimeConfig(train) missing required key: {k}")
             allowed = common_keys | {
                 "memmap_dir",
                 "ckpt_dir",
@@ -447,11 +453,11 @@ class OpsConfig:
             unsupported = set(kw) - allowed
             if unsupported:
                 raise ValueError(
-                    "OpsConfig(train) received unsupported parameters: "
+                    "RuntimeConfig(train) received unsupported parameters: "
                     f"{sorted(unsupported)}"
                 )
             batch_size = int(kw.get("batch_size", 128))
-            return OpsConfig(
+            return RuntimeConfig(
                 mode="train",
                 in_dim=in_dim,
                 out_shape=out_shape,
@@ -477,7 +483,7 @@ class OpsConfig:
             )
         for k in ("memmap_dir", "keys"):
             if k not in kw or kw[k] is None:
-                raise ValueError(f"OpsConfig({mode}) missing required key: {k}")
+                raise ValueError(f"RuntimeConfig({mode}) missing required key: {k}")
         allowed = common_keys | {
             "memmap_dir",
             "keys",
@@ -489,10 +495,10 @@ class OpsConfig:
         unsupported = set(kw) - allowed
         if unsupported:
             raise ValueError(
-                f"OpsConfig({mode}) received unsupported parameters: {sorted(unsupported)}"
+                f"RuntimeConfig({mode}) received unsupported parameters: {sorted(unsupported)}"
             )
         batch_size = int(kw.get("batch_size", 512))
-        return OpsConfig(
+        return RuntimeConfig(
             mode="predict" if mode == "predict" else "infer",
             in_dim=in_dim,
             out_shape=out_shape,
@@ -506,16 +512,16 @@ class OpsConfig:
         )
 
 
-def coerce_ops_config(config: OpsConfig | Dict[str, Any]) -> OpsConfig:
-    if isinstance(config, OpsConfig):
+def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConfig:
+    if isinstance(config, RuntimeConfig):
         data: Dict[str, Any] = asdict(config)
     elif isinstance(config, dict):
         data = dict(config)
     else:
-        raise TypeError("ops configuration must be OpsConfig or dict")
+        raise TypeError("runtime configuration must be RuntimeConfig or dict")
     cfg_dict = data.get("cfg_dict")
     if cfg_dict is None:
-        raise ValueError("cfg_dict is required in ops configuration")
+        raise ValueError("cfg_dict is required in runtime configuration")
     if not isinstance(cfg_dict, dict):
         try:
             data["cfg_dict"] = dict(cfg_dict)
@@ -523,23 +529,27 @@ def coerce_ops_config(config: OpsConfig | Dict[str, Any]) -> OpsConfig:
             raise TypeError("cfg_dict must be dict-like") from exc
     mode_value = data.pop("mode", None)
     if mode_value is None:
-        raise ValueError("ops configuration missing mode")
+        raise ValueError("runtime configuration missing mode")
     mode = str(mode_value).lower()
     if mode not in ("train", "predict", "infer"):
-        raise ValueError(f"invalid ops mode: {mode_value}")
+        raise ValueError(f"invalid runtime mode: {mode_value}")
     if "keys" in data and data["keys"] is not None:
         data["keys"] = list(data["keys"])
-    return OpsConfig.from_partial(mode=mode, **data)
+    return RuntimeConfig.from_partial(mode=mode, **data)
 
 
-def ops_config(
+def runtime_config(
     mode: OpsMode, base: Dict[str, Any] | None, /, *args: Any, **kwargs: Any
-) -> OpsConfig:
+) -> RuntimeConfig:
     data: Dict[str, Any] = dict(base or {})
-    order = OpsConfig.TRAIN_POS_ORDER if mode == "train" else OpsConfig.PRED_POS_ORDER
+    order = (
+        RuntimeConfig.TRAIN_POS_ORDER
+        if mode == "train"
+        else RuntimeConfig.PRED_POS_ORDER
+    )
     for name, val in zip(order, args):
         data[name] = val
     data.update(kwargs)
     actual_mode = data.pop("mode", mode)
-    return coerce_ops_config({"mode": actual_mode, **data})
+    return coerce_runtime_config({"mode": actual_mode, **data})
 

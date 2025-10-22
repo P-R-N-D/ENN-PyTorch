@@ -7,15 +7,15 @@ from . import model as model_ns
 from .config import (
     BuildConfig,
     ModelConfig,
-    OpsConfig,
     OpsMode,
     PatchConfig,
+    RuntimeConfig,
     coerce_model_config,
-    coerce_ops_config,
     coerce_patch_config,
+    coerce_runtime_config,
     model_config,
-    ops_config,
     patch_config,
+    runtime_config,
 )
 
 Root = model_ns.Root
@@ -44,9 +44,9 @@ __all__ = [
     "PatchConfig",
     "BuildConfig",
     "OpsMode",
-    "OpsConfig",
-    "ops_config",
-    "coerce_ops_config",
+    "RuntimeConfig",
+    "runtime_config",
+    "coerce_runtime_config",
     "model_config",
     "patch_config",
     "coerce_model_config",
