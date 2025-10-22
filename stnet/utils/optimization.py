@@ -24,7 +24,7 @@ import torch
 import torch._dynamo
 from torch import nn, optim
 
-from .capability import (
+from .platform import (
     get_device,
     get_runtime_config,
     initialize_sdpa_backends,
