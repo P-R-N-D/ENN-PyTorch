@@ -168,12 +168,20 @@ class TemporalEncoder(nn.Module):
         self.norm = norm_layer(norm_type, d_model)
 
     def forward(
-        self, x: torch.Tensor, causal_mask: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        state = None
+        self,
+        x: torch.Tensor,
+        causal_mask: Optional[torch.Tensor] = None,
+        state: Optional[dict] = None,
+        *,
+        return_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[dict]]]:
+        next_state = state
         for blk in self.blocks:
-            x, state = blk(x, causal_mask=causal_mask, state=state)
-        return self.norm(x)
+            x, next_state = blk(x, causal_mask=causal_mask, state=next_state)
+        x = self.norm(x)
+        if return_state:
+            return x, next_state
+        return x
 
 class CrossTransformer(nn.Module):
     def __init__(
@@ -309,11 +317,20 @@ class GlobalEncoder(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        state: Optional[dict] = None
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        *,
+        state: Optional[dict] = None,
+        return_state: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[dict]]]:
+        next_state = state
         for blk in self.blocks:
-            tokens, state = blk(tokens, causal_mask=None, state=state)
-        return self.norm(tokens)
+            tokens, next_state = blk(tokens, causal_mask=None, state=next_state)
+        tokens = self.norm(tokens)
+        if return_state:
+            return tokens, next_state
+        return tokens
 
 class LocalProcessor(nn.Module):
     def __init__(
