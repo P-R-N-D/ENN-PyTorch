@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from .capability import (
+from .platform import Distributed, System
+from .platform import (
     get_device,
     get_runtime_config,
     initialize_sdpa_backends,
@@ -41,6 +42,8 @@ __all__ = [
     "LossWeightController",
     "attention_flops_bshd",
     "FlopCounter",
+    "Distributed",
+    "System",
     "get_device",
     "get_runtime_config",
     "initialize_sdpa_backends",

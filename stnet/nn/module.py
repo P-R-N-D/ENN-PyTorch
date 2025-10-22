@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
 import torch
@@ -645,6 +646,7 @@ class CrossTransformer(nn.Module):
         fused = self.mix(self.mix_norm(base))
         return s_context + self.drop_path(self.dropout(fused))
 
+@dataclass
 class Payload:
     tokens: torch.Tensor
     context: torch.Tensor
@@ -727,7 +729,7 @@ class LocalProcessor(nn.Module):
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
-        self.out_dim = int(prod(self.out_shape))
+        self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
         self.d_model = int(config.depth)
         self.nhead = int(config.heads)
         self.modeling_type = _normalize_modeling_type(

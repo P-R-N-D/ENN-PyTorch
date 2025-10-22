@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import warnings
-import contextlib
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple, Protocol

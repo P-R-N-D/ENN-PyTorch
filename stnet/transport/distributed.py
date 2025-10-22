@@ -42,7 +42,7 @@ except ImportError:
 
     Endpoint = _EndpointUnavailable()
 
-from ..utils.capability import Network, get_preferred_ip, get_world_size
+from ..utils.platform import Distributed
 
 
 GRPC_DEFAULT_PORT = 5005
@@ -62,7 +62,7 @@ def _require_dist() -> None:
 
 def _world_size() -> int:
     _require_dist()
-    return get_world_size()
+    return Distributed.get_world_size()
 
 
 def _rank() -> int:
@@ -106,10 +106,24 @@ def publish_key(key: str, value: str) -> None:
     store.set(key, value.encode("utf-8"))
 
 
-def get_available_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("", 0))
-        return sock.getsockname()[1]
+def get_available_port(host: Optional[str] = None) -> int:
+    host_text = Distributed.Network.coerce_host(host)
+    default_host = (
+        host_text or Distributed.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    )
+    locator = Distributed.Network(
+        allow_loopback=True,
+        fallback=default_host,
+        default=default_host,
+    )
+    try:
+        allocated = locator.allocate(f"{host_text}:0" if host_text else None)
+        _, port = Distributed.normalize_endpoint(allocated, default_host)
+        return int(port)
+    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("", 0))
+            return int(sock.getsockname()[1])
 
 
 def _local_rank() -> int:
@@ -159,7 +173,7 @@ def _merge_leader_info(
     info: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
     host: str,
 ) -> Dict[str, Any]:
-    resolver = Network(allow_loopback=True)
+    resolver = Distributed.Network(allow_loopback=True)
     incoming_info = _as_dict(info)
     merged_info = _as_dict(existing)
 
@@ -316,7 +330,7 @@ class IOController:
         self._mq = MessageQueueConfig(local_rank=self.local_rank)
         self._flight_port: int = GRPC_DEFAULT_PORT
         self._bind_host: str = "0.0.0.0"
-        self._local_ip: str = get_preferred_ip(allow_loopback=True)
+        self._local_ip: str = Distributed.get_preferred_ip(allow_loopback=True)
         self._server: Any | None = None
         self._clients: Dict[str, Any] = {}
         self._leaders: Dict[str, Dict[str, Any]] = {}
@@ -344,7 +358,7 @@ class IOController:
             leader_by_host[host_identifier] = dict(host_leader)
         self._leaders = leader_by_host
         if self.is_node_leader:
-            locator = Network()
+            locator = Distributed.Network()
             resolved = locator.allocate(f"{self._bind_host}:{self._flight_port}")
             parsed_bind = urlparse(f"tcp://{resolved}")
             bind_host = parsed_bind.hostname or self._bind_host
@@ -386,7 +400,7 @@ class IOController:
                 endpoint_host = merged.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
                     endpoint_host = merged.get("host") or info.get("host")
-                formatter = Network(
+                formatter = Distributed.Network(
                     fallback=host_identifier,
                     allow_loopback=True,
                 )
@@ -443,7 +457,7 @@ class IOController:
     def flight_endpoint(self) -> str | None:
         if not self.is_node_leader:
             return None
-        formatter = Network(
+        formatter = Distributed.Network(
             fallback=self._bind_host,
             allow_loopback=True,
         )

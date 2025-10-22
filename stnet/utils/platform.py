@@ -51,7 +51,7 @@ def is_main_loadable() -> bool:
     return os.path.exists(main_path)
 
 
-def initialize_python_path() -> None:
+def initialize_python_path() -> str:
     separator = os.pathsep
     current_env = os.environ.get("PYTHONPATH", "")
     env_paths = [path for path in current_env.split(separator) if path]
@@ -87,6 +87,9 @@ def initialize_python_path() -> None:
     except Exception:
         package_dir = None
     project_dir = package_dir.parent if package_dir is not None else None
+    cwd_dir: Path | None = None
+    with contextlib.suppress(Exception):
+        cwd_dir = Path.cwd().resolve()
     main_dir: Path | None = None
     main_module = sys.modules.get("__main__")
     if main_module is not None:
@@ -95,7 +98,7 @@ def initialize_python_path() -> None:
             with contextlib.suppress(Exception):
                 main_dir = Path(main_file).resolve().parent
 
-    for candidate in (package_dir, project_dir, main_dir):
+    for candidate in (package_dir, project_dir, main_dir, cwd_dir):
         _ensure_front(candidate)
 
     for entry in list(sys.path):
@@ -109,7 +112,9 @@ def initialize_python_path() -> None:
             continue
         _ensure_env(entry_str)
 
-    os.environ["PYTHONPATH"] = separator.join(paths)
+    python_path = separator.join(paths)
+    os.environ["PYTHONPATH"] = python_path
+    return python_path
 
 
 def optimal_start_method() -> str:
@@ -354,6 +359,45 @@ class Network:
         )
 
     @staticmethod
+    def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
+        """Check whether IPv4 and IPv6 sockets can bind locally."""
+
+        ipv4_ok = False
+        ipv6_ok = False
+
+        ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
+        try:
+            with contextlib.closing(
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            ) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.bind((ipv4_host, 0))
+                ipv4_ok = True
+        except OSError:
+            pass
+
+        if getattr(socket, "has_ipv6", False):
+            ipv6_host = "::1" if allow_loopback else "::"
+            try:
+                with contextlib.closing(
+                    socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                ) as sock6:
+                    if hasattr(socket, "IPPROTO_IPV6") and hasattr(
+                        socket, "IPV6_V6ONLY"
+                    ):
+                        with contextlib.suppress(OSError):
+                            sock6.setsockopt(
+                                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
+                            )
+                    sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    sock6.bind((ipv6_host, 0, 0, 0))
+                    ipv6_ok = True
+            except OSError:
+                pass
+
+        return ipv4_ok, ipv6_ok
+
+    @staticmethod
     def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
         value = endpoint_str.strip()
         if not value:
@@ -500,8 +544,14 @@ def is_port_available(host: str, port: int) -> bool:
     return Network.is_port_available(host, port)
 
 
-def get_available_addr(endpoint: Optional[str]) -> str:
-    return Network.get_available_addr(endpoint)
+def get_available_addr(
+    endpoint: Optional[str], *, default_host: str = "127.0.0.1"
+) -> str:
+    return Network.get_available_addr(endpoint, default_host=default_host)
+
+
+def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
+    return Network.probe_stack_support(allow_loopback=allow_loopback)
 
 
 def get_preferred_ip(
@@ -600,6 +650,34 @@ def get_preferred_ip(
     if allow_loopback:
         return fallback_ipv6_loop if prefer_ipv6 else fallback_ipv4_loop
     return "::" if prefer_ipv6 else "0.0.0.0"
+
+
+def initialize_master_addr(
+    endpoint: Optional[str],
+    *,
+    prefer_ipv6: bool = True,
+    allow_loopback: bool = True,
+) -> tuple[str, int]:
+    """Ensure MASTER_ADDR/MASTER_PORT favoring IPv6 when available."""
+
+    default_host = get_preferred_ip(
+        allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
+    )
+    default_host = default_host or ("::1" if prefer_ipv6 else "127.0.0.1")
+    normalized = Network.coerce_host(endpoint) if endpoint is not None else None
+    if normalized:
+        host, port = normalize_endpoint(normalized, default_host)
+    else:
+        host, port = (default_host, 0)
+    host = host.strip()
+    if host in {"", "0.0.0.0", "::"}:
+        host = default_host
+    literal = normalize_ip_literal(host, allow_loopback=allow_loopback)
+    master_addr = literal or Network.coerce_host(host) or default_host
+    os.environ.setdefault("MASTER_ADDR", master_addr)
+    if port > 0:
+        os.environ.setdefault("MASTER_PORT", str(port))
+    return master_addr, int(port)
 
 
 def get_world_size(device: Optional[torch.device] = None) -> int:
@@ -859,3 +937,82 @@ def optimize_threads() -> dict:
     except Exception:
         pass
     return threads
+
+
+class System:
+    """System-level helpers for runtime, device, and threading configuration."""
+
+    RuntimeConfig = _RuntimeConfig
+    get_runtime_config = staticmethod(get_runtime_config)
+    is_main_loadable = staticmethod(is_main_loadable)
+    initialize_python_path = staticmethod(initialize_python_path)
+    optimal_start_method = staticmethod(optimal_start_method)
+    set_multiprocessing_env = staticmethod(set_multiprocessing_env)
+    default_temp = staticmethod(default_temp)
+    new_dir = staticmethod(new_dir)
+    initialize_sdpa_backends = staticmethod(initialize_sdpa_backends)
+    is_cpu_bf16_supported = staticmethod(is_cpu_bf16_supported)
+    is_cuda_bf16_supported = staticmethod(is_cuda_bf16_supported)
+    get_device = staticmethod(get_device)
+    optimal_optimizer_params = staticmethod(optimal_optimizer_params)
+    cuda_compute_capability = staticmethod(cuda_compute_capability)
+    is_float8_supported = staticmethod(is_float8_supported)
+    is_int8_supported = staticmethod(is_int8_supported)
+    optimal_procs = staticmethod(optimal_procs)
+    cpu_count = staticmethod(cpu_count)
+    optimal_threads = staticmethod(optimal_threads)
+    optimize_threads = staticmethod(optimize_threads)
+
+
+class Distributed:
+    """Distributed-runtime helpers for networking and rendezvous setup."""
+
+    Network = Network
+    coerce_host = staticmethod(coerce_host)
+    normalize_ip_literal = staticmethod(normalize_ip_literal)
+    resolve_host_ip = staticmethod(resolve_host_ip)
+    format_endpoint_host = staticmethod(format_endpoint_host)
+    normalize_endpoint = staticmethod(normalize_endpoint)
+    is_port_available = staticmethod(is_port_available)
+    get_available_addr = staticmethod(get_available_addr)
+    probe_stack_support = staticmethod(probe_stack_support)
+    get_preferred_ip = staticmethod(get_preferred_ip)
+    initialize_master_addr = staticmethod(initialize_master_addr)
+    get_world_size = staticmethod(get_world_size)
+
+
+__all__ = [
+    "System",
+    "Distributed",
+    "Network",
+    "get_runtime_config",
+    "is_main_loadable",
+    "initialize_python_path",
+    "optimal_start_method",
+    "set_multiprocessing_env",
+    "default_temp",
+    "new_dir",
+    "initialize_sdpa_backends",
+    "is_cpu_bf16_supported",
+    "is_cuda_bf16_supported",
+    "get_device",
+    "optimal_optimizer_params",
+    "cuda_compute_capability",
+    "is_float8_supported",
+    "is_int8_supported",
+    "optimal_procs",
+    "cpu_count",
+    "optimal_threads",
+    "optimize_threads",
+    "coerce_host",
+    "normalize_ip_literal",
+    "resolve_host_ip",
+    "format_endpoint_host",
+    "normalize_endpoint",
+    "is_port_available",
+    "get_available_addr",
+    "probe_stack_support",
+    "get_preferred_ip",
+    "initialize_master_addr",
+    "get_world_size",
+]
