@@ -44,10 +44,10 @@ from tqdm.auto import tqdm
 from ..model import Root
 from ..config import (
     ModelConfig,
-    OpsConfig,
     OpsMode,
+    RuntimeConfig,
     coerce_model_config,
-    ops_config,
+    runtime_config,
 )
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader, postprocess, preprocess
@@ -448,11 +448,11 @@ def train(
         "loss_mask_mode": loss_mask_mode,
         "loss_mask_value": loss_mask_value,
     }
-    positional_names = OpsConfig.TRAIN_POS_ORDER[: len(args)]
+    positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = ops_config(
+    ops = runtime_config(
         "train",
         base,
         *args,
@@ -536,11 +536,11 @@ def predict(
         "seed": seed,
         "prefetch_factor": prefetch_factor,
     }
-    positional_names = OpsConfig.PRED_POS_ORDER[: len(args)]
+    positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:
             default_kwargs.pop(key, None)
-    ops = ops_config(
+    ops = runtime_config(
         mode,
         base,
         *args,
@@ -569,7 +569,7 @@ def epoch(
     *,
     model: Root,
     device: torch.device,
-    ops: OpsConfig,
+    ops: RuntimeConfig,
     param_dtype: torch.dtype,
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler,
@@ -871,23 +871,23 @@ def epoch(
 
 def main(*args: Any) -> Optional[Root]:
     if not args:
-        raise TypeError("main requires at least an OpsConfig argument")
+        raise TypeError("main requires at least a RuntimeConfig argument")
 
     System.initialize_python_path()
 
     ret_sink: Optional[Dict[Any, Any]] = None
-    if len(args) == 1 and isinstance(args[0], OpsConfig):
+    if len(args) == 1 and isinstance(args[0], RuntimeConfig):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         ops = args[0]
-    elif len(args) >= 2 and isinstance(args[1], OpsConfig):
+    elif len(args) >= 2 and isinstance(args[1], RuntimeConfig):
         local_rank = int(args[0])
         ops = args[1]
         if len(args) >= 3:
             ret_sink = args[2]
     else:
         raise TypeError(
-            "main expects (OpsConfig,), (local_rank, OpsConfig), or "
-            "(local_rank, OpsConfig, ret_sink) arguments"
+            "main expects (RuntimeConfig,), (local_rank, RuntimeConfig), or "
+            "(local_rank, RuntimeConfig, ret_sink) arguments"
         )
 
     if ops.mode == "train":

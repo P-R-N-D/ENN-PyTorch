@@ -5,10 +5,10 @@ from typing import Any
 
 from ..config import (
     ModelConfig,
-    OpsConfig,
     PatchConfig,
-    coerce_ops_config,
-    ops_config,
+    RuntimeConfig,
+    coerce_runtime_config,
+    runtime_config,
 )
 
 
@@ -47,16 +47,26 @@ def predict(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 
+def learn(*args: Any, **kwargs: Any) -> Any:
+    return train(*args, **kwargs)
+
+
+def infer(*args: Any, **kwargs: Any) -> Any:
+    return predict(*args, **kwargs)
+
+
 __all__ = [
     "ModelConfig",
     "PatchConfig",
-    "OpsConfig",
-    "ops_config",
-    "coerce_ops_config",
+    "RuntimeConfig",
+    "runtime_config",
+    "coerce_runtime_config",
     "new_model",
     "load_model",
     "save_model",
     "joining",
     "train",
+    "learn",
     "predict",
+    "infer",
 ]

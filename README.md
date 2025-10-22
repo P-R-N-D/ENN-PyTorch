@@ -4,9 +4,9 @@
 This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level runtime API for model construction, training, inference, and export utilities. The runtime manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
+- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compiler hints organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
 - **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `OpsConfig` from the unified `stnet.config` module for consistent configuration management.
+- **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.config` module for consistent configuration management.
 - **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives live in `stnet.model.layers` for reuse across modules.
 - **Data transforms** – reusable preprocessing helpers are located under `stnet.data.transforms`, consolidating the former utilities in a single data namespace.
 
@@ -44,27 +44,27 @@ Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message
 ```python
 import torch
 from stnet import (
-    ModelConfig,
     PatchConfig,
+    build_config,
     new_model,
     load_model,
     save_model,
-    train,
-    predict,
+    learn,
+    infer,
 )
 
 patch = PatchConfig(is_cube=True, grid_size_3d=(10, 10, 1), patch_size_3d=(1, 1, 1))
-config = ModelConfig(modeling_type="spatiotemporal", depth=64, heads=4, patch=patch)
+config = build_config(modeling_type="spatiotemporal", depth=64, heads=4, patch=patch)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
 features = torch.randn(32, model.in_dim)
 labels = torch.randn(32, *model.out_shape)
 
 dataset = {"X": features, "Y": labels}
-trained = train(model, dataset, epochs=1, batch_size=8)
+trained = learn(model, dataset, epochs=1, batch_size=8)
 
 infer_batch = {"X": features, "Y": torch.zeros_like(labels)}
-predictions = predict(trained, infer_batch)
+predictions = infer(trained, infer_batch)
 
 save_path = save_model(trained, "checkpoints/stnet.pt")
 restored = load_model(save_path)
