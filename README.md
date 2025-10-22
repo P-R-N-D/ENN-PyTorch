@@ -4,10 +4,11 @@
 This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level runtime API for model construction, training, inference, and export utilities. The runtime manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.nn.container.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized.
+- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
 - **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Runtime facade** – `stnet.runtime` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). Configuration dataclasses (`ModelConfig`, `PatchConfig`) and runtime orchestration (`OpsConfig`) are available from the same namespace for ergonomic imports.
-- **Architecture utilities** – `stnet.nn` houses reusable building blocks including `StochasticDepth`, `norm_layer`, `schedule_stochastic_depth`, and the model definitions so dependents import everything from a single entry point.
+- **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `OpsConfig` from the unified `stnet.config` module for consistent configuration management.
+- **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives live in `stnet.model.layers` for reuse across modules.
+- **Data transforms** – reusable preprocessing helpers are located under `stnet.data.transforms`, consolidating the former utilities in a single data namespace.
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
@@ -42,17 +43,18 @@ Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message
 ## Quick start
 ```python
 import torch
-from stnet.runtime import (
+from stnet import (
     ModelConfig,
+    PatchConfig,
     new_model,
-    save_model,
     load_model,
+    save_model,
     train,
     predict,
-    to_script,
 )
 
-config = ModelConfig(modeling_type="spatiotemporal", depth=64, heads=4)
+patch = PatchConfig(is_cube=True, grid_size_3d=(10, 10, 1), patch_size_3d=(1, 1, 1))
+config = ModelConfig(modeling_type="spatiotemporal", depth=64, heads=4, patch=patch)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
 features = torch.randn(32, model.in_dim)
@@ -67,7 +69,9 @@ predictions = predict(trained, infer_batch)
 save_path = save_model(trained, "checkpoints/stnet.pt")
 restored = load_model(save_path)
 
-scripted = to_script(restored)  # TorchScript export
+restored.eval()
+with torch.inference_mode():
+    scripted_output, _ = restored(features)
 ```
 During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
 

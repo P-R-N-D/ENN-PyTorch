@@ -32,8 +32,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..nn.container import Model
-from ..nn.config import ModelConfig, coerce_model_config
+from ..model import Root
+from ..config import ModelConfig, coerce_model_config
 from ..utils.optimization import inference
 
 
@@ -117,8 +117,8 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
-def _model_config_dict(model: Model) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "_Model__config", None)
+def _model_config_dict(model: Root) -> Dict[str, Any]:
+    cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, ModelConfig):
         return asdict(coerce_model_config(cfg_obj))
     if isinstance(cfg_obj, dict):
@@ -141,7 +141,7 @@ class TorchIO:
 
     @staticmethod
     def save(
-        model: Model,
+        model: Root,
         path: str | Path,
         optimizer: Optional[torch.optim.Optimizer] = None,
         extra: Optional[Dict[str, Any]] = None,
@@ -591,9 +591,9 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
-) -> Model:
+) -> Root:
     cfg = coerce_model_config(config)
-    return Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    return Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
 
 
 def load_model(
@@ -602,7 +602,7 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[str] = None,
-) -> Model:
+) -> Root:
 
     if os.path.isdir(checkpoint_path):
         if in_dim is None or out_shape is None:
@@ -646,7 +646,7 @@ def load_model(
 
 
 def save_model(
-    model: Model,
+    model: Root,
     path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None,

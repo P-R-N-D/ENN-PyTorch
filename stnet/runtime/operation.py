@@ -41,9 +41,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
-from ..nn.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..nn.container import Model
-from ..nn.config import ModelConfig, coerce_model_config
+from ..model import Root
+from ..config import ModelConfig, coerce_model_config
+from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader, postprocess, preprocess
 from ..utils.datatype import to_torch
 from ..data.dataset import SampleReader
@@ -348,7 +348,7 @@ def _ensure_uniform_param_dtype(
 
 
 def train(
-    model: Model,
+    model: Root,
     data: Dict[Tuple, torch.Tensor],
     *args: Any,
     epochs: int = 5,
@@ -371,7 +371,7 @@ def train(
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
-) -> Model:
+) -> Root:
     System.initialize_python_path()
     feats, labels, _, label_shape = preprocess(data)
     mp.allow_connection_pickling()
@@ -400,7 +400,7 @@ def train(
     master_addr, _master_port = Distributed.initialize_master_addr(rdzv_endpoint)
     System.optimize_threads()
     nprocs = System.optimal_procs()["nproc_per_node"]
-    cfg_obj = getattr(model, "_Model__config", None)
+    cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
     else:
@@ -469,7 +469,7 @@ def train(
 
 
 def predict(
-    model: Model,
+    model: Root,
     data: Dict[Tuple, torch.Tensor],
     *args: Any,
     batch_size: int = 512,
@@ -493,7 +493,7 @@ def predict(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
         )
-    cfg_obj = getattr(model, "_Model__config", None)
+    cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
     else:
@@ -562,7 +562,7 @@ def predict(
 
 def epoch(
     *,
-    model: Model,
+    model: Root,
     device: torch.device,
     ops: OpsConfig,
     param_dtype: torch.dtype,
@@ -864,7 +864,7 @@ def epoch(
     )
 
 
-def main(*args: Any) -> Optional[Model]:
+def main(*args: Any) -> Optional[Root]:
     if not args:
         raise TypeError("main requires at least an OpsConfig argument")
 
@@ -903,7 +903,7 @@ def main(*args: Any) -> Optional[Model]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+        model = Root(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -1414,7 +1414,7 @@ def main(*args: Any) -> Optional[Model]:
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
-        model = Model(ops.in_dim, ops.out_shape, config=cfg)
+        model = Root(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -1547,7 +1547,7 @@ def main(*args: Any) -> Optional[Model]:
         with contextlib.suppress(Exception):
             status_bar.close()
         flat = torch.cat(preds, dim=0)
-        pred_struct = Model.unflatten_labels(flat, ops.out_shape)
+        pred_struct = Root.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
             ret_sink.update(ret)

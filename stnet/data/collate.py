@@ -43,7 +43,7 @@ from ..transport.socket import Endpoint
 from ..utils.platform import Distributed, System
 from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
-from ..utils.transform import (
+from .transforms import (
     _ensure_finite_tensor,
     _preprocess_feature_row,
     _preprocess_maybe_batch,

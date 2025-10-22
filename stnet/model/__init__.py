@@ -1,51 +1,57 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import TypeAlias
-
+from ..config import (  # noqa: E402  # requires torch patches before import
+    BuildConfig,
+    ModelConfig,
+    PatchConfig,
+    coerce_model_config,
+    coerce_patch_config,
+    model_config,
+    patch_config,
+)
 from ..utils.compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
-from .config import (  # noqa: E402  # requires torch patches before import
-    ModelConfig,
-    PatchConfig,
-    model_config,
-    patch_config,
-    coerce_model_config,
-    coerce_patch_config,
-)  # noqa: E402  # requires torch patches before import
 from .functional import (  # noqa: E402  # requires torch patches before import
     DataFidelityLoss,
     GeGLU,
     MultipleQuantileLoss,
+    PositionalEncoding,
     StandardNormalLoss,
     StudentsTLoss,
     SwiGLU,
     TiledLoss,
 )  # noqa: E402  # requires torch patches before import
-from .module import (  # noqa: E402  # requires torch patches before import
-    CrossTransformer,
-    GlobalEncoder,
+from .layers import (  # noqa: E402  # requires torch patches before import
     GlobalEncoderLayer,
-    LocalProcessor,
-    Payload,
-    SpatialEncoder,
-    SpatialEncoderLayer,
+    CrossAttention,
+    PatchAttention,
+    PatchEmbedding,
+    PointTransformer,
     StochasticDepth,
-    TemporalEncoder,
     TemporalEncoderLayer,
     norm_layer,
     schedule_stochastic_depth,
 )  # noqa: E402  # requires torch patches before import
-from .container import Model  # noqa: E402  # requires torch patches before import
+from .modules import (  # noqa: E402  # requires torch patches before import
+    CrossTransformer,
+    GlobalEncoder,
+    GlobalEncoderBlock,
+    LocalProcessor,
+    Payload,
+    Root,
+    SpatialEncoder,
+    TemporalEncoder,
+    TemporalEncoderBlock,
+)  # noqa: E402  # requires torch patches before import
 
 __all__ = [
     "sdpa_kernel",
     "SDPBackend",
-    "Model",
+    "Root",
     "ModelConfig",
     "PatchConfig",
-    "BuildConfig",
     "model_config",
     "patch_config",
     "coerce_model_config",
@@ -53,13 +59,19 @@ __all__ = [
     "SpatialEncoder",
     "TemporalEncoder",
     "LocalProcessor",
-    "SpatialEncoderLayer",
+    "PatchEmbedding",
+    "PatchAttention",
+    "PointTransformer",
     "TemporalEncoderLayer",
+    "TemporalEncoderBlock",
     "GlobalEncoderLayer",
+    "GlobalEncoderBlock",
     "CrossTransformer",
     "Payload",
     "GlobalEncoder",
+    "CrossAttention",
     "GeGLU",
+    "PositionalEncoding",
     "SwiGLU",
     "MultipleQuantileLoss",
     "StandardNormalLoss",
@@ -70,6 +82,5 @@ __all__ = [
     "norm_layer",
     "schedule_stochastic_depth",
 ]
-ZLoss: TypeAlias = StandardNormalLoss
-TLoss: TypeAlias = StudentsTLoss
-BuildConfig: TypeAlias = ModelConfig
+ZLoss = StandardNormalLoss
+TLoss = StudentsTLoss
