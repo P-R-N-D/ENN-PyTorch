@@ -42,7 +42,13 @@ from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
 from ..model import Root
-from ..config import ModelConfig, coerce_model_config
+from ..config import (
+    ModelConfig,
+    OpsConfig,
+    OpsMode,
+    coerce_model_config,
+    ops_config,
+)
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader, postprocess, preprocess
 from ..utils.datatype import to_torch
@@ -72,7 +78,6 @@ try:
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from .config import OpsConfig, OpsMode, ops_config
 
 
 ignored_sentences = [
