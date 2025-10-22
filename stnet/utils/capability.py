@@ -169,96 +169,339 @@ def new_dir(prefix: str) -> str:
     return directory
 
 
-def is_port_available(host: str, port: int) -> bool:
-    if port <= 0:
-        return False
-    try:
-        infos = socket.getaddrinfo(
-            host,
-            port,
-            socket.AF_UNSPEC,
-            socket.SOCK_STREAM,
+class Network:
+    """Unified networking helper for host sanitation, resolution, and endpoints."""
+
+    def __init__(
+        self,
+        *,
+        allow_loopback: bool = False,
+        prefer_ipv6: bool | None = None,
+        fallback: Any | None = None,
+        default: str = "127.0.0.1",
+        allow_hostname: bool = True,
+    ) -> None:
+        self.allow_loopback = allow_loopback
+        self.prefer_ipv6 = prefer_ipv6
+        self.fallback = fallback
+        self.default = self.coerce_host(default) or "127.0.0.1"
+        self.allow_hostname = allow_hostname
+
+    @staticmethod
+    def coerce_host(value: Any) -> str:
+        if isinstance(value, str):
+            return value.strip()
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    @staticmethod
+    def strip_host_tokens(value: str) -> tuple[str, bool, bool]:
+        stripped = value.strip()
+        bracketed = False
+        if stripped.startswith("[") and stripped.endswith("]"):
+            stripped = stripped[1:-1].strip()
+            bracketed = True
+        zone_removed = False
+        if "%" in stripped:
+            stripped = stripped.split("%", 1)[0].strip()
+            zone_removed = True
+        return stripped, bracketed, zone_removed
+
+    @classmethod
+    def normalize_ip_literal(
+        cls,
+        value: Any,
+        *,
+        allow_loopback: bool = False,
+    ) -> str | None:
+        candidate_text = cls.coerce_host(value)
+        if not candidate_text:
+            return None
+        stripped_text, _, _ = cls.strip_host_tokens(candidate_text)
+        if not stripped_text:
+            return None
+        try:
+            parsed_address = ipaddress.ip_address(stripped_text)
+        except ValueError:
+            return None
+        if not allow_loopback and (
+            parsed_address.is_unspecified or parsed_address.is_loopback
+        ):
+            return None
+        return parsed_address.compressed
+
+    def normalize(self, value: Any) -> str | None:
+        return self.normalize_ip_literal(
+            value,
+            allow_loopback=self.allow_loopback,
         )
-    except socket.gaierror:
-        return False
-    for family, socktype, proto, _, sockaddr in infos:
-        with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+    @classmethod
+    def resolve_host_ip(
+        cls,
+        host: Any,
+        *,
+        allow_loopback: bool = False,
+        prefer_ipv6: bool | None = None,
+    ) -> str | None:
+        host_text = cls.coerce_host(host)
+        if not host_text:
+            return None
+        literal = cls.normalize_ip_literal(host_text, allow_loopback=allow_loopback)
+        if literal:
+            return literal
+        stripped_text, _, _ = cls.strip_host_tokens(host_text)
+        if not stripped_text:
+            return None
+        addrinfo: list[tuple[Any, ...]] | None = None
+        try:
+            addrinfo = socket.getaddrinfo(
+                stripped_text,
+                None,
+                family=socket.AF_UNSPEC,
+                type=socket.SOCK_STREAM,
+            )
+        except socket.gaierror:
+            return None
+        except Exception:
+            with contextlib.suppress(Exception):
+                addrinfo = socket.getaddrinfo(stripped_text, None)
+        if addrinfo is None or not addrinfo:
+            return None
+        preferred_versions: tuple[int, ...]
+        if prefer_ipv6 is None or prefer_ipv6:
+            preferred_versions = (6, 4)
+        else:
+            preferred_versions = (4, 6)
+        results: dict[int, list[str]] = {4: [], 6: []}
+        for resolved in addrinfo:
             try:
-                sock.bind(sockaddr)
-                return True
-            except OSError:
+                sockaddr = resolved[4]
+            except Exception:
                 continue
-    return False
+            if not sockaddr:
+                continue
+            address_text = sockaddr[0]
+            literal_addr = cls.normalize_ip_literal(
+                address_text,
+                allow_loopback=allow_loopback,
+            )
+            if literal_addr:
+                ip_version = ipaddress.ip_address(literal_addr).version
+                results.setdefault(ip_version, []).append(literal_addr)
+        for version in preferred_versions:
+            if results.get(version):
+                return results[version][0]
+        for literal_addr_list in results.values():
+            if literal_addr_list:
+                return literal_addr_list[0]
+        return None
 
+    def resolve(self, host: Any) -> str | None:
+        return self.resolve_host_ip(
+            host,
+            allow_loopback=self.allow_loopback,
+            prefer_ipv6=self.prefer_ipv6,
+        )
 
-def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
-    value = endpoint_str.strip()
-    if not value:
-        return default_host, 0
-    if value.startswith("["):
-        if "]" not in value:
+    @classmethod
+    def format_endpoint_host(
+        cls,
+        host: Any,
+        *,
+        fallback: Any | None = None,
+        default: str = "127.0.0.1",
+        allow_loopback: bool = False,
+        allow_hostname: bool = True,
+    ) -> str:
+        default_value = cls.coerce_host(default) or "127.0.0.1"
+        candidates: tuple[tuple[Any | None, bool, bool], ...] = (
+            (host, allow_loopback, allow_hostname),
+            (fallback, allow_loopback, allow_hostname),
+            (default_value, True, allow_hostname),
+        )
+        for candidate, loopback_ok, hostnames_ok in candidates:
+            text = cls.coerce_host(candidate)
+            if not text:
+                continue
+            stripped, bracketed, zone_removed = cls.strip_host_tokens(text)
+            if not stripped:
+                continue
+            literal = cls.normalize_ip_literal(stripped, allow_loopback=loopback_ok)
+            if literal:
+                return f"[{literal}]" if ":" in literal else literal
+            if (
+                hostnames_ok
+                and not bracketed
+                and not zone_removed
+                and ":" not in stripped
+            ):
+                return stripped
+
+        literal_default = cls.normalize_ip_literal(default_value, allow_loopback=True)
+        if literal_default:
+            return f"[{literal_default}]" if ":" in literal_default else literal_default
+        return default_value
+
+    def format(self, host: Any) -> str:
+        return self.format_endpoint_host(
+            host,
+            fallback=self.fallback,
+            default=self.default,
+            allow_loopback=self.allow_loopback,
+            allow_hostname=self.allow_hostname,
+        )
+
+    @staticmethod
+    def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
+        value = endpoint_str.strip()
+        if not value:
+            return default_host, 0
+        if value.startswith("["):
+            if "]" not in value:
+                raise ValueError(f"invalid endpoint: {endpoint_str}")
+            closing = value.index("]")
+            host_part = value[1:closing]
+            remainder = value[closing + 1 :]
+            if remainder.startswith(":") and remainder[1:]:
+                return host_part, int(remainder[1:])
+            if remainder in ("", ":"):
+                return host_part, 0
             raise ValueError(f"invalid endpoint: {endpoint_str}")
-        closing = value.index("]")
-        host_part = value[1:closing]
-        remainder = value[closing + 1 :]
-        if remainder.startswith(":") and remainder[1:]:
-            return host_part, int(remainder[1:])
-        if remainder in ("", ":"):
-            return host_part, 0
-        raise ValueError(f"invalid endpoint: {endpoint_str}")
-    host_part, sep, port_part = value.rpartition(":")
-    if sep and port_part.isdigit():
-        return host_part or default_host, int(port_part)
-    return value, 0
+        host_part, sep, port_part = value.rpartition(":")
+        if sep and port_part.isdigit():
+            return host_part or default_host, int(port_part)
+        return value, 0
 
-
-def get_available_addr(endpoint: Optional[str]) -> str:
-    default_host = "127.0.0.1"
-    host: str
-    port: int
-    if endpoint is None:
-        host, port = default_host, 0
-    else:
-        host, port = normalize_endpoint(str(endpoint), default_host)
-
-    if port <= 0 or not is_port_available(host, port):
-        last_error: Optional[BaseException] = None
+    @classmethod
+    def is_port_available(cls, host: str, port: int) -> bool:
+        if port <= 0:
+            return False
         try:
             infos = socket.getaddrinfo(
                 host,
-                0,
+                port,
                 socket.AF_UNSPEC,
                 socket.SOCK_STREAM,
             )
-        except socket.gaierror as exc:
-            raise RuntimeError(f"unable to resolve host for endpoint: {host}") from exc
+        except socket.gaierror:
+            return False
         for family, socktype, proto, _, sockaddr in infos:
             with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 try:
                     sock.bind(sockaddr)
-                    port = int(sock.getsockname()[1])
-                    break
-                except OSError as exc:
-                    last_error = exc
+                    return True
+                except OSError:
                     continue
+        return False
+
+    @classmethod
+    def get_available_addr(
+        cls,
+        endpoint: Optional[str],
+        *,
+        default_host: str = "127.0.0.1",
+    ) -> str:
+        normalized_default = cls.coerce_host(default_host) or "127.0.0.1"
+        if endpoint is None:
+            host, port = normalized_default, 0
         else:
-            if last_error is not None:
+            host, port = cls.normalize_endpoint(str(endpoint), normalized_default)
+
+        if port <= 0 or not cls.is_port_available(host, port):
+            last_error: Optional[BaseException] = None
+            try:
+                infos = socket.getaddrinfo(
+                    host,
+                    0,
+                    socket.AF_UNSPEC,
+                    socket.SOCK_STREAM,
+                )
+            except socket.gaierror as exc:
+                raise RuntimeError(
+                    f"unable to resolve host for endpoint: {host}"
+                ) from exc
+            for family, socktype, proto, _, sockaddr in infos:
+                with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    try:
+                        sock.bind(sockaddr)
+                        port = int(sock.getsockname()[1])
+                        break
+                    except OSError as exc:
+                        last_error = exc
+                        continue
+            else:
+                if last_error is not None:
+                    raise RuntimeError(
+                        f"unable to identify an available port for host: {host}"
+                    ) from last_error
                 raise RuntimeError(
                     f"unable to identify an available port for host: {host}"
-                ) from last_error
-            raise RuntimeError(
-                f"unable to identify an available port for host: {host}"
-            )
+                )
 
-    try:
-        addr = ipaddress.ip_address(host)
-    except ValueError:
-        addr = None
-    if addr is not None and addr.version == 6:
-        return f"[{host}]:{port}"
-    return f"{host}:{port}"
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            addr = None
+        if addr is not None and addr.version == 6:
+            return f"[{host}]:{port}"
+        return f"{host}:{port}"
+
+    def allocate(self, endpoint: Optional[str]) -> str:
+        return self.get_available_addr(endpoint, default_host=self.default)
+
+
+def coerce_host(value: Any) -> str:
+    return Network.coerce_host(value)
+
+
+def normalize_ip_literal(value: Any, *, allow_loopback: bool = False) -> str | None:
+    return Network.normalize_ip_literal(value, allow_loopback=allow_loopback)
+
+
+def resolve_host_ip(
+    host: Any,
+    *,
+    allow_loopback: bool = False,
+    prefer_ipv6: bool | None = None,
+) -> str | None:
+    return Network.resolve_host_ip(
+        host,
+        allow_loopback=allow_loopback,
+        prefer_ipv6=prefer_ipv6,
+    )
+
+
+def format_endpoint_host(
+    host: Any,
+    *,
+    fallback: Any | None = None,
+    default: str = "127.0.0.1",
+    allow_loopback: bool = False,
+    allow_hostname: bool = True,
+) -> str:
+    return Network.format_endpoint_host(
+        host,
+        fallback=fallback,
+        default=default,
+        allow_loopback=allow_loopback,
+        allow_hostname=allow_hostname,
+    )
+
+
+def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
+    return Network.normalize_endpoint(endpoint_str, default_host)
+
+
+def is_port_available(host: str, port: int) -> bool:
+    return Network.is_port_available(host, port)
+
+
+def get_available_addr(endpoint: Optional[str]) -> str:
+    return Network.get_available_addr(endpoint)
 
 
 def get_preferred_ip(

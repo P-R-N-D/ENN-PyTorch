@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import TypeAlias
 
-from ..toolkit.compat import SDPBackend, patch_torch, sdpa_kernel
+from ..utils.compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
 from .config import (  # noqa: E402  # requires torch patches before import
@@ -14,27 +14,30 @@ from .config import (  # noqa: E402  # requires torch patches before import
     coerce_model_config,
     coerce_patch_config,
 )  # noqa: E402  # requires torch patches before import
-from .module import (  # noqa: E402  # requires torch patches before import
-    CrossTransformer,
+from .functional import (  # noqa: E402  # requires torch patches before import
     DataFidelityLoss,
     GeGLU,
+    MultipleQuantileLoss,
+    StandardNormalLoss,
+    StudentsTLoss,
+    SwiGLU,
+    TiledLoss,
+)  # noqa: E402  # requires torch patches before import
+from .module import (  # noqa: E402  # requires torch patches before import
+    CrossTransformer,
     GlobalEncoder,
     GlobalEncoderLayer,
     LocalProcessor,
-    MultipleQuantileLoss,
     Payload,
     SpatialEncoder,
     SpatialEncoderLayer,
-    StandardNormalLoss,
     StochasticDepth,
-    StudentsTLoss,
-    SwiGLU,
     TemporalEncoder,
     TemporalEncoderLayer,
     norm_layer,
     schedule_stochastic_depth,
 )  # noqa: E402  # requires torch patches before import
-from .network import Model  # noqa: E402  # requires torch patches before import
+from .container import Model  # noqa: E402  # requires torch patches before import
 
 __all__ = [
     "sdpa_kernel",
@@ -62,6 +65,7 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
+    "TiledLoss",
     "StochasticDepth",
     "norm_layer",
     "schedule_stochastic_depth",

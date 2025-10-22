@@ -41,13 +41,13 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
-from ..architecture.module import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..architecture.network import Model
-from ..architecture.config import ModelConfig, coerce_model_config
-from ..pipeline.collate import dataloader, postprocess, preprocess
-from ..pipeline.datatype import to_torch
-from ..pipeline.dataset import SampleReader
-from ..toolkit.capability import (
+from ..nn.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
+from ..nn.container import Model
+from ..nn.config import ModelConfig, coerce_model_config
+from ..data.collate import dataloader, postprocess, preprocess
+from ..utils.datatype import to_torch
+from ..data.dataset import SampleReader
+from ..utils.capability import (
     get_available_addr,
     get_device,
     get_preferred_ip,
@@ -61,12 +61,12 @@ from ..toolkit.capability import (
     optimize_threads,
     set_multiprocessing_env,
 )
-from ..toolkit.optimization import (
-    TunedAMP,
+from ..utils.optimization import (
+    AdamW,
+    AutoCast,
     FlopCounter,
     LossWeightController,
-    ModuleTuner,
-    TunedAdamW,
+    Module,
     inference,
     joining,
     no_synchronization,
@@ -658,7 +658,7 @@ def epoch(
                     model, enable=(grad_accum_steps > 1 and (not should_sync))
                 ):
                     with flop_counter_train.step(display=False) as train_counter:
-                        with TunedAMP.float(device):
+                        with AutoCast.float(device):
                             Y_flat = Y.reshape(Y.shape[0], -1).to(
                                 device, dtype=param_dtype
                             )
@@ -742,7 +742,7 @@ def epoch(
         flop_counter_val = FlopCounter(model, mode="eval", device=device)
         with flop_counter_val:
             model.eval()
-            with inference(model), TunedAMP.float(device):
+            with inference(model), AutoCast.float(device):
                 t_fetch_start = time.perf_counter_ns()
                 with joining(model=model, optimizer=optimizer):
                     for step_idx, _raw in enumerate(val_loader):
@@ -949,7 +949,7 @@ def main(*args: Any) -> Optional[Model]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        model, _, _ = ModuleTuner.use_te_module(model, device=device)
+        model, _, _ = Module.use_te_module(model, device=device)
         _ensure_uniform_param_dtype(
             model,
             prefer=(
@@ -959,7 +959,7 @@ def main(*args: Any) -> Optional[Model]:
                 else None
             ),
         )
-        model, _, _ = ModuleTuner.enable_float8_training(
+        model, _, _ = Module.enable_float8_training(
             model, device=device, prefer="te", logger=_float8_log
         )
         model.train()
@@ -1098,7 +1098,7 @@ def main(*args: Any) -> Optional[Model]:
             )
             model.set_requires_gradient_sync(True)
         net_params = [p for p in model.parameters()]
-        optimizer = TunedAdamW.float(
+        optimizer = AdamW.float(
             net_params,
             lr=ops.base_lr,
             weight_decay=ops.weight_decay,
@@ -1431,7 +1431,7 @@ def main(*args: Any) -> Optional[Model]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
-        model, _, _ = ModuleTuner.use_te_module(model, device=device)
+        model, _, _ = Module.use_te_module(model, device=device)
         _ensure_uniform_param_dtype(
             model,
             prefer=(
@@ -1443,7 +1443,7 @@ def main(*args: Any) -> Optional[Model]:
                 else None
             ),
         )
-        model, _, _ = ModuleTuner.enable_float8_prediction(
+        model, _, _ = Module.enable_float8_prediction(
             model,
             device=device,
             prefer="te",
@@ -1471,7 +1471,7 @@ def main(*args: Any) -> Optional[Model]:
         total_flops: float = 0.0
         t_fetch_start = time.perf_counter_ns()
         preds: List[torch.Tensor] = []
-        with flop_counter, inference(model), TunedAMP.float(device):
+        with flop_counter, inference(model), AutoCast.float(device):
             for _idx, _raw in enumerate(data_loader):
                 feat, _label, *_ = preprocess(_raw)
                 X = to_torch(feat)

@@ -1,13 +1,13 @@
 # STNet-PyTorch
 
 ## Overview
-This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level workflow API for model construction, training, inference, and export utilities. The workflow manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
+This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level runtime API for model construction, training, inference, and export utilities. The runtime manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.architecture.network.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized.
+- **Configurable architecture** – `stnet.nn.container.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `BuildConfig` alias keep patch extraction and compiler hints organized.
 - **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Workflow facade** – `stnet.workflow` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). Configuration dataclasses (`ModelConfig`, `PatchConfig`) and runtime orchestration (`OpsConfig`) are available from the same namespace for ergonomic imports.
-- **Architecture utilities** – `stnet.architecture.module` houses reusable building blocks including `StochasticDepth`, `norm_layer`, `schedule_stochastic_depth`, and the model definitions so dependents import everything from a single entry point.
+- **Runtime facade** – `stnet.runtime` re-exports lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`, `predict`, and multiple export utilities (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). Configuration dataclasses (`ModelConfig`, `PatchConfig`) and runtime orchestration (`OpsConfig`) are available from the same namespace for ergonomic imports.
+- **Architecture utilities** – `stnet.nn` houses reusable building blocks including `StochasticDepth`, `norm_layer`, `schedule_stochastic_depth`, and the model definitions so dependents import everything from a single entry point.
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
@@ -42,7 +42,7 @@ Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message
 ## Quick start
 ```python
 import torch
-from stnet.workflow import (
+from stnet.runtime import (
     ModelConfig,
     new_model,
     save_model,
@@ -71,7 +71,7 @@ scripted = to_script(restored)  # TorchScript export
 ```
 During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
 
-The workflow helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
+The runtime helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
 
 ### Sample workbook configuration
 

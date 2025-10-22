@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..architecture.config import ModelConfig, PatchConfig
+from ..nn.config import ModelConfig, PatchConfig
 from .config import OpsConfig, coerce_ops_config, ops_config
 
 
@@ -26,7 +26,7 @@ def save_model(*args: Any, **kwargs: Any) -> Any:
 
 
 def joining(*args: Any, **kwargs: Any) -> Any:
-    from ..toolkit.optimization import joining as _impl
+    from ..utils.optimization import joining as _impl
 
     return _impl(*args, **kwargs)
 

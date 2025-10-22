@@ -32,9 +32,9 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..architecture.network import Model
-from ..architecture.config import ModelConfig, coerce_model_config
-from ..toolkit.optimization import inference
+from ..nn.container import Model
+from ..nn.config import ModelConfig, coerce_model_config
+from ..utils.optimization import inference
 
 
 class MissingDependencyError(ImportError):
