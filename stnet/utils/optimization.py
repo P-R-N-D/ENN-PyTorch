@@ -725,6 +725,225 @@ class AdamW:
         return opt
 
 
+class Module:
+    @staticmethod
+    def _infer_optimal_dtype(
+        device: Optional[Union[torch.device, str]] = None
+    ) -> torch.dtype:
+        dev = torch.device(device) if device is not None else get_device()
+        if dev.type == "cuda":
+            try:
+                if is_cuda_bf16_supported(dev):
+                    return torch.bfloat16
+            except Exception:
+                pass
+            return torch.float16
+        if dev.type == "cpu":
+            return torch.bfloat16 if is_cpu_bf16_supported() else torch.float32
+        if dev.type in {"xpu", "mps"}:
+            return torch.bfloat16 if dev.type == "xpu" else torch.float16
+        return torch.float32
+
+    @staticmethod
+    def _module_reference_tensor(module: nn.Module) -> Optional[torch.Tensor]:
+        with contextlib.suppress(StopIteration):
+            return next(module.parameters())
+        with contextlib.suppress(StopIteration):
+            return next(module.buffers())
+        return None
+
+    @staticmethod
+    def _align_module_like(
+        src: nn.Module,
+        dst: nn.Module,
+        params_dtype: Optional[torch.dtype],
+    ) -> None:
+        ref = Module._module_reference_tensor(src)
+        if ref is not None:
+            with contextlib.suppress(Exception):
+                dst.to(device=ref.device)
+        if params_dtype is not None:
+            with contextlib.suppress(Exception):
+                dst.to(dtype=params_dtype)
+
+    @staticmethod
+    def _copy_state(
+        src: nn.Module, dst: nn.Module, params_dtype: Optional[torch.dtype]
+    ) -> None:
+        try:
+            state = src.state_dict()
+        except Exception:
+            return
+        ref = Module._module_reference_tensor(dst)
+        device = ref.device if ref is not None else None
+        converted = {}
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                tensor = value.detach()
+                if params_dtype is not None and tensor.is_floating_point():
+                    tensor = tensor.to(dtype=params_dtype)
+                if device is not None:
+                    tensor = tensor.to(device=device)
+                converted[key] = tensor
+            else:
+                converted[key] = value
+        with contextlib.suppress(Exception):
+            dst.load_state_dict(converted, strict=False)
+
+    @staticmethod
+    def _make_te_linear(
+        module: nn.Linear,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_linear = getattr(te, "Linear", None)
+        if te_linear is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "in_features": module.in_features,
+            "out_features": module.out_features,
+            "bias": module.bias is not None,
+        }
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_linear(**kwargs)
+        except Exception:
+            return None
+        Module._align_module_like(module, replacement, params_dtype)
+        Module._copy_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _make_te_layer_norm(
+        module: nn.LayerNorm,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_layer_norm = getattr(te, "LayerNorm", None)
+        if te_layer_norm is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "normalized_shape": module.normalized_shape,
+            "eps": module.eps,
+        }
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_layer_norm(**kwargs)
+        except Exception:
+            return None
+        Module._align_module_like(module, replacement, params_dtype)
+        if module.elementwise_affine:
+            Module._copy_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _make_te_rms_norm(
+        module: nn.Module,
+        params_dtype: Optional[torch.dtype],
+        te: Any,
+    ) -> Optional[nn.Module]:
+        te_rms_norm = getattr(te, "RMSNorm", None)
+        if te_rms_norm is None:
+            return None
+        kwargs: Dict[str, Any] = {
+            "normalized_shape": getattr(module, "normalized_shape", None),
+            "eps": getattr(module, "eps", 1e-5),
+        }
+        if kwargs["normalized_shape"] is None:
+            return None
+        if params_dtype is not None:
+            kwargs["params_dtype"] = params_dtype
+        try:
+            replacement = te_rms_norm(**kwargs)
+        except Exception:
+            return None
+        Module._align_module_like(module, replacement, params_dtype)
+        Module._copy_state(module, replacement, params_dtype)
+        return replacement
+
+    @staticmethod
+    def _fuse_sequential_to_te(
+        model: nn.Module, *, params_dtype: Optional[torch.dtype]
+    ) -> Tuple[nn.Module, int]:
+        # Fusing composite modules into transformer_engine equivalents is
+        # opportunistic.  When the backend is not available or a sequence is
+        # not recognised we simply leave the module untouched so that the
+        # caller can continue with native PyTorch modules.
+        try:
+            import transformer_engine.pytorch as te  # noqa: F401
+        except Exception:
+            return (model, 0)
+        # No fusion patterns are implemented yet; return untouched.
+        return (model, 0)
+
+    @staticmethod
+    def _apply_te_module(
+        model: nn.Module,
+        *,
+        apply_te_linear: bool,
+        apply_te_layer_norm: bool,
+        apply_te_rms_norm: bool,
+        filter_linear: Optional[Callable[[nn.Linear, str], bool]],
+        params_dtype: Optional[torch.dtype],
+    ) -> Tuple[nn.Module, int]:
+        try:
+            import transformer_engine.pytorch as te
+        except Exception:
+            return (model, 0)
+
+        def _convert(parent: nn.Module) -> int:
+            converted = 0
+            for name, child in list(parent.named_children()):
+                replacement: Optional[nn.Module] = None
+                if apply_te_linear and isinstance(child, nn.Linear):
+                    if filter_linear is None or filter_linear(child, name):
+                        replacement = Module._make_te_linear(
+                            child, params_dtype, te
+                        )
+                elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
+                    replacement = Module._make_te_layer_norm(
+                        child, params_dtype, te
+                    )
+                else:
+                    rms_cls = getattr(torch.nn, "RMSNorm", None)
+                    if (
+                        apply_te_rms_norm
+                        and rms_cls is not None
+                        and isinstance(child, rms_cls)
+                    ):
+                        replacement = Module._make_te_rms_norm(
+                            child, params_dtype, te
+                        )
+                if replacement is not None:
+                    setattr(parent, name, replacement)
+                    converted += 1
+                    continue
+                converted += _convert(child)
+            return converted
+
+        count = _convert(model)
+        return (model, count)
+
+    @staticmethod
+    def _apply_te_attention(
+        model: nn.Module, *, params_dtype: Optional[torch.dtype]
+    ) -> Tuple[nn.Module, int]:
+        # DotProductAttention modules expose a `te_first` flag that prefers
+        # transformer_engine kernels when available.  Enabling that flag is
+        # sufficient for the modules defined in this package.
+        swapped = 0
+        for module in model.modules():
+            if isinstance(module, DotProductAttention) and getattr(
+                module, "_te_ok", False
+            ):
+                if not getattr(module, "te_first", False):
+                    module.te_first = True
+                swapped += 1
+        return (model, swapped)
+
+    @staticmethod
     def use_te_module(
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
