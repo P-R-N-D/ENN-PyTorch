@@ -42,7 +42,7 @@ except ImportError:
 
     Endpoint = _EndpointUnavailable()
 
-from ..utils.platform import Distributed
+from ..utils.platform import Distributed, Network
 
 
 GRPC_DEFAULT_PORT = 5005
@@ -107,18 +107,14 @@ def publish_key(key: str, value: str) -> None:
 
 
 def get_available_port(host: Optional[str] = None) -> int:
-    host_text = Distributed.Network.coerce_host(host)
+    host_text = Network.coerce_host(host)
     default_host = (
-        host_text or Distributed.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
-    )
-    locator = Distributed.Network(
-        allow_loopback=True,
-        fallback=default_host,
-        default=default_host,
+        host_text or Network.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     )
     try:
-        allocated = locator.allocate(f"{host_text}:0" if host_text else None)
-        _, port = Distributed.normalize_endpoint(allocated, default_host)
+        endpoint = f"{host_text}:0" if host_text else None
+        allocated = Network.get_available_addr(endpoint, default_host=default_host)
+        _, port = Network.normalize_endpoint(allocated, default_host)
         return int(port)
     except Exception:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
@@ -173,7 +169,6 @@ def _merge_leader_info(
     info: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None,
     host: str,
 ) -> Dict[str, Any]:
-    resolver = Distributed.Network(allow_loopback=True)
     incoming_info = _as_dict(info)
     merged_info = _as_dict(existing)
 
@@ -185,32 +180,34 @@ def _merge_leader_info(
             merged_info[key] = value
 
     ip_value = incoming_info.get("ip")
-    sanitized_ip = resolver.normalize(ip_value)
+    sanitized_ip = Network.normalize_ip_literal(ip_value, allow_loopback=True)
     if sanitized_ip:
         merged_info["ip"] = sanitized_ip
     elif ip_value:
-        coerced_ip = resolver.coerce_host(ip_value)
+        coerced_ip = Network.coerce_host(ip_value)
         if coerced_ip:
             merged_info["ip"] = coerced_ip
 
     host_value = incoming_info.get("host")
-    normalized_host = resolver.coerce_host(host_value)
+    normalized_host = Network.coerce_host(host_value)
     if normalized_host:
         merged_info["host"] = normalized_host
     else:
         merged_info.setdefault("host", host)
 
     cached_ip = merged_info.get("ip")
-    cached_sanitized_ip = resolver.normalize(cached_ip)
+    cached_sanitized_ip = Network.normalize_ip_literal(cached_ip, allow_loopback=True)
     if isinstance(cached_ip, str) and not cached_sanitized_ip:
         merged_info.pop("ip", None)
     elif cached_sanitized_ip:
         merged_info["ip"] = cached_sanitized_ip
 
-    has_valid_ip = bool(resolver.normalize(merged_info.get("ip")))
+    has_valid_ip = bool(
+        Network.normalize_ip_literal(merged_info.get("ip"), allow_loopback=True)
+    )
     target_host = merged_info.get("host") or host
     if (not has_valid_ip) and target_host:
-        resolved_ip = resolver.resolve(target_host)
+        resolved_ip = Network.resolve_host_ip(target_host, allow_loopback=True)
         if resolved_ip:
             merged_info["ip"] = resolved_ip
     return merged_info
@@ -330,7 +327,7 @@ class IOController:
         self._mq = MessageQueueConfig(local_rank=self.local_rank)
         self._flight_port: int = GRPC_DEFAULT_PORT
         self._bind_host: str = "0.0.0.0"
-        self._local_ip: str = Distributed.get_preferred_ip(allow_loopback=True)
+        self._local_ip: str = Network.get_preferred_ip(allow_loopback=True)
         self._server: Any | None = None
         self._clients: Dict[str, Any] = {}
         self._leaders: Dict[str, Dict[str, Any]] = {}
@@ -358,8 +355,10 @@ class IOController:
             leader_by_host[host_identifier] = dict(host_leader)
         self._leaders = leader_by_host
         if self.is_node_leader:
-            locator = Distributed.Network()
-            resolved = locator.allocate(f"{self._bind_host}:{self._flight_port}")
+            resolved = Network.get_available_addr(
+                f"{self._bind_host}:{self._flight_port}",
+                default_host=self._bind_host or "127.0.0.1",
+            )
             parsed_bind = urlparse(f"tcp://{resolved}")
             bind_host = parsed_bind.hostname or self._bind_host
             bind_port = parsed_bind.port or int(self._flight_port)
@@ -400,11 +399,12 @@ class IOController:
                 endpoint_host = merged.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
                     endpoint_host = merged.get("host") or info.get("host")
-                formatter = Distributed.Network(
+                formatted_host = Network.format_endpoint_host(
+                    endpoint_host,
                     fallback=host_identifier,
+                    default=host_identifier or "127.0.0.1",
                     allow_loopback=True,
                 )
-                formatted_host = formatter.format(endpoint_host)
                 endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
                     try:
@@ -457,9 +457,10 @@ class IOController:
     def flight_endpoint(self) -> str | None:
         if not self.is_node_leader:
             return None
-        formatter = Distributed.Network(
+        formatted_host = Network.format_endpoint_host(
+            self._local_ip,
             fallback=self._bind_host,
+            default=self._bind_host or "127.0.0.1",
             allow_loopback=True,
         )
-        formatted_host = formatter.format(self._local_ip)
         return f"grpc+tcp://{formatted_host}:{self._flight_port}"

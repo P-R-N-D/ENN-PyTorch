@@ -53,7 +53,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader, postprocess, preprocess
 from ..utils.datatype import to_torch
 from ..data.dataset import SampleReader
-from ..utils.platform import Distributed, System
+from ..utils.platform import Distributed, Network, System
 from ..utils.optimization import (
     AdamW,
     AutoCast,
@@ -399,9 +399,9 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
-    default_rdzv_host = Distributed.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    default_rdzv_host = Network.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
-    rdzv_endpoint = Distributed.get_available_addr(resolved_rdzv)
+    rdzv_endpoint = Network.get_available_addr(resolved_rdzv)
     master_addr, _master_port = Distributed.initialize_master_addr(rdzv_endpoint)
     System.optimize_threads()
     nprocs = System.optimal_procs()["nproc_per_node"]

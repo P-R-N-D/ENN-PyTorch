@@ -19,7 +19,7 @@ from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, P
 from ..transport.socket import Endpoint
 from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
-from ..utils.platform import Distributed, System
+from ..utils.platform import Distributed, Network, System
 _ARROW = patch_arrow()
 
 
@@ -304,7 +304,7 @@ def _build_flight_loaders(
     features_np_dtype = to(meta.get("features_arrow_dtype", "float32"), "numpy")
     labels_np_dtype = to(meta.get("labels_arrow_dtype", "float32"), "numpy")
     try:
-        loopback_host = Distributed.get_preferred_ip(
+        loopback_host = Network.get_preferred_ip(
             "localhost", allow_loopback=True
         )
         host = "0.0.0.0" if is_ddp else (loopback_host or "127.0.0.1")
