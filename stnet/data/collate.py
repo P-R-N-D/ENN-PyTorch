@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import socket
 import time
@@ -113,6 +114,7 @@ def _wrap_data_node(
     prefetch_factor: int,
     non_blocking_copy: bool,
     map_fn: Callable[[Any], Any],
+    length: Optional[int] = None,
 ) -> "DataLoader":
     io_workers = max(1, int(threads["dataloader_workers"]))
     prebatch = max(1, int(threads["prefetch_factor"]))
@@ -148,6 +150,7 @@ def _wrap_data_node(
         node=wrapped,
         prefetch_factor=prefetch_factor,
         non_blocking=bool(non_blocking_copy),
+        length=length,
     )
 
 
@@ -178,9 +181,8 @@ def _build_local_loaders(
     if train_end <= train_start and total:
         train_end = total
     keep = _Keep(reader_tr)
-    node_tr = IterableWrapper(
-        batch_reader_cls(reader_tr, train_start, train_end, int(batch_size))
-    )
+    batcher_tr = batch_reader_cls(reader_tr, train_start, train_end, int(batch_size))
+    node_tr = IterableWrapper(batcher_tr)
     train_loader = _wrap_data_node(
         node_tr,
         device=device,
@@ -188,6 +190,7 @@ def _build_local_loaders(
         prefetch_factor=prefetch_factor,
         non_blocking_copy=non_blocking_copy,
         map_fn=map_fn,
+        length=len(batcher_tr),
     )
     val_loader: Optional[Any] = None
     if val_frac > 0 and train_end < total:
@@ -203,9 +206,8 @@ def _build_local_loaders(
         val_end = int(getattr(val_range, "stop", total))
         if val_end <= val_start:
             val_end = total
-        node_vl = IterableWrapper(
-            batch_reader_cls(reader_vl, val_start, val_end, int(batch_size))
-        )
+        batcher_vl = batch_reader_cls(reader_vl, val_start, val_end, int(batch_size))
+        node_vl = IterableWrapper(batcher_vl)
         val_loader = _wrap_data_node(
             node_vl,
             device=device,
@@ -213,6 +215,7 @@ def _build_local_loaders(
             prefetch_factor=prefetch_factor,
             non_blocking_copy=non_blocking_copy,
             map_fn=map_fn,
+            length=len(batcher_vl),
         )
     return (train_loader, val_loader, keep)
 
@@ -333,6 +336,13 @@ def _build_flight_loaders(
         keep.add(client)
         label_shape = list(meta.get("label_shape", []))
 
+        train_indices = reader_tr._indices()
+        train_start = int(getattr(train_indices, "start", 0))
+        train_stop = int(getattr(train_indices, "stop", 0))
+        train_steps = max(
+            1,
+            math.ceil(max(0, train_stop - train_start) / float(max(1, batch_size))),
+        )
         node_tr = IterableWrapper(
             _iterate_flight_batches(
                 client,
@@ -349,8 +359,16 @@ def _build_flight_loaders(
             prefetch_factor=prefetch_factor,
             non_blocking_copy=non_blocking_copy,
             map_fn=map_fn,
+            length=train_steps,
         )
         if reader_vl is not None:
+            val_indices = reader_vl._indices()
+            val_start = int(getattr(val_indices, "start", 0))
+            val_stop = int(getattr(val_indices, "stop", 0))
+            val_steps = max(
+                1,
+                math.ceil(max(0, val_stop - val_start) / float(max(1, batch_size))),
+            )
             node_vl = IterableWrapper(
                 _iterate_flight_batches(
                     client,
@@ -367,6 +385,7 @@ def _build_flight_loaders(
                 prefetch_factor=prefetch_factor,
                 non_blocking_copy=non_blocking_copy,
                 map_fn=map_fn,
+                length=val_steps,
             )
         else:
             val_loader = None
@@ -714,6 +733,7 @@ class DataLoader:
         dataset: BaseNode | None = None,
         prefetch_factor: int = 2,
         non_blocking: bool = True,
+        length: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         node_obj = node or dataset
@@ -725,6 +745,7 @@ class DataLoader:
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))
         self._non_blocking = bool(non_blocking)
+        self._length = int(length) if length is not None else None
         base = Loader(self._node)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in ("cuda", "mps", "xpu") and DevicePrefetcher is not None:
@@ -741,6 +762,8 @@ class DataLoader:
         return iter(self._iterable)
 
     def __len__(self) -> Any:
+        if self._length is not None:
+            return self._length
         try:
             length = _infer_node_length(self._node)
             return length if length is not None else 1

@@ -327,11 +327,24 @@ def recompute_y_stats(model: Any, loader: Any) -> None:
 
 
 def inverse_y_from_stats(model, y_flat: torch.Tensor) -> torch.Tensor:
-    mu = (model.y_sum / model.y_count).detach()
-    var = (model.y_sum2 / model.y_count - mu**2).clamp_min(1e-12).detach()
-    std = var.sqrt()
+    has_stats = getattr(model, "has_valid_y_stats", None)
+    if callable(has_stats) and not has_stats():
+        return y_flat
+
+    mean = getattr(model, "y_mean", None)
+    std = getattr(model, "y_std", None)
+    if mean is None or std is None:
+        return y_flat
+
     device = y_flat.device
-    return y_flat * std.to(device) + mu.to(device)
+    dtype = y_flat.dtype
+    eps = 1e-6
+    if hasattr(model, "y_eps"):
+        with contextlib.suppress(Exception):
+            eps = float(model.y_eps.item())
+    mu = mean.detach().to(device=device, dtype=dtype)
+    sigma = std.detach().to(device=device, dtype=dtype).clamp_min(eps)
+    return y_flat * sigma + mu
 
 
 def _ensure_uniform_param_dtype(
@@ -1567,7 +1580,6 @@ def main(*args: Any) -> Optional[Root]:
             status_bar.close()
         flat = torch.cat(preds, dim=0)
         pred_struct = Root.unflatten_labels(flat, ops.out_shape)
-        pred_struct = inverse_y_from_stats(model, pred_struct)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
             ret_sink.update(ret)
