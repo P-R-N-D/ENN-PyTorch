@@ -890,14 +890,17 @@ class Root(nn.Module):
             assembled = assembled + bl
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
         if infer_mode:
-            with torch.inference_mode():
-                with AutoCast.float(device):
-                    refined_tokens = self.global_net(tokens_centered)
-                decode_tokens = refined_tokens.detach().clone()
-                with AutoCast.float(device):
-                    residual_context = self.local_net.decode(
-                        decode_tokens, apply_norm=True
-                    )
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(inference(self.global_net))
+                stack.enter_context(AutoCast.float(device))
+                refined_tokens = self.global_net(tokens_centered)
+            decode_tokens = refined_tokens.detach().clone()
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(inference(self.local_net))
+                stack.enter_context(AutoCast.float(device))
+                residual_context = self.local_net.decode(
+                    decode_tokens, apply_norm=True
+                )
         else:
             with torch.enable_grad():
                 with AutoCast.float(device):
