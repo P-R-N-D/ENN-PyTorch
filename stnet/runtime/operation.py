@@ -1565,7 +1565,7 @@ def main(*args: Any) -> Optional[Root]:
         with contextlib.suppress(Exception):
             status_bar.close()
         flat = torch.cat(preds, dim=0)
-        flat = inverse_y_from_stats(model, flat)
+        flat = inverse_y_from_stats(model, flat).to(device)
         pred_struct = Root.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
