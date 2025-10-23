@@ -580,15 +580,6 @@ def predict(
         if device.type in ("cuda", "xpu")
         else 1
     )
-    if nprocs <= 1:
-        ret_dict: Dict[Any, Any] = {}
-        try:
-            main(0, ops, ret_dict)
-            return dict(ret_dict)
-        finally:
-            with contextlib.suppress(Exception):
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-
     manager = mp.Manager()
     ret_dict = manager.dict()
     mp.start_processes(
