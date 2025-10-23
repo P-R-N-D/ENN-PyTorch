@@ -105,6 +105,8 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
     except Exception:
         pass
     warnings.warn(msg)
+
+
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
         keys = []
@@ -180,9 +182,8 @@ def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
         colour="green",
         position=0,
         leave=False,
-        file=sys.stdout,
     )
-    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=False)
+    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=(status_bar.n % 10 == 0))
     return bar
 
 
@@ -323,6 +324,13 @@ def recompute_y_stats(model: Any, loader: Any) -> None:
                 continue
             model.update_y_stats(Y.to(dev))
         model.finalize_y_stats()
+
+
+def inverse_y_from_stats(model, y_flat: torch.Tensor) -> torch.Tensor:
+    mu = (model.y_sum / model.y_count).detach()
+    var = (model.y_sum2 / model.y_count - mu**2).clamp_min(1e-12).detach()
+    std = var.sqrt()
+    return y_flat * std + mu
 
 
 def _ensure_uniform_param_dtype(
@@ -1557,6 +1565,7 @@ def main(*args: Any) -> Optional[Root]:
         with contextlib.suppress(Exception):
             status_bar.close()
         flat = torch.cat(preds, dim=0)
+        flat = inverse_y_from_stats(model, flat)
         pred_struct = Root.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
