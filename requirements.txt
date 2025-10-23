@@ -4,17 +4,16 @@ torchdata>=0.11
 tensordict>=0.10.0
 numpy>=1.24
 netifaces>=0.11
-openpyxl>=3.1
 pyarrow[flight]>=10
 tqdm>=4.66
 
 # Optional extras (install via `pip install -e .[extra]`):
-# queue: pyzmq>=25
-# ao: torchao>=0.5
-# gds: cupy>=12.1, kvikio>=23.8
-# te: transformer-engine[pytorch]>=2.0
-# intel: intel-extension-for-pytorch>=2.3
-# ucx: ucxx-cu12>=0.45.0
+# zeromq: pyzmq>=25
+# optimization: torchao>=0.5
+# nvidia_gds: cupy>=12.1, kvikio>=23.8
+# nvidia_te: transformer-engine[pytorch]>=2.0
+# intel_ai: intel-extension-for-pytorch>=2.3
+# nvidia_rdma: ucxx-cu12>=0.45.0
 # arrow_cuda: pyarrow[cuda]>=10
-# export: onnx>=1.14, onnx-tf>=1.10.0, onnx2tf>=1.18.0, coremltools>=6.3, tensorrt>=10.0, executorch>=0.4
-# scale: torchscale>=0.3.0
+# servable: onnx>=1.14, onnx-tf>=1.10.0, onnx2tf>=1.18.0, coremltools>=6.3, tensorrt>=10.0, executorch>=0.4
+# retention: torchscale>=0.3.0
