@@ -183,7 +183,7 @@ def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
         position=0,
         leave=False,
     )
-    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=(status_bar.n % 10 == 0))
+    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
     return bar
 
 
