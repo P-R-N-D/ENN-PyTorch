@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
+import ipaddress
 import os
 import socket
 import time
@@ -149,6 +150,8 @@ def _local_hostname() -> str:
 def _as_dict(
     candidate: Mapping[str, Any] | Iterable[Tuple[Any, Any]] | None
 ) -> Dict[str, Any]:
+    if candidate is None:
+        return {}
     if isinstance(candidate, dict):
         return dict(candidate)
     elif isinstance(candidate, Mapping):
@@ -173,14 +176,11 @@ def _merge_leader_info(
     merged_info = _as_dict(existing)
 
     for key, value in incoming_info.items():
-        if key in {"ip", "host"}:
-            continue
-        cached_value = merged_info.get(key, ...)
-        if cached_value is ... or cached_value != value:
+        if key not in {"ip", "host"} and merged_info.get(key) != value:
             merged_info[key] = value
 
     ip_value = incoming_info.get("ip")
-    sanitized_ip = Network.normalize_ip_literal(ip_value, allow_loopback=True)
+    sanitized_ip = Network.normalize_ip_literal(ip_value, allow_loopback=False)
     if sanitized_ip:
         merged_info["ip"] = sanitized_ip
     elif ip_value:
@@ -196,18 +196,20 @@ def _merge_leader_info(
         merged_info.setdefault("host", host)
 
     cached_ip = merged_info.get("ip")
-    cached_sanitized_ip = Network.normalize_ip_literal(cached_ip, allow_loopback=True)
+    cached_sanitized_ip = Network.normalize_ip_literal(cached_ip, allow_loopback=False)
     if isinstance(cached_ip, str) and not cached_sanitized_ip:
         merged_info.pop("ip", None)
     elif cached_sanitized_ip:
         merged_info["ip"] = cached_sanitized_ip
 
     has_valid_ip = bool(
-        Network.normalize_ip_literal(merged_info.get("ip"), allow_loopback=True)
+        Network.normalize_ip_literal(merged_info.get("ip"), allow_loopback=False)
     )
     target_host = merged_info.get("host") or host
     if (not has_valid_ip) and target_host:
-        resolved_ip = Network.resolve_host_ip(target_host, allow_loopback=True)
+        resolved_ip = Network.resolve_host_ip(
+            target_host, allow_loopback=False
+        )
         if resolved_ip:
             merged_info["ip"] = resolved_ip
     return merged_info
@@ -254,35 +256,42 @@ def _mq_addr(kind: str, *args: Any, base_path: str = "/dev/shm/stf_mq", **kwargs
 class MessageQueueConfig:
     local_rank: int
     _zmq: Any = field(init=False, repr=False)
+    _zmq_module: Any = field(init=False, repr=False)
     _pull: Any | None = field(init=False, default=None, repr=False)
     _pub: Any | None = field(init=False, default=None, repr=False)
     _push: Any | None = field(init=False, default=None, repr=False)
     _sub: Any | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
+        zmq_module = None
         try:
-            from .queue import zmq
+            from .queue import zmq as queue_zmq
+
+            zmq_module = queue_zmq
         except Exception:
             try:
-                import zmq
+                import zmq as imported_zmq
+
+                zmq_module = imported_zmq
             except Exception as exc:
                 raise RuntimeError(
                     "pyzmq is required. Install it with `pip install stnet-pytorch[queue]` or `pip install pyzmq`."
                 ) from exc
-        self._zmq = zmq.Context.instance()
+        self._zmq_module = cast(Any, zmq_module)
+        self._zmq = self._zmq_module.Context.instance()
         up_addr = _mq_addr("up")
         down_addr = _mq_addr("down")
         if self.local_rank == 0:
-            self._pull = self._zmq.socket(zmq.PULL)
+            self._pull = self._zmq.socket(self._zmq_module.PULL)
             self._pull.bind(up_addr)
-            self._pub = self._zmq.socket(zmq.PUB)
+            self._pub = self._zmq.socket(self._zmq_module.PUB)
             self._pub.bind(down_addr)
         else:
-            self._push = self._zmq.socket(zmq.PUSH)
+            self._push = self._zmq.socket(self._zmq_module.PUSH)
             self._push.connect(up_addr)
-            self._sub = self._zmq.socket(zmq.SUB)
+            self._sub = self._zmq.socket(self._zmq_module.SUB)
             self._sub.connect(down_addr)
-            self._sub.setsockopt(zmq.SUBSCRIBE, b"")
+            self._sub.setsockopt(self._zmq_module.SUBSCRIBE, b"")
 
     def push_up(self, payload: bytes | memoryview) -> None:
         if self.local_rank == 0 or self._push is None:
@@ -327,7 +336,10 @@ class IOController:
         self._mq = MessageQueueConfig(local_rank=self.local_rank)
         self._flight_port: int = GRPC_DEFAULT_PORT
         self._bind_host: str = "0.0.0.0"
-        self._local_ip: str = Network.get_preferred_ip(allow_loopback=True)
+        preferred_ip = Network.get_preferred_ip(allow_loopback=False)
+        if not preferred_ip:
+            preferred_ip = Network.get_preferred_ip(allow_loopback=True)
+        self._local_ip: str = preferred_ip or "127.0.0.1"
         self._server: Any | None = None
         self._clients: Dict[str, Any] = {}
         self._leaders: Dict[str, Dict[str, Any]] = {}
@@ -399,11 +411,22 @@ class IOController:
                 endpoint_host = merged.get("ip")
                 if not endpoint_host or endpoint_host in {"0.0.0.0", ""}:
                     endpoint_host = merged.get("host") or info.get("host")
+                literal_endpoint_host = Network.normalize_ip_literal(
+                    endpoint_host, allow_loopback=True
+                )
+                allow_loopback_remote = False
+                if literal_endpoint_host:
+                    try:
+                        allow_loopback_remote = ipaddress.ip_address(
+                            literal_endpoint_host
+                        ).is_loopback
+                    except ValueError:
+                        allow_loopback_remote = False
                 formatted_host = Network.format_endpoint_host(
                     endpoint_host,
                     fallback=host_identifier,
                     default=host_identifier or "127.0.0.1",
-                    allow_loopback=True,
+                    allow_loopback=allow_loopback_remote,
                 )
                 endpoint = f"grpc+tcp://{formatted_host}:{remote_port}"
                 for attempt in range(10):
@@ -457,10 +480,21 @@ class IOController:
     def flight_endpoint(self) -> str | None:
         if not self.is_node_leader:
             return None
+        literal_local_ip = Network.normalize_ip_literal(
+            self._local_ip, allow_loopback=True
+        )
+        allow_loopback_local = False
+        if literal_local_ip:
+            try:
+                allow_loopback_local = ipaddress.ip_address(
+                    literal_local_ip
+                ).is_loopback
+            except ValueError:
+                allow_loopback_local = False
         formatted_host = Network.format_endpoint_host(
             self._local_ip,
             fallback=self._bind_host,
             default=self._bind_host or "127.0.0.1",
-            allow_loopback=True,
+            allow_loopback=allow_loopback_local,
         )
         return f"grpc+tcp://{formatted_host}:{self._flight_port}"

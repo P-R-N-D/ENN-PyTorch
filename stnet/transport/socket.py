@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import ipaddress
 import os
 import threading
 import time
@@ -329,11 +330,35 @@ class Endpoint:
         thread_error: list[BaseException] = []
         bound = threading.Event()
 
+        if not probe_required:
+            probe_ipv4, probe_ipv6 = Network.probe_stack_support(allow_loopback=True)
+            ipv4_ok = ipv4_ok or probe_ipv4
+            ipv6_ok = ipv6_ok or probe_ipv6
+
         advertise_host = resolved_host
         if advertise_host in ("", "0.0.0.0", "::"):
-            advertise_host = Network.get_preferred_ip(allow_loopback=True)
+            prefer_ipv6 = ipv6_ok and (not ipv4_ok or ":" in (host_text or ""))
+            advertise_host = Network.get_preferred_ip(
+                allow_loopback=False, prefer_ipv6=prefer_ipv6
+            )
+            if not advertise_host:
+                advertise_host = Network.get_preferred_ip(
+                    allow_loopback=True, prefer_ipv6=prefer_ipv6
+                )
             if not advertise_host:
                 advertise_host = "127.0.0.1"
+
+        advertise_literal = Network.normalize_ip_literal(
+            advertise_host, allow_loopback=True
+        )
+        allow_loopback_advertise = False
+        if advertise_literal:
+            try:
+                allow_loopback_advertise = ipaddress.ip_address(
+                    advertise_literal
+                ).is_loopback
+            except ValueError:
+                allow_loopback_advertise = False
 
         thread = threading.Thread(
             target=Endpoint._serve_in_thread,
@@ -370,8 +395,8 @@ class Endpoint:
         advertise_uri_host = Network.format_endpoint_host(
             advertise_host,
             fallback=advertise_host,
-            default=advertise_host,
-            allow_loopback=True,
+            default=advertise_host or "127.0.0.1",
+            allow_loopback=allow_loopback_advertise,
         )
         if advertise_location is not None:
             uri_bytes = getattr(advertise_location, "uri", None)

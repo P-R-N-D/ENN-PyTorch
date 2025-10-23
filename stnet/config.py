@@ -10,30 +10,20 @@ from typing import (
     List,
     Literal,
     Optional,
-    Sequence,
     Tuple,
     TypeAlias,
     Union,
-    cast,
 )
 
 import torch
 
-__all__ = [
-    "PatchConfig",
-    "ModelConfig",
-    "BuildConfig",
-    "coerce_patch_config",
-    "coerce_model_config",
-    "coerce_build_config",
-    "patch_config",
-    "model_config",
-    "build_config",
-    "OpsMode",
-    "RuntimeConfig",
-    "coerce_runtime_config",
-    "runtime_config",
-]
+from .utils.datatype import (
+    ensure_bool,
+    ensure_float,
+    ensure_int,
+    ensure_int_sequence,
+    ensure_int_tuple,
+)
 
 
 @dataclass(frozen=True)
@@ -69,80 +59,6 @@ class ModelConfig:
     enable_compilation: bool = False
     compile_mode: str = "default"
     loss_space: str = "z"
-
-
-def _sanitize_bool(value: Any, *, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    elif isinstance(value, (int, float)):
-        return bool(value)
-    elif value in {"true", "True", "1"}:
-        return True
-    elif value in {"false", "False", "0"}:
-        return False
-    else:
-        raise TypeError(f"{name} must be a boolean-compatible value")
-
-
-def _sanitize_int(
-    value: Any,
-    *,
-    name: str,
-    minimum: Optional[int] = None,
-) -> int:
-    try:
-        ivalue = int(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be an integer-compatible value") from exc
-    if minimum is not None and ivalue < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {ivalue}")
-    return ivalue
-
-
-def _sanitize_float(
-    value: Any,
-    *,
-    name: str,
-    minimum: Optional[float] = None,
-    maximum: Optional[float] = None,
-) -> float:
-    try:
-        fvalue = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be a float-compatible value") from exc
-    if minimum is not None and fvalue < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {fvalue}")
-    if maximum is not None and fvalue > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {fvalue}")
-    return fvalue
-
-
-def _sanitize_tuple_ints(
-    value: Any,
-    *,
-    name: str,
-    dims: int,
-    allow_none: bool = False,
-    keep_scalar: bool = False,
-) -> Optional[Union[int, Tuple[int, ...]]]:
-    if value is None:
-        if allow_none:
-            return None
-        raise TypeError(f"{name} cannot be None")
-    elif isinstance(value, int):
-        ivalue = _sanitize_int(value, name=name, minimum=1)
-        if keep_scalar:
-            return cast(Union[int, Tuple[int, ...]], ivalue)
-        return tuple([ivalue] * dims)
-    elif isinstance(value, (list, tuple)):
-        if len(value) != dims:
-            raise ValueError(f"{name} must have length {dims}, got {len(value)}")
-        items = tuple(_sanitize_int(v, name=name, minimum=1) for v in value)
-        return items
-    else:
-        raise TypeError(f"{name} must be an int or sequence of {dims} integers")
-
-
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> PatchConfig:
@@ -158,48 +74,48 @@ def coerce_patch_config(
     allowed = set(inspect.signature(PatchConfig).parameters.keys())
     filtered = {k: v for k, v in data.items() if k in allowed}
     args: Dict[str, Any] = {}
-    args["is_square"] = _sanitize_bool(
+    args["is_square"] = ensure_bool(
         filtered.get("is_square", defaults["is_square"]), name="is_square"
     )
-    args["patch_size_1d"] = _sanitize_int(
+    args["patch_size_1d"] = ensure_int(
         filtered.get("patch_size_1d", defaults["patch_size_1d"]),
         name="patch_size_1d",
         minimum=1,
     )
     grid2d = filtered.get("grid_size_2d", defaults["grid_size_2d"])
     args["grid_size_2d"] = (
-        _sanitize_tuple_ints(
+        ensure_int_tuple(
             grid2d, name="grid_size_2d", dims=2, allow_none=True, keep_scalar=True
         )
         if grid2d is not None
         else None
     )
     patch2d = filtered.get("patch_size_2d", defaults["patch_size_2d"])
-    args["patch_size_2d"] = _sanitize_tuple_ints(
+    args["patch_size_2d"] = ensure_int_tuple(
         patch2d, name="patch_size_2d", dims=2, keep_scalar=True
     )
-    args["is_cube"] = _sanitize_bool(
+    args["is_cube"] = ensure_bool(
         filtered.get("is_cube", defaults["is_cube"]), name="is_cube"
     )
     grid3d = filtered.get("grid_size_3d", defaults["grid_size_3d"])
     args["grid_size_3d"] = (
-        _sanitize_tuple_ints(
+        ensure_int_tuple(
             grid3d, name="grid_size_3d", dims=3, allow_none=True, keep_scalar=True
         )
         if grid3d is not None
         else None
     )
     patch3d = filtered.get("patch_size_3d", defaults["patch_size_3d"])
-    args["patch_size_3d"] = _sanitize_tuple_ints(
+    args["patch_size_3d"] = ensure_int_tuple(
         patch3d, name="patch_size_3d", dims=3, keep_scalar=True
     )
-    args["dropout"] = _sanitize_float(
+    args["dropout"] = ensure_float(
         filtered.get("dropout", defaults["dropout"]),
         name="patch.dropout",
         minimum=0.0,
         maximum=1.0,
     )
-    args["use_padding"] = _sanitize_bool(
+    args["use_padding"] = ensure_bool(
         filtered.get("use_padding", defaults["use_padding"]), name="use_padding"
     )
     return PatchConfig(**args)
@@ -235,12 +151,12 @@ def coerce_model_config(
         except (TypeError, RuntimeError) as exc:
             raise ValueError(f"invalid device specification: {device_val}") from exc
 
-    args["microbatch"] = _sanitize_int(
+    args["microbatch"] = ensure_int(
         filtered.get("microbatch", getattr(defaults, "microbatch")),
         name="microbatch",
         minimum=1,
     )
-    args["dropout"] = _sanitize_float(
+    args["dropout"] = ensure_float(
         filtered.get("dropout", getattr(defaults, "dropout")),
         name="dropout",
         minimum=0.0,
@@ -251,43 +167,43 @@ def coerce_model_config(
             "normalization_method", getattr(defaults, "normalization_method")
         )
     )
-    args["depth"] = _sanitize_int(
+    args["depth"] = ensure_int(
         filtered.get("depth", getattr(defaults, "depth")),
         name="depth",
         minimum=1,
     )
-    args["heads"] = _sanitize_int(
+    args["heads"] = ensure_int(
         filtered.get("heads", getattr(defaults, "heads")),
         name="heads",
         minimum=1,
     )
-    args["spatial_depth"] = _sanitize_int(
+    args["spatial_depth"] = ensure_int(
         filtered.get("spatial_depth", getattr(defaults, "spatial_depth")),
         name="spatial_depth",
         minimum=1,
     )
-    args["temporal_depth"] = _sanitize_int(
+    args["temporal_depth"] = ensure_int(
         filtered.get("temporal_depth", getattr(defaults, "temporal_depth")),
         name="temporal_depth",
         minimum=1,
     )
-    args["mlp_ratio"] = _sanitize_float(
+    args["mlp_ratio"] = ensure_float(
         filtered.get("mlp_ratio", getattr(defaults, "mlp_ratio")),
         name="mlp_ratio",
         minimum=0.0,
     )
-    args["drop_path"] = _sanitize_float(
+    args["drop_path"] = ensure_float(
         filtered.get("drop_path", getattr(defaults, "drop_path")),
         name="drop_path",
         minimum=0.0,
         maximum=1.0,
     )
-    args["spatial_latents"] = _sanitize_int(
+    args["spatial_latents"] = ensure_int(
         filtered.get("spatial_latents", getattr(defaults, "spatial_latents")),
         name="spatial_latents",
         minimum=1,
     )
-    args["temporal_latents"] = _sanitize_int(
+    args["temporal_latents"] = ensure_int(
         filtered.get("temporal_latents", getattr(defaults, "temporal_latents")),
         name="temporal_latents",
         minimum=1,
@@ -295,11 +211,11 @@ def coerce_model_config(
     args["modeling_type"] = str(
         filtered.get("modeling_type", getattr(defaults, "modeling_type"))
     )
-    args["use_linear_branch"] = _sanitize_bool(
+    args["use_linear_branch"] = ensure_bool(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
     )
-    args["enable_compilation"] = _sanitize_bool(
+    args["enable_compilation"] = ensure_bool(
         filtered.get(
             "enable_compilation", getattr(defaults, "enable_compilation")
         ),
@@ -354,12 +270,6 @@ BuildConfig: TypeAlias = ModelConfig
 
 build_config = model_config
 coerce_build_config = coerce_model_config
-
-
-def _as_tuple_ints(xs: Sequence[int]) -> Tuple[int, ...]:
-    return tuple(int(x) for x in xs)
-
-
 OpsMode = Literal["train", "predict", "infer"]
 
 
@@ -419,7 +329,7 @@ class RuntimeConfig:
             if k not in kw or kw[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
         in_dim = int(kw["in_dim"])
-        out_shape = _as_tuple_ints(kw["out_shape"])
+        out_shape = ensure_int_sequence(kw["out_shape"])
         cfg_dict = dict(kw["cfg_dict"])
         common_keys = {
             "in_dim",
@@ -552,4 +462,3 @@ def runtime_config(
     data.update(kwargs)
     actual_mode = data.pop("mode", mode)
     return coerce_runtime_config({"mode": actual_mode, **data})
-

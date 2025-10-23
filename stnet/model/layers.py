@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from ..utils.optimization import DotProductAttention, MultiScaleRetention
-from .functional import SwiGLU
 
 
 class StochasticDepth(nn.Module):
@@ -413,16 +412,3 @@ class GlobalEncoderLayer(nn.Module):
         else:
             out, new_state = h, state
         return out, new_state
-
-
-__all__ = [
-    "GlobalEncoderLayer",
-    "CrossAttention",
-    "PatchAttention",
-    "PatchEmbedding",
-    "StochasticDepth",
-    "TemporalEncoderLayer",
-    "norm_layer",
-    "reshape_for_heads",
-    "schedule_stochastic_depth",
-]
