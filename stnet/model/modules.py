@@ -904,11 +904,11 @@ class Root(nn.Module):
             with torch.enable_grad():
                 with AutoCast.float(device):
                     refined_tokens = self.global_net(tokens_centered)
-            with torch.enable_grad():
-                with AutoCast.float(device):
-                    residual_context = self.local_net.decode(
-                        refined_tokens, apply_norm=True
-                    )
+                with torch.enable_grad():
+                    with AutoCast.float(device):
+                        residual_context = self.local_net.decode(
+                            refined_tokens, apply_norm=True
+                        )
         residual = residual_context.view(b, -1)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
