@@ -330,7 +330,8 @@ def inverse_y_from_stats(model, y_flat: torch.Tensor) -> torch.Tensor:
     mu = (model.y_sum / model.y_count).detach()
     var = (model.y_sum2 / model.y_count - mu**2).clamp_min(1e-12).detach()
     std = var.sqrt()
-    return y_flat * std + mu
+    device = y_flat.device
+    return y_flat * std.to(device) + mu.to(device)
 
 
 def _ensure_uniform_param_dtype(
@@ -1565,7 +1566,7 @@ def main(*args: Any) -> Optional[Root]:
         with contextlib.suppress(Exception):
             status_bar.close()
         flat = torch.cat(preds, dim=0)
-        flat = inverse_y_from_stats(model, flat).to(device)
+        flat = inverse_y_from_stats(model, flat)
         pred_struct = Root.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
         if ret_sink is not None:
