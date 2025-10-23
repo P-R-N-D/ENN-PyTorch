@@ -89,6 +89,7 @@ ignored_sentences = [
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 
 _DL_STATE_FILE = "dataloader.json"
+_FLOAT8_LOG_MESSAGES: set[str] = set()
 
 
 def dl_state_path(directory: str) -> str:
@@ -96,15 +97,19 @@ def dl_state_path(directory: str) -> str:
 
 
 def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
+    text = str(msg)
+    if text in _FLOAT8_LOG_MESSAGES:
+        return
+    _FLOAT8_LOG_MESSAGES.add(text)
     if not only_main_rank:
-        warnings.warn(msg)
+        warnings.warn(text)
         return
     try:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return
     except Exception:
         pass
-    warnings.warn(msg)
+    warnings.warn(text)
 
 
 def _prune_dcp_state_keys(state: Any) -> Any:
@@ -575,6 +580,15 @@ def predict(
         if device.type in ("cuda", "xpu")
         else 1
     )
+    if nprocs <= 1:
+        ret_dict: Dict[Any, Any] = {}
+        try:
+            main(0, ops, ret_dict)
+            return dict(ret_dict)
+        finally:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     manager = mp.Manager()
     ret_dict = manager.dict()
     mp.start_processes(
@@ -989,9 +1003,14 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             ),
         )
-        model, _, _ = Module.enable_float8_training(
-            model, device=device, prefer="te", logger=_float8_log
-        )
+        fp8_ok, fp8_reason = System.is_float8_supported(device)
+        if fp8_ok:
+            model, _, _ = Module.enable_float8_training(
+                model, device=device, prefer="te", logger=_float8_log
+            )
+        else:
+            AutoCast.configure(model)
+            _float8_log(f"[FP8] disabled: {fp8_reason}")
         model.train()
         world = Distributed.get_world_size(device)
         mesh = init_device_mesh(
@@ -1473,13 +1492,18 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             ),
         )
-        model, _, _ = Module.enable_float8_prediction(
-            model,
-            device=device,
-            prefer="te",
-            logger=_float8_log,
-            dynamic_activations=True,
-        )
+        fp8_infer_ok, fp8_infer_reason = System.is_float8_supported(device)
+        if fp8_infer_ok:
+            model, _, _ = Module.enable_float8_prediction(
+                model,
+                device=device,
+                prefer="te",
+                logger=_float8_log,
+                dynamic_activations=True,
+            )
+        else:
+            AutoCast.configure(model)
+            _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         model.eval()
         data_loader, _, keep = dataloader(
             memmap_dir=ops.memmap_dir or "",
