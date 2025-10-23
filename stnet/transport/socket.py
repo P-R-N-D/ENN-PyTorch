@@ -251,9 +251,9 @@ class Endpoint:
         wait_ready_s: float = 10.0,
         **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
-        locator = Network()
         host_text = Network.coerce_host(host)
         port = int(port)
+        default_host = host_text or "127.0.0.1"
 
         probe_required = host_text in ("", "0.0.0.0", "::", "[::]")
         ipv4_ok = False
@@ -301,7 +301,9 @@ class Endpoint:
         last_error: BaseException | None = None
         for candidate in candidates:
             try:
-                resolved = locator.allocate(candidate)
+                resolved = Network.get_available_addr(
+                    candidate, default_host=default_host
+                )
                 break
             except BaseException as exc:
                 last_error = exc
@@ -365,12 +367,12 @@ class Endpoint:
             )
         except Exception:
             advertise_location = None
-        formatter = Network(
+        advertise_uri_host = Network.format_endpoint_host(
+            advertise_host,
             fallback=advertise_host,
             default=advertise_host,
             allow_loopback=True,
         )
-        advertise_uri_host = formatter.format(advertise_host)
         if advertise_location is not None:
             uri_bytes = getattr(advertise_location, "uri", None)
             if isinstance(uri_bytes, (bytes, bytearray)):
