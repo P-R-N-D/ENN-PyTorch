@@ -19,9 +19,9 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```
    Optional exporter extras are available via:
    ```bash
-   pip install -e .[export]
+   pip install -e .[servable]
    ```
-   Additional extras include `ao`, `gds`, `te`, `intel`, `ucx`, `arrow_cuda`, and `scale` as defined in `pyproject.toml`.
+   Additional extras include `zeromq`, `optimization`, `nvidia_gds`, `nvidia_te`, `intel_ai`, `nvidia_rdma`, `arrow_cuda`, and `retention` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
@@ -36,9 +36,10 @@ The core runtime depends on:
   - add `pyarrow[cuda]` (or install the `arrow_cuda` extra) when GPU-accelerated Arrow Flight is required
 - `tqdm>=4.66`
 
-Optional extras listed in `pyproject.toml` cover exporter stacks (`export`), advanced optimization toolchains (`ao`, `te`, `scale`),
-vendor accelerators (`intel`, `ucx`), storage pipelines (`gds`), Arrow GPU acceleration (`arrow_cuda`), and queue backends (`queue`).
-Install `stnet-pytorch[queue]` or `pyzmq` manually when the ZeroMQ-based message queue helpers are required.
+Optional extras listed in `pyproject.toml` cover exporter stacks (`servable`), advanced optimization toolchains (`optimization`),
+vendor accelerators (`intel_ai`, `nvidia_te`), storage pipelines (`nvidia_gds`), distributed fabrics (`nvidia_rdma`), Arrow GPU acceleration (`arrow_cuda`),
+message queue backends (`zeromq`), and retention-focused research modules (`retention`).
+Install `stnet-pytorch[zeromq]` or `pyzmq` manually when the ZeroMQ-based message queue helpers are required.
 
 ## Quick start
 ```python
@@ -82,7 +83,7 @@ The runtime helpers manage distributed checkpoints, mixed precision, exporter re
 When following `notebook.ipynb` to materialize features from `raw_data.xlsx`, the CUDA profile keeps the model depth at 1152 with larger microbatches while the CPU path dials the depth back to 512 and halves the microbatch size to remain memory efficient. Both flows share the same tokenizer geometry so predictions remain shape-compatible across devices.
 
 ## Exporting for inference
-Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `export` extra to enable the full conversion toolkit.
+Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `servable` extra to enable the full conversion toolkit.
 
 ## License
 **Code** is licensed under **PolyForm Noncommercial 1.0.0**
