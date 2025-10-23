@@ -676,6 +676,8 @@ def _has_join_hook(obj: Any | None) -> bool:
 Int8DynamicActivationInt8WeightConfig: Any | None
 Int8WeightOnlyConfig: Any | None
 quantize_: Any | None
+ptq: Callable[..., tuple[nn.Module, bool, str]] | None
+QAT: Any | None
 
 try:
     from torchao.quantization import (
@@ -683,10 +685,12 @@ try:
         Int8WeightOnlyConfig,
         quantize_,
     )
+    ptq = getattr(quantize_, "ptq", None)
 except ImportError:
     quantize_ = None
     Int8DynamicActivationInt8WeightConfig = None
     Int8WeightOnlyConfig = None
+    ptq = None
 QATConfig = None
 QATStep = None
 try:
@@ -739,6 +743,34 @@ except Exception:
                 CONVERT = "convert"
 
             QATConfig, QATStep = (_NullQATConfig, _NullQATStep)
+try:
+    from torchao.quantization import qat as _qat_module
+
+    QAT = _qat_module if hasattr(_qat_module, "initialize") else None
+except Exception:
+    QAT = None
+
+
+def _ptq_unavailable(
+    model: nn.Module,
+    *args: Any,
+    **kwargs: Any,
+) -> tuple[nn.Module, bool, str]:
+    return (model, False, "PTQ backend unavailable")
+
+
+if ptq is None:
+    ptq = _ptq_unavailable
+
+
+if QAT is None:
+
+    class _QATUnavailable:
+        @staticmethod
+        def initialize(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("QAT backend unavailable")
+
+    QAT = _QATUnavailable()
 
 
 def joining(

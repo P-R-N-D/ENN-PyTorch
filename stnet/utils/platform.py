@@ -830,7 +830,7 @@ class Distributed:
         return max(1, min(cpu_count, 4))
 
 
-# Backwards-compatible functional aliases
+
 
 def get_runtime_config() -> _RuntimeConfig:
     return System.get_runtime_config()
@@ -1003,40 +1003,3 @@ def initialize_master_addr(
 
 def get_world_size(device: Optional[torch.device] = None) -> int:
     return Distributed.get_world_size(device=device)
-
-
-__all__ = [
-    "System",
-    "Distributed",
-    "Network",
-    "get_runtime_config",
-    "is_main_loadable",
-    "initialize_python_path",
-    "optimal_start_method",
-    "set_multiprocessing_env",
-    "default_temp",
-    "new_dir",
-    "initialize_sdpa_backends",
-    "is_cpu_bf16_supported",
-    "is_cuda_bf16_supported",
-    "get_device",
-    "optimal_optimizer_params",
-    "cuda_compute_capability",
-    "is_float8_supported",
-    "is_int8_supported",
-    "optimal_procs",
-    "cpu_count",
-    "optimal_threads",
-    "optimize_threads",
-    "coerce_host",
-    "normalize_ip_literal",
-    "resolve_host_ip",
-    "format_endpoint_host",
-    "normalize_endpoint",
-    "is_port_available",
-    "get_available_addr",
-    "probe_stack_support",
-    "get_preferred_ip",
-    "initialize_master_addr",
-    "get_world_size",
-]

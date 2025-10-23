@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+
+
 from __future__ import annotations
 
 import os
@@ -20,6 +22,7 @@ from ..transport.socket import Endpoint
 from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
 from ..utils.platform import Distributed, Network, System
+
 _ARROW = patch_arrow()
 
 
@@ -739,9 +742,30 @@ class DataLoader:
 
     def __len__(self) -> Any:
         try:
-            return int(get_node_length(self._node))
+            length = _infer_node_length(self._node)
+            return length if length is not None else 1
         except Exception:
             return 1
+
+
+def _infer_node_length(node: BaseNode) -> int | None:
+    candidates = [
+        lambda: len(node),
+        getattr(node, "length", None),
+        getattr(node, "size", None),
+        getattr(node, "num_rows", None),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            value = candidate() if callable(candidate) else candidate
+            if value is None:
+                continue
+            return int(value)
+        except Exception:
+            continue
+    return None
 
 
 def flatten(objs: Iterable[Any]) -> Iterable[Any]:

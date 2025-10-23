@@ -50,20 +50,21 @@ from ..config import (
     runtime_config,
 )
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..data.collate import dataloader, postprocess, preprocess
+from ..data.collate import dataloader
+from ..data.transforms import postprocess, preprocess
 from ..utils.datatype import to_torch
 from ..data.dataset import SampleReader
 from ..utils.platform import Distributed, Network, System
 from ..utils.optimization import (
     AdamW,
     AutoCast,
-    FlopCounter,
     LossWeightController,
     Module,
     inference,
     joining,
     no_synchronization,
 )
+from ..utils.profiler import FlopCounter
 
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -547,7 +548,11 @@ def predict(
         **default_kwargs,
         **kwargs,
     )
-    nprocs = get_world_size(device) if device.type in ("cuda", "xpu") else 1
+    nprocs = (
+        Distributed.get_world_size(device)
+        if device.type in ("cuda", "xpu")
+        else 1
+    )
     manager = mp.Manager()
     ret_dict = manager.dict()
     mp.start_processes(
@@ -966,7 +971,7 @@ def main(*args: Any) -> Optional[Root]:
             model, device=device, prefer="te", logger=_float8_log
         )
         model.train()
-        world = get_world_size(device)
+        world = Distributed.get_world_size(device)
         mesh = init_device_mesh(
             "cuda" if device.type == "cuda" else device.type, (world,)
         )
@@ -1320,7 +1325,7 @@ def main(*args: Any) -> Optional[Root]:
                     torch.distributed.all_reduce(
                         t, op=torch.distributed.ReduceOp.SUM
                     )
-                world = max(1, get_world_size(device))
+                world = max(1, Distributed.get_world_size(device))
                 comp_time /= world
                 io_time /= world
                 flops /= world
