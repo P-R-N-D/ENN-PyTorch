@@ -889,20 +889,22 @@ class Root(nn.Module):
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
         tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
-        grad_context = (
-            inference(self.global_net) if infer_mode else torch.enable_grad()
-        )
-        with grad_context:
-            with AutoCast.float(device):
-                refined_tokens = self.global_net(tokens_centered)
-        decode_context = (
-            inference(self.local_net) if infer_mode else torch.enable_grad()
-        )
-        with decode_context:
-            decode_tokens = refined_tokens.clone() if infer_mode else refined_tokens
-            residual_context = self.local_net.decode(
-                decode_tokens, apply_norm=True
-            )
+        if infer_mode:
+            with torch.inference_mode():
+                with AutoCast.float(device):
+                    refined_tokens = self.global_net(tokens_centered)
+                decode_tokens = refined_tokens.detach().clone()
+                with AutoCast.float(device):
+                    residual_context = self.local_net.decode(
+                        decode_tokens, apply_norm=True
+                    )
+        else:
+            with torch.enable_grad():
+                with AutoCast.float(device):
+                    refined_tokens = self.global_net(tokens_centered)
+                    residual_context = self.local_net.decode(
+                        refined_tokens, apply_norm=True
+                    )
         residual = residual_context.view(b, -1)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
