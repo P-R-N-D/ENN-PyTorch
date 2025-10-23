@@ -7,7 +7,7 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..utils.platform import Distributed
+from ..utils.platform import Network
 from ..utils.compat import patch_arrow
 
 
@@ -251,15 +251,15 @@ class Endpoint:
         wait_ready_s: float = 10.0,
         **kwargs: Any,
     ) -> Tuple[Endpoint.Server, str]:
-        locator = Distributed.Network()
-        host_text = Distributed.Network.coerce_host(host)
+        locator = Network()
+        host_text = Network.coerce_host(host)
         port = int(port)
 
         probe_required = host_text in ("", "0.0.0.0", "::", "[::]")
         ipv4_ok = False
         ipv6_ok = False
         if probe_required:
-            ipv4_ok, ipv6_ok = Distributed.probe_stack_support(allow_loopback=True)
+            ipv4_ok, ipv6_ok = Network.probe_stack_support(allow_loopback=True)
 
         candidates: list[str | None] = []
         seen: set[str | None] = set()
@@ -329,7 +329,7 @@ class Endpoint:
 
         advertise_host = resolved_host
         if advertise_host in ("", "0.0.0.0", "::"):
-            advertise_host = Distributed.get_preferred_ip(allow_loopback=True)
+            advertise_host = Network.get_preferred_ip(allow_loopback=True)
             if not advertise_host:
                 advertise_host = "127.0.0.1"
 
@@ -365,7 +365,7 @@ class Endpoint:
             )
         except Exception:
             advertise_location = None
-        formatter = Distributed.Network(
+        formatter = Network(
             fallback=advertise_host,
             default=advertise_host,
             allow_loopback=True,
