@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -17,12 +17,28 @@ def compute_y_range(
     q_high: float = 0.995,
     *,
     max_batches: int | None = None,
-    labels_key: str = "labels",
+    labels_key: str = "Y",
 ) -> tuple[float, float]:
     ys: list[np.ndarray] = []
     for i, batch in enumerate(loader):
-        if isinstance(batch, dict):
-            y = batch.get(labels_key)
+        if isinstance(batch, Mapping):
+            y = None
+            if labels_key in batch:
+                y = batch[labels_key]
+            else:
+                lower_map = {k.lower(): k for k in batch}
+                key_lower = labels_key.lower()
+                if key_lower in lower_map:
+                    y = batch[lower_map[key_lower]]
+                else:
+                    for candidate in ("Y", "labels", "label", "targets", "target"):
+                        if candidate in batch:
+                            y = batch[candidate]
+                            break
+                        lower_candidate = candidate.lower()
+                        if lower_candidate in lower_map:
+                            y = batch[lower_map[lower_candidate]]
+                            break
         elif isinstance(batch, Sequence) and len(batch) > 0:
             y = batch[-1]
         else:
