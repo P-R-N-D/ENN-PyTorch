@@ -879,6 +879,7 @@ class Root(nn.Module):
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         device = self._device
+        amp_enabled = device.type != "cpu"
         base_dtype = next(self.local_net.parameters()).dtype
         infer_mode = labels_flat is None or (
             net_loss is None and global_loss is None and (local_loss is None)
@@ -903,10 +904,32 @@ class Root(nn.Module):
                 x_slice = features[s:e].to(
                     device, dtype=base_dtype, non_blocking=True
                 )
-                with AutoCast.float(device):
+                with AutoCast.float(device, enabled=amp_enabled):
                     out: Payload = self.local_net(x_slice)
-                token_chunks.append(out.tokens)
-                context_chunks.append(out.context)
+                if (not torch.isfinite(out.tokens).all()) or (
+                    not torch.isfinite(out.context).all()
+                ):
+                    x_f32 = x_slice.to(dtype=torch.float32)
+                    with AutoCast.float(device, enabled=False):
+                        out = self.local_net(x_f32)
+                if (not torch.isfinite(out.tokens).all()) or (
+                    not torch.isfinite(out.context).all()
+                ):
+                    raise RuntimeError(
+                        "[local_net.forward] produced non-finite tokens/context in training"
+                    )
+                out_tokens = (
+                    out.tokens
+                    if out.tokens.dtype == base_dtype
+                    else out.tokens.to(base_dtype)
+                )
+                out_context = (
+                    out.context
+                    if out.context.dtype == base_dtype
+                    else out.context.to(base_dtype)
+                )
+                token_chunks.append(out_tokens)
+                context_chunks.append(out_context)
         else:
             self.local_net.eval()
             self.global_net.eval()
@@ -918,54 +941,112 @@ class Root(nn.Module):
                 )
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(inference(self.local_net))
-                    stack.enter_context(AutoCast.float(device))
+                    stack.enter_context(
+                        AutoCast.float(device, enabled=amp_enabled)
+                    )
                     out = self.local_net(x_slice)
+                if (not torch.isfinite(out.tokens).all()) or (
+                    not torch.isfinite(out.context).all()
+                ):
+                    x_f32 = x_slice.to(dtype=torch.float32)
+                    with inference(self.local_net):
+                        with AutoCast.float(device, enabled=False):
+                            out = self.local_net(x_f32)
+                if not torch.isfinite(out.tokens).all() or not torch.isfinite(out.context).all():
+                    out_tokens = torch.nan_to_num(out.tokens)
+                    out_context = torch.nan_to_num(out.context)
+                else:
+                    out_tokens = out.tokens
+                    out_context = out.context
                 token_chunks.append(
-                    out.tokens
-                    if out.tokens.dtype == base_dtype
-                    else out.tokens.to(base_dtype)
+                    out_tokens
+                    if out_tokens.dtype == base_dtype
+                    else out_tokens.to(base_dtype)
                 )
                 context_chunks.append(
-                    out.context
-                    if out.context.dtype == base_dtype
-                    else out.context.to(base_dtype)
+                    out_context
+                    if out_context.dtype == base_dtype
+                    else out_context.to(base_dtype)
                 )
-        tokens = torch.cat(token_chunks, dim=0).to(
-            device=device, dtype=base_dtype
-        )
-        context = torch.cat(context_chunks, dim=0).to(
-            device=device, dtype=base_dtype
-        )
+        tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
+        context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
+        if (not torch.isfinite(tokens).all()) or (not torch.isfinite(context).all()):
+            if self.training:
+                raise RuntimeError(
+                    "[concat] non-finite tokens/context after local_net forward"
+                )
+            tokens = torch.nan_to_num(tokens)
+            context = torch.nan_to_num(context)
         assembled = context.view(b, -1)
+        if not torch.isfinite(assembled).all():
+            if self.training:
+                raise RuntimeError("[assembled] non-finite in training")
+            assembled = torch.nan_to_num(assembled)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
-        tokens_centered = tokens - tokens.mean(dim=1, keepdim=True)
+        t = tokens
+        if not torch.isfinite(t).all():
+            if self.training:
+                raise RuntimeError("[tokens] non-finite before centering in training")
+            t = torch.nan_to_num(t)
+        tokens = t
+        t32 = t.to(torch.float32)
+        tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=t.dtype)
         if infer_mode:
             with inference(self.global_net):
-                with AutoCast.float(device):
+                with AutoCast.float(device, enabled=amp_enabled):
                     refined_tokens = self.global_net(tokens_centered)
+            if not torch.isfinite(refined_tokens).all():
+                tokens_centered = tokens_centered.to(dtype=torch.float32)
+                with inference(self.global_net):
+                    with AutoCast.float(device, enabled=False):
+                        refined_tokens = self.global_net(tokens_centered)
             decode_tokens = refined_tokens.detach().clone()
             with inference(self.local_net):
-                with AutoCast.float(device):
+                with AutoCast.float(device, enabled=amp_enabled):
                     residual_context = self.local_net.decode(
                         decode_tokens, apply_norm=True
                     )
+            if not torch.isfinite(residual_context).all():
+                decode_tokens = decode_tokens.to(dtype=torch.float32)
+                with inference(self.local_net):
+                    with AutoCast.float(device, enabled=False):
+                        residual_context = self.local_net.decode(
+                            decode_tokens, apply_norm=True
+                        )
         else:
             # Train path: autograd ON
             with torch.enable_grad():
-                with AutoCast.float(device):
+                with AutoCast.float(device, enabled=amp_enabled):
                     refined_tokens = self.global_net(tokens_centered)
-                with torch.enable_grad():
-                    with AutoCast.float(device):
+                if not torch.isfinite(refined_tokens).all():
+                    tokens_centered = tokens_centered.to(dtype=torch.float32)
+                    with AutoCast.float(device, enabled=False):
+                        refined_tokens = self.global_net(tokens_centered)
+                with AutoCast.float(device, enabled=amp_enabled):
+                    residual_context = self.local_net.decode(
+                        refined_tokens, apply_norm=True
+                    )
+                if not torch.isfinite(residual_context).all():
+                    refined_tokens = refined_tokens.to(dtype=torch.float32)
+                    with AutoCast.float(device, enabled=False):
                         residual_context = self.local_net.decode(
                             refined_tokens, apply_norm=True
                         )
         residual = residual_context.view(b, -1)
+        if not torch.isfinite(residual).all():
+            if self.training:
+                raise RuntimeError("[residual] non-finite in training")
+            residual = torch.nan_to_num(residual)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
             y_hat_z = assembled + residual
+        if not torch.isfinite(y_hat_z).all():
+            if self.training:
+                raise RuntimeError("[y_hat_z] non-finite in training")
+            y_hat_z = torch.nan_to_num(y_hat_z)
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
