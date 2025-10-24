@@ -59,6 +59,12 @@ class ModelConfig:
     enable_compilation: bool = False
     compile_mode: str = "default"
     loss_space: str = "z"
+    y_low: float = 0.0
+    y_high: float = 100.0
+    y_eps_range: float = 1e-3
+    auto_y_range: bool = True
+    y_range_q_low: float = 0.005
+    y_range_q_high: float = 0.995
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> PatchConfig:
@@ -227,6 +233,45 @@ def coerce_model_config(
     args["loss_space"] = str(
         filtered.get("loss_space", getattr(defaults, "loss_space"))
     ).lower()
+    args["y_low"] = ensure_float(
+        filtered.get("y_low", getattr(defaults, "y_low")),
+        name="y_low",
+    )
+    args["y_high"] = ensure_float(
+        filtered.get("y_high", getattr(defaults, "y_high")),
+        name="y_high",
+    )
+    if not args["y_high"] > args["y_low"]:
+        raise ValueError(
+            f"y_high must be greater than y_low (got {args['y_low']}, {args['y_high']})"
+        )
+    args["y_eps_range"] = ensure_float(
+        filtered.get("y_eps_range", getattr(defaults, "y_eps_range")),
+        name="y_eps_range",
+        minimum=0.0,
+    )
+    if args["y_eps_range"] <= 0.0:
+        raise ValueError("y_eps_range must be positive")
+    args["auto_y_range"] = ensure_bool(
+        filtered.get("auto_y_range", getattr(defaults, "auto_y_range")),
+        name="auto_y_range",
+    )
+    args["y_range_q_low"] = ensure_float(
+        filtered.get("y_range_q_low", getattr(defaults, "y_range_q_low")),
+        name="y_range_q_low",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["y_range_q_high"] = ensure_float(
+        filtered.get("y_range_q_high", getattr(defaults, "y_range_q_high")),
+        name="y_range_q_high",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if not args["y_range_q_high"] > args["y_range_q_low"]:
+        raise ValueError(
+            "y_range_q_high must be greater than y_range_q_low"
+        )
 
     return ModelConfig(**args)
 

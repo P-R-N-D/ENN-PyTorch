@@ -539,6 +539,9 @@ class Root(nn.Module):
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(prod(self.out_shape))
         self._loss_space = str(getattr(config, "loss_space", "z")).lower()
+        self._y_low = float(getattr(config, "y_low", 0.0))
+        self._y_high = float(getattr(config, "y_high", 100.0))
+        self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -553,6 +556,24 @@ class Root(nn.Module):
             else:
                 device_name = "cpu"
             self._device = torch.device(device_name)
+        self.register_buffer(
+            "y_low_buf",
+            torch.tensor(self._y_low, device=self._device, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "y_high_buf",
+            torch.tensor(self._y_high, device=self._device, dtype=torch.float32),
+            persistent=True,
+        )
+        self.register_buffer(
+            "y_eps_range_buf",
+            torch.tensor(
+                self._y_eps_range, device=self._device, dtype=torch.float32
+            ),
+            persistent=True,
+        )
+        self.set_y_range(self._y_low, self._y_high, self._y_eps_range)
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
@@ -808,6 +829,37 @@ class Root(nn.Module):
         except Exception:
             return False
 
+    def set_y_range(self, y_low: float, y_high: float, eps: float | None = None) -> None:
+        if not (float(y_high) > float(y_low)):
+            raise ValueError(f"y_high({y_high}) must be > y_low({y_low})")
+        if eps is not None and float(eps) <= 0.0:
+            raise ValueError("eps must be positive when provided")
+        self.y_low_buf.copy_(
+            torch.tensor(float(y_low), dtype=self.y_low_buf.dtype, device=self.y_low_buf.device)
+        )
+        self.y_high_buf.copy_(
+            torch.tensor(float(y_high), dtype=self.y_high_buf.dtype, device=self.y_high_buf.device)
+        )
+        if eps is not None:
+            self.y_eps_range_buf.copy_(
+                torch.tensor(float(eps), dtype=self.y_eps_range_buf.dtype, device=self.y_eps_range_buf.device)
+            )
+
+    def _to_logit_range(self, y: torch.Tensor) -> torch.Tensor:
+        A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
+        B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
+        eps = float(self.y_eps_range_buf.item())
+        y01 = (y - A + eps) / (B - A + 2.0 * eps)
+        y01 = torch.clamp(y01, min=eps, max=1.0 - eps)
+        return torch.log(y01 / (1.0 - y01))
+
+    def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
+        A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
+        B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
+        eps = float(self.y_eps_range_buf.item())
+        y01 = torch.sigmoid(z)
+        return y01 * (B - A + 2.0 * eps) + (A - eps)
+
     def forward(
         self,
         features: torch.Tensor,
@@ -920,7 +972,9 @@ class Root(nn.Module):
             else False
         )
         y_hat_out = y_hat_z
-        if self.has_valid_y_stats() and (not is_cls_loss):
+        if self._loss_space == "logit" and (not is_cls_loss):
+            y_hat_out = self._from_logit_range(y_hat_z)
+        elif self.has_valid_y_stats() and (not is_cls_loss):
             mu = self.y_mean.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
             sd = self.y_std.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
             eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
@@ -942,10 +996,22 @@ class Root(nn.Module):
             else:
                 controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
-            total = y_hat_out.new_tensor(0.0, dtype=y_hat_out.dtype)
+            base_tensor = y_hat_z if self._loss_space == "logit" else y_hat_out
+            total = base_tensor.new_tensor(0.0, dtype=base_tensor.dtype)
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            if self._loss_space == "z" and self.has_valid_y_stats():
+            if self._loss_space == "logit":
+                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                tgt = self._to_logit_range(tgt)
+                y_top = y_hat_z
+                y_bot = assembled
+                if global_loss is not None:
+                    top_component = global_loss(y_top, tgt)
+                    total = total + weights[0] * top_component
+                if local_loss is not None:
+                    bottom_component = local_loss(y_bot, tgt)
+                    total = total + weights[1] * bottom_component
+            elif self._loss_space == "z" and self.has_valid_y_stats():
                 mu_lbl = self.y_mean.to(
                     device=y_hat_z.device, dtype=y_hat_z.dtype
                 )
@@ -1004,6 +1070,10 @@ class Root(nn.Module):
             if is_cls_loss:
                 tgt = labels_flat.to(device=y_hat_out.device).long()
                 loss_val = net_loss(y_hat_out, tgt)
+            elif self._loss_space == "logit":
+                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                tgt = self._to_logit_range(tgt)
+                loss_val = net_loss(y_hat_z, tgt)
             elif self._loss_space == "z" and self.has_valid_y_stats():
                 mu_lbl = self.y_mean.to(
                     device=y_hat_z.device, dtype=y_hat_z.dtype
