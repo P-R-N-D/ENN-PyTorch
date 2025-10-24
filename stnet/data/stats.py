@@ -16,49 +16,25 @@ def compute_y_range(
     q_low: float = 0.005,
     q_high: float = 0.995,
     *,
-    max_batches: int | None = None,
     labels_key: str = "Y",
+    max_batches: int | None = None,
 ) -> tuple[float, float]:
-    ys: list[np.ndarray] = []
+    ys = []
     for i, batch in enumerate(loader):
-        if isinstance(batch, Mapping):
-            y = None
-            if labels_key in batch:
-                y = batch[labels_key]
-            else:
-                lower_map = {k.lower(): k for k in batch}
-                key_lower = labels_key.lower()
-                if key_lower in lower_map:
-                    y = batch[lower_map[key_lower]]
-                else:
-                    for candidate in ("Y", "labels", "label", "targets", "target"):
-                        if candidate in batch:
-                            y = batch[candidate]
-                            break
-                        lower_candidate = candidate.lower()
-                        if lower_candidate in lower_map:
-                            y = batch[lower_map[lower_candidate]]
-                            break
-        elif isinstance(batch, Sequence) and len(batch) > 0:
-            y = batch[-1]
-        else:
-            raise TypeError("Unsupported batch structure for compute_y_range")
-        if y is None:
-            raise ValueError(
-                "compute_y_range could not locate labels in the provided batch"
-            )
+        y = batch.get(labels_key) if isinstance(batch, dict) else batch[-1]
         if isinstance(y, torch.Tensor):
-            y_arr = y.detach().cpu().numpy()
-        else:
-            y_arr = np.asarray(y)
-        ys.append(np.ravel(y_arr))
+            y = y.detach().cpu().numpy()
+        ys.append(np.asarray(y).ravel())
         if max_batches is not None and i >= max_batches:
             break
-    if not ys:
-        raise ValueError("compute_y_range received no batches")
-    y_all = np.concatenate(ys, axis=0)
-    lo, hi = np.quantile(y_all, [q_low, q_high])
-    if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+    y_all = np.concatenate(ys, axis=0) if ys else np.array([], dtype=float)
+    if y_all.size == 0:
+        raise ValueError("no labels to compute y-range")
+    finite = y_all[np.isfinite(y_all)]
+    if finite.size == 0:
+        raise ValueError("no finite labels to compute y-range")
+    lo, hi = np.quantile(finite, [q_low, q_high])
+    if not (hi > lo):
         raise ValueError(f"invalid y-range: lo={lo}, hi={hi}")
     return float(lo), float(hi)
 
