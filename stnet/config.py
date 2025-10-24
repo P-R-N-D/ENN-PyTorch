@@ -17,7 +17,7 @@ from typing import (
 
 import torch
 
-from .utils.datatype import (
+from .utils.dtypes import (
     ensure_bool,
     ensure_float,
     ensure_int,

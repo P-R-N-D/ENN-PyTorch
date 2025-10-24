@@ -53,7 +53,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.stats import compute_y_range
-from ..utils.datatype import to_torch
+from ..utils.dtypes import to_torch
 from ..data.dataset import SampleReader
 from ..utils.platform import Distributed, Network, System
 from ..utils.optimization import (
