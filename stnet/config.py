@@ -58,7 +58,7 @@ class ModelConfig:
     use_linear_branch: bool = False
     enable_compilation: bool = False
     compile_mode: str = "default"
-    loss_space: str = "z"
+    loss_space: str = "logit"
     y_low: float = 0.0
     y_high: float = 100.0
     y_eps_range: float = 1e-3
