@@ -851,26 +851,30 @@ class Root(nn.Module):
         A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
         B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
         eps_abs = float(self.y_eps_range_buf.item())
-        span = (B - A).abs().item()
-        eps_rel = float(max(0.0, self._y_eps_rel)) * float(span)
-        eps = float(max(eps_abs, eps_rel))
-        eps = max(eps, 1e-9)
-        eps = min(eps, 0.5 - 1e-9)
-        y01 = (y - A + eps) / (B - A + 2.0 * eps)
-        y01 = torch.clamp(y01, min=eps, max=1.0 - eps)
+        span = float((B - A).abs().item())
+        eps_rel_norm = float(max(0.0, self._y_eps_rel))
+        eps_abs_norm = eps_abs / span if span > 0.0 else float("inf")
+        eps_norm = float(max(eps_rel_norm, eps_abs_norm))
+        eps_norm = max(eps_norm, 1e-9)
+        eps_norm = min(eps_norm, 0.5 - 1e-9)
+        eps_range = eps_norm * span
+        y01 = (y - A + eps_range) / (B - A + 2.0 * eps_range)
+        y01 = torch.clamp(y01, min=eps_norm, max=1.0 - eps_norm)
         return torch.log(y01 / (1.0 - y01))
 
     def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
         B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
         eps_abs = float(self.y_eps_range_buf.item())
-        span = (B - A).abs().item()
-        eps_rel = float(max(0.0, self._y_eps_rel)) * float(span)
-        eps = float(max(eps_abs, eps_rel))
-        eps = max(eps, 1e-9)
-        eps = min(eps, 0.5 - 1e-9)
+        span = float((B - A).abs().item())
+        eps_rel_norm = float(max(0.0, self._y_eps_rel))
+        eps_abs_norm = eps_abs / span if span > 0.0 else float("inf")
+        eps_norm = float(max(eps_rel_norm, eps_abs_norm))
+        eps_norm = max(eps_norm, 1e-9)
+        eps_norm = min(eps_norm, 0.5 - 1e-9)
+        eps_range = eps_norm * span
         y01 = torch.sigmoid(z)
-        return y01 * (B - A + 2.0 * eps) + (A - eps)
+        return y01 * (B - A + 2.0 * eps_range) + (A - eps_range)
 
     def forward(
         self,
