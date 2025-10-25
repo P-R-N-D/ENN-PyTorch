@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import logging
+import math
 import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ from .platform import (
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
     is_float8_supported,
+    is_int4_supported,
     is_int8_supported,
     optimal_optimizer_params,
 )
@@ -42,11 +44,112 @@ patch_torch()
 _LOGGER = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class DataScale:
+    """Summary statistics that describe the magnitude of a dataset."""
+
+    max_abs: float
+    min_abs: Optional[float] = None
+    is_integral: bool = False
+
+    def merge(self, other: Optional["DataScale"]) -> "DataScale":
+        if other is None:
+            return self
+        min_abs: Optional[float]
+        if self.min_abs is None:
+            min_abs = other.min_abs
+        elif other.min_abs is None:
+            min_abs = self.min_abs
+        else:
+            min_abs = min(self.min_abs, other.min_abs)
+        return DataScale(
+            max_abs=max(self.max_abs, other.max_abs),
+            min_abs=min_abs,
+            is_integral=self.is_integral and other.is_integral,
+        )
+
+    @property
+    def min_positive(self) -> Optional[float]:
+        if self.min_abs is None or not math.isfinite(self.min_abs):
+            return None
+        if self.min_abs <= 0.0:
+            return None
+        return self.min_abs
+
+    @classmethod
+    def accumulate(
+        cls,
+        scale: Optional["DataScale"],
+        tensor: Optional[torch.Tensor],
+    ) -> Optional["DataScale"]:
+        if tensor is None:
+            return scale
+        if not isinstance(tensor, torch.Tensor):
+            return scale
+        if tensor.numel() == 0:
+            return scale
+        with torch.no_grad():
+            values = tensor.detach()
+            finite_mask = torch.isfinite(values)
+            has_finite = bool(finite_mask.any().item())
+            if not has_finite:
+                return scale
+            finite_vals = values[finite_mask]
+            abs_vals = finite_vals.abs()
+            max_abs = float(abs_vals.max().item()) if abs_vals.numel() else 0.0
+            pos_vals = abs_vals[abs_vals > 0]
+            min_abs = float(pos_vals.min().item()) if pos_vals.numel() else None
+            if finite_vals.is_floating_point():
+                tol = 1e-6 if finite_vals.dtype in (torch.float32, torch.float64) else 5e-4
+                frac = (finite_vals - torch.round(finite_vals)).abs()
+                is_integral = bool(frac.lt(tol).all().item()) if frac.numel() else True
+            else:
+                is_integral = True
+        current = DataScale(max_abs=max_abs, min_abs=min_abs, is_integral=is_integral)
+        return current if scale is None else current.merge(scale)
+
+
+def _supports_scale(
+    dtype: torch.dtype,
+    scale: Optional[DataScale],
+    *,
+    safety_margin: float = 8.0,
+) -> bool:
+    if scale is None:
+        return True
+    if not isinstance(dtype, torch.dtype):
+        return False
+    max_abs = float(abs(scale.max_abs))
+    if not math.isfinite(max_abs):
+        return False
+    if getattr(dtype, "is_complex", False):
+        base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        return _supports_scale(base_dtype, scale, safety_margin=safety_margin)
+    if getattr(dtype, "is_floating_point", False):
+        info = torch.finfo(dtype)
+        if max_abs > float(info.max) / safety_margin:
+            return False
+        min_pos = scale.min_positive
+        if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
+            return False
+        return True
+    if dtype == torch.bool:
+        return scale.is_integral and max_abs <= 1.0
+    try:
+        info = torch.iinfo(dtype)
+    except TypeError:
+        return False
+    if not scale.is_integral:
+        return False
+    return max_abs <= float(info.max)
+
+
 class AutoCast:
     _fp8_backend: Optional[str] = None
     _int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
+    _scale_hint: Optional[DataScale] = None
 
     @classmethod
     def _resolve_fp8_backend(
@@ -218,30 +321,45 @@ class AutoCast:
         candidates.extend((torch.int16, torch.int32, torch.int64))
         return cls._distinct_dtypes(candidates or (torch.int64,))
 
-    @staticmethod
+    @classmethod
     def _select_dtype(
-        requested: Optional[torch.dtype],
+        cls,
         candidates: Tuple[torch.dtype, ...],
         *,
         fallback: torch.dtype,
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
+        scale: Optional[DataScale] = None,
     ) -> torch.dtype:
-        if requested is None:
-            return candidates[0] if candidates else fallback
-        if requested in candidates:
-            return requested
+        scale_hint = scale if scale is not None else cls._scale_hint
+        for dtype in candidates:
+            if _supports_scale(dtype, scale_hint):
+                return dtype
+        device_str = f" on {device.type}" if device is not None else ""
+        fallback_order: Tuple[torch.dtype, ...]
+        if getattr(fallback, "is_floating_point", False):
+            fallback_order = (fallback, torch.float32, torch.float64)
+        else:
+            fallback_order = (fallback, torch.int64, torch.float32, torch.float64)
+        for dtype in fallback_order:
+            if _supports_scale(dtype, scale_hint):
+                if logger is not None and dtype is not fallback:
+                    logger.debug(
+                        "AutoCast %s fallback%s: promoting to %s due to data scale",
+                        context,
+                        device_str,
+                        str(dtype).split(".")[-1],
+                    )
+                return dtype
         if logger is not None:
-            device_str = f" on {device.type}" if device is not None else ""
             logger.debug(
-                "AutoCast %s fallback%s: requested %s not available; using %s",
+                "AutoCast %s fallback%s: using %s without scale guarantee",
                 context,
                 device_str,
-                str(requested).split(".")[-1],
-                str(candidates[0] if candidates else fallback).split(".")[-1],
+                str(fallback).split(".")[-1],
             )
-        return candidates[0] if candidates else fallback
+        return fallback
 
     @classmethod
     def _te_fp8_context(
@@ -320,7 +438,12 @@ class AutoCast:
         return contexts
 
     @classmethod
-    def configure(cls, model: Optional[nn.Module]) -> None:
+    def configure(
+        cls,
+        model: Optional[nn.Module],
+        *,
+        scale: Optional[DataScale] = None,
+    ) -> None:
         backend: Optional[str] = None
         int_backend: Optional[str] = None
         if isinstance(model, nn.Module):
@@ -354,6 +477,7 @@ class AutoCast:
                 int_backend = "ao"
         cls._fp8_backend = backend
         cls._int_backend = int_backend
+        cls._scale_hint = scale if scale is not None else cls._scale_hint
 
     @classmethod
     @contextlib.contextmanager
@@ -361,31 +485,37 @@ class AutoCast:
         cls,
         device: Optional[Union[torch.device, str]] = None,
         *,
-        dtype: Optional[torch.dtype] = None,
+        scale: Optional[DataScale] = None,
         enabled: Optional[bool] = None,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
-        requested_dtype = cls._coerce_dtype(dtype)
         amp_candidates = cls._float_amp_candidates(dev)
         amp_dtype = cls._select_dtype(
-            requested_dtype,
             amp_candidates,
             fallback=torch.float32,
             logger=_LOGGER,
             context="float",
             device=dev,
+            scale=scale,
         )
         enabled = True if enabled is None else bool(enabled)
         contexts: List[contextlib.AbstractContextManager[None]] = []
 
         backend = cls._resolve_fp8_backend(cls._fp8_backend, device=dev)
         float8_dtypes = cls._float8_dtypes()
-        wants_fp8 = False
-        if backend is not None and enabled:
-            if requested_dtype is None:
-                wants_fp8 = True
-            else:
-                wants_fp8 = requested_dtype in float8_dtypes
+        wants_fp8 = backend is not None and enabled
+        scale_hint = scale if scale is not None else cls._scale_hint
+        if wants_fp8 and scale_hint is not None:
+            fp8_supported = any(
+                _supports_scale(dtype, scale_hint, safety_margin=2.0)
+                for dtype in float8_dtypes
+            )
+            if not fp8_supported:
+                wants_fp8 = False
+                _LOGGER.debug(
+                    "AutoCast FP8 disabled on %s: data scale exceeds float8 range",
+                    dev.type,
+                )
         if wants_fp8:
             if backend == "te":
                 contexts.extend(cls._te_fp8_context(dev, enabled))
@@ -428,19 +558,18 @@ class AutoCast:
         cls,
         device: Optional[Union[torch.device, str]] = None,
         *,
-        dtype: Optional[torch.dtype] = None,
+        scale: Optional[DataScale] = None,
         enabled: Optional[bool] = None,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
-        requested_dtype = cls._coerce_dtype(dtype)
         int_candidates = cls._integer_candidates(dev)
         int_dtype = cls._select_dtype(
-            requested_dtype,
             int_candidates,
             fallback=torch.int64,
             logger=_LOGGER,
             context="int",
             device=dev,
+            scale=scale,
         )
         use_enabled = True if enabled is None else bool(enabled)
         backend = cls._resolve_int_backend(cls._int_backend, device=dev)
@@ -1098,6 +1227,7 @@ class AdamW:
         use_fp8: bool = True,
         use_foreach: Optional[bool] = False,
         use_fused: bool = False,
+        scale: Optional[DataScale] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -1121,6 +1251,17 @@ class AdamW:
                 if logger:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
         if use_fp8 and (hasattr(dev, "type") and dev.type == "cuda"):
+            if scale is not None:
+                float8_dtypes = AutoCast._float8_dtypes()
+                if not any(
+                    _supports_scale(dtype, scale, safety_margin=2.0)
+                    for dtype in float8_dtypes
+                ):
+                    use_fp8 = False
+                    if logger:
+                        logger(
+                            "[OPT] FP8 optimizers disabled: data scale exceeds float8 range"
+                        )
             ok, reason = is_float8_supported(dev)
             if "TE" in str(reason):
                 try:
@@ -1166,10 +1307,10 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        dtype: Optional[str] = None,
         device: Optional[torch.device] = None,
         use_foreach: Optional[bool] = False,
         use_fused: bool = False,
+        scale: Optional[DataScale] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -1192,7 +1333,37 @@ class AdamW:
             except Exception as exc:
                 if logger:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
-        if dtype in {"int8", "int4"}:
+        quant_choice: Optional[str] = None
+        quant_reason: Optional[str] = None
+        if scale is not None:
+            if not scale.is_integral:
+                if logger:
+                    logger("[OPT] Low-bit optimizers disabled: data is not integral")
+            else:
+                max_abs = float(abs(scale.max_abs))
+                candidates: List[Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]] = []
+                if max_abs <= 7.0:
+                    candidates.append(("int4", is_int4_supported))
+                if max_abs <= 127.0:
+                    candidates.append(("int8", is_int8_supported))
+                if not candidates:
+                    if logger:
+                        logger(
+                            "[OPT] Low-bit optimizers disabled: magnitude %.3f exceeds int8 range",
+                            max_abs,
+                        )
+                else:
+                    for name, checker in candidates:
+                        ok, reason = checker(dev)
+                        if ok:
+                            quant_choice = name
+                            quant_reason = reason
+                            break
+                        if logger:
+                            logger(
+                                f"[OPT] {name.upper()} optimizers not supported ({reason}) — fallback"
+                            )
+        if quant_choice in {"int8", "int4"}:
             try:
                 try:
                     from torchao.optim import AdamW4bit, AdamW8bit
@@ -1201,27 +1372,17 @@ class AdamW:
                         AdamW4bit,
                         AdamW8bit,
                     )
-                if dtype == "int8":
-                    ok_int8, reason_int8 = is_int8_supported(dev)
-                    if ok_int8:
-                        opt = AdamW8bit(
-                            params, lr=lr, weight_decay=weight_decay
-                        )
-                        if logger:
-                            note = f" — {reason_int8}" if reason_int8 else ""
-                            logger(f"[OPT] TorchAO AdamW8bit{note}")
-                        return opt
+                if quant_choice == "int8":
+                    opt = AdamW8bit(params, lr=lr, weight_decay=weight_decay)
                     if logger:
-                        logger(
-                            f"[OPT] INT8 optimizers not supported ({reason_int8}) — fallback"
-                        )
-                else:
-                    opt = AdamW4bit(
-                        params, lr=lr, weight_decay=weight_decay
-                    )
-                    if logger:
-                        logger("[OPT] TorchAO AdamW4bit")
+                        note = f" — {quant_reason}" if quant_reason else ""
+                        logger(f"[OPT] TorchAO AdamW8bit{note}")
                     return opt
+                opt = AdamW4bit(params, lr=lr, weight_decay=weight_decay)
+                if logger:
+                    note = f" — {quant_reason}" if quant_reason else ""
+                    logger(f"[OPT] TorchAO AdamW4bit{note}")
+                return opt
             except Exception as exc:
                 if logger:
                     logger(f"[OPT] TorchAO low-bit optimizer unavailable: {exc}")
@@ -1237,21 +1398,33 @@ class AdamW:
 class Module:
     @staticmethod
     def _infer_optimal_dtype(
-        device: Optional[Union[torch.device, str]] = None
+        device: Optional[Union[torch.device, str]] = None,
+        *,
+        scale: Optional[DataScale] = None,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
+        candidates: List[torch.dtype] = []
         if dev.type == "cuda":
             try:
                 if is_cuda_bf16_supported(dev):
-                    return torch.bfloat16
+                    candidates.append(torch.bfloat16)
             except Exception:
                 pass
-            return torch.float16
-        if dev.type == "cpu":
-            return torch.bfloat16 if is_cpu_bf16_supported() else torch.float32
-        if dev.type in {"xpu", "mps"}:
-            return torch.bfloat16 if dev.type == "xpu" else torch.float16
-        return torch.float32
+            candidates.extend((torch.float16, torch.float32))
+        elif dev.type == "cpu":
+            if is_cpu_bf16_supported():
+                candidates.append(torch.bfloat16)
+            candidates.extend((torch.float32, torch.float64))
+        elif dev.type == "xpu":
+            candidates.extend((torch.bfloat16, torch.float32))
+        elif dev.type == "mps":
+            candidates.extend((torch.float16, torch.float32))
+        else:
+            candidates.append(torch.float32)
+        for dtype in candidates:
+            if _supports_scale(dtype, scale):
+                return dtype
+        return torch.float64 if _supports_scale(torch.float64, scale) else candidates[-1]
 
     @staticmethod
     def _module_reference_tensor(module: nn.Module) -> Optional[torch.Tensor]:
@@ -1448,6 +1621,8 @@ class Module:
     def use_te_module(
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
+        *,
+        scale: Optional[DataScale] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         dev = torch.device(device) if device is not None else get_device()
@@ -1461,7 +1636,7 @@ class Module:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Module._infer_optimal_dtype(dev)
+        params_dtype = Module._infer_optimal_dtype(dev, scale=scale)
         model, n_fused = Module._fuse_sequential_to_te(
             model, params_dtype=params_dtype
         )
@@ -1611,25 +1786,29 @@ class Module:
         device: Optional[Union[torch.device, str]] = None,
         logger: Optional[Callable[[str], None]] = None,
         prefer: str = "auto",
+        scale: Optional[DataScale] = None,
     ) -> Tuple[nn.Module, bool, str]:
         ok, reason = is_float8_supported(device)
         if not ok:
-            AutoCast.configure(model)
+            AutoCast.configure(model, scale=scale)
             return (model, False, reason)
         _dev_for_dtype = (
             torch.device(device) if device is not None else get_device()
         )
-        _prefer_bf16 = (
-            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            if _dev_for_dtype.type != "cpu"
-            else is_cpu_bf16_supported()
-        )
-        params_dtype = (
-            torch.bfloat16
-            if _prefer_bf16
-            else torch.float16
-            if _dev_for_dtype.type == "cuda"
-            else torch.float32
+        if scale is not None:
+            float8_dtypes = AutoCast._float8_dtypes()
+            if not any(
+                _supports_scale(dtype, scale, safety_margin=2.0)
+                for dtype in float8_dtypes
+            ):
+                if logger:
+                    logger(
+                        "[FP8] training disabled: data scale exceeds float8 range"
+                    )
+                AutoCast.configure(model, scale=scale)
+                return (model, False, "data scale")
+        params_dtype = Module._infer_optimal_dtype(
+            _dev_for_dtype, scale=scale
         )
 
         order = (
@@ -1647,11 +1826,11 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
-                AutoCast.configure(m2)
+                AutoCast.configure(m2, scale=scale)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {backend} path skipped: {why}")
-        AutoCast.configure(model)
+        AutoCast.configure(model, scale=scale)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
@@ -1662,25 +1841,29 @@ class Module:
         dynamic_activations: bool = False,
         prefer: str = "auto",
         te_swap: bool = True,
+        scale: Optional[DataScale] = None,
     ) -> Tuple[nn.Module, bool, str]:
         ok, reason = is_float8_supported(device)
         if not ok:
-            AutoCast.configure(model)
+            AutoCast.configure(model, scale=scale)
             return (model, False, reason)
         _dev_for_dtype = (
             torch.device(device) if device is not None else get_device()
         )
-        _prefer_bf16 = (
-            torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-            if _dev_for_dtype.type != "cpu"
-            else is_cpu_bf16_supported()
-        )
-        params_dtype = (
-            torch.bfloat16
-            if _prefer_bf16
-            else torch.float16
-            if _dev_for_dtype.type == "cuda"
-            else torch.float32
+        if scale is not None:
+            float8_dtypes = AutoCast._float8_dtypes()
+            if not any(
+                _supports_scale(dtype, scale, safety_margin=2.0)
+                for dtype in float8_dtypes
+            ):
+                if logger:
+                    logger(
+                        "[FP8] inference disabled: data scale exceeds float8 range"
+                    )
+                AutoCast.configure(model, scale=scale)
+                return (model, False, "data scale")
+        params_dtype = Module._infer_optimal_dtype(
+            _dev_for_dtype, scale=scale
         )
 
         order = (
@@ -1704,11 +1887,11 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] inference enabled via {why} ({reason})")
-                AutoCast.configure(m2)
+                AutoCast.configure(m2, scale=scale)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {step} skipped: {why}")
-        AutoCast.configure(model)
+        AutoCast.configure(model, scale=scale)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
