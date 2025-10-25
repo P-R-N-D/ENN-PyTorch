@@ -53,7 +53,7 @@ def _convert_mapping_to_batch(
         labels_tensor = labels_tensor.to(dtype=labels_dtype)
     if sanitize and torch.is_floating_point(labels_tensor):
         labels_tensor = torch.nan_to_num(
-            labels_tensor, nan=0.0, posinf=1000000.0, neginf=-1000000.0
+            labels_tensor, nan=0.0, posinf=0.0, neginf=0.0
         )
     return {"X": features, "Y": labels_tensor}
 
