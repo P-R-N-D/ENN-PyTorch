@@ -930,7 +930,7 @@ def epoch(
                         if should_sync:
                             scaler.unscale_(optimizer)
                             torch.nn.utils.clip_grad_norm_(
-                                model.parameters(), max_norm=1.0
+                                model.parameters(), max_norm=1.0, foreach=False
                             )
                             scaler.step(optimizer)
                             scaler.update()
