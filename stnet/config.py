@@ -61,10 +61,25 @@ class ModelConfig:
     loss_space: str = "logit"
     y_low: float = 0.0
     y_high: float = 100.0
+    # 경계 여유: 절대/상대 병행(둘 중 큰 값 적용)
     y_eps_range: float = 1e-3
+    y_eps_rel: float = 0.01
     auto_y_range: bool = True
-    y_range_q_low: float = 0.005
-    y_range_q_high: float = 0.995
+    # 경계 타깃 줄이기: 분위수 폭 확대(저속 과소/고속 과대 억제)
+    y_range_q_low: float = 0.001
+    y_range_q_high: float = 0.999
+    # A/B 여유 확장(비율)
+    y_range_margin_low: float = 0.05
+    y_range_margin_high: float = 0.02
+    # 로짓 z 규제(과도 포화 억제)
+    z_reg_lambda: float = 0.0
+    # 손실 함수 통계 설정
+    loss_std_mode: str = "pooled"
+    # 보조(비대칭) 손실: Quantile(τ>0.5면 과소예측 가중↑)
+    aux_q_enable: bool = True
+    aux_q_tau: float = 0.7
+    aux_q_weight: float = 0.05
+
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> PatchConfig:
@@ -252,6 +267,11 @@ def coerce_model_config(
     )
     if args["y_eps_range"] <= 0.0:
         raise ValueError("y_eps_range must be positive")
+    args["y_eps_rel"] = ensure_float(
+        filtered.get("y_eps_rel", getattr(defaults, "y_eps_rel")),
+        name="y_eps_rel",
+        minimum=0.0,
+    )
     args["auto_y_range"] = ensure_bool(
         filtered.get("auto_y_range", getattr(defaults, "auto_y_range")),
         name="auto_y_range",
@@ -272,6 +292,41 @@ def coerce_model_config(
         raise ValueError(
             "y_range_q_high must be greater than y_range_q_low"
         )
+    args["y_range_margin_low"] = ensure_float(
+        filtered.get("y_range_margin_low", getattr(defaults, "y_range_margin_low")),
+        name="y_range_margin_low",
+        minimum=0.0,
+    )
+    args["y_range_margin_high"] = ensure_float(
+        filtered.get("y_range_margin_high", getattr(defaults, "y_range_margin_high")),
+        name="y_range_margin_high",
+        minimum=0.0,
+    )
+    args["z_reg_lambda"] = ensure_float(
+        filtered.get("z_reg_lambda", getattr(defaults, "z_reg_lambda")),
+        name="z_reg_lambda",
+        minimum=0.0,
+    )
+    args["loss_std_mode"] = str(
+        filtered.get("loss_std_mode", getattr(defaults, "loss_std_mode"))
+    ).lower()
+    if args["loss_std_mode"] not in {"pooled", "target"}:
+        raise ValueError("loss_std_mode must be 'pooled' or 'target'")
+    args["aux_q_enable"] = ensure_bool(
+        filtered.get("aux_q_enable", getattr(defaults, "aux_q_enable")),
+        name="aux_q_enable",
+    )
+    args["aux_q_tau"] = ensure_float(
+        filtered.get("aux_q_tau", getattr(defaults, "aux_q_tau")),
+        name="aux_q_tau",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["aux_q_weight"] = ensure_float(
+        filtered.get("aux_q_weight", getattr(defaults, "aux_q_weight")),
+        name="aux_q_weight",
+        minimum=0.0,
+    )
 
     return ModelConfig(**args)
 

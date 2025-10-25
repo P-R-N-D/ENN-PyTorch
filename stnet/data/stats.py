@@ -34,7 +34,8 @@ def compute_y_range(
     if finite.size == 0:
         raise ValueError("no finite labels to compute y-range")
     lo, hi = np.quantile(finite, [q_low, q_high])
-    if not (hi > lo):
+    span = float(hi - lo)
+    if span <= 0:
         raise ValueError(f"invalid y-range: lo={lo}, hi={hi}")
     return float(lo), float(hi)
 
