@@ -84,10 +84,22 @@ class ModelConfig:
     loss_z_penalty: str = "softplus"
     loss_z_tau: float = 1.5
     # 보조(비대칭) 손실: Quantile(τ>0.5면 과소예측 가중↑)
-    aux_q_enable: bool = True
-    aux_q_tau_lowspd: float = 0.7
-    aux_q_tau_highspd: float = 0.45
-    aux_q_weight: float = 0.05
+    aux_q_enable: bool = True  # 보조(Quantile) 손실 ON/OFF
+    aux_q_tau_lowspd: float = 0.7  # 하부 구간 τ (ŷ<y 벌점↑)
+    aux_q_tau_highspd: float = 0.45  # 상부 구간 τ (ŷ>y 벌점↑)
+    aux_q_weight: float = 0.05  # 보조 손실 가중치
+    aux_region_lo_pct: float = 0.2  # 하부 구간 퍼센타일(0~1)
+    aux_region_hi_pct: float = 0.8  # 상부 구간 퍼센타일(0~1)
+    aux_tau_lo_region: float = 0.7  # 하부 구간 τ (ŷ<y 벌점↑)
+    aux_tau_hi_region: float = 0.45  # 상부 구간 τ (ŷ>y 벌점↑)
+    aux_weight_lo_region: float = 1.1  # 하부 구간 샘플 가중
+    aux_weight_hi_region: float = 1.05  # 상부 구간 샘플 가중
+    # 퍼센타일 경계 스무딩(EMA/윈도우)
+    aux_quantile_smooth: str = "ema"  # {"ema","window","none"}
+    aux_quantile_ema_beta: float = 0.9  # EMA 베타(높을수록 느리게 변함)
+    aux_quantile_win_size: int = 64  # 윈도우 최대 길이
+    aux_quantile_warmup_steps: int = 16  # 초기 워밍업(생쿼타일 사용) 스텝 수
+    aux_quantile_sync: str = "mean"  # {"mean","first","min","max"} DDP 동기화 방식
     # 속도 가중(저/고속 불균형 보정)
     loss_low_thr: float = 30.0
     loss_high_thr: float = 90.0
@@ -394,6 +406,79 @@ def coerce_model_config(
         name="aux_q_weight",
         minimum=0.0,
     )
+    args["aux_region_lo_pct"] = ensure_float(
+        filtered.get("aux_region_lo_pct", getattr(defaults, "aux_region_lo_pct")),
+        name="aux_region_lo_pct",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["aux_region_hi_pct"] = ensure_float(
+        filtered.get("aux_region_hi_pct", getattr(defaults, "aux_region_hi_pct")),
+        name="aux_region_hi_pct",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if not args["aux_region_hi_pct"] > args["aux_region_lo_pct"]:
+        raise ValueError("aux_region_hi_pct must be greater than aux_region_lo_pct")
+    args["aux_tau_lo_region"] = ensure_float(
+        filtered.get("aux_tau_lo_region", getattr(defaults, "aux_tau_lo_region")),
+        name="aux_tau_lo_region",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["aux_tau_hi_region"] = ensure_float(
+        filtered.get("aux_tau_hi_region", getattr(defaults, "aux_tau_hi_region")),
+        name="aux_tau_hi_region",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["aux_weight_lo_region"] = ensure_float(
+        filtered.get(
+            "aux_weight_lo_region", getattr(defaults, "aux_weight_lo_region")
+        ),
+        name="aux_weight_lo_region",
+        minimum=0.0,
+    )
+    args["aux_weight_hi_region"] = ensure_float(
+        filtered.get(
+            "aux_weight_hi_region", getattr(defaults, "aux_weight_hi_region")
+        ),
+        name="aux_weight_hi_region",
+        minimum=0.0,
+    )
+    args["aux_quantile_smooth"] = str(
+        filtered.get("aux_quantile_smooth", getattr(defaults, "aux_quantile_smooth"))
+    ).lower()
+    if args["aux_quantile_smooth"] not in {"ema", "window", "none"}:
+        raise ValueError("aux_quantile_smooth must be 'ema', 'window', or 'none'")
+    args["aux_quantile_ema_beta"] = ensure_float(
+        filtered.get(
+            "aux_quantile_ema_beta", getattr(defaults, "aux_quantile_ema_beta")
+        ),
+        name="aux_quantile_ema_beta",
+        minimum=0.0,
+        maximum=0.9999,
+    )
+    args["aux_quantile_win_size"] = ensure_int(
+        filtered.get(
+            "aux_quantile_win_size", getattr(defaults, "aux_quantile_win_size")
+        ),
+        name="aux_quantile_win_size",
+        minimum=1,
+    )
+    args["aux_quantile_warmup_steps"] = ensure_int(
+        filtered.get(
+            "aux_quantile_warmup_steps",
+            getattr(defaults, "aux_quantile_warmup_steps"),
+        ),
+        name="aux_quantile_warmup_steps",
+        minimum=0,
+    )
+    args["aux_quantile_sync"] = str(
+        filtered.get("aux_quantile_sync", getattr(defaults, "aux_quantile_sync"))
+    ).lower()
+    if args["aux_quantile_sync"] not in {"mean", "first", "min", "max"}:
+        raise ValueError("aux_quantile_sync must be one of {'mean', 'first', 'min', 'max'}")
     args["loss_low_thr"] = ensure_float(
         filtered.get("loss_low_thr", getattr(defaults, "loss_low_thr")),
         name="loss_low_thr",

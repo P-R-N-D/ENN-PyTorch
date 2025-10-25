@@ -9,6 +9,7 @@ import shutil
 import sys
 import time
 import warnings
+from collections import deque
 from dataclasses import asdict, replace
 from typing import (
     Any,
@@ -20,6 +21,7 @@ from typing import (
     Tuple,
 )
 
+import numpy as np
 import torch
 import torch.distributed
 import torch.multiprocessing as mp
@@ -38,6 +40,17 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+
+try:  # pragma: no cover - optional distributed helpers
+    from torch.distributed import all_reduce as _all_reduce
+    from torch.distributed import get_world_size as _get_world_size
+    from torch.distributed import is_initialized as _dist_is_initialized
+    from torch.distributed import ReduceOp as _ReduceOp
+except Exception:  # pragma: no cover - CPU-only or minimal builds
+    _all_reduce = None
+    _get_world_size = lambda: 1  # type: ignore[assignment]
+    _dist_is_initialized = lambda: False  # type: ignore[assignment]
+    _ReduceOp = None
 
 try:  # pragma: no cover - optional dependency
     from torch.distributed.tensor import DTensor  # type: ignore
@@ -198,6 +211,108 @@ def _resolve_module_device(value: Any, *, _depth: int = 0) -> Optional[torch.dev
         if resolved is not None:
             return resolved
     return None
+
+
+class _QuantileState:
+    __slots__ = (
+        "q_lo",
+        "q_hi",
+        "win_lo",
+        "win_hi",
+        "beta",
+        "mode",
+        "warmup",
+        "count",
+        "sync",
+    )
+
+    def __init__(
+        self,
+        mode: str,
+        beta: float,
+        win_size: int,
+        warmup_steps: int,
+        sync: str,
+    ) -> None:
+        self.q_lo: Optional[torch.Tensor] = None
+        self.q_hi: Optional[torch.Tensor] = None
+        self.win_lo: deque[float] = deque(maxlen=max(1, int(win_size)))
+        self.win_hi: deque[float] = deque(maxlen=max(1, int(win_size)))
+        self.beta = float(beta)
+        self.mode = str(mode)
+        self.warmup = int(max(0, warmup_steps))
+        self.count = 0
+        self.sync = str(sync)
+
+
+def _finite_quantiles(y: torch.Tensor, probs: Sequence[float]) -> List[torch.Tensor]:
+    vals = torch.nan_to_num(y.detach()).to(dtype=torch.float64)
+    finite_mask = torch.isfinite(vals)
+    if not bool(finite_mask.any()):
+        return [
+            torch.tensor(0.0, device=vals.device, dtype=torch.float64) for _ in probs
+        ]
+    qs = torch.as_tensor(list(probs), device=vals.device, dtype=torch.float64)
+    quantiles = torch.quantile(vals[finite_mask], qs)
+    return [q.to(dtype=torch.float64) for q in quantiles.unbind()]
+
+
+def _sync_scalar(value: torch.Tensor, how: str) -> torch.Tensor:
+    if _all_reduce is None or _ReduceOp is None or not _dist_is_initialized():
+        return value.to(dtype=torch.float64)
+    result = value.to(dtype=torch.float64)
+    if how == "mean":
+        _all_reduce(result, op=_ReduceOp.SUM)
+        world = max(1, int(_get_world_size()))
+        result /= world
+    elif how == "min":
+        _all_reduce(result, op=_ReduceOp.MIN)
+    elif how == "max":
+        _all_reduce(result, op=_ReduceOp.MAX)
+    # "first" keeps local value (rank 0 broadcast could be added later)
+    return result
+
+
+def _update_quantiles(
+    state: _QuantileState,
+    target: torch.Tensor,
+    p_lo: float,
+    p_hi: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    q_lo_batch, q_hi_batch = _finite_quantiles(target, [p_lo, p_hi])
+    q_lo_batch = q_lo_batch.to(dtype=torch.float64)
+    q_hi_batch = q_hi_batch.to(dtype=torch.float64)
+    q_lo_batch = _sync_scalar(q_lo_batch, state.sync)
+    q_hi_batch = _sync_scalar(q_hi_batch, state.sync)
+
+    if state.count < state.warmup or state.mode == "none":
+        q_lo = q_lo_batch
+        q_hi = q_hi_batch
+    elif state.mode == "ema":
+        if state.q_lo is None:
+            state.q_lo = q_lo_batch
+        if state.q_hi is None:
+            state.q_hi = q_hi_batch
+        q_lo = state.beta * state.q_lo + (1.0 - state.beta) * q_lo_batch
+        q_hi = state.beta * state.q_hi + (1.0 - state.beta) * q_hi_batch
+    else:  # window
+        state.win_lo.append(float(q_lo_batch.detach().cpu()))
+        state.win_hi.append(float(q_hi_batch.detach().cpu()))
+        q_lo = torch.tensor(
+            np.median(np.asarray(state.win_lo, dtype=np.float64)),
+            device=target.device,
+            dtype=torch.float64,
+        )
+        q_hi = torch.tensor(
+            np.median(np.asarray(state.win_hi, dtype=np.float64)),
+            device=target.device,
+            dtype=torch.float64,
+        )
+
+    state.q_lo = q_lo
+    state.q_hi = q_hi
+    state.count += 1
+    return q_lo, q_hi
 
 
 try:
@@ -670,6 +785,8 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
+    # (선택) 추론 전 퍼센타일 경계 캘리브레이션을 하려면, 별도 샘플 로더로
+    # _QuantileState를 초기화하고 _update_quantiles를 호출하는 훅을 추가할 수 있다.
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
@@ -836,6 +953,15 @@ def epoch(
                 if decay_local
                 else beta0
             )
+            p_lo = float(cfg_dict.get("aux_region_lo_pct", 0.2))
+            p_hi = float(cfg_dict.get("aux_region_hi_pct", 0.8))
+            q_mode = str(cfg_dict.get("aux_quantile_smooth", "ema")).lower()
+            q_beta = float(cfg_dict.get("aux_quantile_ema_beta", 0.9))
+            q_win = int(cfg_dict.get("aux_quantile_win_size", 64))
+            q_warm = int(cfg_dict.get("aux_quantile_warmup_steps", 16))
+            q_sync = str(cfg_dict.get("aux_quantile_sync", "mean")).lower()
+            qstate = _QuantileState(q_mode, q_beta, q_win, q_warm, q_sync)
+            quantile_logged = False
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
                 X = to_torch(feat)
@@ -913,6 +1039,22 @@ def epoch(
                                 local_loss=bottom_loss,
                                 loss_weights=(alpha, beta),
                             )
+                            quantile_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
+
+                            def _ensure_quantiles(
+                                target_tensor: torch.Tensor,
+                            ) -> Tuple[torch.Tensor, torch.Tensor]:
+                                nonlocal quantile_cache
+                                if quantile_cache is None:
+                                    q_lo_raw, q_hi_raw = _update_quantiles(
+                                        qstate, target_tensor, p_lo, p_hi
+                                    )
+                                    quantile_cache = (
+                                        q_lo_raw.to(dtype=target_tensor.dtype),
+                                        q_hi_raw.to(dtype=target_tensor.dtype),
+                                    )
+                                return quantile_cache
+
                             if (
                                 loss_val is not None
                                 and bool(cfg_dict.get("aux_q_enable", True))
@@ -926,24 +1068,29 @@ def epoch(
                                     pred = y_hat.reshape_as(Y_flat)
                                     target = Y_flat.detach()
                                     err = target - pred
-                                    low_thr = float(cfg_dict.get("loss_low_thr", 30.0))
-                                    high_thr = float(cfg_dict.get("loss_high_thr", 90.0))
                                     tau_low = float(
-                                        cfg_dict.get("aux_q_tau_lowspd", 0.7)
+                                        cfg_dict.get(
+                                            "aux_tau_lo_region",
+                                            cfg_dict.get("aux_q_tau_lowspd", 0.7),
+                                        )
                                     )
                                     tau_high = float(
-                                        cfg_dict.get("aux_q_tau_highspd", 0.45)
+                                        cfg_dict.get(
+                                            "aux_tau_hi_region",
+                                            cfg_dict.get("aux_q_tau_highspd", 0.45),
+                                        )
                                     )
                                     tau_mid = pred.new_full(pred.shape, 0.5)
                                     tau_low_tensor = pred.new_full(pred.shape, tau_low)
                                     tau_high_tensor = pred.new_full(pred.shape, tau_high)
+                                    q_lo, q_hi = _ensure_quantiles(target)
                                     tau_tensor = torch.where(
-                                        target <= target.new_tensor(low_thr),
+                                        target <= q_lo,
                                         tau_low_tensor,
                                         tau_mid,
                                     )
                                     tau_tensor = torch.where(
-                                        target >= target.new_tensor(high_thr),
+                                        target >= q_hi,
                                         tau_high_tensor,
                                         tau_tensor,
                                     )
@@ -952,22 +1099,55 @@ def epoch(
                                         (tau_tensor - 1.0) * err,
                                     ).mean()
                                     damp = 1.0 - 0.5 * epoch_progress
+                                    if step_idx == 0 and not quantile_logged:
+                                        try:
+                                            _float8_log(
+                                                f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
+                                                f"quantile_smooth={q_mode} beta={q_beta:.2f} "
+                                                f"win={q_win} warm={q_warm} sync={q_sync} "
+                                                f"pct(lo={p_lo:.2f},hi={p_hi:.2f}) "
+                                                f"q_lo={float(q_lo):.3f} q_hi={float(q_hi):.3f}"
+                                            )
+                                            quantile_logged = True
+                                        except Exception:
+                                            pass
                                     loss_val = loss_val + pred.new_tensor(w_aux * damp) * q_pin
                             if loss_val is not None and isinstance(loss_val, torch.Tensor):
-                                w_low = float(cfg_dict.get("loss_w_low", 1.0))
-                                w_high = float(cfg_dict.get("loss_w_high", 1.0))
+                                w_low = float(
+                                    cfg_dict.get(
+                                        "aux_weight_lo_region",
+                                        cfg_dict.get("loss_w_low", 1.0),
+                                    )
+                                )
+                                w_high = float(
+                                    cfg_dict.get(
+                                        "aux_weight_hi_region",
+                                        cfg_dict.get("loss_w_high", 1.0),
+                                    )
+                                )
                                 if (w_low != 1.0) or (w_high != 1.0):
-                                    low_thr = float(cfg_dict.get("loss_low_thr", 30.0))
-                                    high_thr = float(cfg_dict.get("loss_high_thr", 90.0))
                                     with torch.no_grad():
                                         weights = torch.ones_like(Y_flat)
+                                        q_lo, q_hi = _ensure_quantiles(Y_flat.detach())
+                                        if step_idx == 0 and not quantile_logged:
+                                            try:
+                                                _float8_log(
+                                                    f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
+                                                    f"quantile_smooth={q_mode} beta={q_beta:.2f} "
+                                                    f"win={q_win} warm={q_warm} sync={q_sync} "
+                                                    f"pct(lo={p_lo:.2f},hi={p_hi:.2f}) "
+                                                    f"q_lo={float(q_lo):.3f} q_hi={float(q_hi):.3f}"
+                                                )
+                                                quantile_logged = True
+                                            except Exception:
+                                                pass
                                         weights = torch.where(
-                                            Y_flat <= Y_flat.new_tensor(low_thr),
+                                            Y_flat <= q_lo,
                                             weights * w_low,
                                             weights,
                                         )
                                         weights = torch.where(
-                                            Y_flat >= Y_flat.new_tensor(high_thr),
+                                            Y_flat >= q_hi,
                                             weights * w_high,
                                             weights,
                                         )
