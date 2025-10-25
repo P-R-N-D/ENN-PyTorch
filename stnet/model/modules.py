@@ -529,22 +529,6 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
-    @staticmethod
-    def _reshape_calib_params(
-        module: "Root",
-        state_dict: Dict[str, torch.Tensor],
-        prefix: str,
-        local_metadata: Dict[str, Any],
-        strict: bool,
-        missing_keys: List[str],
-        unexpected_keys: List[str],
-        error_msgs: List[str],
-    ) -> None:
-        for name in ("calib_scale", "calib_bias"):
-            key = prefix + name
-            tensor = state_dict.get(key)
-            if isinstance(tensor, torch.Tensor) and tensor.ndim == 0:
-                state_dict[key] = tensor.reshape(1)
 
     def __init__(
         self,
@@ -566,15 +550,29 @@ class Root(nn.Module):
             getattr(config, "range_penalty_lambda", 0.0)
         )
         self._calib_enable = bool(getattr(config, "calibrate_output", True))
+        
         c_scale = float(getattr(config, "calibrate_init_scale", 1.0))
-        c_bias = float(getattr(config, "calibrate_init_bias", 0.0))
-        self.calib_scale = nn.Parameter(
-            torch.ones(1, dtype=torch.float32) * c_scale, requires_grad=self._calib_enable
+        c_bias  = float(getattr(config, "calibrate_init_bias", 0.0))
+        self.calib_scale = nn.Parameter(torch.ones(1, dtype=torch.float64) * c_scale)
+        self.calib_bias  = nn.Parameter(torch.ones(1, dtype=torch.float64) * c_bias)
+        
+        def _calib_load_pre_hook(module, state_dict, prefix, local_md, strict, missing_keys, unexpected_keys, error_msgs):
+            for name in ("calib_scale", "calib_bias"):
+                key = prefix + name
+                if key not in state_dict:
+                    continue
+                v = state_dict[key]
+                if not isinstance(v, torch.Tensor):
+                    v = torch.as_tensor(v)
+                if v.ndim == 0:
+                    v = v.view(1)
+                elif v.ndim != 1 or v.numel() != 1:
+                    v = v.reshape(-1)[:1]
+                state_dict[key] = v.to(dtype=module.calib_scale.dtype)
+                
+        self._calib_pre_hook_handle = self._register_load_state_dict_pre_hook(
+            _calib_load_pre_hook, with_module=True
         )
-        self.calib_bias = nn.Parameter(
-            torch.ones(1, dtype=torch.float32) * c_bias, requires_grad=self._calib_enable
-        )
-        self._register_load_state_dict_pre_hook(self._reshape_calib_params)
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -1194,10 +1192,8 @@ class Root(nn.Module):
                 y_hat_out = y_hat_z
 
         if self._calib_enable and (not is_cls_loss):
-            cs = self.calib_scale.to(
-                device=y_hat_out.device, dtype=y_hat_out.dtype
-            ).view(1)
-            cb = self.calib_bias.to(device=y_hat_out.device, dtype=y_hat_out.dtype).view(1)
+            cs = self.calib_scale.to(dtype=y_hat_out.dtype, device=y_hat_out.device).view(1)
+            cb = self.calib_bias.to(dtype=y_hat_out.dtype, device=y_hat_out.device).view(1)
             y_hat_out = y_hat_out * cs + cb
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
