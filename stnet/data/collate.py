@@ -307,8 +307,8 @@ def _build_flight_loaders(
     )
     meta = reader_tr._load_meta()
     keep = _Keep(reader_tr, reader_vl)
-    features_np_dtype = to(meta.get("features_arrow_dtype", "float32"), "numpy")
-    labels_np_dtype = to(meta.get("labels_arrow_dtype", "float32"), "numpy")
+    features_np_dtype = to(meta.get("features_arrow_dtype", "float64"), "numpy")
+    labels_np_dtype = to(meta.get("labels_arrow_dtype", "float64"), "numpy")
     try:
         loopback_host = Network.get_preferred_ip(
             "localhost", allow_loopback=True
