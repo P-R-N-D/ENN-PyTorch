@@ -1142,10 +1142,31 @@ def main(*args: Any) -> Optional[Root]:
                     delta = max(1e-3, span * 0.5 or 1.0)
                     A = center - delta
                     B = center + delta
-                A = max(0.0, A)
-                B = min(100.0, B)
-                if B <= A:
-                    B = A + max(1e-3, eps)
+                A = min(100.0, max(0.0, A))
+                B = min(100.0, max(0.0, B))
+                target_width = max(1e-3, eps)
+                if B - A < target_width:
+                    mid = min(100.0, max(0.0, 0.5 * (A + B)))
+                    half = 0.5 * target_width
+                    A = mid - half
+                    B = mid + half
+                    if A < 0.0:
+                        shift = -A
+                        A = 0.0
+                        B = min(100.0, B + shift)
+                    if B > 100.0:
+                        shift = B - 100.0
+                        B = 100.0
+                        A = max(0.0, A - shift)
+                    if B - A < target_width:
+                        if A <= 0.0:
+                            B = min(100.0, A + target_width)
+                        elif B >= 100.0:
+                            A = max(0.0, B - target_width)
+                        else:
+                            B = min(100.0, A + target_width)
+                    A = min(100.0, max(0.0, A))
+                    B = min(100.0, max(0.0, B))
                 try:
                     model.set_y_range(A, B, eps)
                 except Exception as exc:  # pragma: no cover - defensive path
