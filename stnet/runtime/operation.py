@@ -1659,7 +1659,10 @@ def main(*args: Any) -> Optional[Root]:
             nonlocal model
             if target is None or id(target) in wrapped:
                 return target
+            if getattr(target, "_fsdp_applied", False):
+                return target
             wrapped.add(id(target))
+            setattr(target, "_fsdp_applied", True)
             per_mod_ignored = _per_module_ignored_params(target)
             sharded = fully_shard(
                 target,
@@ -1669,6 +1672,7 @@ def main(*args: Any) -> Optional[Root]:
                 ignored_params=per_mod_ignored or None,
             )
             sharded.set_requires_gradient_sync(True)
+            setattr(sharded, "_fsdp_applied", True)
             if target is model:
                 model = sharded
             return sharded
@@ -1689,23 +1693,11 @@ def main(*args: Any) -> Optional[Root]:
                             blocks.append(block)
             return blocks
 
-        try:
-            for submodule in _collect_block_modules(
-                getattr(model, "local_net", None)
-            ) + _collect_block_modules(getattr(model, "global_net", None)):
-                _fsdp_wrap(submodule)
-            _fsdp_wrap(model)
-        except (RuntimeError, ValueError, TypeError):
-            model = fully_shard(
-                model,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                ignored_params=(
-                    ignored_param_registry if len(ignored_param_registry) > 0 else None
-                ),
-                reshard_after_forward=False,
-            )
-            model.set_requires_gradient_sync(True)
+        for submodule in _collect_block_modules(
+            getattr(model, "local_net", None)
+        ) + _collect_block_modules(getattr(model, "global_net", None)):
+            _fsdp_wrap(submodule)
+        model = _fsdp_wrap(model)
         if fp8_enabled and _float8_scale_supported(data_scale):
             with contextlib.suppress(Exception):
                 precompute_float8_dynamic_scale_for_fsdp(
