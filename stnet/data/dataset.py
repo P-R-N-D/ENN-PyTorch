@@ -24,6 +24,27 @@ _ARROW = patch_arrow()
 pa = _ARROW.module
 
 
+_INT_PROMOTION_TARGET = torch.int64
+_FLOAT_PROMOTION_TARGET = torch.float64
+
+
+def _promote_storage_dtype(tensor: torch.Tensor) -> torch.Tensor:
+    """Return a tensor backed by float64/int64 storage when applicable."""
+
+    if not isinstance(tensor, torch.Tensor):
+        tensor = torch.as_tensor(tensor)
+    if tensor.is_floating_point():
+        return tensor.to(dtype=_FLOAT_PROMOTION_TARGET)
+    if tensor.dtype in {
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+    }:
+        return tensor.to(dtype=_INT_PROMOTION_TARGET)
+    return tensor
+
+
 def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     path = os.path.join(memmap_dir, "meta.json")
     with open(path, "r", encoding="utf-8") as handle:
@@ -74,10 +95,10 @@ class SampleReader:
         **kwargs: Any,
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
-        features = (
-            torch.as_tensor(data["features"]).detach().cpu().contiguous()
-        )
-        labels = torch.as_tensor(data["labels"]).detach().cpu().contiguous()
+        features = _promote_storage_dtype(torch.as_tensor(data["features"]).detach())
+        labels = _promote_storage_dtype(torch.as_tensor(data["labels"]).detach())
+        features = features.cpu().contiguous()
+        labels = labels.cpu().contiguous()
         if features.shape[0] != labels.shape[0]:
             raise ValueError("features/labels N mismatch")
         count = int(features.shape[0])
@@ -222,12 +243,14 @@ class SampleReader:
         batch = int(features.shape[0])
         feat_dim = int(features.view(batch, -1).shape[1])
         label_flat = int(labels.view(batch, -1).shape[1])
+        promoted_feats = _promote_storage_dtype(features)
         feat_values = pa.array(
-            np.asarray(features.contiguous().view(-1).cpu().numpy())
+            np.asarray(promoted_feats.contiguous().view(-1).cpu().numpy())
         )
         feat_array = _ARROW.fixed_shape_list_from_arrays(feat_values, feat_dim)
+        promoted_labels = _promote_storage_dtype(labels)
         label_values = pa.array(
-            np.asarray(labels.contiguous().view(-1).cpu().numpy())
+            np.asarray(promoted_labels.contiguous().view(-1).cpu().numpy())
         )
         label_array = _ARROW.fixed_shape_list_from_arrays(label_values, label_flat)
         return pa.record_batch(

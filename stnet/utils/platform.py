@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# Standard library context managers used throughout this module.
 import contextlib
 import importlib
 import ipaddress
@@ -356,6 +357,27 @@ class System:
             return (True, "torchao.quantization")
         except Exception:
             return (True, f"sm_{major}{minor}")
+
+    @staticmethod
+    def is_int4_supported(
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> Tuple[bool, str]:
+        dev = torch.device(device) if device is not None else System.get_device()
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return (False, f"INT4 requires CUDA (found {dev.type})")
+        major, minor = System.cuda_compute_capability(dev)
+        if major <= 0:
+            return (False, "Unable to query CUDA compute capability")
+        if major < 8:
+            return (False, f"INT4 requires sm_80+ (found sm_{major}{minor})")
+        try:
+            importlib.import_module("torchao.optim")
+            return (True, "torchao.optim")
+        except Exception:
+            with contextlib.suppress(Exception):
+                importlib.import_module("torchao.prototype.low_bit_optim")
+                return (True, f"sm_{major}{minor}")
+        return (False, "torchao low-bit optimizers unavailable")
 
     @staticmethod
     def optimal_procs() -> Dict[str, Union[int, str]]:
@@ -899,6 +921,12 @@ def is_int8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
     return System.is_int8_supported(device)
+
+
+def is_int4_supported(
+    device: Optional[Union[torch.device, str]] = None,
+) -> Tuple[bool, str]:
+    return System.is_int4_supported(device)
 
 
 def optimal_procs() -> Dict[str, Union[int, str]]:
