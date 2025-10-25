@@ -96,6 +96,7 @@ def _resolve_data_scale_hint(value: Any, *, _depth: int = 0) -> Optional[DataSca
     if isinstance(candidate, DataScale):
         return candidate
     for attr in ("_fsdp_wrapped_module", "_orig_module", "module"):
+        nested = None
         with contextlib.suppress(Exception):
             nested = getattr(value, attr)
         if nested is None or nested is value:
@@ -128,6 +129,7 @@ def _resolve_module_device(value: Any, *, _depth: int = 0) -> Optional[torch.dev
             if isinstance(buffer, torch.Tensor):
                 return buffer.device
     for attr in ("_fsdp_wrapped_module", "_orig_module", "module"):
+        nested = None
         with contextlib.suppress(Exception):
             nested = getattr(value, attr)
         if nested is None or nested is value:
