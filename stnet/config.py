@@ -81,7 +81,7 @@ class ModelConfig:
     loss_t_df_start: float = 3.0
     loss_t_df_end: float = 6.0
     loss_t_confidence: float = 0.995
-    loss_z_penalty: str = "softmax"
+    loss_z_penalty: str = "softplus"
     loss_z_tau: float = 1.5
     # 보조(비대칭) 손실: Quantile(τ>0.5면 과소예측 가중↑)
     aux_q_enable: bool = True
