@@ -1053,6 +1053,10 @@ class Root(nn.Module):
             else 1e-3
         )
         eps = min(max(eps, 1e-9), 1.0 - 1e-9)
+        # Guard against configurations that set epsilon above 0.5. The
+        # theoretical logit bounds are symmetric only while `eps <= 0.5`, and
+        # larger values invert the clamp range which would raise at runtime.
+        eps = min(eps, 0.5 - 1e-9)
         z_max = math.log((1.0 - eps) / eps)
         y_hat_z = y_hat_z.clamp(min=-z_max, max=z_max)
         if not torch.isfinite(y_hat_z).all():
