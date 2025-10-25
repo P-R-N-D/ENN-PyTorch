@@ -543,7 +543,16 @@ class Root(nn.Module):
         self._y_high = float(getattr(config, "y_high", 100.0))
         self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
         self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.02))
-        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 1e-3))
+        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 1e-2))
+        self._calib_enable = bool(getattr(config, "calibrate_output", True))
+        c_scale = float(getattr(config, "calibrate_init_scale", 1.0))
+        c_bias = float(getattr(config, "calibrate_init_bias", 0.0))
+        self.calib_scale = nn.Parameter(
+            torch.tensor(c_scale, dtype=torch.float32), requires_grad=self._calib_enable
+        )
+        self.calib_bias = nn.Parameter(
+            torch.tensor(c_bias, dtype=torch.float32), requires_grad=self._calib_enable
+        )
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -902,6 +911,24 @@ class Root(nn.Module):
         y = torch.sigmoid(z) * (B - A + 2.0 * eps_val) + (A - eps_val)
         return torch.clamp(y, min=A, max=B)
 
+    def _to_zscore(self, y: torch.Tensor) -> torch.Tensor:
+        if not self.has_valid_y_stats():
+            return y
+        mu = self.y_mean.to(device=y.device, dtype=y.dtype)
+        sd = self.y_std.to(device=y.device, dtype=y.dtype)
+        eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
+        sd = torch.clamp(sd, min=eps)
+        return (y - mu) / sd
+
+    def _from_zscore(self, z: torch.Tensor) -> torch.Tensor:
+        if not self.has_valid_y_stats():
+            return z
+        mu = self.y_mean.to(device=z.device, dtype=z.dtype)
+        sd = self.y_std.to(device=z.device, dtype=z.dtype)
+        eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
+        sd = torch.clamp(sd, min=eps)
+        return z * sd + mu
+
     def forward(
         self,
         features: torch.Tensor,
@@ -1111,14 +1138,20 @@ class Root(nn.Module):
             else False
         )
         y_hat_out = y_hat_z
-        if self._loss_space == "logit" and (not is_cls_loss):
-            y_hat_out = self._from_logit_range(y_hat_z)
-        elif self.has_valid_y_stats() and (not is_cls_loss):
-            mu = self.y_mean.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-            sd = self.y_std.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-            eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
-            sd = torch.clamp(sd, min=eps)
-            y_hat_out = y_hat_z * sd + mu
+        if not is_cls_loss:
+            if self._loss_space == "logit":
+                y_hat_out = self._from_logit_range(y_hat_z)
+            elif self._loss_space == "z":
+                y_hat_out = self._from_zscore(y_hat_z)
+            else:
+                y_hat_out = y_hat_z
+
+        if self._calib_enable and (not is_cls_loss):
+            cs = self.calib_scale.to(
+                device=y_hat_out.device, dtype=y_hat_out.dtype
+            )
+            cb = self.calib_bias.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
+            y_hat_out = y_hat_out * cs + cb
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
@@ -1135,13 +1168,16 @@ class Root(nn.Module):
             else:
                 controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
-            base_tensor = y_hat_z if self._loss_space == "logit" else y_hat_out
+            base_tensor = (
+                y_hat_z if self._loss_space in {"logit", "z"} else y_hat_out
+            )
             total = base_tensor.new_tensor(0.0, dtype=base_tensor.dtype)
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
             if self._loss_space == "logit":
-                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-                tgt = self._to_logit_range(tgt)
+                tgt = self._to_logit_range(
+                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                )
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
@@ -1151,22 +1187,9 @@ class Root(nn.Module):
                     bottom_component = local_loss(y_bot, tgt)
                     total = total + weights[1] * bottom_component
             elif self._loss_space == "z" and self.has_valid_y_stats():
-                mu_lbl = self.y_mean.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                tgt_z = self._to_zscore(
+                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 )
-                sd_lbl = self.y_std.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
-                )
-                eps_lbl = (
-                    float(self.y_eps.item())
-                    if hasattr(self, "y_eps")
-                    else 1e-06
-                )
-                sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
-                tgt_z = labels_flat.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
-                )
-                tgt_z = (tgt_z - mu_lbl) / sd_lbl
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
@@ -1181,19 +1204,7 @@ class Root(nn.Module):
                 )
                 y_top = y_hat_out
                 if self.has_valid_y_stats():
-                    mu_lbl = self.y_mean.to(
-                        device=assembled.device, dtype=assembled.dtype
-                    )
-                    sd_lbl = self.y_std.to(
-                        device=assembled.device, dtype=assembled.dtype
-                    )
-                    eps_lbl = (
-                        float(self.y_eps.item())
-                        if hasattr(self, "y_eps")
-                        else 1e-06
-                    )
-                    sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
-                    y_bot = assembled * sd_lbl + mu_lbl
+                    y_bot = self._from_zscore(assembled)
                 else:
                     y_bot = assembled
                 if global_loss is not None:
@@ -1205,35 +1216,19 @@ class Root(nn.Module):
             if controller is not None:
                 controller.update(top_component, bottom_component)
             loss_val = total
-            if self._loss_space == "logit" and self._z_reg_lambda > 0.0:
-                loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
         elif net_loss is not None and labels_flat is not None:
             if is_cls_loss:
                 tgt = labels_flat.to(device=y_hat_out.device).long()
                 loss_val = net_loss(y_hat_out, tgt)
             elif self._loss_space == "logit":
-                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-                tgt = self._to_logit_range(tgt)
+                tgt = self._to_logit_range(
+                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                )
                 loss_val = net_loss(y_hat_z, tgt)
-                if self._z_reg_lambda > 0.0:
-                    loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
             elif self._loss_space == "z" and self.has_valid_y_stats():
-                mu_lbl = self.y_mean.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                tgt = self._to_zscore(
+                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 )
-                sd_lbl = self.y_std.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
-                )
-                eps_lbl = (
-                    float(self.y_eps.item())
-                    if hasattr(self, "y_eps")
-                    else 1e-06
-                )
-                sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
-                tgt = labels_flat.to(
-                    device=y_hat_z.device, dtype=y_hat_z.dtype
-                )
-                tgt = (tgt - mu_lbl) / sd_lbl
                 loss_val = net_loss(y_hat_z, tgt)
             else:
                 loss_val = net_loss(
@@ -1242,6 +1237,12 @@ class Root(nn.Module):
                         device=y_hat_out.device, dtype=y_hat_out.dtype
                     ),
                 )
+        if (
+            not is_cls_loss
+            and self._z_reg_lambda > 0.0
+            and isinstance(loss_val, torch.Tensor)
+        ):
+            loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
         return (y_hat_out.view(b, *self.out_shape), loss_val)
 
     def stats(self) -> dict:
