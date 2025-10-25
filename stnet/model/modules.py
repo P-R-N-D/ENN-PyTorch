@@ -542,8 +542,8 @@ class Root(nn.Module):
         self._y_low = float(getattr(config, "y_low", 0.0))
         self._y_high = float(getattr(config, "y_high", 100.0))
         self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
-        self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.01))
-        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 0.0))
+        self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.02))
+        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 1e-3))
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -850,31 +850,30 @@ class Root(nn.Module):
     def _to_logit_range(self, y: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
         B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
-        eps_abs = float(self.y_eps_range_buf.item())
         span = float((B - A).abs().item())
-        eps_rel_norm = float(max(0.0, self._y_eps_rel))
-        eps_abs_norm = eps_abs / span if span > 0.0 else float("inf")
-        eps_norm = float(max(eps_rel_norm, eps_abs_norm))
-        eps_norm = max(eps_norm, 1e-9)
-        eps_norm = min(eps_norm, 0.5 - 1e-9)
-        eps_range = eps_norm * span
-        y01 = (y - A + eps_range) / (B - A + 2.0 * eps_range)
-        y01 = torch.clamp(y01, min=eps_norm, max=1.0 - eps_norm)
+        eps_abs = float(self.y_eps_range_buf.item())
+        eps_rel = float(max(0.0, self._y_eps_rel)) * span
+        eps = max(eps_abs, eps_rel, 1e-9)
+        max_eps = max(1e-9, 0.5 * span - 1e-9)
+        eps = min(eps, max_eps)
+        eps_val = torch.tensor(eps, device=y.device, dtype=y.dtype)
+        denom = B - A + 2.0 * eps_val
+        y01 = (y - A + eps_val) / denom
+        min_norm = eps_val / denom
+        y01 = torch.clamp(y01, min=min_norm, max=1.0 - min_norm)
         return torch.log(y01 / (1.0 - y01))
 
     def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
         B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
-        eps_abs = float(self.y_eps_range_buf.item())
         span = float((B - A).abs().item())
-        eps_rel_norm = float(max(0.0, self._y_eps_rel))
-        eps_abs_norm = eps_abs / span if span > 0.0 else float("inf")
-        eps_norm = float(max(eps_rel_norm, eps_abs_norm))
-        eps_norm = max(eps_norm, 1e-9)
-        eps_norm = min(eps_norm, 0.5 - 1e-9)
-        eps_range = eps_norm * span
-        y01 = torch.sigmoid(z)
-        return y01 * (B - A + 2.0 * eps_range) + (A - eps_range)
+        eps_abs = float(self.y_eps_range_buf.item())
+        eps_rel = float(max(0.0, self._y_eps_rel)) * span
+        eps = max(eps_abs, eps_rel, 1e-9)
+        max_eps = max(1e-9, 0.5 * span - 1e-9)
+        eps = min(eps, max_eps)
+        eps_val = torch.tensor(eps, device=z.device, dtype=z.dtype)
+        return torch.sigmoid(z) * (B - A + 2.0 * eps_val) + (A - eps_val)
 
     def forward(
         self,

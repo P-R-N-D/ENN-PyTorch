@@ -801,14 +801,36 @@ def epoch(
                                     tau = float(cfg_dict.get("aux_q_tau", 0.7))
                                     pred = y_hat.reshape_as(Y_flat)
                                     target = Y_flat
-                                    e = target - pred
+                                    err = target - pred
                                     tau_tensor = pred.new_tensor(tau)
-                                    aux = torch.where(
-                                        e >= 0,
-                                        tau_tensor * e,
-                                        (tau_tensor - 1.0) * e,
+                                    qloss = torch.maximum(
+                                        tau_tensor * err,
+                                        (tau_tensor - 1.0) * err,
                                     )
-                                    loss_val = loss_val + pred.new_tensor(w_aux) * aux.mean()
+                                    loss_val = loss_val + pred.new_tensor(w_aux) * qloss.mean()
+                            if loss_val is not None and isinstance(loss_val, torch.Tensor):
+                                w_scale = float(cfg_dict.get("target_weight_scale", 0.5))
+                                pivot = float(cfg_dict.get("target_weight_pivot", 30.0))
+                                if w_scale != 0.0 and pivot > 0.0:
+                                    with torch.no_grad():
+                                        weights = 1.0 + w_scale * torch.clamp(
+                                            (pivot - Y_flat) / pivot,
+                                            min=0.0,
+                                            max=1.0,
+                                        )
+                                    weights = weights.to(
+                                        device=loss_val.device, dtype=loss_val.dtype
+                                    )
+                                    if loss_val.ndim == 0:
+                                        loss_val = loss_val * weights.mean()
+                                    else:
+                                        weight_view = weights
+                                        if weights.shape != loss_val.shape:
+                                            try:
+                                                weight_view = weights.view_as(loss_val)
+                                            except Exception:
+                                                weight_view = weights.expand_as(loss_val)
+                                        loss_val = (loss_val * weight_view).mean()
                         accum_scale = max(1, grad_accum_steps)
                         loss_for_backprop = loss_val / float(accum_scale)
                         scaler.scale(loss_for_backprop).backward()
@@ -1111,10 +1133,40 @@ def main(*args: Any) -> Optional[Root]:
                 warnings.warn(f"auto_y_range failed: {exc}")
             else:
                 span = float(hi - lo)
-                m_low = float(getattr(cfg, "y_range_margin_low", 0.0)) * span
-                m_high = float(getattr(cfg, "y_range_margin_high", 0.0)) * span
+                m_low = float(getattr(cfg, "y_range_margin_low", 0.10)) * span
+                m_high = float(getattr(cfg, "y_range_margin_high", 0.05)) * span
                 A = float(lo) - m_low
                 B = float(hi) + m_high
+                if B <= A:
+                    center = 0.5 * (float(lo) + float(hi))
+                    delta = max(1e-3, span * 0.5 or 1.0)
+                    A = center - delta
+                    B = center + delta
+                A = min(100.0, max(0.0, A))
+                B = min(100.0, max(0.0, B))
+                target_width = max(1e-3, eps)
+                if B - A < target_width:
+                    mid = min(100.0, max(0.0, 0.5 * (A + B)))
+                    half = 0.5 * target_width
+                    A = mid - half
+                    B = mid + half
+                    if A < 0.0:
+                        shift = -A
+                        A = 0.0
+                        B = min(100.0, B + shift)
+                    if B > 100.0:
+                        shift = B - 100.0
+                        B = 100.0
+                        A = max(0.0, A - shift)
+                    if B - A < target_width:
+                        if A <= 0.0:
+                            B = min(100.0, A + target_width)
+                        elif B >= 100.0:
+                            A = max(0.0, B - target_width)
+                        else:
+                            B = min(100.0, A + target_width)
+                    A = min(100.0, max(0.0, A))
+                    B = min(100.0, max(0.0, B))
                 try:
                     model.set_y_range(A, B, eps)
                 except Exception as exc:  # pragma: no cover - defensive path
