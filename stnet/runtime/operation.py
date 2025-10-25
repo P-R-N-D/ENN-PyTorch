@@ -2164,7 +2164,16 @@ def main(*args: Any) -> Optional[Root]:
                             local_loss=None,
                             loss_weights=None,
                         )
-                if bool(getattr(cfg, "clip_output_on_serialize", True)):
+                clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", True))
+                loss_space = str(
+                    getattr(model, "_loss_space", getattr(cfg, "loss_space", ""))
+                ).lower()
+                if (
+                    clip_outputs
+                    and loss_space not in {"logit"}
+                    and hasattr(model, "y_low_buf")
+                    and hasattr(model, "y_high_buf")
+                ):
                     low = float(model.y_low_buf.item())
                     high = float(model.y_high_buf.item())
                     y_hat = y_hat.clamp(min=low, max=high)
