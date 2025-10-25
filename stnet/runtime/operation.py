@@ -38,6 +38,66 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+
+try:  # pragma: no cover - optional dependency
+    from torch.distributed.tensor import DTensor  # type: ignore
+except (ImportError, AttributeError):  # pragma: no cover - environment without DTensor
+    DTensor = ()  # type: ignore
+
+
+def _safe_clip_grad_norm(
+    parameters: Sequence[torch.nn.Parameter],
+    max_norm: float,
+    norm_type: float = 2.0,
+    eps: float = 1e-6,
+) -> float:
+    """Clip gradients while avoiding DTensor/Tensor mixing errors."""
+
+    grads: List[torch.Tensor] = []
+    original_grads: List[torch.Tensor] = []
+    for param in parameters:
+        if param is None:
+            continue
+        grad = getattr(param, "grad", None)
+        if grad is None:
+            continue
+        original_grads.append(grad)
+        if DTensor and isinstance(grad, DTensor):
+            grads.append(grad.to_local())
+        else:
+            grads.append(grad)
+
+    if not grads:
+        return 0.0
+
+    norm_vals = []
+    if norm_type == float("inf"):
+        for grad in grads:
+            norm_vals.append(
+                grad.detach()
+                .abs()
+                .max()
+                .to(device="cpu", dtype=torch.float32)
+            )
+        total_norm_tensor = torch.stack(norm_vals).max()
+    else:
+        for grad in grads:
+            norm_vals.append(
+                grad.detach()
+                .norm(norm_type)
+                .to(device="cpu", dtype=torch.float32)
+            )
+        total_norm_tensor = torch.stack(norm_vals).norm(norm_type)
+
+    total_norm = float(total_norm_tensor)
+    clip_coef = max_norm / (total_norm + eps)
+    clip_coef = min(clip_coef, 1.0)
+
+    if clip_coef < 1.0:
+        for grad in original_grads:
+            grad.mul_(clip_coef)
+
+    return total_norm
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
@@ -935,16 +995,14 @@ def epoch(
                                 try:
                                     clip_fn(clip_max_norm)
                                 except (TypeError, RuntimeError):
-                                    torch.nn.utils.clip_grad_norm_(
-                                        model.parameters(),
+                                    _safe_clip_grad_norm(
+                                        list(model.parameters()),
                                         max_norm=clip_max_norm,
-                                        foreach=False,
                                     )
                             else:
-                                torch.nn.utils.clip_grad_norm_(
-                                    model.parameters(),
+                                _safe_clip_grad_norm(
+                                    list(model.parameters()),
                                     max_norm=clip_max_norm,
-                                    foreach=False,
                                 )
                             scaler.step(optimizer)
                             scaler.update()
