@@ -63,22 +63,41 @@ class ModelConfig:
     y_high: float = 100.0
     # 경계 여유: 절대/상대 병행(둘 중 큰 값 적용)
     y_eps_range: float = 1e-3
-    y_eps_rel: float = 0.01
+    y_eps_rel: float = 0.02
     auto_y_range: bool = True
     # 경계 타깃 줄이기: 분위수 폭 확대(저속 과소/고속 과대 억제)
     y_range_q_low: float = 0.001
     y_range_q_high: float = 0.999
     # A/B 여유 확장(비율)
-    y_range_margin_low: float = 0.05
-    y_range_margin_high: float = 0.02
+    y_range_margin_low: float = 0.10
+    y_range_margin_high: float = 0.05
     # 로짓 z 규제(과도 포화 억제)
-    z_reg_lambda: float = 0.0
+    z_reg_lambda: float = 1e-3
     # 손실 함수 통계 설정
     loss_std_mode: str = "pooled"
+    loss_ddof: int = 1
+    loss_detach_stats: bool = True
+    loss_clamp_max: float = 6.0
+    loss_t_df_start: float = 3.0
+    loss_t_df_end: float = 6.0
+    loss_t_confidence: float = 0.995
+    loss_z_penalty: str = "huber"
+    loss_z_tau: float = 1.5
     # 보조(비대칭) 손실: Quantile(τ>0.5면 과소예측 가중↑)
     aux_q_enable: bool = True
-    aux_q_tau: float = 0.7
+    aux_q_tau_lowspd: float = 0.7
+    aux_q_tau_highspd: float = 0.45
     aux_q_weight: float = 0.05
+    # 속도 가중(저/고속 불균형 보정)
+    loss_low_thr: float = 30.0
+    loss_high_thr: float = 90.0
+    loss_w_low: float = 1.0
+    loss_w_high: float = 1.0
+    # 손실 가중(전역/지역/보조)
+    w_global: float = 1.0
+    w_local: float = 0.2
+    w_aux: float = 0.0
+    local_decay: bool = True
 
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
@@ -312,13 +331,61 @@ def coerce_model_config(
     ).lower()
     if args["loss_std_mode"] not in {"pooled", "target"}:
         raise ValueError("loss_std_mode must be 'pooled' or 'target'")
+    args["loss_ddof"] = ensure_int(
+        filtered.get("loss_ddof", getattr(defaults, "loss_ddof")),
+        name="loss_ddof",
+        minimum=0,
+    )
+    args["loss_detach_stats"] = ensure_bool(
+        filtered.get("loss_detach_stats", getattr(defaults, "loss_detach_stats")),
+        name="loss_detach_stats",
+    )
+    args["loss_clamp_max"] = ensure_float(
+        filtered.get("loss_clamp_max", getattr(defaults, "loss_clamp_max")),
+        name="loss_clamp_max",
+        minimum=0.0,
+    )
+    args["loss_t_df_start"] = ensure_float(
+        filtered.get("loss_t_df_start", getattr(defaults, "loss_t_df_start")),
+        name="loss_t_df_start",
+        minimum=1e-06,
+    )
+    args["loss_t_df_end"] = ensure_float(
+        filtered.get("loss_t_df_end", getattr(defaults, "loss_t_df_end")),
+        name="loss_t_df_end",
+        minimum=1e-06,
+    )
+    if args["loss_t_df_end"] < args["loss_t_df_start"]:
+        raise ValueError("loss_t_df_end must be >= loss_t_df_start")
+    args["loss_t_confidence"] = ensure_float(
+        filtered.get("loss_t_confidence", getattr(defaults, "loss_t_confidence")),
+        name="loss_t_confidence",
+        minimum=1e-06,
+        maximum=0.999999,
+    )
+    args["loss_z_penalty"] = str(
+        filtered.get("loss_z_penalty", getattr(defaults, "loss_z_penalty"))
+    ).lower()
+    if args["loss_z_penalty"] not in {"softplus", "huber"}:
+        raise ValueError("loss_z_penalty must be 'softplus' or 'huber'")
+    args["loss_z_tau"] = ensure_float(
+        filtered.get("loss_z_tau", getattr(defaults, "loss_z_tau")),
+        name="loss_z_tau",
+        minimum=0.0,
+    )
     args["aux_q_enable"] = ensure_bool(
         filtered.get("aux_q_enable", getattr(defaults, "aux_q_enable")),
         name="aux_q_enable",
     )
-    args["aux_q_tau"] = ensure_float(
-        filtered.get("aux_q_tau", getattr(defaults, "aux_q_tau")),
-        name="aux_q_tau",
+    args["aux_q_tau_lowspd"] = ensure_float(
+        filtered.get("aux_q_tau_lowspd", getattr(defaults, "aux_q_tau_lowspd")),
+        name="aux_q_tau_lowspd",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    args["aux_q_tau_highspd"] = ensure_float(
+        filtered.get("aux_q_tau_highspd", getattr(defaults, "aux_q_tau_highspd")),
+        name="aux_q_tau_highspd",
         minimum=0.0,
         maximum=1.0,
     )
@@ -326,6 +393,45 @@ def coerce_model_config(
         filtered.get("aux_q_weight", getattr(defaults, "aux_q_weight")),
         name="aux_q_weight",
         minimum=0.0,
+    )
+    args["loss_low_thr"] = ensure_float(
+        filtered.get("loss_low_thr", getattr(defaults, "loss_low_thr")),
+        name="loss_low_thr",
+    )
+    args["loss_high_thr"] = ensure_float(
+        filtered.get("loss_high_thr", getattr(defaults, "loss_high_thr")),
+        name="loss_high_thr",
+    )
+    if args["loss_high_thr"] < args["loss_low_thr"]:
+        raise ValueError("loss_high_thr must be >= loss_low_thr")
+    args["loss_w_low"] = ensure_float(
+        filtered.get("loss_w_low", getattr(defaults, "loss_w_low")),
+        name="loss_w_low",
+        minimum=0.0,
+    )
+    args["loss_w_high"] = ensure_float(
+        filtered.get("loss_w_high", getattr(defaults, "loss_w_high")),
+        name="loss_w_high",
+        minimum=0.0,
+    )
+    args["w_global"] = ensure_float(
+        filtered.get("w_global", getattr(defaults, "w_global")),
+        name="w_global",
+        minimum=0.0,
+    )
+    args["w_local"] = ensure_float(
+        filtered.get("w_local", getattr(defaults, "w_local")),
+        name="w_local",
+        minimum=0.0,
+    )
+    args["w_aux"] = ensure_float(
+        filtered.get("w_aux", getattr(defaults, "w_aux")),
+        name="w_aux",
+        minimum=0.0,
+    )
+    args["local_decay"] = ensure_bool(
+        filtered.get("local_decay", getattr(defaults, "local_decay")),
+        name="local_decay",
     )
 
     return ModelConfig(**args)

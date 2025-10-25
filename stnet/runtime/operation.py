@@ -685,6 +685,8 @@ def epoch(
     scaler: torch.amp.GradScaler,
     sched: torch.optim.lr_scheduler.LRScheduler,
     loss_controller: LossWeightController,
+    epoch_idx: int,
+    total_epochs: int,
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
     status_bar: Optional[tqdm],
@@ -709,6 +711,48 @@ def epoch(
     else:
         cfg_dict = {}
     flop_breakdown_epoch: Dict[str, float] = {}
+    std_mode = str(cfg_dict.get("loss_std_mode", "pooled")).lower()
+    loss_ddof = int(cfg_dict.get("loss_ddof", 1))
+    detach_stats = bool(cfg_dict.get("loss_detach_stats", True))
+    clamp_max = float(cfg_dict.get("loss_clamp_max", 6.0))
+    loss_t_conf = float(cfg_dict.get("loss_t_confidence", 0.995))
+    loss_z_penalty = str(cfg_dict.get("loss_z_penalty", "huber")).lower()
+    if loss_z_penalty not in {"softplus", "huber"}:
+        loss_z_penalty = "huber"
+    loss_z_tau = float(cfg_dict.get("loss_z_tau", 1.5))
+    df_start = float(cfg_dict.get("loss_t_df_start", 3.0))
+    df_end = float(cfg_dict.get("loss_t_df_end", 6.0))
+    total_epochs = max(1, int(total_epochs))
+    epoch_progress = (int(epoch_idx) + 1) / total_epochs
+    df_now = df_start + (df_end - df_start) * epoch_progress
+    df_now = float(max(df_now, 1e-06))
+    top_loss.base = StudentsTLoss(
+        confidence=loss_t_conf,
+        metric="t_value",
+        two_tailed=True,
+        df=df_now,
+        mu_mode="error",
+        std_mode=std_mode,
+        ddof=loss_ddof,
+        clamp_max=clamp_max,
+        detach_stats=detach_stats,
+        dim=-1,
+        reduction="none",
+    )
+    bottom_loss.base = StandardNormalLoss(
+        confidence=0.99,
+        metric="z_value",
+        two_tailed=True,
+        penalty=loss_z_penalty,
+        tau=loss_z_tau,
+        mu_mode="error",
+        std_mode=std_mode,
+        ddof=loss_ddof,
+        clamp_max=clamp_max,
+        detach_stats=detach_stats,
+        dim=-1,
+        reduction="none",
+    )
     io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -724,6 +768,14 @@ def epoch(
         t_fetch_start = time.perf_counter_ns()
         with joining(model=model, optimizer=optimizer):
             total_batches = len(train_loader)
+            alpha = float(cfg_dict.get("w_global", 1.0))
+            beta0 = float(cfg_dict.get("w_local", 0.2))
+            decay_local = bool(cfg_dict.get("local_decay", True))
+            beta = (
+                beta0 * (1.0 - 0.7 * epoch_progress)
+                if decay_local
+                else beta0
+            )
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
                 X = to_torch(feat)
@@ -785,38 +837,79 @@ def epoch(
                             Y_flat = Y.reshape(Y.shape[0], -1).to(
                                 device, dtype=param_dtype
                             )
+                            if step_idx == 0:
+                                try:
+                                    _float8_log(
+                                        f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
+                                        f"df_now={df_now:.3f} std_mode={std_mode} "
+                                        f"z_penalty={loss_z_penalty}"
+                                    )
+                                except Exception:
+                                    pass
                             y_hat, loss_val = model(
                                 X,
                                 labels_flat=Y_flat,
                                 global_loss=top_loss,
                                 local_loss=bottom_loss,
-                                loss_weights=loss_controller.weights(),
+                                loss_weights=(alpha, beta),
                             )
                             if (
                                 loss_val is not None
                                 and bool(cfg_dict.get("aux_q_enable", True))
                             ):
-                                w_aux = float(cfg_dict.get("aux_q_weight", 0.05))
+                                w_aux_override = float(cfg_dict.get("w_aux", 0.0))
+                                if w_aux_override > 0.0:
+                                    w_aux = w_aux_override
+                                else:
+                                    w_aux = float(cfg_dict.get("aux_q_weight", 0.05))
                                 if w_aux > 0.0:
-                                    tau = float(cfg_dict.get("aux_q_tau", 0.7))
                                     pred = y_hat.reshape_as(Y_flat)
-                                    target = Y_flat
+                                    target = Y_flat.detach()
                                     err = target - pred
-                                    tau_tensor = pred.new_tensor(tau)
-                                    qloss = torch.maximum(
+                                    low_thr = float(cfg_dict.get("loss_low_thr", 30.0))
+                                    high_thr = float(cfg_dict.get("loss_high_thr", 90.0))
+                                    tau_low = float(
+                                        cfg_dict.get("aux_q_tau_lowspd", 0.7)
+                                    )
+                                    tau_high = float(
+                                        cfg_dict.get("aux_q_tau_highspd", 0.45)
+                                    )
+                                    tau_mid = pred.new_full(pred.shape, 0.5)
+                                    tau_low_tensor = pred.new_full(pred.shape, tau_low)
+                                    tau_high_tensor = pred.new_full(pred.shape, tau_high)
+                                    tau_tensor = torch.where(
+                                        target <= target.new_tensor(low_thr),
+                                        tau_low_tensor,
+                                        tau_mid,
+                                    )
+                                    tau_tensor = torch.where(
+                                        target >= target.new_tensor(high_thr),
+                                        tau_high_tensor,
+                                        tau_tensor,
+                                    )
+                                    q_pin = torch.maximum(
                                         tau_tensor * err,
                                         (tau_tensor - 1.0) * err,
-                                    )
-                                    loss_val = loss_val + pred.new_tensor(w_aux) * qloss.mean()
+                                    ).mean()
+                                    damp = 1.0 - 0.5 * epoch_progress
+                                    loss_val = loss_val + pred.new_tensor(w_aux * damp) * q_pin
                             if loss_val is not None and isinstance(loss_val, torch.Tensor):
-                                w_scale = float(cfg_dict.get("target_weight_scale", 0.5))
-                                pivot = float(cfg_dict.get("target_weight_pivot", 30.0))
-                                if w_scale != 0.0 and pivot > 0.0:
+                                w_low = float(cfg_dict.get("loss_w_low", 1.0))
+                                w_high = float(cfg_dict.get("loss_w_high", 1.0))
+                                if (w_low != 1.0) or (w_high != 1.0):
+                                    low_thr = float(cfg_dict.get("loss_low_thr", 30.0))
+                                    high_thr = float(cfg_dict.get("loss_high_thr", 90.0))
                                     with torch.no_grad():
-                                        weights = 1.0 + w_scale * torch.clamp(
-                                            (pivot - Y_flat) / pivot,
-                                            min=0.0,
-                                            max=1.0,
+                                        weights = torch.ones_like(Y_flat)
+                                        weights = torch.where(
+                                            Y_flat <= Y_flat.new_tensor(low_thr),
+                                            weights * w_low,
+                                            weights,
+                                        )
+                                        weights = torch.where(
+                                            Y_flat >= Y_flat.new_tensor(high_thr),
+                                            weights * w_high,
+                                            weights,
                                         )
                                     weights = weights.to(
                                         device=loss_val.device, dtype=loss_val.dtype
@@ -836,6 +929,9 @@ def epoch(
                         scaler.scale(loss_for_backprop).backward()
                         if should_sync:
                             scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(), max_norm=1.0
+                            )
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad(set_to_none=True)
@@ -963,7 +1059,7 @@ def epoch(
                                 labels_flat=Yv_flat,
                                 global_loss=top_loss,
                                 local_loss=bottom_loss,
-                                loss_weights=loss_controller.weights(),
+                                loss_weights=(alpha, beta),
                             )
                         if use_timer:
                             ev_e.record()
@@ -1135,40 +1231,57 @@ def main(*args: Any) -> Optional[Root]:
                 span = float(hi - lo)
                 m_low = float(getattr(cfg, "y_range_margin_low", 0.10)) * span
                 m_high = float(getattr(cfg, "y_range_margin_high", 0.05)) * span
-                A = float(lo) - m_low
-                B = float(hi) + m_high
+                base_low = float(getattr(cfg, "y_low", 0.0))
+                base_high = float(getattr(cfg, "y_high", 100.0))
+                if (
+                    not math.isfinite(base_low)
+                    or not math.isfinite(base_high)
+                    or base_high <= base_low
+                ):
+                    base_low, base_high = 0.0, 100.0
+                A = max(base_low, float(lo) - m_low)
+                B = min(base_high, float(hi) + m_high)
                 if B <= A:
                     center = 0.5 * (float(lo) + float(hi))
                     delta = max(1e-3, span * 0.5 or 1.0)
                     A = center - delta
                     B = center + delta
-                A = min(100.0, max(0.0, A))
-                B = min(100.0, max(0.0, B))
-                target_width = max(1e-3, eps)
+                A = min(base_high, max(base_low, A))
+                B = min(base_high, max(base_low, B))
+                domain_span = max(1e-3, base_high - base_low)
+                target_width = min(domain_span, max(1e-3, eps))
                 if B - A < target_width:
-                    mid = min(100.0, max(0.0, 0.5 * (A + B)))
+                    mid = min(base_high, max(base_low, 0.5 * (A + B)))
                     half = 0.5 * target_width
                     A = mid - half
                     B = mid + half
-                    if A < 0.0:
-                        shift = -A
-                        A = 0.0
-                        B = min(100.0, B + shift)
-                    if B > 100.0:
-                        shift = B - 100.0
-                        B = 100.0
-                        A = max(0.0, A - shift)
+                    if A < base_low:
+                        shift = base_low - A
+                        A = base_low
+                        B = min(base_high, B + shift)
+                    if B > base_high:
+                        shift = B - base_high
+                        B = base_high
+                        A = max(base_low, A - shift)
                     if B - A < target_width:
-                        if A <= 0.0:
-                            B = min(100.0, A + target_width)
-                        elif B >= 100.0:
-                            A = max(0.0, B - target_width)
+                        if A <= base_low:
+                            B = min(base_high, A + target_width)
+                        elif B >= base_high:
+                            A = max(base_low, B - target_width)
                         else:
-                            B = min(100.0, A + target_width)
-                    A = min(100.0, max(0.0, A))
-                    B = min(100.0, max(0.0, B))
+                            B = min(base_high, A + target_width)
+                    A = min(base_high, max(base_low, A))
+                    B = min(base_high, max(base_low, B))
                 try:
                     model.set_y_range(A, B, eps)
+                    try:
+                        _float8_log(
+                            f"[y-range] domain=[{base_low:.3f},{base_high:.3f}] "
+                            f"A={A:.3f}, B={B:.3f}, eps_abs={eps:.4g}, "
+                            f"eps_rel={getattr(cfg, 'y_eps_rel', 0.0)}"
+                        )
+                    except Exception:
+                        pass
                 except Exception as exc:  # pragma: no cover - defensive path
                     warnings.warn(f"set_y_range failed: {exc}")
         train_step_count = 0
@@ -1374,30 +1487,42 @@ def main(*args: Any) -> Optional[Root]:
                         options=StateDictOptions(strict=False),
                     )
         std_mode = str(getattr(cfg, "loss_std_mode", "pooled")).lower()
-        _t = StudentsTLoss(
-            confidence=0.99,
-            metric="t_value",
-            two_tailed=True,
-            df=4,
-            mu_mode="error",
-            std_mode=std_mode,
-            ddof=1,
-            clamp_max=8.0,
-            detach_stats=True,
-            dim=-1,
-            reduction="none",
-        )
+        loss_ddof = int(getattr(cfg, "loss_ddof", 1))
+        detach_stats = bool(getattr(cfg, "loss_detach_stats", True))
+        clamp_max = float(getattr(cfg, "loss_clamp_max", 6.0))
+        loss_t_conf = float(getattr(cfg, "loss_t_confidence", 0.995))
+        loss_z_penalty = str(getattr(cfg, "loss_z_penalty", "huber")).lower()
+        loss_z_tau = float(getattr(cfg, "loss_z_tau", 1.5))
+        df_start = float(getattr(cfg, "loss_t_df_start", 3.0))
+        df_end = float(getattr(cfg, "loss_t_df_end", 6.0))
+
+        def _build_students_t(df: float) -> StudentsTLoss:
+            return StudentsTLoss(
+                confidence=loss_t_conf,
+                metric="t_value",
+                two_tailed=True,
+                df=float(df),
+                mu_mode="error",
+                std_mode=std_mode,
+                ddof=loss_ddof,
+                clamp_max=clamp_max,
+                detach_stats=detach_stats,
+                dim=-1,
+                reduction="none",
+            )
+
+        _t = _build_students_t(df_start)
         _z = StandardNormalLoss(
             confidence=0.99,
             metric="z_value",
             two_tailed=True,
-            penalty="softplus",
-            tau=1.0,
+            penalty=loss_z_penalty,
+            tau=loss_z_tau,
             mu_mode="error",
             std_mode=std_mode,
-            ddof=1,
-            clamp_max=8.0,
-            detach_stats=True,
+            ddof=loss_ddof,
+            clamp_max=clamp_max,
+            detach_stats=detach_stats,
             dim=-1,
             reduction="none",
         )
@@ -1504,7 +1629,7 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             )
 
-            for _ in range(int(ops.epochs)):
+            for epoch_idx in range(int(ops.epochs)):
                 (
                     io_time,
                     comp_time,
@@ -1526,6 +1651,8 @@ def main(*args: Any) -> Optional[Root]:
                     grad_accum_steps=int(ops.grad_accum_steps),
                     train_loader=train_loader,
                     val_loader=val_loader,
+                    epoch_idx=epoch_idx,
+                    total_epochs=int(ops.epochs),
                 )
                 torch.distributed.barrier(
                     device_ids=[local_rank]
