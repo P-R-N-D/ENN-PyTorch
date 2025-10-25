@@ -736,10 +736,35 @@ class Root(nn.Module):
             c = torch.tensor(
                 float(int(self._x_count.item())), dtype=torch.float64, device=dev
             )
-            if dist.is_initialized():
-                dist.all_reduce(s, op=dist.ReduceOp.SUM)
-                dist.all_reduce(s2, op=dist.ReduceOp.SUM)
-                dist.all_reduce(c, op=dist.ReduceOp.SUM)
+            if dist.is_available() and dist.is_initialized():
+                backend = ""
+                try:
+                    backend = str(dist.get_backend()).lower()
+                except Exception:
+                    backend = ""
+                work_tensors = [s, s2, c]
+                original_devices = [t.device for t in work_tensors]
+                target_device = None
+                if backend == "nccl" and torch.cuda.is_available():
+                    try:
+                        target_device = torch.device("cuda", torch.cuda.current_device())
+                    except Exception:
+                        target_device = torch.device("cuda", 0)
+                if target_device is not None:
+                    work_tensors = [
+                        t.to(device=target_device) if t.device != target_device else t
+                        for t in work_tensors
+                    ]
+                dist.all_reduce(work_tensors[0], op=dist.ReduceOp.SUM)
+                dist.all_reduce(work_tensors[1], op=dist.ReduceOp.SUM)
+                dist.all_reduce(work_tensors[2], op=dist.ReduceOp.SUM)
+                work_tensors = [
+                    t.to(device=original_devices[i])
+                    if t.device != original_devices[i]
+                    else t
+                    for i, t in enumerate(work_tensors)
+                ]
+                s, s2, c = work_tensors
             s = s.cpu()
             s2 = s2.cpu()
             c = float(c.cpu().item())
