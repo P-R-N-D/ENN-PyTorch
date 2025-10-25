@@ -700,7 +700,7 @@ class Root(nn.Module):
                 self._x_sum = torch.zeros(D, dtype=torch.float64)
                 self._x_sum2 = torch.zeros(D, dtype=torch.float64)
                 self._x_count = torch.zeros((), dtype=torch.int64)
-            xnz = torch.nan_to_num(x64, nan=0.0)
+            xnz = torch.nan_to_num(x64, nan=0.0, posinf=0.0, neginf=0.0)
             self._x_sum += xnz.sum(dim=0)
             self._x_sum2 += (xnz * xnz).sum(dim=0)
             self._x_count += int(x64.shape[0])
@@ -953,8 +953,12 @@ class Root(nn.Module):
                         with AutoCast.float(device, enabled=False):
                             out = self.local_net(x_f32)
                 if not torch.isfinite(out.tokens).all() or not torch.isfinite(out.context).all():
-                    out_tokens = torch.nan_to_num(out.tokens)
-                    out_context = torch.nan_to_num(out.context)
+                    out_tokens = torch.nan_to_num(
+                        out.tokens, nan=0.0, posinf=0.0, neginf=0.0
+                    )
+                    out_context = torch.nan_to_num(
+                        out.context, nan=0.0, posinf=0.0, neginf=0.0
+                    )
                 else:
                     out_tokens = out.tokens
                     out_context = out.context
@@ -975,13 +979,13 @@ class Root(nn.Module):
                 raise RuntimeError(
                     "[concat] non-finite tokens/context after local_net forward"
                 )
-            tokens = torch.nan_to_num(tokens)
-            context = torch.nan_to_num(context)
+            tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
+            context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
         assembled = context.view(b, -1)
         if not torch.isfinite(assembled).all():
             if self.training:
                 raise RuntimeError("[assembled] non-finite in training")
-            assembled = torch.nan_to_num(assembled)
+            assembled = torch.nan_to_num(assembled, nan=0.0, posinf=0.0, neginf=0.0)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
@@ -989,7 +993,7 @@ class Root(nn.Module):
         if not torch.isfinite(t).all():
             if self.training:
                 raise RuntimeError("[tokens] non-finite before centering in training")
-            t = torch.nan_to_num(t)
+            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
         tokens = t
         t32 = t.to(torch.float32)
         tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=t.dtype)
@@ -1038,15 +1042,27 @@ class Root(nn.Module):
         if not torch.isfinite(residual).all():
             if self.training:
                 raise RuntimeError("[residual] non-finite in training")
-            residual = torch.nan_to_num(residual)
+            residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
         y_hat_z = assembled + residual
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
             y_hat_z = assembled + residual
+        eps = (
+            float(self.y_eps_range_buf.item())
+            if hasattr(self, "y_eps_range_buf")
+            else 1e-3
+        )
+        eps = min(max(eps, 1e-9), 1.0 - 1e-9)
+        # Guard against configurations that set epsilon above 0.5. The
+        # theoretical logit bounds are symmetric only while `eps <= 0.5`, and
+        # larger values invert the clamp range which would raise at runtime.
+        eps = min(eps, 0.5 - 1e-9)
+        z_max = math.log((1.0 - eps) / eps)
+        y_hat_z = y_hat_z.clamp(min=-z_max, max=z_max)
         if not torch.isfinite(y_hat_z).all():
             if self.training:
                 raise RuntimeError("[y_hat_z] non-finite in training")
-            y_hat_z = torch.nan_to_num(y_hat_z)
+            y_hat_z = torch.nan_to_num(y_hat_z, nan=0.0, posinf=0.0, neginf=0.0)
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
