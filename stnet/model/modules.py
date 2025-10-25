@@ -1248,8 +1248,8 @@ class Root(nn.Module):
         ):
             y_low = self.y_low_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
             y_high = self.y_high_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
-            penalty_hi = F.gelu(y_hat_out - y_high)
-            penalty_lo = F.gelu(y_low - y_hat_out)
+            penalty_hi = F.gelu(y_hat_out - y_high).clamp_min(0)
+            penalty_lo = F.gelu(y_low - y_hat_out).clamp_min(0)
             penalty = (penalty_hi.pow(2) + penalty_lo.pow(2)).mean()
             if torch.isfinite(penalty).all():
                 loss_val = loss_val + self._range_penalty_lambda * penalty
