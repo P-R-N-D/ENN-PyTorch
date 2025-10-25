@@ -2164,7 +2164,7 @@ def main(*args: Any) -> Optional[Root]:
                             local_loss=None,
                             loss_weights=None,
                         )
-                clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", True))
+                clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", False))
                 loss_space = str(
                     getattr(model, "_loss_space", getattr(cfg, "loss_space", ""))
                 ).lower()

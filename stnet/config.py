@@ -79,7 +79,8 @@ class ModelConfig:
     calibrate_init_scale: float = 1.0
     calibrate_init_bias: float = 0.0
     # 추론/저장 시 범위 보장을 위한 사후 클립
-    clip_output_on_serialize: bool = True
+    clip_output_on_serialize: bool = False
+    range_penalty_lambda: float = 1e-3
     # 손실 함수 통계 설정
     loss_std_mode: str = "pooled"
     loss_ddof: int = 1
@@ -364,6 +365,13 @@ def coerce_model_config(
             "clip_output_on_serialize", getattr(defaults, "clip_output_on_serialize")
         ),
         name="clip_output_on_serialize",
+    )
+    args["range_penalty_lambda"] = ensure_float(
+        filtered.get(
+            "range_penalty_lambda", getattr(defaults, "range_penalty_lambda")
+        ),
+        name="range_penalty_lambda",
+        minimum=0.0,
     )
     args["loss_std_mode"] = str(
         filtered.get("loss_std_mode", getattr(defaults, "loss_std_mode"))
