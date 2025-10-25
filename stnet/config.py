@@ -58,7 +58,8 @@ class ModelConfig:
     use_linear_branch: bool = False
     enable_compilation: bool = False
     compile_mode: str = "default"
-    loss_space: str = "logit"
+    # 학습 공간: {"z", "logit", "y"} — 기본값은 z-score 회귀
+    loss_space: str = "z"
     y_low: float = 0.0
     y_high: float = 100.0
     # 경계 여유: 절대/상대 병행(둘 중 큰 값 적용)
@@ -71,8 +72,14 @@ class ModelConfig:
     # A/B 여유 확장(비율)
     y_range_margin_low: float = 0.10
     y_range_margin_high: float = 0.05
-    # 로짓 z 규제(과도 포화 억제)
-    z_reg_lambda: float = 1e-3
+    # 로짓/z 회귀 값 규제(숫자 폭주 억제)
+    z_reg_lambda: float = 1e-2
+    # 출력 보정 헤드(Scale/Bias)
+    calibrate_output: bool = True
+    calibrate_init_scale: float = 1.0
+    calibrate_init_bias: float = 0.0
+    # 추론/저장 시 범위 보장을 위한 사후 클립
+    clip_output_on_serialize: bool = True
     # 손실 함수 통계 설정
     loss_std_mode: str = "pooled"
     loss_ddof: int = 1
@@ -337,6 +344,26 @@ def coerce_model_config(
         filtered.get("z_reg_lambda", getattr(defaults, "z_reg_lambda")),
         name="z_reg_lambda",
         minimum=0.0,
+    )
+    args["calibrate_output"] = ensure_bool(
+        filtered.get("calibrate_output", getattr(defaults, "calibrate_output")),
+        name="calibrate_output",
+    )
+    args["calibrate_init_scale"] = ensure_float(
+        filtered.get(
+            "calibrate_init_scale", getattr(defaults, "calibrate_init_scale")
+        ),
+        name="calibrate_init_scale",
+    )
+    args["calibrate_init_bias"] = ensure_float(
+        filtered.get("calibrate_init_bias", getattr(defaults, "calibrate_init_bias")),
+        name="calibrate_init_bias",
+    )
+    args["clip_output_on_serialize"] = ensure_bool(
+        filtered.get(
+            "clip_output_on_serialize", getattr(defaults, "clip_output_on_serialize")
+        ),
+        name="clip_output_on_serialize",
     )
     args["loss_std_mode"] = str(
         filtered.get("loss_std_mode", getattr(defaults, "loss_std_mode"))

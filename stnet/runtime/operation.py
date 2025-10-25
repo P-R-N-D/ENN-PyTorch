@@ -1039,6 +1039,15 @@ def epoch(
                                 local_loss=bottom_loss,
                                 loss_weights=(alpha, beta),
                             )
+                            if step_idx == 0:
+                                try:
+                                    _float8_log(
+                                        f"[train] space={getattr(cfg, 'loss_space', 'z')} "
+                                        f"calib={getattr(cfg, 'calibrate_output', True)} "
+                                        f"z_reg={getattr(cfg, 'z_reg_lambda', 1e-2)}"
+                                    )
+                                except Exception:
+                                    pass
                             quantile_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
                             def _ensure_quantiles(
@@ -2155,6 +2164,19 @@ def main(*args: Any) -> Optional[Root]:
                             local_loss=None,
                             loss_weights=None,
                         )
+                clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", True))
+                loss_space = str(
+                    getattr(model, "_loss_space", getattr(cfg, "loss_space", ""))
+                ).lower()
+                if (
+                    clip_outputs
+                    and loss_space not in {"logit"}
+                    and hasattr(model, "y_low_buf")
+                    and hasattr(model, "y_high_buf")
+                ):
+                    low = float(model.y_low_buf.item())
+                    high = float(model.y_high_buf.item())
+                    y_hat = y_hat.clamp(min=low, max=high)
                 preds.append(y_hat.detach().cpu())
                 if use_timer:
                     ev_e.record()
