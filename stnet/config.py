@@ -81,7 +81,7 @@ class ModelConfig:
     loss_t_df_start: float = 3.0
     loss_t_df_end: float = 6.0
     loss_t_confidence: float = 0.995
-    loss_z_penalty: str = "huber"
+    loss_z_penalty: str = "softmax"
     loss_z_tau: float = 1.5
     # 보조(비대칭) 손실: Quantile(τ>0.5면 과소예측 가중↑)
     aux_q_enable: bool = True
@@ -363,11 +363,11 @@ def coerce_model_config(
         minimum=1e-06,
         maximum=0.999999,
     )
-    args["loss_z_penalty"] = str(
-        filtered.get("loss_z_penalty", getattr(defaults, "loss_z_penalty"))
-    ).lower()
-    if args["loss_z_penalty"] not in {"softplus", "huber"}:
-        raise ValueError("loss_z_penalty must be 'softplus' or 'huber'")
+    pz = str(filtered.get("loss_z_penalty", getattr(defaults, "loss_z_penalty"))).lower()
+    allowed = {"hinge","tau","soft","softplus"}
+    if pz not in allowed:
+        raise ValueError(f"loss_z_penalty must be one of {sorted(allowed)}")
+    args["loss_z_penalty"] = pz
     args["loss_z_tau"] = ensure_float(
         filtered.get("loss_z_tau", getattr(defaults, "loss_z_tau")),
         name="loss_z_tau",
