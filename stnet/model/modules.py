@@ -529,6 +529,23 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
+    @staticmethod
+    def _reshape_calib_params(
+        module: "Root",
+        state_dict: Dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        for name in ("calib_scale", "calib_bias"):
+            key = prefix + name
+            tensor = state_dict.get(key)
+            if isinstance(tensor, torch.Tensor) and tensor.ndim == 0:
+                state_dict[key] = tensor.reshape(1)
+
     def __init__(
         self,
         in_dim: int,
@@ -557,6 +574,7 @@ class Root(nn.Module):
         self.calib_bias = nn.Parameter(
             torch.ones(1, dtype=torch.float32) * c_bias, requires_grad=self._calib_enable
         )
+        self._register_load_state_dict_pre_hook(self._reshape_calib_params)
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
