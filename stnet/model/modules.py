@@ -850,6 +850,19 @@ class Root(nn.Module):
     def _to_logit_range(self, y: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
         B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
+        if (
+            not torch.isfinite(A).all().item()
+            or not torch.isfinite(B).all().item()
+            or not bool((B > A).all().item())
+        ):
+            base_low = float(self._y_low)
+            base_high = float(self._y_high)
+            if (not math.isfinite(base_low)) or (not math.isfinite(base_high)) or (
+                base_high <= base_low
+            ):
+                base_low, base_high = 0.0, 100.0
+            A = y.new_tensor(base_low)
+            B = y.new_tensor(base_high)
         span = float((B - A).abs().item())
         eps_abs = float(self.y_eps_range_buf.item())
         eps_rel = float(max(0.0, self._y_eps_rel)) * span
@@ -866,6 +879,19 @@ class Root(nn.Module):
     def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
         B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
+        if (
+            not torch.isfinite(A).all().item()
+            or not torch.isfinite(B).all().item()
+            or not bool((B > A).all().item())
+        ):
+            base_low = float(self._y_low)
+            base_high = float(self._y_high)
+            if (not math.isfinite(base_low)) or (not math.isfinite(base_high)) or (
+                base_high <= base_low
+            ):
+                base_low, base_high = 0.0, 100.0
+            A = z.new_tensor(base_low)
+            B = z.new_tensor(base_high)
         span = float((B - A).abs().item())
         eps_abs = float(self.y_eps_range_buf.item())
         eps_rel = float(max(0.0, self._y_eps_rel)) * span
@@ -873,7 +899,8 @@ class Root(nn.Module):
         max_eps = max(1e-9, 0.5 * span - 1e-9)
         eps = min(eps, max_eps)
         eps_val = torch.tensor(eps, device=z.device, dtype=z.dtype)
-        return torch.sigmoid(z) * (B - A + 2.0 * eps_val) + (A - eps_val)
+        y = torch.sigmoid(z) * (B - A + 2.0 * eps_val) + (A - eps_val)
+        return torch.clamp(y, min=A, max=B)
 
     def forward(
         self,
