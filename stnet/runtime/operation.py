@@ -1491,7 +1491,7 @@ def main(*args: Any) -> Optional[Root]:
         detach_stats = bool(getattr(cfg, "loss_detach_stats", True))
         clamp_max = float(getattr(cfg, "loss_clamp_max", 6.0))
         loss_t_conf = float(getattr(cfg, "loss_t_confidence", 0.995))
-        loss_z_penalty = str(getattr(cfg, "loss_z_penalty", "huber")).lower()
+        loss_z_penalty = str(getattr(cfg, "loss_z_penalty", "softplus")).lower()
         loss_z_tau = float(getattr(cfg, "loss_z_tau", 1.5))
         df_start = float(getattr(cfg, "loss_t_df_start", 3.0))
         df_end = float(getattr(cfg, "loss_t_df_end", 6.0))
