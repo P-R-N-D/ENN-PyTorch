@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch import nn
 
 from ..utils.compat import patch_torch
@@ -544,6 +545,9 @@ class Root(nn.Module):
         self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
         self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.02))
         self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 1e-2))
+        self._range_penalty_lambda = float(
+            getattr(config, "range_penalty_lambda", 0.0)
+        )
         self._calib_enable = bool(getattr(config, "calibrate_output", True))
         c_scale = float(getattr(config, "calibrate_init_scale", 1.0))
         c_bias = float(getattr(config, "calibrate_init_bias", 0.0))
@@ -1237,6 +1241,18 @@ class Root(nn.Module):
                         device=y_hat_out.device, dtype=y_hat_out.dtype
                     ),
                 )
+        if (
+            not is_cls_loss
+            and isinstance(loss_val, torch.Tensor)
+            and self._range_penalty_lambda > 0.0
+        ):
+            y_low = self.y_low_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
+            y_high = self.y_high_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
+            penalty_hi = F.relu(y_hat_out - y_high)
+            penalty_lo = F.relu(y_low - y_hat_out)
+            penalty = (penalty_hi.pow(2) + penalty_lo.pow(2)).mean()
+            if torch.isfinite(penalty).all():
+                loss_val = loss_val + self._range_penalty_lambda * penalty
         if (
             not is_cls_loss
             and self._z_reg_lambda > 0.0
