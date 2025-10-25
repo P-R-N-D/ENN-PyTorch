@@ -929,9 +929,23 @@ def epoch(
                         scaler.scale(loss_for_backprop).backward()
                         if should_sync:
                             scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                model.parameters(), max_norm=1.0, foreach=False
-                            )
+                            clip_max_norm = 1.0
+                            clip_fn = getattr(model, "clip_grad_norm_", None)
+                            if callable(clip_fn):
+                                try:
+                                    clip_fn(clip_max_norm)
+                                except (TypeError, RuntimeError):
+                                    torch.nn.utils.clip_grad_norm_(
+                                        model.parameters(),
+                                        max_norm=clip_max_norm,
+                                        foreach=False,
+                                    )
+                            else:
+                                torch.nn.utils.clip_grad_norm_(
+                                    model.parameters(),
+                                    max_norm=clip_max_norm,
+                                    foreach=False,
+                                )
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad(set_to_none=True)
