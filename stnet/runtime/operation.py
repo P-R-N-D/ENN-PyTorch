@@ -701,6 +701,13 @@ def epoch(
     if train_loader is None:
         raise RuntimeError("epoch requires a training dataloader")
     in_dim = int(ops.in_dim)
+    cfg_source = getattr(ops, "cfg_dict", None)
+    if isinstance(cfg_source, ModelConfig):
+        cfg_dict = asdict(cfg_source)
+    elif isinstance(cfg_source, dict):
+        cfg_dict = dict(cfg_source)
+    else:
+        cfg_dict = {}
     flop_breakdown_epoch: Dict[str, float] = {}
     io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -785,6 +792,23 @@ def epoch(
                                 local_loss=bottom_loss,
                                 loss_weights=loss_controller.weights(),
                             )
+                            if (
+                                loss_val is not None
+                                and bool(cfg_dict.get("aux_q_enable", True))
+                            ):
+                                w_aux = float(cfg_dict.get("aux_q_weight", 0.05))
+                                if w_aux > 0.0:
+                                    tau = float(cfg_dict.get("aux_q_tau", 0.7))
+                                    pred = y_hat.reshape_as(Y_flat)
+                                    target = Y_flat
+                                    e = target - pred
+                                    tau_tensor = pred.new_tensor(tau)
+                                    aux = torch.where(
+                                        e >= 0,
+                                        tau_tensor * e,
+                                        (tau_tensor - 1.0) * e,
+                                    )
+                                    loss_val = loss_val + pred.new_tensor(w_aux) * aux.mean()
                         accum_scale = max(1, grad_accum_steps)
                         loss_for_backprop = loss_val / float(accum_scale)
                         scaler.scale(loss_for_backprop).backward()
@@ -1078,16 +1102,21 @@ def main(*args: Any) -> Optional[Root]:
             and hasattr(model, "set_y_range")
             and train_loader0 is not None
         ):
-            q_low = float(getattr(cfg, "y_range_q_low", 0.005))
-            q_high = float(getattr(cfg, "y_range_q_high", 0.995))
+            q_low = float(getattr(cfg, "y_range_q_low", 0.001))
+            q_high = float(getattr(cfg, "y_range_q_high", 0.999))
             eps = float(getattr(cfg, "y_eps_range", 1e-3))
             try:
                 lo, hi = compute_y_range(train_loader0, q_low=q_low, q_high=q_high)
             except Exception as exc:  # pragma: no cover - defensive path
                 warnings.warn(f"auto_y_range failed: {exc}")
             else:
+                span = float(hi - lo)
+                m_low = float(getattr(cfg, "y_range_margin_low", 0.0)) * span
+                m_high = float(getattr(cfg, "y_range_margin_high", 0.0)) * span
+                A = float(lo) - m_low
+                B = float(hi) + m_high
                 try:
-                    model.set_y_range(lo, hi, eps)
+                    model.set_y_range(A, B, eps)
                 except Exception as exc:  # pragma: no cover - defensive path
                     warnings.warn(f"set_y_range failed: {exc}")
         train_step_count = 0
@@ -1292,13 +1321,14 @@ def main(*args: Any) -> Optional[Root]:
                         optim_sd,
                         options=StateDictOptions(strict=False),
                     )
+        std_mode = str(getattr(cfg, "loss_std_mode", "pooled")).lower()
         _t = StudentsTLoss(
             confidence=0.99,
             metric="t_value",
             two_tailed=True,
             df=4,
             mu_mode="error",
-            std_mode="pooled",
+            std_mode=std_mode,
             ddof=1,
             clamp_max=8.0,
             detach_stats=True,
@@ -1312,7 +1342,7 @@ def main(*args: Any) -> Optional[Root]:
             penalty="softplus",
             tau=1.0,
             mu_mode="error",
-            std_mode="pooled",
+            std_mode=std_mode,
             ddof=1,
             clamp_max=8.0,
             detach_stats=True,

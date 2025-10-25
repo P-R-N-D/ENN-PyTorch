@@ -542,6 +542,8 @@ class Root(nn.Module):
         self._y_low = float(getattr(config, "y_low", 0.0))
         self._y_high = float(getattr(config, "y_high", 100.0))
         self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
+        self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.01))
+        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 0.0))
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -848,7 +850,12 @@ class Root(nn.Module):
     def _to_logit_range(self, y: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
         B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
-        eps = float(self.y_eps_range_buf.item())
+        eps_abs = float(self.y_eps_range_buf.item())
+        span = (B - A).abs().item()
+        eps_rel = float(max(0.0, self._y_eps_rel)) * float(span)
+        eps = float(max(eps_abs, eps_rel))
+        eps = max(eps, 1e-9)
+        eps = min(eps, 0.5 - 1e-9)
         y01 = (y - A + eps) / (B - A + 2.0 * eps)
         y01 = torch.clamp(y01, min=eps, max=1.0 - eps)
         return torch.log(y01 / (1.0 - y01))
@@ -856,7 +863,12 @@ class Root(nn.Module):
     def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
         B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
-        eps = float(self.y_eps_range_buf.item())
+        eps_abs = float(self.y_eps_range_buf.item())
+        span = (B - A).abs().item()
+        eps_rel = float(max(0.0, self._y_eps_rel)) * float(span)
+        eps = float(max(eps_abs, eps_rel))
+        eps = max(eps, 1e-9)
+        eps = min(eps, 0.5 - 1e-9)
         y01 = torch.sigmoid(z)
         return y01 * (B - A + 2.0 * eps) + (A - eps)
 
@@ -1163,6 +1175,8 @@ class Root(nn.Module):
             if controller is not None:
                 controller.update(top_component, bottom_component)
             loss_val = total
+            if self._loss_space == "logit" and self._z_reg_lambda > 0.0:
+                loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
         elif net_loss is not None and labels_flat is not None:
             if is_cls_loss:
                 tgt = labels_flat.to(device=y_hat_out.device).long()
@@ -1171,6 +1185,8 @@ class Root(nn.Module):
                 tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 tgt = self._to_logit_range(tgt)
                 loss_val = net_loss(y_hat_z, tgt)
+                if self._z_reg_lambda > 0.0:
+                    loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
             elif self._loss_space == "z" and self.has_valid_y_stats():
                 mu_lbl = self.y_mean.to(
                     device=y_hat_z.device, dtype=y_hat_z.dtype
