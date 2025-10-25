@@ -1656,25 +1656,14 @@ def main(*args: Any) -> Optional[Root]:
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
         ) -> Optional[torch.nn.Module]:
-            nonlocal model
-            if target is None or id(target) in wrapped:
-                return target
-            if getattr(target, "_fsdp_applied", False):
-                return target
-            wrapped.add(id(target))
-            setattr(target, "_fsdp_applied", True)
-            per_mod_ignored = _per_module_ignored_params(target)
+            if getattr(module, "_fsdp_applied", False):
+                return module
             sharded = fully_shard(
-                target,
-                mesh=mesh,
-                mp_policy=mp_policy,
+                module, mesh=mesh, mp_policy=mp_policy,
+                ignored_params=(ignored_param_registry if len(ignored_param_registry) > 0 else None),
                 reshard_after_forward=False,
-                ignored_params=per_mod_ignored or None,
             )
-            sharded.set_requires_gradient_sync(True)
             setattr(sharded, "_fsdp_applied", True)
-            if target is model:
-                model = sharded
             return sharded
 
         def _collect_block_modules(
