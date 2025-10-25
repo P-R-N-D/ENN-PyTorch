@@ -73,11 +73,20 @@ def _safe_clip_grad_norm(
     norm_vals = []
     if norm_type == float("inf"):
         for grad in grads:
-            norm_vals.append(grad.detach().abs().max())
+            norm_vals.append(
+                grad.detach()
+                .abs()
+                .max()
+                .to(device="cpu", dtype=torch.float32)
+            )
         total_norm_tensor = torch.stack(norm_vals).max()
     else:
         for grad in grads:
-            norm_vals.append(grad.detach().norm(norm_type))
+            norm_vals.append(
+                grad.detach()
+                .norm(norm_type)
+                .to(device="cpu", dtype=torch.float32)
+            )
         total_norm_tensor = torch.stack(norm_vals).norm(norm_type)
 
     total_norm = float(total_norm_tensor)
