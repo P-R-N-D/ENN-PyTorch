@@ -1035,9 +1035,10 @@ def epoch(
                             y_hat, loss_val = model(
                                 X,
                                 Y_flat,
-                                global_loss=top_loss,
-                                local_loss=bottom_loss,
-                                loss_weights=(alpha, beta),
+                                None,
+                                top_loss,
+                                bottom_loss,
+                                (alpha, beta),
                             )
                             if step_idx == 0:
                                 try:
@@ -1318,9 +1319,10 @@ def epoch(
                             _y, _loss_val = model(
                                 X,
                                 Yv_flat,
-                                global_loss=top_loss,
-                                local_loss=bottom_loss,
-                                loss_weights=(alpha, beta),
+                                None,
+                                top_loss,
+                                bottom_loss,
+                                (alpha, beta),
                             )
                         if use_timer:
                             ev_e.record()
@@ -2141,9 +2143,10 @@ def main(*args: Any) -> Optional[Root]:
                         y_hat, _ = model(
                             X,
                             None,
-                            global_loss=None,
-                            local_loss=None,
-                            loss_weights=None,
+                            None,
+                            None,
+                            None,
+                            None,
                         )
                 clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", False))
                 loss_space = str(

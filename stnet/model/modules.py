@@ -978,13 +978,11 @@ class Root(nn.Module):
         self,
         features: torch.Tensor,
         labels_flat: Optional[torch.Tensor] = None,
-        *args: Any,
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[
-            Union[Tuple[float, float], LossWeightPolicy]
-        ] = None,
+        loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
+        *args: Any,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         features = self._normalize_inputs(features)
