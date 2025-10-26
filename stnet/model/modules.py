@@ -987,6 +987,12 @@ class Root(nn.Module):
         ] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        _ = labels_flat
+        _ = net_loss
+        _ = global_loss
+        _ = local_loss
+        _ = loss_weights
+        kwargs.clear()
         features = self._normalize_inputs(features)
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.view(features.shape[0], -1)
