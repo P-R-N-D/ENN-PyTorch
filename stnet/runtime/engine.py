@@ -35,6 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed._tensor import DTensor, Placement, Replicate
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
@@ -806,6 +807,74 @@ def main(*args: Any) -> Optional[Root]:
 
         wrapped: set[int] = set()
 
+        def _ensure_dtensor(
+            param: torch.nn.Parameter,
+            *,
+            placements: Optional[Sequence[Placement]] = None,
+        ) -> None:
+            if not isinstance(param, torch.nn.Parameter):
+                return
+
+            current_dtensor: Optional[DTensor]
+            current_dtensor = param.data if isinstance(param.data, DTensor) else None
+            placements_tuple: Optional[Tuple[Placement, ...]]
+            placements_tuple = tuple(placements) if placements is not None else None
+
+            if current_dtensor is None:
+                # FSDP flat parameters already carry sharding metadata which must be
+                # preserved.  When we see attributes that indicate FSDP ownership we
+                # leave the tensor untouched instead of forcing a replicated layout,
+                # otherwise the optimizer/checkpoint state would lose the original
+                # sharding information.
+                if (
+                    getattr(param, "_is_sharded", False)
+                    or hasattr(param, "_sharding_spec")
+                    or param.__class__.__name__ == "FlatParameter"
+                ):
+                    return
+
+                placements_tuple = placements_tuple or (Replicate(),)
+                try:
+                    current_dtensor = DTensor.from_local(
+                        param.data,
+                        mesh,
+                        placements_tuple,
+                        run_check=False,
+                    )
+                except Exception:
+                    return
+                param.data = current_dtensor
+            else:
+                # Honor explicitly requested placements when they differ from the
+                # existing DTensor layout by attempting a redistribution.  Fallback
+                # to the original DTensor layout if redistribution fails so we do
+                # not drop gradients entirely.
+                if placements_tuple is not None and tuple(current_dtensor.placements) != placements_tuple:
+                    try:
+                        current_dtensor = current_dtensor.redistribute(
+                            device_mesh=current_dtensor.device_mesh,
+                            placements=placements_tuple,
+                        )
+                        param.data = current_dtensor
+                    except Exception:
+                        placements_tuple = tuple(current_dtensor.placements)
+
+            if placements_tuple is None and current_dtensor is not None:
+                placements_tuple = tuple(current_dtensor.placements)
+
+            grad = param.grad
+            if grad is not None and not isinstance(grad, DTensor):
+                target_mesh = mesh if current_dtensor is None else current_dtensor.device_mesh
+                try:
+                    param.grad = DTensor.from_local(
+                        grad,
+                        target_mesh,
+                        placements_tuple or (Replicate(),),
+                        run_check=False,
+                    )
+                except Exception:
+                    param.grad = None
+
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
         ) -> Optional[torch.nn.Module]:
@@ -859,6 +928,13 @@ def main(*args: Any) -> Optional[Root]:
                 reshard_after_forward=False,
             )
             model.set_requires_gradient_sync(True)
+
+        for ignored_param in ignored_param_registry:
+            _ensure_dtensor(ignored_param, placements=(Replicate(),))
+
+        for parameter in model.parameters():
+            _ensure_dtensor(parameter)
+
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
