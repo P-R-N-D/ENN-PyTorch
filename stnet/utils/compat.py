@@ -147,10 +147,8 @@ class TorchCompat:
                 self.eps = float(eps)
                 self.weight = nn_mod.Parameter(torch_mod.ones(d_model))
 
-            def forward(self, x: Any) -> Any:
-                inv_rms = (
-                    x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-                )
+            def forward(self, x: Any, *args, **kwargs) -> Any:
+                inv_rms = (x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt())
                 return x * inv_rms * self.weight
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
