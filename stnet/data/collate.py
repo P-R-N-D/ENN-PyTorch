@@ -236,7 +236,7 @@ def _iterate_flight_batches(
         features_arr = record_batch.column(0)
         features_np = _ARROW.to_numpy(features_arr, zero_copy_only=False)
         if isinstance(features_np, np.ndarray) and features_np.dtype == object:
-            features_np = np.array(features_arr.to_pylist(), dtype=np.float32)
+            features_np = np.array(features_arr.to_pylist(), dtype=np.float64)
         if not isinstance(features_np, np.ndarray):
             features_np = np.array(features_np, copy=True)
         if (
@@ -252,7 +252,7 @@ def _iterate_flight_batches(
         labels_arr = record_batch.column(1)
         labels_np = _ARROW.to_numpy(labels_arr, zero_copy_only=False)
         if isinstance(labels_np, np.ndarray) and labels_np.dtype == object:
-            labels_np = np.array(labels_arr.to_pylist(), dtype=np.float32)
+            labels_np = np.array(labels_arr.to_pylist(), dtype=np.float64)
         if not isinstance(labels_np, np.ndarray):
             labels_np = np.array(labels_np, copy=True)
         if (

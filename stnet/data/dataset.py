@@ -172,8 +172,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = to(meta.get("features_arrow_dtype", "float32"), "torch")
-        label_dtype = to(meta.get("labels_arrow_dtype", "float32"), "torch")
+        feat_dtype = to(meta.get("features_arrow_dtype", "float64"), "torch")
+        label_dtype = to(meta.get("labels_arrow_dtype", "float64"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -214,8 +214,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = to(meta.get("features_arrow_dtype", "float32"), "torch")
-        label_dtype = to(meta.get("labels_arrow_dtype", "float32"), "torch")
+        feat_dtype = to(meta.get("features_arrow_dtype", "float64"), "torch")
+        label_dtype = to(meta.get("labels_arrow_dtype", "float64"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )

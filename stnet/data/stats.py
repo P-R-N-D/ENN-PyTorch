@@ -267,13 +267,13 @@ def recompute_y_stats(
             with contextlib.suppress(Exception):
                 attr.data.copy_(value.to(device=attr.device, dtype=attr.dtype))
 
-    _copy_to_model("y_min", y_min.to(dtype=torch.float32))
-    _copy_to_model("y_max", y_max.to(dtype=torch.float32))
+    _copy_to_model("y_min", y_min.to(dtype=torch.float64))
+    _copy_to_model("y_max", y_max.to(dtype=torch.float64))
     _copy_to_model("y_sum", y_sum)
     _copy_to_model("y_sum2", y_sum2)
     _copy_to_model("y_count", y_count)
-    _copy_to_model("y_mean", y_mean.to(dtype=torch.float32))
-    _copy_to_model("y_std", y_std.to(dtype=torch.float32))
+    _copy_to_model("y_mean", y_mean.to(dtype=torch.float64))
+    _copy_to_model("y_std", y_std.to(dtype=torch.float64))
 
     attr_ready = getattr(model, "y_stats_ready", None)
     if isinstance(attr_ready, torch.Tensor):
@@ -281,13 +281,13 @@ def recompute_y_stats(
             attr_ready.fill_(ready)
 
     if metadata is not None:
-        metadata.set_stat("y_min", y_min.to(dtype=torch.float32))
-        metadata.set_stat("y_max", y_max.to(dtype=torch.float32))
+        metadata.set_stat("y_min", y_min.to(dtype=torch.float64))
+        metadata.set_stat("y_max", y_max.to(dtype=torch.float64))
         metadata.set_stat("y_sum", y_sum)
         metadata.set_stat("y_sum2", y_sum2)
         metadata.set_stat("y_count", y_count)
-        metadata.set_stat("y_mean", y_mean.to(dtype=torch.float32))
-        metadata.set_stat("y_std", y_std.to(dtype=torch.float32))
+        metadata.set_stat("y_mean", y_mean.to(dtype=torch.float64))
+        metadata.set_stat("y_std", y_std.to(dtype=torch.float64))
 
 
 def inverse_y_from_stats(

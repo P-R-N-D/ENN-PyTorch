@@ -379,7 +379,7 @@ def _preprocess_feature_row(x_tuple: Any) -> torch.Tensor:
     for value in values:
         if not math.isfinite(value):
             raise ValueError("preprocess: feature tuples must be finite")
-    tensor = torch.as_tensor(values, dtype=torch.float32)
+    tensor = torch.as_tensor(values, dtype=torch.float64)
     return _ensure_finite_tensor(tensor, "feature")
 
 def _preprocess_maybe_batch(
@@ -413,7 +413,7 @@ def _preprocess_maybe_batch(
     if not isinstance(label_tensor, torch.Tensor):
         return None
     feature_tensor = _ensure_finite_tensor(
-        feature_tensor.detach().to(dtype=torch.float32), "feature"
+        feature_tensor.detach().to(dtype=torch.float64), "feature"
     )
     if feature_tensor.dim() == 0:
         feature_tensor = feature_tensor.reshape(1, 1)

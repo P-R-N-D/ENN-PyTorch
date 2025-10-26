@@ -35,6 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed._tensor import DTensor, Replicate
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
@@ -806,6 +807,33 @@ def main(*args: Any) -> Optional[Root]:
 
         wrapped: set[int] = set()
 
+        def _ensure_replicated_dtensor(param: torch.nn.Parameter) -> None:
+            if not isinstance(param, torch.nn.Parameter):
+                return
+            if isinstance(param.data, DTensor):
+                return
+            try:
+                distributed = DTensor.from_local(
+                    param.data,
+                    mesh,
+                    (Replicate(),),
+                    run_check=False,
+                )
+            except Exception:
+                return
+            param.data = distributed
+            grad = param.grad
+            if grad is not None and not isinstance(grad, DTensor):
+                try:
+                    param.grad = DTensor.from_local(
+                        grad,
+                        mesh,
+                        (Replicate(),),
+                        run_check=False,
+                    )
+                except Exception:
+                    param.grad = None
+
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
         ) -> Optional[torch.nn.Module]:
@@ -859,6 +887,13 @@ def main(*args: Any) -> Optional[Root]:
                 reshard_after_forward=False,
             )
             model.set_requires_gradient_sync(True)
+
+        for ignored_param in ignored_param_registry:
+            _ensure_replicated_dtensor(ignored_param)
+
+        for parameter in model.parameters():
+            _ensure_replicated_dtensor(parameter)
+
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
