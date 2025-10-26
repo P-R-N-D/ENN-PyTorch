@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import sys as _sys
 from typing import Any
 
 from ..config import (
@@ -58,9 +57,6 @@ def infer(*args: Any, **kwargs: Any) -> Any:
 
 from . import launch as launch
 
-operation = launch
-_sys.modules[f"{__name__}.operation"] = operation
-
 api = launch
 
 __all__ = [
@@ -78,6 +74,5 @@ __all__ = [
     "predict",
     "infer",
     "launch",
-    "operation",
     "api",
 ]
