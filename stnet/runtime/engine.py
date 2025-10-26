@@ -943,9 +943,31 @@ def main(*args: Any) -> Optional[Root]:
             metadata=metadata,
             logger=None,
         )
+        def _prime_adam_like_state(optim: torch.optim.Optimizer) -> None:
+            """Eagerly initialize Adam/AdamW optimizer state to avoid lazy step()."""
+
+            for group in optim.param_groups:
+                amsgrad = group.get("amsgrad", False)
+                for param in group["params"]:
+                    if not getattr(param, "requires_grad", False):
+                        continue
+
+                    state = optim.state.get(param)
+                    if state and {"exp_avg", "exp_avg_sq"}.issubset(state):
+                        continue
+
+                    state = {} if state is None else state
+                    state.setdefault("step", 0)
+                    state.setdefault("exp_avg", torch.zeros_like(param))
+                    state.setdefault("exp_avg_sq", torch.zeros_like(param))
+                    if amsgrad:
+                        state.setdefault("max_exp_avg_sq", torch.zeros_like(param))
+                    optim.state[param] = state
+
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
+                _prime_adam_like_state(optimizer)
                 optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
                 try:
                     load(
