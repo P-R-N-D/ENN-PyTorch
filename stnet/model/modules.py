@@ -70,9 +70,9 @@ class PointTransformer(nn.Module):
     ) -> torch.Tensor:
         if coords.shape[:2] != x.shape[:2]:
             raise ValueError("coords must have shape (B, N, C)")
-        y = self.attn(self.norm1(x), coords, attn_mask=attn_mask)
+        y = self.attn(self.norm1.forward(x), coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2.forward(x))))
         return x
 
 
@@ -170,10 +170,10 @@ class TemporalEncoderBlock(nn.Module):
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         h, state = self.retention(
-            self.norm1(x), attn_mask=causal_mask, state=state
+            self.norm1.forward(x), attn_mask=causal_mask, state=state
         )
         x = x + self.drop_path(self.dropout(h))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2.forward(x))))
         return x, state
 
 
@@ -218,7 +218,7 @@ class TemporalEncoder(nn.Module):
         next_state = state
         for blk in self.blocks:
             x, next_state = blk(x, causal_mask=causal_mask, state=next_state)
-        x = self.norm(x)
+        x = self.norm.forward(x)
         if return_state:
             return x, next_state
         return x
@@ -271,7 +271,7 @@ class CrossTransformer(nn.Module):
                 ],
                 dim=-1,
             )
-            fused = self.mix(self.mix_norm(base))
+            fused = self.mix(self.mix_norm.forward(base))
             return t_context + self.drop_path(self.dropout(fused))
         base = torch.cat(
             [
@@ -282,7 +282,7 @@ class CrossTransformer(nn.Module):
             ],
             dim=-1,
         )
-        fused = self.mix(self.mix_norm(base))
+        fused = self.mix(self.mix_norm.forward(base))
         return s_context + self.drop_path(self.dropout(fused))
 
 @dataclass
@@ -321,10 +321,10 @@ class GlobalEncoderBlock(nn.Module):
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         h, state = self.retention(
-            self.norm1(x), attn_mask=causal_mask, state=state
+            self.norm1.forward(x), attn_mask=causal_mask, state=state
         )
         x = x + self.drop_path(self.dropout(h))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+        x = x + self.drop_path(self.dropout(self.ffn(self.norm2.forward(x))))
         return x, state
 
 class GlobalEncoder(nn.Module):
@@ -367,7 +367,7 @@ class GlobalEncoder(nn.Module):
         next_state = state
         for blk in self.blocks:
             tokens, next_state = blk(tokens, causal_mask=None, state=next_state)
-        tokens = self.norm(tokens)
+        tokens = self.norm.forward(tokens)
         if return_state:
             return tokens, next_state
         return tokens
@@ -479,8 +479,8 @@ class LocalProcessor(nn.Module):
             B, self.temporal_tokens, self.d_model
         )
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
-        spatial_out = self.spatial_encoder(spatial_tokens, coords)
-        temporal_out = self.temporal_encoder(temporal_tokens)
+        spatial_out = self.spatial_encoder.forward(spatial_tokens, coords)
+        temporal_out = self.temporal_encoder.forward(temporal_tokens)
         mode = self.modeling_type
         if mode == "sxs":
             tokens = spatial_out
@@ -492,7 +492,7 @@ class LocalProcessor(nn.Module):
             tokens = self.perception(spatial_out, temporal_out, mode="sxt")
         else:
             raise RuntimeError(f"Unhandled modeling type '{mode}'")
-        tokens = self.norm(tokens)
+        tokens = self.norm.forward(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         context = flat.view(B, *self.out_shape)
@@ -510,7 +510,7 @@ class LocalProcessor(nn.Module):
         self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
     ) -> torch.Tensor:
         if apply_norm:
-            tokens = self.norm(tokens)
+            tokens = self.norm.forward(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         return flat.view(tokens.shape[0], *self.out_shape)
@@ -1019,7 +1019,7 @@ class Root(nn.Module):
                     device, dtype=base_dtype, non_blocking=True
                 )
                 with AutoCast.float(device, enabled=amp_enabled):
-                    out: Payload = self.local_net(x_slice)
+                    out: Payload = self.local_net.forward(x_slice)
                 if (not torch.isfinite(out.tokens).all()) or (
                     not torch.isfinite(out.context).all()
                 ):
@@ -1058,7 +1058,7 @@ class Root(nn.Module):
                     stack.enter_context(
                         AutoCast.float(device, enabled=amp_enabled)
                     )
-                    out = self.local_net(x_slice)
+                    out = self.local_net.forward(x_slice)
                 if (not torch.isfinite(out.tokens).all()) or (
                     not torch.isfinite(out.context).all()
                 ):
@@ -1114,12 +1114,12 @@ class Root(nn.Module):
         if infer_mode:
             with inference(self.global_net):
                 with AutoCast.float(device, enabled=amp_enabled):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens = self.global_net.forward(tokens_centered)
             if not torch.isfinite(refined_tokens).all():
                 tokens_centered = tokens_centered.to(dtype=torch.float32)
                 with inference(self.global_net):
                     with AutoCast.float(device, enabled=False):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens = self.global_net.forward(tokens_centered)
             decode_tokens = refined_tokens.detach().clone()
             with inference(self.local_net):
                 with AutoCast.float(device, enabled=amp_enabled):
@@ -1137,11 +1137,11 @@ class Root(nn.Module):
             # Train path: autograd ON
             with torch.enable_grad():
                 with AutoCast.float(device, enabled=amp_enabled):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens = self.global_net.forward(tokens_centered)
                 if not torch.isfinite(refined_tokens).all():
                     tokens_centered = tokens_centered.to(dtype=torch.float32)
                     with AutoCast.float(device, enabled=False):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens = self.global_net.forward(tokens_centered)
                 with AutoCast.float(device, enabled=amp_enabled):
                     residual_context = self.local_net.decode(
                         refined_tokens, apply_norm=True
