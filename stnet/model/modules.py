@@ -578,11 +578,12 @@ class Root(nn.Module):
             if kwargs:
                 kwargs = {k: v for k, v in kwargs.items() if k in allowed}
             return args, kwargs
-
-        #self.register_forward_pre_hook(_sanitize_pre_hook, with_kwargs=True)
-        #self._calib_pre_hook_handle = self._register_load_state_dict_pre_hook(
-            _calib_load_pre_hook, with_module=True
+        '''
+        self.register_forward_pre_hook(_sanitize_pre_hook, with_kwargs=True)
+        self._calib_pre_hook_handle = self._register_load_state_dict_pre_hook(
+        _calib_load_pre_hook, with_module=True
         )
+        '''
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
