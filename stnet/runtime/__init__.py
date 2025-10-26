@@ -56,6 +56,7 @@ def infer(*args: Any, **kwargs: Any) -> Any:
 
 
 from . import launch as launch
+from . import operation as operation
 
 api = launch
 
@@ -74,5 +75,6 @@ __all__ = [
     "predict",
     "infer",
     "launch",
+    "operation",
     "api",
 ]
