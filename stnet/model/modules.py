@@ -998,6 +998,17 @@ class Root(nn.Module):
         infer_mode = labels_flat is None or (
             net_loss is None and global_loss is None and (local_loss is None)
         )
+
+        def _forward_call(module: Optional[Any], *m_args: Any, **m_kwargs: Any):
+            if module is None:
+                raise TypeError("module is None")
+            if isinstance(module, nn.Module):
+                return module.forward(*m_args, **m_kwargs)
+            if callable(module):
+                return module(*m_args, **m_kwargs)
+            raise TypeError(
+                f"Object of type {type(module).__name__} is not callable"
+            )
         try:
             self.x_seen_elems += torch.tensor(
                 features.numel(),
@@ -1025,7 +1036,7 @@ class Root(nn.Module):
                 ):
                     x_f32 = x_slice.to(dtype=torch.float32)
                     with AutoCast.float(device, enabled=False):
-                        out = self.local_net(x_f32)
+                        out = self.local_net.forward(x_f32)
                 if (not torch.isfinite(out.tokens).all()) or (
                     not torch.isfinite(out.context).all()
                 ):
@@ -1065,7 +1076,7 @@ class Root(nn.Module):
                     x_f32 = x_slice.to(dtype=torch.float32)
                     with inference(self.local_net):
                         with AutoCast.float(device, enabled=False):
-                            out = self.local_net(x_f32)
+                            out = self.local_net.forward(x_f32)
                 if not torch.isfinite(out.tokens).all() or not torch.isfinite(out.context).all():
                     out_tokens = torch.nan_to_num(
                         out.tokens, nan=0.0, posinf=0.0, neginf=0.0
@@ -1101,7 +1112,9 @@ class Root(nn.Module):
                 raise RuntimeError("[assembled] non-finite in training")
             assembled = torch.nan_to_num(assembled, nan=0.0, posinf=0.0, neginf=0.0)
         if self.is_norm_linear and self.linear_branch is not None:
-            bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
+            bl = self.linear_branch.forward(
+                features.to(device, dtype=assembled.dtype)
+            )
             assembled = assembled + bl
         t = tokens
         if not torch.isfinite(t).all():
@@ -1224,10 +1237,10 @@ class Root(nn.Module):
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
-                    top_component = global_loss(y_top, tgt)
+                    top_component = _forward_call(global_loss, y_top, tgt)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
-                    bottom_component = local_loss(y_bot, tgt)
+                    bottom_component = _forward_call(local_loss, y_bot, tgt)
                     total = total + weights[1] * bottom_component
             elif self._loss_space == "z" and self.has_valid_y_stats():
                 tgt_z = self._to_zscore(
@@ -1236,10 +1249,10 @@ class Root(nn.Module):
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
-                    top_component = global_loss(y_top, tgt_z)
+                    top_component = _forward_call(global_loss, y_top, tgt_z)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
-                    bottom_component = local_loss(y_bot, tgt_z)
+                    bottom_component = _forward_call(local_loss, y_bot, tgt_z)
                     total = total + weights[1] * bottom_component
             else:
                 tgt_y = labels_flat.to(
@@ -1251,10 +1264,10 @@ class Root(nn.Module):
                 else:
                     y_bot = assembled
                 if global_loss is not None:
-                    top_component = global_loss(y_top, tgt_y)
+                    top_component = _forward_call(global_loss, y_top, tgt_y)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
-                    bottom_component = local_loss(y_bot, tgt_y)
+                    bottom_component = _forward_call(local_loss, y_bot, tgt_y)
                     total = total + weights[1] * bottom_component
             if controller is not None:
                 controller.update(top_component, bottom_component)
@@ -1262,19 +1275,20 @@ class Root(nn.Module):
         elif net_loss is not None and labels_flat is not None:
             if is_cls_loss:
                 tgt = labels_flat.to(device=y_hat_out.device).long()
-                loss_val = net_loss(y_hat_out, tgt)
+                loss_val = _forward_call(net_loss, y_hat_out, tgt)
             elif self._loss_space == "logit":
                 tgt = self._to_logit_range(
                     labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 )
-                loss_val = net_loss(y_hat_z, tgt)
+                loss_val = _forward_call(net_loss, y_hat_z, tgt)
             elif self._loss_space == "z" and self.has_valid_y_stats():
                 tgt = self._to_zscore(
                     labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
                 )
-                loss_val = net_loss(y_hat_z, tgt)
+                loss_val = _forward_call(net_loss, y_hat_z, tgt)
             else:
-                loss_val = net_loss(
+                loss_val = _forward_call(
+                    net_loss,
                     y_hat_out,
                     labels_flat.to(
                         device=y_hat_out.device, dtype=y_hat_out.dtype

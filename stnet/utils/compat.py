@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import numbers
 import os
 import sys
 from contextlib import contextmanager
@@ -142,16 +143,100 @@ class TorchCompat:
         nn_mod = self.nn_module
 
         class _RMSNorm(nn_mod.Module):
-            def __init__(self, d_model: int, eps: float = 1e-06) -> None:
-                super().__init__()
-                self.eps = float(eps)
-                self.weight = nn_mod.Parameter(torch_mod.ones(d_model))
+            __constants__ = ("normalized_shape", "eps", "elementwise_affine")
 
-            def forward(self, x: Any) -> Any:
-                inv_rms = (
-                    x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-                )
-                return x * inv_rms * self.weight
+            def __init__(
+                self,
+                normalized_shape: Any,
+                eps: float | None = None,
+                elementwise_affine: bool = True,
+                device: Any = None,
+                dtype: Any = None,
+            ) -> None:
+                super().__init__()
+                if isinstance(normalized_shape, numbers.Integral):
+                    normalized_shape = (int(normalized_shape),)
+                else:
+                    normalized_shape = tuple(int(dim) for dim in normalized_shape)
+                if not normalized_shape:
+                    raise ValueError("normalized_shape must be non-empty")
+
+                factory_kwargs = {}
+                if device is not None:
+                    factory_kwargs["device"] = device
+                if dtype is not None:
+                    factory_kwargs["dtype"] = dtype
+
+                self.normalized_shape = normalized_shape
+                self.eps = float(eps) if eps is not None else None
+                self.elementwise_affine = bool(elementwise_affine)
+                if self.elementwise_affine:
+                    self.weight = nn_mod.Parameter(
+                        torch_mod.empty(self.normalized_shape, **factory_kwargs)
+                    )
+                else:
+                    self.register_parameter("weight", None)
+                self.reset_parameters()
+
+            def reset_parameters(self) -> None:
+                if self.elementwise_affine and self.weight is not None:
+                    with torch_mod.no_grad():
+                        self.weight.fill_(1.0)
+
+            def forward(
+                self,
+                input: Any | None = None,
+                *args: Any,
+                **kwargs: Any,
+            ) -> Any:
+                if input is None and args:
+                    input = args[0]
+                    args = args[1:]
+                if input is None:
+                    for key in ("input", "hidden_states", "x"):
+                        if key in kwargs:
+                            input = kwargs.pop(key)
+                            break
+                if input is None:
+                    raise TypeError("RMSNorm.forward() missing required argument 'input'")
+
+                _ = args, kwargs
+
+                x = input
+                if x.dim() < len(self.normalized_shape):
+                    raise RuntimeError(
+                        "input.dim() must be >= len(normalized_shape) but got {} < {}".format(
+                            x.dim(),
+                            len(self.normalized_shape),
+                        )
+                    )
+                dims = tuple(range(-len(self.normalized_shape), 0))
+                if dims and any(
+                    x.shape[dim] != expected
+                    for dim, expected in zip(range(-len(self.normalized_shape), 0), self.normalized_shape)
+                ):
+                    raise RuntimeError(
+                        "Given normalized_shape={}, expected input with shape of the form "
+                        "(*, {}) but got {}".format(
+                            self.normalized_shape,
+                            self.normalized_shape,
+                            tuple(x.shape),
+                        )
+                    )
+
+                eps = self.eps
+                if eps is None:
+                    eps = torch_mod.finfo(x.dtype).eps
+
+                mean_square = x.pow(2).mean(dim=dims, keepdim=True)
+                inv_rms = (mean_square + eps).rsqrt()
+                output = x * inv_rms
+
+                if self.elementwise_affine and self.weight is not None:
+                    view_shape = (1,) * (x.dim() - len(self.normalized_shape)) + self.normalized_shape
+                    output = output * self.weight.view(view_shape)
+
+                return output
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
 
