@@ -1033,7 +1033,7 @@ def epoch(
                                 except Exception:
                                     pass
                             y_hat, loss_val = model(
-                                    X,
+                                    features=X,
                                     labels_flat=Y_flat,
                                     net_loss=None,
                                     global_loss=top_loss,
