@@ -9,12 +9,6 @@ from torch import nn
 
 from ..utils.optimization import DotProductAttention, MultiScaleRetention
 
-class SafeNorm(nn.Module):
-    def __init__(self, mod: nn.Module):
-        super().__init__()
-        self.mod = mod
-    def forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        return self.mod(x)
 
 class StochasticDepth(nn.Module):
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
@@ -41,12 +35,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return SafeNorm(nn.LayerNorm(d_model))
+        return nn.LayerNorm(d_model)
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return SafeNorm(nn.RMSNorm(d_model))
+        return nn.RMSNorm(d_model)
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
-        return SafeNorm(nn.BatchNorm1d(d_model))
-    return SafeNorm(nn.LayerNorm(d_model))
+        return nn.BatchNorm1d(d_model)
+    return nn.LayerNorm(d_model)
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
