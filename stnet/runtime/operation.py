@@ -1034,7 +1034,7 @@ def epoch(
                                     pass
                             y_hat, loss_val = model(
                                 X,
-                                labels_flat=Y_flat,
+                                Y_flat,
                                 global_loss=top_loss,
                                 local_loss=bottom_loss,
                                 loss_weights=(alpha, beta),
@@ -1317,7 +1317,7 @@ def epoch(
                             )
                             _y, _loss_val = model(
                                 X,
-                                labels_flat=Yv_flat,
+                                Yv_flat,
                                 global_loss=top_loss,
                                 local_loss=bottom_loss,
                                 loss_weights=(alpha, beta),
@@ -2140,7 +2140,7 @@ def main(*args: Any) -> Optional[Root]:
                                 mark_step()
                         y_hat, _ = model(
                             X,
-                            labels_flat=None,
+                            None,
                             global_loss=None,
                             local_loss=None,
                             loss_weights=None,
