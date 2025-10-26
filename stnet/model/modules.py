@@ -550,7 +550,6 @@ class Root(nn.Module):
             getattr(config, "range_penalty_lambda", 0.0)
         )
         self._calib_enable = bool(getattr(config, "calibrate_output", True))
-        
         c_scale = float(getattr(config, "calibrate_init_scale", 1.0))
         c_bias  = float(getattr(config, "calibrate_init_bias", 0.0))
         self.calib_scale = nn.Parameter(torch.ones(1, dtype=torch.float64) * c_scale)
@@ -570,6 +569,17 @@ class Root(nn.Module):
                     v = v.reshape(-1)[:1]
                 state_dict[key] = v.to(dtype=module.calib_scale.dtype)
                 
+        def _sanitize_pre_hook(mod, args, kwargs):
+            if len(args) >= 1:
+                args = (args[0],)
+            else:
+                raise TypeError("Root.forward expects features as the first positional argument")
+            allowed = {"labels_flat", "net_loss", "global_loss", "local_loss", "loss_weights"}
+            if kwargs:
+                kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+            return args, kwargs
+
+        self.register_forward_pre_hook(_sanitize_pre_hook, with_kwargs=True)
         self._calib_pre_hook_handle = self._register_load_state_dict_pre_hook(
             _calib_load_pre_hook, with_module=True
         )
