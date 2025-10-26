@@ -976,13 +976,13 @@ class Root(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor, /,
+        *args: Any,
         labels_flat: Optional[torch.Tensor] = None,
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
         loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
-        *args: Any,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         features = self._normalize_inputs(features)
