@@ -35,7 +35,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed._tensor import DTensor, Replicate
+from torch.distributed._tensor import DTensor, Placement, Replicate
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
@@ -807,16 +807,34 @@ def main(*args: Any) -> Optional[Root]:
 
         wrapped: set[int] = set()
 
-        def _ensure_replicated_dtensor(param: torch.nn.Parameter) -> None:
+        def _ensure_dtensor(
+            param: torch.nn.Parameter,
+            *,
+            placements: Optional[Sequence[Placement]] = None,
+        ) -> None:
             if not isinstance(param, torch.nn.Parameter):
                 return
             if isinstance(param.data, DTensor):
                 return
+
+            # FSDP flat parameters already carry sharding metadata which must be
+            # preserved.  When we see attributes that indicate FSDP ownership we
+            # leave the tensor untouched instead of forcing a replicated layout,
+            # otherwise the optimizer/checkpoint state would lose the original
+            # sharding information.
+            if (
+                getattr(param, "_is_sharded", False)
+                or hasattr(param, "_sharding_spec")
+                or param.__class__.__name__ == "FlatParameter"
+            ):
+                return
+
+            placements = tuple(placements or (Replicate(),))
             try:
                 distributed = DTensor.from_local(
                     param.data,
                     mesh,
-                    (Replicate(),),
+                    placements,
                     run_check=False,
                 )
             except Exception:
@@ -828,7 +846,7 @@ def main(*args: Any) -> Optional[Root]:
                     param.grad = DTensor.from_local(
                         grad,
                         mesh,
-                        (Replicate(),),
+                        placements,
                         run_check=False,
                     )
                 except Exception:
@@ -889,10 +907,10 @@ def main(*args: Any) -> Optional[Root]:
             model.set_requires_gradient_sync(True)
 
         for ignored_param in ignored_param_registry:
-            _ensure_replicated_dtensor(ignored_param)
+            _ensure_dtensor(ignored_param, placements=(Replicate(),))
 
         for parameter in model.parameters():
-            _ensure_replicated_dtensor(parameter)
+            _ensure_dtensor(parameter)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
