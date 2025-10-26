@@ -13,19 +13,19 @@ from ..config import (
 
 
 def new_model(*args: Any, **kwargs: Any) -> Any:
-    from .management import new_model as _impl
+    from ..utils.io import new_model as _impl
 
     return _impl(*args, **kwargs)
 
 
 def load_model(*args: Any, **kwargs: Any) -> Any:
-    from .management import load_model as _impl
+    from ..utils.io import load_model as _impl
 
     return _impl(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> Any:
-    from .management import save_model as _impl
+    from ..utils.io import save_model as _impl
 
     return _impl(*args, **kwargs)
 
@@ -36,13 +36,13 @@ def joining(*args: Any, **kwargs: Any) -> Any:
     return _impl(*args, **kwargs)
 
 def train(*args: Any, **kwargs: Any) -> Any:
-    from .operation import train as _impl
+    from .launch import train as _impl
 
     return _impl(*args, **kwargs)
 
 
 def predict(*args: Any, **kwargs: Any) -> Any:
-    from .operation import predict as _impl
+    from .launch import predict as _impl
 
     return _impl(*args, **kwargs)
 
@@ -54,6 +54,10 @@ def learn(*args: Any, **kwargs: Any) -> Any:
 def infer(*args: Any, **kwargs: Any) -> Any:
     return predict(*args, **kwargs)
 
+
+from . import launch as launch
+
+api = launch
 
 __all__ = [
     "ModelConfig",
@@ -69,4 +73,6 @@ __all__ = [
     "learn",
     "predict",
     "infer",
+    "launch",
+    "api",
 ]

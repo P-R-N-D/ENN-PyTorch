@@ -80,19 +80,19 @@ __all__ = [
 
 
 def new_model(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.management import new_model as _impl
+    from .utils.io import new_model as _impl
 
     return _impl(*args, **kwargs)
 
 
 def load_model(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.management import load_model as _impl
+    from .utils.io import load_model as _impl
 
     return _impl(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.management import save_model as _impl
+    from .utils.io import save_model as _impl
 
     return _impl(*args, **kwargs)
 
@@ -104,12 +104,12 @@ def joining(*args: Any, **kwargs: Any) -> Any:
 
 
 def train(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.operation import train as _impl
+    from .runtime.launch import train as _impl
 
     return _impl(*args, **kwargs)
 
 
 def predict(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.operation import predict as _impl
+    from .runtime.launch import predict as _impl
 
     return _impl(*args, **kwargs)
