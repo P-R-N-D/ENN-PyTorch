@@ -1034,11 +1034,11 @@ def epoch(
                                     pass
                             y_hat, loss_val = model(
                                 X,
-                                Y_flat,
-                                None,
-                                top_loss,
-                                bottom_loss,
-                                (alpha, beta),
+                                labels_flat=Y_flat,
+                                net_loss=None,
+                                global_loss=top_loss,
+                                local_loss=bottom_loss,
+                                loss_weights=(alpha, beta),
                             )
                             if step_idx == 0:
                                 try:
