@@ -9,7 +9,6 @@ import shutil
 import sys
 import time
 import warnings
-from collections import deque
 from dataclasses import asdict, replace
 from typing import (
     Any,
@@ -21,7 +20,6 @@ from typing import (
     Tuple,
 )
 
-import numpy as np
 import torch
 import torch.distributed
 import torch.multiprocessing as mp
@@ -40,77 +38,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
-
-try:  # pragma: no cover - optional distributed helpers
-    from torch.distributed import all_reduce as _all_reduce
-    from torch.distributed import get_world_size as _get_world_size
-    from torch.distributed import is_initialized as _dist_is_initialized
-    from torch.distributed import ReduceOp as _ReduceOp
-except Exception:  # pragma: no cover - CPU-only or minimal builds
-    _all_reduce = None
-    _get_world_size = lambda: 1  # type: ignore[assignment]
-    _dist_is_initialized = lambda: False  # type: ignore[assignment]
-    _ReduceOp = None
-
-try:  # pragma: no cover - optional dependency
-    from torch.distributed.tensor import DTensor  # type: ignore
-except (ImportError, AttributeError):  # pragma: no cover - environment without DTensor
-    DTensor = ()  # type: ignore
-
-
-def _safe_clip_grad_norm(
-    parameters: Sequence[torch.nn.Parameter],
-    max_norm: float,
-    norm_type: float = 2.0,
-    eps: float = 1e-6,
-) -> float:
-    """Clip gradients while avoiding DTensor/Tensor mixing errors."""
-
-    grads: List[torch.Tensor] = []
-    original_grads: List[torch.Tensor] = []
-    for param in parameters:
-        if param is None:
-            continue
-        grad = getattr(param, "grad", None)
-        if grad is None:
-            continue
-        original_grads.append(grad)
-        if DTensor and isinstance(grad, DTensor):
-            grads.append(grad.to_local())
-        else:
-            grads.append(grad)
-
-    if not grads:
-        return 0.0
-
-    norm_vals = []
-    if norm_type == float("inf"):
-        for grad in grads:
-            norm_vals.append(
-                grad.detach()
-                .abs()
-                .max()
-                .to(device="cpu", dtype=torch.float32)
-            )
-        total_norm_tensor = torch.stack(norm_vals).max()
-    else:
-        for grad in grads:
-            norm_vals.append(
-                grad.detach()
-                .norm(norm_type)
-                .to(device="cpu", dtype=torch.float32)
-            )
-        total_norm_tensor = torch.stack(norm_vals).norm(norm_type)
-
-    total_norm = float(total_norm_tensor)
-    clip_coef = max_norm / (total_norm + eps)
-    clip_coef = min(clip_coef, 1.0)
-
-    if clip_coef < 1.0:
-        for grad in original_grads:
-            grad.mul_(clip_coef)
-
-    return total_norm
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from tqdm.auto import tqdm
 
@@ -211,108 +138,6 @@ def _resolve_module_device(value: Any, *, _depth: int = 0) -> Optional[torch.dev
         if resolved is not None:
             return resolved
     return None
-
-
-class _QuantileState:
-    __slots__ = (
-        "q_lo",
-        "q_hi",
-        "win_lo",
-        "win_hi",
-        "beta",
-        "mode",
-        "warmup",
-        "count",
-        "sync",
-    )
-
-    def __init__(
-        self,
-        mode: str,
-        beta: float,
-        win_size: int,
-        warmup_steps: int,
-        sync: str,
-    ) -> None:
-        self.q_lo: Optional[torch.Tensor] = None
-        self.q_hi: Optional[torch.Tensor] = None
-        self.win_lo: deque[float] = deque(maxlen=max(1, int(win_size)))
-        self.win_hi: deque[float] = deque(maxlen=max(1, int(win_size)))
-        self.beta = float(beta)
-        self.mode = str(mode)
-        self.warmup = int(max(0, warmup_steps))
-        self.count = 0
-        self.sync = str(sync)
-
-
-def _finite_quantiles(y: torch.Tensor, probs: Sequence[float]) -> List[torch.Tensor]:
-    vals = torch.nan_to_num(y.detach()).to(dtype=torch.float64)
-    finite_mask = torch.isfinite(vals)
-    if not bool(finite_mask.any()):
-        return [
-            torch.tensor(0.0, device=vals.device, dtype=torch.float64) for _ in probs
-        ]
-    qs = torch.as_tensor(list(probs), device=vals.device, dtype=torch.float64)
-    quantiles = torch.quantile(vals[finite_mask], qs)
-    return [q.to(dtype=torch.float64) for q in quantiles.unbind()]
-
-
-def _sync_scalar(value: torch.Tensor, how: str) -> torch.Tensor:
-    if _all_reduce is None or _ReduceOp is None or not _dist_is_initialized():
-        return value.to(dtype=torch.float64)
-    result = value.to(dtype=torch.float64)
-    if how == "mean":
-        _all_reduce(result, op=_ReduceOp.SUM)
-        world = max(1, int(_get_world_size()))
-        result /= world
-    elif how == "min":
-        _all_reduce(result, op=_ReduceOp.MIN)
-    elif how == "max":
-        _all_reduce(result, op=_ReduceOp.MAX)
-    # "first" keeps local value (rank 0 broadcast could be added later)
-    return result
-
-
-def _update_quantiles(
-    state: _QuantileState,
-    target: torch.Tensor,
-    p_lo: float,
-    p_hi: float,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    q_lo_batch, q_hi_batch = _finite_quantiles(target, [p_lo, p_hi])
-    q_lo_batch = q_lo_batch.to(dtype=torch.float64)
-    q_hi_batch = q_hi_batch.to(dtype=torch.float64)
-    q_lo_batch = _sync_scalar(q_lo_batch, state.sync)
-    q_hi_batch = _sync_scalar(q_hi_batch, state.sync)
-
-    if state.count < state.warmup or state.mode == "none":
-        q_lo = q_lo_batch
-        q_hi = q_hi_batch
-    elif state.mode == "ema":
-        if state.q_lo is None:
-            state.q_lo = q_lo_batch
-        if state.q_hi is None:
-            state.q_hi = q_hi_batch
-        q_lo = state.beta * state.q_lo + (1.0 - state.beta) * q_lo_batch
-        q_hi = state.beta * state.q_hi + (1.0 - state.beta) * q_hi_batch
-    else:  # window
-        state.win_lo.append(float(q_lo_batch.detach().cpu()))
-        state.win_hi.append(float(q_hi_batch.detach().cpu()))
-        q_lo = torch.tensor(
-            np.median(np.asarray(state.win_lo, dtype=np.float64)),
-            device=target.device,
-            dtype=torch.float64,
-        )
-        q_hi = torch.tensor(
-            np.median(np.asarray(state.win_hi, dtype=np.float64)),
-            device=target.device,
-            dtype=torch.float64,
-        )
-
-    state.q_lo = q_lo
-    state.q_hi = q_hi
-    state.count += 1
-    return q_lo, q_hi
 
 
 try:
@@ -785,8 +610,6 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
-    # (선택) 추론 전 퍼센타일 경계 캘리브레이션을 하려면, 별도 샘플 로더로
-    # _QuantileState를 초기화하고 _update_quantiles를 호출하는 훅을 추가할 수 있다.
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
@@ -862,8 +685,6 @@ def epoch(
     scaler: torch.amp.GradScaler,
     sched: torch.optim.lr_scheduler.LRScheduler,
     loss_controller: LossWeightController,
-    epoch_idx: int,
-    total_epochs: int,
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
     status_bar: Optional[tqdm],
@@ -880,56 +701,7 @@ def epoch(
     if train_loader is None:
         raise RuntimeError("epoch requires a training dataloader")
     in_dim = int(ops.in_dim)
-    cfg_source = getattr(ops, "cfg_dict", None)
-    if isinstance(cfg_source, ModelConfig):
-        cfg_dict = asdict(cfg_source)
-    elif isinstance(cfg_source, dict):
-        cfg_dict = dict(cfg_source)
-    else:
-        cfg_dict = {}
     flop_breakdown_epoch: Dict[str, float] = {}
-    std_mode = str(cfg_dict.get("loss_std_mode", "pooled")).lower()
-    loss_ddof = int(cfg_dict.get("loss_ddof", 1))
-    detach_stats = bool(cfg_dict.get("loss_detach_stats", True))
-    clamp_max = float(cfg_dict.get("loss_clamp_max", 6.0))
-    loss_t_conf = float(cfg_dict.get("loss_t_confidence", 0.995))
-    loss_z_penalty = str(cfg_dict.get("loss_z_penalty", "huber")).lower()
-    if loss_z_penalty not in {"softplus", "huber"}:
-        loss_z_penalty = "huber"
-    loss_z_tau = float(cfg_dict.get("loss_z_tau", 1.5))
-    df_start = float(cfg_dict.get("loss_t_df_start", 3.0))
-    df_end = float(cfg_dict.get("loss_t_df_end", 6.0))
-    total_epochs = max(1, int(total_epochs))
-    epoch_progress = (int(epoch_idx) + 1) / total_epochs
-    df_now = df_start + (df_end - df_start) * epoch_progress
-    df_now = float(max(df_now, 1e-06))
-    top_loss.base = StudentsTLoss(
-        confidence=loss_t_conf,
-        metric="t_value",
-        two_tailed=True,
-        df=df_now,
-        mu_mode="error",
-        std_mode=std_mode,
-        ddof=loss_ddof,
-        clamp_max=clamp_max,
-        detach_stats=detach_stats,
-        dim=-1,
-        reduction="none",
-    )
-    bottom_loss.base = StandardNormalLoss(
-        confidence=0.99,
-        metric="z_value",
-        two_tailed=True,
-        penalty=loss_z_penalty,
-        tau=loss_z_tau,
-        mu_mode="error",
-        std_mode=std_mode,
-        ddof=loss_ddof,
-        clamp_max=clamp_max,
-        detach_stats=detach_stats,
-        dim=-1,
-        reduction="none",
-    )
     io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
     io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -945,23 +717,6 @@ def epoch(
         t_fetch_start = time.perf_counter_ns()
         with joining(model=model, optimizer=optimizer):
             total_batches = len(train_loader)
-            alpha = float(cfg_dict.get("w_global", 1.0))
-            beta0 = float(cfg_dict.get("w_local", 0.2))
-            decay_local = bool(cfg_dict.get("local_decay", True))
-            beta = (
-                beta0 * (1.0 - 0.7 * epoch_progress)
-                if decay_local
-                else beta0
-            )
-            p_lo = float(cfg_dict.get("aux_region_lo_pct", 0.2))
-            p_hi = float(cfg_dict.get("aux_region_hi_pct", 0.8))
-            q_mode = str(cfg_dict.get("aux_quantile_smooth", "ema")).lower()
-            q_beta = float(cfg_dict.get("aux_quantile_ema_beta", 0.9))
-            q_win = int(cfg_dict.get("aux_quantile_win_size", 64))
-            q_warm = int(cfg_dict.get("aux_quantile_warmup_steps", 16))
-            q_sync = str(cfg_dict.get("aux_quantile_sync", "mean")).lower()
-            qstate = _QuantileState(q_mode, q_beta, q_win, q_warm, q_sync)
-            quantile_logged = False
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
                 X = to_torch(feat)
@@ -1023,177 +778,18 @@ def epoch(
                             Y_flat = Y.reshape(Y.shape[0], -1).to(
                                 device, dtype=param_dtype
                             )
-                            if step_idx == 0:
-                                try:
-                                    _float8_log(
-                                        f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
-                                        f"df_now={df_now:.3f} std_mode={std_mode} "
-                                        f"z_penalty={loss_z_penalty}"
-                                    )
-                                except Exception:
-                                    pass
                             y_hat, loss_val = model(
-                                    features=X,
-                                    labels_flat=Y_flat,
-                                    net_loss=None,
-                                    global_loss=top_loss,
-                                    local_loss=bottom_loss,
-                                    loss_weights=(alpha, beta),
+                                X,
+                                labels_flat=Y_flat,
+                                global_loss=top_loss,
+                                local_loss=bottom_loss,
+                                loss_weights=loss_controller.weights(),
                             )
-                            if step_idx == 0:
-                                try:
-                                    _float8_log(
-                                        f"[train] space={getattr(cfg, 'loss_space', 'z')} "
-                                        f"calib={getattr(cfg, 'calibrate_output', True)} "
-                                        f"z_reg={getattr(cfg, 'z_reg_lambda', 1e-2)}"
-                                    )
-                                except Exception:
-                                    pass
-                            quantile_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-
-                            def _ensure_quantiles(
-                                target_tensor: torch.Tensor,
-                            ) -> Tuple[torch.Tensor, torch.Tensor]:
-                                nonlocal quantile_cache
-                                if quantile_cache is None:
-                                    q_lo_raw, q_hi_raw = _update_quantiles(
-                                        qstate, target_tensor, p_lo, p_hi
-                                    )
-                                    quantile_cache = (
-                                        q_lo_raw.to(dtype=target_tensor.dtype),
-                                        q_hi_raw.to(dtype=target_tensor.dtype),
-                                    )
-                                return quantile_cache
-
-                            if (
-                                loss_val is not None
-                                and bool(cfg_dict.get("aux_q_enable", True))
-                            ):
-                                w_aux_override = float(cfg_dict.get("w_aux", 0.0))
-                                if w_aux_override > 0.0:
-                                    w_aux = w_aux_override
-                                else:
-                                    w_aux = float(cfg_dict.get("aux_q_weight", 0.05))
-                                if w_aux > 0.0:
-                                    pred = y_hat.reshape_as(Y_flat)
-                                    target = Y_flat.detach()
-                                    err = target - pred
-                                    tau_low = float(
-                                        cfg_dict.get(
-                                            "aux_tau_lo_region",
-                                            cfg_dict.get("aux_q_tau_lowspd", 0.7),
-                                        )
-                                    )
-                                    tau_high = float(
-                                        cfg_dict.get(
-                                            "aux_tau_hi_region",
-                                            cfg_dict.get("aux_q_tau_highspd", 0.45),
-                                        )
-                                    )
-                                    tau_mid = pred.new_full(pred.shape, 0.5)
-                                    tau_low_tensor = pred.new_full(pred.shape, tau_low)
-                                    tau_high_tensor = pred.new_full(pred.shape, tau_high)
-                                    q_lo, q_hi = _ensure_quantiles(target)
-                                    tau_tensor = torch.where(
-                                        target <= q_lo,
-                                        tau_low_tensor,
-                                        tau_mid,
-                                    )
-                                    tau_tensor = torch.where(
-                                        target >= q_hi,
-                                        tau_high_tensor,
-                                        tau_tensor,
-                                    )
-                                    q_pin = torch.maximum(
-                                        tau_tensor * err,
-                                        (tau_tensor - 1.0) * err,
-                                    ).mean()
-                                    damp = 1.0 - 0.5 * epoch_progress
-                                    if step_idx == 0 and not quantile_logged:
-                                        try:
-                                            _float8_log(
-                                                f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
-                                                f"quantile_smooth={q_mode} beta={q_beta:.2f} "
-                                                f"win={q_win} warm={q_warm} sync={q_sync} "
-                                                f"pct(lo={p_lo:.2f},hi={p_hi:.2f}) "
-                                                f"q_lo={float(q_lo):.3f} q_hi={float(q_hi):.3f}"
-                                            )
-                                            quantile_logged = True
-                                        except Exception:
-                                            pass
-                                    loss_val = loss_val + pred.new_tensor(w_aux * damp) * q_pin
-                            if loss_val is not None and isinstance(loss_val, torch.Tensor):
-                                w_low = float(
-                                    cfg_dict.get(
-                                        "aux_weight_lo_region",
-                                        cfg_dict.get("loss_w_low", 1.0),
-                                    )
-                                )
-                                w_high = float(
-                                    cfg_dict.get(
-                                        "aux_weight_hi_region",
-                                        cfg_dict.get("loss_w_high", 1.0),
-                                    )
-                                )
-                                if (w_low != 1.0) or (w_high != 1.0):
-                                    with torch.no_grad():
-                                        weights = torch.ones_like(Y_flat)
-                                        q_lo, q_hi = _ensure_quantiles(Y_flat.detach())
-                                        if step_idx == 0 and not quantile_logged:
-                                            try:
-                                                _float8_log(
-                                                    f"[loss] epoch={epoch_idx + 1}/{total_epochs} "
-                                                    f"quantile_smooth={q_mode} beta={q_beta:.2f} "
-                                                    f"win={q_win} warm={q_warm} sync={q_sync} "
-                                                    f"pct(lo={p_lo:.2f},hi={p_hi:.2f}) "
-                                                    f"q_lo={float(q_lo):.3f} q_hi={float(q_hi):.3f}"
-                                                )
-                                                quantile_logged = True
-                                            except Exception:
-                                                pass
-                                        weights = torch.where(
-                                            Y_flat <= q_lo,
-                                            weights * w_low,
-                                            weights,
-                                        )
-                                        weights = torch.where(
-                                            Y_flat >= q_hi,
-                                            weights * w_high,
-                                            weights,
-                                        )
-                                    weights = weights.to(
-                                        device=loss_val.device, dtype=loss_val.dtype
-                                    )
-                                    if loss_val.ndim == 0:
-                                        loss_val = loss_val * weights.mean()
-                                    else:
-                                        weight_view = weights
-                                        if weights.shape != loss_val.shape:
-                                            try:
-                                                weight_view = weights.view_as(loss_val)
-                                            except Exception:
-                                                weight_view = weights.expand_as(loss_val)
-                                        loss_val = (loss_val * weight_view).mean()
                         accum_scale = max(1, grad_accum_steps)
                         loss_for_backprop = loss_val / float(accum_scale)
                         scaler.scale(loss_for_backprop).backward()
                         if should_sync:
                             scaler.unscale_(optimizer)
-                            clip_max_norm = 1.0
-                            clip_fn = getattr(model, "clip_grad_norm_", None)
-                            if callable(clip_fn):
-                                try:
-                                    clip_fn(clip_max_norm)
-                                except (TypeError, RuntimeError):
-                                    _safe_clip_grad_norm(
-                                        list(model.parameters()),
-                                        max_norm=clip_max_norm,
-                                    )
-                            else:
-                                _safe_clip_grad_norm(
-                                    list(model.parameters()),
-                                    max_norm=clip_max_norm,
-                                )
                             scaler.step(optimizer)
                             scaler.update()
                             optimizer.zero_grad(set_to_none=True)
@@ -1318,11 +914,10 @@ def epoch(
                             )
                             _y, _loss_val = model(
                                 X,
-                                Yv_flat,
-                                None,
-                                top_loss,
-                                bottom_loss,
-                                (alpha, beta),
+                                labels_flat=Yv_flat,
+                                global_loss=top_loss,
+                                local_loss=bottom_loss,
+                                loss_weights=loss_controller.weights(),
                             )
                         if use_timer:
                             ev_e.record()
@@ -1483,68 +1078,16 @@ def main(*args: Any) -> Optional[Root]:
             and hasattr(model, "set_y_range")
             and train_loader0 is not None
         ):
-            q_low = float(getattr(cfg, "y_range_q_low", 0.001))
-            q_high = float(getattr(cfg, "y_range_q_high", 0.999))
+            q_low = float(getattr(cfg, "y_range_q_low", 0.005))
+            q_high = float(getattr(cfg, "y_range_q_high", 0.995))
             eps = float(getattr(cfg, "y_eps_range", 1e-3))
             try:
                 lo, hi = compute_y_range(train_loader0, q_low=q_low, q_high=q_high)
             except Exception as exc:  # pragma: no cover - defensive path
                 warnings.warn(f"auto_y_range failed: {exc}")
             else:
-                span = float(hi - lo)
-                m_low = float(getattr(cfg, "y_range_margin_low", 0.10)) * span
-                m_high = float(getattr(cfg, "y_range_margin_high", 0.05)) * span
-                base_low = float(getattr(cfg, "y_low", 0.0))
-                base_high = float(getattr(cfg, "y_high", 100.0))
-                if (
-                    not math.isfinite(base_low)
-                    or not math.isfinite(base_high)
-                    or base_high <= base_low
-                ):
-                    base_low, base_high = 0.0, 100.0
-                A = max(base_low, float(lo) - m_low)
-                B = min(base_high, float(hi) + m_high)
-                if B <= A:
-                    center = 0.5 * (float(lo) + float(hi))
-                    delta = max(1e-3, span * 0.5 or 1.0)
-                    A = center - delta
-                    B = center + delta
-                A = min(base_high, max(base_low, A))
-                B = min(base_high, max(base_low, B))
-                domain_span = max(1e-3, base_high - base_low)
-                target_width = min(domain_span, max(1e-3, eps))
-                if B - A < target_width:
-                    mid = min(base_high, max(base_low, 0.5 * (A + B)))
-                    half = 0.5 * target_width
-                    A = mid - half
-                    B = mid + half
-                    if A < base_low:
-                        shift = base_low - A
-                        A = base_low
-                        B = min(base_high, B + shift)
-                    if B > base_high:
-                        shift = B - base_high
-                        B = base_high
-                        A = max(base_low, A - shift)
-                    if B - A < target_width:
-                        if A <= base_low:
-                            B = min(base_high, A + target_width)
-                        elif B >= base_high:
-                            A = max(base_low, B - target_width)
-                        else:
-                            B = min(base_high, A + target_width)
-                    A = min(base_high, max(base_low, A))
-                    B = min(base_high, max(base_low, B))
                 try:
-                    model.set_y_range(A, B, eps)
-                    try:
-                        _float8_log(
-                            f"[y-range] domain=[{base_low:.3f},{base_high:.3f}] "
-                            f"A={A:.3f}, B={B:.3f}, eps_abs={eps:.4g}, "
-                            f"eps_rel={getattr(cfg, 'y_eps_rel', 0.0)}"
-                        )
-                    except Exception:
-                        pass
+                    model.set_y_range(lo, hi, eps)
                 except Exception as exc:  # pragma: no cover - defensive path
                     warnings.warn(f"set_y_range failed: {exc}")
         train_step_count = 0
@@ -1658,14 +1201,21 @@ def main(*args: Any) -> Optional[Root]:
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
         ) -> Optional[torch.nn.Module]:
-            if getattr(module, "_fsdp_applied", False):
-                return module
+            nonlocal model
+            if target is None or id(target) in wrapped:
+                return target
+            wrapped.add(id(target))
+            per_mod_ignored = _per_module_ignored_params(target)
             sharded = fully_shard(
-                module, mesh=mesh, mp_policy=mp_policy,
-                ignored_params=(ignored_param_registry if len(ignored_param_registry) > 0 else None),
+                target,
+                mesh=mesh,
+                mp_policy=mp_policy,
                 reshard_after_forward=False,
+                ignored_params=per_mod_ignored or None,
             )
-            setattr(sharded, "_fsdp_applied", True)
+            sharded.set_requires_gradient_sync(True)
+            if target is model:
+                model = sharded
             return sharded
 
         def _collect_block_modules(
@@ -1684,11 +1234,23 @@ def main(*args: Any) -> Optional[Root]:
                             blocks.append(block)
             return blocks
 
-        for submodule in _collect_block_modules(
-            getattr(model, "local_net", None)
-        ) + _collect_block_modules(getattr(model, "global_net", None)):
-            _fsdp_wrap(submodule)
-        model = _fsdp_wrap(model)
+        try:
+            for submodule in _collect_block_modules(
+                getattr(model, "local_net", None)
+            ) + _collect_block_modules(getattr(model, "global_net", None)):
+                _fsdp_wrap(submodule)
+            _fsdp_wrap(model)
+        except (RuntimeError, ValueError, TypeError):
+            model = fully_shard(
+                model,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                ignored_params=(
+                    ignored_param_registry if len(ignored_param_registry) > 0 else None
+                ),
+                reshard_after_forward=False,
+            )
+            model.set_requires_gradient_sync(True)
         if fp8_enabled and _float8_scale_supported(data_scale):
             with contextlib.suppress(Exception):
                 precompute_float8_dynamic_scale_for_fsdp(
@@ -1730,43 +1292,30 @@ def main(*args: Any) -> Optional[Root]:
                         optim_sd,
                         options=StateDictOptions(strict=False),
                     )
-        std_mode = str(getattr(cfg, "loss_std_mode", "pooled")).lower()
-        loss_ddof = int(getattr(cfg, "loss_ddof", 1))
-        detach_stats = bool(getattr(cfg, "loss_detach_stats", True))
-        clamp_max = float(getattr(cfg, "loss_clamp_max", 6.0))
-        loss_t_conf = float(getattr(cfg, "loss_t_confidence", 0.995))
-        loss_z_penalty = str(getattr(cfg, "loss_z_penalty", "softplus")).lower()
-        loss_z_tau = float(getattr(cfg, "loss_z_tau", 1.5))
-        df_start = float(getattr(cfg, "loss_t_df_start", 3.0))
-        df_end = float(getattr(cfg, "loss_t_df_end", 6.0))
-
-        def _build_students_t(df: float) -> StudentsTLoss:
-            return StudentsTLoss(
-                confidence=loss_t_conf,
-                metric="t_value",
-                two_tailed=True,
-                df=float(df),
-                mu_mode="error",
-                std_mode=std_mode,
-                ddof=loss_ddof,
-                clamp_max=clamp_max,
-                detach_stats=detach_stats,
-                dim=-1,
-                reduction="none",
-            )
-
-        _t = _build_students_t(df_start)
+        _t = StudentsTLoss(
+            confidence=0.99,
+            metric="t_value",
+            two_tailed=True,
+            df=4,
+            mu_mode="error",
+            std_mode="pooled",
+            ddof=1,
+            clamp_max=8.0,
+            detach_stats=True,
+            dim=-1,
+            reduction="none",
+        )
         _z = StandardNormalLoss(
             confidence=0.99,
             metric="z_value",
             two_tailed=True,
-            penalty=loss_z_penalty,
-            tau=loss_z_tau,
+            penalty="softplus",
+            tau=1.0,
             mu_mode="error",
-            std_mode=std_mode,
-            ddof=loss_ddof,
-            clamp_max=clamp_max,
-            detach_stats=detach_stats,
+            std_mode="pooled",
+            ddof=1,
+            clamp_max=8.0,
+            detach_stats=True,
             dim=-1,
             reduction="none",
         )
@@ -1873,7 +1422,7 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             )
 
-            for epoch_idx in range(int(ops.epochs)):
+            for _ in range(int(ops.epochs)):
                 (
                     io_time,
                     comp_time,
@@ -1895,8 +1444,6 @@ def main(*args: Any) -> Optional[Root]:
                     grad_accum_steps=int(ops.grad_accum_steps),
                     train_loader=train_loader,
                     val_loader=val_loader,
-                    epoch_idx=epoch_idx,
-                    total_epochs=int(ops.epochs),
                 )
                 torch.distributed.barrier(
                     device_ids=[local_rank]
@@ -2142,25 +1689,11 @@ def main(*args: Any) -> Optional[Root]:
                                 mark_step()
                         y_hat, _ = model(
                             X,
-                            None,
-                            None,
-                            None,
-                            None,
-                            None,
+                            labels_flat=None,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
                         )
-                clip_outputs = bool(getattr(cfg, "clip_output_on_serialize", False))
-                loss_space = str(
-                    getattr(model, "_loss_space", getattr(cfg, "loss_space", ""))
-                ).lower()
-                if (
-                    clip_outputs
-                    and loss_space not in {"logit"}
-                    and hasattr(model, "y_low_buf")
-                    and hasattr(model, "y_high_buf")
-                ):
-                    low = float(model.y_low_buf.item())
-                    high = float(model.y_high_buf.item())
-                    y_hat = y_hat.clamp(min=low, max=high)
                 preds.append(y_hat.detach().cpu())
                 if use_timer:
                     ev_e.record()

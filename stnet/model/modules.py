@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from torch import nn
 
 from ..utils.compat import patch_torch
@@ -529,7 +528,6 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
-
     def __init__(
         self,
         in_dim: int,
@@ -544,46 +542,6 @@ class Root(nn.Module):
         self._y_low = float(getattr(config, "y_low", 0.0))
         self._y_high = float(getattr(config, "y_high", 100.0))
         self._y_eps_range = float(getattr(config, "y_eps_range", 1e-3))
-        self._y_eps_rel = float(getattr(config, "y_eps_rel", 0.02))
-        self._z_reg_lambda = float(getattr(config, "z_reg_lambda", 1e-2))
-        self._range_penalty_lambda = float(
-            getattr(config, "range_penalty_lambda", 0.0)
-        )
-        self._calib_enable = bool(getattr(config, "calibrate_output", True))
-        c_scale = float(getattr(config, "calibrate_init_scale", 1.0))
-        c_bias  = float(getattr(config, "calibrate_init_bias", 0.0))
-        self.calib_scale = nn.Parameter(torch.ones(1, dtype=torch.float64) * c_scale)
-        self.calib_bias  = nn.Parameter(torch.ones(1, dtype=torch.float64) * c_bias)
-        
-        def _calib_load_pre_hook(module, state_dict, prefix, local_md, strict, missing_keys, unexpected_keys, error_msgs):
-            for name in ("calib_scale", "calib_bias"):
-                key = prefix + name
-                if key not in state_dict:
-                    continue
-                v = state_dict[key]
-                if not isinstance(v, torch.Tensor):
-                    v = torch.as_tensor(v)
-                if v.ndim == 0:
-                    v = v.view(1)
-                elif v.ndim != 1 or v.numel() != 1:
-                    v = v.reshape(-1)[:1]
-                state_dict[key] = v.to(dtype=module.calib_scale.dtype)
-                
-        def _sanitize_pre_hook(mod, args, kwargs):
-            if len(args) >= 1:
-                args = (args[0],)
-            else:
-                raise TypeError("Root.forward expects features as the first positional argument")
-            allowed = {"labels_flat", "net_loss", "global_loss", "local_loss", "loss_weights"}
-            if kwargs:
-                kwargs = {k: v for k, v in kwargs.items() if k in allowed}
-            return args, kwargs
-
-        self.register_forward_pre_hook(_sanitize_pre_hook, with_kwargs=True)
-        self._calib_pre_hook_handle = self._register_load_state_dict_pre_hook(
-        _calib_load_pre_hook, with_module=True
-        )
-
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -763,35 +721,10 @@ class Root(nn.Module):
             c = torch.tensor(
                 float(int(self._x_count.item())), dtype=torch.float64, device=dev
             )
-            if dist.is_available() and dist.is_initialized():
-                backend = ""
-                try:
-                    backend = str(dist.get_backend()).lower()
-                except Exception:
-                    backend = ""
-                work_tensors = [s, s2, c]
-                original_devices = [t.device for t in work_tensors]
-                target_device = None
-                if backend == "nccl" and torch.cuda.is_available():
-                    try:
-                        target_device = torch.device("cuda", torch.cuda.current_device())
-                    except Exception:
-                        target_device = torch.device("cuda", 0)
-                if target_device is not None:
-                    work_tensors = [
-                        t.to(device=target_device) if t.device != target_device else t
-                        for t in work_tensors
-                    ]
-                dist.all_reduce(work_tensors[0], op=dist.ReduceOp.SUM)
-                dist.all_reduce(work_tensors[1], op=dist.ReduceOp.SUM)
-                dist.all_reduce(work_tensors[2], op=dist.ReduceOp.SUM)
-                work_tensors = [
-                    t.to(device=original_devices[i])
-                    if t.device != original_devices[i]
-                    else t
-                    for i, t in enumerate(work_tensors)
-                ]
-                s, s2, c = work_tensors
+            if dist.is_initialized():
+                dist.all_reduce(s, op=dist.ReduceOp.SUM)
+                dist.all_reduce(s2, op=dist.ReduceOp.SUM)
+                dist.all_reduce(c, op=dist.ReduceOp.SUM)
             s = s.cpu()
             s2 = s2.cpu()
             c = float(c.cpu().item())
@@ -915,85 +848,29 @@ class Root(nn.Module):
     def _to_logit_range(self, y: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=y.device, dtype=y.dtype)
         B = self.y_high_buf.to(device=y.device, dtype=y.dtype)
-        if (
-            not torch.isfinite(A).all().item()
-            or not torch.isfinite(B).all().item()
-            or not bool((B > A).all().item())
-        ):
-            base_low = float(self._y_low)
-            base_high = float(self._y_high)
-            if (not math.isfinite(base_low)) or (not math.isfinite(base_high)) or (
-                base_high <= base_low
-            ):
-                base_low, base_high = 0.0, 100.0
-            A = y.new_tensor(base_low)
-            B = y.new_tensor(base_high)
-        span = float((B - A).abs().item())
-        eps_abs = float(self.y_eps_range_buf.item())
-        eps_rel = float(max(0.0, self._y_eps_rel)) * span
-        eps = max(eps_abs, eps_rel, 1e-9)
-        max_eps = max(1e-9, 0.5 * span - 1e-9)
-        eps = min(eps, max_eps)
-        eps_val = torch.tensor(eps, device=y.device, dtype=y.dtype)
-        denom = B - A + 2.0 * eps_val
-        y01 = (y - A + eps_val) / denom
-        min_norm = eps_val / denom
-        y01 = torch.clamp(y01, min=min_norm, max=1.0 - min_norm)
+        eps = float(self.y_eps_range_buf.item())
+        y01 = (y - A + eps) / (B - A + 2.0 * eps)
+        y01 = torch.clamp(y01, min=eps, max=1.0 - eps)
         return torch.log(y01 / (1.0 - y01))
 
     def _from_logit_range(self, z: torch.Tensor) -> torch.Tensor:
         A = self.y_low_buf.to(device=z.device, dtype=z.dtype)
         B = self.y_high_buf.to(device=z.device, dtype=z.dtype)
-        if (
-            not torch.isfinite(A).all().item()
-            or not torch.isfinite(B).all().item()
-            or not bool((B > A).all().item())
-        ):
-            base_low = float(self._y_low)
-            base_high = float(self._y_high)
-            if (not math.isfinite(base_low)) or (not math.isfinite(base_high)) or (
-                base_high <= base_low
-            ):
-                base_low, base_high = 0.0, 100.0
-            A = z.new_tensor(base_low)
-            B = z.new_tensor(base_high)
-        span = float((B - A).abs().item())
-        eps_abs = float(self.y_eps_range_buf.item())
-        eps_rel = float(max(0.0, self._y_eps_rel)) * span
-        eps = max(eps_abs, eps_rel, 1e-9)
-        max_eps = max(1e-9, 0.5 * span - 1e-9)
-        eps = min(eps, max_eps)
-        eps_val = torch.tensor(eps, device=z.device, dtype=z.dtype)
-        y = torch.sigmoid(z) * (B - A + 2.0 * eps_val) + (A - eps_val)
-        return torch.clamp(y, min=A, max=B)
-
-    def _to_zscore(self, y: torch.Tensor) -> torch.Tensor:
-        if not self.has_valid_y_stats():
-            return y
-        mu = self.y_mean.to(device=y.device, dtype=y.dtype)
-        sd = self.y_std.to(device=y.device, dtype=y.dtype)
-        eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
-        sd = torch.clamp(sd, min=eps)
-        return (y - mu) / sd
-
-    def _from_zscore(self, z: torch.Tensor) -> torch.Tensor:
-        if not self.has_valid_y_stats():
-            return z
-        mu = self.y_mean.to(device=z.device, dtype=z.dtype)
-        sd = self.y_std.to(device=z.device, dtype=z.dtype)
-        eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
-        sd = torch.clamp(sd, min=eps)
-        return z * sd + mu
+        eps = float(self.y_eps_range_buf.item())
+        y01 = torch.sigmoid(z)
+        return y01 * (B - A + 2.0 * eps) + (A - eps)
 
     def forward(
         self,
-        *args: Any,
         features: torch.Tensor,
+        *args: Any,
         labels_flat: Optional[torch.Tensor] = None,
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[Union[Tuple[float,float], LossWeightPolicy]] = None,
+        loss_weights: Optional[
+            Union[Tuple[float, float], LossWeightPolicy]
+        ] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         features = self._normalize_inputs(features)
@@ -1192,18 +1069,14 @@ class Root(nn.Module):
             else False
         )
         y_hat_out = y_hat_z
-        if not is_cls_loss:
-            if self._loss_space == "logit":
-                y_hat_out = self._from_logit_range(y_hat_z)
-            elif self._loss_space == "z":
-                y_hat_out = self._from_zscore(y_hat_z)
-            else:
-                y_hat_out = y_hat_z
-
-        if self._calib_enable and (not is_cls_loss):
-            cs = self.calib_scale.to(dtype=y_hat_out.dtype, device=y_hat_out.device).view(1)
-            cb = self.calib_bias.to(dtype=y_hat_out.dtype, device=y_hat_out.device).view(1)
-            y_hat_out = y_hat_out * cs + cb
+        if self._loss_space == "logit" and (not is_cls_loss):
+            y_hat_out = self._from_logit_range(y_hat_z)
+        elif self.has_valid_y_stats() and (not is_cls_loss):
+            mu = self.y_mean.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+            sd = self.y_std.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+            eps = float(self.y_eps.item()) if hasattr(self, "y_eps") else 1e-06
+            sd = torch.clamp(sd, min=eps)
+            y_hat_out = y_hat_z * sd + mu
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
@@ -1220,16 +1093,13 @@ class Root(nn.Module):
             else:
                 controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
-            base_tensor = (
-                y_hat_z if self._loss_space in {"logit", "z"} else y_hat_out
-            )
+            base_tensor = y_hat_z if self._loss_space == "logit" else y_hat_out
             total = base_tensor.new_tensor(0.0, dtype=base_tensor.dtype)
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
             if self._loss_space == "logit":
-                tgt = self._to_logit_range(
-                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-                )
+                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                tgt = self._to_logit_range(tgt)
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
@@ -1239,9 +1109,22 @@ class Root(nn.Module):
                     bottom_component = local_loss(y_bot, tgt)
                     total = total + weights[1] * bottom_component
             elif self._loss_space == "z" and self.has_valid_y_stats():
-                tgt_z = self._to_zscore(
-                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                mu_lbl = self.y_mean.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
                 )
+                sd_lbl = self.y_std.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                )
+                eps_lbl = (
+                    float(self.y_eps.item())
+                    if hasattr(self, "y_eps")
+                    else 1e-06
+                )
+                sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
+                tgt_z = labels_flat.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                )
+                tgt_z = (tgt_z - mu_lbl) / sd_lbl
                 y_top = y_hat_z
                 y_bot = assembled
                 if global_loss is not None:
@@ -1256,7 +1139,19 @@ class Root(nn.Module):
                 )
                 y_top = y_hat_out
                 if self.has_valid_y_stats():
-                    y_bot = self._from_zscore(assembled)
+                    mu_lbl = self.y_mean.to(
+                        device=assembled.device, dtype=assembled.dtype
+                    )
+                    sd_lbl = self.y_std.to(
+                        device=assembled.device, dtype=assembled.dtype
+                    )
+                    eps_lbl = (
+                        float(self.y_eps.item())
+                        if hasattr(self, "y_eps")
+                        else 1e-06
+                    )
+                    sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
+                    y_bot = assembled * sd_lbl + mu_lbl
                 else:
                     y_bot = assembled
                 if global_loss is not None:
@@ -1273,14 +1168,26 @@ class Root(nn.Module):
                 tgt = labels_flat.to(device=y_hat_out.device).long()
                 loss_val = net_loss(y_hat_out, tgt)
             elif self._loss_space == "logit":
-                tgt = self._to_logit_range(
-                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
-                )
+                tgt = labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                tgt = self._to_logit_range(tgt)
                 loss_val = net_loss(y_hat_z, tgt)
             elif self._loss_space == "z" and self.has_valid_y_stats():
-                tgt = self._to_zscore(
-                    labels_flat.to(device=y_hat_z.device, dtype=y_hat_z.dtype)
+                mu_lbl = self.y_mean.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
                 )
+                sd_lbl = self.y_std.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                )
+                eps_lbl = (
+                    float(self.y_eps.item())
+                    if hasattr(self, "y_eps")
+                    else 1e-06
+                )
+                sd_lbl = torch.clamp(sd_lbl, min=eps_lbl)
+                tgt = labels_flat.to(
+                    device=y_hat_z.device, dtype=y_hat_z.dtype
+                )
+                tgt = (tgt - mu_lbl) / sd_lbl
                 loss_val = net_loss(y_hat_z, tgt)
             else:
                 loss_val = net_loss(
@@ -1289,24 +1196,6 @@ class Root(nn.Module):
                         device=y_hat_out.device, dtype=y_hat_out.dtype
                     ),
                 )
-        if (
-            not is_cls_loss
-            and isinstance(loss_val, torch.Tensor)
-            and self._range_penalty_lambda > 0.0
-        ):
-            y_low = self.y_low_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
-            y_high = self.y_high_buf.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
-            penalty_hi = F.relu(y_hat_out - y_high)
-            penalty_lo = F.relu(y_low - y_hat_out)
-            penalty = (penalty_hi.pow(2) + penalty_lo.pow(2)).mean()
-            if torch.isfinite(penalty).all():
-                loss_val = loss_val + self._range_penalty_lambda * penalty
-        if (
-            not is_cls_loss
-            and self._z_reg_lambda > 0.0
-            and isinstance(loss_val, torch.Tensor)
-        ):
-            loss_val = loss_val + self._z_reg_lambda * y_hat_z.pow(2).mean()
         return (y_hat_out.view(b, *self.out_shape), loss_val)
 
     def stats(self) -> dict:
