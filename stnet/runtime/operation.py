@@ -52,17 +52,15 @@ from ..config import (
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
-from ..data.stats import compute_y_range
 from ..utils.dtypes import to_torch
 from ..data.dataset import SampleReader
+from ..data.stats import MetaData
 from ..utils.platform import Distributed, Network, System
 from ..utils.optimization import (
     AdamW,
     AutoCast,
     LossWeightController,
-    DataScale,
     Module,
-    _supports_scale,
     inference,
     joining,
     no_synchronization,
@@ -70,105 +68,12 @@ from ..utils.optimization import (
 from ..utils.profiler import FlopCounter
 
 
-def _float8_scale_supported(scale: Optional[DataScale]) -> bool:
-    if scale is None:
-        return True
-    try:
-        candidates = AutoCast._float8_dtypes()
-    except Exception:
-        return False
-    if not candidates:
-        return False
-    for dtype in candidates:
-        if isinstance(dtype, torch.dtype) and _supports_scale(
-            dtype, scale, safety_margin=2.0
-        ):
-            return True
-    return False
-
-
-def _resolve_data_scale_hint(value: Any, *, _depth: int = 0) -> Optional[DataScale]:
-    if value is None or _depth > 4:
-        return None
-    if isinstance(value, DataScale):
-        return value
-    candidate = getattr(value, "__data_scale_hint__", None)
-    if isinstance(candidate, DataScale):
-        return candidate
-    for attr in ("_fsdp_wrapped_module", "_orig_module", "module"):
-        nested = None
-        with contextlib.suppress(Exception):
-            nested = getattr(value, attr)
-        if nested is None or nested is value:
-            continue
-        resolved = _resolve_data_scale_hint(nested, _depth=_depth + 1)
-        if resolved is not None:
-            return resolved
-    return None
-
-
-def _resolve_module_device(value: Any, *, _depth: int = 0) -> Optional[torch.device]:
-    if value is None or _depth > 4:
-        return None
-    if isinstance(value, torch.device):
-        return value
-    if isinstance(value, torch.Tensor):
-        return value.device
-    candidate = getattr(value, "device", None)
-    if isinstance(candidate, torch.device):
-        return candidate
-    if isinstance(candidate, torch.Tensor):
-        return candidate.device
-    if isinstance(value, torch.nn.Module):
-        with contextlib.suppress(Exception):
-            param = next(value.parameters(recurse=True), None)
-            if isinstance(param, torch.nn.Parameter):
-                return param.device
-        with contextlib.suppress(Exception):
-            buffer = next(value.buffers(recurse=True), None)
-            if isinstance(buffer, torch.Tensor):
-                return buffer.device
-    for attr in ("_fsdp_wrapped_module", "_orig_module", "module"):
-        nested = None
-        with contextlib.suppress(Exception):
-            nested = getattr(value, attr)
-        if nested is None or nested is value:
-            continue
-        resolved = _resolve_module_device(nested, _depth=_depth + 1)
-        if resolved is not None:
-            return resolved
-    return None
-
-
 try:
-    from torchao.float8 import (
-        precompute_float8_dynamic_scale_for_fsdp as _torchao_precompute_float8_dynamic_scale_for_fsdp,
-    )
-except ImportError:
+    from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
+except ImportError:  # pragma: no cover - optional dependency
 
     def precompute_float8_dynamic_scale_for_fsdp(*args: Any, **kwargs: Any) -> Any:
         return None
-else:
-
-    def precompute_float8_dynamic_scale_for_fsdp(*args: Any, **kwargs: Any) -> Any:
-        if not args and "module" not in kwargs:
-            return None
-        module = args[0] if args else kwargs.get("module")
-        device_hint = kwargs.get("device")
-        device: Optional[torch.device]
-        with contextlib.suppress(Exception):
-            device = torch.device(device_hint) if device_hint is not None else None
-        if device is None:
-            device = _resolve_module_device(module)
-        ok, _ = System.is_float8_supported(device) if device is not None else System.is_float8_supported()
-        if not ok:
-            return None
-        scale_hint = _resolve_data_scale_hint(kwargs.pop("data_scale", None))
-        if scale_hint is None:
-            scale_hint = _resolve_data_scale_hint(module)
-        if scale_hint is not None and not _float8_scale_supported(scale_hint):
-            return None
-        return _torchao_precompute_float8_dynamic_scale_for_fsdp(*args, **kwargs)
 
 
 try:
@@ -207,27 +112,6 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
     except Exception:
         pass
     warnings.warn(text)
-
-
-def _accumulate_data_scale(
-    scale: Optional[DataScale], *values: Any
-) -> Optional[DataScale]:
-    current = scale
-    for value in values:
-        if value is None:
-            continue
-        tensor: Optional[torch.Tensor]
-        if isinstance(value, torch.Tensor):
-            tensor = value
-        else:
-            try:
-                tensor = to_torch(value)
-            except Exception:
-                tensor = None
-        if tensor is None:
-            continue
-        current = DataScale.accumulate(current, tensor)
-    return current
 
 
 def _prune_dcp_state_keys(state: Any) -> Any:
@@ -305,6 +189,7 @@ def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
         colour="green",
         position=0,
         leave=False,
+        dynamic_ncols=True,
     )
     bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
     return bar
@@ -386,6 +271,7 @@ def _advance_status_bar(
     )
     status_bar.set_postfix_str(postfix, refresh=False)
     status_bar.update(increment)
+    status_bar.refresh()
 
 
 def _backend_type(device: torch.device) -> str:
@@ -1032,6 +918,7 @@ def main(*args: Any) -> Optional[Root]:
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
+        metadata = MetaData.for_device(device)
         meta_info = _meta(ops.memmap_dir or "")
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
@@ -1062,54 +949,8 @@ def main(*args: Any) -> Optional[Root]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        data_scale: Optional[DataScale] = None
-        train_loader0, val_loader0, keep0 = dataloader(
-            memmap_dir=ops.memmap_dir,
-            device=device,
-            batch_size=int(ops.batch_size or 128),
-            val_frac=float(ops.val_frac),
-            prefetch_factor=ops.prefetch_factor,
-            non_blocking_copy=bool(ops.overlap_h2d),
-            io_backend="auto",
-        )
-        if (
-            getattr(cfg, "auto_y_range", False)
-            and str(getattr(cfg, "loss_space", "")).lower() == "logit"
-            and hasattr(model, "set_y_range")
-            and train_loader0 is not None
-        ):
-            q_low = float(getattr(cfg, "y_range_q_low", 0.005))
-            q_high = float(getattr(cfg, "y_range_q_high", 0.995))
-            eps = float(getattr(cfg, "y_eps_range", 1e-3))
-            try:
-                lo, hi = compute_y_range(train_loader0, q_low=q_low, q_high=q_high)
-            except Exception as exc:  # pragma: no cover - defensive path
-                warnings.warn(f"auto_y_range failed: {exc}")
-            else:
-                try:
-                    model.set_y_range(lo, hi, eps)
-                except Exception as exc:  # pragma: no cover - defensive path
-                    warnings.warn(f"set_y_range failed: {exc}")
-        train_step_count = 0
-        for train_step_count, _raw in enumerate(train_loader0, start=1):
-            _feat0, _label0, *_ = preprocess(_raw)
-            data_scale = _accumulate_data_scale(data_scale, _feat0, _label0)
-            if hasattr(model, "update_x_stats"):
-                with contextlib.suppress(Exception):
-                    model.update_x_stats(_feat0)
-            _label0 = to_torch(_label0)
-            _Y0_flat = _label0.view(_label0.shape[0], -1)
-            model.update_y_stats(_Y0_flat)
-        model.finalize_y_stats()
-        if hasattr(model, "finalize_x_stats"):
-            model.finalize_x_stats()
-        if keep0 is not None:
-            keep0.cleanup()
-        if data_scale is not None:
-            setattr(model, "__data_scale_hint__", data_scale)
-        model, _, _ = Module.use_te_module(
-            model, device=device, scale=data_scale
-        )
+        model, _, _ = Module.use_te_module(model, device=device)
+        AutoCast.configure(model, metadata=metadata)
         param_dtype = _ensure_uniform_param_dtype(
             model,
             prefer=(
@@ -1128,17 +969,15 @@ def main(*args: Any) -> Optional[Root]:
         if fp8_ok:
             model, fp8_enabled, fp8_backend = Module.enable_float8_training(
                 model,
-                device=device,
-                prefer="te",
+                metadata=metadata,
                 logger=_float8_log,
-                scale=data_scale,
             )
             if not fp8_enabled:
                 disable_note = fp8_backend
         else:
             disable_note = fp8_reason
         if not fp8_enabled:
-            AutoCast.configure(model, scale=data_scale)
+            AutoCast.configure(model, metadata=metadata)
             if disable_note:
                 _float8_log(f"[FP8] disabled: {disable_note}")
         model.train()
@@ -1251,20 +1090,12 @@ def main(*args: Any) -> Optional[Root]:
                 reshard_after_forward=False,
             )
             model.set_requires_gradient_sync(True)
-        if fp8_enabled and _float8_scale_supported(data_scale):
-            with contextlib.suppress(Exception):
-                precompute_float8_dynamic_scale_for_fsdp(
-                    model, data_scale=data_scale
-                )
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
             net_params,
             lr=ops.base_lr,
             weight_decay=ops.weight_decay,
-            use_fp8=(device.type == "cuda"),
-            use_foreach=False,
-            use_fused=False,
-            scale=data_scale,
+            metadata=metadata,
             logger=None,
         )
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
@@ -1382,8 +1213,6 @@ def main(*args: Any) -> Optional[Root]:
                 restore_dl_state = False
 
             train_steps = _loader_length(train_loader)
-            if train_step_count > 0:
-                train_steps = max(train_steps, train_step_count)
             val_steps = _loader_length(val_loader)
             steps_per_epoch = max(1, train_steps + val_steps)
             total_steps = max(1, int(ops.epochs) * steps_per_epoch)
@@ -1494,6 +1323,7 @@ def main(*args: Any) -> Optional[Root]:
                         flop_breakdown=aggregated_breakdown,
                     )
                     status_bar.set_postfix_str(postfix, refresh=False)
+                    status_bar.refresh()
                 torch.distributed.barrier(
                     device_ids=[local_rank]
                     if device.type in ("cuda", "xpu")
@@ -1568,27 +1398,8 @@ def main(*args: Any) -> Optional[Root]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
-        data_scale: Optional[DataScale] = None
-        scale_loader, _, scale_keep = dataloader(
-            memmap_dir=ops.memmap_dir or "",
-            device=device,
-            batch_size=int(ops.batch_size or 512),
-            val_frac=0.0,
-            prefetch_factor=ops.prefetch_factor,
-            non_blocking_copy=False,
-            io_backend="auto",
-        )
-        if scale_loader is not None:
-            for _raw in scale_loader:
-                feat_s, label_s, *_ = preprocess(_raw)
-                data_scale = _accumulate_data_scale(data_scale, feat_s, label_s)
-        if scale_keep is not None:
-            scale_keep.cleanup()
-        if data_scale is not None:
-            setattr(model, "__data_scale_hint__", data_scale)
-        model, _, _ = Module.use_te_module(
-            model, device=device, scale=data_scale
-        )
+        metadata = MetaData.for_device(device)
+        model, _, _ = Module.use_te_module(model, device=device)
         _ensure_uniform_param_dtype(
             model,
             prefer=(
@@ -1600,18 +1411,16 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             ),
         )
+        AutoCast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = System.is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = Module.enable_float8_prediction(
                 model,
-                device=device,
-                prefer="te",
+                metadata=metadata,
                 logger=_float8_log,
-                dynamic_activations=True,
-                scale=data_scale,
             )
         else:
-            AutoCast.configure(model, scale=data_scale)
+            AutoCast.configure(model, metadata=metadata)
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         model.eval()
         data_loader, _, keep = dataloader(

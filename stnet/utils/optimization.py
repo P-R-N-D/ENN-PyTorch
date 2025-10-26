@@ -25,6 +25,8 @@ import torch
 import torch._dynamo
 from torch import nn, optim
 
+from ..data.stats import MetaData
+
 from .platform import (
     get_device,
     get_runtime_config,
@@ -149,7 +151,7 @@ class AutoCast:
     _int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _scale_hint: Optional[DataScale] = None
+    _metadata: Optional[MetaData[Any]] = None
 
     @classmethod
     def _resolve_fp8_backend(
@@ -256,6 +258,32 @@ class AutoCast:
             return device
         return torch.device(device)
 
+    @classmethod
+    def _ensure_metadata(
+        cls,
+        device: Optional[Union[torch.device, str]] = None,
+        *,
+        metadata: Optional[MetaData[Any]] = None,
+    ) -> MetaData[Any]:
+        meta = metadata or cls._metadata
+        dev = cls._resolve_device(device)
+        if meta is None:
+            meta = MetaData.for_device(dev)
+        else:
+            current_device = torch.device(getattr(meta, "device", dev))
+            if current_device != dev:
+                meta.device = dev
+                meta.refresh()
+        if not getattr(meta, "float_dtypes", ()):  # type: ignore[attr-defined]
+            meta.refresh()
+        elif (
+            not getattr(meta, "int_dtypes", ())
+            or not getattr(meta, "float8_dtypes", ())
+        ):  # type: ignore[attr-defined]
+            meta.refresh()
+        cls._metadata = meta
+        return meta
+
     @staticmethod
     def _coerce_dtype(value: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
         if isinstance(value, torch.dtype):
@@ -266,60 +294,31 @@ class AutoCast:
                 return candidate
         return None
 
-    @staticmethod
-    def _distinct_dtypes(candidates: Iterable[torch.dtype]) -> Tuple[torch.dtype, ...]:
-        seen: Dict[torch.dtype, None] = {}
-        for dtype in candidates:
-            if isinstance(dtype, torch.dtype) and dtype not in seen:
-                seen[dtype] = None
-        return tuple(seen.keys())
-
     @classmethod
     def _float_amp_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
-        dev_type = device.type
-        candidates: List[torch.dtype] = []
-        if dev_type == "cuda":
-            if torch.cuda.is_bf16_supported():
-                candidates.append(torch.bfloat16)
-            candidates.append(torch.float16)
-            candidates.append(torch.float32)
-        elif dev_type == "xpu":
-            candidates.extend((torch.bfloat16, torch.float32))
-        elif dev_type == "mps":
-            candidates.extend((torch.float16, torch.float32))
-        elif dev_type == "cpu":
-            if is_cpu_bf16_supported():
-                candidates.append(torch.bfloat16)
-            candidates.extend((torch.float32, torch.float64))
-        else:
-            candidates.append(torch.float32)
-        if not candidates:
-            candidates.append(torch.float32)
-        return cls._distinct_dtypes(candidates)
+        meta = cls._ensure_metadata(device)
+        candidates = getattr(meta, "float_dtypes", ())
+        if candidates:
+            return tuple(candidates)
+        return (torch.float32,)
 
     @staticmethod
     def _float8_dtypes() -> Tuple[torch.dtype, ...]:
-        names = (
-            "float8_e4m3fn",
-            "float8_e4m3fnuz",
-            "float8_e5m2",
-            "float8_e5m2fnuz",
-        )
-        values: List[torch.dtype] = []
-        for name in names:
-            candidate = getattr(torch, name, None)
-            if isinstance(candidate, torch.dtype):
-                values.append(candidate)
-        return tuple(values)
+        meta = AutoCast._metadata
+        if meta is not None and getattr(meta, "float8_dtypes", None):
+            return tuple(meta.float8_dtypes)
+        values = MetaData._float8_dtypes()
+        if meta is not None:
+            meta.float8_dtypes = values
+        return values
 
     @classmethod
     def _integer_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
-        candidates: List[torch.dtype] = []
-        int8_ok, _ = is_int8_supported(device)
-        if int8_ok:
-            candidates.append(torch.int8)
-        candidates.extend((torch.int16, torch.int32, torch.int64))
-        return cls._distinct_dtypes(candidates or (torch.int64,))
+        meta = cls._ensure_metadata(device)
+        candidates = getattr(meta, "int_dtypes", ())
+        if candidates:
+            return tuple(candidates)
+        return (torch.int64,)
 
     @classmethod
     def _select_dtype(
@@ -330,9 +329,9 @@ class AutoCast:
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
-        scale: Optional[DataScale] = None,
+        meta: Optional[MetaData[Any]] = None,
     ) -> torch.dtype:
-        scale_hint = scale if scale is not None else cls._scale_hint
+        scale_hint = getattr(meta, "scale", None)
         for dtype in candidates:
             if _supports_scale(dtype, scale_hint):
                 return dtype
@@ -442,7 +441,7 @@ class AutoCast:
         cls,
         model: Optional[nn.Module],
         *,
-        scale: Optional[DataScale] = None,
+        metadata: Optional[MetaData[Any]] = None,
     ) -> None:
         backend: Optional[str] = None
         int_backend: Optional[str] = None
@@ -473,11 +472,25 @@ class AutoCast:
                     "__int8_training_ptq__",
                     "__int8_inference_ao__",
                 )
-            ):
-                int_backend = "ao"
+                ):
+                    int_backend = "ao"
         cls._fp8_backend = backend
         cls._int_backend = int_backend
-        cls._scale_hint = scale if scale is not None else cls._scale_hint
+        meta = metadata
+        device: Optional[torch.device] = None
+        if meta is not None:
+            device = torch.device(meta.device)
+        elif isinstance(model, nn.Module):
+            tensor: Optional[torch.Tensor] = None
+            with contextlib.suppress(StopIteration):
+                tensor = next(model.parameters())
+            if tensor is None:
+                with contextlib.suppress(StopIteration):
+                    tensor = next(model.buffers())
+            if tensor is not None:
+                device = tensor.device
+        meta = cls._ensure_metadata(device, metadata=meta)
+        cls._metadata = meta
 
     @classmethod
     @contextlib.contextmanager
@@ -485,26 +498,29 @@ class AutoCast:
         cls,
         device: Optional[Union[torch.device, str]] = None,
         *,
-        scale: Optional[DataScale] = None,
-        enabled: Optional[bool] = None,
+        metadata: Optional[MetaData[Any]] = None,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
-        amp_candidates = cls._float_amp_candidates(dev)
+        meta = cls._ensure_metadata(dev, metadata=metadata)
+        amp_candidates = tuple(meta.float_dtypes) if meta.float_dtypes else (torch.float32,)
         amp_dtype = cls._select_dtype(
             amp_candidates,
             fallback=torch.float32,
             logger=_LOGGER,
             context="float",
             device=dev,
-            scale=scale,
+            meta=meta,
         )
-        enabled = True if enabled is None else bool(enabled)
         contexts: List[contextlib.AbstractContextManager[None]] = []
 
         backend = cls._resolve_fp8_backend(cls._fp8_backend, device=dev)
-        float8_dtypes = cls._float8_dtypes()
-        wants_fp8 = backend is not None and enabled
-        scale_hint = scale if scale is not None else cls._scale_hint
+        float8_dtypes = (
+            tuple(meta.float8_dtypes)
+            if meta.float8_dtypes
+            else cls._float8_dtypes()
+        )
+        wants_fp8 = backend is not None
+        scale_hint = meta.scale
         if wants_fp8 and scale_hint is not None:
             fp8_supported = any(
                 _supports_scale(dtype, scale_hint, safety_margin=2.0)
@@ -518,13 +534,13 @@ class AutoCast:
                 )
         if wants_fp8:
             if backend == "te":
-                contexts.extend(cls._te_fp8_context(dev, enabled))
+                contexts.extend(cls._te_fp8_context(dev, True))
                 if not contexts:
                     backend = cls._resolve_fp8_backend("ao", device=dev)
                     if backend == "ao":
-                        contexts.extend(cls._ao_fp8_context(enabled))
+                        contexts.extend(cls._ao_fp8_context(True))
             elif backend == "ao":
-                contexts.extend(cls._ao_fp8_context(enabled))
+                contexts.extend(cls._ao_fp8_context(True))
             else:
                 _LOGGER.debug(
                     "AutoCast FP8 backend '%s' unsupported; disabling", backend
@@ -535,7 +551,7 @@ class AutoCast:
             ctx = torch.amp.autocast(
                 device_type=dev.type,
                 dtype=amp_dtype,
-                enabled=enabled,
+                enabled=True,
             )
             contexts.append(ctx)
         except (RuntimeError, ValueError) as exc:
@@ -546,6 +562,8 @@ class AutoCast:
             cls._last_float_dtype = amp_dtype
         else:
             cls._last_float_dtype = amp_dtype
+        meta.record_float_dtype(amp_dtype)
+        cls._metadata = meta
 
         with contextlib.ExitStack() as stack:
             for ctx in contexts:
@@ -554,32 +572,41 @@ class AutoCast:
 
     @classmethod
     @contextlib.contextmanager
+    def suspend(
+        cls, device: Optional[Union[torch.device, str]] = None
+    ) -> contextlib.AbstractContextManager[None]:
+        dev = cls._resolve_device(device)
+        try:
+            with torch.amp.autocast(device_type=dev.type, enabled=False):
+                yield
+        except (RuntimeError, ValueError):
+            yield
+
+    @classmethod
+    @contextlib.contextmanager
     def integer(
         cls,
         device: Optional[Union[torch.device, str]] = None,
         *,
-        scale: Optional[DataScale] = None,
-        enabled: Optional[bool] = None,
+        metadata: Optional[MetaData[Any]] = None,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
-        int_candidates = cls._integer_candidates(dev)
+        meta = cls._ensure_metadata(dev, metadata=metadata)
+        int_candidates = tuple(meta.int_dtypes) if meta.int_dtypes else (torch.int64,)
         int_dtype = cls._select_dtype(
             int_candidates,
             fallback=torch.int64,
             logger=_LOGGER,
             context="int",
             device=dev,
-            scale=scale,
+            meta=meta,
         )
-        use_enabled = True if enabled is None else bool(enabled)
         backend = cls._resolve_int_backend(cls._int_backend, device=dev)
-        contexts = (
-            cls._int8_context(dev, use_enabled) if use_enabled and backend else []
-        )
-        if not contexts and use_enabled and backend == "te":
+        contexts = cls._int8_context(dev, True) if backend else []
+        if not contexts and backend == "te":
             fallback_backend = cls._resolve_int_backend("ao", device=dev)
             if fallback_backend == "ao":
-                contexts = cls._int8_context(dev, use_enabled)
+                contexts = cls._int8_context(dev, True)
         if not contexts:
             contexts.append(contextlib.nullcontext())
 
@@ -587,6 +614,8 @@ class AutoCast:
             for ctx in contexts:
                 stack.enter_context(ctx)
             cls._last_int_dtype = int_dtype
+            meta.record_int_dtype(int_dtype)
+            cls._metadata = meta
             yield
 
 
@@ -1223,11 +1252,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        device: Optional[torch.device] = None,
-        use_fp8: bool = True,
-        use_foreach: Optional[bool] = False,
-        use_fused: bool = False,
-        scale: Optional[DataScale] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -1236,7 +1261,18 @@ class AdamW:
             if hasattr(model_or_params, "parameters")
             else model_or_params
         )
-        dev: torch.device = device or get_device()
+        ref_tensor: Optional[torch.Tensor] = None
+        if isinstance(model_or_params, nn.Module):
+            ref_tensor = Module._module_reference_tensor(model_or_params)
+        dev: torch.device
+        if metadata is not None:
+            dev = torch.device(metadata.device)
+        elif ref_tensor is not None:
+            dev = ref_tensor.device
+        else:
+            dev = get_device()
+        meta = AutoCast._ensure_metadata(dev, metadata=metadata)
+        dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
                 from transformer_engine.pytorch.optimizers import (
@@ -1250,49 +1286,52 @@ class AdamW:
             except Exception as exc:
                 if logger:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
-        if use_fp8 and (hasattr(dev, "type") and dev.type == "cuda"):
+        scale = meta.scale
+        if hasattr(dev, "type") and dev.type == "cuda":
+            fp8_allowed = True
             if scale is not None:
                 float8_dtypes = AutoCast._float8_dtypes()
                 if not any(
                     _supports_scale(dtype, scale, safety_margin=2.0)
                     for dtype in float8_dtypes
                 ):
-                    use_fp8 = False
+                    fp8_allowed = False
                     if logger:
                         logger(
                             "[OPT] FP8 optimizers disabled: data scale exceeds float8 range"
                         )
             ok, reason = is_float8_supported(dev)
-            if "TE" in str(reason):
-                try:
-                    from transformer_engine.pytorch.optimizers import FusedAdam
+            if fp8_allowed and ok:
+                if "TE" in str(reason):
+                    try:
+                        from transformer_engine.pytorch.optimizers import FusedAdam
 
-                    opt = FusedAdam(params, lr=lr, weight_decay=weight_decay)
-                    if logger:
-                        logger(
-                            f"[OPT] Using FusedAdam (transformer_engine) — {reason}"
-                        )
-                    return opt
-                except Exception as exc:
-                    if logger:
-                        logger(
-                            f"[OPT] transformer_engine.FusedAdam unavailable: {exc}"
-                        )
-            if "AO" in str(reason):
-                try:
-                    from torchao.optim import AdamWFp8
+                        opt = FusedAdam(params, lr=lr, weight_decay=weight_decay)
+                        if logger:
+                            logger(
+                                f"[OPT] Using FusedAdam (transformer_engine) — {reason}"
+                            )
+                        return opt
+                    except Exception as exc:
+                        if logger:
+                            logger(
+                                f"[OPT] transformer_engine.FusedAdam unavailable: {exc}"
+                            )
+                if "AO" in str(reason):
+                    try:
+                        from torchao.optim import AdamWFp8
 
-                    opt = AdamWFp8(params, lr=lr, weight_decay=weight_decay)
-                    if logger:
-                        logger(f"[OPT] Using AdamW-FP8 (torchao) — {reason}")
-                    return opt
-                except Exception as exc:
-                    if logger:
-                        logger(f"[OPT] torchao.AdamWFp8 unavailable: {exc}")
-            elif logger:
-                logger(f"[OPT] FP8 optimizers not supported ({reason}) — fallback")
+                        opt = AdamWFp8(params, lr=lr, weight_decay=weight_decay)
+                        if logger:
+                            logger(f"[OPT] Using AdamW-FP8 (torchao) — {reason}")
+                        return opt
+                    except Exception as exc:
+                        if logger:
+                            logger(f"[OPT] torchao.AdamWFp8 unavailable: {exc}")
+                elif logger:
+                    logger(f"[OPT] FP8 optimizers not supported ({reason}) — fallback")
         flags: Dict[str, bool] = optimal_optimizer_params(
-            dev, use_foreach=use_foreach, use_fused=use_fused
+            dev, use_foreach=None, use_fused=False
         )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
         if logger:
@@ -1307,10 +1346,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        device: Optional[torch.device] = None,
-        use_foreach: Optional[bool] = False,
-        use_fused: bool = False,
-        scale: Optional[DataScale] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -1319,7 +1355,17 @@ class AdamW:
             if hasattr(model_or_params, "parameters")
             else model_or_params
         )
-        dev: torch.device = device or get_device()
+        ref_tensor: Optional[torch.Tensor] = None
+        if isinstance(model_or_params, nn.Module):
+            ref_tensor = Module._module_reference_tensor(model_or_params)
+        if metadata is not None:
+            dev = torch.device(metadata.device)
+        elif ref_tensor is not None:
+            dev = ref_tensor.device
+        else:
+            dev = get_device()
+        meta = AutoCast._ensure_metadata(dev, metadata=metadata)
+        dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
                 from transformer_engine.pytorch.optimizers import (
@@ -1335,6 +1381,7 @@ class AdamW:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
         quant_choice: Optional[str] = None
         quant_reason: Optional[str] = None
+        scale = meta.scale
         if scale is not None:
             if not scale.is_integral:
                 if logger:
@@ -1387,7 +1434,7 @@ class AdamW:
                 if logger:
                     logger(f"[OPT] TorchAO low-bit optimizer unavailable: {exc}")
         flags: Dict[str, bool] = optimal_optimizer_params(
-            dev, use_foreach=use_foreach, use_fused=use_fused
+            dev, use_foreach=None, use_fused=False
         )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
         if logger:
@@ -1433,6 +1480,19 @@ class Module:
         with contextlib.suppress(StopIteration):
             return next(module.buffers())
         return None
+
+    @staticmethod
+    def _metadata_for(
+        model: nn.Module, metadata: Optional[MetaData[Any]] = None
+    ) -> MetaData[Any]:
+        AutoCast.configure(model, metadata=metadata)
+        meta = AutoCast._metadata
+        if meta is None:
+            ref = Module._module_reference_tensor(model)
+            dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
+            meta = MetaData.for_device(dev)
+            AutoCast.configure(model, metadata=meta)
+        return meta
 
     @staticmethod
     def _align_module_like(
@@ -1783,18 +1843,16 @@ class Module:
     @staticmethod
     def enable_float8_training(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
-        prefer: str = "auto",
-        scale: Optional[DataScale] = None,
     ) -> Tuple[nn.Module, bool, str]:
+        meta = Module._metadata_for(model, metadata)
+        device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
-            AutoCast.configure(model, scale=scale)
+            AutoCast.configure(model, metadata=meta)
             return (model, False, reason)
-        _dev_for_dtype = (
-            torch.device(device) if device is not None else get_device()
-        )
+        scale = meta.scale
         if scale is not None:
             float8_dtypes = AutoCast._float8_dtypes()
             if not any(
@@ -1805,18 +1863,11 @@ class Module:
                     logger(
                         "[FP8] training disabled: data scale exceeds float8 range"
                     )
-                AutoCast.configure(model, scale=scale)
+                AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Module._infer_optimal_dtype(
-            _dev_for_dtype, scale=scale
-        )
+        params_dtype = Module._infer_optimal_dtype(device, scale=scale)
 
-        order = (
-            ("te", "torchao")
-            if prefer in ("auto", "te")
-            else ("torchao", "te")
-        )
-        for backend in order:
+        for backend in ("te", "torchao"):
             if backend == "te":
                 m2, ok2, why = Module._try_enable_te_training(
                     model, params_dtype, logger
@@ -1826,30 +1877,26 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
-                AutoCast.configure(m2, scale=scale)
+                AutoCast.configure(m2, metadata=meta)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {backend} path skipped: {why}")
-        AutoCast.configure(model, scale=scale)
+        AutoCast.configure(model, metadata=meta)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
     def enable_float8_prediction(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
-        dynamic_activations: bool = False,
-        prefer: str = "auto",
-        te_swap: bool = True,
-        scale: Optional[DataScale] = None,
     ) -> Tuple[nn.Module, bool, str]:
+        meta = Module._metadata_for(model, metadata)
+        device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
-            AutoCast.configure(model, scale=scale)
+            AutoCast.configure(model, metadata=meta)
             return (model, False, reason)
-        _dev_for_dtype = (
-            torch.device(device) if device is not None else get_device()
-        )
+        scale = meta.scale
         if scale is not None:
             float8_dtypes = AutoCast._float8_dtypes()
             if not any(
@@ -1860,20 +1907,12 @@ class Module:
                     logger(
                         "[FP8] inference disabled: data scale exceeds float8 range"
                     )
-                AutoCast.configure(model, scale=scale)
+                AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Module._infer_optimal_dtype(
-            _dev_for_dtype, scale=scale
-        )
-
-        order = (
-            ("te_swap", "te_present", "ao")
-            if prefer in ("auto", "te")
-            else ("ao", "te_present", "te_swap")
-        )
+        params_dtype = Module._infer_optimal_dtype(device, scale=scale)
+        dynamic_activations = not (scale is not None and scale.is_integral)
+        order = ("te_swap", "te_present", "ao")
         for step in order:
-            if step == "te_swap" and (not te_swap):
-                continue
             if step == "te_swap":
                 m2, ok2, why = Module._try_enable_te_inference_swap(
                     model, params_dtype, logger
@@ -1887,96 +1926,83 @@ class Module:
             if ok2:
                 if logger:
                     logger(f"[FP8] inference enabled via {why} ({reason})")
-                AutoCast.configure(m2, scale=scale)
+                AutoCast.configure(m2, metadata=meta)
                 return (m2, True, why)
             elif logger:
                 logger(f"[FP8] {step} skipped: {why}")
-        AutoCast.configure(model, scale=scale)
+        AutoCast.configure(model, metadata=meta)
         return (model, False, "No usable FP8 backend")
 
     @staticmethod
     def enable_int8_training(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
-        dynamic_activations: bool = True,
-        group_size: int = 128,
-        prefer: str = "auto",
     ) -> Tuple[nn.Module, bool, str]:
         if quantize_ is None:
             msg = "torchao.quantization not installed (INT8/QAT disabled)"
             if logger:
                 logger(f"[INT8] {msg}")
             return (model, False, msg)
-        target_device = torch.device(device) if device is not None else None
-        if target_device is not None:
-            with contextlib.suppress(Exception):
-                model.to(target_device)
-        prefer_norm = str(prefer).strip().lower()
-        use_qat = prefer_norm in ("auto", "qat")
-        use_ptq = prefer_norm in ("auto", "ptq")
-        if use_qat:
-            try:
-                base_cfg = QAT.initialize(
-                    model,
-                    mode="qat-int8",
-                    dynamic_activations=bool(dynamic_activations),
-                    group_size=int(group_size),
-                    logger=logger,
+        meta = Module._metadata_for(model, metadata)
+        device = torch.device(meta.device)
+        with contextlib.suppress(Exception):
+            model.to(device)
+        dynamic_activations = not (meta.scale is not None and meta.scale.is_integral)
+        group_size = 128
+        try:
+            base_cfg = QAT.initialize(
+                model,
+                mode="qat-int8",
+                dynamic_activations=dynamic_activations,
+                group_size=group_size,
+                logger=logger,
+            )
+            setattr(model, "__int8_training_qat__", True)
+            if logger:
+                logger(
+                    f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
                 )
-                setattr(model, "__int8_training_qat__", True)
-                if logger:
-                    logger(
-                        f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
-                    )
-                return (model, True, "QAT-prepare")
-            except Exception as e:
-                if logger:
-                    logger(f"[INT8][QAT] prepare failed: {e}")
-                last_err = e
-        else:
-            last_err = RuntimeError("QAT disabled by prefer")
-        if use_ptq:
-            try:
-                m2, ok, why = ptq(
-                    model,
-                    mode="int8",
-                    dynamic_activations=bool(dynamic_activations),
-                    group_size=int(group_size),
-                    logger=logger,
-                )
-                if ok:
-                    setattr(m2, "__int8_training_ptq__", True)
-                    return (m2, True, f"PTQ({why})")
-                return (model, False, f"PTQ failed: {why}")
-            except Exception as e:
-                return (model, False, f"INT8 training path unavailable: {e}")
-        return (model, False, f"INT8 training disabled: {last_err}")
+            AutoCast.configure(model, metadata=meta)
+            return (model, True, "QAT-prepare")
+        except Exception as exc:
+            if logger:
+                logger(f"[INT8][QAT] prepare failed: {exc}")
+            last_err: Exception = exc
+        try:
+            m2, ok, why = ptq(
+                model,
+                mode="int8",
+                dynamic_activations=dynamic_activations,
+                group_size=group_size,
+                logger=logger,
+            )
+            if ok:
+                setattr(m2, "__int8_training_ptq__", True)
+                AutoCast.configure(m2, metadata=meta)
+                return (m2, True, f"PTQ({why})")
+            AutoCast.configure(model, metadata=meta)
+            return (model, False, f"PTQ failed: {why}")
+        except Exception as exc:
+            AutoCast.configure(model, metadata=meta)
+            return (model, False, f"INT8 training path unavailable: {exc or last_err}")
 
     @staticmethod
     def enable_int8_prediction(
         model: nn.Module,
-        device: Optional[Union[torch.device, str]] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
-        dynamic_activations: bool = True,
-        prefer: str = "auto",
     ) -> Tuple[nn.Module, bool, str]:
         if quantize_ is None:
             msg = "torchao.quantization not installed (INT8 disabled)"
             if logger:
                 logger(f"[INT8] {msg}")
             return (model, False, msg)
-        prefer_norm = str(prefer).strip().lower()
-        if prefer_norm not in ("auto", "ao"):
-            return (
-                model,
-                False,
-                f"INT8 inference prefer={prefer} not supported",
-            )
-        target_device = torch.device(device) if device is not None else None
-        if target_device is not None:
-            with contextlib.suppress(Exception):
-                model.to(target_device)
+        meta = Module._metadata_for(model, metadata)
+        device = torch.device(meta.device)
+        with contextlib.suppress(Exception):
+            model.to(device)
+        dynamic_activations = not (meta.scale is not None and meta.scale.is_integral)
         try:
             if dynamic_activations:
                 cfg = Int8DynamicActivationInt8WeightConfig()
@@ -1986,8 +2012,10 @@ class Module:
             setattr(model, "__int8_inference_ao__", True)
             if logger:
                 logger(f"[INT8][AO] applied {cfg.__class__.__name__}")
+            AutoCast.configure(model, metadata=meta)
             return (model, True, "torchao")
         except Exception as e:
+            AutoCast.configure(model, metadata=meta)
             return (model, False, f"AO failed: {e}")
 
 @dataclass

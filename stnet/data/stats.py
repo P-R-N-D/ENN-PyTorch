@@ -2,13 +2,142 @@
 from __future__ import annotations
 
 import contextlib
+from dataclasses import dataclass, field
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar, TYPE_CHECKING
 
 import numpy as np
 import torch
 
-from ..utils.optimization import inference
+from ..utils.platform import is_cpu_bf16_supported, is_int8_supported
+
+if TYPE_CHECKING:  # pragma: no cover - type-checking helper
+    from ..utils.optimization import DataScale
+
+
+TExtra = TypeVar("TExtra")
+
+
+@dataclass
+class MetaData(Generic[TExtra]):
+    """Container for runtime metadata shared across training and inference.
+
+    The class tracks device capabilities, preferred casting dtypes and cached
+    normalization statistics so that components such as :class:`AutoCast`
+    or post-processing utilities can reuse a single source of truth.
+    """
+
+    device: torch.device
+    float_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
+    int_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
+    float8_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
+    scale: Optional["DataScale"] = None
+    stats: MutableMapping[str, torch.Tensor] = field(default_factory=dict)
+    extra: Dict[str, TExtra] = field(default_factory=dict)
+    last_float: Optional[torch.dtype] = None
+    last_int: Optional[torch.dtype] = None
+
+    @staticmethod
+    def _distinct_dtypes(candidates: Sequence[torch.dtype]) -> Tuple[torch.dtype, ...]:
+        seen: Dict[torch.dtype, None] = {}
+        for dtype in candidates:
+            if isinstance(dtype, torch.dtype) and dtype not in seen:
+                seen[dtype] = None
+        return tuple(seen.keys())
+
+    @staticmethod
+    def _float8_dtypes() -> Tuple[torch.dtype, ...]:
+        names = (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+        )
+        values: list[torch.dtype] = []
+        for name in names:
+            candidate = getattr(torch, name, None)
+            if isinstance(candidate, torch.dtype):
+                values.append(candidate)
+        return tuple(values)
+
+    @classmethod
+    def _float_amp_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+        dev_type = device.type
+        candidates: list[torch.dtype] = []
+        if dev_type == "cuda":
+            if torch.cuda.is_bf16_supported():
+                candidates.append(torch.bfloat16)
+            candidates.append(torch.float16)
+            candidates.append(torch.float32)
+        elif dev_type == "xpu":
+            candidates.extend((torch.bfloat16, torch.float32))
+        elif dev_type == "mps":
+            candidates.extend((torch.float16, torch.float32))
+        elif dev_type == "cpu":
+            if is_cpu_bf16_supported():
+                candidates.append(torch.bfloat16)
+            candidates.extend((torch.float32, torch.float64))
+        else:
+            candidates.append(torch.float32)
+        if not candidates:
+            candidates.append(torch.float32)
+        return cls._distinct_dtypes(candidates)
+
+    @classmethod
+    def _integer_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+        candidates: list[torch.dtype] = []
+        int8_ok, _ = is_int8_supported(device)
+        if int8_ok:
+            candidates.append(torch.int8)
+        candidates.extend((torch.int16, torch.int32, torch.int64))
+        return cls._distinct_dtypes(candidates or (torch.int64,))
+
+    @classmethod
+    def for_device(
+        cls,
+        device: torch.device | str,
+        *,
+        scale: Optional["DataScale"] = None,
+        extra: Optional[Mapping[str, TExtra]] = None,
+    ) -> "MetaData[TExtra]":
+        dev = torch.device(device)
+        meta = cls(
+            device=dev,
+            float_dtypes=cls._float_amp_candidates(dev),
+            int_dtypes=cls._integer_candidates(dev),
+            float8_dtypes=cls._float8_dtypes(),
+            scale=scale,
+        )
+        if extra:
+            meta.extra.update(dict(extra))
+        return meta
+
+    def refresh(self) -> None:
+        """Recompute dtype capabilities for the current device."""
+
+        dev = torch.device(self.device)
+        self.float_dtypes = self._float_amp_candidates(dev)
+        self.int_dtypes = self._integer_candidates(dev)
+        self.float8_dtypes = self._float8_dtypes()
+
+    def update_scale(self, scale: Optional["DataScale"]) -> None:
+        self.scale = scale
+
+    def record_float_dtype(self, dtype: Optional[torch.dtype]) -> None:
+        if isinstance(dtype, torch.dtype):
+            self.last_float = dtype
+
+    def record_int_dtype(self, dtype: Optional[torch.dtype]) -> None:
+        if isinstance(dtype, torch.dtype):
+            self.last_int = dtype
+
+    def set_stat(self, name: str, value: torch.Tensor) -> None:
+        if isinstance(value, torch.Tensor):
+            self.stats[name] = value.detach().clone()
+
+    def get_stat(self, name: str) -> Optional[torch.Tensor]:
+        value = self.stats.get(name)
+        return value.detach().clone() if isinstance(value, torch.Tensor) else None
 
 
 def compute_y_range(
@@ -39,34 +168,146 @@ def compute_y_range(
     return float(lo), float(hi)
 
 
-def recompute_y_stats(model: torch.nn.Module, loader: Iterable[Any]) -> None:
-    """Recompute label statistics for *model* using *loader*."""
+def recompute_y_stats(
+    model: torch.nn.Module,
+    loader: Iterable[Any],
+    *,
+    metadata: MetaData[Any] | None = None,
+) -> None:
+    """Recompute label statistics for *model* using *loader*.
 
-    dev = next(model.parameters()).device
-    model.y_min.fill_(float("inf"))
-    model.y_max.fill_(float("-inf"))
-    model.y_sum.zero_()
-    model.y_sum2.zero_()
-    model.y_count.zero_()
-    model.y_stats_ready.fill_(False)
+    If *metadata* is supplied the freshly computed statistics and device
+    capabilities are cached on the provided :class:`MetaData` instance so that
+    subsequent inference stages can reuse them without touching the model.
+    """
+
+    from ..utils.optimization import inference  # local import to avoid cycles
+
+    try:
+        ref = next(model.parameters())
+    except StopIteration:
+        ref = None
+    dev = ref.device if isinstance(ref, torch.Tensor) else torch.device("cpu")
+
+    if metadata is not None:
+        metadata.device = dev
+        metadata.refresh()
+
+    eps = 1e-6
+    if hasattr(model, "y_eps"):
+        with contextlib.suppress(Exception):
+            y_eps = getattr(model, "y_eps")
+            if isinstance(y_eps, torch.Tensor):
+                eps = float(y_eps.item())
+            else:
+                eps = float(y_eps)
+
+    y_min: torch.Tensor | None = None
+    y_max: torch.Tensor | None = None
+    y_sum: torch.Tensor | None = None
+    y_sum2: torch.Tensor | None = None
+    y_count: torch.Tensor | None = None
+
     model.eval()
     with inference(model):
         for X, Y in loader:
             if Y is None:
                 continue
-            model.update_y_stats(Y.to(dev))
-        model.finalize_y_stats()
+            y = torch.as_tensor(Y).detach()
+            if y.ndim > 2:
+                y = y.view(y.shape[0], -1)
+            elif y.ndim == 1:
+                y = y.view(-1, 1)
+            if y_min is None:
+                D = int(y.shape[1])
+                device = torch.device("cpu")
+                y_min = torch.full((D,), float("inf"), dtype=torch.float64, device=device)
+                y_max = torch.full((D,), float("-inf"), dtype=torch.float64, device=device)
+                y_sum = torch.zeros(D, dtype=torch.float64, device=device)
+                y_sum2 = torch.zeros(D, dtype=torch.float64, device=device)
+                y_count = torch.zeros(D, dtype=torch.float64, device=device)
+            y64 = y.to(dtype=torch.float64, device="cpu")
+            finite = torch.isfinite(y64)
+            if not finite.any():
+                continue
+            assert y_min is not None and y_max is not None
+            assert y_sum is not None and y_sum2 is not None and y_count is not None
+            valid_values = torch.where(finite, y64, torch.zeros_like(y64))
+            y_sum.add_(valid_values.sum(dim=0))
+            y_sum2.add_((valid_values * valid_values).sum(dim=0))
+            y_count.add_(finite.sum(dim=0, dtype=torch.float64))
+            min_candidates = torch.where(
+                finite, y64, torch.full_like(y64, float("inf"))
+            )
+            max_candidates = torch.where(
+                finite, y64, torch.full_like(y64, float("-inf"))
+            )
+            y_min.copy_(torch.minimum(y_min, min_candidates.min(dim=0).values))
+            y_max.copy_(torch.maximum(y_max, max_candidates.max(dim=0).values))
+
+    if y_min is None or y_count is None:
+        raise ValueError("no labels to compute y-stats")
+
+    assert y_max is not None and y_sum is not None and y_sum2 is not None
+    valid_mask = y_count > 0
+    y_mean = torch.zeros_like(y_sum)
+    var = torch.zeros_like(y_sum2)
+    y_mean[valid_mask] = y_sum[valid_mask] / y_count[valid_mask]
+    var[valid_mask] = (
+        y_sum2[valid_mask] / y_count[valid_mask]
+        - y_mean[valid_mask].pow(2)
+    )
+    y_std = torch.sqrt(var.clamp_min(eps**2))
+
+    ready = bool(valid_mask.any().item())
+
+    def _copy_to_model(name: str, value: torch.Tensor) -> None:
+        attr = getattr(model, name, None)
+        if isinstance(attr, torch.Tensor):
+            with contextlib.suppress(Exception):
+                attr.data.copy_(value.to(device=attr.device, dtype=attr.dtype))
+
+    _copy_to_model("y_min", y_min.to(dtype=torch.float32))
+    _copy_to_model("y_max", y_max.to(dtype=torch.float32))
+    _copy_to_model("y_sum", y_sum)
+    _copy_to_model("y_sum2", y_sum2)
+    _copy_to_model("y_count", y_count)
+    _copy_to_model("y_mean", y_mean.to(dtype=torch.float32))
+    _copy_to_model("y_std", y_std.to(dtype=torch.float32))
+
+    attr_ready = getattr(model, "y_stats_ready", None)
+    if isinstance(attr_ready, torch.Tensor):
+        with contextlib.suppress(Exception):
+            attr_ready.fill_(ready)
+
+    if metadata is not None:
+        metadata.set_stat("y_min", y_min.to(dtype=torch.float32))
+        metadata.set_stat("y_max", y_max.to(dtype=torch.float32))
+        metadata.set_stat("y_sum", y_sum)
+        metadata.set_stat("y_sum2", y_sum2)
+        metadata.set_stat("y_count", y_count)
+        metadata.set_stat("y_mean", y_mean.to(dtype=torch.float32))
+        metadata.set_stat("y_std", y_std.to(dtype=torch.float32))
 
 
-def inverse_y_from_stats(model: torch.nn.Module, y_flat: torch.Tensor) -> torch.Tensor:
-    """Undo standardization using the model's stored label statistics."""
+def inverse_y_from_stats(
+    model: torch.nn.Module,
+    y_flat: torch.Tensor,
+    *,
+    metadata: MetaData[Any] | None = None,
+) -> torch.Tensor:
+    """Undo standardization using the stored label statistics."""
 
     has_stats = getattr(model, "has_valid_y_stats", None)
     if callable(has_stats) and not has_stats():
         return y_flat
 
-    mean = getattr(model, "y_mean", None)
-    std = getattr(model, "y_std", None)
+    if metadata is not None:
+        mean = metadata.get_stat("y_mean")
+        std = metadata.get_stat("y_std")
+    else:
+        mean = getattr(model, "y_mean", None)
+        std = getattr(model, "y_std", None)
     if mean is None or std is None:
         return y_flat
 
