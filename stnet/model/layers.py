@@ -32,7 +32,7 @@ class StochasticDepth(nn.Module):
         return x * noise
 
 
-def norm_layer(*args: Any, norm_type: str, d_model: int, **kwargs: Any) -> nn.Module:
+def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
         return nn.LayerNorm(d_model)
