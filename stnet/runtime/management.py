@@ -68,7 +68,7 @@ class _ExportCompat(nn.Module):
         self.net = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
+        y_flat, _ = self.net(x, None, net_loss=None)
         return y_flat
 
 
@@ -93,7 +93,7 @@ def _infer_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) 
         with inference(model):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            y_flat, _ = model(sample, labels_flat=None, net_loss=None)
+            y_flat, _ = model(sample, None, net_loss=None)
         if in_dim is None:
             in_dim = int(sample.numel() // int(sample.shape[0]))
         if out_shape is None:

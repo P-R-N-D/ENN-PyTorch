@@ -977,8 +977,8 @@ class Root(nn.Module):
     def forward(
         self,
         features: torch.Tensor,
-        *args: Any,
         labels_flat: Optional[torch.Tensor] = None,
+        *args: Any,
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
