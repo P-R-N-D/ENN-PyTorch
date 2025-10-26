@@ -1032,7 +1032,7 @@ def epoch(
                                     )
                                 except Exception:
                                     pass
-                            y_hat, loss_val = model(
+                            y_hat, loss_val = model.forward(
                                 X,
                                 labels_flat=Y_flat,
                                 net_loss=None,
