@@ -494,10 +494,38 @@ class AutoCast:
                 )
                 cls._fp8_backend = None
 
+        requested_dtype = amp_dtype
+        if (
+            isinstance(cls._last_float_dtype, torch.dtype)
+            and cls._last_float_dtype in amp_candidates
+        ):
+            requested_dtype = cls._last_float_dtype
+        if dev.type == "cuda" and requested_dtype is torch.bfloat16:
+            bf16_ok = False
+            if torch.cuda.is_available():
+                try:
+                    bf16_ok = torch.cuda.is_bf16_supported()
+                except Exception:
+                    try:
+                        device_index = dev.index
+                        if device_index is None:
+                            device_index = torch.cuda.current_device()
+                    except Exception:
+                        device_index = 0
+                    try:
+                        major, _ = torch.cuda.get_device_capability(device_index)
+                    except Exception:
+                        major = 0
+                    bf16_ok = major >= 8
+            if not bf16_ok:
+                _LOGGER.debug(
+                    "AutoCast.float falling back to fp16 on CUDA device without bf16 support"
+                )
+                requested_dtype = torch.float16
         try:
             ctx = torch.amp.autocast(
                 device_type=dev.type,
-                dtype=amp_dtype,
+                dtype=requested_dtype,
                 enabled=True,
             )
             contexts.append(ctx)
@@ -506,9 +534,9 @@ class AutoCast:
                 "AutoCast.float torch.amp fallback on %s: %s", dev.type, exc
             )
             contexts.append(contextlib.nullcontext())
-            cls._last_float_dtype = amp_dtype
+            cls._last_float_dtype = requested_dtype
         else:
-            cls._last_float_dtype = amp_dtype
+            cls._last_float_dtype = requested_dtype
         cls._metadata = meta
 
         with contextlib.ExitStack() as stack:
@@ -522,10 +550,13 @@ class AutoCast:
         cls, device: Optional[Union[torch.device, str]] = None
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
-        try:
-            with torch.amp.autocast(device_type=dev.type, enabled=False):
-                yield
-        except (RuntimeError, ValueError):
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(
+                    torch.amp.autocast(device_type=dev.type, enabled=False)
+                )
+            except (RuntimeError, ValueError):
+                stack.enter_context(contextlib.nullcontext())
             yield
 
     @classmethod

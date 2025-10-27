@@ -33,6 +33,39 @@ if TYPE_CHECKING:
     from .config import ModelConfig
 
 
+class _Float32Norm(nn.Module):
+    """Wrap a normalization module to execute in float32 for stability."""
+
+    def __init__(self, base_norm: nn.Module) -> None:
+        super().__init__()
+        self.base = base_norm
+
+    def _module_dtype(self) -> Optional[torch.dtype]:
+        with contextlib.suppress(StopIteration):
+            return next(self.base.parameters()).dtype
+        with contextlib.suppress(StopIteration):
+            return next(self.base.buffers()).dtype
+        return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype in (torch.float16, torch.bfloat16):
+            base_dtype = self._module_dtype() or x.dtype
+            if base_dtype == torch.float32:
+                y = self.base(x.float())
+                return y.to(x.dtype)
+            if base_dtype != x.dtype:
+                y = self.base(x.to(base_dtype))
+                return y.to(x.dtype)
+        return self.base(x)
+
+
+if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
+    _disable_torch_compile = torch.compiler.disable
+else:
+    def _disable_torch_compile(fn):
+        return fn
+
+
 class PointTransformer(nn.Module):
     def __init__(
         self,
@@ -47,27 +80,37 @@ class PointTransformer(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        self.coord_dim = int(coord_dim)
         self.d_model = int(d_model)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm1 = norm_layer(norm_type, self.d_model)
+        self.norm1 = _Float32Norm(norm_layer(norm_type, self.d_model))
         self.attn = PatchAttention(
-            self.d_model, nhead, coord_dim=coord_dim
+            self.d_model, nhead, coord_dim=self.coord_dim
         )
-        self.norm2 = norm_layer(norm_type, self.d_model)
+        self.norm2 = _Float32Norm(norm_layer(norm_type, self.d_model))
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
 
+    @_disable_torch_compile
     def forward(
         self,
         x: torch.Tensor,
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if coords.shape[:2] != x.shape[:2]:
-            raise ValueError("coords must have shape (B, N, C)")
+        if x.is_meta or coords.is_meta:
+            raise RuntimeError("meta/fake tensor reached PointTransformer.forward")
+        if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
+            raise ValueError(
+                f"coords must be (B, N, {self.coord_dim}), got {tuple(coords.shape)} vs x {tuple(x.shape)}"
+            )
+        x = x.contiguous()
+        coords = coords.contiguous()
+        if attn_mask is not None:
+            attn_mask = attn_mask.contiguous()
         y = self.attn(self.norm1(x), coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
@@ -153,20 +196,26 @@ class TemporalEncoderBlock(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.norm1 = norm_layer(norm_type, d_model)
+        self.norm1 = _Float32Norm(norm_layer(norm_type, d_model))
         self.retention = TemporalEncoderLayer(d_model, nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm2 = norm_layer(norm_type, d_model)
+        self.norm2 = _Float32Norm(norm_layer(norm_type, d_model))
         hid = int(d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
 
+    @_disable_torch_compile
     def forward(
         self,
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
+        if x.is_meta:
+            raise RuntimeError("meta/fake tensor reached TemporalEncoderBlock.forward")
+        x = x.contiguous()
+        if causal_mask is not None:
+            causal_mask = causal_mask.contiguous()
         h, state = self.retention(
             self.norm1(x), attn_mask=causal_mask, state=state
         )
