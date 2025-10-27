@@ -1117,11 +1117,9 @@ class DotProductAttention(nn.Module):
         sdpa_bias: torch.Tensor | None = None
         if mask_bool is not None:
             finfo = torch.finfo(q_bshd.dtype)
-            sdpa_bias = torch.where(
-                mask_bool,
-                torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device),
-                torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device),
-            ).expand(B, H, L, S)
+            zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
+            neg_inf = torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device)
+            sdpa_bias = torch.where(mask_bool, neg_inf, zero).expand(B, H, L, S)
         if bias_float is not None:
             base = (
                 sdpa_bias
