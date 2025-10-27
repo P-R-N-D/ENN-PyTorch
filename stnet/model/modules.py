@@ -1,10 +1,23 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import math
+import warnings
 from dataclasses import dataclass
+from importlib import import_module
 from math import prod
-from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    List,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 import torch.nn as nn
@@ -53,7 +66,7 @@ elif not hasattr(torch.compiler, "disable"):
 
 from .functional import SwiGLU
 from .layers import (
-    GlobalEncoderLayer,
+    DilatedAttention,
     CrossAttention,
     PatchAttention,
     StochasticDepth,
@@ -268,9 +281,35 @@ class SpatialEncoder(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(x, "is_meta", False) or is_fake_tensor(x):
+            raise RuntimeError("x is meta/fake before SpatialEncoder.forward")
+        if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
+            raise RuntimeError("coords is meta/fake before SpatialEncoder.forward")
+        if x.dim() != 3:
+            raise ValueError(
+                f"SpatialEncoder expects (B, N, C) tokens, got shape {tuple(x.shape)}"
+            )
+        if coords.dim() != 3:
+            raise ValueError(
+                f"SpatialEncoder expects (B, N, D) coords, got shape {tuple(coords.shape)}"
+            )
+        if x.shape[:2] != coords.shape[:2]:
+            raise ValueError(
+                "tokens/coords batch or length mismatch: "
+                f"tokens={tuple(x.shape)} vs coords={tuple(coords.shape)}"
+            )
+        x = x.contiguous()
+        coords = coords.contiguous()
+        if attn_mask is not None:
+            if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
+                raise RuntimeError("attn_mask is meta/fake before SpatialEncoder.forward")
+            attn_mask = attn_mask.contiguous()
         for blk in self.blocks:
             x = blk(x, coords, attn_mask=attn_mask)
-        return self.norm(x)
+        out = self.norm(x)
+        if getattr(out, "is_meta", False) or is_fake_tensor(out):
+            raise RuntimeError("SpatialEncoder produced meta/fake tensor")
+        return out.contiguous()
 
 class TemporalEncoderBlock(nn.Module):
     def __init__(
@@ -429,84 +468,173 @@ class Payload:
     offset: torch.Tensor
     context_shape: Tuple[int, ...]
 
-class GlobalEncoderBlock(nn.Module):
+class LongNet(nn.Module):
+    """
+    LongNet 백본.
+      - 가능한 경우: torchscale.net.longnet.LongNet 우선 사용
+      - 아니면: DilatedAttention 스택으로 유사 호환
+    """
+
     def __init__(
         self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        mlp_ratio: float = 4.0,
+        embed_dim: int,
+        num_heads: int,
+        depth: int,
+        *,
+        dilation_growth: int = 2,
+        base_dilation: int = 1,
+        window_size: Optional[int] = None,
         dropout: float = 0.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        **kwargs: Any,
+        mlp_ratio: float = 4.0,
+        causal: bool = False,
+        batch_first: bool = True,
     ) -> None:
         super().__init__()
-        self.norm1 = norm_layer(norm_type, d_model)
-        self.retention = GlobalEncoderLayer(d_model, nhead)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm2 = norm_layer(norm_type, d_model)
-        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
-        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+        self.batch_first = batch_first
+        self._impl: Optional[nn.Module] = None
+        # torchscale 시도
+        try:
+            ts_longnet = import_module("torchscale.net.longnet")
+            ctor_variants = (
+                dict(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    depth=depth,
+                    dropout=dropout,
+                ),
+                dict(
+                    d_model=embed_dim,
+                    nhead=num_heads,
+                    num_layers=depth,
+                    dropout=dropout,
+                ),
+            )
+            for kw in ctor_variants:
+                try:
+                    self._impl = getattr(ts_longnet, "LongNet")(**kw)  # type: ignore[attr-defined]
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            self._impl = None
 
-    def forward(
+        if self._impl is not None:
+            self._using = "torchscale"
+            self._impl_batch_first = getattr(self._impl, "batch_first", True)
+        else:
+            self._using = "fallback"
+            self._impl_batch_first = True
+            layers: List[nn.Module] = []
+            dilation = base_dilation
+            for _ in range(depth):
+                layers.append(
+                    DilatedAttention(
+                        embed_dim=embed_dim,
+                        num_heads=num_heads,
+                        dilation=dilation,
+                        window_size=window_size,
+                        dropout=dropout,
+                        mlp_ratio=mlp_ratio,
+                        causal=causal,
+                        batch_first=True,
+                    )
+                )
+                dilation = max(1, dilation * max(1, int(dilation_growth)))
+            self.layers = nn.ModuleList(layers)
+            self.norm = nn.LayerNorm(embed_dim)
+
+    @property
+    def using(self) -> str:
+        return self._using
+
+    def forward(  # type: ignore[override]
         self,
         x: torch.Tensor,
-        causal_mask: Optional[torch.Tensor] = None,
-        state: Optional[dict] = None,
-    ) -> Tuple[torch.Tensor, Optional[dict]]:
-        h, state = self.retention(
-            self.norm1(x), attn_mask=causal_mask, state=state
-        )
-        x = x + self.drop_path(self.dropout(h))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
-        return x, state
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._impl is not None:
+            out = x
+            if (
+                self._impl_batch_first
+                and out.dim() == 3
+                and out.shape[0] != out.shape[1]
+                and not self._impl_batch_first
+            ):
+                # 가드: 배치 축 다를 때 전치
+                out = out.transpose(0, 1)
+            try:
+                out = self._impl(out)  # type: ignore[misc]
+            except Exception as exc:
+                warnings.warn(
+                    f"torchscale LongNet 호출 실패: {exc}. 입력을 그대로 반환.",
+                    RuntimeWarning,
+                )
+            if self._impl_batch_first is not True:
+                out = out.transpose(0, 1)
+            return out, None
+        # fallback
+        attn_w: Optional[torch.Tensor] = None
+        out = x
+        for layer in self.layers:
+            out, attn_w = layer(
+                out,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+            )
+        out = self.norm(out)
+        return out, attn_w
+
 
 class GlobalEncoder(nn.Module):
+    """
+    (신) GlobalEncoder: LongNet 백본을 사용하는 전역 인코더.
+    기존 GlobalEncoderBlock/Layer는 제거됨.
+    """
+
     def __init__(
         self,
-        d_model: int,
-        nhead: int,
+        embed_dim: int,
+        num_heads: int,
         depth: int,
-        *args: Any,
-        mlp_ratio: float = 4.0,
+        *,
+        dilation_growth: int = 2,
+        base_dilation: int = 1,
+        window_size: Optional[int] = None,
         dropout: float = 0.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        **kwargs: Any,
+        mlp_ratio: float = 4.0,
+        causal: bool = False,
+        batch_first: bool = True,
     ) -> None:
         super().__init__()
-        drops = schedule_stochastic_depth(drop_path, depth)
-        self.blocks = nn.ModuleList(
-            [
-                GlobalEncoderBlock(
-                    d_model,
-                    nhead,
-                    mlp_ratio=mlp_ratio,
-                    dropout=dropout,
-                    drop_path=drops[i],
-                    norm_type=norm_type,
-                )
-                for i in range(depth)
-            ]
+        self.backbone = LongNet(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            depth=depth,
+            dilation_growth=dilation_growth,
+            base_dilation=base_dilation,
+            window_size=window_size,
+            dropout=dropout,
+            mlp_ratio=mlp_ratio,
+            causal=causal,
+            batch_first=batch_first,
         )
-        self.norm = norm_layer(norm_type, d_model)
 
-    def forward(
+    @property
+    def using(self) -> str:
+        return self.backbone.using
+
+    def forward(  # type: ignore[override]
         self,
-        tokens: torch.Tensor,
-        *,
-        state: Optional[dict] = None,
-        return_state: bool = False,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[dict]]]:
-        next_state = state
-        for blk in self.blocks:
-            tokens, next_state = blk(tokens, causal_mask=None, state=next_state)
-        tokens = self.norm(tokens)
-        if return_state:
-            return tokens, next_state
-        return tokens
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return self.backbone(
+            x,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+        )
 
 class LocalProcessor(nn.Module):
     def __init__(
@@ -608,12 +736,22 @@ class LocalProcessor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Payload:
         B = x.shape[0]
-        spatial_tokens = self.spatial_tokenizer(x).view(
-            B, self.spatial_tokens, self.d_model
-        )
-        temporal_tokens = self.temporal_tokenizer(x).view(
-            B, self.temporal_tokens, self.d_model
-        )
+        spatial_raw = self.spatial_tokenizer(x)
+        expected_spatial = B * self.spatial_tokens * self.d_model
+        if spatial_raw.numel() != expected_spatial:
+            raise RuntimeError(
+                "spatial tokenizer output has unexpected numel: "
+                f"got {spatial_raw.numel()} vs expected {expected_spatial}"
+            )
+        spatial_tokens = spatial_raw.view(B, self.spatial_tokens, self.d_model).contiguous()
+        temporal_raw = self.temporal_tokenizer(x)
+        expected_temporal = B * self.temporal_tokens * self.d_model
+        if temporal_raw.numel() != expected_temporal:
+            raise RuntimeError(
+                "temporal tokenizer output has unexpected numel: "
+                f"got {temporal_raw.numel()} vs expected {expected_temporal}"
+            )
+        temporal_tokens = temporal_raw.view(B, self.temporal_tokens, self.d_model).contiguous()
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_encoder(spatial_tokens, coords)
         temporal_out = self.temporal_encoder(temporal_tokens)
@@ -629,11 +767,13 @@ class LocalProcessor(nn.Module):
         else:
             raise RuntimeError(f"Unhandled modeling type '{mode}'")
         tokens = self.norm(tokens)
+        tokens = tokens.contiguous()
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
-        context = flat.view(B, *self.out_shape)
+        flat = flat.contiguous()
+        context = flat.view(B, *self.out_shape).contiguous()
         dims = tuple(range(1, context.ndim))
-        offset = context.mean(dim=dims, keepdim=True)
+        offset = context.mean(dim=dims, keepdim=True).contiguous()
         return Payload(
             tokens=tokens,
             context=context,
@@ -704,8 +844,7 @@ class Root(nn.Module):
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
             mlp_ratio=float(getattr(config, "mlp_ratio", 4.0)),
             dropout=float(getattr(config, "dropout", 0.0)),
-            drop_path=float(getattr(config, "drop_path", 0.0)),
-            norm_type=str(getattr(config, "normalization_method", "layernorm")),
+            batch_first=True,
         ).to(self._device)
         self.global_net = global_net
         self.microbatch = int(config.microbatch)
@@ -886,12 +1025,12 @@ class Root(nn.Module):
                     if amp_enabled
                     else AutoCast.suspend(device)
                 ):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens, _ = self.global_net(tokens_centered)
             if not torch.isfinite(refined_tokens).all():
                 tokens_centered = tokens_centered.to(dtype=torch.float32)
                 with inference(self.global_net):
                     with AutoCast.suspend(device):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens, _ = self.global_net(tokens_centered)
             decode_tokens = refined_tokens.detach().clone()
             with inference(self.local_net):
                 with (
@@ -917,11 +1056,11 @@ class Root(nn.Module):
                     if amp_enabled
                     else AutoCast.suspend(device)
                 ):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens, _ = self.global_net(tokens_centered)
                 if not torch.isfinite(refined_tokens).all():
                     tokens_centered = tokens_centered.to(dtype=torch.float32)
                     with AutoCast.suspend(device):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens, _ = self.global_net(tokens_centered)
                 with (
                     AutoCast.float(device)
                     if amp_enabled

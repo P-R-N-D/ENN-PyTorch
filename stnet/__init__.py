@@ -27,8 +27,8 @@ CrossAttention = model_ns.CrossAttention
 PointTransformer = model_ns.PointTransformer
 TemporalEncoderLayer = model_ns.TemporalEncoderLayer
 TemporalEncoderBlock = model_ns.TemporalEncoderBlock
-GlobalEncoderLayer = model_ns.GlobalEncoderLayer
-GlobalEncoderBlock = model_ns.GlobalEncoderBlock
+DilatedAttention = model_ns.DilatedAttention
+LongNet = model_ns.LongNet
 CrossTransformer = model_ns.CrossTransformer
 Payload = model_ns.Payload
 GlobalEncoder = model_ns.GlobalEncoder
@@ -65,8 +65,8 @@ __all__ = [
     "PointTransformer",
     "TemporalEncoderLayer",
     "TemporalEncoderBlock",
-    "GlobalEncoderLayer",
-    "GlobalEncoderBlock",
+    "DilatedAttention",
+    "LongNet",
     "CrossTransformer",
     "Payload",
     "GlobalEncoder",

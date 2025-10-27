@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import sys
+
 from .platform import Distributed, System
 from .platform import (
     get_device,
@@ -24,6 +26,9 @@ from .optimization import (
     Module,
 )
 from .profiler import FlopCounter, attention_flops_bshd
+from . import datatype
+
+dtypes = datatype
 from ..data.transforms import (
     IncrementalPCA,
     StandardScaler,
@@ -57,5 +62,10 @@ __all__ = [
     "IncrementalPCA",
     "preprocess",
     "postprocess",
+    "datatype",
+    "dtypes",
 ]
+
+sys.modules[__name__ + ".dtypes"] = datatype
+
 patch_torch()

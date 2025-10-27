@@ -4,6 +4,7 @@ import contextlib
 import importlib
 import inspect
 import logging
+import warnings
 import math
 import os
 from contextlib import AbstractContextManager
@@ -29,6 +30,7 @@ from torch import nn, optim
 from ..data.stats import MetaData
 
 from .platform import (
+    cuda_compute_capability,
     get_device,
     get_runtime_config,
     initialize_sdpa_backends,
@@ -2288,3 +2290,288 @@ def _import_callable(spec: str) -> Callable:
     if not callable(fn):
         raise TypeError(f"{mod_name}:{fn_part} is not callable or not found")
     return fn
+
+
+# ======================================================================================
+# MultiHeadAttention: TE fused MHA 선호, 아니면 torch.nn.MultiheadAttention 폴백
+# ======================================================================================
+try:
+    # NVIDIA Transformer Engine (optional)
+    import transformer_engine.pytorch as te  # type: ignore
+
+    _HAS_TE = True
+except Exception:  # pragma: no cover
+    te = None  # type: ignore
+    _HAS_TE = False
+
+
+def _te_fused_mha_is_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
+    """
+    TE fused MHA를 사용할지 판단: 설치 여부 + CUDA CC 기준.
+    기본 기준: sm80(A100/RTX30 이상) 권장.
+    """
+
+    if not _HAS_TE:
+        return False
+    device = get_device()
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    cc = cuda_compute_capability(device)
+    return cc >= min_cc
+
+
+class MultiHeadAttentionCompat(nn.Module):
+    """torch.nn.MultiheadAttention thin wrapper (batch_first=True)."""
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        bias: bool = True,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+        **_: object,
+    ) -> None:
+        super().__init__()
+        self.batch_first = batch_first
+        self.mha = nn.MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first,
+        )
+
+    def forward(  # type: ignore[override]
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        is_causal: Optional[bool] = None,
+    ):
+        try:
+            return self.mha(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                is_causal=is_causal,
+            )
+        except TypeError:
+            return self.mha(
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+            )
+
+
+class MultiHeadAttentionNvidia(nn.Module):
+    """
+    NVIDIA Transformer Engine MHA 래퍼 (버전 차이를 흡수하도록 시그니처를 다변화 시도).
+    생성/forward 실패 시 안전하게 torch MHA로 폴백합니다.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        bias: bool = True,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+        **kwargs: object,
+    ) -> None:
+        super().__init__()
+        self.batch_first = batch_first
+        self._te_mha = self._build_te_mha(embed_dim, num_heads, dropout, kwargs)
+        if self._te_mha is None:
+            warnings.warn(
+                "Transformer Engine MHA 사용 불가. torch.nn.MultiheadAttention으로 폴백합니다.",
+                RuntimeWarning,
+            )
+            self._fallback = MultiHeadAttentionCompat(
+                embed_dim,
+                num_heads,
+                bias=bias,
+                dropout=dropout,
+                batch_first=batch_first,
+                **kwargs,
+            )
+        else:
+            self._fallback = None
+
+    @staticmethod
+    def _build_te_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
+        if not _HAS_TE:
+            return None
+        candidates = []
+        for name in ("MultiHeadAttention", "MultiheadAttention"):
+            if hasattr(te, name):
+                candidates.append(getattr(te, name))
+        for cls in candidates:
+            ctor_variants = (
+                dict(
+                    hidden_size=embed_dim,
+                    num_attention_heads=num_heads,
+                    attention_dropout=dropout,
+                ),
+                dict(hidden_size=embed_dim, num_heads=num_heads, attention_dropout=dropout),
+                dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
+            )
+            for ckw in ctor_variants:
+                try:
+                    return cls(**{**ckw, **kwargs})
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+        return None
+
+    def forward(  # type: ignore[override]
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        is_causal: Optional[bool] = None,
+    ):
+        if self._te_mha is None:
+            return self._fallback(  # type: ignore[operator]
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                is_causal=is_causal,
+            )
+        for variant in (
+            dict(
+                query=query,
+                key=key,
+                value=value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                is_causal=is_causal,
+            ),
+            dict(query=query, attn_mask=attn_mask, need_weights=need_weights),
+        ):
+            try:
+                out = self._te_mha(**variant)
+                if isinstance(out, tuple) and len(out) >= 1:
+                    return out[0], (out[1] if need_weights and len(out) > 1 else None)
+                return out, None  # type: ignore[return-value]
+            except TypeError:
+                continue
+            except Exception:
+                continue
+        return self._fallback(  # type: ignore[operator]
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            is_causal=is_causal,
+        )
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    프로젝트 표준 MHA: TE fused MHA를 선호하고 불가 시 torch로 폴백.
+
+    속성:
+        backend: "te" | "torch"
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        bias: bool = True,
+        dropout: float = 0.0,
+        batch_first: bool = True,
+        prefer_te_min_cc: Tuple[int, int] = (8, 0),
+        **kwargs: object,
+    ) -> None:
+        super().__init__()
+        if _te_fused_mha_is_preferred(prefer_te_min_cc):
+            try:
+                impl = MultiHeadAttentionNvidia(
+                    embed_dim,
+                    num_heads,
+                    bias=bias,
+                    dropout=dropout,
+                    batch_first=batch_first,
+                    **kwargs,
+                )
+                if isinstance(impl, MultiHeadAttentionNvidia) and impl._te_mha is not None:
+                    self.impl = impl
+                    self._backend = "te"
+                else:
+                    self.impl = MultiHeadAttentionCompat(
+                        embed_dim,
+                        num_heads,
+                        bias=bias,
+                        dropout=dropout,
+                        batch_first=batch_first,
+                        **kwargs,
+                    )
+                    self._backend = "torch"
+            except Exception:
+                self.impl = MultiHeadAttentionCompat(
+                    embed_dim,
+                    num_heads,
+                    bias=bias,
+                    dropout=dropout,
+                    batch_first=batch_first,
+                    **kwargs,
+                )
+                self._backend = "torch"
+        else:
+            self.impl = MultiHeadAttentionCompat(
+                embed_dim,
+                num_heads,
+                bias=bias,
+                dropout=dropout,
+                batch_first=batch_first,
+                **kwargs,
+            )
+            self._backend = "torch"
+
+    @property
+    def backend(self) -> str:
+        return self._backend
+
+    def forward(  # type: ignore[override]
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+        is_causal: Optional[bool] = None,
+    ):
+        return self.impl(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            is_causal=is_causal,
+        )

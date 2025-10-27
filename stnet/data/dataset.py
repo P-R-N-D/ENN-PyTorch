@@ -17,7 +17,7 @@ except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
 from ..utils.compat import patch_arrow
-from ..utils.dtypes import to
+from ..utils.datatype import to
 
 
 _ARROW = patch_arrow()
