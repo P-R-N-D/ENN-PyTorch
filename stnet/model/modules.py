@@ -40,10 +40,22 @@ class _Float32Norm(nn.Module):
         super().__init__()
         self.base = base_norm
 
+    def _module_dtype(self) -> Optional[torch.dtype]:
+        with contextlib.suppress(StopIteration):
+            return next(self.base.parameters()).dtype
+        with contextlib.suppress(StopIteration):
+            return next(self.base.buffers()).dtype
+        return None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.dtype in (torch.float16, torch.bfloat16):
-            y = self.base(x.float())
-            return y.to(x.dtype)
+            base_dtype = self._module_dtype() or x.dtype
+            if base_dtype == torch.float32:
+                y = self.base(x.float())
+                return y.to(x.dtype)
+            if base_dtype != x.dtype:
+                y = self.base(x.to(base_dtype))
+                return y.to(x.dtype)
         return self.base(x)
 
 
