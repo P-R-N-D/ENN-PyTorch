@@ -10,6 +10,28 @@ from torch import nn
 from ..utils.optimization import DotProductAttention, MultiScaleRetention
 
 
+try:
+    # Prefer torch.compiler.disable (PyTorch ≥2.5)
+    _disable_torch_compile = torch.compiler.disable  # type: ignore[attr-defined]
+except Exception:
+    try:
+        # Fallback for PyTorch 2.0–2.4
+        import torch._dynamo as _dynamo  # type: ignore
+
+        _disable_torch_compile = _dynamo.disable  # type: ignore[attr-defined]
+    except Exception:
+
+        def _disable_torch_compile(fn):  # type: ignore
+            return fn
+
+
+def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
+    forward = getattr(module, "forward", None)
+    if callable(forward):
+        module.forward = _disable_torch_compile(forward)  # type: ignore[assignment]
+    return module
+
+
 class StochasticDepth(nn.Module):
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
         super().__init__()
@@ -35,12 +57,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return nn.LayerNorm(d_model)
+        return _disable_module_torch_compile(nn.LayerNorm(d_model))
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(d_model)
+        return _disable_module_torch_compile(nn.RMSNorm(d_model))  # type: ignore[misc]
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
-        return nn.BatchNorm1d(d_model)
-    return nn.LayerNorm(d_model)
+        return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
+    return _disable_module_torch_compile(nn.LayerNorm(d_model))
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
