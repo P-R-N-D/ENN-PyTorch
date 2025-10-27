@@ -683,6 +683,8 @@ def main(*args: Any) -> Optional[Root]:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
     System.initialize_python_path()
+    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
     ret_sink: Optional[Dict[Any, Any]] = None
     if len(args) == 1 and isinstance(args[0], RuntimeConfig):
