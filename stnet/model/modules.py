@@ -986,12 +986,12 @@ class Root(nn.Module):
                     if amp_enabled
                     else AutoCast.suspend(device)
                 ):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens, _ = self.global_net(tokens_centered)
             if not torch.isfinite(refined_tokens).all():
                 tokens_centered = tokens_centered.to(dtype=torch.float32)
                 with inference(self.global_net):
                     with AutoCast.suspend(device):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens, _ = self.global_net(tokens_centered)
             decode_tokens = refined_tokens.detach().clone()
             with inference(self.local_net):
                 with (
@@ -1017,11 +1017,11 @@ class Root(nn.Module):
                     if amp_enabled
                     else AutoCast.suspend(device)
                 ):
-                    refined_tokens = self.global_net(tokens_centered)
+                    refined_tokens, _ = self.global_net(tokens_centered)
                 if not torch.isfinite(refined_tokens).all():
                     tokens_centered = tokens_centered.to(dtype=torch.float32)
                     with AutoCast.suspend(device):
-                        refined_tokens = self.global_net(tokens_centered)
+                        refined_tokens, _ = self.global_net(tokens_centered)
                 with (
                     AutoCast.float(device)
                     if amp_enabled
