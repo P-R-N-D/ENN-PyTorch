@@ -25,11 +25,28 @@ except Exception:
             return fn
 
 
+try:
+    from torch._dynamo import graph_break as _graph_break  # type: ignore
+except Exception:
+
+    def _graph_break() -> None:  # type: ignore
+        return None
+
+
 def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
     forward = getattr(module, "forward", None)
     if callable(forward):
         module.forward = _disable_torch_compile(forward)  # type: ignore[assignment]
     return module
+
+
+class LayerNormFallback(nn.LayerNorm):
+    """LayerNorm module that always executes in eager mode."""
+
+    @_disable_torch_compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        _graph_break()
+        return super().forward(x)
 
 
 class StochasticDepth(nn.Module):
@@ -57,12 +74,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return _disable_module_torch_compile(nn.LayerNorm(d_model))
+        return LayerNormFallback(d_model)
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
         return _disable_module_torch_compile(nn.RMSNorm(d_model))  # type: ignore[misc]
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
         return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
-    return _disable_module_torch_compile(nn.LayerNorm(d_model))
+    return LayerNormFallback(d_model)
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
