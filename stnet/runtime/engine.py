@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import math
 import os
@@ -162,6 +163,48 @@ def _size(dtype: torch.dtype | str) -> int:
         return _SIZEOF[_canonical_dtype(dtype)]
     except KeyError as exc:
         raise TypeError(f"unsupported dtype: {dtype}") from exc
+
+
+def _clear_device_cache(device: Optional[torch.device] = None) -> None:
+    """Release cached device memory across supported accelerator backends."""
+
+    device_types: List[str] = []
+    dev_type = getattr(device, "type", None)
+    if isinstance(dev_type, str) and dev_type:
+        device_types.append(dev_type)
+    else:
+        device_types.extend(["cuda", "xpu", "mps"])
+
+    for kind in dict.fromkeys(device_types):  # preserve order while de-duplicating
+        if kind == "cuda":
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        elif kind == "xpu":
+            xpu = getattr(torch, "xpu", None)
+            if xpu is not None:
+                is_available = getattr(xpu, "is_available", None)
+                empty_cache = getattr(xpu, "empty_cache", None)
+                if callable(is_available) and callable(empty_cache):
+                    if is_available():
+                        empty_cache()
+        elif kind == "mps":
+            mps = getattr(torch, "mps", None)
+            backends_mps = getattr(getattr(torch, "backends", None), "mps", None)
+            empty_cache = getattr(mps, "empty_cache", None) if mps is not None else None
+            if callable(empty_cache):
+                available = None
+                if backends_mps is not None:
+                    available_fn = getattr(backends_mps, "is_available", None)
+                    if callable(available_fn):
+                        available = bool(available_fn())
+                if available is None and mps is not None:
+                    available_fn = getattr(mps, "is_available", None)
+                    if callable(available_fn):
+                        available = bool(available_fn())
+                if available is None:
+                    available = True
+                if available:
+                    empty_cache()
 
 
 def _status_bar(activity: str, total: int, dev: torch.device) -> tqdm:
@@ -668,8 +711,9 @@ def main(*args: Any) -> Optional[Root]:
         backend = _backend_type(device)
         init_kwargs: Dict[str, Any] = {"backend": backend}
         torch.distributed.init_process_group(**init_kwargs)
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        # 초기 1회 캐시 비우기는 선택 사항. OOM 디버깅 중일 때만 유지 권장.
+        # if device.type in {"cuda", "xpu", "mps"}:
+        #     _clear_device_cache(device)
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
@@ -1196,9 +1240,14 @@ def main(*args: Any) -> Optional[Root]:
                     if device.type in ("cuda", "xpu")
                     else None
                 )
+                # 스텝마다 캐시/GC 호출 제거 (성능/안정성 저하 방지)
         finally:
             if keep is not None:
                 keep.cleanup()
+            # 종료 시 전역 캐시 비우기도 보통 불필요. OOM 디버깅 중에만 사용.
+            # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
+            #     _clear_device_cache(device)
+            # gc.collect()
         if local_rank == 0:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -1385,8 +1434,13 @@ def main(*args: Any) -> Optional[Root]:
                 tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
                 _advance_status_bar(status_bar, 1, mbps, tflops)
                 t_fetch_start = time.perf_counter_ns()
+                # 스텝마다 캐시/GC 호출 제거 (성능/안정성 저하 방지)
         with contextlib.suppress(Exception):
             status_bar.close()
+        # 에폭/평가 종료 시점 1회 정도는 허용(선택)
+        # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
+        #     _clear_device_cache(device)
+        # gc.collect()
         flat = torch.cat(preds, dim=0)
         pred_struct = Root.unflatten_labels(flat, ops.out_shape)
         ret = postprocess(ops.keys or [], pred_struct)
@@ -1394,6 +1448,10 @@ def main(*args: Any) -> Optional[Root]:
             ret_sink.update(ret)
         if keep is not None:
             keep.cleanup()
+        # 종료 시 전역 캐시 비우기도 보통 불필요. OOM 디버깅 중에만 사용.
+        # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
+        #     _clear_device_cache(device)
+        # gc.collect()
         return None
 
     raise ValueError(f"unsupported ops mode: {ops.mode}")
