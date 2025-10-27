@@ -2,6 +2,7 @@
 from __future__ import annotations
 import contextlib
 import importlib
+import inspect
 import logging
 import math
 import os
@@ -46,102 +47,42 @@ patch_torch()
 _LOGGER = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True)
-class DataScale:
-    """Summary statistics that describe the magnitude of a dataset."""
-
-    max_abs: float
-    min_abs: Optional[float] = None
-    is_integral: bool = False
-
-    def merge(self, other: Optional["DataScale"]) -> "DataScale":
-        if other is None:
-            return self
-        min_abs: Optional[float]
-        if self.min_abs is None:
-            min_abs = other.min_abs
-        elif other.min_abs is None:
-            min_abs = self.min_abs
-        else:
-            min_abs = min(self.min_abs, other.min_abs)
-        return DataScale(
-            max_abs=max(self.max_abs, other.max_abs),
-            min_abs=min_abs,
-            is_integral=self.is_integral and other.is_integral,
-        )
-
-    @property
-    def min_positive(self) -> Optional[float]:
-        if self.min_abs is None or not math.isfinite(self.min_abs):
-            return None
-        if self.min_abs <= 0.0:
-            return None
-        return self.min_abs
-
-    @classmethod
-    def accumulate(
-        cls,
-        scale: Optional["DataScale"],
-        tensor: Optional[torch.Tensor],
-    ) -> Optional["DataScale"]:
-        if tensor is None:
-            return scale
-        if not isinstance(tensor, torch.Tensor):
-            return scale
-        if tensor.numel() == 0:
-            return scale
-        with torch.no_grad():
-            values = tensor.detach()
-            finite_mask = torch.isfinite(values)
-            has_finite = bool(finite_mask.any().item())
-            if not has_finite:
-                return scale
-            finite_vals = values[finite_mask]
-            abs_vals = finite_vals.abs()
-            max_abs = float(abs_vals.max().item()) if abs_vals.numel() else 0.0
-            pos_vals = abs_vals[abs_vals > 0]
-            min_abs = float(pos_vals.min().item()) if pos_vals.numel() else None
-            if finite_vals.is_floating_point():
-                tol = 1e-6 if finite_vals.dtype in (torch.float32, torch.float64) else 5e-4
-                frac = (finite_vals - torch.round(finite_vals)).abs()
-                is_integral = bool(frac.lt(tol).all().item()) if frac.numel() else True
-            else:
-                is_integral = True
-        current = DataScale(max_abs=max_abs, min_abs=min_abs, is_integral=is_integral)
-        return current if scale is None else current.merge(scale)
-
-
 def _supports_scale(
     dtype: torch.dtype,
-    scale: Optional[DataScale],
+    meta: Optional[MetaData[Any]],
     *,
     safety_margin: float = 8.0,
 ) -> bool:
-    if scale is None:
+    if meta is None or not getattr(meta, "has_scale", False):
         return True
     if not isinstance(dtype, torch.dtype):
         return False
-    max_abs = float(abs(scale.max_abs))
+    max_abs = getattr(meta, "scale_max_abs", None)
+    if max_abs is None:
+        return True
+    max_abs = float(abs(max_abs))
     if not math.isfinite(max_abs):
         return False
     if getattr(dtype, "is_complex", False):
         base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
-        return _supports_scale(base_dtype, scale, safety_margin=safety_margin)
+        return _supports_scale(base_dtype, meta, safety_margin=safety_margin)
     if getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
         if max_abs > float(info.max) / safety_margin:
             return False
-        min_pos = scale.min_positive
+        min_pos = getattr(meta, "scale_min_positive", None)
         if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
             return False
         return True
     if dtype == torch.bool:
-        return scale.is_integral and max_abs <= 1.0
+        is_integral = getattr(meta, "scale_is_integral", None)
+        return (is_integral is None or is_integral) and max_abs <= 1.0
     try:
         info = torch.iinfo(dtype)
     except TypeError:
         return False
-    if not scale.is_integral:
+    is_integral = getattr(meta, "scale_is_integral", None)
+    if is_integral is False:
         return False
     return max_abs <= float(info.max)
 
@@ -266,7 +207,11 @@ class AutoCast:
         metadata: Optional[MetaData[Any]] = None,
     ) -> MetaData[Any]:
         meta = metadata or cls._metadata
-        dev = cls._resolve_device(device)
+        device_hint: Optional[Union[torch.device, str]] = device
+        if device_hint is None and meta is not None:
+            with contextlib.suppress(Exception):
+                device_hint = torch.device(meta.device)
+        dev = cls._resolve_device(device_hint)
         if meta is None:
             meta = MetaData.for_device(dev)
         else:
@@ -274,6 +219,8 @@ class AutoCast:
             if current_device != dev:
                 meta.device = dev
                 meta.refresh()
+            else:
+                meta.ensure_device_info()
         if not getattr(meta, "float_dtypes", ()):  # type: ignore[attr-defined]
             meta.refresh()
         elif (
@@ -281,6 +228,8 @@ class AutoCast:
             or not getattr(meta, "float8_dtypes", ())
         ):  # type: ignore[attr-defined]
             meta.refresh()
+        else:
+            meta.ensure_device_info()
         cls._metadata = meta
         return meta
 
@@ -331,9 +280,8 @@ class AutoCast:
         device: Optional[torch.device] = None,
         meta: Optional[MetaData[Any]] = None,
     ) -> torch.dtype:
-        scale_hint = getattr(meta, "scale", None)
         for dtype in candidates:
-            if _supports_scale(dtype, scale_hint):
+            if _supports_scale(dtype, meta):
                 return dtype
         device_str = f" on {device.type}" if device is not None else ""
         fallback_order: Tuple[torch.dtype, ...]
@@ -342,7 +290,7 @@ class AutoCast:
         else:
             fallback_order = (fallback, torch.int64, torch.float32, torch.float64)
         for dtype in fallback_order:
-            if _supports_scale(dtype, scale_hint):
+            if _supports_scale(dtype, meta):
                 if logger is not None and dtype is not fallback:
                     logger.debug(
                         "AutoCast %s fallback%s: promoting to %s due to data scale",
@@ -520,10 +468,9 @@ class AutoCast:
             else cls._float8_dtypes()
         )
         wants_fp8 = backend is not None
-        scale_hint = meta.scale
-        if wants_fp8 and scale_hint is not None:
+        if wants_fp8 and getattr(meta, "has_scale", False):
             fp8_supported = any(
-                _supports_scale(dtype, scale_hint, safety_margin=2.0)
+                _supports_scale(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
             )
             if not fp8_supported:
@@ -562,7 +509,6 @@ class AutoCast:
             cls._last_float_dtype = amp_dtype
         else:
             cls._last_float_dtype = amp_dtype
-        meta.record_float_dtype(amp_dtype)
         cls._metadata = meta
 
         with contextlib.ExitStack() as stack:
@@ -614,7 +560,6 @@ class AutoCast:
             for ctx in contexts:
                 stack.enter_context(ctx)
             cls._last_int_dtype = int_dtype
-            meta.record_int_dtype(int_dtype)
             cls._metadata = meta
             yield
 
@@ -963,6 +908,18 @@ class DotProductAttention(nn.Module):
             and (self.hd is not None)
         )
         self._te_attn: Any = None
+        self._te_forward_signature: inspect.Signature | None = None
+        self._te_mask_param: str | None = None
+        self._te_mask_type_param: str | None = None
+        self._te_core_bias_param: str | None = None
+        self._te_core_bias_type_param: str | None = None
+        self._te_supports_mask = False
+        self._te_supports_mask_type = False
+        self._te_supports_core_bias = False
+        self._te_supports_core_bias_type = False
+        self._te_supports_attention_dropout = False
+        self._te_supports_is_causal = False
+        self._te_supports_training = False
         if self._te_ok:
             self._te = te
             self._te_attn = te.DotProductAttention(
@@ -971,6 +928,32 @@ class DotProductAttention(nn.Module):
                 qkv_format="bshd",
                 attention_dropout=0.0,
             )
+            _forward = getattr(self._te_attn, "forward", getattr(self._te_attn, "__call__", None))
+            if _forward is not None:
+                try:
+                    self._te_forward_signature = inspect.signature(_forward)
+                except (TypeError, ValueError):
+                    self._te_forward_signature = None
+            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
+            if "attention_mask" in params:
+                self._te_mask_param = "attention_mask"
+            elif "attn_mask" in params:
+                self._te_mask_param = "attn_mask"
+            if "attn_mask_type" in params:
+                self._te_mask_type_param = "attn_mask_type"
+            elif "attention_mask_type" in params:
+                self._te_mask_type_param = "attention_mask_type"
+            if "core_attention_bias" in params:
+                self._te_core_bias_param = "core_attention_bias"
+            if "core_attention_bias_type" in params:
+                self._te_core_bias_type_param = "core_attention_bias_type"
+            self._te_supports_mask = self._te_mask_param is not None
+            self._te_supports_mask_type = self._te_mask_type_param is not None
+            self._te_supports_core_bias = self._te_core_bias_param is not None
+            self._te_supports_core_bias_type = self._te_core_bias_type_param is not None
+            self._te_supports_attention_dropout = "attention_dropout" in params
+            self._te_supports_is_causal = "is_causal" in params
+            self._te_supports_training = "training" in params
 
     @staticmethod
     def _is_te_available() -> Any:
@@ -1024,33 +1007,131 @@ class DotProductAttention(nn.Module):
             except Exception:
                 pass
         dropout_val = float(dropout_p) if training else 0.0
+
+        B, H, L, D = q_bshd.shape
+        S = k_bshd.shape[2]
+
+        mask_bool: torch.Tensor | None = None
+        bias_float: torch.Tensor | None = None
+        if attn_mask is not None:
+            m = attn_mask
+            if m.dtype == torch.bool:
+                mask_bool = m
+            elif torch.is_floating_point(m):
+                bias_float = m
+            elif m.dtype in (
+                torch.int8,
+                torch.int16,
+                torch.int32,
+                torch.int64,
+                torch.uint8,
+            ):
+                try:
+                    sampled = m if m.numel() <= 4096 else m.reshape(-1)[:4096]
+                    uniq = torch.unique(sampled)
+                except Exception:
+                    uniq = torch.tensor([], device=m.device, dtype=m.dtype)
+                if uniq.numel() <= 2 and set(uniq.tolist()).issubset({0, 1}):
+                    mask_bool = m != 0
+                else:
+                    bias_float = m.to(dtype=q_bshd.dtype)
+            else:
+                mask_bool = m.to(torch.bool)
+
+            def _to_bhls(x: torch.Tensor | None) -> torch.Tensor | None:
+                if x is None:
+                    return None
+                x = x.to(device=q_bshd.device)
+                if x.dim() == 0:
+                    x = x.view(1, 1, 1, 1).expand(B, H, L, S)
+                elif x.dim() == 2 and x.shape == (L, S):
+                    x = x.view(1, 1, L, S).expand(B, H, L, S)
+                elif x.dim() == 3:
+                    if x.shape == (B, L, S):
+                        x = x.view(B, 1, L, S).expand(B, H, L, S)
+                    elif x.shape == (H, L, S):
+                        x = x.view(1, H, L, S).expand(B, H, L, S)
+                if x.dim() == 4 and list(x.shape) != [B, H, L, S]:
+                    x = x.expand(
+                        B if x.shape[0] in (1, B) else B,
+                        H if x.shape[1] in (1, H) else H,
+                        L if x.shape[2] in (1, L) else L,
+                        S if x.shape[3] in (1, S) else S,
+                    )
+                return x.contiguous()
+
+            mask_bool = _to_bhls(mask_bool)
+            if bias_float is not None:
+                bias_float = _to_bhls(bias_float).to(dtype=q_bshd.dtype)
+
+            if (
+                mask_bool is not None
+                and bias_float is None
+                and self._te_ok
+                and self._te_attn is not None
+            ):
+                if (not self._te_supports_mask) and self._te_supports_core_bias:
+                    finfo = torch.finfo(q_bshd.dtype)
+                    bias_float = torch.where(
+                        mask_bool,
+                        torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device),
+                        torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device),
+                    ).expand_as(mask_bool)
+                    mask_bool = None
+
         use_te = (
             self.te_first
             and self._te_ok
             and (self._te_attn is not None)
-            and (attn_mask is None)
             and (not kwargs)
         )
+        if bias_float is not None and not self._te_supports_core_bias:
+            use_te = False
+        if mask_bool is not None and not self._te_supports_mask:
+            use_te = False
         if use_te:
             q_te = q_bshd.permute(0, 2, 1, 3).contiguous()
             k_te = k_bshd.permute(0, 2, 1, 3).contiguous()
             v_te = v_bshd.permute(0, 2, 1, 3).contiguous()
+            te_kwargs: dict[str, Any] = {}
+            if self._te_supports_attention_dropout:
+                te_kwargs["attention_dropout"] = dropout_val
+            if self._te_supports_is_causal:
+                te_kwargs["is_causal"] = bool(is_causal)
+            if self._te_supports_training:
+                te_kwargs["training"] = training
+            if mask_bool is not None and self._te_mask_param:
+                te_kwargs[self._te_mask_param] = mask_bool
+                if self._te_supports_mask_type and self._te_mask_type_param:
+                    te_kwargs[self._te_mask_type_param] = "arbitrary"
+            if bias_float is not None and self._te_core_bias_param:
+                te_kwargs[self._te_core_bias_param] = bias_float
+                if self._te_supports_core_bias_type and self._te_core_bias_type_param:
+                    te_kwargs[self._te_core_bias_type_param] = "post_scale_bias"
             try:
-                out_te = self._te_attn(
-                    q_te,
-                    k_te,
-                    v_te,
-                    attn_mask=None,
-                    attention_dropout=dropout_val,
-                    is_causal=bool(is_causal),
-                    training=training,
-                )
+                out_te = self._te_attn(q_te, k_te, v_te, **te_kwargs)
             except Exception:
                 use_te = False
             else:
                 return out_te.permute(0, 2, 1, 3).contiguous()
+        sdpa_bias: torch.Tensor | None = None
+        if mask_bool is not None:
+            finfo = torch.finfo(q_bshd.dtype)
+            sdpa_bias = torch.where(
+                mask_bool,
+                torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device),
+                torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device),
+            ).expand(B, H, L, S)
+        if bias_float is not None:
+            base = (
+                sdpa_bias
+                if sdpa_bias is not None
+                else torch.zeros(B, H, L, S, device=q_bshd.device, dtype=q_bshd.dtype)
+            )
+            sdpa_bias = base + bias_float
+        final_mask = attn_mask if (attn_mask is not None and sdpa_bias is None) else sdpa_bias
         sdpa_kwargs = {
-            "attn_mask": attn_mask,
+            "attn_mask": final_mask,
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
@@ -1113,11 +1194,19 @@ class MultiScaleRetentionCompat(nn.Module):
         state: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        del attn_mask, state, kwargs
-        batch, seq_len, _ = x.shape
+        # Handle MPS bf16 instability by running the block in fp16.
+        restore_dtype: Optional[torch.dtype] = None
+        x_in = x
+        if getattr(x.device, "type", "cpu") == "mps" and x.dtype == torch.bfloat16:
+            restore_dtype = x.dtype
+            x_in = x.to(torch.float16)
+
+        del attn_mask, kwargs
+        del state
+        batch, seq_len, _ = x_in.shape
         head_dim = self.head_dim
-        q = self.q_proj(x).view(batch, seq_len, self.nhead, head_dim)
-        v = self.v_proj(x).view(batch, seq_len, self.nhead, head_dim)
+        q = self.q_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
+        v = self.v_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
         manual_flops = _retention_manual_flops(
             batch,
             seq_len,
@@ -1139,11 +1228,14 @@ class MultiScaleRetentionCompat(nn.Module):
         y = (q * state_tensor).contiguous().view(batch, seq_len, self.d_model)
         y = self.norm(y)
         if self.use_gate and self.g_proj is not None:
-            gate = torch.nn.functional.silu(self.g_proj(x))
+            gate = torch.nn.functional.silu(self.g_proj(x_in))
             y = y * gate
         if manual_flops > 0.0:
             FLOP_PROFILER.add_manual("Retention", manual_flops)
-        return self.o_proj(y)
+        out = self.o_proj(y)
+        if restore_dtype is not None:
+            out = out.to(restore_dtype)
+        return out
 
 
 class MultiScaleRetention(nn.Module):
@@ -1163,6 +1255,10 @@ class MultiScaleRetention(nn.Module):
             )
 
             self._ts_msr = _TorchScaleMSR(self.d_model, self.nhead)
+            # backend-specialization bookkeeping
+            self._msr_dev_tag: Optional[str] = None
+            self._msr_compiled: bool = False
+            self._msr_ipex_infer: bool = False
             self._ts_key_dim = int(
                 getattr(self._ts_msr, "key_dim", self.d_model // self.nhead)
             )
@@ -1211,6 +1307,59 @@ class MultiScaleRetention(nn.Module):
         ) * tril.view(1, 1, length, length)
         return ((sin, cos), inner_mask)
 
+    def _maybe_specialize(self, x: torch.Tensor) -> None:
+        """Pick an optimal backend-specific implementation for TorchScale MSR."""
+        if not self._ts_ok or not isinstance(x, torch.Tensor):
+            return
+        devt = getattr(x.device, "type", "cpu")
+        if self._msr_dev_tag == devt:
+            return
+        self._msr_dev_tag = devt
+
+        # Reset specialization flags
+        self._msr_compiled = False
+        self._msr_ipex_infer = False
+
+        compile_fn = getattr(torch, "compile", None)
+
+        if devt == "cuda" and callable(compile_fn):
+            try:
+                self._ts_msr = compile_fn(self._ts_msr, dynamic=True)
+                self._msr_compiled = True
+            except Exception:
+                pass
+        elif devt == "xpu":
+            try:
+                import intel_extension_for_pytorch as ipex  # type: ignore
+
+                if not self.training:
+                    target_dtype = (
+                        x.dtype
+                        if x.dtype in (torch.float32, torch.float16, torch.bfloat16)
+                        else torch.float32
+                    )
+                    self._ts_msr = ipex.optimize(
+                        self._ts_msr, dtype=target_dtype
+                    )
+                    self._msr_ipex_infer = True
+                else:
+                    if callable(compile_fn):
+                        try:
+                            self._ts_msr = compile_fn(self._ts_msr, dynamic=True)
+                            self._msr_compiled = True
+                        except Exception:
+                            pass
+            except Exception:
+                if callable(compile_fn):
+                    try:
+                        self._ts_msr = compile_fn(self._ts_msr, dynamic=True)
+                        self._msr_compiled = True
+                    except Exception:
+                        pass
+        else:
+            # CPU / MPS: keep eager (compile on MPS remains unstable)
+            pass
+
     def forward(
         self,
         x: torch.Tensor,
@@ -1219,8 +1368,14 @@ class MultiScaleRetention(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         del attn_mask, kwargs
+        self._maybe_specialize(x)
+        restore_dtype: Optional[torch.dtype] = None
+        x_in = x
+        if getattr(x.device, "type", "cpu") == "mps" and x.dtype == torch.bfloat16:
+            restore_dtype = x.dtype
+            x_in = x.to(torch.float16)
         try:
-            batch, seq_len, dim = x.shape
+            batch, seq_len, dim = x_in.shape
         except ValueError:
             manual_flops = 0.0
         else:
@@ -1232,15 +1387,20 @@ class MultiScaleRetention(nn.Module):
                 use_gate=self.use_gate,
             )
         if self._ts_ok:
-            _, seq_len, _ = x.shape
-            rel_pos = self._build_rel_pos(seq_len, x.device, x.dtype)
+            _, seq_len, _ = x_in.shape
+            rel_pos = self._build_rel_pos(seq_len, x_in.device, x_in.dtype)
             out = self._ts_msr(
-                x, rel_pos, chunkwise_recurrent=False, incremental_state=state
+                x_in, rel_pos, chunkwise_recurrent=False, incremental_state=state
             )
             if manual_flops > 0.0:
                 FLOP_PROFILER.add_manual("Retention", manual_flops)
+            if restore_dtype is not None:
+                out = out.to(restore_dtype)
             return out
-        return self._fallback(x, attn_mask=None, state=state)
+        out = self._fallback(x_in, attn_mask=None, state=state)
+        if restore_dtype is not None:
+            out = out.to(restore_dtype)
+        return out
 
 
 class AdamW:
@@ -1286,13 +1446,12 @@ class AdamW:
             except Exception as exc:
                 if logger:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
-        scale = meta.scale
         if hasattr(dev, "type") and dev.type == "cuda":
             fp8_allowed = True
-            if scale is not None:
+            if getattr(meta, "has_scale", False):
                 float8_dtypes = AutoCast._float8_dtypes()
                 if not any(
-                    _supports_scale(dtype, scale, safety_margin=2.0)
+                    _supports_scale(dtype, meta, safety_margin=2.0)
                     for dtype in float8_dtypes
                 ):
                     fp8_allowed = False
@@ -1381,13 +1540,12 @@ class AdamW:
                     logger(f"[OPT] TE FusedAdam unavailable: {exc}")
         quant_choice: Optional[str] = None
         quant_reason: Optional[str] = None
-        scale = meta.scale
-        if scale is not None:
-            if not scale.is_integral:
+        if getattr(meta, "has_scale", False):
+            if getattr(meta, "scale_is_integral", None) is False:
                 if logger:
                     logger("[OPT] Low-bit optimizers disabled: data is not integral")
             else:
-                max_abs = float(abs(scale.max_abs))
+                max_abs = float(abs(getattr(meta, "scale_max_abs", 0.0)))
                 candidates: List[Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]] = []
                 if max_abs <= 7.0:
                     candidates.append(("int4", is_int4_supported))
@@ -1447,7 +1605,7 @@ class Module:
     def _infer_optimal_dtype(
         device: Optional[Union[torch.device, str]] = None,
         *,
-        scale: Optional[DataScale] = None,
+        metadata: Optional[MetaData[Any]] = None,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
         candidates: List[torch.dtype] = []
@@ -1469,9 +1627,13 @@ class Module:
         else:
             candidates.append(torch.float32)
         for dtype in candidates:
-            if _supports_scale(dtype, scale):
+            if _supports_scale(dtype, metadata):
                 return dtype
-        return torch.float64 if _supports_scale(torch.float64, scale) else candidates[-1]
+        return (
+            torch.float64
+            if _supports_scale(torch.float64, metadata)
+            else candidates[-1]
+        )
 
     @staticmethod
     def _module_reference_tensor(module: nn.Module) -> Optional[torch.Tensor]:
@@ -1682,7 +1844,7 @@ class Module:
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
         *,
-        scale: Optional[DataScale] = None,
+        metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         dev = torch.device(device) if device is not None else get_device()
@@ -1696,7 +1858,7 @@ class Module:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Module._infer_optimal_dtype(dev, scale=scale)
+        params_dtype = Module._infer_optimal_dtype(dev, metadata=metadata)
         model, n_fused = Module._fuse_sequential_to_te(
             model, params_dtype=params_dtype
         )
@@ -1852,11 +2014,10 @@ class Module:
         if not ok:
             AutoCast.configure(model, metadata=meta)
             return (model, False, reason)
-        scale = meta.scale
-        if scale is not None:
+        if getattr(meta, "has_scale", False):
             float8_dtypes = AutoCast._float8_dtypes()
             if not any(
-                _supports_scale(dtype, scale, safety_margin=2.0)
+                _supports_scale(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
             ):
                 if logger:
@@ -1865,7 +2026,7 @@ class Module:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Module._infer_optimal_dtype(device, scale=scale)
+        params_dtype = Module._infer_optimal_dtype(device, metadata=meta)
 
         for backend in ("te", "torchao"):
             if backend == "te":
@@ -1896,11 +2057,10 @@ class Module:
         if not ok:
             AutoCast.configure(model, metadata=meta)
             return (model, False, reason)
-        scale = meta.scale
-        if scale is not None:
+        if getattr(meta, "has_scale", False):
             float8_dtypes = AutoCast._float8_dtypes()
             if not any(
-                _supports_scale(dtype, scale, safety_margin=2.0)
+                _supports_scale(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
             ):
                 if logger:
@@ -1909,8 +2069,11 @@ class Module:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Module._infer_optimal_dtype(device, scale=scale)
-        dynamic_activations = not (scale is not None and scale.is_integral)
+        params_dtype = Module._infer_optimal_dtype(device, metadata=meta)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
@@ -1948,7 +2111,10 @@ class Module:
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
-        dynamic_activations = not (meta.scale is not None and meta.scale.is_integral)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
         group_size = 128
         try:
             base_cfg = QAT.initialize(
@@ -2002,7 +2168,10 @@ class Module:
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
-        dynamic_activations = not (meta.scale is not None and meta.scale.is_integral)
+        dynamic_activations = not (
+            getattr(meta, "has_scale", False)
+            and getattr(meta, "scale_is_integral", None) is True
+        )
         try:
             if dynamic_activations:
                 cfg = Int8DynamicActivationInt8WeightConfig()
