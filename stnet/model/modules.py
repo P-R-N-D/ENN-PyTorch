@@ -28,8 +28,27 @@ except Exception:
         _disable_torch_compile = _dynamo.disable  # type: ignore[attr-defined]
     except Exception:
 
-        def _disable_torch_compile(fn):  # type: ignore
+        def _disable_torch_compile(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+            if fn is None:
+                return lambda real_fn: real_fn
             return fn
+
+
+if not hasattr(torch, "compiler"):
+    class _TorchCompilerNamespace:
+        @staticmethod
+        def disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+            return _disable_torch_compile(fn, recursive=recursive)
+
+
+    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
+elif not hasattr(torch.compiler, "disable"):
+
+    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+        return _disable_torch_compile(fn, recursive=recursive)
+
+
+    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
 
 from .functional import SwiGLU
 from .layers import (
@@ -122,6 +141,7 @@ def _normalize_modeling_type(value: Any) -> str:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
 
+@torch.compiler.disable(recursive=True)  # type: ignore[attr-defined]
 class SpatialEncoder(nn.Module):
     def __init__(
         self,
