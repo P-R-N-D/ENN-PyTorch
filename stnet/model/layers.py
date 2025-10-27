@@ -12,17 +12,28 @@ from ..utils.optimization import DotProductAttention, MultiScaleRetention
 
 try:
     # Prefer torch.compiler.disable (PyTorch ≥2.5)
-    _disable_torch_compile = torch.compiler.disable  # type: ignore[attr-defined]
+    _torch_compile_disable = torch.compiler.disable  # type: ignore[attr-defined]
 except Exception:
     try:
         # Fallback for PyTorch 2.0–2.4
         import torch._dynamo as _dynamo  # type: ignore
 
-        _disable_torch_compile = _dynamo.disable  # type: ignore[attr-defined]
+        _torch_compile_disable = _dynamo.disable  # type: ignore[attr-defined]
     except Exception:
 
-        def _disable_torch_compile(fn):  # type: ignore
+        def _torch_compile_disable(fn=None, *, recursive=False):  # type: ignore
+            if fn is None:
+                return lambda real_fn: real_fn
             return fn
+
+
+def _disable_torch_compile(fn=None, *, recursive: bool = False):
+    if fn is None:
+        return lambda real_fn: _disable_torch_compile(real_fn, recursive=recursive)
+    try:
+        return _torch_compile_disable(fn, recursive=recursive)  # type: ignore[misc]
+    except TypeError:
+        return _torch_compile_disable(fn)
 
 
 try:
@@ -43,7 +54,7 @@ def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
 class LayerNormFallback(nn.LayerNorm):
     """LayerNorm module that always executes in eager mode."""
 
-    @_disable_torch_compile
+    @_disable_torch_compile(recursive=True)
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         _graph_break()
         return super().forward(x)
