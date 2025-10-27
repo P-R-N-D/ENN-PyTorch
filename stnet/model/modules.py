@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
 import math
 from dataclasses import dataclass
 from math import prod
@@ -17,6 +16,21 @@ from ..utils.optimization import (
     inference,
 )
 
+
+try:
+    # Prefer torch.compiler.disable (PyTorch ≥2.5)
+    _disable_torch_compile = torch.compiler.disable  # type: ignore[attr-defined]
+except Exception:
+    try:
+        # Fallback for PyTorch 2.0–2.4
+        import torch._dynamo as _dynamo  # type: ignore
+
+        _disable_torch_compile = _dynamo.disable  # type: ignore[attr-defined]
+    except Exception:
+
+        def _disable_torch_compile(fn):  # type: ignore
+            return fn
+
 from .functional import SwiGLU
 from .layers import (
     GlobalEncoderLayer,
@@ -31,39 +45,6 @@ from .layers import (
 patch_torch()
 if TYPE_CHECKING:
     from .config import ModelConfig
-
-
-class _Float32Norm(nn.Module):
-    """Wrap a normalization module to execute in float32 for stability."""
-
-    def __init__(self, base_norm: nn.Module) -> None:
-        super().__init__()
-        self.base = base_norm
-
-    def _module_dtype(self) -> Optional[torch.dtype]:
-        with contextlib.suppress(StopIteration):
-            return next(self.base.parameters()).dtype
-        with contextlib.suppress(StopIteration):
-            return next(self.base.buffers()).dtype
-        return None
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dtype in (torch.float16, torch.bfloat16):
-            base_dtype = self._module_dtype() or x.dtype
-            if base_dtype == torch.float32:
-                y = self.base(x.float())
-                return y.to(x.dtype)
-            if base_dtype != x.dtype:
-                y = self.base(x.to(base_dtype))
-                return y.to(x.dtype)
-        return self.base(x)
-
-
-if hasattr(torch, "compiler") and hasattr(torch.compiler, "disable"):
-    _disable_torch_compile = torch.compiler.disable
-else:
-    def _disable_torch_compile(fn):
-        return fn
 
 
 class PointTransformer(nn.Module):
@@ -84,11 +65,11 @@ class PointTransformer(nn.Module):
         self.d_model = int(d_model)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm1 = _Float32Norm(norm_layer(norm_type, self.d_model))
+        self.norm1 = norm_layer(norm_type, self.d_model)
         self.attn = PatchAttention(
             self.d_model, nhead, coord_dim=self.coord_dim
         )
-        self.norm2 = _Float32Norm(norm_layer(norm_type, self.d_model))
+        self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
@@ -196,11 +177,11 @@ class TemporalEncoderBlock(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.norm1 = _Float32Norm(norm_layer(norm_type, d_model))
+        self.norm1 = norm_layer(norm_type, d_model)
         self.retention = TemporalEncoderLayer(d_model, nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm2 = _Float32Norm(norm_layer(norm_type, d_model))
+        self.norm2 = norm_layer(norm_type, d_model)
         hid = int(d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
 
