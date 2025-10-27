@@ -145,6 +145,50 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
 
 
+def _collect_layernorm_params(root: nn.Module) -> set[nn.Parameter]:
+    params: set[nn.Parameter] = set()
+    for module in root.modules():
+        if isinstance(module, nn.LayerNorm):
+            weight = getattr(module, "weight", None)
+            bias = getattr(module, "bias", None)
+            if isinstance(weight, nn.Parameter):
+                params.add(weight)
+            if isinstance(bias, nn.Parameter):
+                params.add(bias)
+    return params
+
+
+def _assert_no_fake_dtensor_in_ln(root: nn.Module) -> None:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except Exception:  # pragma: no cover - DTensor optional
+        dtensor_types: Tuple[type, ...] = tuple()
+    else:
+        dtensor_types = (_DTensor,)
+
+    bad: list[str] = []
+    for name, module in root.named_modules():
+        if not isinstance(module, nn.LayerNorm):
+            continue
+        for attr in ("weight", "bias"):
+            tensor = getattr(module, attr, None)
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            data_attr = getattr(tensor, "data", None)
+            if (
+                getattr(tensor, "is_meta", False)
+                or is_fake_tensor(tensor)
+                or isinstance(tensor, dtensor_types)
+                or isinstance(data_attr, dtensor_types)
+            ):
+                module_name = name or module.__class__.__name__
+                bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
+    if bad:
+        raise RuntimeError(
+            "LayerNorm params must be real/local tensors:\n  " + "\n  ".join(bad)
+        )
+
+
 def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -> None:
     """Materialize LN γ/β if meta/fake and enforce CPU float32 parameters."""
 
@@ -183,6 +227,8 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
                 not isinstance(weight, torch.Tensor)
                 or getattr(weight, "is_meta", False)
                 or is_fake_tensor(weight)
+                or isinstance(weight, DTensor)
+                or isinstance(getattr(weight, "data", None), DTensor)
             ):
                 data = torch.ones(
                     module.normalized_shape, device=device, dtype=target_dtype
@@ -193,6 +239,8 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
                 not isinstance(bias, torch.Tensor)
                 or getattr(bias, "is_meta", False)
                 or is_fake_tensor(bias)
+                or isinstance(bias, DTensor)
+                or isinstance(getattr(bias, "data", None), DTensor)
             ):
                 data = torch.zeros(
                     module.normalized_shape, device=device, dtype=target_dtype
@@ -1009,16 +1057,18 @@ def main(*args: Any) -> Optional[Root]:
                 )
 
         ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
+        ln_ignored_registry = _IdentityParamSet(())
+        ln_param_ids: set[int] = set()
 
         def _per_module_ignored_params(
             module: torch.nn.Module,
         ) -> Optional[_IdentityParamSet]:
-            if len(ignored_param_registry) == 0:
+            if len(ignored_param_registry) == 0 and not ln_param_ids:
                 return None
             params = [
                 param
                 for param in module.parameters(recurse=True)
-                if param in ignored_param_registry
+                if param in ignored_param_registry or id(param) in ln_param_ids
             ]
             return _IdentityParamSet(tuple(params)) if params else None
 
@@ -1094,18 +1144,38 @@ def main(*args: Any) -> Optional[Root]:
 
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
+            *,
+            use_orig_params: bool = False,
+            ignored_params: Optional[Sequence[torch.nn.Parameter]] = None,
         ) -> Optional[torch.nn.Module]:
             nonlocal model
             if target is None or id(target) in wrapped:
                 return target
             wrapped.add(id(target))
             per_mod_ignored = _per_module_ignored_params(target)
+            combined_ignored: List[torch.nn.Parameter] = []
+            seen_ids: set[int] = set()
+            if per_mod_ignored is not None:
+                for param in per_mod_ignored:
+                    pid = id(param)
+                    if pid not in seen_ids:
+                        seen_ids.add(pid)
+                        combined_ignored.append(param)
+            if ignored_params is not None:
+                module_param_ids = {id(p) for p in target.parameters(recurse=True)}
+                for param in ignored_params:
+                    pid = id(param)
+                    if pid in seen_ids or pid not in module_param_ids:
+                        continue
+                    seen_ids.add(pid)
+                    combined_ignored.append(param)
             sharded = fully_shard(
                 target,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=False,
-                ignored_params=per_mod_ignored or None,
+                use_orig_params=use_orig_params,
+                ignored_params=combined_ignored or None,
             )
             sharded.set_requires_gradient_sync(True)
             if target is model:
@@ -1129,25 +1199,47 @@ def main(*args: Any) -> Optional[Root]:
             return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
+        ln_ignored_params = _collect_layernorm_params(_m_pre)
+        ln_ignored_registry = _IdentityParamSet(tuple(ln_ignored_params))
+        ln_param_ids = {id(param) for param in ln_ignored_params}
         # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
         _materialize_all_layernorms_(_m_pre, device)
         _validate_layernorm_dtypes(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
+        _assert_no_fake_dtensor_in_ln(_m_pre)
 
         try:
             for submodule in _collect_block_modules(
                 getattr(model, "local_net", None)
             ) + _collect_block_modules(getattr(model, "global_net", None)):
-                _fsdp_wrap(submodule)
-            _fsdp_wrap(model)
+                _fsdp_wrap(
+                    submodule,
+                    use_orig_params=True,
+                    ignored_params=ln_ignored_registry if len(ln_ignored_registry) > 0 else None,
+                )
+            _fsdp_wrap(
+                model,
+                use_orig_params=True,
+                ignored_params=ln_ignored_registry if len(ln_ignored_registry) > 0 else None,
+            )
         except (RuntimeError, ValueError, TypeError):
+            combined_fallback: List[torch.nn.Parameter] = []
+            seen_ids: set[int] = set()
+            for collection in (ignored_param_registry, ln_ignored_registry):
+                if collection is None:
+                    continue
+                for param in collection:
+                    pid = id(param)
+                    if pid in seen_ids:
+                        continue
+                    seen_ids.add(pid)
+                    combined_fallback.append(param)
             model = fully_shard(
                 model,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                ignored_params=(
-                    ignored_param_registry if len(ignored_param_registry) > 0 else None
-                ),
+                use_orig_params=True,
+                ignored_params=combined_fallback or None,
                 reshard_after_forward=False,
             )
             model.set_requires_gradient_sync(True)
@@ -1161,6 +1253,7 @@ def main(*args: Any) -> Optional[Root]:
         _m_post = model.module if hasattr(model, "module") else model
         _validate_layernorm_dtypes(_m_post, device)
         _assert_no_meta_tensors(_m_post)
+        _assert_no_fake_dtensor_in_ln(_m_post)
         _maybe_install_meta_pre_hook(_m_post)
 
         net_params = [p for p in model.parameters()]
@@ -1504,6 +1597,7 @@ def main(*args: Any) -> Optional[Root]:
         _materialize_all_layernorms_(_m_eval, device)
         _validate_layernorm_dtypes(_m_eval, device)
         _assert_no_meta_tensors(_m_eval)
+        _assert_no_fake_dtensor_in_ln(_m_eval)
         _maybe_install_meta_pre_hook(_m_eval)
         _ensure_uniform_param_dtype(
             model,
