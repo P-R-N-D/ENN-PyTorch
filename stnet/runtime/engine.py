@@ -143,13 +143,15 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
 
     for submodule in model.modules():
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
-def _assert_no_fake_dtensor_in_ln(root: nn.Module) -> None:
+def _assert_no_fake_dtensor_in_ln(
+    root: nn.Module, *, allow_dtensor: bool = False
+) -> None:
     try:
         from torch.distributed._tensor import DTensor as _DTensor
     except Exception:  # pragma: no cover - DTensor optional
         dtensor_types: Tuple[type, ...] = tuple()
     else:
-        dtensor_types = (_DTensor,)
+        dtensor_types = tuple() if allow_dtensor else (_DTensor,)
 
     bad: list[str] = []
     for name, module in root.named_modules():
@@ -160,12 +162,11 @@ def _assert_no_fake_dtensor_in_ln(root: nn.Module) -> None:
             if not isinstance(tensor, torch.Tensor):
                 continue
             data_attr = getattr(tensor, "data", None)
-            if (
-                getattr(tensor, "is_meta", False)
-                or is_fake_tensor(tensor)
-                or isinstance(tensor, dtensor_types)
-                or isinstance(data_attr, dtensor_types)
-            ):
+            is_meta_or_fake = getattr(tensor, "is_meta", False) or is_fake_tensor(tensor)
+            is_dtensor = isinstance(tensor, dtensor_types) or isinstance(
+                data_attr, dtensor_types
+            )
+            if is_meta_or_fake or is_dtensor:
                 module_name = name or module.__class__.__name__
                 bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
     if bad:
@@ -1194,7 +1195,7 @@ def main(*args: Any) -> Optional[Root]:
         _m_post = model.module if hasattr(model, "module") else model
         _validate_layernorm_dtypes(_m_post, device)
         _assert_no_meta_tensors(_m_post)
-        _assert_no_fake_dtensor_in_ln(_m_post)
+        _assert_no_fake_dtensor_in_ln(_m_post, allow_dtensor=True)
         _maybe_install_meta_pre_hook(_m_post)
 
         net_params = [p for p in model.parameters()]
