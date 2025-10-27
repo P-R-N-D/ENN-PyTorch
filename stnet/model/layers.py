@@ -32,58 +32,6 @@ def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
     return module
 
 
-class _Float32NormMixin:
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self._restore_float32()
-
-    def _restore_float32(self) -> None:
-        with torch.no_grad():
-            for param in self.parameters(recurse=False):
-                if torch.is_floating_point(param.data) and param.data.dtype is not torch.float32:
-                    param.data = param.data.to(param.data.device, dtype=torch.float32)
-            for buffer in self.buffers(recurse=False):
-                if torch.is_floating_point(buffer) and buffer.dtype is not torch.float32:
-                    buffer.copy_(buffer.to(buffer.device, dtype=torch.float32))
-
-    def _cast_input(self, x: torch.Tensor) -> tuple[torch.Tensor, bool]:
-        if not torch.is_floating_point(x):
-            return x, False
-        if x.dtype == torch.float32:
-            return x, False
-        return x.to(torch.float32), True
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        forward_fn = super().forward  # type: ignore[attr-defined]
-        cast_x, should_cast_back = self._cast_input(x)
-        y = forward_fn(cast_x)
-        if should_cast_back and torch.is_floating_point(y) and y.dtype != x.dtype:
-            y = y.to(x.dtype)
-        return y
-
-    def _apply(self, fn: Any) -> "_Float32NormMixin":  # type: ignore[override]
-        result = super()._apply(fn)
-        self._restore_float32()
-        return result
-
-
-class _LayerNormFloat32(_Float32NormMixin, nn.LayerNorm):
-    pass
-
-
-if hasattr(nn, "RMSNorm"):
-
-    class _RMSNormFloat32(_Float32NormMixin, nn.RMSNorm):  # type: ignore[misc]
-        pass
-
-else:
-    _RMSNormFloat32 = None  # type: ignore[assignment]
-
-
-class _BatchNorm1dFloat32(_Float32NormMixin, nn.BatchNorm1d):
-    pass
-
-
 class StochasticDepth(nn.Module):
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
         super().__init__()
@@ -109,12 +57,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return _disable_module_torch_compile(_LayerNormFloat32(d_model))
-    if kind in {"rmsnorm", "rms_norm", "rms"} and _RMSNormFloat32 is not None:
-        return _disable_module_torch_compile(_RMSNormFloat32(d_model))
+        return _disable_module_torch_compile(nn.LayerNorm(d_model))
+    if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
+        return _disable_module_torch_compile(nn.RMSNorm(d_model))  # type: ignore[misc]
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
-        return _disable_module_torch_compile(_BatchNorm1dFloat32(d_model))
-    return _disable_module_torch_compile(_LayerNormFloat32(d_model))
+        return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
+    return _disable_module_torch_compile(nn.LayerNorm(d_model))
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
