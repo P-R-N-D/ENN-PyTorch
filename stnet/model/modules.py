@@ -7,9 +7,10 @@ from math import prod
 from typing import TYPE_CHECKING, Any, List, Optional, Protocol, Sequence, Tuple, Union, cast
 
 import torch
-from torch import nn
+import torch.nn as nn
 
 from ..utils.compat import patch_torch
+from ..utils.debug import is_fake_tensor
 from ..utils.optimization import (
     AutoCast,
     compile,
@@ -102,7 +103,9 @@ class PointTransformer(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # (0) 입력/마스크 메타 유입 즉시 차단
-        if x.is_meta or coords.is_meta:
+        if getattr(x, "is_meta", False) or is_fake_tensor(x):
+            raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
+        if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward")
         if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
             raise ValueError(
@@ -112,7 +115,7 @@ class PointTransformer(nn.Module):
         coords = coords.contiguous()
         if attn_mask is not None:
             attn_mask = attn_mask.contiguous()
-            if getattr(attn_mask, "is_meta", False):
+            if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
 
         # (1) 첫 호출 시 LayerNorm 파라미터가 meta면 즉시 실체화(materialize)
@@ -123,11 +126,17 @@ class PointTransformer(nn.Module):
                     return
                 dev = ref.device
                 target_dtype = torch.float32 if dev.type == "cpu" else ref.dtype
-                if getattr(getattr(ln, "weight", None), "is_meta", False):
+                w = getattr(ln, "weight", None)
+                b = getattr(ln, "bias", None)
+                if (isinstance(w, torch.Tensor) and (
+                    getattr(w, "is_meta", False) or is_fake_tensor(w)
+                )):
                     ln.weight = nn.Parameter(
                         torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
                     )
-                if getattr(getattr(ln, "bias", None), "is_meta", False):
+                if (isinstance(b, torch.Tensor) and (
+                    getattr(b, "is_meta", False) or is_fake_tensor(b)
+                )):
                     ln.bias = nn.Parameter(
                         torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
                     )
@@ -138,12 +147,16 @@ class PointTransformer(nn.Module):
 
         # (2) CPU/eager safety: LN 전/후 meta 가드 + CPU는 fp32 강제
         _x = x
-        if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
+        if isinstance(_x, torch.Tensor) and (
+            getattr(_x, "is_meta", False) or is_fake_tensor(_x)
+        ):
             raise RuntimeError("x is meta before LayerNorm")
         if _x.device.type == "cpu" and _x.is_floating_point() and _x.dtype != torch.float32:
             _x = _x.float()
         _x = self.norm1(_x)
-        if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
+        if isinstance(_x, torch.Tensor) and (
+            getattr(_x, "is_meta", False) or is_fake_tensor(_x)
+        ):
             raise RuntimeError("x is meta after LayerNorm")
         if _x.device.type == "cpu" and x.is_floating_point() and x.dtype != torch.float32:
             _x = _x.to(x.dtype)
@@ -152,7 +165,7 @@ class PointTransformer(nn.Module):
 
         # (3) norm2 경로도 동일 보호
         _x2 = x
-        if getattr(_x2, "is_meta", False):
+        if getattr(_x2, "is_meta", False) or is_fake_tensor(_x2):
             raise RuntimeError("x is meta before LayerNorm(norm2)")
         if (
             _x2.device.type == "cpu"
@@ -161,7 +174,7 @@ class PointTransformer(nn.Module):
         ):
             _x2 = _x2.float()
         _x2 = self.norm2(_x2)
-        if getattr(_x2, "is_meta", False):
+        if getattr(_x2, "is_meta", False) or is_fake_tensor(_x2):
             raise RuntimeError("x is meta after LayerNorm(norm2)")
         if (
             _x2.device.type == "cpu"
