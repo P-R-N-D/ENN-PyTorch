@@ -7,7 +7,16 @@ from typing import Any, Optional, Tuple
 import torch
 from torch import nn
 
-from ..utils.optimization import DotProductAttention, MultiScaleRetention
+from ..utils.optimization import (
+    DotProductAttention,
+    MultiHeadAttention,
+    MultiScaleRetention,
+)
+
+try:
+    from stnet.utils.compat import RMSNorm as _Norm  # type: ignore
+except Exception:
+    _Norm = nn.LayerNorm
 
 
 try:
@@ -446,23 +455,130 @@ class TemporalEncoderLayer(nn.Module):
         return out, new_state
 
 
-class GlobalEncoderLayer(nn.Module):
-    def __init__(self, d_model: int, nhead: int) -> None:
-        super().__init__()
-        self.msr = MultiScaleRetention(d_model, nhead)
+def _build_dilated_mask(
+    seq_len: int,
+    *,
+    dilation: int = 1,
+    window_size: Optional[int] = None,
+    causal: bool = False,
+    device=None,
+) -> torch.Tensor:
+    """
+    Dilated attention용 boolean mask 생성: shape (L, L), True는 mask-out.
+      - (i - j) % dilation == 0
+      - window_size가 주어지면 |i - j| <= window_size
+      - causal이면 j <= i
+    """
 
-    def forward(
+    if dilation < 1:
+        raise ValueError(f"dilation must be >= 1, got {dilation}")
+    L = int(seq_len)
+    i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
+    j = torch.arange(L, device=device).unsqueeze(0).expand(L, L)
+    dist = (i - j).abs()
+    congruent = ((i - j) % dilation) == 0
+    within = (
+        torch.ones_like(congruent, dtype=torch.bool)
+        if window_size is None
+        else (dist <= window_size)
+    )
+    not_future = (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
+    allowed = congruent & within & not_future
+    return ~allowed  # True = masked
+
+
+class DilatedAttention(nn.Module):
+    """
+    Dilated attention 블록. 내부 attention은 프로젝트 표준 MultiHeadAttention 사용.
+
+    Args:
+        embed_dim, num_heads, dilation, window_size, causal, dropout, mlp_ratio,
+        batch_first, bias
+
+    IO:
+        x: (B, L, C) if batch_first
+        key_padding_mask: (B, L) bool, True = pad
+    """
+
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        *,
+        dilation: int = 1,
+        window_size: Optional[int] = None,
+        causal: bool = False,
+        dropout: float = 0.0,
+        mlp_ratio: float = 4.0,
+        batch_first: bool = True,
+        bias: bool = True,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dilation = int(dilation)
+        self.window_size = window_size
+        self.causal = causal
+        self.batch_first = batch_first
+
+        self.norm1 = _Norm(embed_dim)
+        self.attn = MultiHeadAttention(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            bias=bias,
+            batch_first=batch_first,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.norm2 = _Norm(embed_dim)
+        hidden = int(mlp_ratio * embed_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, hidden, bias=True),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, embed_dim, bias=True),
+        )
+
+        self._mask_cache: dict[int, torch.Tensor] = {}
+
+    def _get_mask(self, L: int, device) -> torch.Tensor:
+        mask = self._mask_cache.get(L)
+        if mask is None or mask.device != device:
+            mask = _build_dilated_mask(
+                L,
+                dilation=self.dilation,
+                window_size=self.window_size,
+                causal=self.causal,
+                device=device,
+            )
+            self._mask_cache[L] = mask
+        return mask
+
+    def forward(  # type: ignore[override]
         self,
         x: torch.Tensor,
-        *,
-        attn_mask: Optional[torch.Tensor] = None,
-        state: Optional[dict] = None,
-    ) -> Tuple[torch.Tensor, Optional[dict]]:
-        h = self.msr(x, attn_mask=attn_mask, state=state)
-        if isinstance(h, tuple):
-            out, new_state = h
-            if new_state is None:
-                new_state = state
-        else:
-            out, new_state = h, state
-        return out, new_state
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self.batch_first:
+            x = x.transpose(0, 1)
+        B, L, _ = x.shape
+        residual = x
+        x = self.norm1(x)
+        mask = self._get_mask(L, x.device)
+        attn_out, attn_w = self.attn(
+            x,
+            x,
+            x,
+            attn_mask=mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            is_causal=self.causal,
+        )
+        x = residual + self.dropout(attn_out)
+        residual = x
+        x = self.norm2(x)
+        x = residual + self.ffn(x)
+        if not self.batch_first:
+            x = x.transpose(0, 1)
+        return x, (attn_w if need_weights else None)

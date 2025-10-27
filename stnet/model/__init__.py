@@ -24,7 +24,7 @@ from .functional import (
     TiledLoss,
 )
 from .layers import (
-    GlobalEncoderLayer,
+    DilatedAttention,
     CrossAttention,
     PatchAttention,
     PatchEmbedding,
@@ -36,8 +36,8 @@ from .layers import (
 from .modules import (
     CrossTransformer,
     GlobalEncoder,
-    GlobalEncoderBlock,
     LocalProcessor,
+    LongNet,
     Payload,
     Root,
     SpatialEncoder,
@@ -64,8 +64,8 @@ __all__ = [
     "PointTransformer",
     "TemporalEncoderLayer",
     "TemporalEncoderBlock",
-    "GlobalEncoderLayer",
-    "GlobalEncoderBlock",
+    "DilatedAttention",
+    "LongNet",
     "CrossTransformer",
     "Payload",
     "GlobalEncoder",

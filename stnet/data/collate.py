@@ -21,7 +21,7 @@ from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, P
 
 from ..transport.socket import Endpoint
 from ..utils.compat import has_arrow_flight, patch_arrow
-from ..utils.dtypes import to, to_torch
+from ..utils.datatype import to, to_torch
 from ..utils.platform import Distributed, Network, System
 
 _ARROW = patch_arrow()
