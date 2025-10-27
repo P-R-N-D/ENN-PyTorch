@@ -1199,14 +1199,18 @@ def main(*args: Any) -> Optional[Root]:
             return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
-        ln_ignored_params = _collect_layernorm_params(_m_pre)
-        ln_ignored_registry = _IdentityParamSet(tuple(ln_ignored_params))
-        ln_param_ids = {id(param) for param in ln_ignored_params}
+        ln_ignored_registry = _IdentityParamSet(())
+        ln_param_ids: set[int] = set()
         # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
         _materialize_all_layernorms_(_m_pre, device)
         _validate_layernorm_dtypes(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
         _assert_no_fake_dtensor_in_ln(_m_pre)
+
+        ln_ignored_params = _collect_layernorm_params(_m_pre)
+        if ln_ignored_params:
+            ln_ignored_registry = _IdentityParamSet(tuple(ln_ignored_params))
+            ln_param_ids = {id(param) for param in ln_ignored_params}
 
         try:
             for submodule in _collect_block_modules(
