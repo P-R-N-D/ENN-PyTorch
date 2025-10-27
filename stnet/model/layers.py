@@ -71,8 +71,13 @@ class _LayerNormFloat32(_Float32NormMixin, nn.LayerNorm):
     pass
 
 
-class _RMSNormFloat32(_Float32NormMixin, nn.RMSNorm):  # type: ignore[misc]
-    pass
+if hasattr(nn, "RMSNorm"):
+
+    class _RMSNormFloat32(_Float32NormMixin, nn.RMSNorm):  # type: ignore[misc]
+        pass
+
+else:
+    _RMSNormFloat32 = None  # type: ignore[assignment]
 
 
 class _BatchNorm1dFloat32(_Float32NormMixin, nn.BatchNorm1d):
@@ -105,7 +110,7 @@ def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
         return _disable_module_torch_compile(_LayerNormFloat32(d_model))
-    if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
+    if kind in {"rmsnorm", "rms_norm", "rms"} and _RMSNormFloat32 is not None:
         return _disable_module_torch_compile(_RMSNormFloat32(d_model))
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
         return _disable_module_torch_compile(_BatchNorm1dFloat32(d_model))
