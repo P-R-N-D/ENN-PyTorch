@@ -93,14 +93,15 @@ class PointTransformer(nn.Module):
         self.ffn = SwiGLU(
             self.d_model, hid, out_dim=self.d_model, dropout=dropout
         )
+        self._ln_materialized = False
 
-    @_disable_torch_compile
     def forward(
         self,
         x: torch.Tensor,
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # (0) 입력/마스크 메타 유입 즉시 차단
         if x.is_meta or coords.is_meta:
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward")
         if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
@@ -113,34 +114,59 @@ class PointTransformer(nn.Module):
             attn_mask = attn_mask.contiguous()
             if getattr(attn_mask, "is_meta", False):
                 raise RuntimeError("attn_mask is meta before attention")
-        # --- CPU/eager safety: avoid LN on non-fp32 & guard meta tensors ---
+
+        # (1) 첫 호출 시 LayerNorm 파라미터가 meta면 즉시 실체화(materialize)
+        if not getattr(self, "_ln_materialized", False):
+
+            def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
+                if not isinstance(ln, nn.LayerNorm):
+                    return
+                dev = ref.device
+                target_dtype = torch.float32 if dev.type == "cpu" else ref.dtype
+                if getattr(getattr(ln, "weight", None), "is_meta", False):
+                    ln.weight = nn.Parameter(
+                        torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
+                    )
+                if getattr(getattr(ln, "bias", None), "is_meta", False):
+                    ln.bias = nn.Parameter(
+                        torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
+                    )
+
+            _materialize_ln_(self.norm1, x)
+            _materialize_ln_(self.norm2, x)
+            self._ln_materialized = True
+
+        # (2) CPU/eager safety: LN 전/후 meta 가드 + CPU는 fp32 강제
         _x = x
         if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
             raise RuntimeError("x is meta before LayerNorm")
-        if _x.device.type == "cpu" and _x.dtype in (torch.bfloat16, torch.float16):
+        if _x.device.type == "cpu" and _x.is_floating_point() and _x.dtype != torch.float32:
             _x = _x.float()
         _x = self.norm1(_x)
         if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
             raise RuntimeError("x is meta after LayerNorm")
-        if _x.device.type == "cpu" and x.dtype in (torch.bfloat16, torch.float16):
+        if _x.device.type == "cpu" and x.is_floating_point() and x.dtype != torch.float32:
             _x = _x.to(x.dtype)
         y = self.attn(_x, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
 
+        # (3) norm2 경로도 동일 보호
         _x2 = x
         if getattr(_x2, "is_meta", False):
             raise RuntimeError("x is meta before LayerNorm(norm2)")
-        if _x2.device.type == "cpu" and _x2.dtype in (
-            torch.bfloat16,
-            torch.float16,
+        if (
+            _x2.device.type == "cpu"
+            and _x2.is_floating_point()
+            and _x2.dtype != torch.float32
         ):
             _x2 = _x2.float()
         _x2 = self.norm2(_x2)
         if getattr(_x2, "is_meta", False):
             raise RuntimeError("x is meta after LayerNorm(norm2)")
-        if _x2.device.type == "cpu" and x.dtype in (
-            torch.bfloat16,
-            torch.float16,
+        if (
+            _x2.device.type == "cpu"
+            and x.is_floating_point()
+            and x.dtype != torch.float32
         ):
             _x2 = _x2.to(x.dtype)
         x = x + self.drop_path(self.dropout(self.ffn(_x2)))

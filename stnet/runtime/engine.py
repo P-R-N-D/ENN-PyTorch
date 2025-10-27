@@ -130,6 +130,30 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
 
 
+def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -> None:
+    import torch.nn as nn
+
+    target_dtype = torch.float32 if device.type == "cpu" else None
+    for module in model.modules():
+        if isinstance(module, nn.LayerNorm):
+            if getattr(getattr(module, "weight", None), "is_meta", False):
+                module.weight = nn.Parameter(
+                    torch.ones(
+                        module.normalized_shape,
+                        device=device,
+                        dtype=target_dtype or torch.float32,
+                    )
+                )
+            if getattr(getattr(module, "bias", None), "is_meta", False):
+                module.bias = nn.Parameter(
+                    torch.zeros(
+                        module.normalized_shape,
+                        device=device,
+                        dtype=target_dtype or torch.float32,
+                    )
+                )
+
+
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
         keys = []
@@ -989,6 +1013,11 @@ def main(*args: Any) -> Optional[Root]:
                             blocks.append(block)
             return blocks
 
+        _m_pre = model.module if hasattr(model, "module") else model
+        # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
+        _materialize_all_layernorms_(_m_pre, device)
+        _assert_no_meta_tensors(_m_pre)
+
         try:
             for submodule in _collect_block_modules(
                 getattr(model, "local_net", None)
@@ -1013,9 +1042,9 @@ def main(*args: Any) -> Optional[Root]:
         for parameter in model.parameters():
             _ensure_dtensor(parameter)
 
-        _m = model.module if hasattr(model, "module") else model
-        _assert_no_meta_tensors(_m)
-        _maybe_install_meta_pre_hook(_m)
+        _m_post = model.module if hasattr(model, "module") else model
+        _assert_no_meta_tensors(_m_post)
+        _maybe_install_meta_pre_hook(_m_post)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
@@ -1354,9 +1383,9 @@ def main(*args: Any) -> Optional[Root]:
         model.to(device, non_blocking=True).eval()
         metadata = MetaData.for_device(device)
         model, _, _ = Module.use_te_module(model, device=device)
-        _m = model.module if hasattr(model, "module") else model
-        _assert_no_meta_tensors(_m)
-        _maybe_install_meta_pre_hook(_m)
+        _m_eval = model.module if hasattr(model, "module") else model
+        _assert_no_meta_tensors(_m_eval)
+        _maybe_install_meta_pre_hook(_m_eval)
         _ensure_uniform_param_dtype(
             model,
             prefer=(
