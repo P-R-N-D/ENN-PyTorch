@@ -54,7 +54,31 @@ def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
 class LayerNormFallback(nn.LayerNorm):
     """LayerNorm module that always executes in eager mode."""
 
-    @_disable_torch_compile(recursive=True)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+
+        forward = self.forward
+        try:
+            import torch.compiler as _compiler  # type: ignore[attr-defined]
+
+            try:
+                self.forward = _compiler.disable(fn=forward, recursive=True)  # type: ignore[assignment]
+            except TypeError:
+                self.forward = _compiler.disable(fn=forward)  # type: ignore[assignment]
+            return
+        except (ImportError, AttributeError):
+            pass
+
+        try:
+            import torch._dynamo as _dynamo  # type: ignore[import]
+
+            try:
+                self.forward = _dynamo.disable(fn=forward, recursive=True)  # type: ignore[assignment]
+            except TypeError:
+                self.forward = _dynamo.disable(fn=forward)  # type: ignore[assignment]
+        except (ImportError, AttributeError):
+            pass
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
         _graph_break()
         return super().forward(x)
