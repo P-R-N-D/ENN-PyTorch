@@ -31,7 +31,7 @@ spark = ["pyspark[pandas_on_spark]>=3.5"]
 zeromq = ["pyzmq>=25"]
 optimization = ["torchao>=0.5"]
 nvidia_gds = ["cupy-cuda12x>=13.6", "kvikio>=23.8"]
-nvidia_te = ["transformer-engine[pytorch]>=2.0"]
+nvidia_te = ["transformer-engine[pytorch]>=2.4.0"]
 intel_ai = ["intel-extension-for-pytorch>=2.3"]
 nvidia_rdma = ["ucxx-cu12>=0.45.0"]
 servable = [
