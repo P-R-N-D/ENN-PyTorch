@@ -280,9 +280,35 @@ class SpatialEncoder(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if getattr(x, "is_meta", False) or is_fake_tensor(x):
+            raise RuntimeError("x is meta/fake before SpatialEncoder.forward")
+        if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
+            raise RuntimeError("coords is meta/fake before SpatialEncoder.forward")
+        if x.dim() != 3:
+            raise ValueError(
+                f"SpatialEncoder expects (B, N, C) tokens, got shape {tuple(x.shape)}"
+            )
+        if coords.dim() != 3:
+            raise ValueError(
+                f"SpatialEncoder expects (B, N, D) coords, got shape {tuple(coords.shape)}"
+            )
+        if x.shape[:2] != coords.shape[:2]:
+            raise ValueError(
+                "tokens/coords batch or length mismatch: "
+                f"tokens={tuple(x.shape)} vs coords={tuple(coords.shape)}"
+            )
+        x = x.contiguous()
+        coords = coords.contiguous()
+        if attn_mask is not None:
+            if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
+                raise RuntimeError("attn_mask is meta/fake before SpatialEncoder.forward")
+            attn_mask = attn_mask.contiguous()
         for blk in self.blocks:
             x = blk(x, coords, attn_mask=attn_mask)
-        return self.norm(x)
+        out = self.norm(x)
+        if getattr(out, "is_meta", False) or is_fake_tensor(out):
+            raise RuntimeError("SpatialEncoder produced meta/fake tensor")
+        return out.contiguous()
 
 class TemporalEncoderBlock(nn.Module):
     def __init__(
@@ -709,12 +735,22 @@ class LocalProcessor(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Payload:
         B = x.shape[0]
-        spatial_tokens = self.spatial_tokenizer(x).view(
-            B, self.spatial_tokens, self.d_model
-        )
-        temporal_tokens = self.temporal_tokenizer(x).view(
-            B, self.temporal_tokens, self.d_model
-        )
+        spatial_raw = self.spatial_tokenizer(x)
+        expected_spatial = B * self.spatial_tokens * self.d_model
+        if spatial_raw.numel() != expected_spatial:
+            raise RuntimeError(
+                "spatial tokenizer output has unexpected numel: "
+                f"got {spatial_raw.numel()} vs expected {expected_spatial}"
+            )
+        spatial_tokens = spatial_raw.view(B, self.spatial_tokens, self.d_model).contiguous()
+        temporal_raw = self.temporal_tokenizer(x)
+        expected_temporal = B * self.temporal_tokens * self.d_model
+        if temporal_raw.numel() != expected_temporal:
+            raise RuntimeError(
+                "temporal tokenizer output has unexpected numel: "
+                f"got {temporal_raw.numel()} vs expected {expected_temporal}"
+            )
+        temporal_tokens = temporal_raw.view(B, self.temporal_tokens, self.d_model).contiguous()
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_encoder(spatial_tokens, coords)
         temporal_out = self.temporal_encoder(temporal_tokens)
@@ -730,11 +766,13 @@ class LocalProcessor(nn.Module):
         else:
             raise RuntimeError(f"Unhandled modeling type '{mode}'")
         tokens = self.norm(tokens)
+        tokens = tokens.contiguous()
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
-        context = flat.view(B, *self.out_shape)
+        flat = flat.contiguous()
+        context = flat.view(B, *self.out_shape).contiguous()
         dims = tuple(range(1, context.ndim))
-        offset = context.mean(dim=dims, keepdim=True)
+        offset = context.mean(dim=dims, keepdim=True).contiguous()
         return Payload(
             tokens=tokens,
             context=context,
