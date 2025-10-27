@@ -21,6 +21,7 @@ from typing import (
 
 import torch
 import torch.distributed
+import torch.nn as nn
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -49,6 +50,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..utils.dtypes import to_torch
+from ..utils.debug import is_fake_tensor
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
 from ..utils.optimization import (
@@ -106,52 +108,165 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
 def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
     hits: list[str] = []
     for name, param in module.named_parameters(recurse=True):
-        if getattr(param, "is_meta", False):
+        if (
+            getattr(param, "is_meta", False)
+            or is_fake_tensor(param)
+        ):
             hits.append(f"param {name} shape={tuple(param.shape)}")
     for name, buffer in module.named_buffers(recurse=True):
-        if getattr(buffer, "is_meta", False):
+        if (
+            getattr(buffer, "is_meta", False)
+            or is_fake_tensor(buffer)
+        ):
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
 def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
-    if os.environ.get("STNET_META_HOOK", "0") != "1":
+    hook_mode = os.environ.get("STNET_META_HOOK", "0").strip().lower()
+    if hook_mode in {"0", "", "false", "off"}:
         return
+
+    warn_only = hook_mode in {"warn", "warning"}
 
     def _pre(module: torch.nn.Module, inputs: Tuple[Any, ...]) -> None:
         for arg in inputs:
-            if isinstance(arg, torch.Tensor) and getattr(arg, "is_meta", False):
-                raise RuntimeError(
-                    f"[META] {module.__class__.__name__} got meta input"
-                )
+            if isinstance(arg, torch.Tensor) and (
+                getattr(arg, "is_meta", False) or is_fake_tensor(arg)
+            ):
+                message = f"[META] {module.__class__.__name__} got meta input"
+                if warn_only:
+                    warnings.warn(message, stacklevel=3)
+                    return
+                raise RuntimeError(message)
 
     for submodule in model.modules():
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
 
 
 def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -> None:
-    import torch.nn as nn
+    """Materialize LN γ/β if meta/fake and enforce CPU float32 parameters."""
 
-    target_dtype = torch.float32 if device.type == "cpu" else None
+    def _reset_parameter(
+        module: nn.LayerNorm,
+        name: str,
+        data: torch.Tensor,
+        *,
+        requires_grad: bool,
+    ) -> None:
+        setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
+
     for module in model.modules():
-        if isinstance(module, nn.LayerNorm):
-            if getattr(getattr(module, "weight", None), "is_meta", False):
-                module.weight = nn.Parameter(
-                    torch.ones(
-                        module.normalized_shape,
-                        device=device,
-                        dtype=target_dtype or torch.float32,
-                    )
+        if not isinstance(module, nn.LayerNorm):
+            continue
+
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        requires_grad_w = bool(getattr(weight, "requires_grad", True))
+        requires_grad_b = bool(getattr(bias, "requires_grad", True))
+
+        if device.type == "cpu":
+            target_dtype = torch.float32
+        else:
+            target_dtype = None
+            for tensor in (weight, bias):
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
+                    if not getattr(tensor, "is_meta", False) and not is_fake_tensor(tensor):
+                        target_dtype = tensor.dtype
+                        break
+            if target_dtype is None:
+                target_dtype = torch.get_default_dtype()
+
+        if module.elementwise_affine:
+            if (
+                not isinstance(weight, torch.Tensor)
+                or getattr(weight, "is_meta", False)
+                or is_fake_tensor(weight)
+            ):
+                data = torch.ones(
+                    module.normalized_shape, device=device, dtype=target_dtype
                 )
-            if getattr(getattr(module, "bias", None), "is_meta", False):
-                module.bias = nn.Parameter(
-                    torch.zeros(
-                        module.normalized_shape,
-                        device=device,
-                        dtype=target_dtype or torch.float32,
-                    )
+                _reset_parameter(module, "weight", data, requires_grad=requires_grad_w)
+                weight = module.weight
+            if (
+                not isinstance(bias, torch.Tensor)
+                or getattr(bias, "is_meta", False)
+                or is_fake_tensor(bias)
+            ):
+                data = torch.zeros(
+                    module.normalized_shape, device=device, dtype=target_dtype
                 )
+                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                bias = module.bias
+
+        if device.type == "cpu":
+            if isinstance(weight, torch.Tensor) and weight.dtype != torch.float32:
+                data = weight.to(device=device, dtype=torch.float32)
+                _reset_parameter(module, "weight", data, requires_grad=requires_grad_w)
+                weight = module.weight
+            if isinstance(bias, torch.Tensor) and bias.dtype != torch.float32:
+                data = bias.to(device=device, dtype=torch.float32)
+                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                bias = module.bias
+        else:
+            if (
+                isinstance(weight, torch.Tensor)
+                and isinstance(bias, torch.Tensor)
+                and weight.is_floating_point()
+                and bias.is_floating_point()
+                and bias.dtype != weight.dtype
+            ):
+                data = bias.to(device=device, dtype=weight.dtype)
+                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                bias = module.bias
+
+
+def _validate_layernorm_dtypes(model: torch.nn.Module, device: torch.device) -> None:
+    """Ensure LayerNorm γ/β tensors use consistent, device-appropriate dtypes."""
+
+    mismatches: list[str] = []
+    for name, module in model.named_modules():
+        if not isinstance(module, nn.LayerNorm):
+            continue
+
+        tensors = [
+            ("weight", getattr(module, "weight", None)),
+            ("bias", getattr(module, "bias", None)),
+        ]
+        expected: Optional[torch.dtype]
+        if device.type == "cpu":
+            expected = torch.float32
+        else:
+            expected = None
+
+        for label, tensor in tensors:
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
+                continue
+            if expected is None:
+                expected = tensor.dtype
+            elif tensor.dtype != expected:
+                module_name = name or module.__class__.__name__
+                mismatches.append(
+                    f"{module_name}.{label} has dtype {tensor.dtype} (expected {expected})"
+                )
+
+        if expected is not None and device.type != "cpu":
+            dtypes = {
+                tensor.dtype
+                for _, tensor in tensors
+                if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+            }
+            if len(dtypes) > 1:
+                module_name = name or module.__class__.__name__
+                mismatches.append(
+                    f"{module_name} parameters disagree on dtype: {sorted(dtypes)}"
+                )
+
+    if mismatches:
+        raise RuntimeError(
+            "LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches)
+        )
 
 
 def _prune_dcp_state_keys(state: Any) -> Any:
@@ -1016,6 +1131,7 @@ def main(*args: Any) -> Optional[Root]:
         _m_pre = model.module if hasattr(model, "module") else model
         # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
         _materialize_all_layernorms_(_m_pre, device)
+        _validate_layernorm_dtypes(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
 
         try:
@@ -1043,6 +1159,7 @@ def main(*args: Any) -> Optional[Root]:
             _ensure_dtensor(parameter)
 
         _m_post = model.module if hasattr(model, "module") else model
+        _validate_layernorm_dtypes(_m_post, device)
         _assert_no_meta_tensors(_m_post)
         _maybe_install_meta_pre_hook(_m_post)
 
@@ -1384,6 +1501,8 @@ def main(*args: Any) -> Optional[Root]:
         metadata = MetaData.for_device(device)
         model, _, _ = Module.use_te_module(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
+        _materialize_all_layernorms_(_m_eval, device)
+        _validate_layernorm_dtypes(_m_eval, device)
         _assert_no_meta_tensors(_m_eval)
         _maybe_install_meta_pre_hook(_m_eval)
         _ensure_uniform_param_dtype(
