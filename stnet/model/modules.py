@@ -118,32 +118,51 @@ class PointTransformer(nn.Module):
             if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
 
-        # (1) 첫 호출 시 LayerNorm 파라미터가 meta면 즉시 실체화(materialize)
-        if not getattr(self, "_ln_materialized", False):
+        # (1) LayerNorm 파라미터가 meta/fake/DTensor면 즉시 실체화(materialize)
+        #     (FSDP 래핑 후에도 안전하게 다시 점검하도록 항상 수행; 오버헤드 경미)
+        def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
+            if not isinstance(ln, nn.LayerNorm):
+                return
+            dev = ref.device
+            target_dtype = torch.float32 if dev.type == "cpu" else ref.dtype
+            w = getattr(ln, "weight", None)
+            b = getattr(ln, "bias", None)
+            try:
+                from torch.distributed._tensor import DTensor as _DTensor
+            except Exception:  # pragma: no cover - DTensor optional
+                dtensor_types: Tuple[type, ...] = tuple()
+            else:
+                dtensor_types = (_DTensor,)
+            w_data = getattr(w, "data", None)
+            if (
+                isinstance(w, torch.Tensor)
+                and (
+                    getattr(w, "is_meta", False)
+                    or is_fake_tensor(w)
+                    or isinstance(w, dtensor_types)
+                    or isinstance(w_data, dtensor_types)
+                )
+            ):
+                ln.weight = nn.Parameter(
+                    torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
+                )
+            b_data = getattr(b, "data", None)
+            if (
+                isinstance(b, torch.Tensor)
+                and (
+                    getattr(b, "is_meta", False)
+                    or is_fake_tensor(b)
+                    or isinstance(b, dtensor_types)
+                    or isinstance(b_data, dtensor_types)
+                )
+            ):
+                ln.bias = nn.Parameter(
+                    torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
+                )
 
-            def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
-                if not isinstance(ln, nn.LayerNorm):
-                    return
-                dev = ref.device
-                target_dtype = torch.float32 if dev.type == "cpu" else ref.dtype
-                w = getattr(ln, "weight", None)
-                b = getattr(ln, "bias", None)
-                if (isinstance(w, torch.Tensor) and (
-                    getattr(w, "is_meta", False) or is_fake_tensor(w)
-                )):
-                    ln.weight = nn.Parameter(
-                        torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
-                    )
-                if (isinstance(b, torch.Tensor) and (
-                    getattr(b, "is_meta", False) or is_fake_tensor(b)
-                )):
-                    ln.bias = nn.Parameter(
-                        torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
-                    )
-
-            _materialize_ln_(self.norm1, x)
-            _materialize_ln_(self.norm2, x)
-            self._ln_materialized = True
+        _materialize_ln_(self.norm1, x)
+        _materialize_ln_(self.norm2, x)
+        self._ln_materialized = True
 
         # (2) CPU/eager safety: LN 전/후 meta 가드 + CPU는 fp32 강제
         _x = x
