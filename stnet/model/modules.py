@@ -111,9 +111,39 @@ class PointTransformer(nn.Module):
         coords = coords.contiguous()
         if attn_mask is not None:
             attn_mask = attn_mask.contiguous()
-        y = self.attn(self.norm1(x), coords, attn_mask=attn_mask)
+            if getattr(attn_mask, "is_meta", False):
+                raise RuntimeError("attn_mask is meta before attention")
+        # --- CPU/eager safety: avoid LN on non-fp32 & guard meta tensors ---
+        _x = x
+        if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
+            raise RuntimeError("x is meta before LayerNorm")
+        if _x.device.type == "cpu" and _x.dtype in (torch.bfloat16, torch.float16):
+            _x = _x.float()
+        _x = self.norm1(_x)
+        if isinstance(_x, torch.Tensor) and getattr(_x, "is_meta", False):
+            raise RuntimeError("x is meta after LayerNorm")
+        if _x.device.type == "cpu" and x.dtype in (torch.bfloat16, torch.float16):
+            _x = _x.to(x.dtype)
+        y = self.attn(_x, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
-        x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
+
+        _x2 = x
+        if getattr(_x2, "is_meta", False):
+            raise RuntimeError("x is meta before LayerNorm(norm2)")
+        if _x2.device.type == "cpu" and _x2.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            _x2 = _x2.float()
+        _x2 = self.norm2(_x2)
+        if getattr(_x2, "is_meta", False):
+            raise RuntimeError("x is meta after LayerNorm(norm2)")
+        if _x2.device.type == "cpu" and x.dtype in (
+            torch.bfloat16,
+            torch.float16,
+        ):
+            _x2 = _x2.to(x.dtype)
+        x = x + self.drop_path(self.dropout(self.ffn(_x2)))
         return x
 
 

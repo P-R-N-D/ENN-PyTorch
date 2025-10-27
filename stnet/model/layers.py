@@ -44,7 +44,8 @@ elif not hasattr(torch.compiler, "disable"):
     torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
 
 
-LayerNorm = torch.compiler.disable(nn.LayerNorm, recursive=True)  # type: ignore[attr-defined]
+# rollback: use vanilla LayerNorm in eager/CPU runs
+LayerNorm = nn.LayerNorm
 
 
 def _disable_torch_compile(fn=None, *, recursive: bool = False):

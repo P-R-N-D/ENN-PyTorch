@@ -102,6 +102,34 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
     warnings.warn(text)
 
 
+# --- meta tensor diagnostics (no-op unless env toggles are set) ---
+def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
+    hits: list[str] = []
+    for name, param in module.named_parameters(recurse=True):
+        if getattr(param, "is_meta", False):
+            hits.append(f"param {name} shape={tuple(param.shape)}")
+    for name, buffer in module.named_buffers(recurse=True):
+        if getattr(buffer, "is_meta", False):
+            hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
+    if hits:
+        raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
+
+
+def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
+    if os.environ.get("STNET_META_HOOK", "0") != "1":
+        return
+
+    def _pre(module: torch.nn.Module, inputs: Tuple[Any, ...]) -> None:
+        for arg in inputs:
+            if isinstance(arg, torch.Tensor) and getattr(arg, "is_meta", False):
+                raise RuntimeError(
+                    f"[META] {module.__class__.__name__} got meta input"
+                )
+
+    for submodule in model.modules():
+        submodule.register_forward_pre_hook(_pre, with_kwargs=False)
+
+
 def _prune_dcp_state_keys(state: Any) -> Any:
     try:
         keys = []
@@ -683,8 +711,12 @@ def main(*args: Any) -> Optional[Root]:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
     System.initialize_python_path()
-    os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
-    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    # NOTE: avoid mutating CUDA environment variables at runtime; set them before launch.
+
+    if os.environ.get("STNET_DISABLE_MKLDNN", "0") == "1":
+        mkldnn_backend = getattr(getattr(torch, "backends", None), "mkldnn", None)
+        if mkldnn_backend is not None:
+            mkldnn_backend.enabled = False
 
     ret_sink: Optional[Dict[Any, Any]] = None
     if len(args) == 1 and isinstance(args[0], RuntimeConfig):
@@ -980,6 +1012,10 @@ def main(*args: Any) -> Optional[Root]:
 
         for parameter in model.parameters():
             _ensure_dtensor(parameter)
+
+        _m = model.module if hasattr(model, "module") else model
+        _assert_no_meta_tensors(_m)
+        _maybe_install_meta_pre_hook(_m)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
@@ -1318,6 +1354,9 @@ def main(*args: Any) -> Optional[Root]:
         model.to(device, non_blocking=True).eval()
         metadata = MetaData.for_device(device)
         model, _, _ = Module.use_te_module(model, device=device)
+        _m = model.module if hasattr(model, "module") else model
+        _assert_no_meta_tensors(_m)
+        _maybe_install_meta_pre_hook(_m)
         _ensure_uniform_param_dtype(
             model,
             prefer=(
