@@ -12,6 +12,46 @@ from typing import Any, Iterable, Iterator, Sequence
 import torch
 from torch import nn
 
+
+try:
+    # Prefer torch.compiler.disable (PyTorch ≥2.5)
+    _torch_compile_disable = torch.compiler.disable  # type: ignore[attr-defined]
+except Exception:
+    try:
+        # Fallback for PyTorch 2.0–2.4
+        import torch._dynamo as _dynamo  # type: ignore
+
+        _torch_compile_disable = _dynamo.disable  # type: ignore[attr-defined]
+    except Exception:
+
+        def _torch_compile_disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+            if fn is None:
+                return lambda real_fn: real_fn
+            return fn
+
+
+if not hasattr(torch, "compiler"):
+    class _TorchCompilerNamespace:
+        @staticmethod
+        def disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+            return _torch_compile_disable(fn, recursive=recursive)
+
+
+    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
+elif not hasattr(torch.compiler, "disable"):
+
+    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+        return _torch_compile_disable(fn, recursive=recursive)
+
+
+    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
+
+
+if hasattr(nn, "RMSNorm"):
+    RMSNorm = torch.compiler.disable(nn.RMSNorm, recursive=True)  # type: ignore[attr-defined]
+else:
+    RMSNorm = None  # type: ignore[assignment]
+
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except Exception:
@@ -136,7 +176,10 @@ class TorchCompat:
         self._ensure_nansum()
 
     def _ensure_rmsnorm(self) -> None:
+        global RMSNorm
         if hasattr(self.nn_module, "RMSNorm"):
+            if RMSNorm is None:
+                RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)  # type: ignore[attr-defined]
             return
         torch_mod = self.module
         nn_mod = self.nn_module
@@ -154,6 +197,7 @@ class TorchCompat:
                 return x * inv_rms * self.weight
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
+        RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)  # type: ignore[attr-defined]
 
     def _ensure_fmin(self) -> None:
         if hasattr(self.module, "fmin"):

@@ -27,6 +27,26 @@ except Exception:
             return fn
 
 
+if not hasattr(torch, "compiler"):
+    class _TorchCompilerNamespace:
+        @staticmethod
+        def disable(fn=None, *, recursive=False):  # type: ignore
+            return _torch_compile_disable(fn, recursive=recursive)
+
+
+    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
+elif not hasattr(torch.compiler, "disable"):
+
+    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore
+        return _torch_compile_disable(fn, recursive=recursive)
+
+
+    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
+
+
+LayerNorm = torch.compiler.disable(nn.LayerNorm, recursive=True)  # type: ignore[attr-defined]
+
+
 def _disable_torch_compile(fn=None, *, recursive: bool = False):
     if fn is None:
         return lambda real_fn: _disable_torch_compile(real_fn, recursive=recursive)
@@ -36,52 +56,11 @@ def _disable_torch_compile(fn=None, *, recursive: bool = False):
         return _torch_compile_disable(fn)
 
 
-try:
-    from torch._dynamo import graph_break as _graph_break  # type: ignore
-except Exception:
-
-    def _graph_break() -> None:  # type: ignore
-        return None
-
-
 def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
     forward = getattr(module, "forward", None)
     if callable(forward):
         module.forward = _disable_torch_compile(forward)  # type: ignore[assignment]
     return module
-
-
-class LayerNormFallback(nn.LayerNorm):
-    """LayerNorm module that always executes in eager mode."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-
-        forward = self.forward
-        try:
-            import torch.compiler as _compiler  # type: ignore[attr-defined]
-
-            try:
-                self.forward = _compiler.disable(fn=forward, recursive=True)  # type: ignore[assignment]
-            except TypeError:
-                self.forward = _compiler.disable(fn=forward)  # type: ignore[assignment]
-            return
-        except (ImportError, AttributeError):
-            pass
-
-        try:
-            import torch._dynamo as _dynamo  # type: ignore[import]
-
-            try:
-                self.forward = _dynamo.disable(fn=forward, recursive=True)  # type: ignore[assignment]
-            except TypeError:
-                self.forward = _dynamo.disable(fn=forward)  # type: ignore[assignment]
-        except (ImportError, AttributeError):
-            pass
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
-        _graph_break()
-        return super().forward(x)
 
 
 class StochasticDepth(nn.Module):
@@ -109,12 +88,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return LayerNormFallback(d_model)
+        return _disable_module_torch_compile(LayerNorm(d_model))
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
         return _disable_module_torch_compile(nn.RMSNorm(d_model))  # type: ignore[misc]
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
         return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
-    return LayerNormFallback(d_model)
+    return _disable_module_torch_compile(LayerNorm(d_model))
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
