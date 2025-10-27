@@ -1209,22 +1209,59 @@ def main(*args: Any) -> Optional[Root]:
         def _prime_adam_like_state(optim: torch.optim.Optimizer) -> None:
             """Eagerly initialize Adam/AdamW optimizer state to avoid lazy step()."""
 
+            def _as_step_tensor(
+                value: Any,
+                *,
+                param: torch.Tensor,
+                capturable: bool,
+                fused: bool,
+            ) -> torch.Tensor:
+                desired_device = (
+                    param.device if (capturable or fused) else torch.device("cpu")
+                )
+                desired_dtype = (
+                    param.dtype if torch.is_floating_point(param) else torch.float32
+                )
+                if isinstance(value, torch.Tensor):
+                    step_tensor = value.detach()
+                    if step_tensor.ndim != 0:
+                        step_tensor = step_tensor.reshape(())
+                    if step_tensor.device != desired_device:
+                        step_tensor = step_tensor.to(desired_device)
+                    if step_tensor.dtype != desired_dtype:
+                        step_tensor = step_tensor.to(desired_dtype)
+                else:
+                    base = float(value) if value is not None else 0.0
+                    step_tensor = torch.tensor(
+                        base,
+                        dtype=desired_dtype,
+                        device=desired_device,
+                    )
+                return step_tensor
+
             for group in optim.param_groups:
                 amsgrad = group.get("amsgrad", False)
-                for param in group["params"]:
+                capturable = bool(group.get("capturable", False))
+                fused = bool(group.get("fused", False))
+                for param in group.get("params", []):
                     if not getattr(param, "requires_grad", False):
                         continue
 
                     state = optim.state.get(param)
-                    if state and {"exp_avg", "exp_avg_sq"}.issubset(state):
-                        continue
-
                     state = {} if state is None else state
-                    state.setdefault("step", 0)
-                    state.setdefault("exp_avg", torch.zeros_like(param))
-                    state.setdefault("exp_avg_sq", torch.zeros_like(param))
-                    if amsgrad:
-                        state.setdefault("max_exp_avg_sq", torch.zeros_like(param))
+                    step_value = state.get("step")
+                    state["step"] = _as_step_tensor(
+                        step_value,
+                        param=param,
+                        capturable=capturable,
+                        fused=fused,
+                    )
+                    if "exp_avg" not in state:
+                        state["exp_avg"] = torch.zeros_like(param)
+                    if "exp_avg_sq" not in state:
+                        state["exp_avg_sq"] = torch.zeros_like(param)
+                    if amsgrad and "max_exp_avg_sq" not in state:
+                        state["max_exp_avg_sq"] = torch.zeros_like(param)
                     optim.state[param] = state
 
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
@@ -1253,6 +1290,7 @@ def main(*args: Any) -> Optional[Root]:
                         optim_sd,
                         options=StateDictOptions(strict=False),
                     )
+                    _prime_adam_like_state(optimizer)
         _t = StudentsTLoss(
             confidence=0.99,
             metric="t_value",
