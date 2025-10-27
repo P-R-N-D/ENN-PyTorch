@@ -143,21 +143,6 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
 
     for submodule in model.modules():
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
-
-
-def _collect_layernorm_params(root: nn.Module) -> set[nn.Parameter]:
-    params: set[nn.Parameter] = set()
-    for module in root.modules():
-        if isinstance(module, nn.LayerNorm):
-            weight = getattr(module, "weight", None)
-            bias = getattr(module, "bias", None)
-            if isinstance(weight, nn.Parameter):
-                params.add(weight)
-            if isinstance(bias, nn.Parameter):
-                params.add(bias)
-    return params
-
-
 def _assert_no_fake_dtensor_in_ln(root: nn.Module) -> None:
     try:
         from torch.distributed._tensor import DTensor as _DTensor
@@ -1026,11 +1011,10 @@ def main(*args: Any) -> Optional[Root]:
             output_dtype=None,
             cast_forward_inputs=False,
         )
+        # NOTE: FSDP2에서는 LayerNorm 계열 파라미터도 표준 fully_shard 경로를 타게
+        # 하여 랭크 간 일관성을 유지한다.
         ignored_params: List[torch.nn.Parameter] = []
         for module in model.modules():
-            if isinstance(module, (torch.nn.LayerNorm, torch.nn.RMSNorm)):
-                for p in module.parameters(recurse=False):
-                    ignored_params.append(p)
             for name in ("alpha_t", "alpha_s", "gem_p", "cls_query", "cls"):
                 if hasattr(module, name):
                     p = getattr(module, name)
@@ -1057,18 +1041,16 @@ def main(*args: Any) -> Optional[Root]:
                 )
 
         ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
-        ln_ignored_registry = _IdentityParamSet(())
-        ln_param_ids: set[int] = set()
 
         def _per_module_ignored_params(
             module: torch.nn.Module,
         ) -> Optional[_IdentityParamSet]:
-            if len(ignored_param_registry) == 0 and not ln_param_ids:
+            if len(ignored_param_registry) == 0:
                 return None
             params = [
                 param
                 for param in module.parameters(recurse=True)
-                if param in ignored_param_registry or id(param) in ln_param_ids
+                if param in ignored_param_registry
             ]
             return _IdentityParamSet(tuple(params)) if params else None
 
@@ -1144,38 +1126,18 @@ def main(*args: Any) -> Optional[Root]:
 
         def _fsdp_wrap(
             target: Optional[torch.nn.Module],
-            *,
-            use_orig_params: bool = False,
-            ignored_params: Optional[Sequence[torch.nn.Parameter]] = None,
         ) -> Optional[torch.nn.Module]:
             nonlocal model
             if target is None or id(target) in wrapped:
                 return target
             wrapped.add(id(target))
             per_mod_ignored = _per_module_ignored_params(target)
-            combined_ignored: List[torch.nn.Parameter] = []
-            seen_ids: set[int] = set()
-            if per_mod_ignored is not None:
-                for param in per_mod_ignored:
-                    pid = id(param)
-                    if pid not in seen_ids:
-                        seen_ids.add(pid)
-                        combined_ignored.append(param)
-            if ignored_params is not None:
-                module_param_ids = {id(p) for p in target.parameters(recurse=True)}
-                for param in ignored_params:
-                    pid = id(param)
-                    if pid in seen_ids or pid not in module_param_ids:
-                        continue
-                    seen_ids.add(pid)
-                    combined_ignored.append(param)
             sharded = fully_shard(
                 target,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=False,
-                use_orig_params=use_orig_params,
-                ignored_params=combined_ignored or None,
+                ignored_params=per_mod_ignored or None,
             )
             sharded.set_requires_gradient_sync(True)
             if target is model:
@@ -1199,51 +1161,26 @@ def main(*args: Any) -> Optional[Root]:
             return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
-        ln_ignored_registry = _IdentityParamSet(())
-        ln_param_ids: set[int] = set()
         # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
         _materialize_all_layernorms_(_m_pre, device)
         _validate_layernorm_dtypes(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
         _assert_no_fake_dtensor_in_ln(_m_pre)
 
-        ln_ignored_params = _collect_layernorm_params(_m_pre)
-        if ln_ignored_params:
-            ln_ignored_registry = _IdentityParamSet(tuple(ln_ignored_params))
-            ln_param_ids = {id(param) for param in ln_ignored_params}
-
         try:
             for submodule in _collect_block_modules(
                 getattr(model, "local_net", None)
             ) + _collect_block_modules(getattr(model, "global_net", None)):
-                _fsdp_wrap(
-                    submodule,
-                    use_orig_params=True,
-                    ignored_params=ln_ignored_registry if len(ln_ignored_registry) > 0 else None,
-                )
-            _fsdp_wrap(
-                model,
-                use_orig_params=True,
-                ignored_params=ln_ignored_registry if len(ln_ignored_registry) > 0 else None,
-            )
+                _fsdp_wrap(submodule)
+            _fsdp_wrap(model)
         except (RuntimeError, ValueError, TypeError):
-            combined_fallback: List[torch.nn.Parameter] = []
-            seen_ids: set[int] = set()
-            for collection in (ignored_param_registry, ln_ignored_registry):
-                if collection is None:
-                    continue
-                for param in collection:
-                    pid = id(param)
-                    if pid in seen_ids:
-                        continue
-                    seen_ids.add(pid)
-                    combined_fallback.append(param)
             model = fully_shard(
                 model,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                use_orig_params=True,
-                ignored_params=combined_fallback or None,
+                ignored_params=(
+                    ignored_param_registry if len(ignored_param_registry) > 0 else None
+                ),
                 reshard_after_forward=False,
             )
             model.set_requires_gradient_sync(True)
