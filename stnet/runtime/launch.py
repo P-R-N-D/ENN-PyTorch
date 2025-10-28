@@ -89,7 +89,6 @@ def train(
     else:
         cfg_model = ModelConfig()
     cfg_dict: Dict[str, Any] = asdict(cfg_model)
-    from torch.distributed.launcher.api import Redirects, Tee 
     lc = LaunchConfig(
         min_nodes=1,
         max_nodes=max_nodes,
@@ -102,8 +101,6 @@ def train(
         start_method='spawn',
         #start_method=System.optimal_start_method(),
         log_dir=os.environ.get("STF_ELASTIC_LOGDIR"),
-        redirects=Redirects.FILE, 
-        tee=Tee.STDOUT, 
         local_addr=master_addr,
     )
     base = dict(
