@@ -792,6 +792,8 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
             return True
     return False
+
+
 ############################################
 # TE-friendly mask helpers (addend = -inf) #
 ############################################
@@ -859,10 +861,32 @@ def _expand_bool_mask_to_bhss(
 def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """Return -inf scalar; non-floating dtype은 float32로 승격."""
 
-    # 간결/안전: dtype이 부동이 아니면 float32로 승격하여 -inf 생성
     if not torch.is_floating_point(torch.empty((), dtype=dtype)):
         dtype = torch.float32
     return torch.tensor(float("-inf"), dtype=dtype, device=device)
+
+
+def _te_supported_on_device() -> bool:
+    """Conservatively enable TE fused MHA only on sufficiently new CUDA devices."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        maj, minr = torch.cuda.get_device_capability()
+    except Exception:
+        return False
+    try:
+        min_cc = int(os.environ.get("STF_TE_MIN_CC", "80"))
+    except Exception:
+        min_cc = 80
+    if (maj * 10 + minr) < min_cc:
+        return False
+    try:
+        if torch._dynamo.is_compiling() and os.environ.get("STF_TE_ALLOW_INDUCTOR", "0") != "1":
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _adapt_mask_for_te(
@@ -2502,26 +2526,29 @@ class MultiHeadAttentionCompat(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
-    ):
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Call into PyTorch MHA, tolerating the optional is_causal kwarg."""
+
+        kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         try:
-            return self.mha(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                is_causal=is_causal,
-            )
+            if is_causal is not None:
+                return self.mha(
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    is_causal=is_causal,
+                    **kwargs,
+                )
         except TypeError:
-            return self.mha(
-                query,
-                key,
-                value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-            )
+            pass
+        return self.mha(
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            **kwargs,
+        )
 
 
 class MultiHeadAttentionNvidia(nn.Module):
@@ -2543,7 +2570,7 @@ class MultiHeadAttentionNvidia(nn.Module):
         super().__init__()
         self.batch_first = batch_first
         self.num_heads = int(num_heads)
-        # 미리 PT 폴백 준비 (런타임 안전)
+        # PT 폴백을 미리 준비 (런타임 안전)
         self._fallback = MultiHeadAttentionCompat(
             embed_dim,
             num_heads,
@@ -2556,13 +2583,15 @@ class MultiHeadAttentionNvidia(nn.Module):
         self._force_pt: bool = self._te_mha is None
         if self._force_pt:
             warnings.warn(
-                "Transformer Engine MHA 사용 불가. torch.nn.MultiheadAttention으로 폴백합니다.",
+                "Transformer Engine MHA 사용 불가: torch.nn.MultiheadAttention으로 폴백합니다.",
                 RuntimeWarning,
             )
 
     @staticmethod
     def _build_te_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
         if not _HAS_TE:
+            return None
+        if not _te_supported_on_device():
             return None
         candidates = []
         for name in ("MultiHeadAttention", "MultiheadAttention"):
@@ -2618,7 +2647,7 @@ class MultiHeadAttentionNvidia(nn.Module):
                 batch_first=self.batch_first,
             )
             if te_attn_mask is None:
-                # 변환 실패 → 이후에도 TE 시도하지 않도록 고정
+                # 변환 실패 → TE 재시도 금지하고 PT로 영구 폴백
                 self._force_pt = True
                 return self._fallback(  # type: ignore[operator]
                     query,
@@ -2654,7 +2683,7 @@ class MultiHeadAttentionNvidia(nn.Module):
                     y, w = out[0], (out[1] if need_weights and len(out) > 1 else None)
                 else:
                     y, w = out, None  # type: ignore[assignment]
-                # TE는 [B,S,D] 반환 가정 — batch_first=False면 [S,B,D]로 복원
+                # TE는 [B,S,D]를 반환한다고 가정, 필요시 복원
                 if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
                     y = y.transpose(0, 1)
                 return y, w
