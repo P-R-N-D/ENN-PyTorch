@@ -640,7 +640,6 @@ def epoch(
     torch.Tensor,
     Dict[str, float],
 ]:
-    log_error()
     if train_loader is None:
         raise RuntimeError("epoch requires a training dataloader")
     in_dim = int(ops.in_dim)
@@ -966,6 +965,7 @@ def epoch(
 
 
 def main(*args: Any) -> Optional[Root]:
+    log_error()
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
