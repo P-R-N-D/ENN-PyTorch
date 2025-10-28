@@ -32,7 +32,7 @@ The core runtime depends on:
 - `tensordict>=0.10.0`
 - `numpy>=1.24`
 - `netifaces>=0.11`
-- `pyarrow[all]>=20`
+- `pyarrow[all]>=20.0`
 - `tqdm>=4.66`
 
 Optional extras listed in `pyproject.toml` cover exporter stacks (`servable`), advanced optimization toolchains (`optimization`),
