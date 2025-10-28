@@ -43,6 +43,11 @@ from .layers import (
     schedule_stochastic_depth,
 )
 
+try:
+    from stnet.utils.profiler import FLOP_PROFILER  # noqa: F401
+except Exception:
+    FLOP_PROFILER = None  # noqa: N816
+
 patch_torch()
 if TYPE_CHECKING:
     from .config import ModelConfig
@@ -445,6 +450,17 @@ class LongNet(nn.Module):
         batch_first: bool = True,
     ) -> None:
         super().__init__()
+        self.nhead = int(num_heads)
+        self.head_dim = int(embed_dim // max(self.nhead, 1))
+        self.dropout_p = float(dropout)
+        self.__stf_attention_profile__ = {
+            "format": "xs",
+            "num_heads": self.nhead,
+            "head_dim": self.head_dim,
+            "dropout_attr": "dropout_p",
+            "effective_window_attr": ["window_size", "block_size"],
+            "include_softmax_scale_dropout": True,
+        }
         self.batch_first = batch_first
         self._impl: Optional[nn.Module] = None
         try:
