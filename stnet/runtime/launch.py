@@ -101,11 +101,11 @@ def train(
         start_method=System.optimal_start_method(),
         local_addr=master_addr,
     )
-#Debug Start
-import os, warnings, tempfile, multiprocessing as mp, contextlib, signal, faulthandler
-try:
-    from torch.distributed.elastic.multiprocessing.api import LogsSpecs
-except Exception:
+    #Debug Start
+    import os, warnings, tempfile, multiprocessing as mp, contextlib, signal, faulthandler
+    try:
+        from torch.distributed.elastic.multiprocessing.api import LogsSpecs
+    except Exception:
     LogsSpecs = None
     log_dir = os.environ.get("STF_ELASTIC_LOGDIR") or tempfile.mkdtemp(prefix="torchelastic_")
     os.environ["STF_ELASTIC_LOGDIR"] = log_dir
@@ -143,7 +143,7 @@ except Exception:
         event_log_handler="file",                            # 이벤트 로그 파일 핸들러
     )
     print(f"[launch] logs @ {log_dir}")
-#Debug End
+    #Debug End
     base = dict(
         memmap_dir=memmap_dir,
         ckpt_dir=ckpt_dir,
