@@ -1402,37 +1402,48 @@ class DotProductAttention(nn.Module):
             "is_causal": bool(is_causal),
         }
         # SDPA는 [B,H,S,D] 기대 → 여기서 변환
-        q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
-        k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
-        v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
+        q_bhsd = q_bshd.contiguous()
+        k_bhsd = k_bshd.contiguous()
+        v_bhsd = v_bshd.contiguous()
 
-        S_q = q_bhsd.shape[1]
-        S_k = k_bhsd.shape[1]
+        # --- 마스크 정규화: 버전 독립적으로 [B,L,S] (또는 [L,S])로 통일 ---
+        B, H, S_q, _ = q_bhsd.shape
+        S_k = k_bhsd.shape[2]
         fm = sdpa_kwargs["attn_mask"]
         if fm is not None:
-            # 디바이스/ dtype 정합성 (bool은 디바이스만, float은 dtype까지 맞춤)
+            # 디바이스/ dtype 정합성
             if fm.dtype is torch.bool:
                 fm = fm.to(device=q_bhsd.device, non_blocking=True)
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
-            if fm.dim() == 2 and fm.shape == (S_q, S_k):
-                fm = fm.view(1, 1, S_q, S_k).expand(B, H, S_q, S_k)
-            elif fm.dim() == 3 and fm.shape == (B, S_q, S_k):
-                fm = fm.view(B, 1, S_q, S_k).expand(B, H, S_q, S_k)
-            elif fm.dim() == 4 and fm.shape[0] == B and fm.shape[2:] == (S_q, S_k):
+            # 허용되는 입력: [L,S], [B,L,S], [B,1,L,S], [B,H,L,S]
+            if fm.dim() == 2:
+                # [L,S] → 그대로 두면 H 차원으로 브로드캐스트됨
+                if fm.shape != (S_q, S_k):
+                    raise RuntimeError(f"attn_mask 2D shape {tuple(fm.shape)} != (L={S_q}, S={S_k})")
+            elif fm.dim() == 3:
+                # [B,L,S] → 그대로 사용
+                if fm.shape != (B, S_q, S_k):
+                    raise RuntimeError(f"attn_mask 3D shape {tuple(fm.shape)} != (B={B}, L={S_q}, S={S_k})")
+            elif fm.dim() == 4:
+                # [B,1,L,S] or [B,H,L,S] → [B,L,S]로 축소(헤드 차원 broadcast에 맡김)
+                if fm.shape[0] != B or fm.shape[2:] != (S_q, S_k):
+                    raise RuntimeError(f"attn_mask 4D shape {tuple(fm.shape)} not compatible with (B={B}, L={S_q}, S={S_k})")
                 if fm.shape[1] == 1:
-                    fm = fm.expand(B, H, S_q, S_k)
-                elif fm.shape[1] != H:
-                    raise RuntimeError(
-                        f"attn_mask head dim {fm.shape[1]} != H={H}"
-                    )
+                    fm = fm.view(B, S_q, S_k)
+                else:
+                    # float addend면 헤드 차원에서 '최대'(= 가장 강한 마스킹)로 축소
+                    if fm.dtype is torch.bool:
+                        fm = fm.any(dim=1)
+                    else:
+                        fm = fm.amax(dim=1)
             else:
-                raise RuntimeError(
-                    "attn_mask shape "
-                    f"{tuple(fm.shape)} not compatible with (B={B},H={H},S_q={S_q},S_k={S_k})"
-                )
-            sdpa_kwargs["attn_mask"] = fm.contiguous()
-            # 이미 명시적 마스크/바이어스가 있으면 is_causal은 중복 마스킹을 유발하므로 비활성화
+                raise RuntimeError(f"attn_mask rank {fm.dim()} not supported")
+            fm = fm.contiguous()
+            if fm.dim() == 3:
+                fm = fm.unsqueeze(1)
+            sdpa_kwargs["attn_mask"] = fm
+            # 명시적 마스크/바이어스가 있으면 is_causal은 중복 마스킹을 유발하므로 비활성화
             sdpa_kwargs["is_causal"] = False
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
