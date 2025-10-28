@@ -792,6 +792,156 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
             return True
     return False
+############################################
+# TE-friendly mask helpers (addend = -inf) #
+############################################
+
+
+def _canonical_lengths(
+    query: torch.Tensor, key: torch.Tensor, batch_first: bool
+) -> tuple[int, int, int]:
+    """Return (batch, seq_len_query, seq_len_key) derived from query/key shapes."""
+
+    if batch_first:
+        if query.dim() < 2 or key.dim() < 2:
+            raise ValueError("expected query/key tensors with at least 2 dims when batch_first=True")
+        batch = int(query.shape[0])
+        seq_q = int(query.shape[1])
+        seq_k = int(key.shape[1])
+    else:
+        if query.dim() < 2 or key.dim() < 2:
+            raise ValueError("expected query/key tensors with at least 2 dims when batch_first=False")
+        batch = int(query.shape[1])
+        seq_q = int(query.shape[0])
+        seq_k = int(key.shape[0])
+    return batch, seq_q, seq_k
+
+
+def _expand_bool_mask_to_bhss(
+    mask: torch.Tensor,
+    *,
+    batch: int,
+    heads: int,
+    seq_q: int,
+    seq_k: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Expand a boolean mask into [B, H, S_q, S_k] layout."""
+
+    if mask.dtype is not torch.bool:
+        raise TypeError("expected boolean mask")
+    if mask.dim() == 2:
+        if mask.shape != (seq_q, seq_k):
+            raise ValueError(f"mask shape {tuple(mask.shape)} incompatible with ({seq_q}, {seq_k})")
+        expanded = mask.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k)
+    elif mask.dim() == 3:
+        if mask.shape == (batch, seq_q, seq_k):
+            expanded = mask.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k)
+        else:
+            raise ValueError(f"unsupported 3D mask shape {tuple(mask.shape)}")
+    elif mask.dim() == 4:
+        b, h, sq, sk = mask.shape
+        if b != batch or sq != seq_q or sk != seq_k:
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+            )
+        if h == 1:
+            expanded = mask.expand(batch, heads, seq_q, seq_k)
+        elif h == heads:
+            expanded = mask
+        else:
+            raise ValueError(f"mask head dimension {h} does not match expected heads {heads}")
+    else:
+        raise ValueError(f"unsupported mask rank {mask.dim()}")
+    return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
+
+
+def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Return -inf scalar; non-floating dtype은 float32로 승격."""
+
+    # 간결/안전: dtype이 부동이 아니면 float32로 승격하여 -inf 생성
+    if not torch.is_floating_point(torch.empty((), dtype=dtype)):
+        dtype = torch.float32
+    return torch.tensor(float("-inf"), dtype=dtype, device=device)
+
+
+def _adapt_mask_for_te(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    attn_mask: Optional[torch.Tensor],
+    key_padding_mask: Optional[torch.Tensor],
+    *,
+    num_heads: int,
+    batch_first: bool,
+) -> Optional[torch.Tensor]:
+    """Convert attention masks to TE-friendly float addends."""
+
+    if attn_mask is None and key_padding_mask is None:
+        return None
+
+    batch, seq_q, seq_k = _canonical_lengths(query, key, batch_first)
+    device = query.device
+    dtype = query.dtype
+    heads = int(num_heads)
+    neg_inf = _te_addend(dtype, device)
+    mask_dtype = neg_inf.dtype
+    zero_scalar = torch.zeros((), dtype=mask_dtype, device=device)
+    float_mask: Optional[torch.Tensor] = None
+
+    try:
+        if attn_mask is not None:
+            if attn_mask.dtype is torch.bool:
+                expanded = _expand_bool_mask_to_bhss(
+                    attn_mask,
+                    batch=batch,
+                    heads=heads,
+                    seq_q=seq_q,
+                    seq_k=seq_k,
+                    device=device,
+                )
+                float_mask = torch.where(expanded, neg_inf, zero_scalar)
+            elif torch.is_floating_point(attn_mask):
+                am = attn_mask.to(device=device, dtype=mask_dtype, non_blocking=True)
+                if am.dim() == 2:
+                    if am.shape != (seq_q, seq_k):
+                        return None
+                    float_mask = am.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).clone()
+                elif am.dim() == 3:
+                    if am.shape != (batch, seq_q, seq_k):
+                        return None
+                    float_mask = am.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).clone()
+                elif am.dim() == 4:
+                    if am.shape[0] != batch or am.shape[2] != seq_q or am.shape[3] != seq_k:
+                        return None
+                    if am.shape[1] == 1:
+                        float_mask = am.expand(batch, heads, seq_q, seq_k).clone()
+                    elif am.shape[1] == heads:
+                        float_mask = am.clone()
+                    else:
+                        return None
+                else:
+                    return None
+            else:
+                return None
+
+        if key_padding_mask is not None:
+            if key_padding_mask.dtype is not torch.bool:
+                key_padding_mask = key_padding_mask.to(device=device, dtype=torch.bool, non_blocking=True)
+            else:
+                key_padding_mask = key_padding_mask.to(device=device, non_blocking=True)
+            if key_padding_mask.dim() != 2 or key_padding_mask.shape != (batch, seq_k):
+                return None
+            padding = key_padding_mask.view(batch, 1, 1, seq_k)
+            pad_values = torch.where(
+                padding.expand(batch, heads, seq_q, seq_k),
+                neg_inf,
+                zero_scalar,
+            )
+            float_mask = pad_values if float_mask is None else float_mask + pad_values
+
+        return float_mask.contiguous() if float_mask is not None else None
+    except Exception:
+        return None
 
 
 def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
@@ -2392,22 +2542,23 @@ class MultiHeadAttentionNvidia(nn.Module):
     ) -> None:
         super().__init__()
         self.batch_first = batch_first
+        self.num_heads = int(num_heads)
+        # 미리 PT 폴백 준비 (런타임 안전)
+        self._fallback = MultiHeadAttentionCompat(
+            embed_dim,
+            num_heads,
+            bias=bias,
+            dropout=dropout,
+            batch_first=batch_first,
+            **kwargs,
+        )
         self._te_mha = self._build_te_mha(embed_dim, num_heads, dropout, kwargs)
-        if self._te_mha is None:
+        self._force_pt: bool = self._te_mha is None
+        if self._force_pt:
             warnings.warn(
                 "Transformer Engine MHA 사용 불가. torch.nn.MultiheadAttention으로 폴백합니다.",
                 RuntimeWarning,
             )
-            self._fallback = MultiHeadAttentionCompat(
-                embed_dim,
-                num_heads,
-                bias=bias,
-                dropout=dropout,
-                batch_first=batch_first,
-                **kwargs,
-            )
-        else:
-            self._fallback = None
 
     @staticmethod
     def _build_te_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
@@ -2446,7 +2597,7 @@ class MultiHeadAttentionNvidia(nn.Module):
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
     ):
-        if self._te_mha is None:
+        if self._force_pt or (self._te_mha is None):
             return self._fallback(  # type: ignore[operator]
                 query,
                 key,
@@ -2456,27 +2607,63 @@ class MultiHeadAttentionNvidia(nn.Module):
                 need_weights=need_weights,
                 is_causal=is_causal,
             )
+        te_attn_mask = attn_mask
+        if attn_mask is not None or key_padding_mask is not None:
+            te_attn_mask = _adapt_mask_for_te(
+                query,
+                key,
+                attn_mask,
+                key_padding_mask,
+                num_heads=self.num_heads,
+                batch_first=self.batch_first,
+            )
+            if te_attn_mask is None:
+                # 변환 실패 → 이후에도 TE 시도하지 않도록 고정
+                self._force_pt = True
+                return self._fallback(  # type: ignore[operator]
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    is_causal=is_causal,
+                )
+        # ===== batch_first=False 처리: TE는 [B,S,D] 경로를 선호하므로 재정렬 =====
+        bf = bool(self.batch_first)
+        _q, _k, _v = query, key, value
+        if not bf:
+            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+        # ======================================================================
         for variant in (
             dict(
-                query=query,
-                key=key,
-                value=value,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
+                query=_q,
+                key=_k,
+                value=_v,
+                attn_mask=te_attn_mask,
                 need_weights=need_weights,
                 is_causal=is_causal,
             ),
-            dict(query=query, attn_mask=attn_mask, need_weights=need_weights),
+            dict(query=_q, attn_mask=te_attn_mask, need_weights=need_weights),
+            # 일부 TE 구현은 'attention_mask' 이름을 받음
+            dict(query=_q, key=_k, value=_v, attention_mask=te_attn_mask, need_weights=need_weights),
         ):
             try:
                 out = self._te_mha(**variant)
                 if isinstance(out, tuple) and len(out) >= 1:
-                    return out[0], (out[1] if need_weights and len(out) > 1 else None)
-                return out, None  # type: ignore[return-value]
+                    y, w = out[0], (out[1] if need_weights and len(out) > 1 else None)
+                else:
+                    y, w = out, None  # type: ignore[assignment]
+                # TE는 [B,S,D] 반환 가정 — batch_first=False면 [S,B,D]로 복원
+                if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
+                    y = y.transpose(0, 1)
+                return y, w
             except TypeError:
                 continue
             except Exception:
                 continue
+        # TE가 모든 시도를 거부 → PT로 고정 전환 후 폴백
+        self._force_pt = True
         return self._fallback(  # type: ignore[operator]
             query,
             key,
@@ -2551,6 +2738,15 @@ class MultiHeadAttention(nn.Module):
                 **kwargs,
             )
             self._backend = "torch"
+        if isinstance(self.impl, MultiHeadAttentionNvidia):
+            self.impl._fallback = MultiHeadAttentionCompat(
+                embed_dim,
+                num_heads,
+                bias=bias,
+                dropout=dropout,
+                batch_first=batch_first,
+                **kwargs,
+            )
 
     @property
     def backend(self) -> str:
