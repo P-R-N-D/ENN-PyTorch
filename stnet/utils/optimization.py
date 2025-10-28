@@ -1108,12 +1108,14 @@ class DotProductAttention(nn.Module):
         cfg = get_runtime_config()
         self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
         ok, te = self._is_te_available()
-        self._te_ok = (
+        self._te_ok = bool(
             ok
             and torch.cuda.is_available()
+            and _te_supported_on_device()
             and (self.nh is not None)
             and (self.hd is not None)
         )
+        self._force_pt: bool = False
         self._te_attn: Any = None
         self._te_forward_signature: inspect.Signature | None = None
         self._te_mask_param: str | None = None
@@ -1129,38 +1131,60 @@ class DotProductAttention(nn.Module):
         self._te_supports_training = False
         if self._te_ok:
             self._te = te
-            self._te_attn = te.DotProductAttention(
-                num_attention_heads=self.nh,
-                kv_channels=self.hd,
-                qkv_format="bshd",
-                attention_dropout=0.0,
-            )
-            _forward = getattr(self._te_attn, "forward", getattr(self._te_attn, "__call__", None))
-            if _forward is not None:
-                try:
-                    self._te_forward_signature = inspect.signature(_forward)
-                except (TypeError, ValueError):
-                    self._te_forward_signature = None
-            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
-            if "attention_mask" in params:
-                self._te_mask_param = "attention_mask"
-            elif "attn_mask" in params:
-                self._te_mask_param = "attn_mask"
-            if "attn_mask_type" in params:
-                self._te_mask_type_param = "attn_mask_type"
-            elif "attention_mask_type" in params:
-                self._te_mask_type_param = "attention_mask_type"
-            if "core_attention_bias" in params:
-                self._te_core_bias_param = "core_attention_bias"
-            if "core_attention_bias_type" in params:
-                self._te_core_bias_type_param = "core_attention_bias_type"
-            self._te_supports_mask = self._te_mask_param is not None
-            self._te_supports_mask_type = self._te_mask_type_param is not None
-            self._te_supports_core_bias = self._te_core_bias_param is not None
-            self._te_supports_core_bias_type = self._te_core_bias_type_param is not None
-            self._te_supports_attention_dropout = "attention_dropout" in params
-            self._te_supports_is_causal = "is_causal" in params
-            self._te_supports_training = "training" in params
+            try:
+                self._te_attn = te.DotProductAttention(
+                    num_attention_heads=self.nh,
+                    kv_channels=self.hd,
+                    qkv_format="bshd",
+                    attention_dropout=0.0,
+                )
+            except Exception:
+                # TE 초기화 실패 시 즉시 PyTorch 경로로 고정
+                self._te_attn = None
+                self._force_pt = True
+            if self._te_attn is not None:
+                _forward = getattr(
+                    self._te_attn,
+                    "forward",
+                    getattr(self._te_attn, "__call__", None),
+                )
+                if _forward is not None:
+                    try:
+                        self._te_forward_signature = inspect.signature(_forward)
+                    except (TypeError, ValueError):
+                        self._te_forward_signature = None
+                params = (
+                    self._te_forward_signature.parameters
+                    if self._te_forward_signature
+                    else {}
+                )
+                if "attention_mask" in params:
+                    self._te_mask_param = "attention_mask"
+                elif "attn_mask" in params:
+                    self._te_mask_param = "attn_mask"
+                if "attn_mask_type" in params:
+                    self._te_mask_type_param = "attn_mask_type"
+                elif "attention_mask_type" in params:
+                    self._te_mask_type_param = "attention_mask_type"
+                if "core_attention_bias" in params:
+                    self._te_core_bias_param = "core_attention_bias"
+                if "core_attention_bias_type" in params:
+                    self._te_core_bias_type_param = "core_attention_bias_type"
+                self._te_supports_mask = self._te_mask_param is not None
+                self._te_supports_mask_type = (
+                    self._te_mask_type_param is not None
+                )
+                self._te_supports_core_bias = (
+                    self._te_core_bias_param is not None
+                )
+                self._te_supports_core_bias_type = (
+                    self._te_core_bias_type_param is not None
+                )
+                self._te_supports_attention_dropout = (
+                    "attention_dropout" in params
+                )
+                self._te_supports_is_causal = "is_causal" in params
+                self._te_supports_training = "training" in params
 
     @staticmethod
     def _is_te_available() -> Any:
@@ -1271,31 +1295,44 @@ class DotProductAttention(nn.Module):
             if bias_float is not None:
                 bias_float = _to_bhls(bias_float).to(dtype=q_bshd.dtype)
 
+            # TE가 mask를 직접 지원하지 않지만 core bias는 지원하면 bool mask를 addend로 변환
             if (
                 mask_bool is not None
                 and bias_float is None
                 and self._te_ok
                 and self._te_attn is not None
+                and not self._te_supports_mask
+                and self._te_supports_core_bias
             ):
-                if (not self._te_supports_mask) and self._te_supports_core_bias:
-                    finfo = torch.finfo(q_bshd.dtype)
-                    bias_float = torch.where(
-                        mask_bool,
-                        torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device),
-                        torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device),
-                    ).expand_as(mask_bool)
-                    mask_bool = None
+                finfo = torch.finfo(q_bshd.dtype)
+                neg_inf = torch.full(
+                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                )
+                zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
+                bias_float = torch.where(mask_bool, neg_inf, zero).expand_as(mask_bool)
+                mask_bool = None
 
+        try:
+            is_compiling = bool(torch._dynamo.is_compiling())
+        except Exception:
+            is_compiling = False
+        supports_mask = (mask_bool is None) or self._te_supports_mask
+        supports_bias = (bias_float is None) or self._te_supports_core_bias
+        q_is_cuda = bool(q.is_cuda)
         use_te = (
             self.te_first
             and self._te_ok
+            and not self._force_pt
             and (self._te_attn is not None)
-            and (not kwargs)
+            and not is_compiling
+            and supports_mask
+            and supports_bias
+            and q_is_cuda
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and self.nh is not None
+            and self.hd is not None
+            and not kwargs
         )
-        if bias_float is not None and not self._te_supports_core_bias:
-            use_te = False
-        if mask_bool is not None and not self._te_supports_mask:
-            use_te = False
         if use_te:
             q_te = q_bshd.permute(0, 2, 1, 3).contiguous()
             k_te = k_bshd.permute(0, 2, 1, 3).contiguous()
@@ -1318,6 +1355,8 @@ class DotProductAttention(nn.Module):
             try:
                 out_te = self._te_attn(q_te, k_te, v_te, **te_kwargs)
             except Exception:
+                # TE 커널 예외 발생 시 이후부터는 PyTorch 경로만 사용
+                self._force_pt = True
                 use_te = False
             else:
                 return out_te.permute(0, 2, 1, 3).contiguous()
@@ -1340,9 +1379,10 @@ class DotProductAttention(nn.Module):
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
-        q_bhsd = q_bshd
-        k_bhsd = k_bshd
-        v_bhsd = v_bshd
+        # ✅ 명확히 다시 계산(typo 방지)
+        q_bhsd = q_bshd.view(B, H, L, D)
+        k_bhsd = k_bshd.view(B, H, S, D)
+        v_bhsd = v_bshd.view(B, H, S, D)
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
