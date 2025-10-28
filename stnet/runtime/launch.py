@@ -106,7 +106,7 @@ def train(
     try:
         from torch.distributed.elastic.multiprocessing.api import LogsSpecs
     except Exception:
-    LogsSpecs = None
+        LogsSpecs = None
     log_dir = os.environ.get("STF_ELASTIC_LOGDIR") or tempfile.mkdtemp(prefix="torchelastic_")
     os.environ["STF_ELASTIC_LOGDIR"] = log_dir
     os.makedirs(log_dir, exist_ok=True)
