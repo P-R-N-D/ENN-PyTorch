@@ -98,7 +98,8 @@ def train(
         run_id=run_id,
         max_restarts=0,
         monitor_interval=5,
-        start_method=System.optimal_start_method(),
+        start_method='spawn',
+        #start_method=System.optimal_start_method(),
         local_addr=master_addr,
     )
     base = dict(
