@@ -1432,11 +1432,11 @@ class DotProductAttention(nn.Module):
                 if fm.shape[1] == 1:
                     fm = fm.view(B, S_q, S_k)
                 else:
-                    # float addend면 헤드 차원에서 '최대'(= 가장 강한 마스킹)로 축소
+                    # float addend면 헤드 차원에서 가장 제한적인 값(최솟값)으로 축소
                     if fm.dtype is torch.bool:
                         fm = fm.any(dim=1)
                     else:
-                        fm = fm.amax(dim=1)
+                        fm = fm.amin(dim=1)
             else:
                 raise RuntimeError(f"attn_mask rank {fm.dim()} not supported")
             fm = fm.contiguous()
