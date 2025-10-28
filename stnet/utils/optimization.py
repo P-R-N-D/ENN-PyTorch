@@ -1406,8 +1406,8 @@ class DotProductAttention(nn.Module):
         k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
         v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
 
-        _, _, S_q, _ = q_bhsd.shape
-        S_k = k_bhsd.shape[2]
+        S_q = q_bhsd.shape[1]
+        S_k = k_bhsd.shape[1]
         fm = sdpa_kwargs["attn_mask"]
         if fm is not None:
             # 디바이스/ dtype 정합성 (bool은 디바이스만, float은 dtype까지 맞춤)
