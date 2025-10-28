@@ -869,17 +869,41 @@ def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 def _te_supported_on_device() -> bool:
     """Conservatively enable TE fused MHA only on sufficiently new CUDA devices."""
 
+    if os.environ.get("STF_DISABLE_TE", "") == "1":
+        return False
     if not torch.cuda.is_available():
         return False
     try:
-        maj, minr = torch.cuda.get_device_capability()
+        device = get_device()
     except Exception:
+        device = torch.device("cuda", 0)
+    if device.type != "cuda":
         return False
     try:
-        min_cc = int(os.environ.get("STF_TE_MIN_CC", "80"))
+        index = device.index if device.index is not None else torch.cuda.current_device()
     except Exception:
-        min_cc = 80
-    if (maj * 10 + minr) < min_cc:
+        index = 0
+    try:
+        props = torch.cuda.get_device_properties(index)
+        maj = int(getattr(props, "major", 0))
+        minr = int(getattr(props, "minor", 0))
+    except Exception:
+        try:
+            maj, minr = torch.cuda.get_device_capability(index)
+        except Exception:
+            return False
+    raw_cc = os.environ.get("STF_TE_MIN_CC", "")
+    min_major, min_minor = 8, 0
+    if raw_cc:
+        try:
+            parsed = int(raw_cc)
+        except Exception:
+            parsed = 80
+        if parsed < 10:
+            min_major, min_minor = parsed, 0
+        else:
+            min_major, min_minor = divmod(parsed, 10)
+    if maj < min_major or (maj == min_major and minr < min_minor):
         return False
     try:
         if torch._dynamo.is_compiling() and os.environ.get("STF_TE_ALLOW_INDUCTOR", "0") != "1":
@@ -1135,7 +1159,7 @@ class DotProductAttention(nn.Module):
                 self._te_attn = te.DotProductAttention(
                     num_attention_heads=self.nh,
                     kv_channels=self.hd,
-                    qkv_format="bshd",
+                    qkv_format="bshd",  # TE는 [B,S,H,D] 기대
                     attention_dropout=0.0,
                 )
             except Exception:
@@ -1295,7 +1319,7 @@ class DotProductAttention(nn.Module):
             if bias_float is not None:
                 bias_float = _to_bhls(bias_float).to(dtype=q_bshd.dtype)
 
-            # TE가 mask를 직접 지원하지 않지만 core bias는 지원하면 bool mask를 addend로 변환
+            # TE가 bool mask 미지원이고 core bias는 받는 경우: bool→bias(-inf/0)로 변환
             if (
                 mask_bool is not None
                 and bias_float is None
@@ -1316,27 +1340,24 @@ class DotProductAttention(nn.Module):
             is_compiling = bool(torch._dynamo.is_compiling())
         except Exception:
             is_compiling = False
-        supports_mask = (mask_bool is None) or self._te_supports_mask
-        supports_bias = (bias_float is None) or self._te_supports_core_bias
-        q_is_cuda = bool(q.is_cuda)
+        # 보수적 TE 게이트
         use_te = (
             self.te_first
             and self._te_ok
             and not self._force_pt
             and (self._te_attn is not None)
+            and (not kwargs)
             and not is_compiling
-            and supports_mask
-            and supports_bias
-            and q_is_cuda
-            and q.dtype in (torch.float16, torch.bfloat16)
-            and self.nh is not None
-            and self.hd is not None
-            and not kwargs
+            and q_bshd.is_cuda
+            and q_bshd.dtype in (torch.float16, torch.bfloat16)
+            and ((mask_bool is None) or self._te_supports_mask)
+            and ((bias_float is None) or self._te_supports_core_bias)
         )
         if use_te:
-            q_te = q_bshd.permute(0, 2, 1, 3).contiguous()
-            k_te = k_bshd.permute(0, 2, 1, 3).contiguous()
-            v_te = v_bshd.permute(0, 2, 1, 3).contiguous()
+            # qkv_format="bshd" → TE에는 [B,S,H,D] 형식으로 전달
+            q_te = q_bshd.transpose(1, 2).contiguous()
+            k_te = k_bshd.transpose(1, 2).contiguous()
+            v_te = v_bshd.transpose(1, 2).contiguous()
             te_kwargs: dict[str, Any] = {}
             if self._te_supports_attention_dropout:
                 te_kwargs["attention_dropout"] = dropout_val
@@ -1359,7 +1380,8 @@ class DotProductAttention(nn.Module):
                 self._force_pt = True
                 use_te = False
             else:
-                return out_te.permute(0, 2, 1, 3).contiguous()
+                # TE 반환도 [B,S,H,D] 가정 → 다시 [B,H,S,D]로 변환
+                return out_te.transpose(1, 2).contiguous()
         sdpa_bias: torch.Tensor | None = None
         if mask_bool is not None:
             finfo = torch.finfo(q_bshd.dtype)
@@ -1379,10 +1401,13 @@ class DotProductAttention(nn.Module):
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
-        # ✅ 명확히 다시 계산(typo 방지)
-        q_bhsd = q_bshd.view(B, H, L, D)
-        k_bhsd = k_bshd.view(B, H, S, D)
-        v_bhsd = v_bshd.view(B, H, S, D)
+        # 이미 final_mask/bias가 있으면 is_causal 중복을 피하는 게 안전
+        if final_mask is not None:
+            sdpa_kwargs["is_causal"] = False
+        # SDPA는 [B,H,S,D] 기대 → 여기서 변환
+        q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
+        k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
+        v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
@@ -2509,14 +2534,59 @@ def _import_callable(spec: str) -> Callable:
 # ======================================================================================
 # MultiHeadAttention: TE fused MHA 선호, 아니면 torch.nn.MultiheadAttention 폴백
 # ======================================================================================
-try:
-    # NVIDIA Transformer Engine (optional)
-    import transformer_engine.pytorch as te  # type: ignore
-
-    _HAS_TE = True
-except Exception:  # pragma: no cover
+_HAS_TE: bool
+if os.environ.get("STF_DISABLE_TE", "") == "1":
     te = None  # type: ignore
     _HAS_TE = False
+else:
+    _should_import_te = True
+    if not torch.cuda.is_available():
+        _should_import_te = False
+    else:
+        try:
+            device = get_device()
+        except Exception:
+            device = torch.device("cuda", 0)
+        if getattr(device, "type", "cpu") != "cuda":
+            _should_import_te = False
+        else:
+            try:
+                index = (
+                    device.index
+                    if device.index is not None
+                    else torch.cuda.current_device()
+                )
+            except Exception:
+                index = 0
+            try:
+                props = torch.cuda.get_device_properties(index)
+                major = int(getattr(props, "major", 0))
+            except Exception:
+                try:
+                    major, _ = torch.cuda.get_device_capability(index)
+                except Exception:
+                    major = 0
+            min_major_env = os.environ.get("STF_TE_MIN_CC", "")
+            try:
+                min_major = int(min_major_env) if min_major_env else 8
+            except Exception:
+                min_major = 8
+            if min_major >= 10:
+                min_major //= 10
+            if major < min_major:
+                _should_import_te = False
+    if _should_import_te:
+        try:
+            # NVIDIA Transformer Engine (optional)
+            import transformer_engine.pytorch as te  # type: ignore
+
+            _HAS_TE = True
+        except Exception:  # pragma: no cover
+            te = None  # type: ignore
+            _HAS_TE = False
+    else:
+        te = None  # type: ignore
+        _HAS_TE = False
 
 
 def _te_fused_mha_is_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
@@ -2526,6 +2596,8 @@ def _te_fused_mha_is_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
     """
 
     if not _HAS_TE:
+        return False
+    if not _te_supported_on_device():
         return False
     device = get_device()
     if device.type != "cuda" or not torch.cuda.is_available():
