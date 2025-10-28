@@ -32,8 +32,7 @@ The core runtime depends on:
 - `tensordict>=0.10.0`
 - `numpy>=1.24`
 - `netifaces>=0.11`
-- `pyarrow[flight]>=10`
-  - add `pyarrow[cuda]` (or install the `arrow_cuda` extra) when GPU-accelerated Arrow Flight is required
+- `pyarrow[all]>=20`
 - `tqdm>=4.66`
 
 Optional extras listed in `pyproject.toml` cover exporter stacks (`servable`), advanced optimization toolchains (`optimization`),
