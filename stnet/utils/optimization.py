@@ -1293,31 +1293,69 @@ class DotProductAttention(nn.Module):
             else:
                 mask_bool = m.to(torch.bool)
 
-            def _to_bhls(x: torch.Tensor | None) -> torch.Tensor | None:
+            def _flatten_mask_shape(
+                mask: torch.Tensor,
+            ) -> tuple[torch.Tensor, int, int]:
+                if mask.dim() == 0:
+                    shaped = mask.to(device=q_bshd.device).view(1, 1, 1, 1)
+                    shaped = shaped.expand(1, 1, L, S)
+                    return shaped.contiguous(), 1, 1
+                if mask.dim() < 2:
+                    raise RuntimeError(
+                        f"attn_mask rank {mask.dim()} not supported; expected at least 2 dimensions"
+                    )
+                if mask.shape[-2:] != (L, S):
+                    raise RuntimeError(
+                        "attn_mask trailing dims {} do not match expected (L={}, S={})".format(
+                            tuple(mask.shape[-2:]), L, S
+                        )
+                    )
+                mask = mask.to(device=q_bshd.device).contiguous()
+                while True:
+                    leading = mask.shape[:-2]
+                    if not leading:
+                        return mask.view(1, 1, L, S).contiguous(), 1, 1
+                    batch_dim = leading[0]
+                    if batch_dim in (B, 1):
+                        head_dims = leading[1:]
+                        break
+                    if batch_dim == H:
+                        mask = mask.unsqueeze(0)
+                        continue
+                    raise RuntimeError(
+                        f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
+                    )
+                head_dims = tuple(head_dims)
+                head_count = 1 if not head_dims else math.prod(head_dims)
+                mask = mask.view(batch_dim, head_count, L, S)
+                if head_count not in (1, H):
+                    raise RuntimeError(
+                        "attn_mask head dims {} collapse to {} which is not compatible with num_heads {}".format(
+                            head_dims, head_count, H
+                        )
+                    )
+                return mask.contiguous(), int(batch_dim), int(head_count)
+
+            def _to_bhls(
+                x: torch.Tensor | None, *, dtype: torch.dtype | None = None
+            ) -> torch.Tensor | None:
                 if x is None:
                     return None
-                x = x.to(device=q_bshd.device)
-                if x.dim() == 0:
-                    x = x.view(1, 1, 1, 1).expand(B, H, L, S)
-                elif x.dim() == 2 and x.shape == (L, S):
-                    x = x.view(1, 1, L, S).expand(B, H, L, S)
-                elif x.dim() == 3:
-                    if x.shape == (B, L, S):
-                        x = x.view(B, 1, L, S).expand(B, H, L, S)
-                    elif x.shape == (H, L, S):
-                        x = x.view(1, H, L, S).expand(B, H, L, S)
-                if x.dim() == 4 and list(x.shape) != [B, H, L, S]:
-                    x = x.expand(
-                        B if x.shape[0] in (1, B) else B,
-                        H if x.shape[1] in (1, H) else H,
-                        L if x.shape[2] in (1, L) else L,
-                        S if x.shape[3] in (1, S) else S,
-                    )
-                return x.contiguous()
+                mask, batch_dim, head_count = _flatten_mask_shape(x)
+                if batch_dim != B:
+                    mask = mask.expand(B, head_count, L, S)
+                    batch_dim = B
+                if head_count == 1:
+                    mask = mask.expand(batch_dim, H, L, S)
+                elif head_count == H and batch_dim != B:
+                    mask = mask.expand(B, head_count, L, S)
+                if dtype is not None and mask.dtype != dtype:
+                    mask = mask.to(dtype=dtype)
+                return mask.contiguous()
 
             mask_bool = _to_bhls(mask_bool)
             if bias_float is not None:
-                bias_float = _to_bhls(bias_float).to(dtype=q_bshd.dtype)
+                bias_float = _to_bhls(bias_float, dtype=q_bshd.dtype)
 
             # TE가 bool mask 미지원이고 core bias는 받는 경우: bool→bias(-inf/0)로 변환
             if (
@@ -1402,37 +1440,30 @@ class DotProductAttention(nn.Module):
             "is_causal": bool(is_causal),
         }
         # SDPA는 [B,H,S,D] 기대 → 여기서 변환
-        q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
-        k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
-        v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
+        q_bhsd = q_bshd.contiguous()
+        k_bhsd = k_bshd.contiguous()
+        v_bhsd = v_bshd.contiguous()
 
-        S_q = q_bhsd.shape[1]
-        S_k = k_bhsd.shape[1]
+        # --- 마스크 정규화: 버전 독립적으로 [B,H,L,S] (또는 브로드캐스트 가능 형태)로 통일 ---
+        B, H, _, _ = q_bhsd.shape
         fm = sdpa_kwargs["attn_mask"]
         if fm is not None:
-            # 디바이스/ dtype 정합성 (bool은 디바이스만, float은 dtype까지 맞춤)
+            # 디바이스/ dtype 정합성 및 형태 정규화
             if fm.dtype is torch.bool:
                 fm = fm.to(device=q_bhsd.device, non_blocking=True)
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
-            if fm.dim() == 2 and fm.shape == (S_q, S_k):
-                fm = fm.view(1, 1, S_q, S_k).expand(B, H, S_q, S_k)
-            elif fm.dim() == 3 and fm.shape == (B, S_q, S_k):
-                fm = fm.view(B, 1, S_q, S_k).expand(B, H, S_q, S_k)
-            elif fm.dim() == 4 and fm.shape[0] == B and fm.shape[2:] == (S_q, S_k):
-                if fm.shape[1] == 1:
-                    fm = fm.expand(B, H, S_q, S_k)
-                elif fm.shape[1] != H:
-                    raise RuntimeError(
-                        f"attn_mask head dim {fm.shape[1]} != H={H}"
-                    )
-            else:
+            fm, batch_dim, head_count = _flatten_mask_shape(fm)
+            if batch_dim not in (1, B):
                 raise RuntimeError(
-                    "attn_mask shape "
-                    f"{tuple(fm.shape)} not compatible with (B={B},H={H},S_q={S_q},S_k={S_k})"
+                    f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
+                )
+            if head_count not in (1, H):
+                raise RuntimeError(
+                    f"attn_mask head count {head_count} incompatible with num_heads {H}"
                 )
             sdpa_kwargs["attn_mask"] = fm.contiguous()
-            # 이미 명시적 마스크/바이어스가 있으면 is_causal은 중복 마스킹을 유발하므로 비활성화
+            # 명시적 마스크/바이어스가 있으면 is_causal은 중복 마스킹을 유발하므로 비활성화
             sdpa_kwargs["is_causal"] = False
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
