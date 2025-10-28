@@ -9,6 +9,20 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 
 import torch
 from torch import nn
+
+__all__ = [
+    "FLOP_PROFILER",
+    "FlopCounter",
+    "attention_flops_bshd",
+    "estimate_attention_flops",
+]
+
+# ------------------------------------------------------------
+# NOTE:
+#  - torch.profiler(with_flops=True) 우선 사용
+#  - NVTX(nsight) 소스의 값도 소프트 카운터로 수집
+#  - 모듈 메타데이터(format="xs") 지원: 입력 x만 있는 모듈을 위해
+# ------------------------------------------------------------
 def _infer_linear_mkn(
     inp: torch.Tensor, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
@@ -162,6 +176,42 @@ def _attention_forward_hook(
             if num_heads <= 0:
                 return
             head_dim = int(metadata.get("head_dim", embed_dim // max(num_heads, 1)))
+        elif fmt == "xs":
+            x = q
+            batch = int(x.shape[0])
+            seq_len = int(x.shape[1]) if x.dim() >= 2 else 1
+            num_heads = int(
+                metadata.get(
+                    "num_heads",
+                    getattr(mod, "nhead", getattr(mod, "num_heads", 0)),
+                )
+            )
+            if num_heads <= 0:
+                return
+            if x.dim() >= 2:
+                model_dim = int(x.shape[-1])
+            else:
+                model_dim = int(getattr(mod, "d_model", metadata.get("d_model", num_heads)))
+            head_dim = int(metadata.get("head_dim", model_dim // max(num_heads, 1)))
+            win_keys = metadata.get("effective_window_attr", None)
+            eff_w = 0
+            if isinstance(win_keys, (list, tuple)):
+                for key in win_keys:
+                    value = getattr(mod, key, None)
+                    if isinstance(value, (int, float)) and int(value) > 0:
+                        eff_w = int(value)
+                        break
+            elif isinstance(win_keys, str):
+                value = getattr(mod, win_keys, None)
+                if isinstance(value, (int, float)) and int(value) > 0:
+                    eff_w = int(value)
+            if eff_w > 0:
+                connections = batch * num_heads * seq_len * eff_w
+                fwd = 4.0 * connections * head_dim
+                misc = 6.0 * connections
+                total = (fwd + misc) * (1.0 + (2.0 if mod.training else 0.0))
+                profiler.add_manual("Attention", float(total))
+                return
         else:
             return
     except Exception:
@@ -277,31 +327,27 @@ class _FlopProfiler:
     def record_nvtx_soft(self, value: float) -> None:
         self._nvtx_soft_add(value)
 
-    def make_nvtx_counter(self, device: Optional[torch.device]) -> Any:
+    def make_nvtx_counter(self, device: Optional[torch.device] = None) -> Any:
         self.ensure_nvtx_getter()
         getter = self._nvtx_getter or self._nvtx_soft_getter
         try:
-            import torch.cuda.nvtx as nvtx
-            getattr(nvtx, "__name__", None)
+            import torch.cuda.nvtx as nvtx  # noqa: F401
         except Exception:
             return contextlib.nullcontext()
 
-        class _NvtxScope:
-            def __init__(self, device: Optional[torch.device]) -> None:
-                self.device = device
-                self._entered = False
+        class _NvtxScope(contextlib.AbstractContextManager):
+            def __init__(self, dev: Optional[torch.device]) -> None:
+                self._dev = dev
 
-            def __enter__(self) -> "_NvtxScope":
-                if self.device is not None and self.device.type == "cuda":
-                    try:
-                        torch.cuda.synchronize(self.device)
-                    except Exception:
-                        pass
-                self._entered = True
+            def __enter__(self):
+                try:
+                    if self._dev is not None and getattr(self._dev, "type", "") == "cuda":
+                        torch.cuda.synchronize(self._dev)
+                except Exception:
+                    pass
                 return self
 
-            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-                self._entered = False
+            def __exit__(self, exc_type, exc, tb):
                 return False
 
             def get_total_flops(self) -> float:
@@ -312,24 +358,32 @@ class _FlopProfiler:
 
         return _NvtxScope(device)
 
-    def _torch_counter(self, display: bool) -> Any:
+    def _torch_counter(self, display: bool = False) -> Any:
+        """
+        torch.profiler(with_flops=True) 우선, 실패 시 legacy flop_counter 사용.
+        """
+
         try:
             from torch.profiler import profile
+        except Exception:
+            profile = None
 
-            class _TorchScope:
-                def __init__(self, display: bool) -> None:
-                    self.display = display
+        if profile is not None:
+
+            class _TorchScope(contextlib.AbstractContextManager):
+                def __init__(self, show: bool) -> None:
+                    self._show = show
                     self._prof = None
 
-                def __enter__(self) -> "_TorchScope":
+                def __enter__(self):
                     self._prof = profile(with_flops=True, record_shapes=False)
                     self._prof.__enter__()
                     return self
 
-                def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+                def __exit__(self, exc_type, exc, tb):
                     if self._prof is not None:
                         self._prof.__exit__(exc_type, exc, tb)
-                        if self.display:
+                        if self._show:
                             try:
                                 self._prof.key_averages().table(sort_by="flops")
                             except Exception:
@@ -341,13 +395,42 @@ class _FlopProfiler:
                         return 0.0
                     try:
                         events = self._prof.key_averages()
-                        return float(sum(e.flops for e in events if hasattr(e, "flops")))
+                        return float(
+                            sum(getattr(e, "flops", 0.0) for e in events)
+                        )
                     except Exception:
                         return 0.0
 
-            return _TorchScope(display)
-        except Exception:
-            return contextlib.nullcontext()
+            return _TorchScope(bool(display))
+
+        class _LegacyScope(contextlib.AbstractContextManager):
+            def __init__(self, show: bool) -> None:
+                try:
+                    from torch.utils.flop_counter import FlopCounterMode as _TorchMode
+
+                    self._impl = _TorchMode(display=show)
+                except Exception:
+                    self._impl = None
+
+            def __enter__(self):
+                if self._impl is not None:
+                    self._impl.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                if self._impl is not None:
+                    self._impl.__exit__(exc_type, exc, tb)
+                return False
+
+            def get_total_flops(self) -> float:
+                if self._impl is None:
+                    return 0.0
+                try:
+                    return float(self._impl.get_total_flops())
+                except Exception:
+                    return 0.0
+
+        return _LegacyScope(bool(display))
 
     def start_hooks(
         self,

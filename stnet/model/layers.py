@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import nn
@@ -17,6 +17,13 @@ try:
     from stnet.utils.compat import RMSNorm as _Norm  # type: ignore
 except Exception:
     _Norm = nn.LayerNorm
+
+
+try:
+    # 프로파일러가 없어도 동작하게 안전 import
+    from stnet.utils.profiler import FLOP_PROFILER  # noqa: F401
+except Exception:
+    FLOP_PROFILER = None  # noqa: N816
 
 
 try:
@@ -51,6 +58,11 @@ elif not hasattr(torch.compiler, "disable"):
 
 
     torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
+
+
+_HAS_MARK_STEP = hasattr(torch, "compiler") and hasattr(
+    torch.compiler, "cudagraph_mark_step_begin"
+)
 
 
 # rollback: use vanilla LayerNorm in eager/CPU runs
@@ -455,13 +467,13 @@ class TemporalEncoderLayer(nn.Module):
         return out, new_state
 
 
+@_disable_torch_compile
 def _build_dilated_mask(
     seq_len: int,
     *,
     dilation: int = 1,
     window_size: Optional[int] = None,
     causal: bool = False,
-    device=None,
 ) -> torch.Tensor:
     """
     Dilated attention용 boolean mask 생성: shape (L, L), True는 mask-out.
@@ -473,6 +485,7 @@ def _build_dilated_mask(
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
     L = int(seq_len)
+    device = torch.device("cpu")
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
     j = torch.arange(L, device=device).unsqueeze(0).expand(L, L)
     dist = (i - j).abs()
@@ -484,7 +497,7 @@ def _build_dilated_mask(
     )
     not_future = (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
     allowed = congruent & within & not_future
-    return ~allowed  # True = masked
+    return (~allowed).contiguous()  # True = masked
 
 
 class DilatedAttention(nn.Module):
@@ -520,6 +533,17 @@ class DilatedAttention(nn.Module):
         self.window_size = window_size
         self.causal = causal
         self.batch_first = batch_first
+        self.nhead = int(num_heads)
+        self.head_dim = int(embed_dim // max(self.nhead, 1))
+        self.dropout_p = float(dropout)
+        self.__stf_attention_profile__ = {
+            "format": "xs",
+            "num_heads": self.nhead,
+            "head_dim": self.head_dim,
+            "dropout_attr": "dropout_p",
+            "effective_window_attr": ["window_size"],
+            "include_softmax_scale_dropout": True,
+        }
 
         self.norm1 = _Norm(embed_dim)
         self.attn = MultiHeadAttention(
@@ -539,20 +563,26 @@ class DilatedAttention(nn.Module):
             nn.Linear(hidden, embed_dim, bias=True),
         )
 
-        self._mask_cache: dict[int, torch.Tensor] = {}
+        self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
 
-    def _get_mask(self, L: int, device) -> torch.Tensor:
-        mask = self._mask_cache.get(L)
-        if mask is None or mask.device != device:
-            mask = _build_dilated_mask(
-                L,
-                dilation=self.dilation,
-                window_size=self.window_size,
-                causal=self.causal,
-                device=device,
+    @_disable_torch_compile
+    def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        mask_cpu = self._mask_cache_cpu.get(L)
+        if mask_cpu is None:
+            mask_cpu = (
+                _build_dilated_mask(
+                    L,
+                    dilation=self.dilation,
+                    window_size=self.window_size,
+                    causal=self.causal,
+                )
+                .detach()
+                .clone()
+                .contiguous()
+                .cpu()
             )
-            self._mask_cache[L] = mask
-        return mask
+            self._mask_cache_cpu[L] = mask_cpu
+        return mask_cpu.to(device=device, non_blocking=True).clone()
 
     def forward(  # type: ignore[override]
         self,
@@ -560,6 +590,11 @@ class DilatedAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if _HAS_MARK_STEP:
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
         if not self.batch_first:
             x = x.transpose(0, 1)
         B, L, _ = x.shape

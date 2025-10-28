@@ -78,6 +78,47 @@ ignored_sentences = [
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
     "TypedStorage is deprecated.*",
 ]
+
+
+# ------------------------------------------------------------
+# Colab/Jupyter 로그 파일(/var/colab/app.log)에서 \r 기반 tqdm가
+# 한 줄만 보이고 갱신이 끊기는 문제를 피하기 위해,
+# 주기적으로 줄바꿈 로그를 추가로 찍어주는 미러를 둔다.
+#  - STF_PROGRESS_MIRROR=1 (기본) 이면 활성화
+#  - STF_PROGRESS_EVERY=5  (초)  간격
+# ------------------------------------------------------------
+
+
+class _ProgressMirror:
+    def __init__(self, *, enabled: bool = True, every_s: float = 5.0) -> None:
+        self.enabled = bool(enabled)
+        try:
+            every = float(every_s)
+        except (TypeError, ValueError):
+            every = 5.0
+        self.every_ns = max(0, int(every * 1e9))
+        self._last = 0
+
+    def maybe_log(
+        self,
+        *,
+        epoch_idx: int,
+        total_epochs: int,
+        step_idx: int,
+        total_steps: int,
+        note: str | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        now = time.perf_counter_ns()
+        if self._last and self.every_ns > 0 and now - self._last < self.every_ns:
+            return
+        self._last = now
+        pct = 100.0 * float(step_idx) / max(1.0, float(total_steps))
+        msg = f"[e{epoch_idx + 1}/{max(1, total_epochs)}] {step_idx}/{total_steps} ({pct:5.1f}%)"
+        if note:
+            msg = f"{msg} | {note}"
+        print(msg, flush=True)
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 
 _DL_STATE_FILE = "dataloader.json"
@@ -591,6 +632,7 @@ def epoch(
     grad_accum_steps: int,
     train_loader: Any,
     val_loader: Any,
+    current_epoch_idx: int = 0,
 ) -> Tuple[
     torch.Tensor,
     torch.Tensor,
@@ -617,6 +659,21 @@ def epoch(
         t_fetch_start = time.perf_counter_ns()
         with joining(model=model, optimizer=optimizer):
             total_batches = len(train_loader)
+            total_epochs = int(getattr(ops, "epochs", 1))
+            try:
+                every_env = float(os.environ.get("STF_PROGRESS_EVERY", "5"))
+            except (TypeError, ValueError):
+                every_env = 5.0
+            is_main_rank = True
+            try:
+                if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+                    is_main_rank = False
+            except Exception:
+                pass
+            mirror = _ProgressMirror(
+                enabled=is_main_rank and (os.environ.get("STF_PROGRESS_MIRROR", "1") != "0"),
+                every_s=every_env,
+            )
             for step_idx, _raw in enumerate(train_loader):
                 feat, label, *_ = preprocess(_raw)
                 X = to_torch(feat)
@@ -749,6 +806,12 @@ def epoch(
                         comp_elapsed=comp_elapsed,
                         flop_breakdown=flop_breakdown_epoch,
                     )
+                mirror.maybe_log(
+                    epoch_idx=current_epoch_idx,
+                    total_epochs=total_epochs,
+                    step_idx=step_idx + 1,
+                    total_steps=total_batches,
+                )
                 t_fetch_start = time.perf_counter_ns()
 
     if val_loader is not None:
@@ -758,6 +821,22 @@ def epoch(
             with inference(model), AutoCast.float(device):
                 t_fetch_start = time.perf_counter_ns()
                 with joining(model=model, optimizer=optimizer):
+                    num_val_steps = len(val_loader)
+                    try:
+                        every_env = float(os.environ.get("STF_PROGRESS_EVERY", "5"))
+                    except (TypeError, ValueError):
+                        every_env = 5.0
+                    vm_is_main_rank = True
+                    try:
+                        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+                            vm_is_main_rank = False
+                    except Exception:
+                        pass
+                    vmirror = _ProgressMirror(
+                        enabled=vm_is_main_rank
+                        and (os.environ.get("STF_PROGRESS_MIRROR", "1") != "0"),
+                        every_s=every_env,
+                    )
                     for step_idx, _raw in enumerate(val_loader):
                         feat, label, *_ = preprocess(_raw)
                         X = to_torch(feat)
@@ -869,6 +948,12 @@ def epoch(
                                 comp_elapsed=comp_elapsed,
                                 flop_breakdown=flop_breakdown_epoch,
                             )
+                        vmirror.maybe_log(
+                            epoch_idx=current_epoch_idx,
+                            total_epochs=int(getattr(ops, "epochs", 1)),
+                            step_idx=step_idx + 1,
+                            total_steps=num_val_steps,
+                        )
                         t_fetch_start = time.perf_counter_ns()
     return (
         io_time,
@@ -1419,7 +1504,7 @@ def main(*args: Any) -> Optional[Root]:
                 else None
             )
 
-            for _ in range(int(ops.epochs)):
+            for epoch_idx in range(int(ops.epochs)):
                 (
                     io_time,
                     comp_time,
@@ -1441,6 +1526,7 @@ def main(*args: Any) -> Optional[Root]:
                     grad_accum_steps=int(ops.grad_accum_steps),
                     train_loader=train_loader,
                     val_loader=val_loader,
+                    current_epoch_idx=epoch_idx,
                 )
                 torch.distributed.barrier(
                     device_ids=[local_rank]
