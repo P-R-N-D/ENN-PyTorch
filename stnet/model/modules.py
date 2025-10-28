@@ -31,39 +31,6 @@ from ..utils.optimization import (
 )
 
 
-try:
-    # Prefer torch.compiler.disable (PyTorch ≥2.5)
-    _disable_torch_compile = torch.compiler.disable  # type: ignore[attr-defined]
-except Exception:
-    try:
-        # Fallback for PyTorch 2.0–2.4
-        import torch._dynamo as _dynamo  # type: ignore
-
-        _disable_torch_compile = _dynamo.disable  # type: ignore[attr-defined]
-    except Exception:
-
-        def _disable_torch_compile(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
-            if fn is None:
-                return lambda real_fn: real_fn
-            return fn
-
-
-if not hasattr(torch, "compiler"):
-    class _TorchCompilerNamespace:
-        @staticmethod
-        def disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
-            return _disable_torch_compile(fn, recursive=recursive)
-
-
-    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
-elif not hasattr(torch.compiler, "disable"):
-
-    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
-        return _disable_torch_compile(fn, recursive=recursive)
-
-
-    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
-
 from .functional import SwiGLU
 from .layers import (
     DilatedAttention,
@@ -71,6 +38,7 @@ from .layers import (
     PatchAttention,
     StochasticDepth,
     TemporalEncoderLayer,
+    _disable_torch_compile,
     norm_layer,
     schedule_stochastic_depth,
 )
@@ -115,7 +83,6 @@ class PointTransformer(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # (0) 입력/마스크 메타 유입 즉시 차단
         if getattr(x, "is_meta", False) or is_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
         if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
@@ -130,9 +97,6 @@ class PointTransformer(nn.Module):
             attn_mask = attn_mask.contiguous()
             if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
-
-        # (1) LayerNorm 파라미터가 meta/fake/DTensor면 즉시 실체화(materialize)
-        #     (FSDP 래핑 후에도 안전하게 다시 점검하도록 항상 수행; 오버헤드 경미)
         def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
             if not isinstance(ln, nn.LayerNorm):
                 return
@@ -142,7 +106,7 @@ class PointTransformer(nn.Module):
             b = getattr(ln, "bias", None)
             try:
                 from torch.distributed._tensor import DTensor as _DTensor
-            except Exception:  # pragma: no cover - DTensor optional
+            except Exception:
                 dtensor_types: Tuple[type, ...] = tuple()
             else:
                 dtensor_types = (_DTensor,)
@@ -176,8 +140,6 @@ class PointTransformer(nn.Module):
         _materialize_ln_(self.norm1, x)
         _materialize_ln_(self.norm2, x)
         self._ln_materialized = True
-
-        # (2) CPU/eager safety: LN 전/후 meta 가드 + CPU는 fp32 강제
         _x = x
         if isinstance(_x, torch.Tensor) and (
             getattr(_x, "is_meta", False) or is_fake_tensor(_x)
@@ -194,8 +156,6 @@ class PointTransformer(nn.Module):
             _x = _x.to(x.dtype)
         y = self.attn(_x, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
-
-        # (3) norm2 경로도 동일 보호
         _x2 = x
         if getattr(_x2, "is_meta", False) or is_fake_tensor(_x2):
             raise RuntimeError("x is meta before LayerNorm(norm2)")
@@ -242,7 +202,7 @@ def _normalize_modeling_type(value: Any) -> str:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
 
-@torch.compiler.disable(recursive=True)  # type: ignore[attr-defined]
+@_disable_torch_compile(recursive=True)
 class SpatialEncoder(nn.Module):
     def __init__(
         self,
@@ -434,9 +394,9 @@ class CrossTransformer(nn.Module):
         t_context = self.cross_t(temporal_tokens, spatial_tokens)
         if mode_l == "sxs":
             return s_context
-        if mode_l == "txt":
+        elif mode_l == "txt":
             return t_context
-        if mode_l == "txs":
+        elif mode_l == "txs":
             base = torch.cat(
                 [
                     t_context,
@@ -448,17 +408,18 @@ class CrossTransformer(nn.Module):
             )
             fused = self.mix(self.mix_norm(base))
             return t_context + self.drop_path(self.dropout(fused))
-        base = torch.cat(
-            [
-                s_context,
-                t_context.mean(dim=1, keepdim=True).expand(
-                    -1, s_context.size(1), -1
-                ),
-            ],
-            dim=-1,
-        )
-        fused = self.mix(self.mix_norm(base))
-        return s_context + self.drop_path(self.dropout(fused))
+        else:
+            base = torch.cat(
+                [
+                    s_context,
+                    t_context.mean(dim=1, keepdim=True).expand(
+                        -1, s_context.size(1), -1
+                    ),
+                ],
+                dim=-1,
+            )
+            fused = self.mix(self.mix_norm(base))
+            return s_context + self.drop_path(self.dropout(fused))
 
 @dataclass
 class Payload:
@@ -469,12 +430,6 @@ class Payload:
     context_shape: Tuple[int, ...]
 
 class LongNet(nn.Module):
-    """
-    LongNet 백본.
-      - 가능한 경우: torchscale.net.longnet.LongNet 우선 사용
-      - 아니면: DilatedAttention 스택으로 유사 호환
-    """
-
     def __init__(
         self,
         embed_dim: int,
@@ -492,31 +447,35 @@ class LongNet(nn.Module):
         super().__init__()
         self.batch_first = batch_first
         self._impl: Optional[nn.Module] = None
-        # torchscale 시도
         try:
             ts_longnet = import_module("torchscale.net.longnet")
-            ctor_variants = (
-                dict(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    depth=depth,
-                    dropout=dropout,
-                ),
-                dict(
-                    d_model=embed_dim,
-                    nhead=num_heads,
-                    num_layers=depth,
-                    dropout=dropout,
-                ),
-            )
-            for kw in ctor_variants:
-                try:
-                    self._impl = getattr(ts_longnet, "LongNet")(**kw)  # type: ignore[attr-defined]
-                    break
-                except Exception:
-                    continue
         except Exception:
             self._impl = None
+        else:
+            ctor_variants = (
+                {
+                    "embed_dim": embed_dim,
+                    "num_heads": num_heads,
+                    "depth": depth,
+                    "dropout": dropout,
+                },
+                {
+                    "d_model": embed_dim,
+                    "nhead": num_heads,
+                    "num_layers": depth,
+                    "dropout": dropout,
+                },
+            )
+            longnet_ctor = getattr(ts_longnet, "LongNet", None)
+            impl = None
+            if callable(longnet_ctor):
+                for kw in ctor_variants:
+                    try:
+                        impl = longnet_ctor(**kw)
+                        break
+                    except Exception:
+                        continue
+            self._impl = impl
 
         if self._impl is not None:
             self._using = "torchscale"
@@ -547,11 +506,12 @@ class LongNet(nn.Module):
     def using(self) -> str:
         return self._using
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        **_: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self._impl is not None:
             out = x
@@ -561,10 +521,9 @@ class LongNet(nn.Module):
                 and out.shape[0] != out.shape[1]
                 and not self._impl_batch_first
             ):
-                # 가드: 배치 축 다를 때 전치
                 out = out.transpose(0, 1)
             try:
-                out = self._impl(out)  # type: ignore[misc]
+                out = self._impl(out)
             except Exception as exc:
                 warnings.warn(
                     f"torchscale LongNet 호출 실패: {exc}. 입력을 그대로 반환.",
@@ -573,7 +532,6 @@ class LongNet(nn.Module):
             if self._impl_batch_first is not True:
                 out = out.transpose(0, 1)
             return out, None
-        # fallback
         attn_w: Optional[torch.Tensor] = None
         out = x
         for layer in self.layers:
@@ -587,11 +545,6 @@ class LongNet(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
-    """
-    (신) GlobalEncoder: LongNet 백본을 사용하는 전역 인코더.
-    기존 GlobalEncoderBlock/Layer는 제거됨.
-    """
-
     def __init__(
         self,
         embed_dim: int,
@@ -624,11 +577,12 @@ class GlobalEncoder(nn.Module):
     def using(self) -> str:
         return self.backbone.using
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        **_: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return self.backbone(
             x,
@@ -743,7 +697,9 @@ class LocalProcessor(nn.Module):
                 "spatial tokenizer output has unexpected numel: "
                 f"got {spatial_raw.numel()} vs expected {expected_spatial}"
             )
-        spatial_tokens = spatial_raw.view(B, self.spatial_tokens, self.d_model).contiguous()
+        spatial_tokens = (
+            spatial_raw.reshape(B, self.spatial_tokens, self.d_model).contiguous()
+        )
         temporal_raw = self.temporal_tokenizer(x)
         expected_temporal = B * self.temporal_tokens * self.d_model
         if temporal_raw.numel() != expected_temporal:
@@ -751,7 +707,9 @@ class LocalProcessor(nn.Module):
                 "temporal tokenizer output has unexpected numel: "
                 f"got {temporal_raw.numel()} vs expected {expected_temporal}"
             )
-        temporal_tokens = temporal_raw.view(B, self.temporal_tokens, self.d_model).contiguous()
+        temporal_tokens = (
+            temporal_raw.reshape(B, self.temporal_tokens, self.d_model).contiguous()
+        )
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_encoder(spatial_tokens, coords)
         temporal_out = self.temporal_encoder(temporal_tokens)
@@ -771,7 +729,7 @@ class LocalProcessor(nn.Module):
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         flat = flat.contiguous()
-        context = flat.view(B, *self.out_shape).contiguous()
+        context = flat.reshape(B, *self.out_shape).contiguous()
         dims = tuple(range(1, context.ndim))
         offset = context.mean(dim=dims, keepdim=True).contiguous()
         return Payload(
@@ -789,7 +747,7 @@ class LocalProcessor(nn.Module):
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
-        return flat.view(tokens.shape[0], *self.out_shape)
+        return flat.reshape(tokens.shape[0], *self.out_shape)
 
 
 class LossWeightPolicy(Protocol):
@@ -901,7 +859,7 @@ class Root(nn.Module):
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if features.ndim == 3 and features.shape[1] == 1:
-            features = features.view(features.shape[0], -1)
+            features = features.reshape(features.shape[0], -1)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         device = self._device
@@ -925,15 +883,15 @@ class Root(nn.Module):
                 ctx = AutoCast.float(device) if amp_enabled else AutoCast.suspend(device)
                 with ctx:
                     out: Payload = self.local_net(x_slice)
-                if (not torch.isfinite(out.tokens).all()) or (
-                    not torch.isfinite(out.context).all()
-                ):
+                tokens_finite = torch.isfinite(out.tokens).all()
+                context_finite = torch.isfinite(out.context).all()
+                if not (tokens_finite and context_finite):
                     x_f32 = x_slice.to(dtype=torch.float32)
                     with AutoCast.suspend(device):
                         out = self.local_net(x_f32)
-                if (not torch.isfinite(out.tokens).all()) or (
-                    not torch.isfinite(out.context).all()
-                ):
+                    tokens_finite = torch.isfinite(out.tokens).all()
+                    context_finite = torch.isfinite(out.context).all()
+                if not (tokens_finite and context_finite):
                     raise RuntimeError(
                         "[local_net.forward] produced non-finite tokens/context in training"
                     )
@@ -966,14 +924,16 @@ class Root(nn.Module):
                         else AutoCast.suspend(device)
                     )
                     out = self.local_net(x_slice)
-                if (not torch.isfinite(out.tokens).all()) or (
-                    not torch.isfinite(out.context).all()
-                ):
+                tokens_finite = torch.isfinite(out.tokens).all()
+                context_finite = torch.isfinite(out.context).all()
+                if not (tokens_finite and context_finite):
                     x_f32 = x_slice.to(dtype=torch.float32)
                     with inference(self.local_net):
                         with AutoCast.suspend(device):
                             out = self.local_net(x_f32)
-                if not torch.isfinite(out.tokens).all() or not torch.isfinite(out.context).all():
+                    tokens_finite = torch.isfinite(out.tokens).all()
+                    context_finite = torch.isfinite(out.context).all()
+                if not (tokens_finite and context_finite):
                     out_tokens = torch.nan_to_num(
                         out.tokens, nan=0.0, posinf=0.0, neginf=0.0
                     )
@@ -995,15 +955,18 @@ class Root(nn.Module):
                 )
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
-        if (not torch.isfinite(tokens).all()) or (not torch.isfinite(context).all()):
+        tokens_finite = torch.isfinite(tokens).all()
+        context_finite = torch.isfinite(context).all()
+        if not (tokens_finite and context_finite):
             if self.training:
                 raise RuntimeError(
                     "[concat] non-finite tokens/context after local_net forward"
                 )
             tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
             context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
-        assembled = context.view(b, -1)
-        if not torch.isfinite(assembled).all():
+        assembled = context.reshape(b, -1)
+        assembled_finite = torch.isfinite(assembled).all()
+        if not assembled_finite:
             if self.training:
                 raise RuntimeError("[assembled] non-finite in training")
             assembled = torch.nan_to_num(assembled, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1011,7 +974,8 @@ class Root(nn.Module):
             bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
             assembled = assembled + bl
         t = tokens
-        if not torch.isfinite(t).all():
+        tokens_ok = torch.isfinite(t).all()
+        if not tokens_ok:
             if self.training:
                 raise RuntimeError("[tokens] non-finite before centering in training")
             t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1049,7 +1013,6 @@ class Root(nn.Module):
                             decode_tokens, apply_norm=True
                         )
         else:
-            # Train path: autograd ON
             with torch.enable_grad():
                 with (
                     AutoCast.float(device)
@@ -1075,7 +1038,7 @@ class Root(nn.Module):
                         residual_context = self.local_net.decode(
                             refined_tokens, apply_norm=True
                         )
-        residual = residual_context.view(b, -1)
+        residual = residual_context.reshape(b, -1)
         if not torch.isfinite(residual).all():
             if self.training:
                 raise RuntimeError("[residual] non-finite in training")
@@ -1134,7 +1097,7 @@ class Root(nn.Module):
                     device=y_hat_out.device, dtype=y_hat_out.dtype
                 )
                 loss_val = net_loss(y_hat_out, tgt)
-        return (y_hat_out.view(b, *self.out_shape), loss_val)
+        return (y_hat_out.reshape(b, *self.out_shape), loss_val)
 
     @staticmethod
     def flatten_labels(
@@ -1155,4 +1118,4 @@ class Root(nn.Module):
     def unflatten_labels(
         flat: torch.Tensor, shape: Sequence[int]
     ) -> torch.Tensor:
-        return flat.view(flat.shape[0], *shape)
+        return flat.reshape(flat.shape[0], *shape).contiguous()
