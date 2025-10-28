@@ -140,7 +140,7 @@ def train(
         start_method="spawn",                                # ✅ spawn 고정
         log_line_prefix_template="[%(role)s][%(rank)s] ",    # 콘솔에 랭크 프리픽스
         logs_specs=logs_specs,                               # ✅ 파일 리다이렉트(가능 시)
-        event_log_handler="file",                            # 이벤트 로그 파일 핸들러
+        event_log_handler="console",                            # 이벤트 로그 파일 핸들러
     )
     print(f"[launch] logs @ {log_dir}")
     #Debug End
