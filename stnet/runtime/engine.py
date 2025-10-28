@@ -50,7 +50,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..utils.datatype import to_torch
-from ..utils.debug import is_fake_tensor
+from ..utils.debug import is_fake_tensor, log_error
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
 from ..utils.optimization import (
@@ -640,6 +640,7 @@ def epoch(
     torch.Tensor,
     Dict[str, float],
 ]:
+    log_error()
     if train_loader is None:
         raise RuntimeError("epoch requires a training dataloader")
     in_dim = int(ops.in_dim)
