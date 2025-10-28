@@ -1401,13 +1401,39 @@ class DotProductAttention(nn.Module):
             "dropout_p": dropout_val,
             "is_causal": bool(is_causal),
         }
-        # 이미 final_mask/bias가 있으면 is_causal 중복을 피하는 게 안전
-        if final_mask is not None:
-            sdpa_kwargs["is_causal"] = False
         # SDPA는 [B,H,S,D] 기대 → 여기서 변환
         q_bhsd = q_bshd.permute(0, 2, 1, 3).contiguous()
         k_bhsd = k_bshd.permute(0, 2, 1, 3).contiguous()
         v_bhsd = v_bshd.permute(0, 2, 1, 3).contiguous()
+
+        S_q = q_bhsd.shape[1]
+        S_k = k_bhsd.shape[1]
+        fm = sdpa_kwargs["attn_mask"]
+        if fm is not None:
+            # 디바이스/ dtype 정합성 (bool은 디바이스만, float은 dtype까지 맞춤)
+            if fm.dtype is torch.bool:
+                fm = fm.to(device=q_bhsd.device, non_blocking=True)
+            else:
+                fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
+            if fm.dim() == 2 and fm.shape == (S_q, S_k):
+                fm = fm.view(1, 1, S_q, S_k).expand(B, H, S_q, S_k)
+            elif fm.dim() == 3 and fm.shape == (B, S_q, S_k):
+                fm = fm.view(B, 1, S_q, S_k).expand(B, H, S_q, S_k)
+            elif fm.dim() == 4 and fm.shape[0] == B and fm.shape[2:] == (S_q, S_k):
+                if fm.shape[1] == 1:
+                    fm = fm.expand(B, H, S_q, S_k)
+                elif fm.shape[1] != H:
+                    raise RuntimeError(
+                        f"attn_mask head dim {fm.shape[1]} != H={H}"
+                    )
+            else:
+                raise RuntimeError(
+                    "attn_mask shape "
+                    f"{tuple(fm.shape)} not compatible with (B={B},H={H},S_q={S_q},S_k={S_k})"
+                )
+            sdpa_kwargs["attn_mask"] = fm.contiguous()
+            # 이미 명시적 마스크/바이어스가 있으면 is_causal은 중복 마스킹을 유발하므로 비활성화
+            sdpa_kwargs["is_causal"] = False
         backends = initialize_sdpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
