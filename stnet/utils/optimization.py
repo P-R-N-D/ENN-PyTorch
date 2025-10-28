@@ -1354,10 +1354,10 @@ class DotProductAttention(nn.Module):
             and ((bias_float is None) or self._te_supports_core_bias)
         )
         if use_te:
-            # qkv_format="bshd" → TE에는 [B,S,H,D] 그대로 전달
-            q_te = q_bshd.contiguous()
-            k_te = k_bshd.contiguous()
-            v_te = v_bshd.contiguous()
+            # qkv_format="bshd" → TE에는 [B,S,H,D] 형식으로 전달
+            q_te = q_bshd.transpose(1, 2).contiguous()
+            k_te = k_bshd.transpose(1, 2).contiguous()
+            v_te = v_bshd.transpose(1, 2).contiguous()
             te_kwargs: dict[str, Any] = {}
             if self._te_supports_attention_dropout:
                 te_kwargs["attention_dropout"] = dropout_val
@@ -1380,8 +1380,8 @@ class DotProductAttention(nn.Module):
                 self._force_pt = True
                 use_te = False
             else:
-                # TE 반환도 [B,S,H,D] 가정
-                return out_te.contiguous()
+                # TE 반환도 [B,S,H,D] 가정 → 다시 [B,H,S,D]로 변환
+                return out_te.transpose(1, 2).contiguous()
         sdpa_bias: torch.Tensor | None = None
         if mask_bool is not None:
             finfo = torch.finfo(q_bshd.dtype)
