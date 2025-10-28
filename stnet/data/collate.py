@@ -133,15 +133,6 @@ def _wrap_data_node(
         max_concurrent=thread_max_concurrent,
         prebatch=prebatch,
     )
-    proc_max_concurrent = proc_workers
-    wrapped = ParallelMapper(
-        wrapped,
-        map_fn=identity,
-        num_workers=proc_workers,
-        in_order=False,
-        method="process",
-        max_concurrent=proc_max_concurrent,
-    )
     wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
     if device.type in {"cuda", "xpu", "mps"}:
         wrapped = PinMemory(wrapped, pin_memory_device=device.type)
