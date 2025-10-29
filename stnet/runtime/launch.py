@@ -101,49 +101,6 @@ def train(
         start_method=System.optimal_start_method(),
         local_addr=master_addr,
     )
-    #Debug Start
-    import tempfile, signal, faulthandler
-    try:
-        from torch.distributed.elastic.multiprocessing.api import LogsSpecs
-    except Exception:
-        LogsSpecs = None
-    log_dir = os.environ.get("STF_ELASTIC_LOGDIR") or tempfile.mkdtemp(prefix="torchelastic_")
-    os.environ["STF_ELASTIC_LOGDIR"] = log_dir
-    os.makedirs(log_dir, exist_ok=True)
-    sig_path = os.path.join(log_dir, "signal.log")
-    with contextlib.suppress(Exception):
-        fh = open(sig_path, "w", buffering=1)
-        faulthandler.enable(all_threads=True, file=fh)
-        for sig in (signal.SIGSEGV, signal.SIGABRT, signal.SIGBUS):
-            faulthandler.register(sig, file=fh, all_threads=True, chain=True)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=RuntimeWarning)
-        try: mp.set_start_method("spawn", force=True)
-        except RuntimeError: pass
-    logs_specs = None
-    if LogsSpecs is not None:
-        try:
-            logs_specs = LogsSpecs(root_path=log_dir)  
-        except Exception:
-            logs_specs = None  
-    lc = LaunchConfig(
-        min_nodes=1,
-        max_nodes=1,
-        nproc_per_node=int(os.environ.get("WORLD_SIZE","1")),
-        rdzv_backend=kwargs.get("rdzv_backend", "c10d"),     # etcd/zeus-adapter 쓰면 거기에 맞춰 변경
-        rdzv_endpoint=kwargs.get("rdzv_endpoint", "localhost:29400"),
-        rdzv_timeout=900,
-        run_id=kwargs.get("run_id", "stnet"),
-        role="trainer",
-        max_restarts=0,
-        monitor_interval=0.1,
-        start_method="spawn",                                # ✅ spawn 고정
-        log_line_prefix_template="[%(role)s][%(rank)s] ",    # 콘솔에 랭크 프리픽스
-        logs_specs=logs_specs,                               # ✅ 파일 리다이렉트(가능 시)
-        event_log_handler="console",                            # 이벤트 로그 파일 핸들러
-    )
-    print(f"[launch] logs @ {log_dir}")
-    #Debug End
     base = dict(
         memmap_dir=memmap_dir,
         ckpt_dir=ckpt_dir,
