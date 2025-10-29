@@ -1667,14 +1667,16 @@ def main(*args: Any) -> Optional[Root]:
                             )
                     y_hat_cpu = y_hat.detach().cpu().contiguous()
                     if streaming:
+                        chunk_path = os.path.join(
+                            chunk_dir, f"chunk_{chunk_idx:06d}.pt"
+                        )
                         try:
-                            torch.save(
-                                y_hat_cpu,
-                                os.path.join(chunk_dir, f"chunk_{chunk_idx:06d}.pt"),
-                            )
+                            torch.save(y_hat_cpu, chunk_path)
                             chunk_idx += 1
                         except Exception as err:
                             streaming = False
+                            with contextlib.suppress(OSError):
+                                os.remove(chunk_path)
                             warnings.warn(
                                 "Streaming inference disabled after failing to write "
                                 "predictions to disk; falling back to in-memory aggregation."
@@ -1691,6 +1693,8 @@ def main(*args: Any) -> Optional[Root]:
                                         preds.append(
                                             torch.load(chunk_path, map_location="cpu")
                                         )
+                                        with contextlib.suppress(OSError):
+                                            os.remove(chunk_path)
                                     except Exception as load_err:
                                         warnings.warn(
                                             "Failed to recover streamed predictions from "
@@ -1699,6 +1703,9 @@ def main(*args: Any) -> Optional[Root]:
                                             stacklevel=2,
                                         )
                                 recovered_streaming = True
+                                with contextlib.suppress(OSError):
+                                    if not os.listdir(chunk_dir):
+                                        os.rmdir(chunk_dir)
                             preds.append(y_hat_cpu)
                     else:
                         preds.append(y_hat_cpu)
