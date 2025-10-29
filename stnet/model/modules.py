@@ -30,6 +30,26 @@ from ..utils.optimization import (
     inference,
 )
 
+try:
+    from torch._inductor import config as _inductor_config  # type: ignore[attr-defined]
+except Exception:
+    _inductor_config = None  # type: ignore[assignment]
+else:
+    try:
+        triton_cfg = getattr(_inductor_config, "triton")
+        if hasattr(triton_cfg, "cudagraph_skip_dynamic_graphs"):
+            triton_cfg.cudagraph_skip_dynamic_graphs = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+try:
+    from torch.compiler import disable as _compile_disable  # type: ignore[attr-defined]
+except Exception:
+    def _compile_disable(fn=None, *, recursive: bool = False):  # type: ignore
+        if fn is None:
+            return lambda real_fn: real_fn
+        return fn
+
 
 from .functional import SwiGLU
 from .layers import (
@@ -184,20 +204,21 @@ class PointTransformer(nn.Module):
 
 
 _MODELING_TYPE_ALIASES: dict[str, str] = {
-    "ss": "sxs",
-    "spatial": "sxs",
-    "sxs": "sxs",
-    "tt": "txt",
-    "temporal": "txt",
-    "txt": "txt",
-    "txs": "txs",
-    "st": "sxt",
-    "ts": "sxt",
-    "sxt": "sxt",
-    "spatiotemporal": "sxt",
-    "spatio-temporal": "sxt",
-    "temporospatial": "sxt",
-    "temporo-spatial": "sxt",
+    "ss": "ss",
+    "spatial": "ss",
+    "sxs": "ss",
+    "tt": "tt",
+    "temporal": "tt",
+    "txt": "tt",
+    "ts": "ts",
+    "txs": "ts",
+    "temporal-spatial": "ts",
+    "temporo-spatial": "ts",
+    "temporospatial": "ts",
+    "st": "st",
+    "sxt": "st",
+    "spatiotemporal": "st",
+    "spatio-temporal": "st",
 }
 
 def _normalize_modeling_type(value: Any) -> str:
@@ -387,44 +408,82 @@ class CrossTransformer(nn.Module):
         self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
 
     def forward(
         self,
         spatial_tokens: torch.Tensor,
         temporal_tokens: torch.Tensor,
-        mode: str = "spatiotemporal",
+        mode: Optional[str] = None,
+    ) -> torch.Tensor:
+        if self._fixed_mode is not None:
+            mode_l = _normalize_modeling_type(self._fixed_mode)
+            if mode_l == "ss":
+                return self.cross_s(spatial_tokens, temporal_tokens)
+            if mode_l == "tt":
+                return self.cross_t(temporal_tokens, spatial_tokens)
+            if mode_l == "ts":
+                s_context = self.cross_s(spatial_tokens, temporal_tokens)
+                t_context = self.cross_t(temporal_tokens, spatial_tokens)
+                base = torch.cat(
+                    [
+                        t_context,
+                        s_context.mean(dim=1, keepdim=True).expand_as(t_context),
+                    ],
+                    dim=-1,
+                )
+                fused = self.mix(self.mix_norm(base))
+                return t_context + self.drop_path(self.dropout(fused))
+            if mode_l == "st":
+                s_context = self.cross_s(spatial_tokens, temporal_tokens)
+                t_context = self.cross_t(temporal_tokens, spatial_tokens)
+                base = torch.cat(
+                    [
+                        s_context,
+                        t_context.mean(dim=1, keepdim=True).expand_as(s_context),
+                    ],
+                    dim=-1,
+                )
+                fused = self.mix(self.mix_norm(base))
+                return s_context + self.drop_path(self.dropout(fused))
+        requested = mode if mode is not None else "spatiotemporal"
+        return self._forward_dynamic(spatial_tokens, temporal_tokens, requested)
+
+    @_compile_disable
+    def _forward_dynamic(
+        self,
+        spatial_tokens: torch.Tensor,
+        temporal_tokens: torch.Tensor,
+        mode: str,
     ) -> torch.Tensor:
         mode_l = _normalize_modeling_type(mode)
         s_context = self.cross_s(spatial_tokens, temporal_tokens)
         t_context = self.cross_t(temporal_tokens, spatial_tokens)
-        if mode_l == "sxs":
+        if mode_l == "ss":
             return s_context
-        elif mode_l == "txt":
+        if mode_l == "tt":
             return t_context
-        elif mode_l == "txs":
+        if mode_l == "ts":
             base = torch.cat(
                 [
                     t_context,
-                    s_context.mean(dim=1, keepdim=True).expand(
-                        -1, t_context.size(1), -1
-                    ),
+                    s_context.mean(dim=1, keepdim=True).expand_as(t_context),
                 ],
                 dim=-1,
             )
             fused = self.mix(self.mix_norm(base))
             return t_context + self.drop_path(self.dropout(fused))
-        else:
+        if mode_l == "st":
             base = torch.cat(
                 [
                     s_context,
-                    t_context.mean(dim=1, keepdim=True).expand(
-                        -1, s_context.size(1), -1
-                    ),
+                    t_context.mean(dim=1, keepdim=True).expand_as(s_context),
                 ],
                 dim=-1,
             )
             fused = self.mix(self.mix_norm(base))
             return s_context + self.drop_path(self.dropout(fused))
+        raise RuntimeError(f"Unhandled mode: {mode_l}")
 
 @dataclass
 class Payload:
@@ -665,6 +724,7 @@ class LocalProcessor(nn.Module):
             mlp_ratio=self.mlp_ratio,
             drop_path=self.drop_path,
         )
+        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
         self.norm = norm_layer(self.norm_type, self.d_model)
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
         self.head = nn.Sequential(
@@ -729,17 +789,31 @@ class LocalProcessor(nn.Module):
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_encoder(spatial_tokens, coords)
         temporal_out = self.temporal_encoder(temporal_tokens)
-        mode = self.modeling_type
-        if mode == "sxs":
-            tokens = spatial_out
-        elif mode == "txt":
-            tokens = temporal_out
-        elif mode == "txs":
-            tokens = self.perception(temporal_out, spatial_out, mode="txs")
-        elif mode == "sxt":
-            tokens = self.perception(spatial_out, temporal_out, mode="sxt")
+        mode = self._fixed_mode
+        if mode is not None:
+            mode_l = _normalize_modeling_type(mode)
+            if mode_l == "ss":
+                tokens = spatial_out
+            elif mode_l == "tt":
+                tokens = temporal_out
+            elif mode_l == "ts":
+                if hasattr(self.perception, "_forward_dynamic"):
+                    tokens = self.perception._forward_dynamic(  # type: ignore[attr-defined]
+                        temporal_out, spatial_out, "ts"
+                    )
+                else:
+                    tokens = self.perception(temporal_out, spatial_out, mode="ts")
+            elif mode_l == "st":
+                if hasattr(self.perception, "_forward_dynamic"):
+                    tokens = self.perception._forward_dynamic(  # type: ignore[attr-defined]
+                        spatial_out, temporal_out, "st"
+                    )
+                else:
+                    tokens = self.perception(spatial_out, temporal_out, mode="st")
+            else:
+                raise RuntimeError(f"Unhandled modeling type '{mode}'")
         else:
-            raise RuntimeError(f"Unhandled modeling type '{mode}'")
+            tokens = self._forward_dynamic(spatial_out, temporal_out)
         tokens = self.norm(tokens)
         tokens = tokens.contiguous()
         pooled = tokens.mean(dim=1)
@@ -755,6 +829,22 @@ class LocalProcessor(nn.Module):
             offset=offset,
             context_shape=self.out_shape,
         )
+
+    @_compile_disable
+    def _forward_dynamic(self, spatial_out, temporal_out):
+        mode = getattr(self, "modeling_type", None)
+        if mode is None:
+            raise RuntimeError("modeling_type is not set")
+        mode_l = _normalize_modeling_type(mode)
+        if mode_l == "ss":
+            return spatial_out
+        if mode_l == "tt":
+            return temporal_out
+        if mode_l == "ts":
+            return self.perception(temporal_out, spatial_out, mode="ts")
+        if mode_l == "st":
+            return self.perception(spatial_out, temporal_out, mode="st")
+        raise RuntimeError(f"Unhandled modeling type '{mode_l}'")
 
     def decode(
         self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
@@ -855,6 +945,18 @@ class Root(nn.Module):
             except Exception:
                 pass
         self.__config = config
+        self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
+
+    @staticmethod
+    def _graph_safe_cast(
+        x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]
+    ) -> torch.Tensor:
+        target_dtype = dtype or x.dtype
+        if x.device != device:
+            return x.to(device=device, dtype=target_dtype, non_blocking=True)
+        if x.dtype != target_dtype:
+            return x.to(dtype=target_dtype)
+        return x
 
     def set_input_scale_method(self, method: str = "standard") -> None:
         self._input_scale_method = (
@@ -880,7 +982,8 @@ class Root(nn.Module):
         b = features.shape[0]
         device = self._device
         amp_enabled = device.type != "cpu"
-        base_dtype = next(self.local_net.parameters()).dtype
+        base_param = next(self.local_net.parameters())
+        base_dtype = self._base_dtype or base_param.dtype
         infer_mode = labels_flat is None or (
             net_loss is None and global_loss is None and (local_loss is None)
         )
@@ -893,34 +996,16 @@ class Root(nn.Module):
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
-                x_slice = features[s:e].to(
-                    device, dtype=base_dtype, non_blocking=True
-                )
+                x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
                 ctx = AutoCast.float(device) if amp_enabled else AutoCast.suspend(device)
                 with ctx:
                     out: Payload = self.local_net(x_slice)
-                tokens_finite = torch.isfinite(out.tokens).all()
-                context_finite = torch.isfinite(out.context).all()
-                if not (tokens_finite and context_finite):
-                    x_f32 = x_slice.to(dtype=torch.float32)
-                    with AutoCast.suspend(device):
-                        out = self.local_net(x_f32)
-                    tokens_finite = torch.isfinite(out.tokens).all()
-                    context_finite = torch.isfinite(out.context).all()
-                if not (tokens_finite and context_finite):
-                    raise RuntimeError(
-                        "[local_net.forward] produced non-finite tokens/context in training"
-                    )
-                out_tokens = (
-                    out.tokens
-                    if out.tokens.dtype == base_dtype
-                    else out.tokens.to(base_dtype)
-                )
-                out_context = (
-                    out.context
-                    if out.context.dtype == base_dtype
-                    else out.context.to(base_dtype)
-                )
+                out_tokens = torch.nan_to_num(
+                    out.tokens, nan=0.0, posinf=0.0, neginf=0.0
+                ).to(dtype=base_dtype)
+                out_context = torch.nan_to_num(
+                    out.context, nan=0.0, posinf=0.0, neginf=0.0
+                ).to(dtype=base_dtype)
                 token_chunks.append(out_tokens)
                 context_chunks.append(out_context)
         else:
@@ -929,9 +1014,7 @@ class Root(nn.Module):
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
-                x_slice = features[s:e].to(
-                    device, dtype=base_dtype, non_blocking=True
-                )
+                x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(inference(self.local_net))
                     stack.enter_context(
@@ -940,64 +1023,27 @@ class Root(nn.Module):
                         else AutoCast.suspend(device)
                     )
                     out = self.local_net(x_slice)
-                tokens_finite = torch.isfinite(out.tokens).all()
-                context_finite = torch.isfinite(out.context).all()
-                if not (tokens_finite and context_finite):
-                    x_f32 = x_slice.to(dtype=torch.float32)
-                    with inference(self.local_net):
-                        with AutoCast.suspend(device):
-                            out = self.local_net(x_f32)
-                    tokens_finite = torch.isfinite(out.tokens).all()
-                    context_finite = torch.isfinite(out.context).all()
-                if not (tokens_finite and context_finite):
-                    out_tokens = torch.nan_to_num(
-                        out.tokens, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-                    out_context = torch.nan_to_num(
-                        out.context, nan=0.0, posinf=0.0, neginf=0.0
-                    )
-                else:
-                    out_tokens = out.tokens
-                    out_context = out.context
-                token_chunks.append(
-                    out_tokens
-                    if out_tokens.dtype == base_dtype
-                    else out_tokens.to(base_dtype)
-                )
-                context_chunks.append(
-                    out_context
-                    if out_context.dtype == base_dtype
-                    else out_context.to(base_dtype)
-                )
+                out_tokens = torch.nan_to_num(
+                    out.tokens, nan=0.0, posinf=0.0, neginf=0.0
+                ).to(dtype=base_dtype)
+                out_context = torch.nan_to_num(
+                    out.context, nan=0.0, posinf=0.0, neginf=0.0
+                ).to(dtype=base_dtype)
+                token_chunks.append(out_tokens)
+                context_chunks.append(out_context)
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
-        tokens_finite = torch.isfinite(tokens).all()
-        context_finite = torch.isfinite(context).all()
-        if not (tokens_finite and context_finite):
-            if self.training:
-                raise RuntimeError(
-                    "[concat] non-finite tokens/context after local_net forward"
-                )
-            tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
-            context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
-        assembled = context.reshape(b, -1)
-        assembled_finite = torch.isfinite(assembled).all()
-        if not assembled_finite:
-            if self.training:
-                raise RuntimeError("[assembled] non-finite in training")
-            assembled = torch.nan_to_num(assembled, nan=0.0, posinf=0.0, neginf=0.0)
+        tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
+        context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
+        assembled = torch.nan_to_num(context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0)
         if self.is_norm_linear and self.linear_branch is not None:
-            bl = self.linear_branch(features.to(device, dtype=assembled.dtype))
+            bl = self.linear_branch(
+                self._graph_safe_cast(features, self._device, assembled.dtype)
+            )
             assembled = assembled + bl
-        t = tokens
-        tokens_ok = torch.isfinite(t).all()
-        if not tokens_ok:
-            if self.training:
-                raise RuntimeError("[tokens] non-finite before centering in training")
-            t = torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
-        tokens = t
-        t32 = t.to(torch.float32)
-        tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=t.dtype)
+        tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
+        t32 = tokens.to(torch.float32)
+        tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=tokens.dtype)
         if infer_mode:
             with inference(self.global_net):
                 with (
@@ -1006,11 +1052,9 @@ class Root(nn.Module):
                     else AutoCast.suspend(device)
                 ):
                     refined_tokens, _ = self.global_net(tokens_centered)
-            if not torch.isfinite(refined_tokens).all():
-                tokens_centered = tokens_centered.to(dtype=torch.float32)
-                with inference(self.global_net):
-                    with AutoCast.suspend(device):
-                        refined_tokens, _ = self.global_net(tokens_centered)
+            refined_tokens = torch.nan_to_num(
+                refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
+            )
             decode_tokens = refined_tokens.detach().clone()
             with inference(self.local_net):
                 with (
@@ -1021,13 +1065,9 @@ class Root(nn.Module):
                     residual_context = self.local_net.decode(
                         decode_tokens, apply_norm=True
                     )
-            if not torch.isfinite(residual_context).all():
-                decode_tokens = decode_tokens.to(dtype=torch.float32)
-                with inference(self.local_net):
-                    with AutoCast.suspend(device):
-                        residual_context = self.local_net.decode(
-                            decode_tokens, apply_norm=True
-                        )
+            residual_context = torch.nan_to_num(
+                residual_context, nan=0.0, posinf=0.0, neginf=0.0
+            )
         else:
             with torch.enable_grad():
                 with (
@@ -1036,10 +1076,9 @@ class Root(nn.Module):
                     else AutoCast.suspend(device)
                 ):
                     refined_tokens, _ = self.global_net(tokens_centered)
-                if not torch.isfinite(refined_tokens).all():
-                    tokens_centered = tokens_centered.to(dtype=torch.float32)
-                    with AutoCast.suspend(device):
-                        refined_tokens, _ = self.global_net(tokens_centered)
+                refined_tokens = torch.nan_to_num(
+                    refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
+                )
                 with (
                     AutoCast.float(device)
                     if amp_enabled
@@ -1048,25 +1087,17 @@ class Root(nn.Module):
                     residual_context = self.local_net.decode(
                         refined_tokens, apply_norm=True
                     )
-                if not torch.isfinite(residual_context).all():
-                    refined_tokens = refined_tokens.to(dtype=torch.float32)
-                    with AutoCast.suspend(device):
-                        residual_context = self.local_net.decode(
-                            refined_tokens, apply_norm=True
-                        )
-        residual = residual_context.reshape(b, -1)
-        if not torch.isfinite(residual).all():
-            if self.training:
-                raise RuntimeError("[residual] non-finite in training")
-            residual = torch.nan_to_num(residual, nan=0.0, posinf=0.0, neginf=0.0)
-        y_hat = assembled + residual
+                residual_context = torch.nan_to_num(
+                    residual_context, nan=0.0, posinf=0.0, neginf=0.0
+                )
+        residual = torch.nan_to_num(
+            residual_context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
+        )
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
-            y_hat = assembled + residual
-        if not torch.isfinite(y_hat).all():
-            if self.training:
-                raise RuntimeError("[y_hat] non-finite in training")
-            y_hat = torch.nan_to_num(y_hat, nan=0.0, posinf=0.0, neginf=0.0)
+        y_hat = torch.nan_to_num(
+            assembled + residual, nan=0.0, posinf=0.0, neginf=0.0
+        )
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None

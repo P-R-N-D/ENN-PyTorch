@@ -5,6 +5,7 @@ import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..utils.optimization import (
@@ -58,11 +59,6 @@ elif not hasattr(torch.compiler, "disable"):
 
 
     torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
-
-
-_HAS_MARK_STEP = hasattr(torch, "compiler") and hasattr(
-    torch.compiler, "cudagraph_mark_step_begin"
-)
 
 
 # rollback: use vanilla LayerNorm in eager/CPU runs
@@ -169,6 +165,11 @@ class PatchEmbedding(nn.Module):
         self.d_model = int(d_model)
         self.patch = patch
         self.pad_to_multiple = bool(pad_to_multiple)
+        self.static_spatial: Optional[Tuple[int, ...]] = getattr(self, "static_spatial", None)
+        if self.static_spatial is None:
+            hw = getattr(self, "static_hw", None)
+            if hw is not None and self.ndim == 2:
+                self.static_spatial = (int(hw[0]), int(hw[1]))
         stride = patch if stride is None else stride
         match self.ndim:
             case 1:
@@ -250,16 +251,14 @@ class PatchEmbedding(nn.Module):
                 kernel = self.patch[0]
                 need = (length + kernel - 1) // kernel * kernel
                 if length < need:
-                    x = torch.nn.functional.pad(x, (0, need - length))
+                    x = F.pad(x, (0, need - length))
             case 2:
                 h, w = x.shape[-2:]
                 kh, kw = self.patch[:2]
                 need_h = (h + kh - 1) // kh * kh
                 need_w = (w + kw - 1) // kw * kw
                 if h < need_h or w < need_w:
-                    x = torch.nn.functional.pad(
-                        x, (0, need_w - w, 0, need_h - h)
-                    )
+                    x = F.pad(x, (0, need_w - w, 0, need_h - h))
             case 3:
                 t, h, w = x.shape[-3:]
                 kt, kh, kw = self.patch
@@ -267,7 +266,7 @@ class PatchEmbedding(nn.Module):
                 need_h = (h + kh - 1) // kh * kh
                 need_w = (w + kw - 1) // kw * kw
                 if t < need_t or h < need_h or w < need_w:
-                    x = torch.nn.functional.pad(
+                    x = F.pad(
                         x,
                         (0, need_w - w, 0, need_h - h, 0, need_t - t),
                     )
@@ -276,8 +275,10 @@ class PatchEmbedding(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         x = self._normalize_shape(x)
         x = torch.atleast_3d(x)
-        if x.shape[1] != self.patch[0] and self.pad_to_multiple:
-            x = self._pad(x)
+        if self.static_spatial is not None:
+            x = self._pad_or_crop_to_nd(x, self.static_spatial)
+        elif x.shape[1] != self.patch[0] and self.pad_to_multiple:
+            x = self._pad_dynamic(x)
         y = self.proj(x)
         match self.ndim:
             case 1:
@@ -297,6 +298,31 @@ class PatchEmbedding(nn.Module):
             case _:
                 raise RuntimeError("Unsupported ndim for PatchEmbedding")
         return (self.dropout(tokens), meta)
+
+    def _pad_or_crop_to_nd(self, x: torch.Tensor, target: Tuple[int, ...]) -> torch.Tensor:
+        if len(target) != self.ndim:
+            raise ValueError(
+                f"static_spatial must have length {self.ndim}, got {len(target)}"
+            )
+        tgt = [int(v) for v in target]
+        if any(v <= 0 for v in tgt):
+            raise ValueError("static_spatial values must be positive")
+        spatial = list(x.shape[-self.ndim :])
+        pads: list[int] = []
+        for cur, want in reversed(list(zip(spatial, tgt))):
+            pad_right = max(want - cur, 0)
+            pads.extend([0, pad_right])
+        if any(pads):
+            x = F.pad(x, tuple(pads))
+        slices = [slice(None)] * x.ndim
+        base = x.ndim - self.ndim
+        for offset, want in enumerate(tgt):
+            slices[base + offset] = slice(0, want)
+        return x[tuple(slices)]
+
+    @_disable_torch_compile
+    def _pad_dynamic(self, x: torch.Tensor) -> torch.Tensor:
+        return self._pad(x)
 
 
 class CrossAttention(nn.Module):
@@ -380,6 +406,7 @@ class PatchAttention(nn.Module):
         self.attn = DotProductAttention(
             num_heads=self.nhead, head_dim=self.head_dim
         )
+        self.register_buffer("_zero_mask", torch.empty(0, dtype=torch.bool), persistent=False)
 
     def _expand_mask(
         self, mask: torch.Tensor, *, target: torch.Size
@@ -401,6 +428,19 @@ class PatchAttention(nn.Module):
         B, N, _ = x.shape
         if coords.shape[:2] != (B, N):
             raise ValueError("coords must have shape (B, N, C)")
+        if attn_mask is None:
+            zero_mask = self._zero_mask
+            needs_init = (
+                zero_mask.numel() != N * N
+                or zero_mask.shape[-1] != N
+                or zero_mask.device != x.device
+            )
+            if needs_init:
+                zero_mask = torch.ones((N, N), dtype=torch.bool, device=x.device)
+            else:
+                zero_mask = zero_mask.to(device=x.device)
+            self._zero_mask = zero_mask
+            attn_mask = zero_mask
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         qh, kh, vh = (
@@ -415,23 +455,17 @@ class PatchAttention(nn.Module):
             .view(B, N, N, self.nhead, self.head_dim)
             .permute(0, 3, 1, 2, 4)
         )
-        additive: Optional[torch.Tensor] = None
-        if attn_mask is not None:
-            mask = self._expand_mask(attn_mask, target=rel_bias.shape)
-            if mask.dtype == torch.bool:
-                additive = rel_bias.new_zeros(rel_bias.shape)
-                additive = additive.masked_fill(~mask, float("-inf"))
-            else:
-                additive = mask.to(dtype=rel_bias.dtype)
+        mask = self._expand_mask(attn_mask, target=rel_bias.shape)
+        if mask.dtype == torch.bool:
+            min_value = torch.finfo(rel_bias.dtype).min
+            additive = (~mask).to(dtype=rel_bias.dtype) * min_value
+        else:
+            additive = mask.to(dtype=rel_bias.dtype)
         scores = torch.einsum("bhid,bhjd->bhij", qh, kh) / math.sqrt(
             float(self.head_dim)
         )
-        scores = scores + rel_bias
-        if additive is not None:
-            scores = scores + additive
-            attn_bias = rel_bias + additive
-        else:
-            attn_bias = rel_bias
+        scores = scores + rel_bias + additive
+        attn_bias = rel_bias + additive
         weights = torch.softmax(scores, dim=-1)
         base = self.attn(
             qh,
@@ -564,9 +598,14 @@ class DilatedAttention(nn.Module):
         )
 
         self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
+        self._mask_cache_gpu: Dict[Tuple[int, int], torch.Tensor] = {}
 
     @_disable_torch_compile
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
+        key = (L, device.index if device.type == "cuda" else -1)
+        mask_gpu = self._mask_cache_gpu.get(key)
+        if mask_gpu is not None and mask_gpu.device == device:
+            return mask_gpu
         mask_cpu = self._mask_cache_cpu.get(L)
         if mask_cpu is None:
             mask_cpu = (
@@ -577,12 +616,13 @@ class DilatedAttention(nn.Module):
                     causal=self.causal,
                 )
                 .detach()
-                .clone()
                 .contiguous()
                 .cpu()
             )
             self._mask_cache_cpu[L] = mask_cpu
-        return mask_cpu.to(device=device, non_blocking=True).clone()
+        mask_gpu = mask_cpu.to(device=device, non_blocking=True)
+        self._mask_cache_gpu[key] = mask_gpu
+        return mask_gpu
 
     def forward(  # type: ignore[override]
         self,
@@ -590,11 +630,7 @@ class DilatedAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if _HAS_MARK_STEP:
-            try:
-                torch.compiler.cudagraph_mark_step_begin()
-            except Exception:
-                pass
+        # CG 친화성: 스텝 경계 호출은 상위 루프/엔진에서 담당 (모듈 내부 호출 금지)
         if not self.batch_first:
             x = x.transpose(0, 1)
         B, L, _ = x.shape
