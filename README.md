@@ -9,6 +9,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 - **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.config` module for consistent configuration management, while orchestration internals live under `stnet.runtime.launch` for direct use when needed.
 - **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives live in `stnet.model.layers` for reuse across modules.
 - **Data transforms** – reusable preprocessing helpers are located under `stnet.data.transforms`, consolidating the former utilities in a single data namespace.
+- **Thread load balancer** – dataloader workers automatically pin to allowed CPUs, request OpenMP `proc_bind(spread)` when available, and dynamically retune PyTorch intra/inter-op thread counts to avoid oversubscription.
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
@@ -33,6 +34,7 @@ The core runtime depends on:
 - `numpy>=1.24`
 - `netifaces>=0.11`
 - `pyarrow[all]>=20.0`
+- `psutil>=5.9`
 - `tqdm>=4.66`
 
 Optional extras listed in `pyproject.toml` cover exporter stacks (`servable`), advanced optimization toolchains (`optimization`),

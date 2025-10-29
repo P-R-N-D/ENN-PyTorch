@@ -6,12 +6,19 @@ from __future__ import annotations
 import math
 import os
 import socket
+import sys
 import time
 import warnings
 from collections import deque
 from contextlib import nullcontext, suppress
 from functools import partial
 from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple, Union
+
+import ctypes
+import importlib
+import itertools
+import threading
+from threading import Lock
 
 import numpy as np
 import torch
@@ -29,6 +36,343 @@ _ARROW = patch_arrow()
 
 def identity(item: Any) -> Any:
     return item
+
+
+class ThreadLoadBalancer:
+    """Best-effort thread affinity + OpenMP proc_bind(spread) + dynamic PyTorch thread tuning.
+       If nothing is effective, transparently falls back to passthrough (no changes)."""
+
+    __slots__ = (
+        "_psutil",
+        "_allowed_cpus",
+        "_ring",
+        "_tls",
+        "_lock",
+        "_io_workers",
+        "_samples",
+        "_cpu_ns",
+        "_wall_ns",
+        "_last_retune_ts",
+        "_enabled",
+        "_pin_attempts",
+        "_pin_success",
+        "_omp_ok",
+    )
+
+    def __init__(self, io_workers: int) -> None:
+        self._psutil = self._try_import_psutil()
+        self._allowed_cpus = self._get_allowed_cpus_psutil_first()
+        if not self._allowed_cpus:
+            self._allowed_cpus = list(range(max(1, os.cpu_count() or 1)))
+        self._ring = itertools.cycle(self._allowed_cpus)
+        self._tls = threading.local()
+        self._lock = Lock()
+        self._io_workers = max(1, int(io_workers))
+        self._samples = 0
+        self._cpu_ns = 0
+        self._wall_ns = 0
+        self._last_retune_ts = time.perf_counter()
+        self._pin_attempts = 0
+        self._pin_success = 0
+        self._omp_ok = self._omp_try_set_spread_best_effort()
+        self._enabled = (len(self._allowed_cpus) >= 2) or self._omp_ok
+        self._pre_tune(io_workers)
+
+    @staticmethod
+    def _try_import_psutil():
+        try:
+            return importlib.import_module("psutil")
+        except Exception:
+            return None
+
+    def _get_allowed_cpus_psutil_first(self) -> list[int]:
+        if self._psutil is not None:
+            try:
+                proc = self._psutil.Process()
+                if hasattr(proc, "cpu_affinity"):
+                    cpus = proc.cpu_affinity()
+                    if cpus:
+                        return sorted({int(c) for c in cpus})
+            except Exception:
+                pass
+        if os.name == "nt":
+            try:
+                k32 = ctypes.windll.kernel32
+                k32.GetActiveProcessorGroupCount.restype = ctypes.c_ushort
+                k32.GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
+                k32.GetActiveProcessorCount.restype = ctypes.c_ushort
+                group_count = int(k32.GetActiveProcessorGroupCount())
+                counts = [int(k32.GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
+                groups = list(range(group_count))
+                try:
+                    GetCurrentProcess = k32.GetCurrentProcess
+                    GetProcessGroupAffinity = getattr(k32, "GetProcessGroupAffinity", None)
+                    if GetProcessGroupAffinity:
+                        handle = GetCurrentProcess()
+                        arr_type = ctypes.c_ushort * max(1, group_count)
+                        arr = arr_type()
+                        needed = ctypes.c_ushort(group_count)
+                        if GetProcessGroupAffinity(handle, ctypes.byref(needed), arr):
+                            groups = list(arr)[: int(needed.value)]
+                except Exception:
+                    pass
+                flattened: list[int] = []
+                base = 0
+                for group_index in range(group_count):
+                    count = counts[group_index]
+                    if group_index in groups:
+                        flattened.extend(range(base, base + count))
+                    base += count
+                if flattened:
+                    return flattened
+            except Exception:
+                pass
+        try:
+            return sorted(int(c) for c in os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        return list(range(max(1, os.cpu_count() or 1)))
+
+    @staticmethod
+    def _omp_try_set_spread_best_effort() -> bool:
+        candidates: list[str] = []
+        plat = sys.platform
+        if plat.startswith("linux"):
+            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
+        elif plat == "darwin":
+            candidates = ["libomp.dylib", "libiomp5.dylib"]
+        elif os.name == "nt":
+            candidates = ["libiomp5md.dll", "vcomp140.dll"]
+        for name in candidates:
+            try:
+                lib = ctypes.CDLL(name)
+            except OSError:
+                continue
+            try:
+                fn = getattr(lib, "omp_set_proc_bind")
+                fn.argtypes = [ctypes.c_int]
+                fn.restype = None
+                fn(4)
+                return True
+            except Exception:
+                pass
+            try:
+                kmp = getattr(lib, "kmp_set_defaults")
+                kmp.restype = None
+                kmp(b"KMP_AFFINITY=granularity=fine,scatter")
+                return True
+            except Exception:
+                pass
+        return False
+
+    def _next_core(self) -> int:
+        with self._lock:
+            return int(next(self._ring))
+
+    @staticmethod
+    def _pin_windows(core: int) -> bool:
+        try:
+            k32 = ctypes.windll.kernel32
+            GetActiveProcessorGroupCount = k32.GetActiveProcessorGroupCount
+            GetActiveProcessorCount = k32.GetActiveProcessorCount
+            GetCurrentThread = k32.GetCurrentThread
+            SetThreadAffinityMask = k32.SetThreadAffinityMask
+            SetThreadGroupAffinity = k32.SetThreadGroupAffinity
+            SetThreadIdealProcessorEx = getattr(k32, "SetThreadIdealProcessorEx", None)
+
+            GetActiveProcessorGroupCount.restype = ctypes.c_ushort
+            GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
+            GetActiveProcessorCount.restype = ctypes.c_ushort
+            group_count = int(GetActiveProcessorGroupCount())
+            counts = [int(GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
+            total = sum(counts) or (os.cpu_count() or 1)
+            idx = int(core) % max(1, total)
+            group = 0
+            within = idx
+            for gid, cnt in enumerate(counts):
+                if within < cnt:
+                    group = gid
+                    break
+                within -= cnt
+            thread_handle = GetCurrentThread()
+            if group_count <= 1:
+                mask = ctypes.c_size_t(1 << within)
+                prev = SetThreadAffinityMask(thread_handle, mask.value)
+                return bool(prev)
+
+            class GROUP_AFFINITY(ctypes.Structure):
+                _fields_ = [
+                    ("Mask", ctypes.c_ulonglong),
+                    ("Group", ctypes.c_ushort),
+                    ("Reserved", ctypes.c_ushort * 3),
+                ]
+
+            affinity = GROUP_AFFINITY(ctypes.c_ulonglong(1 << within), ctypes.c_ushort(group), (ctypes.c_ushort * 3)(0, 0, 0))
+            ok = SetThreadGroupAffinity(thread_handle, ctypes.byref(affinity), None)
+            if ok and SetThreadIdealProcessorEx is not None:
+                try:
+                    class PROCESSOR_NUMBER(ctypes.Structure):
+                        _fields_ = [
+                            ("Group", ctypes.c_ushort),
+                            ("Number", ctypes.c_ubyte),
+                            ("Reserved", ctypes.c_ubyte),
+                        ]
+
+                    proc_num = PROCESSOR_NUMBER(group, within, 0)
+                    SetThreadIdealProcessorEx(thread_handle, ctypes.byref(proc_num), None)
+                except Exception:
+                    pass
+            return bool(ok)
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pin_linux_like(core: int) -> bool:
+        try:
+            tid = threading.get_native_id()
+            os.sched_setaffinity(tid, {int(core)})  # type: ignore[attr-defined]
+            return True
+        except Exception:
+            try:
+                os.sched_setaffinity(0, {int(core)})  # type: ignore[attr-defined]
+                return True
+            except Exception:
+                return False
+
+    @staticmethod
+    def _pin_bsd(core: int) -> bool:
+        # BSD 계열은 표준 per-thread API가 제각각이라 안전하게 no-op 처리.
+        return False
+
+    def _pin_once(self) -> None:
+        if not self._enabled:
+            return
+        attempts = getattr(self._tls, "attempts", 0)
+        if getattr(self._tls, "pinned", False) or attempts >= 4:
+            return
+        self._tls.attempts = attempts + 1
+        core = self._next_core()
+        ok = False
+        if os.name == "nt":
+            ok = self._pin_windows(core)
+        else:
+            plat = sys.platform
+            if plat.startswith("linux"):
+                ok = self._pin_linux_like(core)
+            elif "bsd" in plat:
+                ok = self._pin_bsd(core)
+            elif plat == "darwin":
+                try:
+                    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                    THREAD_AFFINITY_POLICY = 4
+
+                    class thread_affinity_policy_data_t(ctypes.Structure):
+                        _fields_ = [("affinity_tag", ctypes.c_int)]
+
+                    policy = thread_affinity_policy_data_t(int(core) + 1)
+                    lib.mach_thread_self.restype = ctypes.c_uint
+                    lib.thread_policy_set.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
+                    port = lib.mach_thread_self()
+                    result = lib.thread_policy_set(port, THREAD_AFFINITY_POLICY, ctypes.byref(policy), 1)
+                    ok = result == 0
+                except Exception:
+                    ok = False
+        self._tls.pinned = bool(ok)
+        self._pin_attempts += 1
+        if ok:
+            self._pin_success += 1
+        if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
+            self._enabled = False
+
+    @staticmethod
+    def _set_torch_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
+        if intra is not None:
+            try:
+                torch.set_num_threads(max(1, int(intra)))
+            except Exception:
+                pass
+        if inter is not None and hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(max(1, int(inter)))
+            except Exception:
+                pass
+
+    def _pre_tune(self, io_workers: int) -> None:
+        if not self._enabled:
+            return
+        cpus = max(1, len(self._allowed_cpus))
+        tuned_workers = max(1, min(int(io_workers), cpus))
+        self._io_workers = tuned_workers
+        try:
+            intra = int(torch.get_num_threads())
+        except Exception:
+            intra = cpus
+        if intra * tuned_workers > cpus:
+            new_intra = max(1, cpus // tuned_workers)
+            self._set_torch_threads(intra=new_intra)
+        want_inter = max(1, min(tuned_workers // 2, 4))
+        self._set_torch_threads(inter=want_inter)
+
+    def _retune_if_needed(self) -> None:
+        if not self._enabled:
+            return
+        if self._samples < 128:
+            return
+        now = time.perf_counter()
+        if (now - self._last_retune_ts) < 1.0:
+            return
+        with self._lock:
+            cpu_ns = self._cpu_ns
+            wall_ns = self._wall_ns
+            self._cpu_ns = 0
+            self._wall_ns = 0
+            self._samples = 0
+        self._last_retune_ts = now
+        if wall_ns <= 0:
+            return
+        cpu_ratio = cpu_ns / float(wall_ns)
+        cpus = max(1, len(self._allowed_cpus))
+        workers = max(1, self._io_workers)
+        if cpu_ratio >= 0.5:
+            target_intra = max(1, cpus // workers)
+            if cpus >= 8:
+                target_intra = min(target_intra, 2)
+            self._set_torch_threads(intra=target_intra)
+            self._set_torch_threads(inter=max(1, min(2, workers)))
+        else:
+            relaxed = min(4, max(1, cpus // max(1, workers // 2)))
+            current = max(1, torch.get_num_threads())
+            if current < relaxed:
+                self._set_torch_threads(intra=relaxed)
+
+    def wrap_map(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+        if not self._enabled:
+            return fn
+
+        def _inner(x: Any) -> Any:
+            self._pin_once()
+            t0 = time.perf_counter_ns()
+            thread_time = getattr(time, "thread_time_ns", None)
+            tc0 = thread_time() if callable(thread_time) else 0
+            y = fn(x)
+            tc1 = thread_time() if callable(thread_time) else 0
+            t1 = time.perf_counter_ns()
+            with self._lock:
+                self._samples += 1
+                self._cpu_ns += max(0, int(tc1) - int(tc0))
+                self._wall_ns += max(0, int(t1) - int(t0))
+            self._retune_if_needed()
+            return y
+
+        return _inner
+
+    def tune_workers(self, io_workers: int) -> int:
+        if not self._enabled:
+            return int(io_workers)
+        cpus = max(1, len(self._allowed_cpus))
+        tuned = max(1, min(int(io_workers), cpus))
+        self._io_workers = tuned
+        return tuned
 
 
 
@@ -122,6 +466,10 @@ def _wrap_data_node(
     cpu_budget = max(1, cpu_total - 1) if cpu_total > 1 else 1
     proc_target = max(io_workers, 2)
     proc_workers = max(1, min(cpu_budget, proc_target))
+
+    load_balancer = ThreadLoadBalancer(io_workers)
+    io_workers = load_balancer.tune_workers(io_workers)
+    map_fn = load_balancer.wrap_map(map_fn)
 
     thread_max_concurrent = io_workers
     wrapped: BaseNode = ParallelMapper(
