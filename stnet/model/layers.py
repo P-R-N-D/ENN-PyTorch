@@ -5,6 +5,7 @@ import math
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from ..utils.optimization import (
@@ -250,16 +251,14 @@ class PatchEmbedding(nn.Module):
                 kernel = self.patch[0]
                 need = (length + kernel - 1) // kernel * kernel
                 if length < need:
-                    x = torch.nn.functional.pad(x, (0, need - length))
+                    x = F.pad(x, (0, need - length))
             case 2:
                 h, w = x.shape[-2:]
                 kh, kw = self.patch[:2]
                 need_h = (h + kh - 1) // kh * kh
                 need_w = (w + kw - 1) // kw * kw
                 if h < need_h or w < need_w:
-                    x = torch.nn.functional.pad(
-                        x, (0, need_w - w, 0, need_h - h)
-                    )
+                    x = F.pad(x, (0, need_w - w, 0, need_h - h))
             case 3:
                 t, h, w = x.shape[-3:]
                 kt, kh, kw = self.patch
@@ -267,7 +266,7 @@ class PatchEmbedding(nn.Module):
                 need_h = (h + kh - 1) // kh * kh
                 need_w = (w + kw - 1) // kw * kw
                 if t < need_t or h < need_h or w < need_w:
-                    x = torch.nn.functional.pad(
+                    x = F.pad(
                         x,
                         (0, need_w - w, 0, need_h - h, 0, need_t - t),
                     )
@@ -314,7 +313,7 @@ class PatchEmbedding(nn.Module):
             pad_right = max(want - cur, 0)
             pads.extend([0, pad_right])
         if any(pads):
-            x = torch.nn.functional.pad(x, tuple(pads))
+            x = F.pad(x, tuple(pads))
         slices = [slice(None)] * x.ndim
         base = x.ndim - self.ndim
         for offset, want in enumerate(tgt):
