@@ -965,7 +965,6 @@ def epoch(
 
 
 def main(*args: Any) -> Optional[Root]:
-    log_error()
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
