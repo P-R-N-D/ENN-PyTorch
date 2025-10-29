@@ -50,7 +50,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..utils.datatype import to_torch
-from ..utils.debug import is_fake_tensor, log_error
+from ..utils.debug import is_fake_tensor
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
 from ..utils.optimization import (
