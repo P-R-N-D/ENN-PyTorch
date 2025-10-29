@@ -314,7 +314,7 @@ class PatchEmbedding(nn.Module):
             pad_right = max(want - cur, 0)
             pads.extend([0, pad_right])
         if any(pads):
-            x = F.pad(x, tuple(pads))
+            x = torch.nn.functional.pad(x, tuple(pads))
         slices = [slice(None)] * x.ndim
         base = x.ndim - self.ndim
         for offset, want in enumerate(tgt):
