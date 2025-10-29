@@ -22,25 +22,25 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[servable]
    ```
-   Additional extras include `zeromq`, `optimization`, `nvidia_gds`, `nvidia_te`, `intel_ai`, `nvidia_rdma`, `arrow_cuda`, and `retention` as defined in `pyproject.toml`.
+   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `nvidia_rdma_cu12`, `nvidia_rdma_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
 
-- `torch>=2.6`
-- `torchvision>=0.16`
-- `torchdata>=0.11`
-- `tensordict>=0.10.0`
-- `numpy>=1.24`
+- `torch>=2.7.0`
+- `torchvision>=0.22.0`
+- `torchdata>=0.11.0`
+- `tensordict>=0.8.0`
+- `numpy>=2.2.5`
 - `netifaces>=0.11`
-- `pyarrow[all]>=20.0`
-- `psutil>=5.9`
-- `tqdm>=4.66`
+- `pyarrow>=20.0.0`
+- `tqdm>=4.67.1`
+- `pyzmq>=26.3.0`
 
-Optional extras listed in `pyproject.toml` cover exporter stacks (`servable`), advanced optimization toolchains (`optimization`),
-vendor accelerators (`intel_ai`, `nvidia_te`), storage pipelines (`nvidia_gds`), distributed fabrics (`nvidia_rdma`), Arrow GPU acceleration (`arrow_cuda`),
-message queue backends (`zeromq`), and retention-focused research modules (`retention`).
-Install `stnet-pytorch[zeromq]` or `pyzmq` manually when the ZeroMQ-based message queue helpers are required.
+Optional extras listed in `pyproject.toml` cover dataframe integrations (`pandas`, `polars`), spreadsheet tooling (`excel`), Spark pipelines (`spark`),
+advanced optimization toolchains (`optimization`), vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`), storage pipelines
+(`nvidia_gds_cu12`, `nvidia_gds_cu13`), distributed fabrics (`nvidia_rdma_cu12`, `nvidia_rdma_cu13`), and retention-focused research modules
+(`torchscale`). Install the `servable` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
 
 ## Quick start
 ```python
