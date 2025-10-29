@@ -6,20 +6,20 @@ numpy>=2.2.5
 netifaces>=0.11
 pyarrow>=20.0.0
 tqdm>=4.67.1
+pyzmq>=26.3.0
 
 # Optional extras (install via `pip install -e .[extra]`):
 # pandas: pandas>=2.2.0
 # polars: polars>=1.30.0
 # excel: openpyxl>=3.1.5, fastexcel>=0.14.0
 # spark: pyspark[pandas_on_spark]>=4.0.0
-# zmq: pyzmq>=26.3.0
 # optimization: torchao>=0.11.0, psutil>=7.0.0
 # nvidia_gds_cu12: cupy-cuda12x>=13.4.1, kvikio-cu12>=25.4.0
 # nvidia_gds_cu13: cupy-cuda13x>=13.6.0, kvikio-cu13>=25.10.0
 # nvidia_te_cu12: transformer-engine-cu12>=2.2.0, transformer-engine-torch>=2.2.0
-# nvidia_te_cu13: transformer-engine-cu12>=0.0.0a0, transformer-engine-torch>=2.2.0
+# nvidia_te_cu13: transformer-engine-cu13>=0.0.0a0, transformer-engine-torch>=2.2.0
 # nvidia_rdma_cu12: ucxx-cu12>=0.43.0, distributed-ucxx-cu12>=0.43.0
-# nvidia_rdma_cu13: ucxx-cu13>=0.46.0, distributed-ucxx-cu12>=0.46.0
+# nvidia_rdma_cu13: ucxx-cu13>=0.46.0, distributed-ucxx-cu13>=0.46.0
 # intel_ai: intel-extension-for-pytorch>=2.7.0
 # servable: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
 # torchscale: torchscale>=0.3.0
