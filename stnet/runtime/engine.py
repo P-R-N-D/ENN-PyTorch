@@ -1603,6 +1603,7 @@ def main(*args: Any) -> Optional[Root]:
         total_flops: float = 0.0
         t_fetch_start = time.perf_counter_ns()
         preds: List[torch.Tensor] = []
+        recovered_streaming: bool = False
         try:
             with flop_counter, inference(model), AutoCast.float(device):
                 for _idx, _raw in enumerate(data_loader):
@@ -1672,8 +1673,32 @@ def main(*args: Any) -> Optional[Root]:
                                 os.path.join(chunk_dir, f"chunk_{chunk_idx:06d}.pt"),
                             )
                             chunk_idx += 1
-                        except Exception:
+                        except Exception as err:
                             streaming = False
+                            warnings.warn(
+                                "Streaming inference disabled after failing to write "
+                                "predictions to disk; falling back to in-memory aggregation."
+                                f" (error: {err!r})",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+                            if not recovered_streaming and chunk_idx > 0:
+                                for stored_idx in range(chunk_idx):
+                                    chunk_path = os.path.join(
+                                        chunk_dir, f"chunk_{stored_idx:06d}.pt"
+                                    )
+                                    try:
+                                        preds.append(
+                                            torch.load(chunk_path, map_location="cpu")
+                                        )
+                                    except Exception as load_err:
+                                        warnings.warn(
+                                            "Failed to recover streamed predictions from "
+                                            f"{chunk_path!r}: {load_err!r}",
+                                            RuntimeWarning,
+                                            stacklevel=2,
+                                        )
+                                recovered_streaming = True
                             preds.append(y_hat_cpu)
                     else:
                         preds.append(y_hat_cpu)
