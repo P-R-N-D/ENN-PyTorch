@@ -452,10 +452,16 @@ class Endpoint:
         split: str,
     ) -> None:
         meta = mmts._load_meta()
-        total = int(meta["N"])
-        fractions = meta.get("fractions", [1.0, 0.0])
-        train_end = int(total * float(fractions[0])) if fractions else total
-        start, end = (0, train_end) if split == "train" else (train_end, total)
+        total = int(meta.get("N", 0))
+        indices = mmts._indices()
+        start = int(getattr(indices, "start", 0))
+        stop_attr = getattr(indices, "stop", None)
+        computed_end = (
+            int(stop_attr)
+            if stop_attr is not None
+            else start + len(mmts)
+        )
+        end = min(total, computed_end) if total else computed_end
 
         batches = list(Endpoint._iter_batches(mmts, batch_size, start, end))
         if not batches:
