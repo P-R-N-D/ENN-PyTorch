@@ -14,6 +14,12 @@ from ..utils.compat import patch_torch
 patch_torch()
 
 
+def reshape_for_heads(tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int) -> torch.Tensor:
+    """[B, N, D] -> [B, H, N, Hd]."""
+
+    return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
+
+
 def expand_mask_like_prediction(
     mask: torch.Tensor, prediction: torch.Tensor
 ) -> torch.Tensor:

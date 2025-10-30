@@ -10,15 +10,7 @@ import sys
 import time
 import warnings
 from dataclasses import replace
-from typing import (
-    Any,
-    Dict,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed
@@ -64,6 +56,7 @@ from ..utils.optimization import (
     no_synchronization,
 )
 from ..utils.profiler import FlopCounter
+from ..utils.compat import maybe_mark_cudagraph_step_end
 
 
 try:
@@ -79,18 +72,7 @@ ignored_sentences = [
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
     "TypedStorage is deprecated.*",
 ]
-
-
 # --- tqdm helpers (global bar only) ---
-
-
-def _safe_len(x: Any) -> int:
-    try:
-        return int(len(x))
-    except Exception:
-        return 0
-
-
 def _infer_num_batches(loader: Any) -> int:
     """Best-effort batch count for loaders that may be stateful."""
     if loader is None:
@@ -726,13 +708,7 @@ def epochs(
                         )
 
                     with contextlib.suppress(Exception):
-                        mark_step = getattr(
-                            getattr(torch, "compiler", None),
-                            "cudagraph_mark_step_end",
-                            None,
-                        )
-                        if callable(mark_step):
-                            mark_step()
+                        maybe_mark_cudagraph_step_end()
 
                     if status_bar is not None:
                         io_elapsed = prev_io_time + float(io_time.item())

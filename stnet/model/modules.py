@@ -42,13 +42,8 @@ else:
     except Exception:
         pass
 
-try:
-    from torch.compiler import disable as _compile_disable  # type: ignore[attr-defined]
-except Exception:
-    def _compile_disable(fn=None, *, recursive: bool = False):  # type: ignore
-        if fn is None:
-            return lambda real_fn: real_fn
-        return fn
+patch_torch()
+_compile_disable = torch.compiler.disable
 
 
 from .functional import SwiGLU
@@ -68,7 +63,6 @@ try:
 except Exception:
     FLOP_PROFILER = None  # noqa: N816
 
-patch_torch()
 if TYPE_CHECKING:
     from .config import ModelConfig
 
