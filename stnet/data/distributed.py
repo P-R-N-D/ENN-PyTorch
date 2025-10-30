@@ -242,7 +242,7 @@ class Endpoint:
         start: int,
         end: int,
     ) -> Iterator[pa.RecordBatch]:
-        from .data.dataset import SampleReader
+        from .dataset import SampleReader
 
         index = start
         while index < end:
