@@ -401,8 +401,11 @@ class PatchAttention(nn.Module):
         if attn_mask is None:
             additive = torch.zeros_like(rel_bias)
         else:
+            mask = attn_mask
+            if mask.dtype is torch.bool:
+                mask = torch.logical_not(mask)
             additive = attn_mask_to_additive(
-                attn_mask,
+                mask,
                 batch=B,
                 heads=self.nhead,
                 seq_q=N,
