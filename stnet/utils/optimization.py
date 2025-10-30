@@ -858,6 +858,57 @@ def _expand_bool_mask_to_bhss(
     return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
 
 
+def attn_mask_to_additive(
+    attn_mask: torch.Tensor | None,
+    *,
+    batch: int,
+    heads: int,
+    seq_q: int,
+    seq_k: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """
+    Normalize 2D/3D/4D attention masks into a [B, H, S_q, S_k] float addend.
+    - Boolean masks -> -inf at masked positions (TE-compatible)
+    - Floating masks -> broadcast to [B, H, S_q, S_k]
+    - None -> all zeros
+    """
+
+    if attn_mask is None:
+        return torch.zeros((batch, heads, seq_q, seq_k), dtype=dtype, device=device)
+    if attn_mask.dtype is torch.bool:
+        expanded = _expand_bool_mask_to_bhss(
+            attn_mask, batch=batch, heads=heads, seq_q=seq_q, seq_k=seq_k, device=device
+        )
+        neg_inf = _te_addend(dtype, device)
+        zero = torch.zeros((), dtype=neg_inf.dtype, device=device)
+        return torch.where(expanded, neg_inf, zero).to(dtype)
+    am = attn_mask.to(device=device, dtype=dtype, non_blocking=True)
+    if am.dim() == 2:
+        if am.shape != (seq_q, seq_k):
+            raise ValueError(f"mask shape {tuple(am.shape)} incompatible with ({seq_q}, {seq_k})")
+        return am.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).contiguous()
+    if am.dim() == 3:
+        if am.shape != (batch, seq_q, seq_k):
+            raise ValueError(
+                f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+            )
+        return am.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).contiguous()
+    if am.dim() == 4:
+        b, h, sq, sk = am.shape
+        if b != batch or sq != seq_q or sk != seq_k:
+            raise ValueError(
+                f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+            )
+        if h == 1:
+            return am.expand(batch, heads, seq_q, seq_k).contiguous()
+        if h == heads:
+            return am.contiguous()
+        raise ValueError(f"mask head dimension {h} does not match expected heads {heads}")
+    raise ValueError(f"unsupported mask rank {am.dim()}")
+
+
 def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
     """Return -inf scalar; non-floating dtype은 float32로 승격."""
 

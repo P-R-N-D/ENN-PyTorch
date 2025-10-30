@@ -12,7 +12,10 @@ from ..utils.optimization import (
     DotProductAttention,
     MultiHeadAttention,
     MultiScaleRetention,
+    attn_mask_to_additive,
 )
+from ..utils.compat import patch_torch
+from .functional import reshape_for_heads
 
 try:
     from stnet.utils.compat import RMSNorm as _Norm  # type: ignore
@@ -27,38 +30,8 @@ except Exception:
     FLOP_PROFILER = None  # noqa: N816
 
 
-try:
-    # Prefer torch.compiler.disable (PyTorch ≥2.5)
-    _torch_compile_disable = torch.compiler.disable  # type: ignore[attr-defined]
-except Exception:
-    try:
-        # Fallback for PyTorch 2.0–2.4
-        import torch._dynamo as _dynamo  # type: ignore
-
-        _torch_compile_disable = _dynamo.disable  # type: ignore[attr-defined]
-    except Exception:
-
-        def _torch_compile_disable(fn=None, *, recursive=False):  # type: ignore
-            if fn is None:
-                return lambda real_fn: real_fn
-            return fn
-
-
-if not hasattr(torch, "compiler"):
-    class _TorchCompilerNamespace:
-        @staticmethod
-        def disable(fn=None, *, recursive=False):  # type: ignore
-            return _torch_compile_disable(fn, recursive=recursive)
-
-
-    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
-elif not hasattr(torch.compiler, "disable"):
-
-    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore
-        return _torch_compile_disable(fn, recursive=recursive)
-
-
-    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
+patch_torch()
+_torch_compile_disable = torch.compiler.disable
 
 
 # rollback: use vanilla LayerNorm in eager/CPU runs
@@ -121,12 +94,6 @@ def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
         return [0.0 for _ in range(depth)]
     step = float(max_rate) / max(1, depth)
     return [step * float(index + 1) for index in range(depth)]
-
-
-def reshape_for_heads(
-    tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
-) -> torch.Tensor:
-    return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
 
 
 class PatchEmbedding(nn.Module):
@@ -406,18 +373,6 @@ class PatchAttention(nn.Module):
         self.attn = DotProductAttention(
             num_heads=self.nhead, head_dim=self.head_dim
         )
-        self.register_buffer("_zero_mask", torch.empty(0, dtype=torch.bool), persistent=False)
-
-    def _expand_mask(
-        self, mask: torch.Tensor, *, target: torch.Size
-    ) -> torch.Tensor:
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-        if mask.shape[-2:] != target[-2:]:
-            raise ValueError("Attention mask shape mismatch in PatchAttention")
-        return mask
 
     def forward(
         self,
@@ -428,19 +383,6 @@ class PatchAttention(nn.Module):
         B, N, _ = x.shape
         if coords.shape[:2] != (B, N):
             raise ValueError("coords must have shape (B, N, C)")
-        if attn_mask is None:
-            zero_mask = self._zero_mask
-            needs_init = (
-                zero_mask.numel() != N * N
-                or zero_mask.shape[-1] != N
-                or zero_mask.device != x.device
-            )
-            if needs_init:
-                zero_mask = torch.ones((N, N), dtype=torch.bool, device=x.device)
-            else:
-                zero_mask = zero_mask.to(device=x.device)
-            self._zero_mask = zero_mask
-            attn_mask = zero_mask
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         qh, kh, vh = (
@@ -455,12 +397,22 @@ class PatchAttention(nn.Module):
             .view(B, N, N, self.nhead, self.head_dim)
             .permute(0, 3, 1, 2, 4)
         )
-        mask = self._expand_mask(attn_mask, target=rel_bias.shape)
-        if mask.dtype == torch.bool:
-            min_value = torch.finfo(rel_bias.dtype).min
-            additive = (~mask).to(dtype=rel_bias.dtype) * min_value
+        # note: when no mask is provided, additive is a zero tensor (no masking)
+        if attn_mask is None:
+            additive = torch.zeros_like(rel_bias)
         else:
-            additive = mask.to(dtype=rel_bias.dtype)
+            mask = attn_mask
+            if mask.dtype is torch.bool:
+                mask = torch.logical_not(mask)
+            additive = attn_mask_to_additive(
+                mask,
+                batch=B,
+                heads=self.nhead,
+                seq_q=N,
+                seq_k=N,
+                dtype=rel_bias.dtype,
+                device=rel_bias.device,
+            )
         scores = torch.einsum("bhid,bhjd->bhij", qh, kh) / math.sqrt(
             float(self.head_dim)
         )

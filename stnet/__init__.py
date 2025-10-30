@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any
-
 from . import model as model_ns
 from .config import (
     BuildConfig,
@@ -17,6 +15,7 @@ from .config import (
     patch_config,
     runtime_config,
 )
+from .runtime import joining, load_model, new_model, predict, save_model, train
 
 Root = model_ns.Root
 SpatialEncoder = model_ns.SpatialEncoder
@@ -78,38 +77,3 @@ __all__ = [
     "DataFidelityLoss",
 ]
 
-
-def new_model(*args: Any, **kwargs: Any) -> Any:
-    from .utils.io import new_model as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def load_model(*args: Any, **kwargs: Any) -> Any:
-    from .utils.io import load_model as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def save_model(*args: Any, **kwargs: Any) -> Any:
-    from .utils.io import save_model as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def joining(*args: Any, **kwargs: Any) -> Any:
-    from .utils.optimization import joining as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def train(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.launch import train as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def predict(*args: Any, **kwargs: Any) -> Any:
-    from .runtime.launch import predict as _impl
-
-    return _impl(*args, **kwargs)

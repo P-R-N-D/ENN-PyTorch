@@ -234,6 +234,16 @@ def patch_torch(
     return compat
 
 
+def maybe_mark_cudagraph_step_end() -> None:
+    """Call torch.compiler.cudagraph_mark_step_end() if present (no-op otherwise)."""
+    try:
+        mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
+        if callable(mark_step):
+            mark_step()
+    except Exception:
+        pass
+
+
 class ArrowCompat:
     def __init__(self, module: Any, flight: Any) -> None:
         self.module = module
