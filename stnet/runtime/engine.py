@@ -43,7 +43,7 @@ from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..utils.datatype import to_torch
-from ..utils.debug import is_fake_tensor
+from ..utils import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
 from ..utils.optimization import (
@@ -163,16 +163,10 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
 def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
     hits: list[str] = []
     for name, param in module.named_parameters(recurse=True):
-        if (
-            getattr(param, "is_meta", False)
-            or is_fake_tensor(param)
-        ):
+        if is_meta_or_fake_tensor(param):
             hits.append(f"param {name} shape={tuple(param.shape)}")
     for name, buffer in module.named_buffers(recurse=True):
-        if (
-            getattr(buffer, "is_meta", False)
-            or is_fake_tensor(buffer)
-        ):
+        if is_meta_or_fake_tensor(buffer):
             hits.append(f"buffer {name} shape={tuple(buffer.shape)}")
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
@@ -187,9 +181,7 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
 
     def _pre(module: torch.nn.Module, inputs: Tuple[Any, ...]) -> None:
         for arg in inputs:
-            if isinstance(arg, torch.Tensor) and (
-                getattr(arg, "is_meta", False) or is_fake_tensor(arg)
-            ):
+            if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
                 message = f"[META] {module.__class__.__name__} got meta input"
                 if warn_only:
                     warnings.warn(message, stacklevel=3)
@@ -217,7 +209,7 @@ def _assert_no_fake_dtensor_in_ln(
             if not isinstance(tensor, torch.Tensor):
                 continue
             data_attr = getattr(tensor, "data", None)
-            is_meta_or_fake = getattr(tensor, "is_meta", False) or is_fake_tensor(tensor)
+            is_meta_or_fake = is_meta_or_fake_tensor(tensor)
             is_dtensor = isinstance(tensor, dtensor_types) or isinstance(
                 data_attr, dtensor_types
             )
@@ -257,7 +249,7 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
             target_dtype = None
             for tensor in (weight, bias):
                 if isinstance(tensor, torch.Tensor) and tensor.is_floating_point():
-                    if not getattr(tensor, "is_meta", False) and not is_fake_tensor(tensor):
+                    if not is_meta_or_fake_tensor(tensor):
                         target_dtype = tensor.dtype
                         break
             if target_dtype is None:
@@ -266,8 +258,7 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
         if module.elementwise_affine:
             if (
                 not isinstance(weight, torch.Tensor)
-                or getattr(weight, "is_meta", False)
-                or is_fake_tensor(weight)
+                or is_meta_or_fake_tensor(weight)
                 or isinstance(weight, DTensor)
                 or isinstance(getattr(weight, "data", None), DTensor)
             ):
@@ -278,8 +269,7 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
                 weight = module.weight
             if (
                 not isinstance(bias, torch.Tensor)
-                or getattr(bias, "is_meta", False)
-                or is_fake_tensor(bias)
+                or is_meta_or_fake_tensor(bias)
                 or isinstance(bias, DTensor)
                 or isinstance(getattr(bias, "data", None), DTensor)
             ):
