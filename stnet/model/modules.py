@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from ..utils.compat import patch_torch
-from ..utils.debug import is_fake_tensor
+from ..utils import is_fake_tensor, is_meta_or_fake_tensor
 from ..utils.optimization import (
     AutoCast,
     compile,
@@ -102,9 +102,9 @@ class PointTransformer(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if getattr(x, "is_meta", False) or is_fake_tensor(x):
+        if is_meta_or_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
-        if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
+        if is_meta_or_fake_tensor(coords):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward")
         if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
             raise ValueError(
@@ -114,7 +114,7 @@ class PointTransformer(nn.Module):
         coords = coords.contiguous()
         if attn_mask is not None:
             attn_mask = attn_mask.contiguous()
-            if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
+            if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
         def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
             if not isinstance(ln, nn.LayerNorm):
@@ -133,8 +133,7 @@ class PointTransformer(nn.Module):
             if (
                 isinstance(w, torch.Tensor)
                 and (
-                    getattr(w, "is_meta", False)
-                    or is_fake_tensor(w)
+                    is_meta_or_fake_tensor(w)
                     or isinstance(w, dtensor_types)
                     or isinstance(w_data, dtensor_types)
                 )
@@ -146,8 +145,7 @@ class PointTransformer(nn.Module):
             if (
                 isinstance(b, torch.Tensor)
                 and (
-                    getattr(b, "is_meta", False)
-                    or is_fake_tensor(b)
+                    is_meta_or_fake_tensor(b)
                     or isinstance(b, dtensor_types)
                     or isinstance(b_data, dtensor_types)
                 )
@@ -160,23 +158,19 @@ class PointTransformer(nn.Module):
         _materialize_ln_(self.norm2, x)
         self._ln_materialized = True
         _x = x
-        if isinstance(_x, torch.Tensor) and (
-            getattr(_x, "is_meta", False) or is_fake_tensor(_x)
-        ):
+        if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
             raise RuntimeError("x is meta before LayerNorm")
         if _x.device.type == "cpu" and _x.is_floating_point() and _x.dtype != torch.float32:
             _x = _x.float()
         _x = self.norm1(_x)
-        if isinstance(_x, torch.Tensor) and (
-            getattr(_x, "is_meta", False) or is_fake_tensor(_x)
-        ):
+        if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
             raise RuntimeError("x is meta after LayerNorm")
         if _x.device.type == "cpu" and x.is_floating_point() and x.dtype != torch.float32:
             _x = _x.to(x.dtype)
         y = self.attn(_x, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
         _x2 = x
-        if getattr(_x2, "is_meta", False) or is_fake_tensor(_x2):
+        if is_meta_or_fake_tensor(_x2):
             raise RuntimeError("x is meta before LayerNorm(norm2)")
         if (
             _x2.device.type == "cpu"
@@ -185,7 +179,7 @@ class PointTransformer(nn.Module):
         ):
             _x2 = _x2.float()
         _x2 = self.norm2(_x2)
-        if getattr(_x2, "is_meta", False) or is_fake_tensor(_x2):
+        if is_meta_or_fake_tensor(_x2):
             raise RuntimeError("x is meta after LayerNorm(norm2)")
         if (
             _x2.device.type == "cpu"
@@ -261,9 +255,9 @@ class SpatialEncoder(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if getattr(x, "is_meta", False) or is_fake_tensor(x):
+        if is_meta_or_fake_tensor(x):
             raise RuntimeError("x is meta/fake before SpatialEncoder.forward")
-        if getattr(coords, "is_meta", False) or is_fake_tensor(coords):
+        if is_meta_or_fake_tensor(coords):
             raise RuntimeError("coords is meta/fake before SpatialEncoder.forward")
         if x.dim() != 3:
             raise ValueError(
@@ -281,13 +275,13 @@ class SpatialEncoder(nn.Module):
         x = x.contiguous()
         coords = coords.contiguous()
         if attn_mask is not None:
-            if getattr(attn_mask, "is_meta", False) or is_fake_tensor(attn_mask):
+            if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta/fake before SpatialEncoder.forward")
             attn_mask = attn_mask.contiguous()
         for blk in self.blocks:
             x = blk(x, coords, attn_mask=attn_mask)
         out = self.norm(x)
-        if getattr(out, "is_meta", False) or is_fake_tensor(out):
+        if is_meta_or_fake_tensor(out):
             raise RuntimeError("SpatialEncoder produced meta/fake tensor")
         return out.contiguous()
 
@@ -319,7 +313,7 @@ class TemporalEncoderBlock(nn.Module):
         causal_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
-        if x.is_meta:
+        if is_meta_or_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached TemporalEncoderBlock.forward")
         x = x.contiguous()
         if causal_mask is not None:
