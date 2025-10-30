@@ -1,20 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from .distributed import IOController
-from .memory import CudaIpc, GpuDirectStorage, MemoryMap, SharedMemory, Ucxx
-from .queue import CompatQueue, DistributedQueue, MessageQueue
-from .socket import Endpoint
+import sys
+
+from ..distributed import Endpoint
+from .. import distributed as socket
+
+sys.modules.setdefault(f"{__name__}.socket", socket)
 
 __all__ = [
     "Endpoint",
-    "IOController",
-    "DistributedQueue",
-    "MemoryMap",
-    "SharedMemory",
-    "CudaIpc",
-    "Ucxx",
-    "GpuDirectStorage",
-    "CompatQueue",
-    "MessageQueue",
+    "socket",
 ]

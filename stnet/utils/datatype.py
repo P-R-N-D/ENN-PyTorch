@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Sequence, Tuple, Union, cast
+from typing import Any, Dict
 
 import numpy as np
 import torch
@@ -111,16 +111,6 @@ _PLATFORM_ALIASES = {
     "canonical": "name",
 }
 
-_BOOL_TEXT = {
-    "true": True,
-    "True": True,
-    "1": True,
-    "false": False,
-    "False": False,
-    "0": False,
-}
-
-
 def _canonical_dtype_name(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
@@ -180,80 +170,3 @@ def to_torch(obj: Any) -> torch.Tensor:
 
 
 
-
-
-def ensure_bool(value: Any, *, name: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    elif isinstance(value, (int, float)):
-        return bool(value)
-    elif isinstance(value, str):
-        normalized = value.strip()
-        if normalized in _BOOL_TEXT:
-            return _BOOL_TEXT[normalized]
-    raise TypeError(f"{name} must be a boolean-compatible value")
-
-
-def ensure_int(
-    value: Any,
-    *,
-    name: str,
-    minimum: Optional[int] = None,
-    maximum: Optional[int] = None,
-) -> int:
-    try:
-        ivalue = int(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be an integer-compatible value") from exc
-    if minimum is not None and ivalue < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {ivalue}")
-    if maximum is not None and ivalue > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {ivalue}")
-    return ivalue
-
-
-def ensure_float(
-    value: Any,
-    *,
-    name: str,
-    minimum: Optional[float] = None,
-    maximum: Optional[float] = None,
-) -> float:
-    try:
-        fvalue = float(value)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be a float-compatible value") from exc
-    if minimum is not None and fvalue < minimum:
-        raise ValueError(f"{name} must be >= {minimum}, got {fvalue}")
-    if maximum is not None and fvalue > maximum:
-        raise ValueError(f"{name} must be <= {maximum}, got {fvalue}")
-    return fvalue
-
-
-def ensure_int_tuple(
-    value: Any,
-    *,
-    name: str,
-    dims: int,
-    allow_none: bool = False,
-    keep_scalar: bool = False,
-) -> Optional[Union[int, Tuple[int, ...]]]:
-    if value is None:
-        if allow_none:
-            return None
-        raise TypeError(f"{name} cannot be None")
-    if isinstance(value, int):
-        ivalue = ensure_int(value, name=name, minimum=1)
-        if keep_scalar:
-            return cast(Union[int, Tuple[int, ...]], ivalue)
-        return tuple([ivalue] * dims)
-    if isinstance(value, (list, tuple)):
-        if len(value) != dims:
-            raise ValueError(f"{name} must have length {dims}, got {len(value)}")
-        items = tuple(ensure_int(v, name=name, minimum=1) for v in value)
-        return items
-    raise TypeError(f"{name} must be an int or sequence of {dims} integers")
-
-
-def ensure_int_sequence(xs: Sequence[int]) -> Tuple[int, ...]:
-    return tuple(int(x) for x in xs)

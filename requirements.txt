@@ -1,12 +1,10 @@
 torch>=2.7.0
-torchvision>=0.22.0
 torchdata>=0.11.0
 tensordict>=0.8.0
 numpy>=2.2.5
 netifaces>=0.11.0
 pyarrow>=20.0.0
 tqdm>=4.67.1
-pyzmq>=26.3.0
 
 # Optional extras (install via `pip install -e .[extra]`):
 # pandas: pandas>=2.2.0

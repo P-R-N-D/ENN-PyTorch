@@ -8,12 +8,12 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from ..utils.platform import Network
-from ..utils.compat import patch_arrow
+from .utils.platform import Network
+from .utils.compat import patch_arrow
 
 
 if TYPE_CHECKING:
-    from ..data.dataset import SampleReader
+    from .data.dataset import SampleReader
 
 
 _ARROW = patch_arrow()
@@ -21,6 +21,13 @@ pa = _ARROW.module
 flight = _ARROW.flight
 if flight is None:
     raise ImportError("pyarrow.flight is required for Endpoint support")
+
+
+__all__ = [
+    "Endpoint",
+    "client",
+    "server",
+]
 
 
 class Endpoint:
@@ -235,7 +242,7 @@ class Endpoint:
         start: int,
         end: int,
     ) -> Iterator[pa.RecordBatch]:
-        from ..data.dataset import SampleReader
+        from .data.dataset import SampleReader
 
         index = start
         while index < end:
