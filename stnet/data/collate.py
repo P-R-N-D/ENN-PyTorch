@@ -26,7 +26,7 @@ import torch.distributed as dist
 from torch.distributed import distributed_c10d
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
-from ..transport.socket import Endpoint
+from ..distributed import Endpoint
 from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
 from ..utils.platform import Distributed, Network, System

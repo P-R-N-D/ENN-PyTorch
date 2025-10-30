@@ -28,14 +28,12 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 The core runtime depends on:
 
 - `torch>=2.7.0`
-- `torchvision>=0.22.0`
 - `torchdata>=0.11.0`
 - `tensordict>=0.8.0`
 - `numpy>=2.2.5`
-- `netifaces>=0.11`
+- `netifaces>=0.11.0`
 - `pyarrow>=20.0.0`
 - `tqdm>=4.67.1`
-- `pyzmq>=26.3.0`
 
 Optional extras listed in `pyproject.toml` cover dataframe integrations (`pandas`, `polars`), spreadsheet tooling (`excel`), Spark pipelines (`spark`),
 advanced optimization toolchains (`optimization`), vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`), storage pipelines
