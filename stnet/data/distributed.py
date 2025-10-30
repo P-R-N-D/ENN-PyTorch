@@ -8,12 +8,12 @@ import time
 from urllib.parse import urlparse
 from typing import TYPE_CHECKING, Any, Iterator, Tuple
 
-from .utils.platform import Network
-from .utils.compat import patch_arrow
+from ..utils.platform import Network
+from ..utils.compat import patch_arrow
 
 
 if TYPE_CHECKING:
-    from .data.dataset import SampleReader
+    from .dataset import SampleReader
 
 
 _ARROW = patch_arrow()

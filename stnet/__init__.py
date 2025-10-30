@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from . import model as model_ns
-from . import distributed as socket
 from .config import (
     BuildConfig,
     ModelConfig,
@@ -76,6 +75,5 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
-    "socket",
 ]
 
