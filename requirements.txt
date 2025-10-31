@@ -19,5 +19,5 @@ tqdm>=4.67.1
 # nvidia_rdma_cu12: ucxx-cu12>=0.43.0, distributed-ucxx-cu12>=0.43.0
 # nvidia_rdma_cu13: ucxx-cu13>=0.46.0, distributed-ucxx-cu13>=0.46.0
 # intel_ai: intel-extension-for-pytorch>=2.7.0
-# servable: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
+# service: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
 # torchscale: torchscale>=0.3.0
