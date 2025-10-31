@@ -20,7 +20,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```
    Optional exporter extras are available via:
    ```bash
-   pip install -e .[servable]
+   pip install -e .[service]
    ```
 -   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `compiler`, and `torchscale` as defined in `pyproject.toml`.
 
@@ -105,7 +105,7 @@ The runtime helpers manage distributed checkpoints, mixed precision, exporter re
 When following `notebook.ipynb` to materialize features from `raw_data.xlsx`, the CUDA profile keeps the model depth at 1152 with larger microbatches while the CPU path dials the depth back to 512 and halves the microbatch size to remain memory efficient. Both flows share the same tokenizer geometry so predictions remain shape-compatible across devices.
 
 ## Exporting for inference
-Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `servable` extra to enable the full conversion toolkit.
+Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `service` extra to enable the full conversion toolkit.
 
 ## License
 **Code** is licensed under **PolyForm Noncommercial 1.0.0**
