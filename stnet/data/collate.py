@@ -3,12 +3,9 @@
 
 from __future__ import annotations
 
-import math
 import os
-import socket
 import sys
 import time
-import warnings
 from collections import deque
 from contextlib import nullcontext, suppress
 from functools import partial
@@ -20,18 +17,11 @@ import itertools
 import threading
 from threading import Lock
 
-import numpy as np
 import torch
-import torch.distributed as dist
-from torch.distributed import distributed_c10d
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
-from .distributed import Endpoint
-from ..utils.compat import has_arrow_flight, patch_arrow
 from ..utils.datatype import to, to_torch
-from ..utils.platform import Distributed, Network, System
-
-_ARROW = patch_arrow()
+from ..utils.platform import System
 
 
 def identity(item: Any) -> Any:
@@ -402,54 +392,6 @@ def _convert_mapping_to_batch(
     return {"X": features, "Y": labels_tensor}
 
 
-def _world_info() -> Tuple[int, int, int, bool]:
-    rank = int(os.environ.get("RANK", os.environ.get("PMI_RANK", "0")))
-    local_rank = int(
-        os.environ.get(
-            "LOCAL_RANK", os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", "0")
-        )
-    )
-    world_env = os.environ.get("WORLD_SIZE", os.environ.get("PMI_SIZE"))
-    world: Optional[int] = None
-    if world_env is not None:
-        with suppress(ValueError):
-            world = int(world_env)
-    if world is None:
-        with suppress(Exception):
-            world = int(Distributed.get_world_size())
-    world = world or 1
-    return (rank, local_rank, world, world > 1)
-
-
-def _negotiate() -> Tuple[int, bool]:
-    if not (dist.is_available() and dist.is_initialized()):
-        return (0, True)
-    world = Distributed.get_world_size()
-    rank = dist.get_rank()
-    hostname = socket.gethostname()
-    hosts: list[str] = ["" for _ in range(world)]
-    dist.all_gather_object(hosts, hostname)
-    peers = [index for index, value in enumerate(hosts) if value == hostname]
-    leader_rank = min(peers) if peers else rank
-    ordered = list(dict.fromkeys(sorted(hosts)))
-    node_id = ordered.index(hostname) if hostname in ordered else 0
-    return (node_id, rank == leader_rank)
-
-
-def _new_flight(split: str, name: str, uri: str) -> Tuple[str, str]:
-    if not (dist.is_available() and dist.is_initialized()):
-        return (name, uri)
-    node_id, is_leader = _negotiate()
-    store = distributed_c10d._get_default_store()
-    key = f"flight/endpoints/{node_id}/{split}".encode("utf-8")
-    if is_leader:
-        store.set(key, f"{name}|{uri}".encode("utf-8"))
-    dist.barrier()
-    value = store.get(key).decode("utf-8")
-    published_name, published_uri = value.split("|", 1)
-    return (published_name, published_uri)
-
-
 def _wrap_data_node(
     node: IterableWrapper,
     *,
@@ -557,181 +499,6 @@ def _build_local_loaders(
             length=len(batcher_vl),
         )
     return (train_loader, val_loader, keep)
-
-
-def _iterate_flight_batches(
-    client: Endpoint.Client,
-    name: str,
-    *,
-    features_np_dtype: Any,
-    labels_np_dtype: Any,
-    label_shape: Sequence[int],
-) -> Iterator[Dict[str, torch.Tensor]]:
-    reader = client.reader(name, timeout_s=120.0)
-    for record_batch in reader:
-        batch_size_rb = int(getattr(record_batch, "num_rows", 0)) or int(
-            len(record_batch.column(0))
-        )
-        features_arr = record_batch.column(0)
-        features_np = _ARROW.to_numpy(features_arr, zero_copy_only=False)
-        if isinstance(features_np, np.ndarray) and features_np.dtype == object:
-            features_np = np.array(features_arr.to_pylist(), dtype=np.float64)
-        if not isinstance(features_np, np.ndarray):
-            features_np = np.array(features_np, copy=True)
-        if (
-            getattr(features_np, "flags", None) is None
-            or not features_np.flags.writeable
-            or (not features_np.flags.c_contiguous)
-        ):
-            features_np = np.ascontiguousarray(features_np).copy()
-        if features_np.dtype != features_np_dtype:
-            features_np = features_np.astype(features_np_dtype, copy=False)
-        features_tensor = torch.from_numpy(features_np).view(batch_size_rb, -1)
-
-        labels_arr = record_batch.column(1)
-        labels_np = _ARROW.to_numpy(labels_arr, zero_copy_only=False)
-        if isinstance(labels_np, np.ndarray) and labels_np.dtype == object:
-            labels_np = np.array(labels_arr.to_pylist(), dtype=np.float64)
-        if not isinstance(labels_np, np.ndarray):
-            labels_np = np.array(labels_np, copy=True)
-        if (
-            getattr(labels_np, "flags", None) is None
-            or not labels_np.flags.writeable
-            or (not labels_np.flags.c_contiguous)
-        ):
-            labels_np = np.ascontiguousarray(labels_np).copy()
-        if labels_np.dtype != labels_np_dtype:
-            labels_np = labels_np.astype(labels_np_dtype, copy=False)
-        labels_tensor = torch.from_numpy(labels_np)
-        if label_shape:
-            labels_tensor = labels_tensor.reshape(batch_size_rb, -1).view(
-                batch_size_rb, *label_shape
-            )
-        else:
-            labels_tensor = labels_tensor.reshape(batch_size_rb, -1)
-        yield {"X": features_tensor, "Y": labels_tensor}
-
-
-def _build_flight_loaders(
-    memmap_dir: str,
-    batch_size: int,
-    val_frac: float,
-    *,
-    device: torch.device,
-    threads: Dict[str, int],
-    prefetch_factor: int,
-    non_blocking_copy: bool,
-    map_fn: Callable[[Any], Any],
-    batch_reader_cls: type,
-    sample_reader_cls: type,
-) -> Tuple[Any, Optional[Any], _Keep]:
-    rank, local_rank, _, is_ddp = _world_info()
-    name_train = Endpoint.resource_key(memmap_dir, "train")
-    name_val = Endpoint.resource_key(memmap_dir, "val")
-    reader_tr = sample_reader_cls.from_dir(
-        memmap_dir,
-        split="train",
-        batch_size=int(batch_size),
-        val_frac=val_frac,
-    )
-    reader_vl = (
-        sample_reader_cls.from_dir(
-            memmap_dir,
-            split="val",
-            batch_size=int(batch_size),
-            val_frac=val_frac,
-        )
-        if val_frac > 0
-        else None
-    )
-    meta = reader_tr._load_meta()
-    keep = _Keep(reader_tr, reader_vl)
-    features_np_dtype = to(meta.get("features_arrow_dtype", "float64"), "numpy")
-    labels_np_dtype = to(meta.get("labels_arrow_dtype", "float64"), "numpy")
-    try:
-        loopback_host = Network.get_preferred_ip(
-            "localhost", allow_loopback=True
-        )
-        host = "0.0.0.0" if is_ddp else (loopback_host or "127.0.0.1")
-        uri_value = ""
-        if not is_ddp or local_rank == 0:
-            server, uri_value = Endpoint.start_server_standby(host=host, port=0)
-            keep.add(server)
-            Endpoint.reg_mmt_dataset(
-                server, name_train, reader_tr, int(batch_size), "train"
-            )
-            if reader_vl is not None:
-                Endpoint.reg_mmt_dataset(
-                    server, name_val, reader_vl, int(batch_size), "val"
-                )
-            name_train, uri_value = _new_flight("train", name_train, uri_value)
-            if reader_vl is not None:
-                name_val, uri_value = _new_flight("val", name_val, uri_value)
-        else:
-            name_train, uri_value = _new_flight("train", name_train, "")
-            if reader_vl is not None:
-                name_val, uri_value = _new_flight("val", name_val, uri_value)
-        client = Endpoint.Client(uri_value)
-        keep.add(client)
-        label_shape = list(meta.get("label_shape", []))
-
-        train_indices = reader_tr._indices()
-        train_start = int(getattr(train_indices, "start", 0))
-        train_stop = int(getattr(train_indices, "stop", 0))
-        train_steps = max(
-            1,
-            math.ceil(max(0, train_stop - train_start) / float(max(1, batch_size))),
-        )
-        node_tr = IterableWrapper(
-            _iterate_flight_batches(
-                client,
-                name_train,
-                features_np_dtype=features_np_dtype,
-                labels_np_dtype=labels_np_dtype,
-                label_shape=label_shape,
-            )
-        )
-        train_loader = _wrap_data_node(
-            node_tr,
-            device=device,
-            threads=threads,
-            prefetch_factor=prefetch_factor,
-            non_blocking_copy=non_blocking_copy,
-            map_fn=map_fn,
-            length=train_steps,
-        )
-        if reader_vl is not None:
-            val_indices = reader_vl._indices()
-            val_start = int(getattr(val_indices, "start", 0))
-            val_stop = int(getattr(val_indices, "stop", 0))
-            val_steps = max(
-                1,
-                math.ceil(max(0, val_stop - val_start) / float(max(1, batch_size))),
-            )
-            node_vl = IterableWrapper(
-                _iterate_flight_batches(
-                    client,
-                    name_val,
-                    features_np_dtype=features_np_dtype,
-                    labels_np_dtype=labels_np_dtype,
-                    label_shape=label_shape,
-                )
-            )
-            val_loader = _wrap_data_node(
-                node_vl,
-                device=device,
-                threads=threads,
-                prefetch_factor=prefetch_factor,
-                non_blocking_copy=non_blocking_copy,
-                map_fn=map_fn,
-                length=val_steps,
-            )
-        else:
-            val_loader = None
-        return (train_loader, val_loader, keep)
-    except Exception:
-        keep.cleanup()
-        raise
 
 
 class DevicePrefetcher(Iterator[Any]):
@@ -1213,7 +980,6 @@ def dataloader(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = False,
     flatten_features: bool = False,
-    io_backend: str = "auto",
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     device_obj = (
@@ -1221,17 +987,6 @@ def dataloader(
         if not isinstance(device, torch.device)
         else device
     )
-    backend_input = io_backend or "auto"
-    if not isinstance(backend_input, str):
-        raise TypeError(
-            "io_backend must be a string such as 'auto', 'local', or 'flight'"
-        )
-    backend_normalized = backend_input.lower()
-    allow_fallback = backend_normalized == "auto"
-    if backend_normalized == "auto":
-        backend = "flight" if has_arrow_flight() else "local"
-    else:
-        backend = backend_normalized
     threads = System.optimize_threads()
     map_fn = partial(
         fetch,
@@ -1250,36 +1005,9 @@ def dataloader(
         sample_reader_cls=SampleReader,
     )
 
-    if backend == "local":
-        return _build_local_loaders(
-            memmap_dir,
-            int(batch_size),
-            val_frac,
-            **wrap_kwargs,
-        )
-    if backend != "flight":
-        raise ValueError(f"Unsupported io_backend: {backend_input!r}")
-
-    try:
-        return _build_flight_loaders(
-            memmap_dir,
-            int(batch_size),
-            val_frac,
-            **wrap_kwargs,
-        )
-    except Exception as exc:
-        if not allow_fallback:
-            raise
-        warnings.warn(
-            (
-                "Arrow Flight backend unavailable"
-                f" ({exc}). Falling back to the local memory-mapped dataloader."
-            ),
-            RuntimeWarning,
-        )
-        return _build_local_loaders(
-            memmap_dir,
-            int(batch_size),
-            val_frac,
-            **wrap_kwargs,
-        )
+    return _build_local_loaders(
+        memmap_dir,
+        int(batch_size),
+        val_frac,
+        **wrap_kwargs,
+    )

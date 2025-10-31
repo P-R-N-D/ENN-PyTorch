@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import Iterable, Optional
 
+import inspect
+
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -142,14 +144,27 @@ def wrap_fsdp_module(
     Additional keyword arguments mirror those accepted by ``fully_shard``.
     """
 
-    sharded = fully_shard(
-        module,
-        mesh=mesh,
-        mp_policy=mp_policy,
-        reshard_after_forward=reshard_after_forward,
-        sync_module_states=sync_module_states,
-        ignored_params=ignored_params,
-    )
+    sig = inspect.signature(fully_shard)
+    params = sig.parameters
+
+    args = [module]
+    kwargs = {}
+
+    if "mesh" in params:
+        kwargs["mesh"] = mesh
+    elif "process_group" in params and mesh is not None:
+        kwargs["process_group"] = mesh
+
+    if "mp_policy" in params and mp_policy is not None:
+        kwargs["mp_policy"] = mp_policy
+    if "reshard_after_forward" in params:
+        kwargs["reshard_after_forward"] = reshard_after_forward
+    if "sync_module_states" in params:
+        kwargs["sync_module_states"] = sync_module_states
+    if "ignored_params" in params and ignored_params is not None:
+        kwargs["ignored_params"] = ignored_params
+
+    sharded = fully_shard(*args, **kwargs)
     try:
         sharded.set_requires_gradient_sync(True)
     except AttributeError:

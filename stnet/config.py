@@ -129,7 +129,7 @@ class ModelConfig:
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     enable_compilation: bool = False
-    compile_mode: str = "default"
+    compile_mode: str = "disabled"
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> PatchConfig:

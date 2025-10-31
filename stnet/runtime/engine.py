@@ -1074,9 +1074,11 @@ def main(*args: Any) -> Optional[Root]:
             mkldnn_backend.enabled = False
 
     ret_sink: Optional[Dict[Any, Any]] = None
-    if len(args) == 1 and isinstance(args[0], RuntimeConfig):
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if isinstance(args[0], RuntimeConfig):
         ops = args[0]
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        if len(args) >= 2:
+            ret_sink = args[1]
     elif len(args) >= 2 and isinstance(args[1], RuntimeConfig):
         local_rank = int(args[0])
         ops = args[1]
@@ -1084,8 +1086,8 @@ def main(*args: Any) -> Optional[Root]:
             ret_sink = args[2]
     else:
         raise TypeError(
-            "main expects (RuntimeConfig,), (local_rank, RuntimeConfig), or "
-            "(local_rank, RuntimeConfig, ret_sink) arguments"
+            "main expects (RuntimeConfig,), (RuntimeConfig, ret_sink), "
+            "(local_rank, RuntimeConfig), or (local_rank, RuntimeConfig, ret_sink) arguments"
         )
 
     if ops.mode == "train":
@@ -1553,7 +1555,6 @@ def main(*args: Any) -> Optional[Root]:
                 val_frac=float(ops.val_frac),
                 prefetch_factor=ops.prefetch_factor,
                 non_blocking_copy=bool(ops.overlap_h2d),
-                io_backend="auto",
             )
             if restore_dl_state:
                 with contextlib.suppress(Exception):
@@ -1731,7 +1732,6 @@ def main(*args: Any) -> Optional[Root]:
             val_frac=0.0,
             prefetch_factor=ops.prefetch_factor,
             non_blocking_copy=True,
-            io_backend="auto",
         )
         total_batches = _infer_num_batches(data_loader)
         status_bar: Optional[tqdm]
