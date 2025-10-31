@@ -39,7 +39,7 @@ Optional extras listed in `pyproject.toml` include:
 - dataframe integrations (`pandas`, `polars`)
 - spreadsheet tooling (`excel`)
 - Spark pipelines (`spark`)
-- advanced optimization toolchains (`optimization`)
+- advanced optimization toolchains (`thread`, `torchao`)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
 - storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`)
 - retention-focused research modules (`torchscale`)
