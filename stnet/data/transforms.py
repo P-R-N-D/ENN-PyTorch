@@ -3,12 +3,11 @@ from __future__ import annotations
 
 import math
 from contextlib import suppress
-from typing import Any, Dict, List, Mapping, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from tensordict import TensorDictBase
 
 from ..utils.datatype import to_torch_tensor
 
@@ -446,7 +445,7 @@ def _preprocess_label_tensor(value: Any) -> torch.Tensor:
 def preprocess(
     data: Dict[Tuple, torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
-    if isinstance(data, (Mapping, TensorDictBase)) and "X" in data and ("Y" in data):
+    if isinstance(data, dict) and "X" in data and ("Y" in data):
         x, y = (data["X"], data["Y"])
         batch_result = _preprocess_maybe_batch(x, y)
         if batch_result is not None:
@@ -460,8 +459,6 @@ def preprocess(
         keys = [_preprocess_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
-    elif isinstance(data, TensorDictBase):
-        return preprocess(data.to_dict())
     elif isinstance(data, (tuple, list)) and len(data) >= 2:
         x, y = (data[0], data[1])
         batch_result = _preprocess_maybe_batch(x, y)

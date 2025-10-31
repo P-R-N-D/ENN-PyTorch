@@ -49,9 +49,11 @@ from ..utils.platform import Distributed, System
 from ..utils.optimization import (
     AdamW,
     AutoCast,
+    inference,
     LossWeightController,
     Module,
-    inference,
+)
+from ..utils.distributed import (
     joining,
     no_synchronization,
 )
@@ -1510,7 +1512,6 @@ def main(*args: Any) -> Optional[Root]:
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
-            loss_key="loss_top",
         )
         bottom_loss = TiledLoss(
             _z,
@@ -1519,7 +1520,6 @@ def main(*args: Any) -> Optional[Root]:
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
-            loss_key="loss_bottom",
         )
         loss_controller = LossWeightController()
         ckpt_state_path = dl_state_path(ops.ckpt_dir or "")

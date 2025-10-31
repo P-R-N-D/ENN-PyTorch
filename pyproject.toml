@@ -13,34 +13,33 @@ license-files = ["LICENSE*"]
 authors = [{ name = "Kim Jeseok" }]
 keywords = ["transformer", "spatio-temporal", "pytorch", "fp8", "training"]
 dependencies = [
-  "torch>=2.9.0",
+  "torch>=2.7.0",
   "torchdata>=0.11.0",
-  "tensordict>=0.10.0",
-  "torchrl>=0.10.0",
-  "triton>=3.5.0",
-  "numpy>=2.3.4",
+  "tensordict>=0.8.0",
+  "numpy>=2.2.5",
   "netifaces>=0.11.0",
   "tqdm>=4.67.1"
 ]
 
 [project.optional-dependencies]
-pandas = ["pandas>=2.3.3"]
-polars = ["polars>=1.35.1"]
-excel = ["openpyxl>=3.1.5", "fastexcel>=0.16.0"]
-spark = ["pyspark[pandas_on_spark]>=4.0.1"]
-optimization = ["torchao>=0.14.1", "psutil>=7.1.2"]
-nvidia_gds_cu12 = ["cupy-cuda12x>=13.6.0", "kvikio-cu12>=25.10.0"]
+pandas = ["pandas>=2.2.0"]
+polars = ["polars>=1.30.0"]
+excel = ["openpyxl>=3.1.5", "fastexcel>=0.14.0"]
+spark = ["pyspark[pandas_on_spark]>=4.0.0"]
+optimization = ["torchao>=0.11.0", "psutil>=7.0.0"]
+nvidia_gds_cu12 = ["cupy-cuda12x>=13.4.1", "kvikio-cu12>=25.4.0"]
 nvidia_gds_cu13 = ["cupy-cuda13x>=13.6.0", "kvikio-cu13>=25.10.0"]
-nvidia_te_cu12 = ["transformer-engine-cu12>=2.8.0", "transformer-engine-torch>=2.8.0"]
-nvidia_te_cu13 = ["transformer-engine-cu13>=0.0.0a0", "transformer-engine-torch>=2.8.0"]
-intel_ai = ["intel-extension-for-pytorch>=2.8.0"]
+nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
+nvidia_te_cu13 = ["transformer-engine-cu13>=0.0.0a0", "transformer-engine-torch>=2.2.0"]
+intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
+compiler = ["triton>=3.2.0; platform_system == 'Linux' and platform_machine == 'x86_64'"]
 service = [
-  "onnx>=1.19.1",
+  "onnx>=1.18.0",
   "onnx-tf>=1.10.0",
-  "onnx2tf>=1.28.3",
+  "onnx2tf>=1.27.2",
   "coremltools>=8.3.0",
-  "tensorrt>=10.13.3.9",
-  "executorch>=1.0.0"
+  "tensorrt>=10.10.0.31",
+  "executorch>=0.6.0"
 ]
 torchscale = ["torchscale>=0.3.0"]
 

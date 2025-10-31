@@ -10,7 +10,6 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 from tensordict import MemoryMappedTensor
-from tensordict import tensorclass
 
 try:
     from torchdata.nodes import IterableWrapper
@@ -50,12 +49,6 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     path = os.path.join(memmap_dir, "meta.json")
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
-
-
-@tensorclass
-class Sample:
-    X: torch.Tensor
-    Y: torch.Tensor
 
 
 class SampleReader:
@@ -189,9 +182,7 @@ class SampleReader:
         )
         for index in self._indices():
             feat = feat_mmt[index]
-            label = label_mmt[index]
-            if label_shape:
-                label = label.view(*label_shape)
+            label = label_mmt[index].view(*label_shape)
             feat_tensor = (
                 feat
                 if isinstance(feat, torch.Tensor)
@@ -202,8 +193,7 @@ class SampleReader:
                 if isinstance(label, torch.Tensor)
                 else torch.as_tensor(label)
             )
-            sample = Sample(X=feat_tensor, Y=label_tensor)
-            yield sample.to_tensordict()
+            yield (feat_tensor, label_tensor)
 
     def __len__(self) -> int:
         return len(self._indices())

@@ -6,7 +6,7 @@ import os
 import shutil
 import warnings
 from dataclasses import asdict
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -153,7 +153,7 @@ def train(
 
 def predict(
     model: Root,
-    data: Any,
+    data: Dict[Tuple, torch.Tensor],
     *args: Any,
     batch_size: int = 512,
     seed: int = 7,
@@ -184,19 +184,17 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
-    normalized_data = data
-    if isinstance(data, Mapping):
-        if any((v is None for v in data.values())):
-            dummy_shape = tuple(model.out_shape)
-            normalized_data = {
-                k: (
-                    torch.zeros(dummy_shape)
-                    if v is None
-                    else torch.as_tensor(v).view(*dummy_shape)
-                )
-                for k, v in data.items()
-            }
-    feats, labels, keys, label_shape = preprocess(normalized_data)
+    if any((v is None for v in data.values())):
+        dummy_shape = tuple(model.out_shape)
+        data = {
+            k: (
+                torch.zeros(dummy_shape)
+                if v is None
+                else torch.as_tensor(v).view(*dummy_shape)
+            )
+            for k, v in data.items()
+        }
+    feats, labels, keys, label_shape = preprocess(data)
     SampleReader.materialize(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
