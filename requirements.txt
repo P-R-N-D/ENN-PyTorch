@@ -2,6 +2,7 @@ torch>=2.9.0
 torchdata>=0.11.0
 tensordict>=0.10.0
 torchrl>=0.10.0
+triton>=3.5.0
 numpy>=2.3.4
 netifaces>=0.11.0
 tqdm>=4.67.1
@@ -12,13 +13,10 @@ tqdm>=4.67.1
 # excel: openpyxl>=3.1.5, fastexcel>=0.16.0
 # spark: pyspark[pandas_on_spark]>=4.0.1
 # optimization: torchao>=0.14.1, psutil>=7.1.2
-# compiler (Linux x86_64): triton>=3.5.0
 # nvidia_gds_cu12: cupy-cuda12x>=13.6.0, kvikio-cu12>=25.10.0
 # nvidia_gds_cu13: cupy-cuda13x>=13.6.0, kvikio-cu13>=25.10.0
 # nvidia_te_cu12: transformer-engine-cu12>=2.8.0, transformer-engine-torch>=2.8.0
 # nvidia_te_cu13: transformer-engine-cu13>=0.0.0a0, transformer-engine-torch>=2.8.0
-# nvidia_rdma_cu12: ucxx-cu12>=0.46.0, distributed-ucxx-cu12>=0.46.0
-# nvidia_rdma_cu13: ucxx-cu13>=0.46.0, distributed-ucxx-cu13>=0.46.0
 # intel_ai: intel-extension-for-pytorch>=2.8.0
 # service: onnx>=1.19.1, onnx-tf>=1.10.0, onnx2tf>=1.28.3, coremltools>=8.3.0, tensorrt>=10.13.3.9, executorch>=1.0.0
 # torchscale: torchscale>=0.3.0
