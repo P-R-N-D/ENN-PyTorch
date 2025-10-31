@@ -912,24 +912,27 @@ class Root(nn.Module):
             )
         except Exception:
             pass
-        mode = str(getattr(config, "compile_mode", "disabled"))
-        try:
-            self.local_net = compile(
-                self.local_net,
-                mode=mode,
-                fullgraph=False,
-                dynamic=False,
-                backend="inductor",
-            )
-            self.global_net = compile(
-                self.global_net,
-                mode=mode,
-                fullgraph=False,
-                dynamic=False,
-                backend="inductor",
-            )
-        except Exception:
-            pass
+        raw_mode = getattr(config, "compile_mode", "disabled")
+        mode = str(raw_mode or "").strip()
+        normalized_mode = mode.lower()
+        disable_compile = normalized_mode in {"", "disabled", "none"}
+        compile_mode_arg = normalized_mode if not disable_compile else None
+        self.local_net = compile(
+            self.local_net,
+            mode=compile_mode_arg,
+            fullgraph=False,
+            dynamic=False,
+            backend="inductor",
+            disable=disable_compile,
+        )
+        self.global_net = compile(
+            self.global_net,
+            mode=compile_mode_arg,
+            fullgraph=False,
+            dynamic=False,
+            backend="inductor",
+            disable=disable_compile,
+        )
         self.__config = config
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
 

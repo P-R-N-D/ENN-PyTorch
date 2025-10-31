@@ -285,9 +285,16 @@ def coerce_model_config(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
     )
-    args["compile_mode"] = str(
-        filtered.get("compile_mode", getattr(defaults, "compile_mode"))
-    )
+    raw_compile_mode = filtered.get("compile_mode", getattr(defaults, "compile_mode"))
+    if raw_compile_mode is None:
+        normalized_compile_mode = getattr(defaults, "compile_mode")
+    else:
+        normalized_compile_mode = str(raw_compile_mode).strip()
+        if not normalized_compile_mode:
+            normalized_compile_mode = getattr(defaults, "compile_mode")
+        else:
+            normalized_compile_mode = normalized_compile_mode.lower()
+    args["compile_mode"] = normalized_compile_mode
 
     return ModelConfig(**args)
 

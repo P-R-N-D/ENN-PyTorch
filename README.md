@@ -4,7 +4,7 @@
 This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level runtime API for model construction, training, inference, and export utilities. The runtime manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, compilation options, and other hyperparameters that tailor the spatio-temporal transformer. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compiler hints organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
+- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, and compiler hints through a single `compile_mode` string (default: `"disabled"`) instead of a boolean flag. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compilation options organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
 - **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
 - **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.config` module for consistent configuration management, while orchestration internals live under `stnet.runtime.launch` for direct use when needed.
 - **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives live in `stnet.model.layers` for reuse across modules.
@@ -22,7 +22,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[servable]
    ```
-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `nvidia_rdma_cu12`, `nvidia_rdma_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
+   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `nvidia_rdma_cu12`, `nvidia_rdma_cu13`, `intel_ai`, `compiler`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
@@ -35,10 +35,25 @@ The core runtime depends on:
 - `pyarrow>=20.0.0`
 - `tqdm>=4.67.1`
 
-Optional extras listed in `pyproject.toml` cover dataframe integrations (`pandas`, `polars`), spreadsheet tooling (`excel`), Spark pipelines (`spark`),
-advanced optimization toolchains (`optimization`), vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`), storage pipelines
-(`nvidia_gds_cu12`, `nvidia_gds_cu13`), distributed fabrics (`nvidia_rdma_cu12`, `nvidia_rdma_cu13`), and retention-focused research modules
-(`torchscale`). Install the `servable` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+Optional extras listed in `pyproject.toml` include:
+- dataframe integrations (`pandas`, `polars`)
+- spreadsheet tooling (`excel`)
+- Spark pipelines (`spark`)
+- advanced optimization toolchains (`optimization`)
+- vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
+- storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`)
+- distributed fabrics (`nvidia_rdma_cu12`, `nvidia_rdma_cu13`)
+- retention-focused research modules (`torchscale`)
+- compiler niceties (`compiler`, which installs Triton kernels on Linux/x86_64 hosts)
+
+Install the `servable` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+
+### Compiler configuration
+
+`ModelConfig.compile_mode` accepts the same modes as `torch.compile` (for example `"default"`, `"reduce-overhead"`, or `"max-autotune"`).
+The runtime now treats `"disabled"`, `"none"`, or an empty string as an explicit request to skip compilation, so you no longer need the
+legacy `enable_compilation` flag. The helper in `stnet.utils.optimization.compile` normalizes the value, trims whitespace, and avoids
+calling `torch.compile` when compilation is disabled or unsupported.
 
 ## Quick start
 ```python
@@ -54,7 +69,13 @@ from stnet import (
 )
 
 patch = PatchConfig(is_cube=True, grid_size_3d=(10, 10, 1), patch_size_3d=(1, 1, 1))
-config = build_config(modeling_type="spatiotemporal", depth=64, heads=4, patch=patch)
+config = build_config(
+    modeling_type="spatiotemporal",
+    depth=64,
+    heads=4,
+    patch=patch,
+    compile_mode="default",  # set to "disabled" (default) to keep eager execution
+)
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
 features = torch.randn(32, model.in_dim)
