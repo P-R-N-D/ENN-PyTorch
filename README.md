@@ -50,7 +50,7 @@ Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core M
 
 `ModelConfig.compile_mode` accepts the same modes as `torch.compile` (for example `"default"`, `"reduce-overhead"`, or `"max-autotune"`).
 The runtime now treats `"disabled"`, `"none"`, or an empty string as an explicit request to skip compilation, so you no longer need the
-legacy `enable_compilation` flag. The helper in `stnet.utils.optimization.compile` normalizes the value, trims whitespace, and avoids
+legacy `enable_compilation` flag. The helper in `stnet.kernels.compile` normalizes the value, trims whitespace, and avoids
 calling `torch.compile` when compilation is disabled or unsupported.
 
 ## Quick start

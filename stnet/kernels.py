@@ -25,9 +25,9 @@ import torch
 import torch._dynamo
 from torch import nn, optim
 
-from ..data.stats import MetaData
+from .data.stats import MetaData
 
-from .platform import (
+from .utils.platform import (
     cuda_compute_capability,
     get_device,
     get_runtime_config,
@@ -40,7 +40,7 @@ from .platform import (
     optimal_optimizer_params,
 )
 from .compat import patch_torch
-from .profiler import FLOP_PROFILER, attention_flops_bshd
+from .utils.profiler import FLOP_PROFILER, attention_flops_bshd
 
 patch_torch()
 
@@ -2554,7 +2554,7 @@ def _import_callable(spec: str) -> Callable:
         raise ValueError("Empty spec for callable import")
     raw = spec.strip()
     root_pkg = __package__.split(".", 1)[0] if __package__ else "stnet"
-    default_module = f"{root_pkg}.utils.optimization"
+    default_module = f"{root_pkg}.kernels"
     if ":" in raw:
         mod_part, fn_part = raw.split(":", 1)
     else:

@@ -46,23 +46,21 @@ from ..utils.datatype import to_torch_tensor
 from ..utils import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
-from ..utils.optimization import (
+from ..kernels import (
     AdamW,
     AutoCast,
     inference,
     LossWeightController,
     Module,
 )
-from ..utils.distributed import (
-    joining,
-    no_synchronization,
-)
 from ..utils.profiler import FlopCounter
-from ..utils.compat import maybe_mark_cudagraph_step_end
+from ..compat import maybe_mark_cudagraph_step_end
 from .distributed import (
     broadcast_model_states,
     distributed_barrier,
     is_dist_avail_and_initialized,
+    joining,
+    no_synchronization,
     wrap_ddp_if_needed,
     wrap_fsdp_module,
 )
