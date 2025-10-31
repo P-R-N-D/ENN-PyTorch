@@ -16,7 +16,7 @@ try:
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
-from ..utils.compat import patch_arrow
+from ..compat import patch_arrow
 from ..utils.datatype import convert
 
 

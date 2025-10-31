@@ -12,14 +12,14 @@ from .platform import (
     get_runtime_config,
     initialize_sdpa_backends,
 )
-from .compat import (
+from ..compat import (
     SDPBackend,
     TorchCompat,
     _to_sdpa_backends,
     patch_torch,
     sdpa_kernel,
 )
-from .optimization import (
+from ..kernels import (
     AdamW,
     AutoCast,
     DotProductAttention,
@@ -29,7 +29,7 @@ from .optimization import (
     MultiScaleRetentionCompat,
     Module,
 )
-from .distributed import joining, no_synchronization
+from ..runtime.distributed import joining, no_synchronization
 from .profiler import FlopCounter, attention_flops_bshd
 from . import datatype
 

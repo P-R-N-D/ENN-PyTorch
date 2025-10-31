@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from ..utils.compat import SDPBackend, patch_torch, sdpa_kernel
+from ..compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
 

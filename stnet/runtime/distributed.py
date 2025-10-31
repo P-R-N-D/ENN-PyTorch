@@ -1,23 +1,91 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Iterable, Optional
-
+import contextlib
 import inspect
+from contextlib import AbstractContextManager
+from typing import TYPE_CHECKING, Any, Iterable, Optional, TypeAlias, Union
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import fully_shard
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.optim import Optimizer
+
+try:  # pragma: no cover - optional dependency
+    from torch.distributed.algorithms.join import Join as _TorchJoin
+except ImportError:  # pragma: no cover - optional dependency
+    _TorchJoin = None
+
+Join: type[AbstractContextManager[None]] | None = _TorchJoin
+
+if TYPE_CHECKING:  # pragma: no cover - type checking only
+    from torch.distributed._composable.fsdp import FSDPModule
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+else:  # pragma: no cover - fallback when optional deps missing
+    FSDP = object
+    FSDPModule = object
+
+JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
 
 
 __all__ = [
+    "Join",
+    "JoinableModel",
     "broadcast_model_states",
-    "is_dist_avail_and_initialized",
-    "wrap_ddp_if_needed",
     "distributed_barrier",
+    "is_dist_avail_and_initialized",
+    "joining",
+    "no_synchronization",
+    "wrap_ddp_if_needed",
     "wrap_fsdp_module",
 ]
+
+
+@contextlib.contextmanager
+def no_synchronization(
+    model: torch.nn.Module,
+    *,
+    enable: bool = True,
+) -> AbstractContextManager[None]:
+    if not enable:
+        yield
+        return
+
+    ctx: AbstractContextManager[None] | None = None
+    try:
+        no_sync = getattr(model, "no_sync", None)
+        if callable(no_sync):
+            ctx = no_sync()
+    except Exception:
+        ctx = None
+
+    if ctx is None:
+        yield
+        return
+
+    with ctx:
+        yield
+
+
+def _has_join_hook(obj: Any | None) -> bool:
+    if obj is None:
+        return False
+    return getattr(obj, "join_hook", None) is not None
+
+
+def joining(
+    model: JoinableModel,
+    optimizer: Optimizer | None = None,
+) -> AbstractContextManager[None]:
+    if Join is None:
+        return contextlib.nullcontext()
+
+    joinables = tuple(obj for obj in (model, optimizer) if _has_join_hook(obj))
+    if not joinables:
+        return contextlib.nullcontext()
+
+    return Join(joinables, throw_on_early_termination=True)  # type: ignore[arg-type]
 
 
 def is_dist_avail_and_initialized() -> bool:

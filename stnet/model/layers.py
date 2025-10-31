@@ -8,17 +8,17 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..utils.optimization import (
+from ..kernels import (
     DotProductAttention,
     MultiHeadAttention,
     MultiScaleRetention,
     attn_mask_to_additive,
 )
-from ..utils.compat import patch_torch
+from ..compat import patch_torch
 from .functional import reshape_for_heads
 
 try:
-    from stnet.utils.compat import RMSNorm as _Norm  # type: ignore
+    from stnet.compat import RMSNorm as _Norm  # type: ignore
 except Exception:
     _Norm = nn.LayerNorm
 

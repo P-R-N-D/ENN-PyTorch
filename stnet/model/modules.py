@@ -22,9 +22,9 @@ from typing import (
 import torch
 import torch.nn as nn
 
-from ..utils.compat import patch_torch
+from ..compat import patch_torch
 from ..utils import is_fake_tensor, is_meta_or_fake_tensor
-from ..utils.optimization import (
+from ..kernels import (
     AutoCast,
     compile,
     inference,
