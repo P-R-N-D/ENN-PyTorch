@@ -22,7 +22,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[service]
    ```
--   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `compiler`, and `torchscale` as defined in `pyproject.toml`.
+-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
@@ -42,7 +42,6 @@ Optional extras listed in `pyproject.toml` include:
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
 - storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`)
 - retention-focused research modules (`torchscale`)
-- compiler niceties (`compiler`, which installs Triton kernels on Linux/x86_64 hosts)
 
 Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
 
