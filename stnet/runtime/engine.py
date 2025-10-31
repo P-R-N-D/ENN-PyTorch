@@ -42,7 +42,7 @@ from ..config import (
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
-from ..utils.datatype import to_torch
+from ..utils.datatype import to_torch_tensor
 from ..utils import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from ..utils.platform import Distributed, System
@@ -599,7 +599,7 @@ def epochs(
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
                     feat, label, *_ = preprocess(_raw)
-                    X = to_torch(feat)
+                    X = to_torch_tensor(feat)
                     X = torch.atleast_2d(X)
                     if X.dim() != 2:
                         raise RuntimeError(
@@ -609,7 +609,7 @@ def epochs(
                         raise RuntimeError(
                             f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                         )
-                    Y = to_torch(label)
+                    Y = to_torch_tensor(label)
 
                     t_ready = time.perf_counter_ns()
                     if use_timer:
@@ -736,7 +736,7 @@ def epochs(
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
-                            X = to_torch(feat)
+                            X = to_torch_tensor(feat)
                             X = torch.atleast_2d(X)
                             if X.dim() != 2:
                                 raise RuntimeError(
@@ -746,7 +746,7 @@ def epochs(
                                 raise RuntimeError(
                                     f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                                 )
-                            Y = to_torch(label)
+                            Y = to_torch_tensor(label)
 
                             t_ready = time.perf_counter_ns()
                             if use_timer:
@@ -910,7 +910,7 @@ def infer(
         with flop_counter, inference(run_model), AutoCast.float(device):
             for _idx, _raw in enumerate(data_loader):
                 feat, _label, *_ = preprocess(_raw)
-                X = to_torch(feat)
+                X = to_torch_tensor(feat)
                 X = torch.atleast_2d(X)
                 if X.dim() != 2:
                     raise RuntimeError(
@@ -1510,6 +1510,7 @@ def main(*args: Any) -> Optional[Root]:
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
+            loss_key="loss_top",
         )
         bottom_loss = TiledLoss(
             _z,
@@ -1518,6 +1519,7 @@ def main(*args: Any) -> Optional[Root]:
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
+            loss_key="loss_bottom",
         )
         loss_controller = LossWeightController()
         ckpt_state_path = dl_state_path(ops.ckpt_dir or "")

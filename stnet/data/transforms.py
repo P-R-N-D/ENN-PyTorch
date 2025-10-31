@@ -3,13 +3,14 @@ from __future__ import annotations
 
 import math
 from contextlib import suppress
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from tensordict import TensorDictBase
 
-from ..utils.datatype import to_torch
+from ..utils.datatype import to_torch_tensor
 
 class _ScalerBase:
     def __init__(
@@ -389,7 +390,7 @@ def _preprocess_maybe_batch(
         feature_tensor: Any = x_value
     else:
         feature_tensor = None
-        for attr in ("to_torch", "to_tensor", "as_tensor"):
+        for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
             if not hasattr(x_value, attr):
                 continue
             with suppress(Exception):
@@ -407,7 +408,7 @@ def _preprocess_maybe_batch(
     if not isinstance(feature_tensor, torch.Tensor):
         return None
     try:
-        label_tensor = to_torch(y_value)
+        label_tensor = to_torch_tensor(y_value)
     except Exception:
         return None
     if not isinstance(label_tensor, torch.Tensor):
@@ -436,7 +437,7 @@ def _preprocess_maybe_batch(
     return (feature_tensor, label_tensor, batch_keys, label_shape)
 
 def _preprocess_label_tensor(value: Any) -> torch.Tensor:
-    tensor = to_torch(value)
+    tensor = to_torch_tensor(value)
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(value)
     return tensor.detach()
@@ -445,7 +446,7 @@ def _preprocess_label_tensor(value: Any) -> torch.Tensor:
 def preprocess(
     data: Dict[Tuple, torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
-    if isinstance(data, dict) and "X" in data and ("Y" in data):
+    if isinstance(data, (Mapping, TensorDictBase)) and "X" in data and ("Y" in data):
         x, y = (data["X"], data["Y"])
         batch_result = _preprocess_maybe_batch(x, y)
         if batch_result is not None:
@@ -459,6 +460,8 @@ def preprocess(
         keys = [_preprocess_to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
+    elif isinstance(data, TensorDictBase):
+        return preprocess(data.to_dict())
     elif isinstance(data, (tuple, list)) and len(data) >= 2:
         x, y = (data[0], data[1])
         batch_result = _preprocess_maybe_batch(x, y)

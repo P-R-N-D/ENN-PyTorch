@@ -10,6 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 import numpy as np
 import torch
 from tensordict import MemoryMappedTensor
+from tensordict import tensorclass
 
 try:
     from torchdata.nodes import IterableWrapper
@@ -17,7 +18,7 @@ except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
 from ..utils.compat import patch_arrow
-from ..utils.datatype import to
+from ..utils.datatype import convert
 
 
 _ARROW = patch_arrow()
@@ -49,6 +50,12 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     path = os.path.join(memmap_dir, "meta.json")
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+@tensorclass
+class Sample:
+    X: torch.Tensor
+    Y: torch.Tensor
 
 
 class SampleReader:
@@ -121,8 +128,8 @@ class SampleReader:
             "N": count,
             "feature_dim": feat_dim,
             "label_shape": label_shape,
-            "features_arrow_dtype": to(features.dtype, "arrow"),
-            "labels_arrow_dtype": to(labels.dtype, "arrow"),
+            "features_arrow_dtype": convert(features.dtype, "arrow"),
+            "labels_arrow_dtype": convert(labels.dtype, "arrow"),
             "fractions": [float(train_frac), float(val_frac)],
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
@@ -172,8 +179,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = to(meta.get("features_arrow_dtype", "float64"), "torch")
-        label_dtype = to(meta.get("labels_arrow_dtype", "float64"), "torch")
+        feat_dtype = convert(meta.get("features_arrow_dtype", "float64"), "torch")
+        label_dtype = convert(meta.get("labels_arrow_dtype", "float64"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -182,7 +189,9 @@ class SampleReader:
         )
         for index in self._indices():
             feat = feat_mmt[index]
-            label = label_mmt[index].view(*label_shape)
+            label = label_mmt[index]
+            if label_shape:
+                label = label.view(*label_shape)
             feat_tensor = (
                 feat
                 if isinstance(feat, torch.Tensor)
@@ -193,7 +202,8 @@ class SampleReader:
                 if isinstance(label, torch.Tensor)
                 else torch.as_tensor(label)
             )
-            yield (feat_tensor, label_tensor)
+            sample = Sample(X=feat_tensor, Y=label_tensor)
+            yield sample.to_tensordict()
 
     def __len__(self) -> int:
         return len(self._indices())
@@ -214,8 +224,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = to(meta.get("features_arrow_dtype", "float64"), "torch")
-        label_dtype = to(meta.get("labels_arrow_dtype", "float64"), "torch")
+        feat_dtype = convert(meta.get("features_arrow_dtype", "float64"), "torch")
+        label_dtype = convert(meta.get("labels_arrow_dtype", "float64"), "torch")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
