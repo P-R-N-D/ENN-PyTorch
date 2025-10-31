@@ -20,7 +20,7 @@ from threading import Lock
 import torch
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
-from ..utils.datatype import to, to_torch
+from ..utils.datatype import convert, to_torch_tensor
 from ..utils.platform import System
 
 
@@ -382,7 +382,7 @@ def _convert_mapping_to_batch(
         and (features.dim() >= 2)
     ):
         features = features.flatten(start_dim=1)
-    labels_tensor = to_torch(labels)
+    labels_tensor = to_torch_tensor(labels)
     if labels_dtype is not None and getattr(labels_tensor, "dtype", None) != labels_dtype:
         labels_tensor = labels_tensor.to(dtype=labels_dtype)
     if sanitize and torch.is_floating_point(labels_tensor):

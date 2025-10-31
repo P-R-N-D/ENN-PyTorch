@@ -27,10 +27,11 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 ## Dependencies
 The core runtime depends on:
 
-- `torch>=2.7.0`
+- `torch>=2.9.0`
 - `torchdata>=0.11.0`
-- `tensordict>=0.8.0`
-- `numpy>=2.2.5`
+- `tensordict>=0.10.0`
+- `torchrl>=0.10.0`
+- `numpy>=2.3.4`
 - `netifaces>=0.11.0`
 - `tqdm>=4.67.1`
 

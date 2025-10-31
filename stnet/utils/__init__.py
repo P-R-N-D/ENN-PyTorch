@@ -30,6 +30,11 @@ from .optimization import (
 )
 from .profiler import FlopCounter, attention_flops_bshd
 from . import datatype
+from .datatype import (
+    as_tensordict,
+    merge_tensordict,
+    td_to_plain_dict,
+)
 
 try:  # pragma: no cover - optional dependency
     from torchdistx.fake import is_fake as _tdx_is_fake  # type: ignore[attr-defined]
@@ -67,7 +72,6 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
 
     return is_meta_tensor(value) or is_fake_tensor(value)
 
-dtypes = datatype
 from ..data.transforms import (
     IncrementalPCA,
     StandardScaler,
@@ -102,12 +106,19 @@ __all__ = [
     "preprocess",
     "postprocess",
     "datatype",
+    "datatypes",
     "dtypes",
+    "as_tensordict",
+    "td_to_plain_dict",
+    "merge_tensordict",
     "is_fake_tensor",
     "is_meta_tensor",
     "is_meta_or_fake_tensor",
 ]
 
+datatypes = datatype
+dtypes = datatype
 sys.modules[__name__ + ".dtypes"] = datatype
+sys.modules[__name__ + ".datatypes"] = datatype
 
 patch_torch()
