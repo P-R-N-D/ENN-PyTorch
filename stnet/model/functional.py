@@ -2,96 +2,17 @@
 from __future__ import annotations
 
 import math
-from typing import Any, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
-from tensordict import TensorDictBase
-from torchrl.objectives import LossModule
 
 from ..utils.compat import patch_torch
-from ..utils.datatype import as_tensordict
 
 patch_torch()
 
-
-class _TensorDictLoss(LossModule):
-    """LossModule helper supporting TensorDict and legacy tensor inputs."""
-
-    def __init__(
-        self,
-        *,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_total",
-    ) -> None:
-        super().__init__()
-        self.pred_key = str(pred_key)
-        self.target_key = str(target_key)
-        if not loss_key.startswith("loss"):
-            loss_key = f"loss_{loss_key}" if loss_key else "loss"
-        self.loss_key = str(loss_key)
-
-    def _coerce_inputs(
-        self,
-        data: Any = None,
-        target: Optional[Tensor] = None,
-        **kwargs: Any,
-    ) -> Tuple[TensorDictBase, Tensor, Tensor]:
-        if isinstance(data, TensorDictBase):
-            if target is not None:
-                raise ValueError("target must be None when passing a TensorDict")
-            if kwargs:
-                raise ValueError("keyword arguments not supported with TensorDict inputs")
-            td = data
-        else:
-            mapping: dict[str, Any] = {}
-            if isinstance(data, Mapping):
-                mapping.update(data)
-            elif data is not None:
-                mapping[self.pred_key] = data
-            if target is not None:
-                mapping[self.target_key] = target
-            if kwargs:
-                mapping.update(kwargs)
-            td = as_tensordict(mapping)
-        if self.pred_key not in td.keys():
-            raise KeyError(f"Missing prediction key '{self.pred_key}' in loss input")
-        if self.target_key not in td.keys():
-            raise KeyError(f"Missing target key '{self.target_key}' in loss input")
-        pred = td.get(self.pred_key)
-        tgt = td.get(self.target_key)
-        return td, pred, tgt
-
-    def _format_output(
-        self, loss: Tensor, *, base_td: Optional[TensorDictBase] = None
-    ) -> TensorDictBase | dict[str, Tensor]:
-        if base_td is None:
-            return {self.loss_key: loss}
-        result = base_td.clone()
-        result.set(self.loss_key, loss)
-        return result
-
-
-def _extract_loss_tensor(value: Any) -> Tensor:
-    if isinstance(value, Tensor):
-        return value
-    if isinstance(value, TensorDictBase):
-        for key in value.keys():
-            result = value.get(key)
-            if isinstance(result, Tensor):
-                return result
-        raise TypeError("TensorDict-based loss output does not contain tensor values")
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if isinstance(item, Tensor) and str(key).startswith("loss"):
-                return item
-        for item in value.values():
-            if isinstance(item, Tensor):
-                return item
-    raise TypeError(f"Unsupported loss output type: {type(value)!r}")
 
 def reshape_for_heads(tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int) -> torch.Tensor:
     """[B, N, D] -> [B, H, N, Hd]."""
@@ -295,19 +216,15 @@ class SwiGLU(nn.Module):
         y = self.dropout(y)
         return self.out_proj(y)
 
-class MultipleQuantileLoss(_TensorDictLoss):
+class MultipleQuantileLoss(nn.Module):
     def __init__(
         self,
         quantiles: Sequence[float],
         weights: Optional[Sequence[float]] = None,
         quantile_dim: Optional[int] = None,
         reduction: str = "mean",
-        *,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_quantile",
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         q = torch.tensor(list(quantiles), dtype=torch.float32)
         assert q.ndim == 1 and torch.all((q > 0) & (q < 1))
         self.register_buffer("q", q)
@@ -335,7 +252,7 @@ class MultipleQuantileLoss(_TensorDictLoss):
             return candidates[0]
         raise ValueError("cannot infer quantile_dim")
 
-    def _loss(self, preds: Tensor, target: Tensor) -> Tensor:
+    def forward(self, preds: Tensor, target: Tensor) -> Tensor:
         if preds.shape != target.shape:
             raise ValueError("shape mismatch")
         qdim = self._resolve_qdim(preds.shape)
@@ -355,17 +272,7 @@ class MultipleQuantileLoss(_TensorDictLoss):
         )
         return (per_q * self.w).sum()
 
-    def forward(
-        self,
-        data: Any = None,
-        target: Optional[Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, Tensor]:  # type: ignore[override]
-        base_td, preds, tgt = self._coerce_inputs(data, target, **kwargs)
-        loss = self._loss(preds, tgt)
-        return self._format_output(loss, base_td=base_td)
-
-class StandardNormalLoss(_TensorDictLoss):
+class StandardNormalLoss(nn.Module):
     _Number = Union[float, int]
     _TensorLike = Union[_Number, torch.Tensor]
 
@@ -388,12 +295,9 @@ class StandardNormalLoss(_TensorDictLoss):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_standard_normal",
         **kwargs: Any,
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         assert 0.0 < confidence < 1.0
         assert metric.lower() in {
             "z",
@@ -528,7 +432,9 @@ class StandardNormalLoss(_TensorDictLoss):
             torch.tensor(q, device=device, dtype=dtype)
         )
 
-    def _loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError("shape mismatch")
         dims = self._get_dims(pred)
@@ -576,17 +482,7 @@ class StandardNormalLoss(_TensorDictLoss):
                 raise ValueError("Invalid penalty")
         return self._reduce(pen)
 
-    def forward(
-        self,
-        data: Any = None,
-        target: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
-        loss = self._loss(pred, tgt)
-        return self._format_output(loss, base_td=base_td)
-
-class StudentsTLoss(_TensorDictLoss):
+class StudentsTLoss(nn.Module):
     _Number = Union[float, int]
     _TensorLike = Union[_Number, torch.Tensor]
 
@@ -610,12 +506,9 @@ class StudentsTLoss(_TensorDictLoss):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_students_t",
         **kwargs: Any,
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         assert 0.0 < confidence < 1.0
         assert metric.lower() in {
             "t",
@@ -775,7 +668,9 @@ class StudentsTLoss(_TensorDictLoss):
                 hi = torch.where(mask, hi, mid)
             return hi
 
-    def _loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
         if pred.shape != target.shape:
             raise ValueError("shape mismatch")
         dims = self._get_dims(pred)
@@ -823,16 +718,6 @@ class StudentsTLoss(_TensorDictLoss):
             case _:
                 raise ValueError("Invalid penalty")
         return self._reduce(pen)
-
-    def forward(
-        self,
-        data: Any = None,
-        target: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
-        loss = self._loss(pred, tgt)
-        return self._format_output(loss, base_td=base_td)
 
 def _as_tuple(x: Any) -> Tuple[int, ...]:
     return tuple((int(v) for v in x))
@@ -896,7 +781,7 @@ def _nufft_nd_cufinufft(
             out_list.append(fk.unsqueeze(0))
     return torch.cat(out_list, dim=0)
 
-class DataFidelityLoss(_TensorDictLoss):
+class DataFidelityLoss(nn.Module):
     def __init__(
         self,
         out_shape: Sequence[int],
@@ -908,12 +793,9 @@ class DataFidelityLoss(_TensorDictLoss):
         fft_norm: Optional[str] = "ortho",
         reduction: str = "mean",
         nufft_eps: float = 1e-06,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_data_fidelity",
         **kwargs: Any,
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         self.out_shape = _as_tuple(out_shape)
         self.ndim = len(self.out_shape)
         self.mode = str(mode).lower()
@@ -947,7 +829,7 @@ class DataFidelityLoss(_TensorDictLoss):
                 val = sq.reshape(B, -1).mean(dim=1)
         return val * self.weight
 
-    def _loss(
+    def forward(
         self, pred_flat: torch.Tensor, target_flat: torch.Tensor
     ) -> torch.Tensor:
         B = int(pred_flat.shape[0])
@@ -1018,29 +900,16 @@ class DataFidelityLoss(_TensorDictLoss):
                 raise ValueError(f"Invalid mode: {self.mode}")
         return self._mse(Xk, Yk)
 
-    def forward(
-        self,
-        data: Any = None,
-        target: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
-        loss = self._loss(pred, tgt)
-        return self._format_output(loss, base_td=base_td)
-
-class LinearCombinationLoss(_TensorDictLoss):
+class LinearCombinationLoss(nn.Module):
     def __init__(
         self,
         coefficient: Sequence[float],
         loss: Sequence[nn.Module],
         *args: Any,
         offset: float = 0.0,
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_linear_combination",
         **kwargs: Any,
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         if not (
             isinstance(coefficient, (list, tuple))
             and isinstance(loss, (list, tuple))
@@ -1054,27 +923,16 @@ class LinearCombinationLoss(_TensorDictLoss):
         self.losses = nn.ModuleList(list(loss))
         self.offset = float(offset)
 
-    def _loss(self, pred: Tensor, target: Tensor) -> Tensor:
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
         for w, L in zip(self.coefficient, self.losses):
-            out = L(pred, target)
-            v = _extract_loss_tensor(out)
+            v = L(pred, target)
             if v.dim() > 0:
                 v = v.mean()
             total = total + w.to(device=pred.device, dtype=pred.dtype) * v
         return total
 
-    def forward(
-        self,
-        data: Any = None,
-        target: Optional[Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, Tensor]:  # type: ignore[override]
-        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
-        loss = self._loss(pred, tgt)
-        return self._format_output(loss, base_td=base_td)
-
-class TiledLoss(_TensorDictLoss):
+class TiledLoss(nn.Module):
     def __init__(
         self,
         base: nn.Module,
@@ -1084,12 +942,9 @@ class TiledLoss(_TensorDictLoss):
         tile_dim: Optional[int] = None,
         tile_size: Optional[int] = None,
         reduction: str = "mean",
-        pred_key: str = "pred",
-        target_key: str = "target",
-        loss_key: str = "loss_tiled",
         **kwargs: Any,
     ) -> None:
-        super().__init__(pred_key=pred_key, target_key=target_key, loss_key=loss_key)
+        super().__init__()
         self.base = base
         self.mask_mode = str(mask_mode).lower()
         self.mask_value = mask_value
@@ -1139,22 +994,16 @@ class TiledLoss(_TensorDictLoss):
         return x
 
     def forward(
-        self,
-        data: Any = None,
-        target: Optional[torch.Tensor] = None,
-        **kwargs: Any,
-    ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
-        mask = self._make_mask(pred, tgt)
+        self, pred: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        mask = self._make_mask(pred, target)
         if self.tile_dim is None or self.tile_size is None:
-            value = self.base(pred, tgt)
-            loss_tensor = _extract_loss_tensor(value)
-            reduced = self._reduce(loss_tensor, mask)
-            return self._format_output(reduced, base_td=base_td)
+            v = self.base(pred, target)
+            return self._reduce(v, mask)
         nd = pred.ndim
-        tile_dim_idx = self.tile_dim + nd if self.tile_dim < 0 else self.tile_dim
-        tile_dim_idx = max(0, min(tile_dim_idx, nd - 1))
-        N = pred.shape[tile_dim_idx]
+        td = self.tile_dim + nd if self.tile_dim < 0 else self.tile_dim
+        td = max(0, min(td, nd - 1))
+        N = pred.shape[td]
         start = 0
         total_sum = pred.new_tensor(0.0, dtype=pred.dtype)
         total_count = pred.new_tensor(0.0, dtype=pred.dtype)
@@ -1162,11 +1011,11 @@ class TiledLoss(_TensorDictLoss):
         while start < N:
             end = min(N, start + self.tile_size)
             sl = [slice(None)] * nd
-            sl[tile_dim_idx] = slice(start, end)
+            sl[td] = slice(start, end)
             pv = pred[tuple(sl)]
-            tv = tgt[tuple(sl)]
+            tv = target[tuple(sl)]
             mv = mask[tuple(sl)] if mask is not None else None
-            elem = _extract_loss_tensor(self.base(pv, tv))
+            elem = self.base(pv, tv)
             if self.reduction == "none":
                 parts.append(elem if mv is None else elem.masked_select(mv))
             elif mv is not None:
@@ -1178,13 +1027,12 @@ class TiledLoss(_TensorDictLoss):
             start = end
         match self.reduction:
             case "none":
-                result = (
-                    torch.cat(parts, dim=tile_dim_idx) if parts else pred.new_zeros(())
+                return (
+                    torch.cat(parts, dim=td) if parts else pred.new_zeros(())
                 )
-                return self._format_output(result, base_td=base_td)
             case "sum":
-                return self._format_output(total_sum, base_td=base_td)
+                return total_sum
             case "mean":
                 denom = torch.clamp(total_count, min=1.0)
-                return self._format_output(total_sum / denom, base_td=base_td)
-        return self._format_output(pred.new_zeros(()), base_td=base_td)
+                return total_sum / denom
+        return pred.new_zeros(())

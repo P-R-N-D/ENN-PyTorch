@@ -22,16 +22,15 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[servable]
    ```
-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `nvidia_rdma_cu12`, `nvidia_rdma_cu13`, `intel_ai`, `compiler`, and `torchscale` as defined in `pyproject.toml`.
+-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `compiler`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
 
-- `torch>=2.9.0`
+- `torch>=2.7.0`
 - `torchdata>=0.11.0`
-- `tensordict>=0.10.0`
-- `torchrl>=0.10.0`
-- `numpy>=2.3.4`
+- `tensordict>=0.8.0`
+- `numpy>=2.2.5`
 - `netifaces>=0.11.0`
 - `tqdm>=4.67.1`
 
@@ -42,7 +41,6 @@ Optional extras listed in `pyproject.toml` include:
 - advanced optimization toolchains (`optimization`)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
 - storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`)
-- distributed fabrics (`nvidia_rdma_cu12`, `nvidia_rdma_cu13`)
 - retention-focused research modules (`torchscale`)
 - compiler niceties (`compiler`, which installs Triton kernels on Linux/x86_64 hosts)
 

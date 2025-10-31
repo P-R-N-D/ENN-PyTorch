@@ -45,61 +45,8 @@ else:
 patch_torch()
 _compile_disable = torch.compiler.disable
 
-def unwrap(
-    module: Any,
-    *,
-    attr_priority: Sequence[str] = (
-        "module",
-        "model",
-        "_module",
-        "mod",
-        "net",
-    ),
-) -> nn.Module:
-    """Return the innermost :class:`~torch.nn.Module` from ``module``.
 
-    The helper accepts either an :class:`~torch.nn.Module` instance or a
-    bound method/function whose ``__self__`` is a module. Wrapper modules
-    (``DataParallel``/``DistributedDataParallel``/custom wrappers) are peeled
-    by following common attribute names listed in ``attr_priority`` until the
-    raw module implementation is reached.
-    """
-
-    candidate: Any
-    if isinstance(module, nn.Module):
-        candidate = module
-    else:
-        owner = getattr(module, "__self__", None)
-        if isinstance(owner, nn.Module):
-            candidate = owner
-        else:
-            raise TypeError(
-                "unwrap expects an nn.Module or bound method; "
-                f"got {type(module).__name__}."
-            )
-
-    visited: set[int] = set()
-    while isinstance(candidate, nn.Module):
-        ident = id(candidate)
-        if ident in visited:
-            break
-        visited.add(ident)
-        inner: Optional[nn.Module] = None
-        for name in attr_priority:
-            value = getattr(candidate, name, None)
-            if isinstance(value, nn.Module) and id(value) not in visited:
-                inner = value
-                break
-        if inner is None:
-            return candidate
-        candidate = inner
-
-    if isinstance(candidate, nn.Module):
-        return candidate
-    raise TypeError("Failed to unwrap module to an nn.Module instance")
-
-
-from .functional import SwiGLU, _extract_loss_tensor
+from .functional import SwiGLU
 from .layers import (
     DilatedAttention,
     CrossAttention,
@@ -1169,12 +1116,10 @@ class Root(nn.Module):
             y_top = y_hat_out
             y_bot = assembled.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
             if global_loss is not None:
-                top_result = global_loss(y_top, tgt)
-                top_component = _extract_loss_tensor(top_result)
+                top_component = global_loss(y_top, tgt)
                 total = total + weights[0] * top_component
             if local_loss is not None:
-                bottom_result = local_loss(y_bot, tgt)
-                bottom_component = _extract_loss_tensor(bottom_result)
+                bottom_component = local_loss(y_bot, tgt)
                 total = total + weights[1] * bottom_component
             if controller is not None:
                 controller.update(top_component, bottom_component)

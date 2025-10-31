@@ -20,7 +20,7 @@ from threading import Lock
 import torch
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
-from ..utils.datatype import convert, to_torch_tensor
+from ..utils.datatype import to_torch_tensor
 from ..utils.platform import System
 
 

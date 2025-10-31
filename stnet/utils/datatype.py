@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Sequence
+from typing import Any, Dict
 
 import numpy as np
 import torch
-from tensordict import TensorDict
-from tensordict import TensorDictBase
 
 from .compat import patch_arrow
 
@@ -171,57 +169,4 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
     return torch.as_tensor(obj)
 
 
-def as_tensordict(
-    data: Any = None,
-    *,
-    batch_size: Optional[Sequence[int]] = None,
-    device: Optional[torch.device] = None,
-) -> TensorDict:
-    """Return ``data`` as a :class:`~tensordict.TensorDict` instance."""
 
-    if isinstance(data, TensorDictBase):
-        return data
-    if isinstance(data, Mapping):
-        return TensorDict(
-            dict(data), batch_size=batch_size, device=device  # type: ignore[arg-type]
-        )
-    if data is None:
-        return TensorDict({}, batch_size=batch_size or [])
-    raise TypeError(f"Unsupported input type for TensorDict conversion: {type(data)!r}")
-
-
-def merge_tensordict(
-    base: TensorDictBase | Mapping[str, Any],
-    updates: Optional[Mapping[str, Any]] = None,
-) -> TensorDict:
-    """Merge ``updates`` into ``base`` returning a new tensordict."""
-
-    td = as_tensordict(base)
-    if updates:
-        td = td.clone(False)
-        for key, value in updates.items():
-            td.set(key, value)
-    return td
-
-
-def td_to_plain_dict(
-    td: TensorDictBase,
-    keys: Optional[Sequence[str]] = None,
-    *,
-    detach: bool = False,
-) -> Dict[str, Any]:
-    """Convert a tensordict into a Python dict optionally selecting ``keys``."""
-
-    if keys is not None:
-        td = td.select(*keys, strict=False)
-    out = td.to_dict()
-    if detach:
-        stack: list[Dict[str, Any]] = [out]
-        while stack:
-            current = stack.pop()
-            for name, value in current.items():
-                if isinstance(value, torch.Tensor):
-                    current[name] = value.detach()
-                elif isinstance(value, dict):
-                    stack.append(value)
-    return out

@@ -8,7 +8,7 @@ from ..config import (
     runtime_config,
 )
 from ..utils.io import load_model, new_model, save_model
-from ..utils.optimization import joining
+from ..utils.distributed import joining
 from . import launch as launch
 from .launch import predict, train
 

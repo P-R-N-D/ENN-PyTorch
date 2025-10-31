@@ -10,7 +10,6 @@ import os
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Dict,
@@ -19,7 +18,6 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    TypeAlias,
     Union,
 )
 
@@ -47,6 +45,106 @@ from .profiler import FLOP_PROFILER, attention_flops_bshd
 patch_torch()
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def is_transformer_engine_enabled(model: torch.nn.Module) -> bool:
+    te_flags = (
+        getattr(model, "__fp8_inference_te__", False),
+        getattr(model, "__fp8_training_te__", False),
+        getattr(model, "__te_fp8_default__", False),
+    )
+    if any(te_flags):
+        return True
+
+    for module in model.modules():
+        mod_name = getattr(module.__class__, "__module__", "")
+        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+            return True
+    return False
+
+
+def _is_inference_compiled(model: torch.nn.Module) -> bool:
+    compile_attrs = (
+        "_is_compiled_for_inference",
+        "__is_compiled_for_inference__",
+        "__compiled_for_serving__",
+        "__serving_compiled__",
+        "_is_serialized_for_serving",
+    )
+    if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
+        return True
+
+    jit = getattr(torch, "jit", None)
+    script_like_types: List[type] = []
+    if jit is not None:
+        for name in ("ScriptModule", "RecursiveScriptModule", "TopLevelTracedModule"):
+            typ = getattr(jit, name, None)
+            if isinstance(typ, type):
+                script_like_types.append(typ)
+        for mod_name in ("_script", "_trace"):
+            submod = getattr(jit, mod_name, None)
+            if submod is None:
+                continue
+            for name in ("RecursiveScriptModule", "TopLevelTracedModule"):
+                typ = getattr(submod, name, None)
+                if isinstance(typ, type):
+                    script_like_types.append(typ)
+
+    if any(isinstance(model, typ) for typ in script_like_types):
+        return True
+
+    try:
+        modules = tuple(model.modules())
+    except Exception:
+        modules = ()
+
+    for module in modules:
+        if module is model:
+            continue
+        if any(bool(getattr(module, attr, False)) for attr in compile_attrs):
+            return True
+        if any(isinstance(module, typ) for typ in script_like_types):
+            return True
+    return False
+
+
+def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
+    indicator_attrs = (
+        "_aot_autograd_graph",
+        "_aot_autograd_cache",
+        "_aot_compiled_autograd",
+        "_aot_autograd_traced_module",
+        "__aot_autograd__",
+        "__compiled_with_aot_autograd__",
+    )
+    if any(getattr(model, attr, None) for attr in indicator_attrs):
+        return True
+
+    try:
+        modules = tuple(model.modules())
+    except Exception:
+        modules = ()
+
+    for module in modules:
+        if module is model:
+            continue
+        if any(getattr(module, attr, None) for attr in indicator_attrs):
+            return True
+        class_name = module.__class__.__name__
+        module_name = getattr(module.__class__, "__module__", "")
+        if "AOTAutograd" in class_name or "aot_autograd" in module_name:
+            return True
+    return False
+
+
+def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
+    if (
+        is_transformer_engine_enabled(model)
+        or _is_inference_compiled(model)
+        or _is_aot_autograd_enabled(model)
+    ):
+        return torch.no_grad()
+    return torch.inference_mode()
 
 
 def _supports_scale(
@@ -636,47 +734,6 @@ def compile(
         return module
 
 
-@contextlib.contextmanager
-def no_synchronization(
-    model: nn.Module,
-    *,
-    enable: bool = True,
-) -> contextlib.AbstractContextManager[None]:
-    if not enable:
-        yield
-        return
-    ctx = None
-    try:
-        no_sync = getattr(model, "no_sync", None)
-        if callable(no_sync):
-            ctx = no_sync()
-    except Exception:
-        ctx = None
-    if ctx is None:
-        yield
-        return
-    with ctx:
-        yield
-
-try:
-    from torch.distributed.algorithms.join import Join as _TorchJoin
-except ImportError:
-    _TorchJoin = None
-
-Join: type[AbstractContextManager[None]] | None = _TorchJoin
-
-if TYPE_CHECKING:
-    from torch.distributed._composable.fsdp import FSDPModule
-    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-    from torch.nn.parallel import DistributedDataParallel as DDP
-else:
-    DDP = object
-    FSDP = object
-    FSDPModule = object
-
-JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
-
-
 def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((x, x), dim=-1).reshape(*x.shape[:-1], -1)
 
@@ -708,101 +765,6 @@ def _is_contiguous_bshd(tensor: torch.Tensor) -> bool:
         and stride[-3] == num_heads * head_dim
         and stride[-4] == seq_len * num_heads * head_dim
     )
-
-
-def is_transformer_engine_enabled(model: torch.nn.Module) -> bool:
-    te_flags = (
-        getattr(model, "__fp8_inference_te__", False),
-        getattr(model, "__fp8_training_te__", False),
-        getattr(model, "__te_fp8_default__", False),
-    )
-    if any(te_flags):
-        return True
-
-    for module in model.modules():
-        mod_name = getattr(module.__class__, "__module__", "")
-        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
-            return True
-    return False
-
-
-def _is_inference_compiled(model: torch.nn.Module) -> bool:
-    compile_attrs = (
-        "_is_compiled_for_inference",
-        "__is_compiled_for_inference__",
-        "__compiled_for_serving__",
-        "__serving_compiled__",
-        "_is_serialized_for_serving",
-    )
-    if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
-        return True
-
-    jit = getattr(torch, "jit", None)
-    script_like_types: List[type] = []
-    if jit is not None:
-        for name in ("ScriptModule", "RecursiveScriptModule", "TopLevelTracedModule"):
-            typ = getattr(jit, name, None)
-            if isinstance(typ, type):
-                script_like_types.append(typ)
-        for mod_name in ("_script", "_trace"):
-            submod = getattr(jit, mod_name, None)
-            if submod is None:
-                continue
-            for name in ("RecursiveScriptModule", "TopLevelTracedModule"):
-                typ = getattr(submod, name, None)
-                if isinstance(typ, type):
-                    script_like_types.append(typ)
-
-    if any(isinstance(model, typ) for typ in script_like_types):
-        return True
-
-    try:
-        modules = tuple(model.modules())
-    except Exception:
-        modules = ()
-
-    for module in modules:
-        if module is model:
-            continue
-        if any(bool(getattr(module, attr, False)) for attr in compile_attrs):
-            return True
-        if any(isinstance(module, typ) for typ in script_like_types):
-            return True
-    return False
-
-
-def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
-    indicator_attrs = (
-        "_aot_autograd_graph",
-        "_aot_autograd_cache",
-        "_aot_compiled_autograd",
-        "_aot_autograd_traced_module",
-        "__aot_autograd__",
-        "__compiled_with_aot_autograd__",
-    )
-    if any(getattr(model, attr, None) for attr in indicator_attrs):
-        return True
-
-    try:
-        modules = tuple(model.modules())
-    except Exception:
-        modules = ()
-
-    for module in modules:
-        if module is model:
-            continue
-        if any(getattr(module, attr, None) for attr in indicator_attrs):
-            return True
-        class_name = module.__class__.__name__
-        module_name = getattr(module.__class__, "__module__", "")
-        if "AOTAutograd" in class_name or "aot_autograd" in module_name:
-            return True
-    return False
-
-
-############################################
-# TE-friendly mask helpers (addend = -inf) #
-############################################
 
 
 def _canonical_lengths(
@@ -1049,21 +1011,6 @@ def _adapt_mask_for_te(
         return None
 
 
-def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
-    if (
-        is_transformer_engine_enabled(model)
-        or _is_inference_compiled(model)
-        or _is_aot_autograd_enabled(model)
-    ):
-        return torch.no_grad()
-    return torch.inference_mode()
-
-
-def _has_join_hook(obj: Any | None) -> bool:
-    if obj is None:
-        return False
-    return getattr(obj, "join_hook", None) is not None
-
 Int8DynamicActivationInt8WeightConfig: Any | None
 Int8WeightOnlyConfig: Any | None
 quantize_: Any | None
@@ -1162,18 +1109,6 @@ if QAT is None:
             raise RuntimeError("QAT backend unavailable")
 
     QAT = _QATUnavailable()
-
-
-def joining(
-    model: JoinableModel,
-    optimizer: optim.Optimizer | None = None,
-) -> AbstractContextManager[None]:
-    if Join is None:
-        return contextlib.nullcontext()
-    joinables = tuple(obj for obj in (model, optimizer) if _has_join_hook(obj))
-    if not joinables:
-        return contextlib.nullcontext()
-    return Join(joinables, throw_on_early_termination=True)
 
 
 class DotProductAttention(nn.Module):
