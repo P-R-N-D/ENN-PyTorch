@@ -182,7 +182,9 @@ class SampleReader:
         )
         for index in self._indices():
             feat = feat_mmt[index]
-            label = label_mmt[index].view(*label_shape)
+            label = label_mmt[index]
+            if label_shape:
+                label = label.view(*label_shape)
             feat_tensor = (
                 feat
                 if isinstance(feat, torch.Tensor)
