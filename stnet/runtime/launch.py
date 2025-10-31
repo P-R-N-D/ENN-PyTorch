@@ -159,6 +159,8 @@ def predict(
     seed: int = 7,
     prefetch_factor: Optional[int] = 1,
     mode: OpsMode = "predict",
+    max_nodes: Optional[int] = None,
+    rdzv_backend: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
     System.initialize_python_path()
@@ -225,21 +227,28 @@ def predict(
         **default_kwargs,
         **kwargs,
     )
-    nprocs = (
-        Distributed.get_world_size(device)
-        if device.type in ("cuda", "xpu")
-        else 1
-    )
+    default_rdzv_host = Network.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    rdzv_endpoint = Network.get_available_addr(default_rdzv_host)
+    master_addr, _ = Distributed.initialize_master_addr(rdzv_endpoint)
+    System.optimize_threads()
+    nprocs = int(System.optimal_procs()["nproc_per_node"])
     manager = mp.Manager()
     ret_dict = manager.dict()
-    mp.start_processes(
-        main,
-        args=(ops, ret_dict),
-        nprocs=nprocs,
-        join=True,
-        daemon=False,
+    resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
+    resolved_rdzv_backend = rdzv_backend or "c10d"
+    lc = LaunchConfig(
+        min_nodes=1,
+        max_nodes=resolved_max_nodes,
+        nproc_per_node=nprocs,
+        rdzv_backend=resolved_rdzv_backend,
+        rdzv_endpoint=rdzv_endpoint,
+        run_id="predict",
+        max_restarts=0,
+        monitor_interval=5,
         start_method=System.optimal_start_method(),
+        local_addr=master_addr,
     )
+    elastic_launch(lc, main)(ops, ret_dict)
     try:
         return dict(ret_dict)
     finally:

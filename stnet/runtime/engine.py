@@ -31,7 +31,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed._tensor import DTensor, Placement, Replicate
-from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..model import Root
@@ -57,6 +57,13 @@ from ..utils.optimization import (
 )
 from ..utils.profiler import FlopCounter
 from ..utils.compat import maybe_mark_cudagraph_step_end
+from .distributed import (
+    broadcast_model_states,
+    distributed_barrier,
+    is_dist_avail_and_initialized,
+    wrap_ddp_if_needed,
+    wrap_fsdp_module,
+)
 
 
 try:
@@ -564,25 +571,31 @@ def epochs(
     prev_io_bytes = 0.0
     prev_flops = 0.0
 
-    for epoch_idx in range(int(total_epochs)):
-        if status_bar is not None:
-            status_bar.set_description(
-                f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]"
-            )
+    join_context = joining(model=model, optimizer=optimizer)
+    with join_context:
+        for epoch_idx in range(int(total_epochs)):
+            if status_bar is not None:
+                status_bar.set_description(
+                    f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]"
+                )
 
-        flop_breakdown_epoch: Dict[str, float] = {}
-        io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
-        comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
-        io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
-        flops = torch.tensor(0.0, device=device, dtype=torch.float64)
+            if is_dist_avail_and_initialized():
+                target_module = model.module if hasattr(model, "module") else model
+                broadcast_model_states(target_module)
+                distributed_barrier(device)
 
-        flop_counter_train = FlopCounter(model, mode="train", device=device)
-        with flop_counter_train:
-            model.train()
-            optimizer.zero_grad(set_to_none=True)
-            t_fetch_start = time.perf_counter_ns()
+            flop_breakdown_epoch: Dict[str, float] = {}
+            io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
+            comp_time = torch.tensor(0.0, device=device, dtype=torch.float64)
+            io_bytes = torch.tensor(0.0, device=device, dtype=torch.float64)
+            flops = torch.tensor(0.0, device=device, dtype=torch.float64)
 
-            with joining(model=model, optimizer=optimizer):
+            flop_counter_train = FlopCounter(model, mode="train", device=device)
+            with flop_counter_train:
+                model.train()
+                optimizer.zero_grad(set_to_none=True)
+                t_fetch_start = time.perf_counter_ns()
+
                 total_batches = len(train_loader)
                 for step_idx, _raw in enumerate(train_loader):
                     feat, label, *_ = preprocess(_raw)
@@ -715,13 +728,12 @@ def epochs(
 
                     t_fetch_start = time.perf_counter_ns()
 
-        if val_loader is not None:
-            flop_counter_val = FlopCounter(model, mode="eval", device=device)
-            with flop_counter_val:
-                model.eval()
-                with inference(model), AutoCast.float(device):
-                    t_fetch_start = time.perf_counter_ns()
-                    with joining(model=model, optimizer=optimizer):
+            if val_loader is not None:
+                flop_counter_val = FlopCounter(model, mode="eval", device=device)
+                with flop_counter_val:
+                    model.eval()
+                    with inference(model), AutoCast.float(device):
+                        t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
                             X = to_torch(feat)
@@ -836,33 +848,218 @@ def epochs(
 
                             t_fetch_start = time.perf_counter_ns()
 
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            torch.distributed.barrier(
-                device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
-            )
-            for t in (comp_time, io_time, flops, io_bytes):
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+            if is_dist_avail_and_initialized():
+                for t in (comp_time, io_time, flops, io_bytes):
+                    torch.distributed.all_reduce(
+                        t, op=torch.distributed.ReduceOp.SUM
+                    )
 
-            world = max(1, Distributed.get_world_size(device))
-            comp_time /= world
-            io_time /= world
-            flops /= world
-            io_bytes /= world
+                world = max(1, Distributed.get_world_size(device))
+                comp_time /= world
+                io_time /= world
+                flops /= world
+                io_bytes /= world
 
-            torch.distributed.barrier(
-                device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
-            )
+                distributed_barrier(device)
 
-        prev_comp_time += float(comp_time.item())
-        prev_io_time += float(io_time.item())
-        prev_flops += float(flops.item())
-        prev_io_bytes += float(io_bytes.item())
+            prev_comp_time += float(comp_time.item())
+            prev_io_time += float(io_time.item())
+            prev_flops += float(flops.item())
+            prev_io_bytes += float(io_bytes.item())
 
     if status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
         status_bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
         status_bar.close()
+
+
+def infer(
+    model: torch.nn.Module,
+    data_loader: Any,
+    *,
+    device: torch.device,
+    ops: RuntimeConfig,
+    status_bar: Optional[tqdm] = None,
+    chunk_dir: Optional[str] = None,
+    streaming: bool = False,
+) -> Optional[Dict[Tuple, torch.Tensor]]:
+    """Run inference with optional streaming output aggregation."""
+
+    run_model = wrap_ddp_if_needed(model, device=device)
+    run_model.eval()
+    module_eval = run_model.module if hasattr(run_model, "module") else run_model
+    broadcast_model_states(module_eval)
+
+    chunk_idx = 0
+    flop_counter = FlopCounter(run_model, mode="eval", device=device)
+    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
+        torch, "Event"
+    )
+    io_bytes: float = 0.0
+    io_time: float = 0.0
+    comp_time: float = 0.0
+    total_flops: float = 0.0
+    t_fetch_start = time.perf_counter_ns()
+    preds: List[torch.Tensor] = []
+    recovered_streaming = False
+    is_dist = is_dist_avail_and_initialized()
+    rank = torch.distributed.get_rank() if is_dist else 0
+
+    try:
+        with flop_counter, inference(run_model), AutoCast.float(device):
+            for _idx, _raw in enumerate(data_loader):
+                feat, _label, *_ = preprocess(_raw)
+                X = to_torch(feat)
+                X = torch.atleast_2d(X)
+                if X.dim() != 2:
+                    raise RuntimeError(
+                        f"infer: feats.ndim={X.dim()} (expect 2), shape={tuple(X.shape)}"
+                    )
+                if X.shape[1] != int(ops.in_dim):
+                    raise AssertionError(
+                        "infer: feature dim mismatch — "
+                        f"feats.shape[1]={X.shape[1]} != in_dim={ops.in_dim}."
+                    )
+                if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+                    X = X.to(dtype=torch.float32)
+                if use_timer:
+                    ev_h2d_s, ev_h2d_e = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    ev_h2d_s.record()
+                    X = X.to(device, non_blocking=True)
+                    ev_h2d_e.record()
+                    ev_h2d_e.synchronize()
+                    h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
+                else:
+                    t_h2d_s = time.perf_counter_ns()
+                    X = X.to(device, non_blocking=True)
+                    t_h2d_e = time.perf_counter_ns()
+                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
+                io_time += wait_s + h2d_s
+                with contextlib.suppress(Exception):
+                    io_bytes += float(X.element_size() * X.nelement())
+                if use_timer:
+                    ev_s, ev_e = (
+                        torch.Event(device=device, enable_timing=True),
+                        torch.Event(device=device, enable_timing=True),
+                    )
+                    ev_s.record()
+                else:
+                    t0 = time.perf_counter_ns()
+                with no_synchronization(run_model, enable=True):
+                    with flop_counter.step(display=False) as step_counter:
+                        with contextlib.suppress(Exception):
+                            mark_step = getattr(
+                                getattr(torch, "compiler", None),
+                                "cudagraph_mark_step_begin",
+                                None,
+                            )
+                            if callable(mark_step):
+                                mark_step()
+                        y_hat, _ = run_model(
+                            X,
+                            labels_flat=None,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                        )
+                y_hat_cpu = y_hat.detach().cpu().contiguous()
+                if streaming and rank == 0:
+                    chunk_path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
+                    try:
+                        torch.save(y_hat_cpu, chunk_path)
+                        chunk_idx += 1
+                    except Exception as err:
+                        streaming = False
+                        with contextlib.suppress(OSError):
+                            os.remove(chunk_path)
+                        warnings.warn(
+                            "Streaming inference disabled after failing to write "
+                            "predictions to disk; falling back to in-memory aggregation."
+                            f" (error: {err!r})",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        if not recovered_streaming and chunk_idx > 0:
+                            for stored_idx in range(chunk_idx):
+                                chunk_path = os.path.join(
+                                    chunk_dir or "", f"chunk_{stored_idx:06d}.pt"
+                                )
+                                try:
+                                    preds.append(
+                                        torch.load(chunk_path, map_location="cpu")
+                                    )
+                                    with contextlib.suppress(OSError):
+                                        os.remove(chunk_path)
+                                except Exception as load_err:
+                                    warnings.warn(
+                                        "Failed to recover streamed predictions from "
+                                        f"{chunk_path!r}: {load_err!r}",
+                                        RuntimeWarning,
+                                        stacklevel=2,
+                                    )
+                            recovered_streaming = True
+                            with contextlib.suppress(OSError):
+                                if chunk_dir and not os.listdir(chunk_dir):
+                                    os.rmdir(chunk_dir)
+                        preds.append(y_hat_cpu)
+                else:
+                    preds.append(y_hat_cpu)
+                if use_timer:
+                    ev_e.record()
+                    ev_e.synchronize()
+                    comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
+                else:
+                    t1 = time.perf_counter_ns()
+                    comp_time += (t1 - t0) / 1_000_000_000.0
+                with contextlib.suppress(Exception):
+                    step_flops = float(step_counter.get_total_flops())
+                total_flops += max(0.0, step_flops)
+                mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
+                tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
+                if status_bar is not None:
+                    status_bar.set_postfix_str(
+                        f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS",
+                        refresh=False,
+                    )
+                    status_bar.update(1 if status_bar.total is not None else 0)
+                t_fetch_start = time.perf_counter_ns()
+    finally:
+        with contextlib.suppress(Exception):
+            if status_bar is not None:
+                status_bar.close()
+
+    if streaming and rank == 0:
+        manifest = {
+            "dir": chunk_dir,
+            "num_chunks": int(chunk_idx),
+            "out_shape": list(ops.out_shape),
+        }
+        with contextlib.suppress(Exception):
+            with open(
+                os.path.join(chunk_dir or "", "manifest.json"),
+                "w",
+                encoding="utf-8",
+            ) as manifest_file:
+                json.dump(manifest, manifest_file)
+    elif not streaming:
+        flat = torch.cat(preds, dim=0) if preds else torch.empty(0)
+        pred_struct = Root.unflatten_labels(flat, ops.out_shape)
+        result = postprocess(ops.keys or [], pred_struct)
+    else:
+        result = None
+
+    distributed_barrier(device)
+
+    if streaming:
+        return None
+    if is_dist and rank != 0:
+        return None
+    return result if not streaming else None
 
 def main(*args: Any) -> Optional[Root]:
     if not args:
@@ -1118,14 +1315,14 @@ def main(*args: Any) -> Optional[Root]:
                 return target
             wrapped.add(id(target))
             per_mod_ignored = _per_module_ignored_params(target)
-            sharded = fully_shard(
+            sharded = wrap_fsdp_module(
                 target,
                 mesh=mesh,
                 mp_policy=mp_policy,
                 reshard_after_forward=False,
+                sync_module_states=True,
                 ignored_params=per_mod_ignored or None,
             )
-            sharded.set_requires_gradient_sync(True)
             if target is model:
                 model = sharded
             return sharded
@@ -1160,7 +1357,7 @@ def main(*args: Any) -> Optional[Root]:
                 _fsdp_wrap(submodule)
             _fsdp_wrap(model)
         except (RuntimeError, ValueError, TypeError):
-            model = fully_shard(
+            model = wrap_fsdp_module(
                 model,
                 mesh=mesh,
                 mp_policy=mp_policy,
@@ -1168,8 +1365,8 @@ def main(*args: Any) -> Optional[Root]:
                     ignored_param_registry if len(ignored_param_registry) > 0 else None
                 ),
                 reshard_after_forward=False,
+                sync_module_states=True,
             )
-            model.set_requires_gradient_sync(True)
 
         for ignored_param in ignored_param_registry:
             _ensure_dtensor(ignored_param, placements=(Replicate(),))
@@ -1182,6 +1379,7 @@ def main(*args: Any) -> Optional[Root]:
         _assert_no_meta_tensors(_m_post)
         _assert_no_fake_dtensor_in_ln(_m_post, allow_dtensor=True)
         _maybe_install_meta_pre_hook(_m_post)
+        broadcast_model_states(_m_post)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(
@@ -1471,6 +1669,11 @@ def main(*args: Any) -> Optional[Root]:
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
         device = System.get_device()
+        _set_backend(device)
+        backend = _backend_type(device)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend=backend)
+
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
@@ -1520,6 +1723,7 @@ def main(*args: Any) -> Optional[Root]:
             AutoCast.configure(model, metadata=metadata)
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         model.eval()
+
         data_loader, _, keep = dataloader(
             memmap_dir=ops.memmap_dir or "",
             device=device,
@@ -1530,8 +1734,9 @@ def main(*args: Any) -> Optional[Root]:
             io_backend="auto",
         )
         total_batches = _infer_num_batches(data_loader)
+        status_bar: Optional[tqdm]
         try:
-            if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            if torch.distributed.get_rank() != 0:
                 status_bar = None
             else:
                 status_bar = tqdm(
@@ -1552,182 +1757,31 @@ def main(*args: Any) -> Optional[Root]:
         if not chunk_dir and (ops.ckpt_dir or ""):
             chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks")
         streaming = False
-        if chunk_dir:
+        if chunk_dir and torch.distributed.get_rank() == 0:
             try:
                 os.makedirs(chunk_dir, exist_ok=True)
                 streaming = True
             except Exception:
                 streaming = False
-        chunk_idx = 0
-        flop_counter = FlopCounter(model, mode="eval", device=device)
-        use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-            torch, "Event"
-        )
-        io_bytes: float = 0.0
-        io_time: float = 0.0
-        comp_time: float = 0.0
-        total_flops: float = 0.0
-        t_fetch_start = time.perf_counter_ns()
-        preds: List[torch.Tensor] = []
-        recovered_streaming: bool = False
-        try:
-            with flop_counter, inference(model), AutoCast.float(device):
-                for _idx, _raw in enumerate(data_loader):
-                    feat, _label, *_ = preprocess(_raw)
-                    X = to_torch(feat)
-                    X = torch.atleast_2d(X)
-                    if X.dim() != 2:
-                        raise RuntimeError(
-                            f"infer: feats.ndim={X.dim()} (expect 2), shape={tuple(X.shape)}"
-                        )
-                    if X.shape[1] != int(ops.in_dim):
-                        raise AssertionError(
-                            "infer: feature dim mismatch — "
-                            f"feats.shape[1]={X.shape[1]} != in_dim={ops.in_dim}."
-                        )
-                    if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                        X = X.to(dtype=torch.float32)
-                    if use_timer:
-                        ev_h2d_s, ev_h2d_e = (
-                            torch.Event(device=device, enable_timing=True),
-                            torch.Event(device=device, enable_timing=True),
-                        )
-                        ev_h2d_s.record()
-                        X = X.to(device, non_blocking=True)
-                        ev_h2d_e.record()
-                        ev_h2d_e.synchronize()
-                        h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
-                    else:
-                        t_h2d_s = time.perf_counter_ns()
-                        X = X.to(device, non_blocking=True)
-                        t_h2d_e = time.perf_counter_ns()
-                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                    wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
-                    io_time += wait_s + h2d_s
-                    with contextlib.suppress(Exception):
-                        io_bytes += float(X.element_size() * X.nelement())
-                    if use_timer:
-                        ev_s, ev_e = (
-                            torch.Event(device=device, enable_timing=True),
-                            torch.Event(device=device, enable_timing=True),
-                        )
-                        ev_s.record()
-                    else:
-                        t0 = time.perf_counter_ns()
-                    with no_synchronization(model, enable=True):
-                        with flop_counter.step(display=False) as step_counter:
-                            with contextlib.suppress(Exception):
-                                mark_step = getattr(
-                                    getattr(torch, "compiler", None),
-                                    "cudagraph_mark_step_begin",
-                                    None,
-                                )
-                                if callable(mark_step):
-                                    mark_step()
-                            y_hat, _ = model(
-                                X,
-                                labels_flat=None,
-                                global_loss=None,
-                                local_loss=None,
-                                loss_weights=None,
-                            )
-                    y_hat_cpu = y_hat.detach().cpu().contiguous()
-                    if streaming:
-                        chunk_path = os.path.join(
-                            chunk_dir, f"chunk_{chunk_idx:06d}.pt"
-                        )
-                        try:
-                            torch.save(y_hat_cpu, chunk_path)
-                            chunk_idx += 1
-                        except Exception as err:
-                            streaming = False
-                            with contextlib.suppress(OSError):
-                                os.remove(chunk_path)
-                            warnings.warn(
-                                "Streaming inference disabled after failing to write "
-                                "predictions to disk; falling back to in-memory aggregation."
-                                f" (error: {err!r})",
-                                RuntimeWarning,
-                                stacklevel=2,
-                            )
-                            if not recovered_streaming and chunk_idx > 0:
-                                for stored_idx in range(chunk_idx):
-                                    chunk_path = os.path.join(
-                                        chunk_dir, f"chunk_{stored_idx:06d}.pt"
-                                    )
-                                    try:
-                                        preds.append(
-                                            torch.load(chunk_path, map_location="cpu")
-                                        )
-                                        with contextlib.suppress(OSError):
-                                            os.remove(chunk_path)
-                                    except Exception as load_err:
-                                        warnings.warn(
-                                            "Failed to recover streamed predictions from "
-                                            f"{chunk_path!r}: {load_err!r}",
-                                            RuntimeWarning,
-                                            stacklevel=2,
-                                        )
-                                recovered_streaming = True
-                                with contextlib.suppress(OSError):
-                                    if not os.listdir(chunk_dir):
-                                        os.rmdir(chunk_dir)
-                            preds.append(y_hat_cpu)
-                    else:
-                        preds.append(y_hat_cpu)
-                    if use_timer:
-                        ev_e.record()
-                        ev_e.synchronize()
-                        comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
-                    else:
-                        t1 = time.perf_counter_ns()
-                        comp_time += (t1 - t0) / 1_000_000_000.0
-                    with contextlib.suppress(Exception):
-                        step_flops = float(step_counter.get_total_flops())
-                    total_flops += max(0.0, step_flops)
-                    mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
-                    tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-                    if status_bar is not None:
-                        status_bar.set_postfix_str(
-                            f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS",
-                            refresh=False,
-                        )
-                        status_bar.update(1 if status_bar.total is not None else 0)
-                    t_fetch_start = time.perf_counter_ns()
-                    # 스텝마다 캐시/GC 호출 제거 (성능/안정성 저하 방지)
-        finally:
-            with contextlib.suppress(Exception):
-                if status_bar is not None:
-                    status_bar.close()
-        # 에폭/평가 종료 시점 1회 정도는 허용(선택)
-        # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
-        #     _clear_device_cache(device)
-        # gc.collect()
-        if streaming:
-            manifest = {
-                "dir": chunk_dir,
-                "num_chunks": int(chunk_idx),
-                "out_shape": list(ops.out_shape),
-            }
-            with contextlib.suppress(Exception):
-                with open(
-                    os.path.join(chunk_dir, "manifest.json"),
-                    "w",
-                    encoding="utf-8",
-                ) as manifest_file:
-                    json.dump(manifest, manifest_file)
         else:
-            flat = torch.cat(preds, dim=0) if preds else torch.empty(0)
-            pred_struct = Root.unflatten_labels(flat, ops.out_shape)
-            ret = postprocess(ops.keys or [], pred_struct)
-            if ret_sink is not None:
-                ret_sink.update(ret)
+            chunk_dir = chunk_dir if streaming else None
+
+        result = infer(
+            model,
+            data_loader,
+            device=device,
+            ops=ops,
+            status_bar=status_bar,
+            chunk_dir=chunk_dir,
+            streaming=streaming,
+        )
+        if result is not None and ret_sink is not None:
+            ret_sink.update(result)
         if keep is not None:
             keep.cleanup()
-        # 종료 시 전역 캐시 비우기도 보통 불필요. OOM 디버깅 중에만 사용.
-        # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
-        #     _clear_device_cache(device)
-        # gc.collect()
+
+        distributed_barrier(device)
+        torch.distributed.destroy_process_group()
         return None
 
     raise ValueError(f"unsupported ops mode: {ops.mode}")
