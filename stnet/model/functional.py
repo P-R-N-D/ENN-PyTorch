@@ -67,8 +67,12 @@ class _TensorDictLoss(LossModule):
 
     def _format_output(
         self, loss: Tensor, *, base_td: Optional[TensorDictBase] = None
-    ) -> dict[str, Tensor]:
-        return {self.loss_key: loss}
+    ) -> TensorDictBase | dict[str, Tensor]:
+        if base_td is None:
+            return {self.loss_key: loss}
+        result = base_td.clone()
+        result.set(self.loss_key, loss)
+        return result
 
 
 def _extract_loss_tensor(value: Any) -> Tensor:
@@ -357,9 +361,9 @@ class MultipleQuantileLoss(_TensorDictLoss):
         target: Optional[Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, Tensor]:  # type: ignore[override]
-        _, preds, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, preds, tgt = self._coerce_inputs(data, target, **kwargs)
         loss = self._loss(preds, tgt)
-        return self._format_output(loss)
+        return self._format_output(loss, base_td=base_td)
 
 class StandardNormalLoss(_TensorDictLoss):
     _Number = Union[float, int]
@@ -578,9 +582,9 @@ class StandardNormalLoss(_TensorDictLoss):
         target: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        _, pred, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
         loss = self._loss(pred, tgt)
-        return self._format_output(loss)
+        return self._format_output(loss, base_td=base_td)
 
 class StudentsTLoss(_TensorDictLoss):
     _Number = Union[float, int]
@@ -826,9 +830,9 @@ class StudentsTLoss(_TensorDictLoss):
         target: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        _, pred, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
         loss = self._loss(pred, tgt)
-        return self._format_output(loss)
+        return self._format_output(loss, base_td=base_td)
 
 def _as_tuple(x: Any) -> Tuple[int, ...]:
     return tuple((int(v) for v in x))
@@ -1020,9 +1024,9 @@ class DataFidelityLoss(_TensorDictLoss):
         target: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        _, pred, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
         loss = self._loss(pred, tgt)
-        return self._format_output(loss)
+        return self._format_output(loss, base_td=base_td)
 
 class LinearCombinationLoss(_TensorDictLoss):
     def __init__(
@@ -1066,9 +1070,9 @@ class LinearCombinationLoss(_TensorDictLoss):
         target: Optional[Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, Tensor]:  # type: ignore[override]
-        _, pred, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
         loss = self._loss(pred, tgt)
-        return self._format_output(loss)
+        return self._format_output(loss, base_td=base_td)
 
 class TiledLoss(_TensorDictLoss):
     def __init__(
@@ -1140,17 +1144,17 @@ class TiledLoss(_TensorDictLoss):
         target: Optional[torch.Tensor] = None,
         **kwargs: Any,
     ) -> dict[str, torch.Tensor]:  # type: ignore[override]
-        _, pred, tgt = self._coerce_inputs(data, target, **kwargs)
+        base_td, pred, tgt = self._coerce_inputs(data, target, **kwargs)
         mask = self._make_mask(pred, tgt)
         if self.tile_dim is None or self.tile_size is None:
             value = self.base(pred, tgt)
             loss_tensor = _extract_loss_tensor(value)
             reduced = self._reduce(loss_tensor, mask)
-            return self._format_output(reduced)
+            return self._format_output(reduced, base_td=base_td)
         nd = pred.ndim
-        td = self.tile_dim + nd if self.tile_dim < 0 else self.tile_dim
-        td = max(0, min(td, nd - 1))
-        N = pred.shape[td]
+        tile_dim_idx = self.tile_dim + nd if self.tile_dim < 0 else self.tile_dim
+        tile_dim_idx = max(0, min(tile_dim_idx, nd - 1))
+        N = pred.shape[tile_dim_idx]
         start = 0
         total_sum = pred.new_tensor(0.0, dtype=pred.dtype)
         total_count = pred.new_tensor(0.0, dtype=pred.dtype)
@@ -1158,7 +1162,7 @@ class TiledLoss(_TensorDictLoss):
         while start < N:
             end = min(N, start + self.tile_size)
             sl = [slice(None)] * nd
-            sl[td] = slice(start, end)
+            sl[tile_dim_idx] = slice(start, end)
             pv = pred[tuple(sl)]
             tv = tgt[tuple(sl)]
             mv = mask[tuple(sl)] if mask is not None else None
@@ -1174,11 +1178,13 @@ class TiledLoss(_TensorDictLoss):
             start = end
         match self.reduction:
             case "none":
-                result = torch.cat(parts, dim=td) if parts else pred.new_zeros(())
-                return self._format_output(result)
+                result = (
+                    torch.cat(parts, dim=tile_dim_idx) if parts else pred.new_zeros(())
+                )
+                return self._format_output(result, base_td=base_td)
             case "sum":
-                return self._format_output(total_sum)
+                return self._format_output(total_sum, base_td=base_td)
             case "mean":
                 denom = torch.clamp(total_count, min=1.0)
-                return self._format_output(total_sum / denom)
-        return self._format_output(pred.new_zeros(()))
+                return self._format_output(total_sum / denom, base_td=base_td)
+        return self._format_output(pred.new_zeros(()), base_td=base_td)
