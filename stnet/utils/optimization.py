@@ -607,7 +607,13 @@ def compile(
     options: Optional[Dict[str, Any]] = None,
     disable: bool = False,
 ) -> nn.Module:
-    if disable:
+    normalized_mode = ""
+    if mode is not None:
+        try:
+            normalized_mode = str(mode).strip().lower()
+        except Exception:
+            normalized_mode = ""
+    if disable or normalized_mode in {"", "disabled", "none"}:
         return module
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:

@@ -128,7 +128,6 @@ class ModelConfig:
     modeling_type: str = "spatiotemporal"
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
-    enable_compilation: bool = False
     compile_mode: str = "disabled"
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
@@ -285,12 +284,6 @@ def coerce_model_config(
     args["use_linear_branch"] = ensure_bool(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
-    )
-    args["enable_compilation"] = ensure_bool(
-        filtered.get(
-            "enable_compilation", getattr(defaults, "enable_compilation")
-        ),
-        name="enable_compilation",
     )
     args["compile_mode"] = str(
         filtered.get("compile_mode", getattr(defaults, "compile_mode"))
