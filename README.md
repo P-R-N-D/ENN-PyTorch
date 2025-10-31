@@ -22,7 +22,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[service]
    ```
--   Additional extras include `pandas`, `polars`, `excel`, `spark`, `optimization`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
+-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `thread`, `torchao`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core runtime depends on:
