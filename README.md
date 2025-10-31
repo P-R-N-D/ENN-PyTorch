@@ -32,7 +32,6 @@ The core runtime depends on:
 - `tensordict>=0.8.0`
 - `numpy>=2.2.5`
 - `netifaces>=0.11.0`
-- `pyarrow>=20.0.0`
 - `tqdm>=4.67.1`
 
 Optional extras listed in `pyproject.toml` include:
@@ -46,7 +45,7 @@ Optional extras listed in `pyproject.toml` include:
 - retention-focused research modules (`torchscale`)
 - compiler niceties (`compiler`, which installs Triton kernels on Linux/x86_64 hosts)
 
-Install the `servable` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
+Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
 
 ### Compiler configuration
 
