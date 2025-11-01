@@ -126,8 +126,6 @@ def _model_config_dict(model: Root) -> Dict[str, Any]:
     return asdict(ModelConfig())
 
 
-
-
 class TorchIO:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
@@ -145,6 +143,7 @@ class TorchIO:
         path: str | Path,
         optimizer: Optional[torch.optim.Optimizer] = None,
         extra: Optional[Dict[str, Any]] = None,
+        *args: Any,
         **opts: Any,
     ) -> Path:
         p = Path(path)
@@ -221,7 +220,7 @@ class TorchIO:
 
 class ConverterBase(Protocol):
     name: str
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]: ...
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]: ...
 
 
 class Converter:
@@ -233,10 +232,11 @@ class Converter:
         def export(
             model: nn.Module,
             onnx_path: Path,
-            *,
+            *args: Any,
             sample_input: Optional[torch.Tensor] = None,
             opset_version: int = 18,
             dynamic_batch: bool = True,
+            **kwargs: Any,
         ) -> Path:
             _require("onnx", "pip install onnx")
             wrapper = _ExportCompat(model).eval()
@@ -282,7 +282,7 @@ class Converter:
             return onnx_path
 
         @staticmethod
-        def ensure(model: nn.Module, onnx_path: Path, **opts: Any) -> Path:
+        def ensure(model: nn.Module, onnx_path: Path, *args: Any, **opts: Any) -> Path:
             if not onnx_path.exists():
                 return Converter._OnnxLayer.export(model, onnx_path, **opts)
             return onnx_path
@@ -292,11 +292,12 @@ class Converter:
         def save_ort(
             onnx_path: Path,
             ort_path: Path,
-            *,
+            *args: Any,
             optimization_level: str = "all",
             optimization_style: str = "fixed",
             target_platform: Optional[str] = None,
             save_optimized_onnx_model: bool = False,
+            **kwargs: Any,
         ) -> Tuple[Path, Optional[Path]]:
             _require("onnxruntime", "pip install onnxruntime")
             import onnxruntime as ort
@@ -359,7 +360,7 @@ class Converter:
 
 class OnnxConverter:
     name = "onnx"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         out = Converter._OnnxLayer.export(
             model, dst,
             sample_input=opts.get("sample_input"),
@@ -371,7 +372,7 @@ class OnnxConverter:
 
 class OrtConverter:
     name = "ort"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
         onnx_path = Converter._OnnxLayer.ensure(
             model, onnx_path,
@@ -391,7 +392,7 @@ class OrtConverter:
 
 class TensorRTConverter:
     name = "tensorrt"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
         onnx_path = Converter._OnnxLayer.ensure(
             model, onnx_path,
@@ -447,7 +448,7 @@ class TensorRTConverter:
 
 class NnefConverter:
     name = "nnef"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
         onnx_path = Converter._OnnxLayer.ensure(
             model, onnx_path,
@@ -486,7 +487,7 @@ class NnefConverter:
 
 class CoreMLConverter:
     name = "coreml"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         _require("coremltools", "pip install coremltools")
         import coremltools as ct
         sample = _pad_sample(model, opts.get("sample_input"))
@@ -519,7 +520,7 @@ class CoreMLConverter:
 
 class LiteRTConverter:
     name = "litert"
-    def convert(self, model: nn.Module, dst: Path, **opts: Any) -> Tuple[Path, ...]:
+    def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         sample_input = opts.get("sample_input")
         opset_version = int(opts.get("opset_version", 18))
         dynamic_batch = bool(opts.get("dynamic_batch", True))
