@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys as _sys
 
 from . import datatype as datatype_module
-from .collate import DataLoader, dataloader, fetch
+from .pipeline import DataLoader, dataloader, fetch
 from .nodes import BatchSampler, SampleReader
 from .stats import MetaData
 from .transforms import (
