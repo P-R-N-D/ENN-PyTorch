@@ -21,7 +21,7 @@ import torch
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
 from .datatype import to_torch_tensor
-from ..api.utils import System
+from ..backend.environment import System
 
 
 def identity(item: Any) -> Any:

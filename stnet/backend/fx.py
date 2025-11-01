@@ -6,7 +6,6 @@ import math
 import os
 import warnings
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
 from typing import (
     Any,
     Callable,
@@ -53,7 +52,6 @@ __all__ = [
     "is_transformer_engine_enabled",
     "inference",
     "AutoCast",
-    "LossWeightController",
     "compile",
     "_import_callable",
     "Accelerator",
@@ -756,49 +754,6 @@ def compile(
     except Exception as exc:
         _LOGGER.warning("torch.compile failed (%s); returning original module", exc)
         return module
-
-
-@dataclass
-class LossWeightController:
-    momentum: float = 0.9
-    min_weight: float = 0.05
-    max_weight: float = 0.95
-    eps: float = 1e-06
-    top_avg: float = 1.0
-    bottom_avg: float = 1.0
-
-    def weights(self) -> Tuple[float, float]:
-        top = max(self.eps, self.top_avg)
-        bottom = max(self.eps, self.bottom_avg)
-        total = top + bottom
-        if total <= 0.0:
-            return (0.5, 0.5)
-        ratio_top = top / total
-        ratio_bottom = bottom / total
-        ratio_top = float(min(max(ratio_top, self.min_weight), self.max_weight))
-        ratio_bottom = float(
-            min(max(ratio_bottom, self.min_weight), self.max_weight)
-        )
-        norm = ratio_top + ratio_bottom
-        if norm <= 0.0:
-            return (0.5, 0.5)
-        return (ratio_top / norm, ratio_bottom / norm)
-
-    def update(
-        self,
-        top_loss: Optional[torch.Tensor],
-        bottom_loss: Optional[torch.Tensor],
-    ) -> None:
-        if top_loss is not None:
-            top_val = float(top_loss.detach().abs().mean().item())
-            self.top_avg = self.momentum * self.top_avg + (
-                1.0 - self.momentum
-            ) * max(top_val, self.eps)
-        if bottom_loss is not None:
-            bottom_val = float(bottom_loss.detach().abs().mean().item())
-            self.bottom_avg = self.momentum * self.bottom_avg + (
-                1.0 - self.momentum
-            ) * max(bottom_val, self.eps)
 
 
 def _import_callable(spec: str) -> Callable:

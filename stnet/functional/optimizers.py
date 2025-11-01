@@ -16,7 +16,7 @@ from ..utils.platform import (
     is_int8_supported,
     optimal_optimizer_params,
 )
-from .fx import AutoCast, Accelerator, _supports_scale
+from ..backend.fx import AutoCast, Accelerator, _supports_scale
 
 __all__ = ["AdamW"]
 

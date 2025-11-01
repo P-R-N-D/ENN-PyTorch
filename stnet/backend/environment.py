@@ -18,15 +18,15 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from ..backend.compat import (
+from .compat import (
     SDPBackend,
     TorchCompat,
     _to_sdpa_backends,
     patch_torch,
     sdpa_kernel,
 )
-from ..backend.distributed import joining, no_synchronization
-from ..backend.profiler import FlopCounter, attention_flops_bshd
+from .distributed import joining, no_synchronization
+from .profiler import FlopCounter, attention_flops_bshd
 from ..data import datatype
 from ..data.transforms import (
     IncrementalPCA,
@@ -35,8 +35,9 @@ from ..data.transforms import (
     postprocess,
     preprocess,
 )
-from ..backend.optimizers import AdamW
-from ..backend.fx import AutoCast, Accelerator, LossWeightController, inference
+from ..functional.optimizers import AdamW
+from .fx import AutoCast, Accelerator, inference
+from ..functional.losses import LossWeightController
 from ..model.kernels import (
     DotProductAttention,
     MultiScaleRetention,

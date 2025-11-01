@@ -33,7 +33,7 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from .utils import Distributed, Network, System
+from ..backend.environment import Distributed, Network, System
 from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 
