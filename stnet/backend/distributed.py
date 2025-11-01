@@ -28,17 +28,17 @@ from torch.optim import Optimizer
 
 from .environment import System
 
-try:  # pragma: no cover - optional dependency
+try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:
     _TorchJoin = None
 
 Join: type[AbstractContextManager[None]] | None = _TorchJoin
 
-if TYPE_CHECKING:  # pragma: no cover - type checking only
+if TYPE_CHECKING:
     from torch.distributed._composable.fsdp import FSDPModule
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-else:  # pragma: no cover - fallback when optional deps missing
+else:
     FSDP = object
     FSDPModule = object
 
@@ -70,8 +70,9 @@ class Network:
     @staticmethod
     def normalize_ip_literal(
         value: Any,
-        *,
+        *args: Any,
         allow_loopback: bool = False,
+        **kwargs: Any,
     ) -> str | None:
         candidate_text = Network.coerce_host(value)
         if not candidate_text:
@@ -92,9 +93,10 @@ class Network:
     @staticmethod
     def resolve_host_ip(
         host: Any,
-        *,
+        *args: Any,
         allow_loopback: bool = False,
         prefer_ipv6: bool | None = None,
+        **kwargs: Any,
     ) -> str | None:
         host_text = Network.coerce_host(host)
         if not host_text:
@@ -150,11 +152,12 @@ class Network:
     @staticmethod
     def format_endpoint_host(
         host: Any,
-        *,
+        *args: Any,
         fallback: Any | None = None,
         default: str = "127.0.0.1",
         allow_loopback: bool = False,
         allow_hostname: bool = True,
+        **kwargs: Any,
     ) -> str:
         if allow_hostname:
             literal = Network.coerce_host(host)
@@ -212,8 +215,9 @@ class Network:
     @staticmethod
     def get_available_addr(
         endpoint: Optional[str],
-        *,
+        *args: Any,
         default_host: str = "127.0.0.1",
+        **kwargs: Any,
     ) -> str:
         if endpoint:
             normalized = Network.coerce_host(endpoint)
@@ -253,7 +257,7 @@ class Network:
         return f"{host}:{selected_port}"
 
     @staticmethod
-    def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
+    def probe_stack_support(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
         ipv4_ok = False
         ipv6_ok = False
         ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
@@ -285,9 +289,10 @@ class Network:
     @staticmethod
     def get_preferred_ip(
         hostname: Optional[str] = None,
-        *,
+        *args: Any,
         prefer_ipv6: bool = True,
         allow_loopback: bool = True,
+        **kwargs: Any,
     ) -> str:
         names: List[str] = []
         if hostname:
@@ -385,9 +390,10 @@ class Distributed:
     @staticmethod
     def initialize_master_addr(
         endpoint: Optional[str],
-        *,
+        *args: Any,
         prefer_ipv6: bool = True,
         allow_loopback: bool = True,
+        **kwargs: Any,
     ) -> tuple[str, int]:
         default_host = Network.get_preferred_ip(
             allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
@@ -443,15 +449,16 @@ def coerce_host(value: Any) -> str:
     return Network.coerce_host(value)
 
 
-def normalize_ip_literal(value: Any, *, allow_loopback: bool = False) -> str | None:
+def normalize_ip_literal(value: Any, *args: Any, allow_loopback: bool = False, **kwargs: Any) -> str | None:
     return Network.normalize_ip_literal(value, allow_loopback=allow_loopback)
 
 
 def resolve_host_ip(
     host: Any,
-    *,
+    *args: Any,
     allow_loopback: bool = False,
     prefer_ipv6: bool | None = None,
+    **kwargs: Any,
 ) -> str | None:
     return Network.resolve_host_ip(
         host,
@@ -462,7 +469,7 @@ def resolve_host_ip(
 
 def format_endpoint_host(
     host: Any,
-    *,
+    *args: Any,
     fallback: Any | None = None,
     default: str = "127.0.0.1",
     allow_loopback: bool = False,
@@ -487,21 +494,23 @@ def is_port_available(host: str, port: int) -> bool:
 
 def get_available_addr(
     endpoint: Optional[str],
-    *,
+    *args: Any,
     default_host: str = "127.0.0.1",
+    **kwargs: Any,
 ) -> str:
     return Network.get_available_addr(endpoint, default_host=default_host)
 
 
-def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
+def probe_stack_support(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
     return Network.probe_stack_support(allow_loopback=allow_loopback)
 
 
 def get_preferred_ip(
     hostname: Optional[str] = None,
-    *,
+    *args: Any,
     prefer_ipv6: bool = True,
     allow_loopback: bool = True,
+    **kwargs: Any,
 ) -> str:
     return Network.get_preferred_ip(
         hostname,
@@ -512,9 +521,10 @@ def get_preferred_ip(
 
 def initialize_master_addr(
     endpoint: Optional[str],
-    *,
+    *args: Any,
     prefer_ipv6: bool = True,
     allow_loopback: bool = True,
+    **kwargs: Any,
 ) -> tuple[str, int]:
     return Distributed.initialize_master_addr(
         endpoint,
@@ -530,7 +540,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
 @contextlib.contextmanager
 def no_synchronization(
     model: torch.nn.Module,
-    *,
+    *args: Any,
     enable: bool = True,
 ) -> AbstractContextManager[None]:
     if not enable:
@@ -570,11 +580,10 @@ def joining(
     if not joinables:
         return contextlib.nullcontext()
 
-    return Join(joinables, throw_on_early_termination=True)  # type: ignore[arg-type]
+    return Join(joinables, throw_on_early_termination=True)
 
 
 def is_dist_avail_and_initialized() -> bool:
-    """Return ``True`` when torch.distributed is available and initialized."""
 
     try:
         return dist.is_available() and dist.is_initialized()
@@ -595,35 +604,29 @@ def _device_ids_from(device: Optional[torch.device]) -> Optional[Iterable[int]]:
 
 
 def distributed_barrier(device: Optional[torch.device] = None) -> None:
-    """Synchronize all ranks if the process group is initialized."""
 
     if not is_dist_avail_and_initialized():
         return
     try:
         dist.barrier(device_ids=_device_ids_from(device))
     except TypeError:
-        # ``device_ids`` keyword is not supported by all backends.
         dist.barrier()
 
 
 def broadcast_model_states(
     module: torch.nn.Module,
-    *,
+    *args: Any,
     src: int = 0,
+    **kwargs: Any,
 ) -> None:
-    """Broadcast parameters and buffers from ``src`` to all other ranks.
-
-    The helper is aware of DTensor instances and re-wraps the broadcasted
-    local shard to preserve placements.
-    """
 
     if not is_dist_avail_and_initialized():
         return
 
     try:
-        from torch.distributed._tensor import DTensor  # type: ignore
-    except Exception:  # pragma: no cover - DTensor optional
-        DTensor = tuple()  # type: ignore[assignment]
+        from torch.distributed._tensor import DTensor
+    except Exception:
+        DTensor = tuple()
 
     for buffer in module.buffers(recurse=True):
         data = getattr(buffer, "data", None)
@@ -639,10 +642,10 @@ def broadcast_model_states(
         if not isinstance(data, torch.Tensor):
             continue
         try:
-            if isinstance(data, DTensor):  # type: ignore[arg-type]
+            if isinstance(data, DTensor):
                 local = data.to_local()
                 dist.broadcast(local, src=src)
-                param.data = type(data).from_local(  # type: ignore[assignment]
+                param.data = type(data).from_local(
                     local,
                     device_mesh=data.device_mesh,
                     placements=tuple(data.placements),
@@ -656,14 +659,10 @@ def broadcast_model_states(
 
 def wrap_ddp_if_needed(
     module: torch.nn.Module,
-    *,
+    *args: Any,
     device: torch.device,
+    **kwargs: Any,
 ) -> torch.nn.Module:
-    """Wrap ``module`` with :class:`~torch.nn.parallel.DistributedDataParallel`.
-
-    The wrapper is only applied when the default process group is initialized.
-    The module is always moved to ``device``.
-    """
 
     module = module.to(device)
     if not is_dist_avail_and_initialized():
@@ -683,19 +682,14 @@ def wrap_ddp_if_needed(
 
 def wrap_fsdp_module(
     module: torch.nn.Module,
-    *,
+    *args: Any,
     mesh: Any | None,
     mp_policy: Any | None = None,
     reshard_after_forward: bool = False,
     sync_module_states: bool = True,
     ignored_params: Sequence[torch.nn.Parameter] | None = None,
+    **kwargs: Any,
 ) -> torch.nn.Module:
-    """Wrap ``module`` using ``torch.distributed.fsdp.fully_shard``.
-
-    This helper ensures ``requires_gradient_sync`` is enabled on the returned
-    FSDP wrapper so gradient synchronization happens by default.
-    Additional keyword arguments mirror those accepted by ``fully_shard``.
-    """
 
     sig = inspect.signature(fully_shard)
     params = sig.parameters
