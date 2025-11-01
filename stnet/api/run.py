@@ -1,4 +1,4 @@
-"""High-level orchestration entrypoints for STNet."""
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import contextlib
@@ -20,8 +20,8 @@ from torch.distributed.checkpoint.state_dict import (
 
 try:
     from torch.distributed.run import LaunchConfig, elastic_launch
-except ImportError:  # pragma: no cover - compatibility
-    from torch.distributed.launcher.api import LaunchConfig, elastic_launch  # type: ignore
+except ImportError:
+    from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..data.nodes import SampleReader
 from ..data.transforms import preprocess
@@ -63,7 +63,6 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Root:
-    """Train ``model`` using ``data`` and return the updated instance."""
 
     System.initialize_python_path()
     feats, labels, _, label_shape = preprocess(data)
@@ -173,7 +172,6 @@ def predict(
     rdzv_backend: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
-    """Run inference with ``model`` and return the aggregated predictions."""
 
     System.initialize_python_path()
     System.set_multiprocessing_env()
@@ -267,7 +265,4 @@ def predict(
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
 launch = SimpleNamespace(train=train, predict=predict)
-
-__all__ = ["train", "predict", "launch"]
