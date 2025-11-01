@@ -6,7 +6,7 @@ import torch
 from torch import nn, optim
 
 from ..data.stats import MetaData
-from ..utils.platform import (
+from ..backend.environment import (
     get_device,
     is_float8_supported,
     is_int4_supported,

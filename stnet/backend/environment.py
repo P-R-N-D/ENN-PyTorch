@@ -4,18 +4,15 @@ from __future__ import annotations
 # Standard library context managers used throughout this module.
 import contextlib
 import importlib
-import ipaddress
 import math
 import multiprocessing
 import os
-import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 
 @dataclass
@@ -131,7 +128,10 @@ class System:
             except ValueError:
                 continue
             return method
-        raise RuntimeError("No supported multiprocessing start method (tried forkserver, spawn).")
+        raise RuntimeError(
+            "No supported multiprocessing start method "
+            "(tried forkserver, spawn)."
+        )
 
     @staticmethod
     def set_multiprocessing_env() -> None:
@@ -156,7 +156,8 @@ class System:
                 continue
             return
         raise RuntimeError(
-            "Unable to configure multiprocessing start method (tried forkserver, spawn)."
+            "Unable to configure multiprocessing start method "
+            "(tried forkserver, spawn)."
         ) from last_error
 
     @staticmethod
@@ -425,434 +426,6 @@ class System:
         return threads
 
 
-class Network:
-    @staticmethod
-    def coerce_host(value: Any) -> str:
-        if isinstance(value, str):
-            return value.strip()
-        if value is None:
-            return ""
-        return str(value).strip()
-
-    @staticmethod
-    def _strip_host_tokens(value: str) -> tuple[str, bool, bool]:
-        stripped = value.strip()
-        bracketed = False
-        if stripped.startswith("[") and stripped.endswith("]"):
-            stripped = stripped[1:-1].strip()
-            bracketed = True
-        zone_removed = False
-        if "%" in stripped:
-            stripped = stripped.split("%", 1)[0].strip()
-            zone_removed = True
-        return stripped, bracketed, zone_removed
-
-    @staticmethod
-    def normalize_ip_literal(
-        value: Any,
-        *,
-        allow_loopback: bool = False,
-    ) -> str | None:
-        candidate_text = Network.coerce_host(value)
-        if not candidate_text:
-            return None
-        stripped_text, _, _ = Network._strip_host_tokens(candidate_text)
-        if not stripped_text:
-            return None
-        try:
-            parsed_address = ipaddress.ip_address(stripped_text)
-        except ValueError:
-            return None
-        if not allow_loopback and (
-            parsed_address.is_unspecified or parsed_address.is_loopback
-        ):
-            return None
-        return parsed_address.compressed
-
-    @staticmethod
-    def resolve_host_ip(
-        host: Any,
-        *,
-        allow_loopback: bool = False,
-        prefer_ipv6: bool | None = None,
-    ) -> str | None:
-        host_text = Network.coerce_host(host)
-        if not host_text:
-            return None
-        literal = Network.normalize_ip_literal(host_text, allow_loopback=allow_loopback)
-        if literal:
-            return literal
-        stripped_text, _, _ = Network._strip_host_tokens(host_text)
-        if not stripped_text:
-            return None
-        addrinfo: list[tuple[Any, ...]] | None = None
-        try:
-            addrinfo = socket.getaddrinfo(
-                stripped_text,
-                None,
-                family=socket.AF_UNSPEC,
-                type=socket.SOCK_STREAM,
-            )
-        except socket.gaierror:
-            return None
-        except Exception:
-            with contextlib.suppress(Exception):
-                addrinfo = socket.getaddrinfo(stripped_text, None)
-        if addrinfo is None or not addrinfo:
-            return None
-        preferred_versions: tuple[int, ...]
-        if prefer_ipv6 is None or prefer_ipv6:
-            preferred_versions = (6, 4)
-        else:
-            preferred_versions = (4, 6)
-        results: dict[int, list[str]] = {4: [], 6: []}
-        for resolved in addrinfo:
-            try:
-                sockaddr = resolved[4]
-            except Exception:
-                continue
-            if not sockaddr:
-                continue
-            address_text = sockaddr[0]
-            literal_addr = Network.normalize_ip_literal(
-                address_text,
-                allow_loopback=allow_loopback,
-            )
-            if literal_addr:
-                ip_version = ipaddress.ip_address(literal_addr).version
-                results.setdefault(ip_version, []).append(literal_addr)
-        for version in preferred_versions:
-            if results.get(version):
-                return results[version][0]
-        for literal_addr_list in results.values():
-            if literal_addr_list:
-                return literal_addr_list[0]
-        return None
-
-    @staticmethod
-    def format_endpoint_host(
-        host: Any,
-        *,
-        fallback: Any | None = None,
-        default: str = "127.0.0.1",
-        allow_loopback: bool = False,
-        allow_hostname: bool = True,
-    ) -> str:
-        default_value = Network.coerce_host(default) or "127.0.0.1"
-        candidates: tuple[tuple[Any | None, bool, bool], ...] = (
-            (host, allow_loopback, allow_hostname),
-            (fallback, allow_loopback, allow_hostname),
-            (default_value, True, allow_hostname),
-        )
-        for candidate, loopback_ok, hostnames_ok in candidates:
-            text = Network.coerce_host(candidate)
-            if not text:
-                continue
-            stripped, bracketed, zone_removed = Network._strip_host_tokens(text)
-            if not stripped:
-                continue
-            literal = Network.normalize_ip_literal(stripped, allow_loopback=loopback_ok)
-            if literal:
-                return f"[{literal}]" if ":" in literal else literal
-            if (
-                hostnames_ok
-                and not bracketed
-                and not zone_removed
-                and ":" not in stripped
-            ):
-                return stripped
-
-        literal_default = Network.normalize_ip_literal(default_value, allow_loopback=True)
-        if literal_default:
-            return f"[{literal_default}]" if ":" in literal_default else literal_default
-        return default_value
-
-    @staticmethod
-    def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
-        value = endpoint_str.strip()
-        if not value:
-            return default_host, 0
-        if value.startswith("["):
-            if "]" not in value:
-                raise ValueError(f"invalid endpoint: {endpoint_str}")
-            closing = value.index("]")
-            host_part = value[1:closing]
-            remainder = value[closing + 1 :]
-            if remainder.startswith(":") and remainder[1:]:
-                return host_part, int(remainder[1:])
-            if remainder in ("", ":"):
-                return host_part, 0
-            raise ValueError(f"invalid endpoint: {endpoint_str}")
-        host_part, sep, port_part = value.rpartition(":")
-        if sep and port_part.isdigit():
-            return host_part or default_host, int(port_part)
-        return value, 0
-
-    @staticmethod
-    def is_port_available(host: str, port: int) -> bool:
-        if port <= 0:
-            return False
-        try:
-            infos = socket.getaddrinfo(
-                host,
-                port,
-                socket.AF_UNSPEC,
-                socket.SOCK_STREAM,
-            )
-        except socket.gaierror:
-            return False
-        for family, socktype, proto, _, sockaddr in infos:
-            with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    sock.bind(sockaddr)
-                    return True
-                except OSError:
-                    continue
-        return False
-
-    @staticmethod
-    def get_available_addr(
-        endpoint: Optional[str],
-        *,
-        default_host: str = "127.0.0.1",
-    ) -> str:
-        normalized_default = Network.coerce_host(default_host) or "127.0.0.1"
-        if endpoint is None:
-            host, port = normalized_default, 0
-        else:
-            host, port = Network.normalize_endpoint(str(endpoint), normalized_default)
-
-        if port <= 0 or not Network.is_port_available(host, port):
-            last_error: Optional[BaseException] = None
-            try:
-                infos = socket.getaddrinfo(
-                    host,
-                    0,
-                    socket.AF_UNSPEC,
-                    socket.SOCK_STREAM,
-                )
-            except socket.gaierror as exc:
-                raise RuntimeError(
-                    f"unable to resolve host for endpoint: {host}"
-                ) from exc
-            for family, socktype, proto, _, sockaddr in infos:
-                with contextlib.closing(socket.socket(family, socktype, proto)) as sock:
-                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    try:
-                        sock.bind(sockaddr)
-                        port = int(sock.getsockname()[1])
-                        break
-                    except OSError as exc:
-                        last_error = exc
-                        continue
-            else:
-                if last_error is not None:
-                    raise RuntimeError(
-                        f"unable to identify an available port for host: {host}"
-                    ) from last_error
-                raise RuntimeError(
-                    f"unable to identify an available port for host: {host}"
-                )
-
-        try:
-            addr = ipaddress.ip_address(host)
-        except ValueError:
-            addr = None
-        if addr is not None and addr.version == 6:
-            return f"[{host}]:{port}"
-        return f"{host}:{port}"
-
-    @staticmethod
-    def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
-        ipv4_ok = False
-        ipv6_ok = False
-
-        ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
-        try:
-            with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                sock.bind((ipv4_host, 0))
-                ipv4_ok = True
-        except OSError:
-            pass
-
-        if getattr(socket, "has_ipv6", False):
-            ipv6_host = "::1" if allow_loopback else "::"
-            try:
-                with contextlib.closing(socket.socket(socket.AF_INET6, socket.SOCK_STREAM)) as sock6:
-                    if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
-                        with contextlib.suppress(OSError):
-                            sock6.setsockopt(
-                                socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
-                            )
-                    sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    sock6.bind((ipv6_host, 0, 0, 0))
-                    ipv6_ok = True
-            except OSError:
-                pass
-
-        return ipv4_ok, ipv6_ok
-
-    @staticmethod
-    def get_preferred_ip(
-        hostname: Optional[str] = None,
-        *,
-        prefer_ipv6: bool = True,
-        allow_loopback: bool = True,
-    ) -> str:
-        names: List[str] = []
-        if hostname:
-            candidate = str(hostname).strip()
-            if candidate:
-                names.append(candidate)
-        try:
-            system_host = socket.gethostname()
-        except Exception:
-            system_host = ""
-        if system_host:
-            names.append(system_host)
-        if allow_loopback:
-            names.append("localhost")
-
-        buckets: Dict[
-            Tuple[str, int],
-            List[Union[ipaddress.IPv4Address, ipaddress.IPv6Address]],
-        ] = {
-            ("global", 4): [],
-            ("global", 6): [],
-            ("loopback", 4): [],
-            ("loopback", 6): [],
-        }
-        seen: set[Tuple[int, str]] = set()
-
-        for name in names:
-            if not name:
-                continue
-            infos: List[Tuple[Any, ...]] = []
-            try:
-                infos = socket.getaddrinfo(
-                    name,
-                    None,
-                    socket.AF_UNSPEC,
-                    socket.SOCK_STREAM,
-                )
-            except socket.gaierror:
-                continue
-            except Exception:
-                with contextlib.suppress(Exception):
-                    infos = socket.getaddrinfo(name, None)
-            for info in infos:
-                try:
-                    sockaddr = info[4]
-                except Exception:
-                    sockaddr = None
-                if not sockaddr:
-                    continue
-                addr_text = sockaddr[0]
-                base, _, _ = addr_text.partition("%")
-                try:
-                    parsed = ipaddress.ip_address(base)
-                except ValueError:
-                    continue
-                if parsed.is_unspecified:
-                    continue
-                key = (parsed.version, parsed.compressed)
-                if key in seen:
-                    continue
-                seen.add(key)
-                bucket_key = ("loopback" if parsed.is_loopback else "global", parsed.version)
-                buckets.setdefault(bucket_key, []).append(parsed)
-
-        if prefer_ipv6:
-            order: Tuple[Tuple[str, int], ...] = (
-                ("global", 6),
-                ("global", 4),
-                ("loopback", 6),
-                ("loopback", 4),
-            )
-        else:
-            order = (
-                ("global", 4),
-                ("global", 6),
-                ("loopback", 4),
-                ("loopback", 6),
-            )
-
-        for bucket_key in order:
-            if not allow_loopback and bucket_key[0] == "loopback":
-                continue
-            bucket = buckets.get(bucket_key) or []
-            if bucket:
-                return bucket[0].compressed
-
-        fallback_ipv6_loop = "::1"
-        fallback_ipv4_loop = "127.0.0.1"
-        if allow_loopback:
-            return fallback_ipv6_loop if prefer_ipv6 else fallback_ipv4_loop
-        return "::" if prefer_ipv6 else "0.0.0.0"
-
-
-class Distributed:
-    @staticmethod
-    def initialize_master_addr(
-        endpoint: Optional[str],
-        *,
-        prefer_ipv6: bool = True,
-        allow_loopback: bool = True,
-    ) -> tuple[str, int]:
-        default_host = Network.get_preferred_ip(
-            allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
-        )
-        default_host = default_host or ("::1" if prefer_ipv6 else "127.0.0.1")
-        normalized = Network.coerce_host(endpoint) if endpoint is not None else None
-        if normalized:
-            host, port = Network.normalize_endpoint(normalized, default_host)
-        else:
-            host, port = (default_host, 0)
-        host = host.strip()
-        if host in {"", "0.0.0.0", "::"}:
-            host = default_host
-        literal = Network.normalize_ip_literal(host, allow_loopback=allow_loopback)
-        master_addr = literal or Network.coerce_host(host) or default_host
-        os.environ.setdefault("MASTER_ADDR", master_addr)
-        if port > 0:
-            os.environ.setdefault("MASTER_PORT", str(port))
-        return master_addr, int(port)
-
-    @staticmethod
-    def get_world_size(device: Optional[torch.device] = None) -> int:
-        try:
-            if dist.is_available() and dist.is_initialized():
-                return int(dist.get_world_size())
-        except Exception:
-            pass
-
-        dev = device
-        if dev is None:
-            with contextlib.suppress(Exception):
-                dev = System.get_device()
-        if dev is None:
-            dev = torch.device("cpu")
-        if dev.type == "cuda":
-            try:
-                return int(torch.cuda.device_count())
-            except Exception:
-                return 1
-        elif dev.type == "xpu":
-            xpu = getattr(torch, "xpu", None)
-            if xpu is not None:
-                with contextlib.suppress(Exception):
-                    count = int(xpu.device_count())
-                    if count > 0:
-                        return count
-            return 1
-        cpu_count = os.cpu_count() or 1
-        return max(1, min(cpu_count, 4))
-
-
-
-
 def get_runtime_config() -> _RuntimeConfig:
     return System.get_runtime_config()
 
@@ -944,98 +517,8 @@ def optimize_threads() -> Dict[str, Union[int, bool]]:
     return System.optimize_threads()
 
 
-def coerce_host(value: Any) -> str:
-    return Network.coerce_host(value)
-
-
-def normalize_ip_literal(value: Any, *, allow_loopback: bool = False) -> str | None:
-    return Network.normalize_ip_literal(value, allow_loopback=allow_loopback)
-
-
-def resolve_host_ip(
-    host: Any,
-    *,
-    allow_loopback: bool = False,
-    prefer_ipv6: bool | None = None,
-) -> str | None:
-    return Network.resolve_host_ip(
-        host,
-        allow_loopback=allow_loopback,
-        prefer_ipv6=prefer_ipv6,
-    )
-
-
-def format_endpoint_host(
-    host: Any,
-    *,
-    fallback: Any | None = None,
-    default: str = "127.0.0.1",
-    allow_loopback: bool = False,
-    allow_hostname: bool = True,
-) -> str:
-    return Network.format_endpoint_host(
-        host,
-        fallback=fallback,
-        default=default,
-        allow_loopback=allow_loopback,
-        allow_hostname=allow_hostname,
-    )
-
-
-def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
-    return Network.normalize_endpoint(endpoint_str, default_host)
-
-
-def is_port_available(host: str, port: int) -> bool:
-    return Network.is_port_available(host, port)
-
-
-def get_available_addr(
-    endpoint: Optional[str],
-    *,
-    default_host: str = "127.0.0.1",
-) -> str:
-    return Network.get_available_addr(endpoint, default_host=default_host)
-
-
-def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
-    return Network.probe_stack_support(allow_loopback=allow_loopback)
-
-
-def get_preferred_ip(
-    hostname: Optional[str] = None,
-    *,
-    prefer_ipv6: bool = True,
-    allow_loopback: bool = True,
-) -> str:
-    return Network.get_preferred_ip(
-        hostname,
-        prefer_ipv6=prefer_ipv6,
-        allow_loopback=allow_loopback,
-    )
-
-
-def initialize_master_addr(
-    endpoint: Optional[str],
-    *,
-    prefer_ipv6: bool = True,
-    allow_loopback: bool = True,
-) -> tuple[str, int]:
-    return Distributed.initialize_master_addr(
-        endpoint,
-        prefer_ipv6=prefer_ipv6,
-        allow_loopback=allow_loopback,
-    )
-
-
-def get_world_size(device: Optional[torch.device] = None) -> int:
-    return Distributed.get_world_size(device=device)
-
-
 __all__ = [
     "System",
-    "Network",
-    "Distributed",
     "get_runtime_config",
     "is_main_loadable",
     "initialize_python_path",
@@ -1053,12 +536,7 @@ __all__ = [
     "is_int8_supported",
     "is_int4_supported",
     "optimal_procs",
-    "normalize_ip_literal",
-    "normalize_endpoint",
-    "is_port_available",
-    "get_available_addr",
-    "probe_stack_support",
-    "get_preferred_ip",
-    "initialize_master_addr",
-    "get_world_size",
+    "cpu_count",
+    "optimal_threads",
+    "optimize_threads",
 ]

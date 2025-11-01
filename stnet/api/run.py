@@ -4,10 +4,11 @@ from __future__ import annotations
 import contextlib
 import os
 import shutil
+import socket
 import warnings
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -33,8 +34,70 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from ..backend.environment import Distributed, Network, System
+from ..backend.distributed import Distributed, Network
+from ..backend.environment import System
 from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
+
+
+@contextlib.contextmanager
+def _single_process_dist_env(config: LaunchConfig) -> Iterator[None]:
+    env_keys = (
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "RANK",
+        "LOCAL_RANK",
+        "WORLD_SIZE",
+        "LOCAL_WORLD_SIZE",
+    )
+    saved_env = {key: os.environ.get(key) for key in env_keys}
+    try:
+        master_addr = (config.local_addr or os.environ.get("MASTER_ADDR") or "127.0.0.1").strip()
+        if not master_addr:
+            master_addr = "127.0.0.1"
+        os.environ["MASTER_ADDR"] = master_addr
+        current_port = os.environ.get("MASTER_PORT")
+        port_value = int(current_port) if current_port and current_port.isdigit() else 0
+        if port_value <= 0:
+            endpoint = getattr(config, "rdzv_endpoint", None)
+            if isinstance(endpoint, str) and ":" in endpoint:
+                with contextlib.suppress(ValueError):
+                    port_value = int(endpoint.rsplit(":", 1)[1])
+        if port_value <= 0:
+            with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port_value = int(sock.getsockname()[1])
+        os.environ["MASTER_PORT"] = str(port_value)
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        yield
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _launch_runtime(
+    config: LaunchConfig,
+    ops: RuntimeConfig,
+    *,
+    ret_sink: Optional[Dict[Any, Any]] = None,
+    use_distributed: bool,
+) -> None:
+    if use_distributed:
+        if ret_sink is None:
+            elastic_launch(config, main)(ops)
+        else:
+            elastic_launch(config, main)(ops, ret_sink)
+        return
+    with _single_process_dist_env(config):
+        if ret_sink is None:
+            main(ops)
+        else:
+            main(ops, ret_sink)
 
 
 def train(
@@ -60,6 +123,7 @@ def train(
     loss_tile_size: Optional[int] = None,
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
+    use_distributed: bool = True,
     **kwargs: Any,
 ) -> Root:
     """Train ``model`` using ``data`` and return the updated instance."""
@@ -146,7 +210,7 @@ def train(
         **default_kwargs,
         **kwargs,
     )
-    elastic_launch(lc, main)(ops)
+    _launch_runtime(lc, ops, use_distributed=use_distributed)
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -170,6 +234,7 @@ def predict(
     mode: OpsMode = "predict",
     max_nodes: Optional[int] = None,
     rdzv_backend: Optional[str] = None,
+    use_distributed: bool = True,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
     """Run inference with ``model`` and return the aggregated predictions."""
@@ -242,8 +307,8 @@ def predict(
     master_addr, _ = Distributed.initialize_master_addr(rdzv_endpoint)
     System.optimize_threads()
     nprocs = int(System.optimal_procs()["nproc_per_node"])
-    manager = mp.Manager()
-    ret_dict = manager.dict()
+    manager = mp.Manager() if use_distributed else None
+    ret_dict = manager.dict() if manager is not None else None
     resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
     resolved_rdzv_backend = rdzv_backend or "c10d"
     lc = LaunchConfig(
@@ -258,9 +323,21 @@ def predict(
         start_method=System.optimal_start_method(),
         local_addr=master_addr,
     )
-    elastic_launch(lc, main)(ops, ret_dict)
+    if use_distributed:
+        assert ret_dict is not None
+        elastic_launch(lc, main)(ops, ret_dict)
+        result: Dict[Tuple, torch.Tensor] = dict(ret_dict)
+    else:
+        local_sink: Dict[Any, Any] = {}
+        _launch_runtime(
+            lc,
+            ops,
+            ret_sink=local_sink,
+            use_distributed=False,
+        )
+        result = {tuple(key): value for key, value in local_sink.items()}
     try:
-        return dict(ret_dict)
+        return result
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)

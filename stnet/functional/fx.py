@@ -11,7 +11,7 @@ from torch import nn
 from ..backend.compat import patch_torch
 from ..data.stats import MetaData
 from ..model.kernels import DotProductAttention
-from ..utils.platform import (
+from ..backend.environment import (
     get_device,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
