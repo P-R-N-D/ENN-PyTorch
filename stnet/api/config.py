@@ -19,7 +19,7 @@ from typing import (
 import torch
 
 
-def ensure_bool(value: Any, *, name: str) -> bool:
+def ensure_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -35,10 +35,11 @@ def ensure_bool(value: Any, *, name: str) -> bool:
 
 def ensure_int(
     value: Any,
-    *,
+    *args: Any,
     name: str,
     minimum: Optional[int] = None,
     maximum: Optional[int] = None,
+    **kwargs: Any,
 ) -> int:
     try:
         ivalue = int(value)
@@ -53,10 +54,11 @@ def ensure_int(
 
 def ensure_float(
     value: Any,
-    *,
+    *args: Any,
     name: str,
     minimum: Optional[float] = None,
     maximum: Optional[float] = None,
+    **kwargs: Any,
 ) -> float:
     try:
         fvalue = float(value)
@@ -71,11 +73,12 @@ def ensure_float(
 
 def ensure_int_tuple(
     value: Any,
-    *,
+    *args: Any,
     name: str,
     dims: int,
     allow_none: bool = False,
     keep_scalar: bool = False,
+    **kwargs: Any,
 ) -> Optional[Union[int, Tuple[int, ...]]]:
     if value is None:
         if allow_none:
@@ -129,6 +132,8 @@ class ModelConfig:
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
+
+
 def coerce_patch_config(
     config: PatchConfig | Dict[str, Any] | None,
 ) -> PatchConfig:
@@ -302,7 +307,8 @@ def coerce_model_config(
 def patch_config(
     base: PatchConfig | Dict[str, Any] | None = None,
     /,
-    **overrides: Any,
+    *args: Any,
+    **kwargs: Any,
 ) -> PatchConfig:
     if base is None:
         data: Dict[str, Any] = {}
@@ -312,14 +318,15 @@ def patch_config(
         data = dict(base)
     else:
         raise TypeError("base must be PatchConfig, dict, or None")
-    data.update(overrides)
+    data.update(kwargs)
     return coerce_patch_config(data)
 
 
 def model_config(
     base: ModelConfig | Dict[str, Any] | None = None,
     /,
-    **overrides: Any,
+    *args: Any,
+    **kwargs: Any,
 ) -> ModelConfig:
     if base is None:
         data: Dict[str, Any] = {}
@@ -329,7 +336,7 @@ def model_config(
         data = dict(base)
     else:
         raise TypeError("base must be ModelConfig, dict, or None")
-    data.update(overrides)
+    data.update(kwargs)
     return coerce_model_config(data)
 
 
@@ -391,14 +398,14 @@ class RuntimeConfig:
     )
 
     @staticmethod
-    def from_partial(mode: OpsMode, **kw: Any) -> "RuntimeConfig":
-        kw = dict(kw)
+    def from_partial(mode: OpsMode, *args: Any, **kwargs: Any) -> "RuntimeConfig":
+        kwargs = dict(kwargs)
         for k in ("in_dim", "out_shape", "cfg_dict"):
-            if k not in kw or kw[k] is None:
+            if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
-        in_dim = int(kw["in_dim"])
-        out_shape = ensure_int_sequence(kw["out_shape"])
-        cfg_dict = dict(kw["cfg_dict"])
+        in_dim = int(kwargs["in_dim"])
+        out_shape = ensure_int_sequence(kwargs["out_shape"])
+        cfg_dict = dict(kwargs["cfg_dict"])
         common_keys = {
             "in_dim",
             "out_shape",
@@ -406,7 +413,7 @@ class RuntimeConfig:
         }
         if mode == "train":
             for k in ("memmap_dir", "ckpt_dir"):
-                if k not in kw or kw[k] is None:
+                if k not in kwargs or kwargs[k] is None:
                     raise ValueError(f"RuntimeConfig(train) missing required key: {k}")
             allowed = common_keys | {
                 "memmap_dir",
@@ -428,39 +435,39 @@ class RuntimeConfig:
                 "loss_mask_mode",
                 "loss_mask_value",
             }
-            unsupported = set(kw) - allowed
+            unsupported = set(kwargs) - allowed
             if unsupported:
                 raise ValueError(
                     "RuntimeConfig(train) received unsupported parameters: "
                     f"{sorted(unsupported)}"
                 )
-            batch_size = int(kw.get("batch_size", 128))
+            batch_size = int(kwargs.get("batch_size", 128))
             return RuntimeConfig(
                 mode="train",
                 in_dim=in_dim,
                 out_shape=out_shape,
                 cfg_dict=cfg_dict,
-                memmap_dir=str(kw["memmap_dir"]),
-                ckpt_dir=str(kw["ckpt_dir"]),
-                init_ckpt_dir=kw.get("init_ckpt_dir"),
-                epochs=int(kw.get("epochs", 5)),
+                memmap_dir=str(kwargs["memmap_dir"]),
+                ckpt_dir=str(kwargs["ckpt_dir"]),
+                init_ckpt_dir=kwargs.get("init_ckpt_dir"),
+                epochs=int(kwargs.get("epochs", 5)),
                 batch_size=batch_size,
-                val_frac=float(kw.get("val_frac", 0.1)),
-                base_lr=float(kw.get("base_lr", 1e-3)),
-                weight_decay=float(kw.get("weight_decay", 1e-4)),
-                warmup_ratio=float(kw.get("warmup_ratio", 0.0)),
-                eta_min=float(kw.get("eta_min", 0.0)),
-                seed=int(kw.get("seed", 42)),
-                prefetch_factor=kw.get("prefetch_factor", 1),
-                grad_accum_steps=int(kw.get("grad_accum_steps", 1)),
-                overlap_h2d=bool(kw.get("overlap_h2d", True)),
-                loss_tile_dim=kw.get("loss_tile_dim"),
-                loss_tile_size=kw.get("loss_tile_size"),
-                loss_mask_mode=str(kw.get("loss_mask_mode", "none")),
-                loss_mask_value=kw.get("loss_mask_value"),
+                val_frac=float(kwargs.get("val_frac", 0.1)),
+                base_lr=float(kwargs.get("base_lr", 1e-3)),
+                weight_decay=float(kwargs.get("weight_decay", 1e-4)),
+                warmup_ratio=float(kwargs.get("warmup_ratio", 0.0)),
+                eta_min=float(kwargs.get("eta_min", 0.0)),
+                seed=int(kwargs.get("seed", 42)),
+                prefetch_factor=kwargs.get("prefetch_factor", 1),
+                grad_accum_steps=int(kwargs.get("grad_accum_steps", 1)),
+                overlap_h2d=bool(kwargs.get("overlap_h2d", True)),
+                loss_tile_dim=kwargs.get("loss_tile_dim"),
+                loss_tile_size=kwargs.get("loss_tile_size"),
+                loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
+                loss_mask_value=kwargs.get("loss_mask_value"),
             )
         for k in ("memmap_dir", "keys"):
-            if k not in kw or kw[k] is None:
+            if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig({mode}) missing required key: {k}")
         allowed = common_keys | {
             "memmap_dir",
@@ -470,23 +477,23 @@ class RuntimeConfig:
             "seed",
             "prefetch_factor",
         }
-        unsupported = set(kw) - allowed
+        unsupported = set(kwargs) - allowed
         if unsupported:
             raise ValueError(
                 f"RuntimeConfig({mode}) received unsupported parameters: {sorted(unsupported)}"
             )
-        batch_size = int(kw.get("batch_size", 512))
+        batch_size = int(kwargs.get("batch_size", 512))
         return RuntimeConfig(
             mode="predict" if mode == "predict" else "infer",
             in_dim=in_dim,
             out_shape=out_shape,
             cfg_dict=cfg_dict,
-            memmap_dir=str(kw["memmap_dir"]),
-            model_ckpt_dir=kw.get("model_ckpt_dir"),
-            keys=list(kw["keys"]),
+            memmap_dir=str(kwargs["memmap_dir"]),
+            model_ckpt_dir=kwargs.get("model_ckpt_dir"),
+            keys=list(kwargs["keys"]),
             batch_size=batch_size,
-            seed=int(kw.get("seed", 7)),
-            prefetch_factor=kw.get("prefetch_factor", 1),
+            seed=int(kwargs.get("seed", 7)),
+            prefetch_factor=kwargs.get("prefetch_factor", 1),
         )
 
 
