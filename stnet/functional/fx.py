@@ -28,7 +28,6 @@ patch_torch()
 def reshape_for_heads(
     tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
 ) -> torch.Tensor:
-    """Reshape a projection to multi-head layout."""
 
     return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
 
