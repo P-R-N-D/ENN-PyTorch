@@ -34,7 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from ..model import Root
 from ..api.config import ModelConfig, coerce_model_config
-from ..backend.engine import inference
+from ..backend.fx import inference
 
 
 class MissingDependencyError(ImportError):

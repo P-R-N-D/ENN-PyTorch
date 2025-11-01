@@ -806,7 +806,7 @@ def _import_callable(spec: str) -> Callable:
         raise ValueError("Empty spec for callable import")
     raw = spec.strip()
     root_pkg = __package__.split(".", 1)[0] if __package__ else "stnet"
-    default_module = f"{root_pkg}.backend.engine"
+    default_module = f"{root_pkg}.backend.fx"
     if ":" in raw:
         mod_part, fn_part = raw.split(":", 1)
     else:

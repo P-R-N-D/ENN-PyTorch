@@ -39,8 +39,8 @@ from ..api.config import (
     RuntimeConfig,
     coerce_model_config,
 )
-from ..model.losses import StandardNormalLoss, StudentsTLoss, TiledLoss
-from ..model.optimizers import AdamW
+from .losses import StandardNormalLoss, StudentsTLoss, TiledLoss
+from .optimizers import AdamW
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_torch_tensor

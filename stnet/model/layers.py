@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
-from ..backend.engine import AutoCast, compile, inference, reshape_for_heads
+from ..backend.fx import AutoCast, compile, inference, reshape_for_heads
 from .activations import GeGLU, SwiGLU
 from .kernels import (
     DotProductAttention,

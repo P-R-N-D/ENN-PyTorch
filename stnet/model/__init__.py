@@ -14,7 +14,7 @@ from ..api.config import (
     patch_config,
 )
 from .activations import GeGLU, SwiGLU
-from .losses import (
+from ..backend.losses import (
     DataFidelityLoss,
     LinearCombinationLoss,
     MultipleQuantileLoss,
@@ -22,7 +22,7 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .nn import (
+from .layers import (
     CrossAttention,
     CrossTransformer,
     DilatedAttention,
