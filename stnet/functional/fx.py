@@ -52,7 +52,6 @@ __all__ = [
     "is_transformer_engine_enabled",
     "AutoCast",
     "_import_callable",
-    "Accelerator",
     "LayerReplacement",
     "Quantization",
     "Gradient",
@@ -1588,5 +1587,3 @@ class LayerReplacement:
         return (m2, ok, why)
 
 
-#: Backwards compatibility alias for the previous public helper name.
-Accelerator = LayerReplacement

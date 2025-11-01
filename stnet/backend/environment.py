@@ -36,7 +36,7 @@ from ..data.transforms import (
     preprocess,
 )
 from ..functional.optimizers import AdamW
-from ..functional.fx import Accelerator, AutoCast, Gradient, LayerReplacement
+from ..functional.fx import AutoCast, Gradient, LayerReplacement
 from ..functional.losses import LossWeightController
 from ..model.kernels import (
     DotProductAttention,
@@ -1107,7 +1107,6 @@ __all__ = [
     "MultiScaleRetention",
     "MultiScaleRetentionCompat",
     "LossWeightController",
-    "Accelerator",
     "LayerReplacement",
     "Gradient",
     "attention_flops_bshd",
