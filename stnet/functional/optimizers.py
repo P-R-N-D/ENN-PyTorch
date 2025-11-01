@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn, optim
 
 from ..data.stats import MetaData
-from ..model.kernels import DotProductAttention
 from ..utils.platform import (
     get_device,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
     is_float8_supported,
     is_int4_supported,
     is_int8_supported,

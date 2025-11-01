@@ -24,10 +24,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from ..api import is_fake_tensor, is_meta_or_fake_tensor
+from ..api import is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
 from ..functional.fx import AutoCast, Gradient, reshape_for_heads
-from .activations import GeGLU, SwiGLU
+from .activations import SwiGLU
 from .kernels import (
     DotProductAttention,
     MultiHeadAttention,

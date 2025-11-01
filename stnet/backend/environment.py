@@ -18,33 +18,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from .compat import (
-    SDPBackend,
-    TorchCompat,
-    _to_sdpa_backends,
-    patch_torch,
-    sdpa_kernel,
-)
-from .distributed import joining, no_synchronization
-from .profiler import FlopCounter, attention_flops_bshd
-from ..data import datatype
-from ..data.transforms import (
-    IncrementalPCA,
-    StandardScaler,
-    VarianceThreshold,
-    postprocess,
-    preprocess,
-)
-from ..functional.optimizers import AdamW
-from ..functional.fx import AutoCast, Gradient, LayerReplacement
-from ..functional.losses import LossWeightController
-from ..model.kernels import (
-    DotProductAttention,
-    MultiScaleRetention,
-    MultiScaleRetentionCompat,
-)
-
-
 @dataclass
 class _RuntimeConfig:
     deterministic: bool = False
@@ -1059,89 +1032,33 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
     return Distributed.get_world_size(device=device)
 
 
-try:  # pragma: no cover - optional dependency
-    from torchdistx.fake import is_fake as _tdx_is_fake  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - torchdistx not installed
-    _tdx_is_fake = None  # type: ignore
-
-try:  # pragma: no cover - private API best-effort
-    from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
-except Exception:  # pragma: no cover - fallback when private API unavailable
-    FakeTensor = tuple()  # type: ignore
-
-
-def is_fake_tensor(value: Any) -> bool:
-    """Return ``True`` when ``value`` references a FakeTensor placeholder."""
-
-    if not isinstance(value, torch.Tensor):
-        return False
-    if _tdx_is_fake is not None:
-        try:
-            return bool(_tdx_is_fake(value))
-        except Exception:
-            pass
-    return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
-
-
-def is_meta_tensor(value: Any) -> bool:
-    """Check whether a tensor is backed by the meta device placeholder."""
-
-    return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
-
-
-def is_meta_or_fake_tensor(value: Any) -> bool:
-    """Return ``True`` when ``value`` is either a meta tensor or a fake tensor."""
-
-    return is_meta_tensor(value) or is_fake_tensor(value)
-
-
-dtypes = datatype
-
 __all__ = [
     "System",
     "Network",
     "Distributed",
-    "AdamW",
-    "AutoCast",
-    "DotProductAttention",
-    "MultiScaleRetention",
-    "MultiScaleRetentionCompat",
-    "LossWeightController",
-    "LayerReplacement",
-    "Gradient",
-    "attention_flops_bshd",
-    "FlopCounter",
-    "joining",
-    "no_synchronization",
-    "get_device",
     "get_runtime_config",
+    "is_main_loadable",
+    "initialize_python_path",
+    "optimal_start_method",
+    "set_multiprocessing_env",
+    "default_temp",
+    "new_dir",
     "initialize_sdpa_backends",
-    "patch_torch",
-    "TorchCompat",
-    "SDPBackend",
-    "sdpa_kernel",
-    "_to_sdpa_backends",
-    "VarianceThreshold",
-    "StandardScaler",
-    "IncrementalPCA",
-    "preprocess",
-    "postprocess",
-    "datatype",
-    "dtypes",
-    "is_fake_tensor",
-    "is_meta_tensor",
-    "is_meta_or_fake_tensor",
-    "get_world_size",
-    "initialize_master_addr",
-    "get_preferred_ip",
+    "is_cpu_bf16_supported",
+    "is_cuda_bf16_supported",
+    "get_device",
+    "optimal_optimizer_params",
+    "cuda_compute_capability",
+    "is_float8_supported",
+    "is_int8_supported",
+    "is_int4_supported",
+    "optimal_procs",
+    "normalize_ip_literal",
+    "normalize_endpoint",
+    "is_port_available",
+    "get_available_addr",
     "probe_stack_support",
-    "resolve_address",
-    "resolve_endpoint",
+    "get_preferred_ip",
+    "initialize_master_addr",
+    "get_world_size",
 ]
-
-module_name = __name__
-package_name = __package__ or module_name
-sys.modules[module_name + ".dtypes"] = datatype
-sys.modules[package_name + ".dtypes"] = datatype
-
-patch_torch()

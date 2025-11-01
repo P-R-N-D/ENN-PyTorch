@@ -2,9 +2,6 @@
 from __future__ import annotations
 
 from ..backend.compat import SDPBackend, patch_torch, sdpa_kernel
-
-patch_torch()
-
 from ..api.config import (
     ModelConfig,
     PatchConfig,
@@ -43,6 +40,8 @@ from .layers import (
     norm_layer,
     schedule_stochastic_depth,
 )
+
+patch_torch()
 
 __all__ = [
     "sdpa_kernel",

@@ -9,7 +9,7 @@ import time
 from collections import deque
 from contextlib import nullcontext, suppress
 from functools import partial
-from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, Mapping, Optional, Tuple, Union
 
 import ctypes
 import importlib
@@ -404,11 +404,6 @@ def _wrap_data_node(
 ) -> "DataLoader":
     io_workers = max(1, int(threads["dataloader_workers"]))
     prebatch = max(1, int(threads["prefetch_factor"]))
-    cpu_total = os.cpu_count() or io_workers
-    cpu_budget = max(1, cpu_total - 1) if cpu_total > 1 else 1
-    proc_target = max(io_workers, 2)
-    proc_workers = max(1, min(cpu_budget, proc_target))
-
     load_balancer = ThreadLoadBalancer(io_workers)
     io_workers = load_balancer.tune_workers(io_workers)
     map_fn = load_balancer.wrap_map(map_fn)
