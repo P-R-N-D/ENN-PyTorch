@@ -35,13 +35,9 @@ from ..data.transforms import (
     postprocess,
     preprocess,
 )
-from ..functional import AdamW, Module
-from ..kernels import (
-    AutoCast,
-    LossWeightController,
-    inference,
-)
-from ..model.ops import (
+from ..model.optimizers import AdamW
+from ..backend.engine import AutoCast, Accelerator, LossWeightController, inference
+from ..model.kernels import (
     DotProductAttention,
     MultiScaleRetention,
     MultiScaleRetentionCompat,
@@ -1110,7 +1106,7 @@ __all__ = [
     "MultiScaleRetention",
     "MultiScaleRetentionCompat",
     "LossWeightController",
-    "Module",
+    "Accelerator",
     "attention_flops_bshd",
     "FlopCounter",
     "inference",

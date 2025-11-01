@@ -34,7 +34,7 @@ from .config import (
     runtime_config,
 )
 from .utils import Distributed, Network, System
-from ..backend.engine import _prune_dcp_state_keys, ignored_pattern, main
+from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 
 def train(

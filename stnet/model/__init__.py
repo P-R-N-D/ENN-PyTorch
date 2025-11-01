@@ -13,14 +13,13 @@ from ..api.config import (
     model_config,
     patch_config,
 )
-from ..functional import (
+from .activations import GeGLU, SwiGLU
+from .losses import (
     DataFidelityLoss,
-    GeGLU,
+    LinearCombinationLoss,
     MultipleQuantileLoss,
-    PositionalEncoding,
     StandardNormalLoss,
     StudentsTLoss,
-    SwiGLU,
     TiledLoss,
 )
 from .nn import (
@@ -33,6 +32,7 @@ from .nn import (
     PatchAttention,
     PatchEmbedding,
     Payload,
+    PositionalEncoding,
     PointTransformer,
     Root,
     SpatialEncoder,
@@ -71,6 +71,7 @@ __all__ = [
     "GeGLU",
     "PositionalEncoding",
     "SwiGLU",
+    "LinearCombinationLoss",
     "MultipleQuantileLoss",
     "StandardNormalLoss",
     "StudentsTLoss",
