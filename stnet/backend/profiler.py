@@ -10,19 +10,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 import torch
 from torch import nn
 
-__all__ = [
-    "FLOP_PROFILER",
-    "FlopCounter",
-    "attention_flops_bshd",
-    "estimate_attention_flops",
-]
 
-# ------------------------------------------------------------
-# NOTE:
-#  - torch.profiler(with_flops=True) 우선 사용
-#  - NVTX(nsight) 소스의 값도 소프트 카운터로 수집
-#  - 모듈 메타데이터(format="xs") 지원: 입력 x만 있는 모듈을 위해
-# ------------------------------------------------------------
 def _infer_linear_mkn(
     inp: torch.Tensor, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
@@ -84,10 +72,11 @@ def _linear_forward_hook(
     mod: nn.Module,
     inp: Tuple[Any, ...],
     out: Any,
-    *,
+    *args: Any,
     profiler: "_FlopProfiler",
     include_bias: bool,
     effective_bwd: float,
+    **kwargs: Any,
 ) -> None:
     weight = getattr(mod, "weight", None)
     if weight is None:
@@ -105,9 +94,10 @@ def _conv_forward_hook(
     mod: nn.Module,
     inp: Tuple[Any, ...],
     out: Any,
-    *,
+    *args: Any,
     profiler: "_FlopProfiler",
     effective_bwd: float,
+    **kwargs: Any,
 ) -> None:
     weight = getattr(mod, "weight", None)
     x = inp[0] if inp else None
@@ -124,11 +114,12 @@ def estimate_attention_flops(
     seq_len: int,
     num_heads: int,
     head_dim: int,
-    *,
+    *args: Any,
     bwd_factor: float,
     dropout_p: float,
     training: bool,
     include_softmax_scale_dropout: bool,
+    **kwargs: Any,
 ) -> float:
     if batch <= 0 or seq_len <= 0 or num_heads <= 0 or head_dim <= 0:
         return 0.0
@@ -147,9 +138,10 @@ def _attention_forward_hook(
     mod: nn.Module,
     inp: Tuple[Any, ...],
     out: Any,
-    *,
+    *args: Any,
     profiler: "_FlopProfiler",
     metadata: Dict[str, Any],
+    **kwargs: Any,
 ) -> None:
     if not inp:
         return
@@ -331,7 +323,7 @@ class _FlopProfiler:
         self.ensure_nvtx_getter()
         getter = self._nvtx_getter or self._nvtx_soft_getter
         try:
-            import torch.cuda.nvtx as nvtx  # noqa: F401
+            import torch.cuda.nvtx as nvtx
         except Exception:
             return contextlib.nullcontext()
 
@@ -359,9 +351,6 @@ class _FlopProfiler:
         return _NvtxScope(device)
 
     def _torch_counter(self, display: bool = False) -> Any:
-        """
-        torch.profiler(with_flops=True) 우선, 실패 시 legacy flop_counter 사용.
-        """
 
         try:
             from torch.profiler import profile
@@ -435,10 +424,11 @@ class _FlopProfiler:
     def start_hooks(
         self,
         model: nn.Module,
-        *,
+        *args: Any,
         mode: str,
         include_bias: bool,
         bwd_factor: Optional[float],
+        **kwargs: Any,
     ) -> List[Any]:
         handles: List[Any] = []
         effective_bwd = 2.0 if mode == "train" else 0.0
