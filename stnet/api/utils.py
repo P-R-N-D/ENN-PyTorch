@@ -35,8 +35,8 @@ from ..data.transforms import (
     postprocess,
     preprocess,
 )
-from ..model.optimizers import AdamW
-from ..backend.engine import AutoCast, Accelerator, LossWeightController, inference
+from ..backend.optimizers import AdamW
+from ..backend.fx import AutoCast, Accelerator, LossWeightController, inference
 from ..model.kernels import (
     DotProductAttention,
     MultiScaleRetention,

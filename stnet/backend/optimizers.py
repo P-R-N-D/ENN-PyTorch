@@ -6,7 +6,7 @@ import torch
 from torch import nn, optim
 
 from ..data.stats import MetaData
-from .kernels import DotProductAttention
+from ..model.kernels import DotProductAttention
 from ..utils.platform import (
     get_device,
     is_cpu_bf16_supported,
@@ -16,7 +16,7 @@ from ..utils.platform import (
     is_int8_supported,
     optimal_optimizer_params,
 )
-from ..backend.engine import AutoCast, Accelerator, _supports_scale
+from .fx import AutoCast, Accelerator, _supports_scale
 
 __all__ = ["AdamW"]
 

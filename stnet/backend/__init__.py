@@ -10,6 +10,15 @@ from ..api.config import (
 from ..api.io import load_model, new_model, save_model
 from ..api.run import launch, predict, train
 from .distributed import joining
+from .losses import (
+    DataFidelityLoss,
+    LinearCombinationLoss,
+    MultipleQuantileLoss,
+    StandardNormalLoss,
+    StudentsTLoss,
+    TiledLoss,
+)
+from .optimizers import AdamW
 
 learn = train
 infer = predict
@@ -29,4 +38,11 @@ __all__ = [
     "predict",
     "infer",
     "launch",
+    "AdamW",
+    "MultipleQuantileLoss",
+    "StandardNormalLoss",
+    "StudentsTLoss",
+    "DataFidelityLoss",
+    "LinearCombinationLoss",
+    "TiledLoss",
 ]
