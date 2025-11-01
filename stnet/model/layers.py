@@ -36,28 +36,27 @@ from .kernels import (
 )
 
 try:
-    from torch._inductor import config as _inductor_config  # type: ignore[attr-defined]
+    from torch._inductor import config as _inductor_config
 except Exception:
-    _inductor_config = None  # type: ignore[assignment]
+    _inductor_config = None
 else:
     try:
         triton_cfg = getattr(_inductor_config, "triton")
         if hasattr(triton_cfg, "cudagraph_skip_dynamic_graphs"):
-            triton_cfg.cudagraph_skip_dynamic_graphs = True  # type: ignore[attr-defined]
+            triton_cfg.cudagraph_skip_dynamic_graphs = True
     except Exception:
         pass
 
 try:
-    from ..backend.compat import RMSNorm as _Norm  # type: ignore
+    from ..backend.compat import RMSNorm as _Norm
 except Exception:
     _Norm = nn.LayerNorm
 
 
 try:
-    # 프로파일러가 없어도 동작하게 안전 import
-    from ..backend.profiler import FLOP_PROFILER  # noqa: F401
+    from ..backend.profiler import FLOP_PROFILER
 except Exception:
-    FLOP_PROFILER = None  # noqa: N816
+    FLOP_PROFILER = None
 
 
 patch_torch()
@@ -69,15 +68,14 @@ if TYPE_CHECKING:
     from ..api.config import ModelConfig
 
 
-# rollback: use vanilla LayerNorm in eager/CPU runs
 LayerNorm = nn.LayerNorm
 
 
-def _disable_torch_compile(fn=None, *, recursive: bool = False):
+def _disable_torch_compile(fn=None, *args: Any, recursive: bool = False, **kwargs: Any):
     if fn is None:
         return lambda real_fn: _disable_torch_compile(real_fn, recursive=recursive)
     try:
-        return _torch_compile_disable(fn, recursive=recursive)  # type: ignore[misc]
+        return _torch_compile_disable(fn, recursive=recursive)
     except TypeError:
         return _torch_compile_disable(fn)
 
@@ -85,7 +83,7 @@ def _disable_torch_compile(fn=None, *, recursive: bool = False):
 def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
     forward = getattr(module, "forward", None)
     if callable(forward):
-        module.forward = _disable_torch_compile(forward)  # type: ignore[assignment]
+        module.forward = _disable_torch_compile(forward)
     return module
 
 
@@ -187,7 +185,7 @@ def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     if kind in {"layernorm", "layer_norm", "ln"}:
         return _disable_module_torch_compile(LayerNorm(d_model))
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return _disable_module_torch_compile(nn.RMSNorm(d_model))  # type: ignore[misc]
+        return _disable_module_torch_compile(nn.RMSNorm(d_model))
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
         return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
     return _disable_module_torch_compile(LayerNorm(d_model))
@@ -406,8 +404,9 @@ class CrossAttention(nn.Module):
         dropout: float = 0.0,
         norm_type: str = "layernorm",
         bias: bool = True,
-        *,
+        *args: Any,
         use_gate: bool = True,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         if d_model % nhead != 0:
@@ -455,8 +454,9 @@ class PatchAttention(nn.Module):
         self,
         d_model: int,
         nhead: int,
-        *,
+        *args: Any,
         coord_dim: int = 3,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         if d_model % nhead != 0:
@@ -503,7 +503,6 @@ class PatchAttention(nn.Module):
             .view(B, N, N, self.nhead, self.head_dim)
             .permute(0, 3, 1, 2, 4)
         )
-        # note: when no mask is provided, additive is a zero tensor (no masking)
         if attn_mask is None:
             additive = torch.zeros_like(rel_bias)
         else:
@@ -545,9 +544,10 @@ class TemporalEncoderLayer(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        *,
+        *args: Any,
         attn_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
+        **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         h = self.msr(x, attn_mask=attn_mask, state=state)
         if isinstance(h, tuple):
@@ -562,17 +562,12 @@ class TemporalEncoderLayer(nn.Module):
 @_disable_torch_compile
 def _build_dilated_mask(
     seq_len: int,
-    *,
+    *args: Any,
     dilation: int = 1,
     window_size: Optional[int] = None,
     causal: bool = False,
+    **kwargs: Any,
 ) -> torch.Tensor:
-    """
-    Dilated attention용 boolean mask 생성: shape (L, L), True는 mask-out.
-      - (i - j) % dilation == 0
-      - window_size가 주어지면 |i - j| <= window_size
-      - causal이면 j <= i
-    """
 
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
@@ -589,27 +584,16 @@ def _build_dilated_mask(
     )
     not_future = (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
     allowed = congruent & within & not_future
-    return (~allowed).contiguous()  # True = masked
+    return (~allowed).contiguous()
 
 
 class DilatedAttention(nn.Module):
-    """
-    Dilated attention 블록. 내부 attention은 프로젝트 표준 MultiHeadAttention 사용.
-
-    Args:
-        embed_dim, num_heads, dilation, window_size, causal, dropout, mlp_ratio,
-        batch_first, bias
-
-    IO:
-        x: (B, L, C) if batch_first
-        key_padding_mask: (B, L) bool, True = pad
-    """
 
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
-        *,
+        *args: Any,
         dilation: int = 1,
         window_size: Optional[int] = None,
         causal: bool = False,
@@ -617,6 +601,7 @@ class DilatedAttention(nn.Module):
         mlp_ratio: float = 4.0,
         batch_first: bool = True,
         bias: bool = True,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -682,13 +667,12 @@ class DilatedAttention(nn.Module):
         self._mask_cache_gpu[key] = mask_gpu
         return mask_gpu
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # CG 친화성: 스텝 경계 호출은 상위 루프/엔진에서 담당 (모듈 내부 호출 금지)
         if not self.batch_first:
             x = x.transpose(0, 1)
         B, L, _ = x.shape
@@ -714,6 +698,7 @@ class DilatedAttention(nn.Module):
 
 
 class PointTransformer(nn.Module):
+    
     def __init__(
         self,
         d_model: int,
@@ -864,6 +849,7 @@ def _normalize_modeling_type(value: Any) -> str:
 
 @_disable_torch_compile(recursive=True)
 class SpatialEncoder(nn.Module):
+    
     def __init__(
         self,
         d_model: int,
@@ -932,6 +918,7 @@ class SpatialEncoder(nn.Module):
         return out.contiguous()
 
 class TemporalEncoderBlock(nn.Module):
+    
     def __init__(
         self,
         d_model: int,
@@ -973,6 +960,7 @@ class TemporalEncoderBlock(nn.Module):
 
 
 class TemporalEncoder(nn.Module):
+    
     def __init__(
         self,
         d_model: int,
@@ -1007,8 +995,9 @@ class TemporalEncoder(nn.Module):
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
-        *,
+        *args: Any,
         return_state: bool = False,
+        **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[dict]]]:
         next_state = state
         for blk in self.blocks:
@@ -1019,6 +1008,7 @@ class TemporalEncoder(nn.Module):
         return x
 
 class CrossTransformer(nn.Module):
+    
     def __init__(
         self,
         d_model: int,
@@ -1128,12 +1118,13 @@ class Payload:
     context_shape: Tuple[int, ...]
 
 class LongNet(nn.Module):
+    
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
         depth: int,
-        *,
+        *args: Any,
         dilation_growth: int = 2,
         base_dilation: int = 1,
         window_size: Optional[int] = None,
@@ -1141,6 +1132,7 @@ class LongNet(nn.Module):
         mlp_ratio: float = 4.0,
         causal: bool = False,
         batch_first: bool = True,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.nhead = int(num_heads)
@@ -1254,12 +1246,13 @@ class LongNet(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
+    
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
         depth: int,
-        *,
+        *args: Any,
         dilation_growth: int = 2,
         base_dilation: int = 1,
         window_size: Optional[int] = None,
@@ -1267,6 +1260,7 @@ class GlobalEncoder(nn.Module):
         mlp_ratio: float = 4.0,
         causal: bool = False,
         batch_first: bool = True,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.backbone = LongNet(
@@ -1300,6 +1294,7 @@ class GlobalEncoder(nn.Module):
         )
 
 class LocalProcessor(nn.Module):
+    
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -1432,14 +1427,14 @@ class LocalProcessor(nn.Module):
                 tokens = temporal_out
             elif mode_l == "ts":
                 if hasattr(self.perception, "_forward_dynamic"):
-                    tokens = self.perception._forward_dynamic(  # type: ignore[attr-defined]
+                    tokens = self.perception._forward_dynamic(
                         temporal_out, spatial_out, "ts"
                     )
                 else:
                     tokens = self.perception(temporal_out, spatial_out, mode="ts")
             elif mode_l == "st":
                 if hasattr(self.perception, "_forward_dynamic"):
-                    tokens = self.perception._forward_dynamic(  # type: ignore[attr-defined]
+                    tokens = self.perception._forward_dynamic(
                         spatial_out, temporal_out, "st"
                     )
                 else:
@@ -1491,6 +1486,7 @@ class LocalProcessor(nn.Module):
 
 
 class LossWeightPolicy(Protocol):
+    
     def weights(self) -> Tuple[float, float]:
         ...
 
@@ -1503,6 +1499,7 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
+    
     def __init__(
         self,
         in_dim: int,
