@@ -23,14 +23,6 @@ TExtra = TypeVar("TExtra")
 
 @dataclass
 class MetaData(Generic[TExtra]):
-    """Container for runtime metadata shared across training and inference.
-
-    The class tracks device capabilities, preferred casting dtypes and cached
-    normalization statistics so that components such as :class:`AutoCast`
-    or post-processing utilities can reuse a single source of truth. Device
-    information, including the device type and CUDA compute capability where
-    available, is recorded for downstream consumers.
-    """
 
     device: torch.device
     device_type: str = field(init=False, default="cpu")
@@ -104,7 +96,7 @@ class MetaData(Generic[TExtra]):
         return tuple(values)
 
     @classmethod
-    def _float_amp_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         dev_type = device.type
         candidates: list[torch.dtype] = []
         if dev_type == "cuda":
@@ -127,7 +119,7 @@ class MetaData(Generic[TExtra]):
         return cls._distinct_dtypes(candidates)
 
     @classmethod
-    def _integer_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         candidates: list[torch.dtype] = []
         int8_ok, _ = is_int8_supported(device)
         if int8_ok:
@@ -137,13 +129,14 @@ class MetaData(Generic[TExtra]):
 
     @classmethod
     def for_device(
-        cls,
+        cls: object,
         device: torch.device | str,
-        *,
+        *args: Any,
         scale_max_abs: Optional[float] = None,
         scale_min_abs: Optional[float] = None,
         scale_is_integral: Optional[bool] = None,
         extra: Optional[Mapping[str, TExtra]] = None,
+        **kwargs: Any,
     ) -> "MetaData[TExtra]":
         dev = torch.device(device)
         meta = cls(
@@ -161,7 +154,6 @@ class MetaData(Generic[TExtra]):
         return meta
 
     def refresh(self) -> None:
-        """Recompute dtype capabilities for the current device."""
 
         dev = torch.device(self.device)
         self._refresh_device_info()
@@ -179,10 +171,11 @@ class MetaData(Generic[TExtra]):
 
     def update_scale(
         self,
-        *,
+        *args: Any,
         max_abs: Optional[float] = None,
         min_abs: Optional[float] = None,
         is_integral: Optional[bool] = None,
+        **kwargs: Any,
     ) -> None:
         if max_abs is None and min_abs is None and is_integral is None:
             self.clear_scale()
@@ -252,9 +245,10 @@ def compute_y_range(
     loader: Iterable[Any],
     q_low: float = 0.005,
     q_high: float = 0.995,
-    *,
+    *args: Any,
     labels_key: str = "Y",
     max_batches: int | None = None,
+    **kwargs: Any,
 ) -> tuple[float, float]:
     ys = []
     for i, batch in enumerate(loader):
@@ -279,17 +273,12 @@ def compute_y_range(
 def recompute_y_stats(
     model: torch.nn.Module,
     loader: Iterable[Any],
-    *,
+    *args: Any,
     metadata: MetaData[Any] | None = None,
+    **kwargs: Any,
 ) -> None:
-    """Recompute label statistics for *model* using *loader*.
 
-    If *metadata* is supplied the freshly computed statistics and device
-    capabilities are cached on the provided :class:`MetaData` instance so that
-    subsequent inference stages can reuse them without touching the model.
-    """
-
-    from ..functional.fx import Gradient  # local import to avoid cycles
+    from ..functional.fx import Gradient
 
     try:
         ref = next(model.parameters())
@@ -401,10 +390,10 @@ def recompute_y_stats(
 def inverse_y_from_stats(
     model: torch.nn.Module,
     y_flat: torch.Tensor,
-    *,
+    *args: Any,
     metadata: MetaData[Any] | None = None,
+    **kwargs: Any,
 ) -> torch.Tensor:
-    """Undo standardization using the stored label statistics."""
 
     has_stats = getattr(model, "has_valid_y_stats", None)
     if callable(has_stats) and not has_stats():
@@ -428,4 +417,3 @@ def inverse_y_from_stats(
     mu = mean.detach().to(device=device, dtype=dtype)
     sigma = std.detach().to(device=device, dtype=dtype).clamp_min(eps)
     return y_flat * sigma + mu
-
