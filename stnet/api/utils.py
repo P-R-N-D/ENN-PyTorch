@@ -35,15 +35,16 @@ from ..data.transforms import (
     postprocess,
     preprocess,
 )
+from ..functional import AdamW, Module
 from ..kernels import (
-    AdamW,
     AutoCast,
-    DotProductAttention,
     LossWeightController,
-    Module,
+    inference,
+)
+from ..model.ops import (
+    DotProductAttention,
     MultiScaleRetention,
     MultiScaleRetentionCompat,
-    inference,
 )
 
 

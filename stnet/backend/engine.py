@@ -39,7 +39,7 @@ from ..api.config import (
     RuntimeConfig,
     coerce_model_config,
 )
-from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
+from ..functional import AdamW, Module, StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_torch_tensor
@@ -47,11 +47,9 @@ from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from ..api.utils import Distributed, System
 from ..kernels import (
-    AdamW,
     AutoCast,
     inference,
     LossWeightController,
-    Module,
 )
 from .profiler import FlopCounter
 from .compat import maybe_mark_cudagraph_step_end

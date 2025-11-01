@@ -994,7 +994,7 @@ def dataloader(
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
-    from .dataset import BatchReader, SampleReader
+    from .nodes import BatchReader, SampleReader
     wrap_kwargs = dict(
         device=device_obj,
         threads=threads,
