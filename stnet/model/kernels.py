@@ -21,17 +21,6 @@ from ..backend.environment import (
 )
 
 
-__all__ = [
-    "DotProductAttention",
-    "MultiScaleRetentionCompat",
-    "MultiScaleRetention",
-    "MultiHeadAttentionCompat",
-    "MultiHeadAttentionNvidia",
-    "MultiHeadAttention",
-    "attn_mask_to_additive",
-]
-
-
 def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((x, x), dim=-1).reshape(*x.shape[:-1], -1)
 
@@ -39,10 +28,11 @@ def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
 def _retention_manual_flops(
     batch: int,
     seq_len: int,
-    *,
+    *args: Any,
     num_heads: int,
     head_dim: int,
     use_gate: bool,
+    **kwargs: Any,
 ) -> float:
     if batch <= 0 or seq_len <= 0 or num_heads <= 0 or head_dim <= 0:
         return 0.0
@@ -68,7 +58,6 @@ def _is_contiguous_bshd(tensor: torch.Tensor) -> bool:
 def _canonical_lengths(
     query: torch.Tensor, key: torch.Tensor, batch_first: bool
 ) -> tuple[int, int, int]:
-    """Return (batch, seq_len_query, seq_len_key) derived from query/key shapes."""
 
     if batch_first:
         if query.dim() < 2 or key.dim() < 2:
@@ -87,14 +76,14 @@ def _canonical_lengths(
 
 def _expand_bool_mask_to_bhss(
     mask: torch.Tensor,
-    *,
+    *args: Any,
     batch: int,
     heads: int,
     seq_q: int,
     seq_k: int,
     device: torch.device,
+    **kwargs: Any,
 ) -> torch.Tensor:
-    """Expand a boolean mask into [B, H, S_q, S_k] layout."""
 
     if mask.dtype is not torch.bool:
         raise TypeError("expected boolean mask")
@@ -126,20 +115,15 @@ def _expand_bool_mask_to_bhss(
 
 def attn_mask_to_additive(
     attn_mask: torch.Tensor | None,
-    *,
+    *args: Any,
     batch: int,
     heads: int,
     seq_q: int,
     seq_k: int,
     dtype: torch.dtype,
     device: torch.device,
+    **kwargs: Any,
 ) -> torch.Tensor:
-    """
-    Normalize 2D/3D/4D attention masks into a [B, H, S_q, S_k] float addend.
-    - Boolean masks -> -inf at masked positions (TE-compatible)
-    - Floating masks -> broadcast to [B, H, S_q, S_k]
-    - None -> all zeros
-    """
 
     if attn_mask is None:
         return torch.zeros((batch, heads, seq_q, seq_k), dtype=dtype, device=device)
@@ -176,7 +160,6 @@ def attn_mask_to_additive(
 
 
 def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """Return -inf scalar; non-floating dtype은 float32로 승격."""
 
     if not torch.is_floating_point(torch.empty((), dtype=dtype)):
         dtype = torch.float32
@@ -184,7 +167,6 @@ def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 
 
 def _te_supported_on_device() -> bool:
-    """Conservatively enable TE fused MHA only on sufficiently new CUDA devices."""
 
     if os.environ.get("STF_DISABLE_TE", "") == "1":
         return False
@@ -235,11 +217,11 @@ def _adapt_mask_for_te(
     key: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
     key_padding_mask: Optional[torch.Tensor],
-    *,
+    *args: Any,
     num_heads: int,
     batch_first: bool,
+    **kwargs: Any,
 ) -> Optional[torch.Tensor]:
-    """Convert attention masks to TE-friendly float addends."""
 
     if attn_mask is None and key_padding_mask is None:
         return None
@@ -311,7 +293,7 @@ def _adapt_mask_for_te(
 
 _HAS_TE: bool
 if os.environ.get("STF_DISABLE_TE", "") == "1":
-    te = None  # type: ignore
+    te = None
     _HAS_TE = False
 else:
     _should_import_te = True
@@ -352,22 +334,18 @@ else:
                 _should_import_te = False
     if _should_import_te:
         try:
-            import transformer_engine.pytorch as te  # type: ignore
+            import transformer_engine.pytorch as te  
 
             _HAS_TE = True
-        except Exception:  # pragma: no cover
-            te = None  # type: ignore
+        except Exception:  
+            te = None  
             _HAS_TE = False
     else:
-        te = None  # type: ignore
+        te = None
         _HAS_TE = False
 
 
 def _te_fused_mha_is_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
-    """
-    TE fused MHA를 사용할지 판단: 설치 여부 + CUDA CC 기준.
-    기본 기준: sm80(A100/RTX30 이상) 권장.
-    """
 
     if not _HAS_TE:
         return False
@@ -420,7 +398,7 @@ class DotProductAttention(nn.Module):
                 self._te_attn = te_mod.DotProductAttention(
                     num_attention_heads=self.nh,
                     kv_channels=self.hd,
-                    qkv_format="bshd",  # TE는 [B,S,H,D] 기대
+                    qkv_format="bshd",
                     attention_dropout=0.0,
                 )
             except Exception:
@@ -495,11 +473,12 @@ class DotProductAttention(nn.Module):
         q: torch.Tensor,
         k: torch.Tensor,
         v: torch.Tensor,
-        *,
+        *args: Any,
         attn_mask: Optional[torch.Tensor] = None,
         dropout_p: float = 0.0,
         is_causal: bool = False,
         training: Optional[bool] = None,
+        **kwargs: Any,
     ) -> torch.Tensor:
         training = bool(training) if training is not None else self.training
         q = self._to_optimal_dtype(q)
@@ -911,11 +890,11 @@ class MultiHeadAttentionCompat(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        *,
+        *args: Any,
         bias: bool = True,
         dropout: float = 0.0,
         batch_first: bool = True,
-        **_: object,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.batch_first = batch_first
@@ -927,7 +906,7 @@ class MultiHeadAttentionCompat(nn.Module):
             batch_first=batch_first,
         )
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -964,11 +943,11 @@ class MultiHeadAttentionNvidia(nn.Module):
         self,
         embed_dim: int,
         num_heads: int,
-        *,
+        *args: Any,
         bias: bool = True,
         dropout: float = 0.0,
         batch_first: bool = True,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         self.batch_first = batch_first
@@ -1018,7 +997,7 @@ class MultiHeadAttentionNvidia(nn.Module):
                     continue
         return None
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -1029,7 +1008,7 @@ class MultiHeadAttentionNvidia(nn.Module):
         is_causal: Optional[bool] = None,
     ):
         if self._force_pt or (self._te_mha is None):
-            return self._fallback(  # type: ignore[operator]
+            return self._fallback(
                 query,
                 key,
                 value,
@@ -1050,7 +1029,7 @@ class MultiHeadAttentionNvidia(nn.Module):
             )
             if te_attn_mask is None:
                 self._force_pt = True
-                return self._fallback(  # type: ignore[operator]
+                return self._fallback(
                     query,
                     key,
                     value,
@@ -1080,7 +1059,7 @@ class MultiHeadAttentionNvidia(nn.Module):
                 if isinstance(out, tuple) and len(out) >= 1:
                     y, w = out[0], (out[1] if need_weights and len(out) > 1 else None)
                 else:
-                    y, w = out, None  # type: ignore[assignment]
+                    y, w = out, None
                 if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
                     y = y.transpose(0, 1)
                 return y, w
@@ -1089,7 +1068,7 @@ class MultiHeadAttentionNvidia(nn.Module):
             except Exception:
                 continue
         self._force_pt = True
-        return self._fallback(  # type: ignore[operator]
+        return self._fallback(
             query,
             key,
             value,
@@ -1101,23 +1080,17 @@ class MultiHeadAttentionNvidia(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """
-    프로젝트 표준 MHA: TE fused MHA를 선호하고 불가 시 torch로 폴백.
-
-    속성:
-        backend: "te" | "torch"
-    """
 
     def __init__(
         self,
         embed_dim: int,
         num_heads: int,
-        *,
+        *args: Any,
         bias: bool = True,
         dropout: float = 0.0,
         batch_first: bool = True,
         prefer_te_min_cc: Tuple[int, int] = (8, 0),
-        **kwargs: object,
+        **kwargs: Any,
     ) -> None:
         super().__init__()
         if _te_fused_mha_is_preferred(prefer_te_min_cc):
@@ -1177,7 +1150,7 @@ class MultiHeadAttention(nn.Module):
     def backend(self) -> str:
         return self._backend
 
-    def forward(  # type: ignore[override]
+    def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
