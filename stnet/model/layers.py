@@ -48,14 +48,14 @@ else:
         pass
 
 try:
-    from stnet.backend.compat import RMSNorm as _Norm  # type: ignore
+    from ..backend.compat import RMSNorm as _Norm  # type: ignore
 except Exception:
     _Norm = nn.LayerNorm
 
 
 try:
     # 프로파일러가 없어도 동작하게 안전 import
-    from stnet.backend.profiler import FLOP_PROFILER  # noqa: F401
+    from ..backend.profiler import FLOP_PROFILER  # noqa: F401
 except Exception:
     FLOP_PROFILER = None  # noqa: N816
 
@@ -66,7 +66,7 @@ _compile_disable = torch.compiler.disable
 
 
 if TYPE_CHECKING:
-    from stnet.api.config import ModelConfig
+    from ..api.config import ModelConfig
 
 
 # rollback: use vanilla LayerNorm in eager/CPU runs

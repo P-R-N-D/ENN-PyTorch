@@ -49,11 +49,12 @@ from ..data.pipeline import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_torch_tensor
 from ..data.stats import MetaData
-from .environment import Distributed, System
+from .environment import System
 from ..functional.fx import AutoCast, Gradient, LayerReplacement
 from .profiler import FlopCounter
 from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
 from .distributed import (
+    Distributed,
     broadcast_model_states,
     distributed_barrier,
     is_dist_avail_and_initialized,

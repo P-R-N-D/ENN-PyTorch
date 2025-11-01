@@ -33,7 +33,8 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from ..backend.environment import Distributed, Network, System
+from ..backend.distributed import Distributed, Network
+from ..backend.environment import System
 from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 
@@ -259,8 +260,9 @@ def predict(
         local_addr=master_addr,
     )
     elastic_launch(lc, main)(ops, ret_dict)
+    result: Dict[Tuple, torch.Tensor] = dict(ret_dict)
     try:
-        return dict(ret_dict)
+        return result
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)

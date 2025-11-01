@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from . import model as model_ns
+from typing import Any
+
 from .api.config import (
     BuildConfig,
     ModelConfig,
@@ -15,28 +16,6 @@ from .api.config import (
     patch_config,
     runtime_config,
 )
-from .backend import joining, load_model, new_model, predict, save_model, train
-
-Root = model_ns.Root
-SpatialEncoder = model_ns.SpatialEncoder
-TemporalEncoder = model_ns.TemporalEncoder
-LocalProcessor = model_ns.LocalProcessor
-PatchAttention = model_ns.PatchAttention
-CrossAttention = model_ns.CrossAttention
-PointTransformer = model_ns.PointTransformer
-TemporalEncoderLayer = model_ns.TemporalEncoderLayer
-TemporalEncoderBlock = model_ns.TemporalEncoderBlock
-DilatedAttention = model_ns.DilatedAttention
-LongNet = model_ns.LongNet
-CrossTransformer = model_ns.CrossTransformer
-Payload = model_ns.Payload
-GlobalEncoder = model_ns.GlobalEncoder
-GeGLU = model_ns.GeGLU
-SwiGLU = model_ns.SwiGLU
-MultipleQuantileLoss = model_ns.MultipleQuantileLoss
-StandardNormalLoss = model_ns.StandardNormalLoss
-StudentsTLoss = model_ns.StudentsTLoss
-DataFidelityLoss = model_ns.DataFidelityLoss
 __all__ = [
     "Root",
     "ModelConfig",
@@ -76,4 +55,73 @@ __all__ = [
     "StudentsTLoss",
     "DataFidelityLoss",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {
+        "Root",
+        "SpatialEncoder",
+        "TemporalEncoder",
+        "LocalProcessor",
+        "PatchAttention",
+        "CrossAttention",
+        "PointTransformer",
+        "TemporalEncoderLayer",
+        "TemporalEncoderBlock",
+        "DilatedAttention",
+        "LongNet",
+        "CrossTransformer",
+        "Payload",
+        "GlobalEncoder",
+        "GeGLU",
+        "SwiGLU",
+        "MultipleQuantileLoss",
+        "StandardNormalLoss",
+        "StudentsTLoss",
+        "DataFidelityLoss",
+    }:
+        from . import model as model_ns
+
+        mapping = {
+            "Root": model_ns.Root,
+            "SpatialEncoder": model_ns.SpatialEncoder,
+            "TemporalEncoder": model_ns.TemporalEncoder,
+            "LocalProcessor": model_ns.LocalProcessor,
+            "PatchAttention": model_ns.PatchAttention,
+            "CrossAttention": model_ns.CrossAttention,
+            "PointTransformer": model_ns.PointTransformer,
+            "TemporalEncoderLayer": model_ns.TemporalEncoderLayer,
+            "TemporalEncoderBlock": model_ns.TemporalEncoderBlock,
+            "DilatedAttention": model_ns.DilatedAttention,
+            "LongNet": model_ns.LongNet,
+            "CrossTransformer": model_ns.CrossTransformer,
+            "Payload": model_ns.Payload,
+            "GlobalEncoder": model_ns.GlobalEncoder,
+            "GeGLU": model_ns.GeGLU,
+            "SwiGLU": model_ns.SwiGLU,
+            "MultipleQuantileLoss": model_ns.MultipleQuantileLoss,
+            "StandardNormalLoss": model_ns.StandardNormalLoss,
+            "StudentsTLoss": model_ns.StudentsTLoss,
+            "DataFidelityLoss": model_ns.DataFidelityLoss,
+        }
+        return mapping[name]
+    if name in {"train", "predict", "new_model", "load_model", "save_model", "joining"}:
+        from .backend import joining as _joining, load_model as _load_model
+        from .backend import new_model as _new_model, predict as _predict, save_model as _save_model
+        from .backend import train as _train
+
+        mapping = {
+            "train": _train,
+            "predict": _predict,
+            "new_model": _new_model,
+            "load_model": _load_model,
+            "save_model": _save_model,
+            "joining": _joining,
+        }
+        return mapping[name]
+    raise AttributeError(f"module 'stnet' has no attribute '{name}'")
+
+
+def __dir__() -> list[str]:
+    return sorted(set(__all__))
 
