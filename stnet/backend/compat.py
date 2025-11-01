@@ -12,29 +12,26 @@ from typing import Any, Iterable, Iterator, Sequence
 import torch
 from torch import nn
 
-try:  # pragma: no cover - optional dependency
-    from torchdistx.fake import is_fake as _tdx_is_fake  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - torchdistx not installed
-    _tdx_is_fake = None  # type: ignore[assignment]
+try:
+    from torchdistx.fake import is_fake as _tdx_is_fake
+except Exception:
+    _tdx_is_fake = None
 
-try:  # pragma: no cover - private API best-effort
-    from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
-except Exception:  # pragma: no cover - fallback when private API unavailable
-    FakeTensor = tuple()  # type: ignore[assignment]
+try:
+    from torch._subclasses.fake_tensor import FakeTensor
+except Exception:
+    FakeTensor = tuple()
 
 
 try:
-    # Prefer torch.compiler.disable (PyTorch ≥2.5)
-    _torch_compile_disable = torch.compiler.disable  # type: ignore[attr-defined]
+    _torch_compile_disable = torch.compiler.disable
 except Exception:
     try:
-        # Fallback for PyTorch 2.0–2.4
-        import torch._dynamo as _dynamo  # type: ignore
-
-        _torch_compile_disable = _dynamo.disable  # type: ignore[attr-defined]
+        import torch._dynamo as _dynamo
+        _torch_compile_disable = _dynamo.disable
     except Exception:
 
-        def _torch_compile_disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+        def _torch_compile_disable(fn=None, *args: Any, recursive=False, **kwargs: Any):
             if fn is None:
                 return lambda real_fn: real_fn
             return fn
@@ -43,24 +40,24 @@ except Exception:
 if not hasattr(torch, "compiler"):
     class _TorchCompilerNamespace:
         @staticmethod
-        def disable(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+        def disable(fn=None, *args: Any, recursive=False, **kwargs: Any):
             return _torch_compile_disable(fn, recursive=recursive)
 
 
-    torch.compiler = _TorchCompilerNamespace()  # type: ignore[attr-defined]
+    torch.compiler = _TorchCompilerNamespace()
 elif not hasattr(torch.compiler, "disable"):
 
-    def _compiler_disable_passthrough(fn=None, *, recursive=False):  # type: ignore[no-untyped-def]
+    def _compiler_disable_passthrough(fn=None, *args: Any, recursive=False, **kwargs: Any):
         return _torch_compile_disable(fn, recursive=recursive)
 
 
-    torch.compiler.disable = _compiler_disable_passthrough  # type: ignore[attr-defined]
+    torch.compiler.disable = _compiler_disable_passthrough
 
 
 if hasattr(nn, "RMSNorm"):
-    RMSNorm = torch.compiler.disable(nn.RMSNorm, recursive=True)  # type: ignore[attr-defined]
+    RMSNorm = torch.compiler.disable(nn.RMSNorm, recursive=True)
 else:
-    RMSNorm = None  # type: ignore[assignment]
+    RMSNorm = None
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -188,7 +185,7 @@ class TorchCompat:
         global RMSNorm
         if hasattr(self.nn_module, "RMSNorm"):
             if RMSNorm is None:
-                RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)  # type: ignore[attr-defined]
+                RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)
             return
         torch_mod = self.module
         nn_mod = self.nn_module
@@ -206,7 +203,7 @@ class TorchCompat:
                 return x * inv_rms * self.weight
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
-        RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)  # type: ignore[attr-defined]
+        RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)
 
     def _ensure_fmin(self) -> None:
         if hasattr(self.module, "fmin"):
@@ -244,15 +241,16 @@ def patch_torch(
 
 
 def maybe_mark_cudagraph_step_end() -> None:
-    """Call torch.compiler.cudagraph_mark_step_end() if present (no-op otherwise)."""
+
     try:
         mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
         if callable(mark_step):
             mark_step()
     except Exception:
         pass
+
+
 def is_fake_tensor(value: Any) -> bool:
-    """Return ``True`` when ``value`` references a FakeTensor placeholder."""
 
     if not isinstance(value, torch.Tensor):
         return False
@@ -265,13 +263,11 @@ def is_fake_tensor(value: Any) -> bool:
 
 
 def is_meta_tensor(value: Any) -> bool:
-    """Check whether a tensor is backed by the meta device placeholder."""
 
     return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
 
 
 def is_meta_or_fake_tensor(value: Any) -> bool:
-    """Return ``True`` when ``value`` is either a meta tensor or a fake tensor."""
 
     return is_meta_tensor(value) or is_fake_tensor(value)
 
@@ -363,6 +359,3 @@ def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
         if candidate is not None:
             resolved.append(candidate)
     return resolved
-
-
-patch_torch()
