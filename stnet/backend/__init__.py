@@ -10,7 +10,7 @@ from ..api.config import (
 from ..api.io import load_model, new_model, save_model
 from ..api.run import launch, predict, train
 from .distributed import joining
-from .losses import (
+from ..functional.losses import (
     DataFidelityLoss,
     LinearCombinationLoss,
     MultipleQuantileLoss,
@@ -18,7 +18,7 @@ from .losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from .optimizers import AdamW
+from ..functional.optimizers import AdamW
 
 learn = train
 infer = predict

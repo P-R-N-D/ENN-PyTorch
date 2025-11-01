@@ -14,7 +14,7 @@ from ..api.config import (
     patch_config,
 )
 from .activations import GeGLU, SwiGLU
-from ..backend.losses import (
+from ..functional.losses import (
     DataFidelityLoss,
     LinearCombinationLoss,
     MultipleQuantileLoss,
