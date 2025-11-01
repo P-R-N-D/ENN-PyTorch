@@ -142,6 +142,3 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
         if callable(method):
             return method()
     return torch.as_tensor(obj)
-
-
-
