@@ -22,11 +22,17 @@ try:
 except ImportError:  # pragma: no cover - compatibility
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch  # type: ignore
 
-from ..config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
+from ..api.config import (
+    ModelConfig,
+    OpsMode,
+    RuntimeConfig,
+    coerce_model_config,
+    runtime_config,
+)
 from ..data.dataset import SampleReader
 from ..data.transforms import preprocess
 from ..model import Root
-from ..utils.platform import Distributed, Network, System
+from ..run.utils import Distributed, Network, System
 from .engine import _prune_dcp_state_keys, ignored_pattern, main
 
 

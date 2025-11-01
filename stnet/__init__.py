@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from . import model as model_ns
-from .config import (
+from .api.config import (
     BuildConfig,
     ModelConfig,
     OpsMode,
@@ -15,7 +15,7 @@ from .config import (
     patch_config,
     runtime_config,
 )
-from .runtime import joining, load_model, new_model, predict, save_model, train
+from .backend import joining, load_model, new_model, predict, save_model, train
 
 Root = model_ns.Root
 SpatialEncoder = model_ns.SpatialEncoder

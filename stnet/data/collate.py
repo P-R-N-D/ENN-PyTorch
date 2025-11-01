@@ -20,8 +20,8 @@ from threading import Lock
 import torch
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 
-from ..utils.datatype import to_torch_tensor
-from ..utils.platform import System
+from .datatype import to_torch_tensor
+from ..run.utils import System
 
 
 def identity(item: Any) -> Any:

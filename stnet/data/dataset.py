@@ -16,8 +16,8 @@ try:
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
 
-from ..compat import patch_arrow
-from ..utils.datatype import convert
+from ..backend.compat import patch_arrow
+from .datatype import convert
 
 
 _ARROW = patch_arrow()

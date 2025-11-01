@@ -39,8 +39,8 @@ from .utils.platform import (
     is_int8_supported,
     optimal_optimizer_params,
 )
-from .compat import patch_torch
-from .utils.profiler import FLOP_PROFILER, attention_flops_bshd
+from .backend.compat import patch_torch
+from .backend.profiler import FLOP_PROFILER, attention_flops_bshd
 
 patch_torch()
 
