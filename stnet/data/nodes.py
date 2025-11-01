@@ -32,6 +32,12 @@ except Exception:
 from .datatype import convert
 
 
+_LEGACY_DTYPE_KEYS = {
+    "features_dtype": ("features_arrow_dtype",),
+    "labels_dtype": ("labels_arrow_dtype",),
+}
+
+
 _INT_PROMOTION_TARGET = torch.int64
 _FLOAT_PROMOTION_TARGET = torch.float64
 
@@ -57,6 +63,16 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
     path = os.path.join(memmap_dir, "meta.json")
     with open(path, "r", encoding="utf-8") as handle:
         return json.load(handle)
+
+
+def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
+    keys = (key, *_LEGACY_DTYPE_KEYS.get(key, ()))
+    for candidate in keys:
+        value = meta.get(candidate)
+        if value is not None:
+            return convert(value, "torch")
+    keys_display = ", ".join(keys)
+    raise ValueError(f"missing dtype metadata for {key}; looked for {keys_display}")
 
 
 class SampleReader:
@@ -180,8 +196,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = convert(meta.get("features_dtype", "float64"), "torch")
-        label_dtype = convert(meta.get("labels_dtype", "float64"), "torch")
+        feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
+        label_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -224,8 +240,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = convert(meta.get("features_dtype", "float64"), "torch")
-        label_dtype = convert(meta.get("labels_dtype", "float64"), "torch")
+        feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
+        label_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
