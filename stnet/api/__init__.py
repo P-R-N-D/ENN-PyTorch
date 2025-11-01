@@ -1,10 +1,48 @@
-"""Public orchestration API for STNet."""
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import importlib
 import sys as _sys
 from typing import Any, Dict, Tuple
+
+__all__ = [
+    "train",
+    "predict",
+    "launch",
+    "AutoCast",
+    "DotProductAttention",
+    "MultiScaleRetention",
+    "MultiScaleRetentionCompat",
+    "AdamW",
+    "LayerReplacement",
+    "Gradient",
+    "LossWeightController",
+    "attention_flops_bshd",
+    "FlopCounter",
+    "joining",
+    "no_synchronization",
+    "Distributed",
+    "Network",
+    "System",
+    "get_device",
+    "get_runtime_config",
+    "initialize_sdpa_backends",
+    "patch_torch",
+    "TorchCompat",
+    "SDPBackend",
+    "sdpa_kernel",
+    "_to_sdpa_backends",
+    "VarianceThreshold",
+    "StandardScaler",
+    "IncrementalPCA",
+    "preprocess",
+    "postprocess",
+    "datatype",
+    "dtypes",
+    "is_fake_tensor",
+    "is_meta_tensor",
+    "is_meta_or_fake_tensor",
+]
 
 _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "launch": ("stnet.api.run", "launch"),
@@ -47,45 +85,6 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "datatype": ("stnet.data.datatype", None),
     "dtypes": ("stnet.data.datatype", None),
 }
-
-__all__ = [
-    "train",
-    "predict",
-    "launch",
-    "AutoCast",
-    "DotProductAttention",
-    "MultiScaleRetention",
-    "MultiScaleRetentionCompat",
-    "AdamW",
-    "LayerReplacement",
-    "Gradient",
-    "LossWeightController",
-    "attention_flops_bshd",
-    "FlopCounter",
-    "joining",
-    "no_synchronization",
-    "Distributed",
-    "Network",
-    "System",
-    "get_device",
-    "get_runtime_config",
-    "initialize_sdpa_backends",
-    "patch_torch",
-    "TorchCompat",
-    "SDPBackend",
-    "sdpa_kernel",
-    "_to_sdpa_backends",
-    "VarianceThreshold",
-    "StandardScaler",
-    "IncrementalPCA",
-    "preprocess",
-    "postprocess",
-    "datatype",
-    "dtypes",
-    "is_fake_tensor",
-    "is_meta_tensor",
-    "is_meta_or_fake_tensor",
-]
 
 
 def __getattr__(name: str) -> Any:
