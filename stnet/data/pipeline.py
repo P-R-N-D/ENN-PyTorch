@@ -26,8 +26,6 @@ def identity(item: Any) -> Any:
 
 
 class ThreadLoadBalancer:
-    """Best-effort thread affinity + OpenMP proc_bind(spread) + dynamic PyTorch thread tuning.
-       If nothing is effective, transparently falls back to passthrough (no changes)."""
 
     __slots__ = (
         "_psutil",
