@@ -1,3 +1,6 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
 import contextlib
 import importlib
 import logging
@@ -20,16 +23,7 @@ from ..backend.environment import (
 )
 
 patch_torch()
-__all__ = [
-    "reshape_for_heads",
-    "is_transformer_engine_enabled",
-    "AutoCast",
-    "_import_callable",
-    "LayerReplacement",
-    "Quantization",
-    "Gradient",
-    "_supports_scale",
-]
+
 
 def reshape_for_heads(
     tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
@@ -146,13 +140,14 @@ class Gradient:
     @staticmethod
     def compile(
         module: nn.Module,
-        *,
+        *args: Any,
         backend: Optional[str] = None,
         mode: Optional[str] = None,
         fullgraph: Optional[bool] = None,
         dynamic: Optional[bool] = None,
         options: Optional[Dict[str, Any]] = None,
         disable: bool = False,
+        **kwargs: Any
     ) -> nn.Module:
         normalized_mode = ""
         if mode is not None:
@@ -186,8 +181,9 @@ class Gradient:
 def _supports_scale(
     dtype: torch.dtype,
     meta: Optional[MetaData[Any]],
-    *,
+    *args: Any,
     safety_margin: float = 8.0,
+    **kwargs: Any,
 ) -> bool:
     if meta is None or not getattr(meta, "has_scale", False):
         return True
@@ -232,10 +228,11 @@ class AutoCast:
 
     @classmethod
     def _resolve_fp8_backend(
-        cls,
+        cls: object,
         preferred: Optional[str],
-        *,
+        *args: Any,
         device: Optional[torch.device] = None,
+        **kwargs: Any,
     ) -> Optional[str]:
         dev = device if device is not None else cls._resolve_device(None)
         order: Tuple[str, ...]
@@ -279,10 +276,11 @@ class AutoCast:
 
     @classmethod
     def _resolve_int_backend(
-        cls,
+        cls: object,
         preferred: Optional[str],
-        *,
+        *args: Any,
         device: Optional[torch.device] = None,
+        **kwargs: Any,
     ) -> Optional[str]:
         dev = device if device is not None else cls._resolve_device(None)
         order: Tuple[str, ...]
@@ -337,10 +335,11 @@ class AutoCast:
 
     @classmethod
     def _ensure_metadata(
-        cls,
+        cls: object,
         device: Optional[Union[torch.device, str]] = None,
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> MetaData[Any]:
         meta = metadata or cls._metadata
         device_hint: Optional[Union[torch.device, str]] = device
@@ -357,12 +356,12 @@ class AutoCast:
                 meta.refresh()
             else:
                 meta.ensure_device_info()
-        if not getattr(meta, "float_dtypes", ()):  # type: ignore[attr-defined]
+        if not getattr(meta, "float_dtypes", ()):
             meta.refresh()
         elif (
             not getattr(meta, "int_dtypes", ())
             or not getattr(meta, "float8_dtypes", ())
-        ):  # type: ignore[attr-defined]
+        ):
             meta.refresh()
         else:
             meta.ensure_device_info()
@@ -380,7 +379,7 @@ class AutoCast:
         return None
 
     @classmethod
-    def _float_amp_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         meta = cls._ensure_metadata(device)
         candidates = getattr(meta, "float_dtypes", ())
         if candidates:
@@ -398,7 +397,7 @@ class AutoCast:
         return values
 
     @classmethod
-    def _integer_candidates(cls, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         meta = cls._ensure_metadata(device)
         candidates = getattr(meta, "int_dtypes", ())
         if candidates:
@@ -407,14 +406,15 @@ class AutoCast:
 
     @classmethod
     def _select_dtype(
-        cls,
+        cls: object,
         candidates: Tuple[torch.dtype, ...],
-        *,
+        *args: Any,
         fallback: torch.dtype,
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
         meta: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> torch.dtype:
         for dtype in candidates:
             if _supports_scale(dtype, meta):
@@ -446,7 +446,7 @@ class AutoCast:
 
     @classmethod
     def _te_fp8_context(
-        cls, device: torch.device, enabled: bool
+        cls: object, device: torch.device, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
         if not enabled:
@@ -466,7 +466,7 @@ class AutoCast:
 
     @classmethod
     def _ao_fp8_context(
-        cls, enabled: bool
+        cls: object, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
         if not enabled:
@@ -486,7 +486,7 @@ class AutoCast:
 
     @classmethod
     def _int8_context(
-        cls,
+        cls: object,
         device: torch.device,
         enabled: bool,
     ) -> List[contextlib.AbstractContextManager[None]]:
@@ -522,10 +522,11 @@ class AutoCast:
 
     @classmethod
     def configure(
-        cls,
+        cls: object,
         model: Optional[nn.Module],
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> None:
         backend: Optional[str] = None
         int_backend: Optional[str] = None
@@ -579,10 +580,11 @@ class AutoCast:
     @classmethod
     @contextlib.contextmanager
     def float(
-        cls,
+        cls: object,
         device: Optional[Union[torch.device, str]] = None,
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
         meta = cls._ensure_metadata(dev, metadata=metadata)
@@ -683,7 +685,7 @@ class AutoCast:
     @classmethod
     @contextlib.contextmanager
     def suspend(
-        cls, device: Optional[Union[torch.device, str]] = None
+        cls:object, device: Optional[Union[torch.device, str]] = None
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
         with contextlib.ExitStack() as stack:
@@ -698,10 +700,11 @@ class AutoCast:
     @classmethod
     @contextlib.contextmanager
     def integer(
-        cls,
+        cls: object,
         device: Optional[Union[torch.device, str]] = None,
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
         meta = cls._ensure_metadata(dev, metadata=metadata)
@@ -862,7 +865,6 @@ if QAT is None:
 
 
 class Quantization:
-    """Utility helpers to manage PTQ/QAT backends for INT8 workflows."""
 
     quantize: Optional[Callable[..., Any]] = quantize_
     Int8DynamicActivationInt8WeightConfig: Optional[type] = (
@@ -875,26 +877,27 @@ class Quantization:
     ptq: Callable[..., tuple[nn.Module, bool, str]] = staticmethod(ptq)
 
     @classmethod
-    def is_available(cls) -> bool:
+    def is_available(cls: object) -> bool:
         return callable(cls.quantize)
 
     @classmethod
-    def is_qat_available(cls) -> bool:
+    def is_qat_available(cls: object) -> bool:
         initialize = getattr(cls.QAT, "initialize", None)
         return callable(initialize)
 
     @classmethod
-    def is_ptq_available(cls) -> bool:
+    def is_ptq_available(cls: object) -> bool:
         return callable(cls.ptq) and cls.ptq is not _ptq_unavailable
 
     @classmethod
     def prepare_qat(
-        cls,
+        cls: object,
         model: nn.Module,
-        *,
+        *args: Any,
         dynamic_activations: bool,
         group_size: int = 128,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> Any:
         if not cls.is_qat_available():
             raise RuntimeError("QAT backend unavailable")
@@ -908,12 +911,13 @@ class Quantization:
 
     @classmethod
     def apply_ptq(
-        cls,
+        cls: object,
         model: nn.Module,
-        *,
+        *args: Any,
         dynamic_activations: bool,
         group_size: int = 128,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_ptq_available():
             return (model, False, "PTQ backend unavailable")
@@ -927,11 +931,12 @@ class Quantization:
 
     @classmethod
     def apply_ao(
-        cls,
+        cls: object,
         model: nn.Module,
-        *,
+        *args: Any,
         dynamic_activations: bool,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_available():
             return (model, False, "torchao.quantization not installed (INT8 disabled)")
@@ -957,12 +962,13 @@ class Quantization:
 
     @classmethod
     def enable_training(
-        cls,
+        cls: object,
         model: nn.Module,
-        *,
+        *args: Any,
         dynamic_activations: bool,
         group_size: int = 128,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_available():
             msg = "torchao.quantization not installed (INT8/QAT disabled)"
@@ -1005,11 +1011,12 @@ class Quantization:
 
     @classmethod
     def enable_prediction(
-        cls,
+        cls: object,
         model: nn.Module,
-        *,
+        *args: Any,
         dynamic_activations: bool,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_available():
             msg = "torchao.quantization not installed (INT8 disabled)"
@@ -1022,8 +1029,9 @@ class LayerReplacement:
     @staticmethod
     def _infer_optimal_dtype(
         device: Optional[Union[torch.device, str]] = None,
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
+        **kwargs: Any,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
         candidates: List[torch.dtype] = []
@@ -1198,12 +1206,13 @@ class LayerReplacement:
     @staticmethod
     def _apply_te_module(
         model: nn.Module,
-        *,
+        *args: Any,
         apply_te_linear: bool,
         apply_te_layer_norm: bool,
         apply_te_rms_norm: bool,
         filter_linear: Optional[Callable[[nn.Linear, str], bool]],
         params_dtype: Optional[torch.dtype],
+        **kwargs: Any,
     ) -> Tuple[nn.Module, int]:
         try:
             import transformer_engine.pytorch as te
@@ -1245,7 +1254,7 @@ class LayerReplacement:
 
     @staticmethod
     def _apply_te_attention(
-        model: nn.Module, *, params_dtype: Optional[torch.dtype]
+        model: nn.Module, *args: Any, params_dtype: Optional[torch.dtype], **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         swapped = 0
         for module in model.modules():
@@ -1261,9 +1270,10 @@ class LayerReplacement:
     def use_te_module(
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
-        *,
+        *args: Any,
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
     ) -> Tuple[nn.Module, bool, str]:
         dev = torch.device(device) if device is not None else get_device()
         if dev.type != "cuda":
@@ -1558,5 +1568,3 @@ class LayerReplacement:
         )
         AutoCast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
-
-
