@@ -32,12 +32,6 @@ except Exception:
 from .datatype import convert
 
 
-_LEGACY_DTYPE_KEYS = {
-    "features_dtype": ("features_arrow_dtype",),
-    "labels_dtype": ("labels_arrow_dtype",),
-}
-
-
 _INT_PROMOTION_TARGET = torch.int64
 _FLOAT_PROMOTION_TARGET = torch.float64
 
@@ -66,13 +60,22 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
 
 
 def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
-    keys = (key, *_LEGACY_DTYPE_KEYS.get(key, ()))
-    for candidate in keys:
-        value = meta.get(candidate)
-        if value is not None:
-            return convert(value, "torch")
-    keys_display = ", ".join(keys)
-    raise ValueError(f"missing dtype metadata for {key}; looked for {keys_display}")
+    value = meta.get(key)
+    if value is None:
+        suffix = "_dtype"
+        base = key[: -len(suffix)] if key.endswith(suffix) else key
+        for candidate, candidate_value in meta.items():
+            if candidate == key:
+                continue
+            if candidate.startswith(base) and candidate.endswith(suffix):
+                value = candidate_value
+                break
+    if value is None:
+        raise ValueError(f"missing dtype metadata for {key}")
+    try:
+        return convert(value, "torch")
+    except Exception as exc:  # pragma: no cover - defensive conversion guard
+        raise TypeError(f"invalid dtype metadata for {key}: {value!r}") from exc
 
 
 class SampleReader:
