@@ -223,7 +223,34 @@ class Network:
                     return f"{host}:{port}"
         literal_default = Network.normalize_ip_literal(default_host, allow_loopback=True)
         host = literal_default or Network.coerce_host(default_host) or "127.0.0.1"
-        return f"{host}:0"
+        selected_port = 0
+        try:
+            parsed_host = ipaddress.ip_address(host)
+        except ValueError:
+            parsed_host = None
+
+        family = socket.AF_INET
+        bind_addr: tuple[Any, ...] = (host, 0)
+        if parsed_host and parsed_host.version == 6:
+            family = socket.AF_INET6
+            bind_addr = (host, 0, 0, 0)
+
+        try:
+            with contextlib.closing(socket.socket(family, socket.SOCK_STREAM)) as sock:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                if (
+                    family == socket.AF_INET6
+                    and hasattr(socket, "IPPROTO_IPV6")
+                    and hasattr(socket, "IPV6_V6ONLY")
+                ):
+                    with contextlib.suppress(OSError):
+                        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+                sock.bind(bind_addr)
+                selected_port = sock.getsockname()[1]
+        except OSError:
+            selected_port = 0
+
+        return f"{host}:{selected_port}"
 
     @staticmethod
     def probe_stack_support(*, allow_loopback: bool = True) -> tuple[bool, bool]:
