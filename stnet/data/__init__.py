@@ -16,8 +16,6 @@ from .transforms import (
 )
 from .datatype import convert, to_torch_tensor
 
-datatype = datatype_module
-dtypes = datatype_module
 __all__ = [
     "BatchSampler",
     "DataLoader",
@@ -36,4 +34,9 @@ __all__ = [
     "dtypes",
 ]
 
+
 _sys.modules[__name__ + ".dtypes"] = datatype_module
+
+
+datatype = datatype_module
+dtypes = datatype_module
