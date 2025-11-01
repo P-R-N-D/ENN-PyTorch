@@ -1,5 +1,4 @@
-"""Functional components such as losses and optimizers."""
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from .losses import (
