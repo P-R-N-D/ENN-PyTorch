@@ -6,70 +6,55 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from ..backend.compat import patch_arrow
-
-_ARROW = patch_arrow()
-
-
 _CANONICAL_DTYPE_MAP: Dict[str, Dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
         "numpy": np.float64,
-        "arrow": "float64",
         "python": float,
     },
     "float32": {
         "torch": torch.float32,
         "numpy": np.float32,
-        "arrow": "float32",
         "python": float,
     },
     "float16": {
         "torch": torch.float16,
         "numpy": np.float16,
-        "arrow": "float16",
         "python": float,
     },
     "bfloat16": {
         "torch": getattr(torch, "bfloat16", torch.float32),
         "numpy": np.float32,
-        "arrow": "bfloat16",
         "python": float,
     },
     "int64": {
         "torch": torch.int64,
         "numpy": np.int64,
-        "arrow": "int64",
         "python": int,
     },
     "int32": {
         "torch": torch.int32,
         "numpy": np.int32,
-        "arrow": "int32",
         "python": int,
     },
     "int16": {
         "torch": torch.int16,
         "numpy": np.int16,
-        "arrow": "int16",
         "python": int,
     },
     "int8": {
         "torch": torch.int8,
         "numpy": np.int8,
-        "arrow": "int8",
         "python": int,
     },
     "uint8": {
         "torch": torch.uint8,
         "numpy": np.uint8,
-        "arrow": "uint8",
         "python": int,
     },
     "bool": {
         "torch": torch.bool,
         "numpy": np.bool_,
-        "arrow": "bool",
         "python": bool,
     },
 }
@@ -103,8 +88,6 @@ _PLATFORM_ALIASES = {
     "pytorch": "torch",
     "numpy": "numpy",
     "np": "numpy",
-    "arrow": "arrow",
-    "pyarrow": "arrow",
     "python": "python",
     "native": "python",
     "name": "name",
@@ -114,7 +97,6 @@ _PLATFORM_ALIASES = {
 def _canonical_dtype_name(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
-    pa_mod = getattr(_ARROW, "module", None)
     if isinstance(src, torch.dtype):
         key = str(src)
     elif isinstance(src, str):
@@ -122,17 +104,10 @@ def _canonical_dtype_name(src: Any) -> str:
     elif isinstance(src, np.dtype):
         key = src.name
     else:
-        data_type_cls = getattr(pa_mod, "DataType", None) if pa_mod else None
-        if data_type_cls is not None and isinstance(src, data_type_cls):
-            try:
-                key = np.dtype(src.to_pandas_dtype()).name
-            except Exception:
-                key = str(src)
-        else:
-            try:
-                key = np.dtype(src).name
-            except Exception:
-                key = str(src)
+        try:
+            key = np.dtype(src).name
+        except Exception:
+            key = str(src)
     key = key.strip().lower()
     if key.startswith("torch."):
         key = key.split(".", 1)[1]

@@ -45,7 +45,7 @@ from ..functional.losses import (
     TiledLoss,
 )
 from ..functional.optimizers import AdamW
-from ..data.collate import dataloader
+from ..data.pipeline import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_torch_tensor
 from ..data.stats import MetaData
