@@ -12,6 +12,16 @@ from typing import Any, Iterable, Iterator, Sequence
 import torch
 from torch import nn
 
+try:  # pragma: no cover - optional dependency
+    from torchdistx.fake import is_fake as _tdx_is_fake  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - torchdistx not installed
+    _tdx_is_fake = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - private API best-effort
+    from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
+except Exception:  # pragma: no cover - fallback when private API unavailable
+    FakeTensor = tuple()  # type: ignore[assignment]
+
 
 try:
     # Prefer torch.compiler.disable (PyTorch ≥2.5)
@@ -307,6 +317,31 @@ def patch_arrow(module: Any | None = None) -> ArrowCompat:
     return compat
 
 
+def is_fake_tensor(value: Any) -> bool:
+    """Return ``True`` when ``value`` references a FakeTensor placeholder."""
+
+    if not isinstance(value, torch.Tensor):
+        return False
+    if _tdx_is_fake is not None:
+        try:
+            return bool(_tdx_is_fake(value))
+        except Exception:
+            pass
+    return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+
+
+def is_meta_tensor(value: Any) -> bool:
+    """Check whether a tensor is backed by the meta device placeholder."""
+
+    return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
+
+
+def is_meta_or_fake_tensor(value: Any) -> bool:
+    """Return ``True`` when ``value`` is either a meta tensor or a fake tensor."""
+
+    return is_meta_tensor(value) or is_fake_tensor(value)
+
+
 def lazy_import(module_name: str) -> Any:
     spec = util.find_spec(module_name)
     if spec is None or spec.loader is None:
@@ -412,3 +447,6 @@ def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
         if candidate is not None:
             resolved.append(candidate)
     return resolved
+
+
+patch_torch()

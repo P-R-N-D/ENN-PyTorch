@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import gc
 import json
 import math
 import os
@@ -49,12 +48,11 @@ from ..functional.optimizers import AdamW
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_torch_tensor
-from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from .environment import Distributed, System
 from ..functional.fx import AutoCast, Gradient, LayerReplacement
 from .profiler import FlopCounter
-from .compat import maybe_mark_cudagraph_step_end
+from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
 from .distributed import (
     broadcast_model_states,
     distributed_barrier,
@@ -109,7 +107,7 @@ def _infer_num_batches(loader: Any) -> int:
 def make_global_bar(
     *, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device
 ) -> Tuple[Optional[tqdm], int]:
-    """학습 전체 구간(Global) 고정 total 바 생성 (실행 중 total 변경 금지)"""
+    """Create the process-wide progress bar with a fixed total."""
     try:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
             return None, 0  # rank 0만 표시
@@ -133,8 +131,10 @@ def make_global_bar(
     return bar, per_epoch
 
 
-def tick_bar(bar: Optional[tqdm], *, mbps: Optional[float] = None, tflops: Optional[float] = None) -> None:
-    """1 스텝 전진 + 간단 postfix 갱신"""
+def tick_bar(
+    bar: Optional[tqdm], *, mbps: Optional[float] = None, tflops: Optional[float] = None
+) -> None:
+    """Advance the global progress bar and update its postfix string."""
     if bar is None:
         return
     if (mbps is not None) and (tflops is not None):
