@@ -67,7 +67,7 @@ from .distributed import (
 
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-except ImportError:  # pragma: no cover - optional dependency
+except ImportError:
 
     def precompute_float8_dynamic_scale_for_fsdp(*args: Any, **kwargs: Any) -> Any:
         return None
@@ -78,13 +78,13 @@ ignored_sentences = [
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
     "TypedStorage is deprecated.*",
 ]
-# --- tqdm helpers (global bar only) ---
+
 def _infer_num_batches(loader: Any) -> int:
-    """Best-effort batch count for loaders that may be stateful."""
+
     if loader is None:
         return 0
     try:
-        n = len(loader)  # type: ignore[arg-type]
+        n = len(loader)
         if isinstance(n, int) and n >= 0:
             return n
     except Exception:
@@ -106,12 +106,12 @@ def _infer_num_batches(loader: Any) -> int:
 
 
 def make_global_bar(
-    *, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device
+    *args: Any, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device, **kwargs: Any
 ) -> Tuple[Optional[tqdm], int]:
-    """Create the process-wide progress bar with a fixed total."""
+
     try:
         if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return None, 0  # rank 0만 표시
+            return None, 0
     except Exception:
         pass
     per_epoch = _infer_num_batches(train_loader) + _infer_num_batches(val_loader)
@@ -133,9 +133,9 @@ def make_global_bar(
 
 
 def tick_bar(
-    bar: Optional[tqdm], *, mbps: Optional[float] = None, tflops: Optional[float] = None
+    bar: Optional[tqdm], *args: Any, mbps: Optional[float] = None, tflops: Optional[float] = None, **kwargs: Any
 ) -> None:
-    """Advance the global progress bar and update its postfix string."""
+
     if bar is None:
         return
     if (mbps is not None) and (tflops is not None):
@@ -151,7 +151,7 @@ def dl_state_path(directory: str) -> str:
     return os.path.join(directory, _DL_STATE_FILE)
 
 
-def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
+def _float8_log(msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any) -> None:
     text = str(msg)
     if text in _FLOAT8_LOG_MESSAGES:
         return
@@ -167,7 +167,6 @@ def _float8_log(msg: str, *, only_main_rank: bool = True) -> None:
     warnings.warn(text)
 
 
-# --- meta tensor diagnostics (no-op unless env toggles are set) ---
 def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
     hits: list[str] = []
     for name, param in module.named_parameters(recurse=True):
@@ -198,12 +197,14 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
 
     for submodule in model.modules():
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
+
+
 def _assert_no_fake_dtensor_in_ln(
-    root: nn.Module, *, allow_dtensor: bool = False
+    root: nn.Module, *args: Any, allow_dtensor: bool = False, **kwargs: Any
 ) -> None:
     try:
         from torch.distributed._tensor import DTensor as _DTensor
-    except Exception:  # pragma: no cover - DTensor optional
+    except Exception:
         dtensor_types: Tuple[type, ...] = tuple()
     else:
         dtensor_types = tuple() if allow_dtensor else (_DTensor,)
@@ -231,14 +232,14 @@ def _assert_no_fake_dtensor_in_ln(
 
 
 def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -> None:
-    """Materialize LN γ/β if meta/fake and enforce CPU float32 parameters."""
 
     def _reset_parameter(
         module: nn.LayerNorm,
         name: str,
         data: torch.Tensor,
-        *,
+        *args: Any,
         requires_grad: bool,
+        **kwargs: Any,
     ) -> None:
         setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
@@ -310,7 +311,6 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
 
 
 def _validate_layernorm_dtypes(model: torch.nn.Module, device: torch.device) -> None:
-    """Ensure LayerNorm γ/β tensors use consistent, device-appropriate dtypes."""
 
     mismatches: list[str] = []
     for name, module in model.named_modules():
@@ -420,7 +420,6 @@ def _size(dtype: torch.dtype | str) -> int:
 
 
 def _clear_device_cache(device: Optional[torch.device] = None) -> None:
-    """Release cached device memory across supported accelerator backends."""
 
     device_types: List[str] = []
     dev_type = getattr(device, "type", None)
@@ -429,7 +428,7 @@ def _clear_device_cache(device: Optional[torch.device] = None) -> None:
     else:
         device_types.extend(["cuda", "xpu", "mps"])
 
-    for kind in dict.fromkeys(device_types):  # preserve order while de-duplicating
+    for kind in dict.fromkeys(device_types):
         if kind == "cuda":
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -459,6 +458,8 @@ def _clear_device_cache(device: Optional[torch.device] = None) -> None:
                     available = True
                 if available:
                     empty_cache()
+
+
 def _backend_type(device: torch.device) -> str:
     if device.type == "cuda":
         return "nccl"
@@ -476,7 +477,6 @@ def _set_backend(device: torch.device) -> None:
     else:
         try:
             import netifaces
-
             gws = netifaces.gateways()
             iface: str | None = None
             default_gateways = gws.get("default", {}) if isinstance(gws, dict) else {}
@@ -501,6 +501,8 @@ def _meta(memmap_dir: str) -> Dict[str, Any]:
     meta_path = os.path.join(memmap_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
 def _ensure_uniform_param_dtype(
     model: Any, prefer: Optional[torch.dtype] = None
 ) -> Optional[torch.dtype]:
@@ -529,11 +531,8 @@ def _ensure_uniform_param_dtype(
     return tgt
 
 
-
-
-
 def epochs(
-    *,
+    *args: Any,
     model: Root,
     device: torch.device,
     ops: RuntimeConfig,
@@ -549,8 +548,8 @@ def epochs(
     val_loader: Any,
     total_epochs: int,
     local_rank: int = 0,
+    **kwaargs: Any,
 ) -> None:
-    """학습 전체(여러 에폭)를 수행한다."""
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
@@ -878,14 +877,14 @@ def epochs(
 def infer(
     model: torch.nn.Module,
     data_loader: Any,
-    *,
+    *args: Any,
     device: torch.device,
     ops: RuntimeConfig,
     status_bar: Optional[tqdm] = None,
     chunk_dir: Optional[str] = None,
     streaming: bool = False,
+    **kwargs: Any,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
-    """Run inference with optional streaming output aggregation."""
 
     run_model = wrap_ddp_if_needed(model, device=device)
     run_model.eval()
@@ -1062,12 +1061,12 @@ def infer(
         return None
     return result if not streaming else None
 
-def main(*args: Any) -> Optional[Root]:
+
+def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
     System.initialize_python_path()
-    # NOTE: avoid mutating CUDA environment variables at runtime; set them before launch.
 
     if os.environ.get("STNET_DISABLE_MKLDNN", "0") == "1":
         mkldnn_backend = getattr(getattr(torch, "backends", None), "mkldnn", None)
@@ -1103,9 +1102,6 @@ def main(*args: Any) -> Optional[Root]:
         backend = _backend_type(device)
         init_kwargs: Dict[str, Any] = {"backend": backend}
         torch.distributed.init_process_group(**init_kwargs)
-        # 초기 1회 캐시 비우기는 선택 사항. OOM 디버깅 중일 때만 유지 권장.
-        # if device.type in {"cuda", "xpu", "mps"}:
-        #     _clear_device_cache(device)
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
@@ -1197,8 +1193,6 @@ def main(*args: Any) -> Optional[Root]:
             output_dtype=None,
             cast_forward_inputs=False,
         )
-        # NOTE: FSDP2에서는 LayerNorm 계열 파라미터도 표준 fully_shard 경로를 타게
-        # 하여 랭크 간 일관성을 유지한다.
         ignored_params: List[torch.nn.Parameter] = []
         for module in model.modules():
             for name in ("alpha_t", "alpha_s", "gem_p", "cls_query", "cls"):
@@ -1256,11 +1250,6 @@ def main(*args: Any) -> Optional[Root]:
             placements_tuple = tuple(placements) if placements is not None else None
 
             if current_dtensor is None:
-                # FSDP flat parameters already carry sharding metadata which must be
-                # preserved.  When we see attributes that indicate FSDP ownership we
-                # leave the tensor untouched instead of forcing a replicated layout,
-                # otherwise the optimizer/checkpoint state would lose the original
-                # sharding information.
                 if (
                     getattr(param, "_is_sharded", False)
                     or hasattr(param, "_sharding_spec")
@@ -1280,10 +1269,6 @@ def main(*args: Any) -> Optional[Root]:
                     return
                 param.data = current_dtensor
             else:
-                # Honor explicitly requested placements when they differ from the
-                # existing DTensor layout by attempting a redistribution.  Fallback
-                # to the original DTensor layout if redistribution fails so we do
-                # not drop gradients entirely.
                 if placements_tuple is not None and tuple(current_dtensor.placements) != placements_tuple:
                     try:
                         current_dtensor = current_dtensor.redistribute(
@@ -1347,7 +1332,6 @@ def main(*args: Any) -> Optional[Root]:
             return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
-        # LN 파라미터가 meta면, 학습 시작 전(optimizer 생성 전) 강제 실체화
         _materialize_all_layernorms_(_m_pre, device)
         _validate_layernorm_dtypes(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
@@ -1392,8 +1376,8 @@ def main(*args: Any) -> Optional[Root]:
             metadata=metadata,
             logger=None,
         )
+        
         def _prime_adam_like_state(optim: torch.optim.Optimizer) -> None:
-            """Eagerly initialize Adam/AdamW optimizer state to avoid lazy step()."""
 
             def _as_step_tensor(
                 value: Any,
@@ -1615,14 +1599,9 @@ def main(*args: Any) -> Optional[Root]:
                 total_epochs=int(ops.epochs),
                 local_rank=local_rank,
             )
-            # 스텝마다 캐시/GC 호출 제거 (성능/안정성 저하 방지)
         finally:
             if keep is not None:
                 keep.cleanup()
-            # 종료 시 전역 캐시 비우기도 보통 불필요. OOM 디버깅 중에만 사용.
-            # if getattr(device, "type", None) in {"cuda", "xpu", "mps"}:
-            #     _clear_device_cache(device)
-            # gc.collect()
         if local_rank == 0:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
