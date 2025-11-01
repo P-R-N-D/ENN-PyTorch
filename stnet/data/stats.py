@@ -11,7 +11,7 @@ import math
 import numpy as np
 import torch
 
-from ..run.utils import (
+from ..api.utils import (
     cuda_compute_capability,
     is_cpu_bf16_supported,
     is_int8_supported,

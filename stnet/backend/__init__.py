@@ -7,7 +7,7 @@ from ..api.config import (
     coerce_runtime_config,
     runtime_config,
 )
-from ..run.io import load_model, new_model, save_model
+from ..api.io import load_model, new_model, save_model
 from .distributed import joining
 from . import launch as launch
 from .launch import predict, train

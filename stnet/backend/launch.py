@@ -32,7 +32,7 @@ from ..api.config import (
 from ..data.dataset import SampleReader
 from ..data.transforms import preprocess
 from ..model import Root
-from ..run.utils import Distributed, Network, System
+from ..api.utils import Distributed, Network, System
 from .engine import _prune_dcp_state_keys, ignored_pattern, main
 
 

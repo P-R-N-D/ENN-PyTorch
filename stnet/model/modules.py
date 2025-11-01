@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 
 from ..backend.compat import patch_torch
-from ..run import is_fake_tensor, is_meta_or_fake_tensor
+from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..kernels import (
     AutoCast,
     compile,
