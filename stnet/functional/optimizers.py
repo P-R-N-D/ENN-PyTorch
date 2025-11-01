@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
@@ -15,7 +16,6 @@ from ..backend.environment import (
 )
 from .fx import AutoCast, LayerReplacement, _supports_scale
 
-__all__ = ["AdamW"]
 
 class AdamW:
     @staticmethod
