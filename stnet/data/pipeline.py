@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-
-
 from __future__ import annotations
 
 import os
@@ -117,7 +115,7 @@ class ThreadLoadBalancer:
             except Exception:
                 pass
         try:
-            return sorted(int(c) for c in os.sched_getaffinity(0))  # type: ignore[attr-defined]
+            return sorted(int(c) for c in os.sched_getaffinity(0))
         except Exception:
             pass
         return list(range(max(1, os.cpu_count() or 1)))
@@ -219,18 +217,17 @@ class ThreadLoadBalancer:
     def _pin_linux_like(core: int) -> bool:
         try:
             tid = threading.get_native_id()
-            os.sched_setaffinity(tid, {int(core)})  # type: ignore[attr-defined]
+            os.sched_setaffinity(tid, {int(core)})
             return True
         except Exception:
             try:
-                os.sched_setaffinity(0, {int(core)})  # type: ignore[attr-defined]
+                os.sched_setaffinity(0, {int(core)})
                 return True
             except Exception:
                 return False
 
     @staticmethod
     def _pin_bsd(core: int) -> bool:
-        # BSD 계열은 표준 per-thread API가 제각각이라 안전하게 no-op 처리.
         return False
 
     def _pin_once(self) -> None:
@@ -368,10 +365,11 @@ class ThreadLoadBalancer:
 
 def _convert_mapping_to_batch(
     batch: Mapping[str, Any],
-    *,
+    *args: Any,
     flatten_features: bool,
     labels_dtype: Optional[torch.dtype],
     sanitize: bool,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     features = batch["X"]
     labels = batch["Y"]
@@ -393,13 +391,14 @@ def _convert_mapping_to_batch(
 
 def _wrap_data_node(
     node: IterableWrapper,
-    *,
+    *args: Any,
     device: torch.device,
     threads: Dict[str, int],
     prefetch_factor: int,
     non_blocking_copy: bool,
     map_fn: Callable[[Any], Any],
     length: Optional[int] = None,
+    **kwargs: Any,
 ) -> "DataLoader":
     io_workers = max(1, int(threads["dataloader_workers"]))
     prebatch = max(1, int(threads["prefetch_factor"]))
@@ -433,7 +432,7 @@ def _build_local_loaders(
     memmap_dir: str,
     batch_size: int,
     val_frac: float,
-    *,
+    *args: Any,
     device: torch.device,
     threads: Dict[str, int],
     prefetch_factor: int,
@@ -441,6 +440,7 @@ def _build_local_loaders(
     map_fn: Callable[[Any], Any],
     batch_reader_cls: type,
     sample_reader_cls: type,
+    **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     reader_tr = sample_reader_cls.from_dir(
         memmap_dir,
