@@ -13,6 +13,13 @@ from .losses import (
     expand_mask_like_prediction,
 )
 from .optimizers import AdamW
+from .fx import (
+    AutoCast,
+    Gradient,
+    LayerReplacement,
+    is_transformer_engine_enabled,
+    reshape_for_heads,
+)
 
 __all__ = [
     "expand_mask_like_prediction",
@@ -24,4 +31,9 @@ __all__ = [
     "TiledLoss",
     "LossWeightController",
     "AdamW",
+    "AutoCast",
+    "LayerReplacement",
+    "Gradient",
+    "is_transformer_engine_enabled",
+    "reshape_for_heads",
 ]

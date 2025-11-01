@@ -21,8 +21,8 @@ from typing import (
 import torch
 from torch import Tensor, nn
 
-from .compat import patch_torch
-from .profiler import FLOP_PROFILER, attention_flops_bshd
+from ..backend.compat import patch_torch
+from ..backend.profiler import FLOP_PROFILER, attention_flops_bshd
 from ..data.stats import MetaData
 from ..model.kernels import (
     DotProductAttention,
@@ -50,11 +50,11 @@ patch_torch()
 __all__ = [
     "reshape_for_heads",
     "is_transformer_engine_enabled",
-    "inference",
     "AutoCast",
-    "compile",
     "_import_callable",
-    "Accelerator",
+    "LayerReplacement",
+    "Quantization",
+    "Gradient",
     "_supports_scale",
 ]
 
@@ -159,14 +159,55 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     return False
 
 
-def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
-    if (
-        is_transformer_engine_enabled(model)
-        or _is_inference_compiled(model)
-        or _is_aot_autograd_enabled(model)
-    ):
-        return torch.no_grad()
-    return torch.inference_mode()
+class Gradient:
+    @staticmethod
+    def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
+        if (
+            is_transformer_engine_enabled(model)
+            or _is_inference_compiled(model)
+            or _is_aot_autograd_enabled(model)
+        ):
+            return torch.no_grad()
+        return torch.inference_mode()
+
+    @staticmethod
+    def compile(
+        module: nn.Module,
+        *,
+        backend: Optional[str] = None,
+        mode: Optional[str] = None,
+        fullgraph: Optional[bool] = None,
+        dynamic: Optional[bool] = None,
+        options: Optional[Dict[str, Any]] = None,
+        disable: bool = False,
+    ) -> nn.Module:
+        normalized_mode = ""
+        if mode is not None:
+            try:
+                normalized_mode = str(mode).strip().lower()
+            except Exception:
+                normalized_mode = ""
+        if disable or normalized_mode in {"", "disabled", "none"}:
+            return module
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            return module
+        kwargs: Dict[str, Any] = {}
+        if backend is not None:
+            kwargs["backend"] = backend
+        if mode is not None:
+            kwargs["mode"] = mode
+        if fullgraph is not None:
+            kwargs["fullgraph"] = bool(fullgraph)
+        if dynamic is not None:
+            kwargs["dynamic"] = bool(dynamic)
+        if options:
+            kwargs["options"] = dict(options)
+        try:
+            return compile_fn(module, **kwargs)
+        except Exception as exc:
+            _LOGGER.warning("torch.compile failed (%s); returning original module", exc)
+            return module
 
 
 def _supports_scale(
@@ -717,51 +758,12 @@ class AutoCast:
             yield
 
 
-def compile(
-    module: nn.Module,
-    *,
-    backend: Optional[str] = None,
-    mode: Optional[str] = None,
-    fullgraph: Optional[bool] = None,
-    dynamic: Optional[bool] = None,
-    options: Optional[Dict[str, Any]] = None,
-    disable: bool = False,
-) -> nn.Module:
-    normalized_mode = ""
-    if mode is not None:
-        try:
-            normalized_mode = str(mode).strip().lower()
-        except Exception:
-            normalized_mode = ""
-    if disable or normalized_mode in {"", "disabled", "none"}:
-        return module
-    compile_fn = getattr(torch, "compile", None)
-    if compile_fn is None:
-        return module
-    kwargs: Dict[str, Any] = {}
-    if backend is not None:
-        kwargs["backend"] = backend
-    if mode is not None:
-        kwargs["mode"] = mode
-    if fullgraph is not None:
-        kwargs["fullgraph"] = bool(fullgraph)
-    if dynamic is not None:
-        kwargs["dynamic"] = bool(dynamic)
-    if options:
-        kwargs["options"] = dict(options)
-    try:
-        return compile_fn(module, **kwargs)
-    except Exception as exc:
-        _LOGGER.warning("torch.compile failed (%s); returning original module", exc)
-        return module
-
-
 def _import_callable(spec: str) -> Callable:
     if not isinstance(spec, str) or not spec.strip():
         raise ValueError("Empty spec for callable import")
     raw = spec.strip()
     root_pkg = __package__.split(".", 1)[0] if __package__ else "stnet"
-    default_module = f"{root_pkg}.backend.fx"
+    default_module = f"{root_pkg}.functional.fx"
     if ":" in raw:
         mod_part, fn_part = raw.split(":", 1)
     else:
@@ -885,7 +887,165 @@ if QAT is None:
 
     QAT = _QATUnavailable()
 
-class Accelerator:
+
+class Quantization:
+    """Utility helpers to manage PTQ/QAT backends for INT8 workflows."""
+
+    quantize: Optional[Callable[..., Any]] = quantize_
+    Int8DynamicActivationInt8WeightConfig: Optional[type] = (
+        Int8DynamicActivationInt8WeightConfig
+    )
+    Int8WeightOnlyConfig: Optional[type] = Int8WeightOnlyConfig
+    QAT: Any = QAT
+    QATConfig: Any = QATConfig
+    QATStep: Any = QATStep
+    ptq: Callable[..., tuple[nn.Module, bool, str]] = staticmethod(ptq)
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return callable(cls.quantize)
+
+    @classmethod
+    def is_qat_available(cls) -> bool:
+        initialize = getattr(cls.QAT, "initialize", None)
+        return callable(initialize)
+
+    @classmethod
+    def is_ptq_available(cls) -> bool:
+        return callable(cls.ptq) and cls.ptq is not _ptq_unavailable
+
+    @classmethod
+    def prepare_qat(
+        cls,
+        model: nn.Module,
+        *,
+        dynamic_activations: bool,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> Any:
+        if not cls.is_qat_available():
+            raise RuntimeError("QAT backend unavailable")
+        return cls.QAT.initialize(
+            model,
+            mode="qat-int8",
+            dynamic_activations=dynamic_activations,
+            group_size=group_size,
+            logger=logger,
+        )
+
+    @classmethod
+    def apply_ptq(
+        cls,
+        model: nn.Module,
+        *,
+        dynamic_activations: bool,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> tuple[nn.Module, bool, str]:
+        if not cls.is_ptq_available():
+            return (model, False, "PTQ backend unavailable")
+        return cls.ptq(
+            model,
+            mode="int8",
+            dynamic_activations=dynamic_activations,
+            group_size=group_size,
+            logger=logger,
+        )
+
+    @classmethod
+    def apply_ao(
+        cls,
+        model: nn.Module,
+        *,
+        dynamic_activations: bool,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> tuple[nn.Module, bool, str]:
+        if not cls.is_available():
+            return (model, False, "torchao.quantization not installed (INT8 disabled)")
+        cfg_cls = (
+            cls.Int8DynamicActivationInt8WeightConfig
+            if dynamic_activations
+            else cls.Int8WeightOnlyConfig
+        )
+        if cfg_cls is None:
+            return (model, False, "Quantization config unavailable")
+        try:
+            cfg = cfg_cls()
+        except Exception as exc:
+            return (model, False, f"Failed to initialize quantization config: {exc}")
+        try:
+            cls.quantize(model, cfg)
+        except Exception as exc:
+            return (model, False, f"AO failed: {exc}")
+        if logger is not None:
+            logger(f"[INT8][AO] applied {cfg.__class__.__name__}")
+        setattr(model, "__int8_inference_ao__", True)
+        return (model, True, "torchao")
+
+    @classmethod
+    def enable_training(
+        cls,
+        model: nn.Module,
+        *,
+        dynamic_activations: bool,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> tuple[nn.Module, bool, str]:
+        if not cls.is_available():
+            msg = "torchao.quantization not installed (INT8/QAT disabled)"
+            if logger:
+                logger(f"[INT8] {msg}")
+            return (model, False, msg)
+        last_err: Optional[Exception] = None
+        if cls.is_qat_available():
+            try:
+                base_cfg = cls.prepare_qat(
+                    model,
+                    dynamic_activations=dynamic_activations,
+                    group_size=group_size,
+                    logger=logger,
+                )
+                setattr(model, "__int8_training_qat__", True)
+                if logger:
+                    logger(
+                        f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
+                    )
+                return (model, True, "QAT-prepare")
+            except Exception as exc:
+                last_err = exc
+                if logger:
+                    logger(f"[INT8][QAT] prepare failed: {exc}")
+        try:
+            m2, ok, why = cls.apply_ptq(
+                model,
+                dynamic_activations=dynamic_activations,
+                group_size=group_size,
+                logger=logger,
+            )
+        except Exception as exc:
+            err = exc or last_err or RuntimeError("Unknown PTQ failure")
+            return (model, False, f"INT8 training path unavailable: {err}")
+        if ok:
+            setattr(m2, "__int8_training_ptq__", True)
+            return (m2, True, f"PTQ({why})")
+        return (model, False, f"PTQ failed: {why}")
+
+    @classmethod
+    def enable_prediction(
+        cls,
+        model: nn.Module,
+        *,
+        dynamic_activations: bool,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> tuple[nn.Module, bool, str]:
+        if not cls.is_available():
+            msg = "torchao.quantization not installed (INT8 disabled)"
+            if logger:
+                logger(f"[INT8] {msg}")
+            return (model, False, msg)
+        return cls.apply_ao(model, dynamic_activations=dynamic_activations, logger=logger)
+
+class LayerReplacement:
     @staticmethod
     def _infer_optimal_dtype(
         device: Optional[Union[torch.device, str]] = None,
@@ -935,7 +1095,7 @@ class Accelerator:
         AutoCast.configure(model, metadata=metadata)
         meta = AutoCast._metadata
         if meta is None:
-            ref = Accelerator._module_reference_tensor(model)
+            ref = LayerReplacement._module_reference_tensor(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
             meta = MetaData.for_device(dev)
             AutoCast.configure(model, metadata=meta)
@@ -947,7 +1107,7 @@ class Accelerator:
         dst: nn.Module,
         params_dtype: Optional[torch.dtype],
     ) -> None:
-        ref = Accelerator._module_reference_tensor(src)
+        ref = LayerReplacement._module_reference_tensor(src)
         if ref is not None:
             with contextlib.suppress(Exception):
                 dst.to(device=ref.device)
@@ -963,7 +1123,7 @@ class Accelerator:
             state = src.state_dict()
         except Exception:
             return
-        ref = Accelerator._module_reference_tensor(dst)
+        ref = LayerReplacement._module_reference_tensor(dst)
         device = ref.device if ref is not None else None
         converted = {}
         for key, value in state.items():
@@ -999,8 +1159,8 @@ class Accelerator:
             replacement = te_linear(**kwargs)
         except Exception:
             return None
-        Accelerator._align_module_like(module, replacement, params_dtype)
-        Accelerator._copy_state(module, replacement, params_dtype)
+        LayerReplacement._align_module_like(module, replacement, params_dtype)
+        LayerReplacement._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1022,9 +1182,9 @@ class Accelerator:
             replacement = te_layer_norm(**kwargs)
         except Exception:
             return None
-        Accelerator._align_module_like(module, replacement, params_dtype)
+        LayerReplacement._align_module_like(module, replacement, params_dtype)
         if module.elementwise_affine:
-            Accelerator._copy_state(module, replacement, params_dtype)
+            LayerReplacement._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1048,8 +1208,8 @@ class Accelerator:
             replacement = te_rms_norm(**kwargs)
         except Exception:
             return None
-        Accelerator._align_module_like(module, replacement, params_dtype)
-        Accelerator._copy_state(module, replacement, params_dtype)
+        LayerReplacement._align_module_like(module, replacement, params_dtype)
+        LayerReplacement._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1083,11 +1243,11 @@ class Accelerator:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = Accelerator._make_te_linear(
+                        replacement = LayerReplacement._make_te_linear(
                             child, params_dtype, te
                         )
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = Accelerator._make_te_layer_norm(
+                    replacement = LayerReplacement._make_te_layer_norm(
                         child, params_dtype, te
                     )
                 else:
@@ -1097,7 +1257,7 @@ class Accelerator:
                         and rms_cls is not None
                         and isinstance(child, rms_cls)
                     ):
-                        replacement = Accelerator._make_te_rms_norm(
+                        replacement = LayerReplacement._make_te_rms_norm(
                             child, params_dtype, te
                         )
                 if replacement is not None:
@@ -1143,11 +1303,11 @@ class Accelerator:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Accelerator._infer_optimal_dtype(dev, metadata=metadata)
-        model, n_fused = Accelerator._fuse_sequential_to_te(
+        params_dtype = LayerReplacement._infer_optimal_dtype(dev, metadata=metadata)
+        model, n_fused = LayerReplacement._fuse_sequential_to_te(
             model, params_dtype=params_dtype
         )
-        model, n_basic = Accelerator._apply_te_module(
+        model, n_basic = LayerReplacement._apply_te_module(
             model,
             apply_te_linear=True,
             apply_te_layer_norm=True,
@@ -1156,7 +1316,7 @@ class Accelerator:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = Accelerator._apply_te_attention(
+            model, attn_swapped = LayerReplacement._apply_te_attention(
                 model, params_dtype=params_dtype
             )
         except Exception:
@@ -1179,7 +1339,7 @@ class Accelerator:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped_model, n = Accelerator._apply_te_module(
+            swapped_model, n = LayerReplacement._apply_te_module(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1221,7 +1381,7 @@ class Accelerator:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped, n = Accelerator._apply_te_module(
+            swapped, n = LayerReplacement._apply_te_module(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1293,7 +1453,7 @@ class Accelerator:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Accelerator._metadata_for(model, metadata)
+        meta = LayerReplacement._metadata_for(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
@@ -1311,15 +1471,15 @@ class Accelerator:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Accelerator._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = LayerReplacement._infer_optimal_dtype(device, metadata=meta)
 
         for backend in ("te", "torchao"):
             if backend == "te":
-                m2, ok2, why = Accelerator._try_enable_te_training(
+                m2, ok2, why = LayerReplacement._try_enable_te_training(
                     model, params_dtype, logger
                 )
             else:
-                m2, ok2, why = Accelerator._try_enable_ao_training(model, logger)
+                m2, ok2, why = LayerReplacement._try_enable_ao_training(model, logger)
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
@@ -1336,7 +1496,7 @@ class Accelerator:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Accelerator._metadata_for(model, metadata)
+        meta = LayerReplacement._metadata_for(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
@@ -1354,7 +1514,7 @@ class Accelerator:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Accelerator._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = LayerReplacement._infer_optimal_dtype(device, metadata=meta)
         dynamic_activations = not (
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
@@ -1362,13 +1522,13 @@ class Accelerator:
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
-                m2, ok2, why = Accelerator._try_enable_te_inference_swap(
+                m2, ok2, why = LayerReplacement._try_enable_te_inference_swap(
                     model, params_dtype, logger
                 )
             elif step == "te_present":
-                m2, ok2, why = Accelerator._try_use_existing_te(model, logger)
+                m2, ok2, why = LayerReplacement._try_use_existing_te(model, logger)
             else:
-                m2, ok2, why = Accelerator._try_enable_ao_inference(
+                m2, ok2, why = LayerReplacement._try_enable_ao_inference(
                     model, dynamic_activations, logger
                 )
             if ok2:
@@ -1387,12 +1547,7 @@ class Accelerator:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        if quantize_ is None:
-            msg = "torchao.quantization not installed (INT8/QAT disabled)"
-            if logger:
-                logger(f"[INT8] {msg}")
-            return (model, False, msg)
-        meta = Accelerator._metadata_for(model, metadata)
+        meta = LayerReplacement._metadata_for(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1401,42 +1556,14 @@ class Accelerator:
             and getattr(meta, "scale_is_integral", None) is True
         )
         group_size = 128
-        try:
-            base_cfg = QAT.initialize(
-                model,
-                mode="qat-int8",
-                dynamic_activations=dynamic_activations,
-                group_size=group_size,
-                logger=logger,
-            )
-            setattr(model, "__int8_training_qat__", True)
-            if logger:
-                logger(
-                    f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
-                )
-            AutoCast.configure(model, metadata=meta)
-            return (model, True, "QAT-prepare")
-        except Exception as exc:
-            if logger:
-                logger(f"[INT8][QAT] prepare failed: {exc}")
-            last_err: Exception = exc
-        try:
-            m2, ok, why = ptq(
-                model,
-                mode="int8",
-                dynamic_activations=dynamic_activations,
-                group_size=group_size,
-                logger=logger,
-            )
-            if ok:
-                setattr(m2, "__int8_training_ptq__", True)
-                AutoCast.configure(m2, metadata=meta)
-                return (m2, True, f"PTQ({why})")
-            AutoCast.configure(model, metadata=meta)
-            return (model, False, f"PTQ failed: {why}")
-        except Exception as exc:
-            AutoCast.configure(model, metadata=meta)
-            return (model, False, f"INT8 training path unavailable: {exc or last_err}")
+        m2, ok, why = Quantization.enable_training(
+            model,
+            dynamic_activations=dynamic_activations,
+            group_size=group_size,
+            logger=logger,
+        )
+        AutoCast.configure(m2 if ok else model, metadata=meta)
+        return (m2, ok, why)
 
     @staticmethod
     def enable_int8_prediction(
@@ -1444,12 +1571,7 @@ class Accelerator:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        if quantize_ is None:
-            msg = "torchao.quantization not installed (INT8 disabled)"
-            if logger:
-                logger(f"[INT8] {msg}")
-            return (model, False, msg)
-        meta = Accelerator._metadata_for(model, metadata)
+        meta = LayerReplacement._metadata_for(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1457,17 +1579,8 @@ class Accelerator:
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
         )
-        try:
-            if dynamic_activations:
-                cfg = Int8DynamicActivationInt8WeightConfig()
-            else:
-                cfg = Int8WeightOnlyConfig()
-            quantize_(model, cfg)
-            setattr(model, "__int8_inference_ao__", True)
-            if logger:
-                logger(f"[INT8][AO] applied {cfg.__class__.__name__}")
-            AutoCast.configure(model, metadata=meta)
-            return (model, True, "torchao")
-        except Exception as e:
-            AutoCast.configure(model, metadata=meta)
-            return (model, False, f"AO failed: {e}")
+        m2, ok, why = Quantization.enable_prediction(
+            model, dynamic_activations=dynamic_activations, logger=logger
+        )
+        AutoCast.configure(m2 if ok else model, metadata=meta)
+        return (m2, ok, why)

@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
-from ..backend.fx import AutoCast, compile, inference, reshape_for_heads
+from ..functional.fx import AutoCast, Gradient, reshape_for_heads
 from .activations import GeGLU, SwiGLU
 from .kernels import (
     DotProductAttention,
@@ -1563,7 +1563,7 @@ class Root(nn.Module):
         normalized_mode = mode.lower()
         disable_compile = normalized_mode in {"", "disabled", "none"}
         compile_mode_arg = normalized_mode if not disable_compile else None
-        self.local_net = compile(
+        self.local_net = Gradient.compile(
             self.local_net,
             mode=compile_mode_arg,
             fullgraph=False,
@@ -1571,7 +1571,7 @@ class Root(nn.Module):
             backend="inductor",
             disable=disable_compile,
         )
-        self.global_net = compile(
+        self.global_net = Gradient.compile(
             self.global_net,
             mode=compile_mode_arg,
             fullgraph=False,
@@ -1651,7 +1651,7 @@ class Root(nn.Module):
                 e = min(b, (idx + 1) * self.microbatch)
                 x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
                 with contextlib.ExitStack() as stack:
-                    stack.enter_context(inference(self.local_net))
+                    stack.enter_context(Gradient.inference(self.local_net))
                     stack.enter_context(
                         AutoCast.float(device)
                         if amp_enabled
@@ -1680,7 +1680,7 @@ class Root(nn.Module):
         t32 = tokens.to(torch.float32)
         tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=tokens.dtype)
         if infer_mode:
-            with inference(self.global_net):
+            with Gradient.inference(self.global_net):
                 with (
                     AutoCast.float(device)
                     if amp_enabled
@@ -1691,7 +1691,7 @@ class Root(nn.Module):
                 refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
             )
             decode_tokens = refined_tokens.detach().clone()
-            with inference(self.local_net):
+            with Gradient.inference(self.local_net):
                 with (
                     AutoCast.float(device)
                     if amp_enabled

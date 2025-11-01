@@ -289,7 +289,7 @@ def recompute_y_stats(
     subsequent inference stages can reuse them without touching the model.
     """
 
-    from ..backend.fx import inference  # local import to avoid cycles
+    from ..functional.fx import Gradient  # local import to avoid cycles
 
     try:
         ref = next(model.parameters())
@@ -317,7 +317,7 @@ def recompute_y_stats(
     y_count: torch.Tensor | None = None
 
     model.eval()
-    with inference(model):
+    with Gradient.inference(model):
         for X, Y in loader:
             if Y is None:
                 continue
