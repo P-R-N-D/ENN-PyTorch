@@ -52,7 +52,7 @@ from ..data.datatype import to_torch_tensor
 from ..api import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
 from .environment import Distributed, System
-from .fx import AutoCast, Accelerator, inference
+from ..functional.fx import AutoCast, Gradient, LayerReplacement
 from .profiler import FlopCounter
 from .compat import maybe_mark_cudagraph_step_end
 from .distributed import (
@@ -732,7 +732,7 @@ def epochs(
                 flop_counter_val = FlopCounter(model, mode="eval", device=device)
                 with flop_counter_val:
                     model.eval()
-                    with inference(model), AutoCast.float(device):
+                    with Gradient.inference(model), AutoCast.float(device):
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
@@ -907,7 +907,7 @@ def infer(
     rank = torch.distributed.get_rank() if is_dist else 0
 
     try:
-        with flop_counter, inference(run_model), AutoCast.float(device):
+        with flop_counter, Gradient.inference(run_model), AutoCast.float(device):
             for _idx, _raw in enumerate(data_loader):
                 feat, _label, *_ = preprocess(_raw)
                 X = to_torch_tensor(feat)
@@ -1154,7 +1154,7 @@ def main(*args: Any) -> Optional[Root]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        model, _, _ = Accelerator.use_te_module(model, device=device)
+        model, _, _ = LayerReplacement.use_te_module(model, device=device)
         AutoCast.configure(model, metadata=metadata)
         param_dtype = _ensure_uniform_param_dtype(
             model,
@@ -1172,7 +1172,7 @@ def main(*args: Any) -> Optional[Root]:
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
         if fp8_ok:
-            model, fp8_enabled, fp8_backend = Accelerator.enable_float8_training(
+            model, fp8_enabled, fp8_backend = LayerReplacement.enable_float8_training(
                 model,
                 metadata=metadata,
                 logger=_float8_log,
@@ -1694,7 +1694,7 @@ def main(*args: Any) -> Optional[Root]:
                 )
         model.to(device, non_blocking=True).eval()
         metadata = MetaData.for_device(device)
-        model, _, _ = Accelerator.use_te_module(model, device=device)
+        model, _, _ = LayerReplacement.use_te_module(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _materialize_all_layernorms_(_m_eval, device)
         _validate_layernorm_dtypes(_m_eval, device)
@@ -1715,7 +1715,7 @@ def main(*args: Any) -> Optional[Root]:
         AutoCast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = System.is_float8_supported(device)
         if fp8_infer_ok:
-            model, _, _ = Accelerator.enable_float8_prediction(
+            model, _, _ = LayerReplacement.enable_float8_prediction(
                 model,
                 metadata=metadata,
                 logger=_float8_log,

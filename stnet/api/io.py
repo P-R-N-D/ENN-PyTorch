@@ -34,7 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from ..model import Root
 from ..api.config import ModelConfig, coerce_model_config
-from ..backend.fx import inference
+from ..functional.fx import Gradient
 
 
 class MissingDependencyError(ImportError):
@@ -90,7 +90,7 @@ def _infer_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) 
         dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
         model.eval()
-        with inference(model):
+        with Gradient.inference(model):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             y_flat, _ = model(sample, labels_flat=None, net_loss=None)
@@ -491,7 +491,7 @@ class CoreMLConverter:
         import coremltools as ct
         sample = _pad_sample(model, opts.get("sample_input"))
         wrapper = _ExportCompat(model).eval()
-        with inference(wrapper):
+        with Gradient.inference(wrapper):
             scripted = torch.jit.trace(wrapper, sample)
         cu_map = {
             "ALL": getattr(ct.ComputeUnit, "ALL", None),

@@ -16,7 +16,7 @@ from ..utils.platform import (
     is_int8_supported,
     optimal_optimizer_params,
 )
-from ..backend.fx import AutoCast, Accelerator, _supports_scale
+from .fx import AutoCast, LayerReplacement, _supports_scale
 
 __all__ = ["AdamW"]
 
@@ -40,7 +40,7 @@ class AdamW:
         )
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
-            ref_tensor = Accelerator._module_reference_tensor(model_or_params)
+            ref_tensor = LayerReplacement._module_reference_tensor(model_or_params)
         dev: torch.device
         if metadata is not None:
             dev = torch.device(metadata.device)
@@ -133,7 +133,7 @@ class AdamW:
         )
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
-            ref_tensor = Accelerator._module_reference_tensor(model_or_params)
+            ref_tensor = LayerReplacement._module_reference_tensor(model_or_params)
         if metadata is not None:
             dev = torch.device(metadata.device)
         elif ref_tensor is not None:
