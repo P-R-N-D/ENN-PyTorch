@@ -112,6 +112,9 @@ __all__ = [
     "is_meta_or_fake_tensor",
 ]
 
-sys.modules[__name__ + ".dtypes"] = datatype
+module_name = __name__
+package_name = __package__ or module_name
+sys.modules[module_name + ".dtypes"] = datatype
+sys.modules[package_name + ".dtypes"] = datatype
 
 patch_torch()
