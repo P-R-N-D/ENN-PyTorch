@@ -23,7 +23,7 @@ try:
 except ImportError:  # pragma: no cover - compatibility
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch  # type: ignore
 
-from ..data.dataset import SampleReader
+from ..data.nodes import SampleReader
 from ..data.transforms import preprocess
 from ..model import Root
 from .config import (
