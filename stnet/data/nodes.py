@@ -37,7 +37,6 @@ _FLOAT_PROMOTION_TARGET = torch.float64
 
 
 def _promote_storage_dtype(tensor: torch.Tensor) -> torch.Tensor:
-    """Return a tensor backed by float64/int64 storage when applicable."""
 
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(tensor)
@@ -74,7 +73,7 @@ def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
         raise ValueError(f"missing dtype metadata for {key}")
     try:
         return convert(value, "torch")
-    except Exception as exc:  # pragma: no cover - defensive conversion guard
+    except Exception as exc:
         raise TypeError(f"invalid dtype metadata for {key}: {value!r}") from exc
 
 
@@ -96,7 +95,7 @@ class SampleReader:
 
     @classmethod
     def from_dir(
-        cls,
+        cls: object,
         memmap_dir: str,
         *args: Any,
         split: str = "train",
