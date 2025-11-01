@@ -289,7 +289,7 @@ def recompute_y_stats(
     subsequent inference stages can reuse them without touching the model.
     """
 
-    from ..kernels import inference  # local import to avoid cycles
+    from ..backend.engine import inference  # local import to avoid cycles
 
     try:
         ref = next(model.parameters())
