@@ -35,17 +35,17 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..model import Root
-from ..config import (
+from ..api.config import (
     RuntimeConfig,
     coerce_model_config,
 )
 from ..model.functional import StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..data.collate import dataloader
 from ..data.transforms import postprocess, preprocess
-from ..utils.datatype import to_torch_tensor
-from ..utils import is_fake_tensor, is_meta_or_fake_tensor
+from ..data.datatype import to_torch_tensor
+from ..run import is_fake_tensor, is_meta_or_fake_tensor
 from ..data.stats import MetaData
-from ..utils.platform import Distributed, System
+from ..run.utils import Distributed, System
 from ..kernels import (
     AdamW,
     AutoCast,
@@ -53,8 +53,8 @@ from ..kernels import (
     LossWeightController,
     Module,
 )
-from ..utils.profiler import FlopCounter
-from ..compat import maybe_mark_cudagraph_step_end
+from .profiler import FlopCounter
+from .compat import maybe_mark_cudagraph_step_end
 from .distributed import (
     broadcast_model_states,
     distributed_barrier,

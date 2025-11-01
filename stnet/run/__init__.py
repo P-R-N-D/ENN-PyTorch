@@ -1,37 +1,41 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import sys
 from typing import Any
 
-import sys
 import torch
 
-from .platform import Distributed, System
-from .platform import (
-    get_device,
-    get_runtime_config,
-    initialize_sdpa_backends,
-)
-from ..compat import (
+from .utils import Distributed, Network, System
+from .utils import get_device, get_runtime_config, initialize_sdpa_backends
+from ..backend.compat import (
     SDPBackend,
     TorchCompat,
     _to_sdpa_backends,
     patch_torch,
     sdpa_kernel,
 )
+from ..backend.distributed import joining, no_synchronization
+from ..backend.profiler import FlopCounter, attention_flops_bshd
 from ..kernels import (
     AdamW,
     AutoCast,
     DotProductAttention,
-    inference,
     LossWeightController,
+    Module,
     MultiScaleRetention,
     MultiScaleRetentionCompat,
-    Module,
+    inference,
 )
-from ..runtime.distributed import joining, no_synchronization
-from .profiler import FlopCounter, attention_flops_bshd
-from . import datatype
+from ..data import datatype
+from ..data.transforms import (
+    IncrementalPCA,
+    StandardScaler,
+    VarianceThreshold,
+    postprocess,
+    preprocess,
+)
+
 
 try:  # pragma: no cover - optional dependency
     from torchdistx.fake import is_fake as _tdx_is_fake  # type: ignore[attr-defined]
@@ -69,14 +73,8 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
 
     return is_meta_tensor(value) or is_fake_tensor(value)
 
+
 dtypes = datatype
-from ..data.transforms import (
-    IncrementalPCA,
-    StandardScaler,
-    VarianceThreshold,
-    postprocess,
-    preprocess,
-)
 
 __all__ = [
     "AutoCast",
@@ -92,6 +90,7 @@ __all__ = [
     "joining",
     "no_synchronization",
     "Distributed",
+    "Network",
     "System",
     "get_device",
     "get_runtime_config",

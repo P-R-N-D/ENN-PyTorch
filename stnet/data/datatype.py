@@ -6,7 +6,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from ..compat import patch_arrow
+from ..backend.compat import patch_arrow
 
 _ARROW = patch_arrow()
 

@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ..utils.datatype import to_torch_tensor
+from .datatype import to_torch_tensor
 
 class _ScalerBase:
     def __init__(

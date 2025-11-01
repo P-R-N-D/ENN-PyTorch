@@ -22,8 +22,8 @@ from typing import (
 import torch
 import torch.nn as nn
 
-from ..compat import patch_torch
-from ..utils import is_fake_tensor, is_meta_or_fake_tensor
+from ..backend.compat import patch_torch
+from ..run import is_fake_tensor, is_meta_or_fake_tensor
 from ..kernels import (
     AutoCast,
     compile,
@@ -59,12 +59,12 @@ from .layers import (
 )
 
 try:
-    from stnet.utils.profiler import FLOP_PROFILER  # noqa: F401
+    from stnet.backend.profiler import FLOP_PROFILER  # noqa: F401
 except Exception:
     FLOP_PROFILER = None  # noqa: N816
 
 if TYPE_CHECKING:
-    from .config import ModelConfig
+    from stnet.api.config import ModelConfig
 
 
 class PointTransformer(nn.Module):

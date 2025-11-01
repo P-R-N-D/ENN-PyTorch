@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from ..compat import SDPBackend, patch_torch, sdpa_kernel
+from ..backend.compat import SDPBackend, patch_torch, sdpa_kernel
 
 patch_torch()
 
-from ..config import (
+from ..api.config import (
     ModelConfig,
     PatchConfig,
     coerce_model_config,

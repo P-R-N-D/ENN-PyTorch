@@ -33,7 +33,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..model import Root
-from ..config import ModelConfig, coerce_model_config
+from ..api.config import ModelConfig, coerce_model_config
 from ..kernels import inference
 
 

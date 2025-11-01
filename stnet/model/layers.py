@@ -14,18 +14,18 @@ from ..kernels import (
     MultiScaleRetention,
     attn_mask_to_additive,
 )
-from ..compat import patch_torch
+from ..backend.compat import patch_torch
 from .functional import reshape_for_heads
 
 try:
-    from stnet.compat import RMSNorm as _Norm  # type: ignore
+    from stnet.backend.compat import RMSNorm as _Norm  # type: ignore
 except Exception:
     _Norm = nn.LayerNorm
 
 
 try:
     # 프로파일러가 없어도 동작하게 안전 import
-    from stnet.utils.profiler import FLOP_PROFILER  # noqa: F401
+    from stnet.backend.profiler import FLOP_PROFILER  # noqa: F401
 except Exception:
     FLOP_PROFILER = None  # noqa: N816
 

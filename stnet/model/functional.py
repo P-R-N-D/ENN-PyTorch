@@ -9,7 +9,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
-from ..compat import patch_torch
+from ..backend.compat import patch_torch
 
 patch_torch()
 

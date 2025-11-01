@@ -1,21 +1,19 @@
 from __future__ import annotations
 
-from ..config import (
+from ..api.config import (
     ModelConfig,
     PatchConfig,
     RuntimeConfig,
     coerce_runtime_config,
     runtime_config,
 )
-from ..utils.io import load_model, new_model, save_model
+from ..run.io import load_model, new_model, save_model
 from .distributed import joining
 from . import launch as launch
 from .launch import predict, train
 
 learn = train
 infer = predict
-
-api = launch
 
 __all__ = [
     "ModelConfig",
@@ -32,5 +30,4 @@ __all__ = [
     "predict",
     "infer",
     "launch",
-    "api",
 ]

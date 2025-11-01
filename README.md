@@ -1,12 +1,12 @@
 # STNet-PyTorch
 
 ## Overview
-This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level runtime API for model construction, training, inference, and export utilities. The runtime manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
+This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level backend API for model construction, training, inference, and export utilities. The backend manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
 
 ## Key components
-- **Configurable architecture** – `stnet.config.ModelConfig` defines depth, attention heads, patching strategy, and compiler hints through a single `compile_mode` string (default: `"disabled"`) instead of a boolean flag. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compilation options organized. Runtime helpers re-export these dataclasses so existing imports from `stnet.runtime` continue to function.
+- **Configurable architecture** – `stnet.api.config.ModelConfig` defines depth, attention heads, patching strategy, and compiler hints through a single `compile_mode` string (default: `"disabled"`) instead of a boolean flag. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compilation options organized. Backend helpers re-export these dataclasses so existing imports from `stnet.backend` continue to function.
 - **Modeling type aliases** – `_normalize_modeling_type` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Runtime facade** – `stnet.runtime` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The runtime consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.config` module for consistent configuration management, while orchestration internals live under `stnet.runtime.launch` for direct use when needed.
+- **Backend facade** – `stnet.backend` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The backend consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.api.config` module for consistent configuration management, while orchestration internals live under `stnet.backend.launch` for direct use when needed. A public API surface under `stnet.api.run` keeps high-level orchestration entrypoints separate from the backend implementation.
 - **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives live in `stnet.model.layers` for reuse across modules.
 - **Data transforms** – reusable preprocessing helpers are located under `stnet.data.transforms`, consolidating the former utilities in a single data namespace.
 - **Thread load balancer** – dataloader workers automatically pin to allowed CPUs, request OpenMP `proc_bind(spread)` when available, and dynamically retune PyTorch intra/inter-op thread counts to avoid oversubscription.
@@ -25,7 +25,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 -   Additional extras include `pandas`, `polars`, `excel`, `spark`, `thread`, `torchao`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
 
 ## Dependencies
-The core runtime depends on:
+The core backend depends on:
 
 - `torch>=2.7.0`
 - `torchdata>=0.11.0`
@@ -49,7 +49,7 @@ Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core M
 ### Compiler configuration
 
 `ModelConfig.compile_mode` accepts the same modes as `torch.compile` (for example `"default"`, `"reduce-overhead"`, or `"max-autotune"`).
-The runtime treats `"disabled"`, `"none"`, or an empty string as an explicit request to skip compilation. The helper in `stnet.kernels.compile` normalizes the value, trims whitespace, and avoids
+The backend treats `"disabled"`, `"none"`, or an empty string as an explicit request to skip compilation. The helper in `stnet.kernels.compile` normalizes the value, trims whitespace, and avoids
 calling `torch.compile` when compilation is disabled or unsupported.
 
 ## Quick start
@@ -93,11 +93,11 @@ with torch.inference_mode():
 ```
 During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
 
-The runtime helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
+The backend helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
 
-## Debugging runtime tensor issues
+## Debugging backend tensor issues
 - Enable meta/fake tensor diagnostics by setting `STNET_META_HOOK=1` to raise immediately when a module receives a meta/FakeTensor input. Use `STNET_META_HOOK=warn` during inference services to log a warning instead of aborting execution.
-- Toggle the oneDNN (MKLDNN) backend with `STNET_DISABLE_MKLDNN=1`. When set, the runtime will call `torch.backends.mkldnn.enabled = False` before model construction so you can confirm whether a backend-specific kernel is responsible for anomalous behavior.
+- Toggle the oneDNN (MKLDNN) backend with `STNET_DISABLE_MKLDNN=1`. When set, the backend will call `torch.backends.mkldnn.enabled = False` before model construction so you can confirm whether a backend-specific kernel is responsible for anomalous behavior.
 
 ### Sample workbook configuration
 
