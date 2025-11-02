@@ -17,7 +17,7 @@ from threading import Lock
 import torch
 from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 from .datatype import to_torch_tensor
-from .nodes import DevicePrefetcher
+from .nodes import DevicePrefetcher, GDSBatchReader
 from ..backend.environment import System
 
 
@@ -438,6 +438,7 @@ def _build_local_loaders(
     map_fn: Callable[[Any], Any],
     batch_reader_cls: type,
     sample_reader_cls: type,
+    batch_reader_kwargs: Optional[Dict[str, Any]] | None = None,
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Keep]:
     reader_tr = sample_reader_cls.from_dir(
@@ -454,7 +455,10 @@ def _build_local_loaders(
     if train_end <= train_start and total:
         train_end = total
     keep = _Keep(reader_tr)
-    batcher_tr = batch_reader_cls(reader_tr, train_start, train_end, int(batch_size))
+    reader_kwargs = dict(batch_reader_kwargs or {})
+    batcher_tr = batch_reader_cls(
+        reader_tr, train_start, train_end, int(batch_size), **reader_kwargs
+    )
     node_tr = IterableWrapper(batcher_tr)
     train_loader = _wrap_data_node(
         node_tr,
@@ -479,7 +483,10 @@ def _build_local_loaders(
         val_end = int(getattr(val_range, "stop", total))
         if val_end <= val_start:
             val_end = total
-        batcher_vl = batch_reader_cls(reader_vl, val_start, val_end, int(batch_size))
+        reader_kwargs = dict(batch_reader_kwargs or {})
+        batcher_vl = batch_reader_cls(
+            reader_vl, val_start, val_end, int(batch_size), **reader_kwargs
+        )
         node_vl = IterableWrapper(batcher_vl)
         val_loader = _wrap_data_node(
             node_vl,
@@ -519,8 +526,24 @@ class DataLoader:
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in ("cuda", "mps", "xpu") and DevicePrefetcher is not None:
             try:
+                gpu_guard_default = "2048" if dev_t == "cuda" else "512"
+                gpu_guard_mb = int(
+                    os.environ.get("STNET_GPU_GUARD_MB", gpu_guard_default)
+                )
+            except Exception:
+                gpu_guard_mb = 2048 if dev_t == "cuda" else 512
+            try:
+                host_guard_mb = int(os.environ.get("STNET_HOST_GUARD_MB", "1024"))
+            except Exception:
+                host_guard_mb = 1024
+            try:
                 self._iterable = DevicePrefetcher(
-                    base, device=self._device, depth=self._prefetch_factor
+                    base,
+                    device=self._device,
+                    depth=self._prefetch_factor,
+                    memory_backpressure=True,
+                    gpu_guard_bytes=gpu_guard_mb * (1 << 20),
+                    host_guard_bytes=host_guard_mb * (1 << 20),
                 )
             except TypeError:
                 self._iterable = base
@@ -658,14 +681,33 @@ def dataloader(
         flatten_features=flatten_features,
     )
     from .nodes import BatchReader, SampleReader
+
+    def _env_flag(name: str, default: str = "0") -> bool:
+        value = os.environ.get(name, default)
+        return value not in {"", "0", "false", "False"}
+
+    use_gds = (
+        isinstance(device_obj, torch.device)
+        and device_obj.type == "cuda"
+        and torch.cuda.is_available()
+        and _env_flag("STNET_GDS")
+        and GDSBatchReader is not None
+        and os.path.exists(os.path.join(memmap_dir, "features.bin"))
+        and os.path.exists(os.path.join(memmap_dir, "labels.bin"))
+    )
+    batch_reader_cls = GDSBatchReader if use_gds else BatchReader
+    batch_reader_kwargs: Optional[Dict[str, Any]] = (
+        {"device": device_obj} if use_gds else None
+    )
     wrap_kwargs = dict(
         device=device_obj,
         threads=threads,
         prefetch_factor=prefetch_factor,
         non_blocking_copy=bool(non_blocking_copy),
         map_fn=map_fn,
-        batch_reader_cls=BatchReader,
+        batch_reader_cls=batch_reader_cls,
         sample_reader_cls=SampleReader,
+        batch_reader_kwargs=batch_reader_kwargs,
     )
 
     return _build_local_loaders(

@@ -379,8 +379,17 @@ class System:
         return (False, "torchao low-bit optimizers unavailable")
 
     @staticmethod
+    def _safe_cuda_device_count() -> int:
+        try:
+            if torch.cuda.is_available():
+                return int(torch.cuda.device_count())
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
     def optimal_procs() -> Dict[str, Union[int, str]]:
-        n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        n_gpu = System._safe_cuda_device_count()
         return {"nproc_per_node": n_gpu or 1, "device": "cuda" if n_gpu else "cpu"}
 
     @staticmethod
@@ -393,7 +402,7 @@ class System:
     @staticmethod
     def optimal_threads() -> Dict[str, Union[int, bool]]:
         n_cpu = System.cpu_count()
-        n_gpu = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        n_gpu = System._safe_cuda_device_count()
         intra = max(1, min(n_cpu, int(round(0.8 * n_cpu))))
         inter = max(1, min(4, int(math.sqrt(intra))))
         workers = (

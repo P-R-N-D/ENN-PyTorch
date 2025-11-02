@@ -23,11 +23,27 @@ from typing import (
 
 import torch
 from tensordict import MemoryMappedTensor
+from torch.utils.dlpack import from_dlpack
 
 try:
     from torchdata.nodes import IterableWrapper
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import cupy as cp
+except Exception:
+    cp = None
+
+try:
+    from kvikio import CuFile
+except Exception:
+    CuFile = None
 
 from .datatype import convert
 
@@ -75,6 +91,63 @@ def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
         return convert(value, "torch")
     except Exception as exc:
         raise TypeError(f"invalid dtype metadata for {key}: {value!r}") from exc
+
+
+def _host_free_bytes() -> int:
+    if psutil is not None:
+        try:
+            return int(psutil.virtual_memory().available)
+        except Exception:
+            pass
+    if hasattr(os, "sysconf"):
+        try:
+            pages = os.sysconf("SC_AVPHYS_PAGES")
+            page_size = os.sysconf("SC_PAGE_SIZE")
+            if isinstance(pages, int) and isinstance(page_size, int):
+                return int(pages) * int(page_size)
+        except Exception:
+            pass
+    return 0
+
+
+def _device_free_bytes(dev: torch.device) -> int:
+    try:
+        kind = getattr(dev, "type", str(dev))
+        if kind == "cuda" and torch.cuda.is_available():
+            free, _ = torch.cuda.memory.mem_get_info(dev)
+            return int(free)
+        if kind == "xpu" and hasattr(torch, "xpu"):
+            try:
+                free, _ = torch.xpu.memory.mem_get_info()
+                return int(free)
+            except Exception:
+                return 0
+        if (
+            kind == "mps"
+            and getattr(torch.backends, "mps", None)
+            and torch.backends.mps.is_available()
+        ):
+            try:
+                return int(
+                    torch.mps.recommended_max_memory()
+                    - torch.mps.driver_allocated_memory()
+                )
+            except Exception:
+                return 0
+    except Exception:
+        pass
+    return 0
+
+
+def _torch_dtype_to_cupy(dtype: torch.dtype) -> "cp.dtype":
+    if cp is None:
+        raise RuntimeError("cupy is required for dtype conversion")
+    try:
+        # torch.empty produces a CPU tensor, safe for numpy conversion.
+        np_dtype = torch.empty([], dtype=dtype).numpy().dtype
+        return cp.dtype(np_dtype)
+    except Exception as exc:
+        raise TypeError(f"unable to map torch dtype {dtype!r} to CuPy") from exc
 
 
 class SampleReader:
@@ -143,6 +216,13 @@ class SampleReader:
         MemoryMappedTensor.from_tensor(
             labels.view(count, label_flat), filename=label_path, existsok=True
         )
+        if bool(int(os.environ.get("STNET_GDS_EXPORT", "0"))):
+            feat_bin = os.path.join(memmap_dir, "features.bin")
+            lab_bin = os.path.join(memmap_dir, "labels.bin")
+            with open(feat_bin, "wb") as feat_handle:
+                features.view(count, feat_dim).numpy().tofile(feat_handle)
+            with open(lab_bin, "wb") as lab_handle:
+                labels.view(count, label_flat).numpy().tofile(lab_handle)
         meta = {
             "N": count,
             "feature_dim": feat_dim,
@@ -292,6 +372,101 @@ class BatchReader:
         return int(math.ceil(span / float(self._batch)))
 
 
+if CuFile is not None and cp is not None:
+
+    class GDSBatchReader:
+        def __init__(
+            self,
+            mmts: SampleReader,
+            start: int,
+            end: int,
+            batch_size: int,
+            *,
+            device: Optional[Union[str, torch.device]] = None,
+        ) -> None:
+            if CuFile is None or cp is None:
+                raise RuntimeError("GDSBatchReader requires kvikio and cupy")
+            self._mmts = mmts
+            self._start = int(start)
+            self._end = int(end)
+            self._batch = max(1, int(batch_size))
+            self._device = (
+                torch.device(device)
+                if device is not None and not isinstance(device, torch.device)
+                else device
+            )
+            if self._device is None:
+                index = torch.cuda.current_device() if torch.cuda.is_available() else 0
+                self._device = torch.device("cuda", index)
+            meta = self._mmts._load_meta()
+            self._feat_dim = int(meta.get("feature_dim", 0))
+            label_shape = list(meta.get("label_shape", []))
+            self._label_shape = label_shape
+            self._label_flat = (
+                int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+            )
+            self._feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
+            self._lab_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
+            self._feat_path = os.path.join(
+                self._mmts.dir, meta.get("features_bin_filename", "features.bin")
+            )
+            self._lab_path = os.path.join(
+                self._mmts.dir, meta.get("labels_bin_filename", "labels.bin")
+            )
+            if not (os.path.exists(self._feat_path) and os.path.exists(self._lab_path)):
+                raise FileNotFoundError(
+                    "GDS binary files (features.bin, labels.bin) are required"
+                )
+            self._feat_cp_dtype = _torch_dtype_to_cupy(self._feat_dtype)
+            self._lab_cp_dtype = _torch_dtype_to_cupy(self._lab_dtype)
+            self._feat_stride = int(self._feat_cp_dtype.itemsize * self._feat_dim)
+            self._lab_stride = int(self._lab_cp_dtype.itemsize * self._label_flat)
+
+        def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+            dev = torch.device(self._device)
+            index = int(self._start)
+            feat_offset = int(self._start) * self._feat_stride
+            lab_offset = int(self._start) * self._lab_stride
+            idx = dev.index
+            if idx is None:
+                try:
+                    idx = torch.cuda.current_device()
+                except Exception:
+                    idx = cp.cuda.runtime.getDevice()
+            with cp.cuda.Device(int(idx)):
+                with CuFile(self._feat_path, "rb") as feat_handle, CuFile(
+                    self._lab_path, "rb"
+                ) as lab_handle:
+                    while index < self._end:
+                        nxt = min(index + self._batch, self._end)
+                        rows = int(nxt - index)
+                        if rows <= 0:
+                            break
+                        x_cp = cp.empty((rows, self._feat_dim), dtype=self._feat_cp_dtype)
+                        y_cp = cp.empty((rows, self._label_flat), dtype=self._lab_cp_dtype)
+                        feat_handle.pread(x_cp, feat_offset)
+                        lab_handle.pread(y_cp, lab_offset)
+                        xb = from_dlpack(x_cp.toDlpack())
+                        yb = from_dlpack(y_cp.toDlpack()).view(
+                            rows, *self._label_shape
+                        )
+                        yield {"X": xb, "Y": yb}
+                        step = rows * self._feat_stride
+                        feat_offset += step
+                        lab_offset += rows * self._lab_stride
+                        index = nxt
+
+        def __len__(self) -> int:
+            if self._end <= self._start:
+                return 0
+            span = self._end - self._start
+            return int(math.ceil(span / float(self._batch)))
+
+
+else:
+    GDSBatchReader = None  # type: ignore
+
+
 class BatchSampler(IterableWrapper):
     def __init__(
         self,
@@ -357,11 +532,14 @@ class DevicePrefetcher(Iterator[Any]):
         amp_dtype: Optional[torch.dtype] = None,
         max_bytes: Optional[int] = None,
         autotune: bool = True,
-        tune_interval: int = 50,
+        tune_interval: int = 32,
         depth_min: int = 1,
         depth_max: int = 8,
         enable_graphs: bool = False,
         graph_warmup: int = 2,
+        memory_backpressure: bool = True,
+        gpu_guard_bytes: Optional[int] = None,
+        host_guard_bytes: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         self._it = iter(iterable)
@@ -384,6 +562,29 @@ class DevicePrefetcher(Iterator[Any]):
         self._autotune = bool(autotune)
         self._tune_interval = max(10, int(tune_interval))
         self._graph_enabled = bool(enable_graphs and self._backend == "cuda")
+        self._mem_bp = bool(memory_backpressure)
+        try:
+            self._gpu_guard = (
+                int(gpu_guard_bytes)
+                if gpu_guard_bytes is not None
+                else int(
+                    os.environ.get(
+                        "STNET_GPU_GUARD_MB",
+                        "2048" if self._backend == "cuda" else "512",
+                    )
+                )
+                * (1 << 20)
+            )
+        except Exception:
+            self._gpu_guard = 2 << 30 if self._backend == "cuda" else 512 << 20
+        try:
+            self._host_guard = (
+                int(host_guard_bytes)
+                if host_guard_bytes is not None
+                else int(os.environ.get("STNET_HOST_GUARD_MB", "1024")) * (1 << 20)
+            )
+        except Exception:
+            self._host_guard = 1024 << 20
         self._slots = 1 if self._graph_enabled else max(1, int(slots))
         self._streams: list[Any] = []
         self._streams = self._init_streams()
@@ -397,6 +598,8 @@ class DevicePrefetcher(Iterator[Any]):
         self._graph: Optional[torch.cuda.CUDAGraph] = None
         self._graph_warmup = max(1, int(graph_warmup))
         self._err: Optional[BaseException] = None
+        self._bp_sleep = 0.002
+        self.use_pinned = bool(pin_if_needed and self._backend == "cuda")
         self._preload()
 
     def _init_streams(self) -> list[Any]:
@@ -438,12 +641,34 @@ class DevicePrefetcher(Iterator[Any]):
             return sum((self._bytes(value) for value in obj.values()))
         return 0
 
+    def _guard_host_bytes(self, need: int) -> None:
+        if not self._mem_bp or need <= 0:
+            return
+        guard = max(0, int(self._host_guard))
+        while True:
+            free = _host_free_bytes()
+            if free <= 0 or free - guard >= need:
+                break
+            time.sleep(self._bp_sleep)
+
+    def _guard_device_bytes(self, need: int) -> None:
+        if not self._mem_bp or need <= 0:
+            return
+        if self._backend not in {"cuda", "xpu", "mps"}:
+            return
+        guard = max(0, int(self._gpu_guard))
+        while True:
+            free = _device_free_bytes(self._dev)
+            if free <= 0 or free - guard >= need:
+                break
+            time.sleep(self._bp_sleep)
+
     def _should_pin(self, tensor: Any) -> bool:
         if not isinstance(tensor, torch.Tensor):
             return False
         if tensor.device.type != "cpu":
             return False
-        if self._backend not in {"cuda", "xpu", "mps"}:
+        if not self.use_pinned:
             return False
         if (
             self._pin_if_needed
@@ -454,7 +679,18 @@ class DevicePrefetcher(Iterator[Any]):
         return self._pin_if_needed
 
     def _pin_tensor(self, tensor: Any) -> Any:
+        if self._backend in {"xpu", "mps"}:
+            return tensor
         if self._should_pin(tensor):
+            need = int(
+                getattr(
+                    tensor,
+                    "nbytes",
+                    tensor.numel() * max(1, tensor.element_size()),
+                )
+            )
+            if self._mem_bp and need > 0:
+                self._guard_host_bytes(need)
             with suppress(Exception):
                 return tensor.pin_memory()
         return tensor
@@ -465,7 +701,7 @@ class DevicePrefetcher(Iterator[Any]):
     def _move_tensor(self, tensor: Any) -> Any:
         if isinstance(tensor, torch.Tensor):
             kwargs: Dict[str, Any] = {
-                "non_blocking": self._backend in {"cuda", "xpu", "mps"}
+                "non_blocking": (self._backend == "cuda") and self.use_pinned
             }
             if self._amp_dtype is not None:
                 kwargs["dtype"] = self._amp_dtype
@@ -527,10 +763,13 @@ class DevicePrefetcher(Iterator[Any]):
             return torch.mps.stream(stream)
         return nullcontext()
 
-    def _enqueue(self, batch: Any, slot: int) -> None:
+    def _enqueue(self, batch: Any, slot: int, expected_bytes: Optional[int] = None) -> None:
         stream = self._streams[slot] if self._streams else None
         start = time.perf_counter()
         with self._stream_ctx(stream):
+            need = expected_bytes if expected_bytes is not None else self._bytes(batch)
+            if need > 0:
+                self._guard_device_bytes(need)
             if self._graph_enabled:
                 if self._static is None:
                     self._static = self._allocate_static_like(
@@ -559,9 +798,12 @@ class DevicePrefetcher(Iterator[Any]):
             except Exception as exc:
                 self._err = self._err or exc
                 break
+            need = self._bytes(batch)
+            if self._mem_bp and need > 0:
+                self._guard_host_bytes(need)
             batch = self._pin_cpu(batch)
             slot = self._rr % self._slots
-            self._enqueue(batch, slot)
+            self._enqueue(batch, slot, expected_bytes=need)
 
     def __iter__(self) -> "DevicePrefetcher":
         return self
