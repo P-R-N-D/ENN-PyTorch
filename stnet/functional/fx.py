@@ -150,10 +150,7 @@ class Gradient:
     ) -> nn.Module:
         normalized_mode = ""
         if mode is not None:
-            try:
-                normalized_mode = str(mode).strip().lower()
-            except Exception:
-                normalized_mode = ""
+            normalized_mode = str(mode).strip().lower()
         if disable or normalized_mode in {"", "disabled", "none"}:
             return module
         compile_fn = getattr(torch, "compile", None)
@@ -170,11 +167,7 @@ class Gradient:
             kwargs["dynamic"] = bool(dynamic)
         if options:
             kwargs["options"] = dict(options)
-        try:
-            return compile_fn(module, **kwargs)
-        except Exception as exc:
-            _LOGGER.warning("torch.compile failed (%s); returning original module", exc)
-            return module
+        return compile_fn(module, **kwargs)
 
 
 def _supports_scale(
