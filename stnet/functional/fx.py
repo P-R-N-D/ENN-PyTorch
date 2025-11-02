@@ -1024,7 +1024,7 @@ class Quantization:
             return (model, False, msg)
         return cls.apply_ao(model, dynamic_activations=dynamic_activations, logger=logger)
 
-class LayerReplacement:
+class Fusion:
     @staticmethod
     def _infer_optimal_dtype(
         device: Optional[Union[torch.device, str]] = None,
@@ -1075,7 +1075,7 @@ class LayerReplacement:
         AutoCast.configure(model, metadata=metadata)
         meta = AutoCast._metadata
         if meta is None:
-            ref = LayerReplacement._module_reference_tensor(model)
+            ref = Fusion._module_reference_tensor(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
             meta = MetaData.for_device(dev)
             AutoCast.configure(model, metadata=meta)
@@ -1087,7 +1087,7 @@ class LayerReplacement:
         dst: nn.Module,
         params_dtype: Optional[torch.dtype],
     ) -> None:
-        ref = LayerReplacement._module_reference_tensor(src)
+        ref = Fusion._module_reference_tensor(src)
         if ref is not None:
             with contextlib.suppress(Exception):
                 dst.to(device=ref.device)
@@ -1103,7 +1103,7 @@ class LayerReplacement:
             state = src.state_dict()
         except Exception:
             return
-        ref = LayerReplacement._module_reference_tensor(dst)
+        ref = Fusion._module_reference_tensor(dst)
         device = ref.device if ref is not None else None
         converted = {}
         for key, value in state.items():
@@ -1139,8 +1139,8 @@ class LayerReplacement:
             replacement = te_linear(**kwargs)
         except Exception:
             return None
-        LayerReplacement._align_module_like(module, replacement, params_dtype)
-        LayerReplacement._copy_state(module, replacement, params_dtype)
+        Fusion._align_module_like(module, replacement, params_dtype)
+        Fusion._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1162,9 +1162,9 @@ class LayerReplacement:
             replacement = te_layer_norm(**kwargs)
         except Exception:
             return None
-        LayerReplacement._align_module_like(module, replacement, params_dtype)
+        Fusion._align_module_like(module, replacement, params_dtype)
         if module.elementwise_affine:
-            LayerReplacement._copy_state(module, replacement, params_dtype)
+            Fusion._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1188,8 +1188,8 @@ class LayerReplacement:
             replacement = te_rms_norm(**kwargs)
         except Exception:
             return None
-        LayerReplacement._align_module_like(module, replacement, params_dtype)
-        LayerReplacement._copy_state(module, replacement, params_dtype)
+        Fusion._align_module_like(module, replacement, params_dtype)
+        Fusion._copy_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1224,11 +1224,11 @@ class LayerReplacement:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = LayerReplacement._make_te_linear(
+                        replacement = Fusion._make_te_linear(
                             child, params_dtype, te
                         )
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = LayerReplacement._make_te_layer_norm(
+                    replacement = Fusion._make_te_layer_norm(
                         child, params_dtype, te
                     )
                 else:
@@ -1238,7 +1238,7 @@ class LayerReplacement:
                         and rms_cls is not None
                         and isinstance(child, rms_cls)
                     ):
-                        replacement = LayerReplacement._make_te_rms_norm(
+                        replacement = Fusion._make_te_rms_norm(
                             child, params_dtype, te
                         )
                 if replacement is not None:
@@ -1285,11 +1285,11 @@ class LayerReplacement:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = LayerReplacement._infer_optimal_dtype(dev, metadata=metadata)
-        model, n_fused = LayerReplacement._fuse_sequential_to_te(
+        params_dtype = Fusion._infer_optimal_dtype(dev, metadata=metadata)
+        model, n_fused = Fusion._fuse_sequential_to_te(
             model, params_dtype=params_dtype
         )
-        model, n_basic = LayerReplacement._apply_te_module(
+        model, n_basic = Fusion._apply_te_module(
             model,
             apply_te_linear=True,
             apply_te_layer_norm=True,
@@ -1298,7 +1298,7 @@ class LayerReplacement:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = LayerReplacement._apply_te_attention(
+            model, attn_swapped = Fusion._apply_te_attention(
                 model, params_dtype=params_dtype
             )
         except Exception:
@@ -1321,7 +1321,7 @@ class LayerReplacement:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped_model, n = LayerReplacement._apply_te_module(
+            swapped_model, n = Fusion._apply_te_module(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1363,7 +1363,7 @@ class LayerReplacement:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped, n = LayerReplacement._apply_te_module(
+            swapped, n = Fusion._apply_te_module(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1435,7 +1435,7 @@ class LayerReplacement:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = LayerReplacement._metadata_for(model, metadata)
+        meta = Fusion._metadata_for(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
@@ -1453,15 +1453,15 @@ class LayerReplacement:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = LayerReplacement._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = Fusion._infer_optimal_dtype(device, metadata=meta)
 
         for backend in ("te", "torchao"):
             if backend == "te":
-                m2, ok2, why = LayerReplacement._try_enable_te_training(
+                m2, ok2, why = Fusion._try_enable_te_training(
                     model, params_dtype, logger
                 )
             else:
-                m2, ok2, why = LayerReplacement._try_enable_ao_training(model, logger)
+                m2, ok2, why = Fusion._try_enable_ao_training(model, logger)
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
@@ -1478,7 +1478,7 @@ class LayerReplacement:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = LayerReplacement._metadata_for(model, metadata)
+        meta = Fusion._metadata_for(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
@@ -1496,7 +1496,7 @@ class LayerReplacement:
                     )
                 AutoCast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = LayerReplacement._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = Fusion._infer_optimal_dtype(device, metadata=meta)
         dynamic_activations = not (
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
@@ -1504,13 +1504,13 @@ class LayerReplacement:
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
-                m2, ok2, why = LayerReplacement._try_enable_te_inference_swap(
+                m2, ok2, why = Fusion._try_enable_te_inference_swap(
                     model, params_dtype, logger
                 )
             elif step == "te_present":
-                m2, ok2, why = LayerReplacement._try_use_existing_te(model, logger)
+                m2, ok2, why = Fusion._try_use_existing_te(model, logger)
             else:
-                m2, ok2, why = LayerReplacement._try_enable_ao_inference(
+                m2, ok2, why = Fusion._try_enable_ao_inference(
                     model, dynamic_activations, logger
                 )
             if ok2:
@@ -1529,7 +1529,7 @@ class LayerReplacement:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = LayerReplacement._metadata_for(model, metadata)
+        meta = Fusion._metadata_for(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1554,7 +1554,7 @@ class LayerReplacement:
         metadata: Optional[MetaData[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = LayerReplacement._metadata_for(model, metadata)
+        meta = Fusion._metadata_for(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)

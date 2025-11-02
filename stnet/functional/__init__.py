@@ -15,7 +15,7 @@ from .optimizers import AdamW
 from .fx import (
     AutoCast,
     Gradient,
-    LayerReplacement,
+    Fusion,
     is_transformer_engine_enabled,
     reshape_for_heads,
 )
@@ -31,7 +31,7 @@ __all__ = [
     "LossWeightController",
     "AdamW",
     "AutoCast",
-    "LayerReplacement",
+    "Fusion",
     "Gradient",
     "is_transformer_engine_enabled",
     "reshape_for_heads",
