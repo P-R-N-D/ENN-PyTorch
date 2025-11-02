@@ -143,7 +143,6 @@ def _torch_dtype_to_cupy(dtype: torch.dtype) -> "cp.dtype":
     if cp is None:
         raise RuntimeError("cupy is required for dtype conversion")
     try:
-        # torch.empty produces a CPU tensor, safe for numpy conversion.
         np_dtype = torch.empty([], dtype=dtype).numpy().dtype
         return cp.dtype(np_dtype)
     except Exception as exc:
@@ -381,8 +380,9 @@ if CuFile is not None and cp is not None:
             start: int,
             end: int,
             batch_size: int,
-            *,
+            *args: Any,
             device: Optional[Union[str, torch.device]] = None,
+            **kwargs: Any,
         ) -> None:
             if CuFile is None or cp is None:
                 raise RuntimeError("GDSBatchReader requires kvikio and cupy")
@@ -464,7 +464,7 @@ if CuFile is not None and cp is not None:
 
 
 else:
-    GDSBatchReader = None  # type: ignore
+    GDSBatchReader = None
 
 
 class BatchSampler(IterableWrapper):
