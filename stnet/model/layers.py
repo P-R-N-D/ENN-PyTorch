@@ -60,8 +60,6 @@ except Exception:
 
 
 patch_torch()
-_torch_compile_disable = torch.compiler.disable
-_compile_disable = torch.compiler.disable
 
 
 if TYPE_CHECKING:
@@ -69,22 +67,6 @@ if TYPE_CHECKING:
 
 
 LayerNorm = nn.LayerNorm
-
-
-def _disable_torch_compile(fn=None, *args: Any, recursive: bool = False, **kwargs: Any):
-    if fn is None:
-        return lambda real_fn: _disable_torch_compile(real_fn, recursive=recursive)
-    try:
-        return _torch_compile_disable(fn, recursive=recursive)
-    except TypeError:
-        return _torch_compile_disable(fn)
-
-
-def _disable_module_torch_compile(module: nn.Module) -> nn.Module:
-    forward = getattr(module, "forward", None)
-    if callable(forward):
-        module.forward = _disable_torch_compile(forward)
-    return module
 
 
 class PositionalEncoding(nn.Module):
@@ -183,12 +165,12 @@ class StochasticDepth(nn.Module):
 def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     kind = str(norm_type).lower()
     if kind in {"layernorm", "layer_norm", "ln"}:
-        return _disable_module_torch_compile(LayerNorm(d_model))
+        return LayerNorm(d_model)
     if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return _disable_module_torch_compile(nn.RMSNorm(d_model))
+        return nn.RMSNorm(d_model)
     if kind in {"batchnorm", "batchnorm1d", "bn", "bn1d"}:
-        return _disable_module_torch_compile(nn.BatchNorm1d(d_model))
-    return _disable_module_torch_compile(LayerNorm(d_model))
+        return nn.BatchNorm1d(d_model)
+    return LayerNorm(d_model)
 
 
 def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
@@ -391,7 +373,6 @@ class PatchEmbedding(nn.Module):
             slices[base + offset] = slice(0, want)
         return x[tuple(slices)]
 
-    @_disable_torch_compile
     def _pad_dynamic(self, x: torch.Tensor) -> torch.Tensor:
         return self._pad(x)
 
@@ -559,7 +540,6 @@ class TemporalEncoderLayer(nn.Module):
         return out, new_state
 
 
-@_disable_torch_compile
 def _build_dilated_mask(
     seq_len: int,
     *args: Any,
@@ -643,7 +623,6 @@ class DilatedAttention(nn.Module):
         self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
         self._mask_cache_gpu: Dict[Tuple[int, int], torch.Tensor] = {}
 
-    @_disable_torch_compile
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
         key = (L, device.index if device.type == "cuda" else -1)
         mask_gpu = self._mask_cache_gpu.get(key)
@@ -847,7 +826,6 @@ def _normalize_modeling_type(value: Any) -> str:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
 
-@_disable_torch_compile(recursive=True)
 class SpatialEncoder(nn.Module):
     
     def __init__(
@@ -939,7 +917,6 @@ class TemporalEncoderBlock(nn.Module):
         hid = int(d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
 
-    @_disable_torch_compile
     def forward(
         self,
         x: torch.Tensor,
@@ -1073,7 +1050,6 @@ class CrossTransformer(nn.Module):
         requested = mode if mode is not None else "spatiotemporal"
         return self._forward_dynamic(spatial_tokens, temporal_tokens, requested)
 
-    @_compile_disable
     def _forward_dynamic(
         self,
         spatial_tokens: torch.Tensor,
@@ -1459,7 +1435,6 @@ class LocalProcessor(nn.Module):
             context_shape=self.out_shape,
         )
 
-    @_compile_disable
     def _forward_dynamic(self, spatial_out, temporal_out):
         mode = getattr(self, "modeling_type", None)
         if mode is None:

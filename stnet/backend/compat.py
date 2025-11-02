@@ -23,39 +23,8 @@ except Exception:
     FakeTensor = tuple()
 
 
-try:
-    _torch_compile_disable = torch.compiler.disable
-except Exception:
-    try:
-        import torch._dynamo as _dynamo
-        _torch_compile_disable = _dynamo.disable
-    except Exception:
-
-        def _torch_compile_disable(fn=None, *args: Any, recursive=False, **kwargs: Any):
-            if fn is None:
-                return lambda real_fn: real_fn
-            return fn
-
-
-if not hasattr(torch, "compiler"):
-    class _TorchCompilerNamespace:
-        @staticmethod
-        def disable(fn=None, *args: Any, recursive=False, **kwargs: Any):
-            return _torch_compile_disable(fn, recursive=recursive)
-
-
-    torch.compiler = _TorchCompilerNamespace()
-elif not hasattr(torch.compiler, "disable"):
-
-    def _compiler_disable_passthrough(fn=None, *args: Any, recursive=False, **kwargs: Any):
-        return _torch_compile_disable(fn, recursive=recursive)
-
-
-    torch.compiler.disable = _compiler_disable_passthrough
-
-
 if hasattr(nn, "RMSNorm"):
-    RMSNorm = torch.compiler.disable(nn.RMSNorm, recursive=True)
+    RMSNorm = nn.RMSNorm
 else:
     RMSNorm = None
 
@@ -184,8 +153,7 @@ class TorchCompat:
     def _ensure_rmsnorm(self) -> None:
         global RMSNorm
         if hasattr(self.nn_module, "RMSNorm"):
-            if RMSNorm is None:
-                RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)
+            RMSNorm = self.nn_module.RMSNorm
             return
         torch_mod = self.module
         nn_mod = self.nn_module
@@ -203,7 +171,7 @@ class TorchCompat:
                 return x * inv_rms * self.weight
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
-        RMSNorm = torch.compiler.disable(self.nn_module.RMSNorm, recursive=True)
+        RMSNorm = self.nn_module.RMSNorm
 
     def _ensure_fmin(self) -> None:
         if hasattr(self.module, "fmin"):
@@ -241,13 +209,9 @@ def patch_torch(
 
 
 def maybe_mark_cudagraph_step_end() -> None:
-
-    try:
-        mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
-        if callable(mark_step):
-            mark_step()
-    except Exception:
-        pass
+    mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
+    if callable(mark_step):
+        mark_step()
 
 
 def is_fake_tensor(value: Any) -> bool:
