@@ -539,43 +539,45 @@ def preprocess(
     multi-node datasets that collate into ``List[dict]`` or
     ``List[TensorDict]`` structures.
     """
+    def _flatten_sequence(
+        entries: Sequence[BatchLike],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
+        feature_chunks: List[torch.Tensor] = []
+        label_chunks: List[torch.Tensor] = []
+        keys: List[Tuple] = []
+        label_shape: Tuple[int, ...] | None = None
+        for entry in entries:
+            feats, labels, sub_keys, sub_shape = preprocess(entry)
+            feature_chunks.append(feats)
+            label_chunks.append(labels)
+            if label_shape is None:
+                label_shape = sub_shape
+            elif label_shape != sub_shape:
+                raise ValueError(
+                    "preprocess: inconsistent label shapes across sequence entries"
+                )
+            offset = len(keys)
+            if sub_keys:
+                for idx, key in enumerate(sub_keys):
+                    if isinstance(key, tuple) and len(key) == 1 and isinstance(key[0], int):
+                        keys.append((offset + key[0],))
+                    else:
+                        keys.append((offset + idx,) + tuple(key))
+            else:
+                for idx in range(int(feats.shape[0])):
+                    keys.append((offset + idx,))
+        features = torch.cat(feature_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)
+        resolved_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
+        if label_shape is None:
+            label_shape = resolved_shape
+        return (features, labels, keys, label_shape)
+
     if isinstance(data, Sequence) and not isinstance(data, (bytes, str)) and len(data) > 0:
         if all(isinstance(item, TensorDictBase) for item in data):
-            stacked = TensorDict.stack(list(data), dim=0)
-            return preprocess(stacked)
+            return _flatten_sequence(list(data))
         if all(isinstance(item, Mapping) for item in data):
-            feature_chunks: List[torch.Tensor] = []
-            label_chunks: List[torch.Tensor] = []
-            keys: List[Tuple] = []
-            label_shape: Tuple[int, ...] | None = None
-            for entry in data:
-                feats, labels, sub_keys, sub_shape = preprocess(entry)
-                feature_chunks.append(feats)
-                label_chunks.append(labels)
-                if label_shape is None:
-                    label_shape = sub_shape
-                elif label_shape != sub_shape:
-                    raise ValueError(
-                        "preprocess: inconsistent label shapes across sequence entries"
-                    )
-                offset = len(keys)
-                if sub_keys:
-                    for idx, key in enumerate(sub_keys):
-                        if isinstance(key, tuple) and len(key) == 1 and isinstance(key[0], int):
-                            keys.append((offset + key[0],))
-                        else:
-                            keys.append((offset + idx,) + tuple(key))
-                else:
-                    for idx in range(int(feats.shape[0])):
-                        keys.append((offset + idx,))
-            features = torch.cat(feature_chunks, dim=0)
-            labels = torch.cat(label_chunks, dim=0)
-            resolved_shape = (
-                tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
-            )
-            if label_shape is None:
-                label_shape = resolved_shape
-            return (features, labels, keys, label_shape)
+            return _flatten_sequence(list(data))
     elif isinstance(data, Sequence) and len(data) == 0:
         raise ValueError("preprocess: received an empty sequence")
     if isinstance(data, TensorDictBase):

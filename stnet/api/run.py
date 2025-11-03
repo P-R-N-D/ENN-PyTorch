@@ -7,7 +7,7 @@ import shutil
 import warnings
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -200,16 +200,26 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
-    if any((v is None for v in data.values())):
+    def _materialize_missing(batch: Mapping[str, Any]) -> Mapping[str, Any]:
+        if not any(value is None for value in batch.values()):
+            return batch
         dummy_shape = tuple(model.out_shape)
-        data = {
-            k: (
+        return {
+            key: (
                 torch.zeros(dummy_shape)
-                if v is None
-                else torch.as_tensor(v).view(*dummy_shape)
+                if value is None
+                else torch.as_tensor(value).view(*dummy_shape)
             )
-            for k, v in data.items()
+            for key, value in batch.items()
         }
+
+    if isinstance(data, Mapping):
+        data = _materialize_missing(data)
+    elif isinstance(data, Sequence) and not isinstance(data, (bytes, str)):
+        data = [
+            _materialize_missing(item) if isinstance(item, Mapping) else item
+            for item in data
+        ]
     feats, labels, keys, label_shape = preprocess(data)
     SampleReader.materialize(
         {"features": feats, "labels": labels},
