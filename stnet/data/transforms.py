@@ -13,7 +13,8 @@ from tensordict import TensorDict, TensorDictBase
 from .datatype import to_torch_tensor
 
 
-BatchLike = Union[Mapping[str, Any], TensorDictBase]
+BatchItem = Union[Mapping[Any, Any], TensorDictBase]
+BatchLike = Union[BatchItem, Sequence[BatchItem]]
 
 
 def _infer_batch_size(d: Mapping[str, Any]) -> list[int] | list:
@@ -31,6 +32,18 @@ def batch_to_tensordict(
 ) -> TensorDict:
     """Convert a plain mapping or TensorDict into a :class:`TensorDict` instance."""
 
+    if isinstance(batch, Sequence) and not isinstance(batch, (bytes, str)):
+        items: List[TensorDictBase] = []
+        for element in batch:
+            if isinstance(element, TensorDictBase):
+                items.append(element.to(device) if device is not None else element)
+            elif isinstance(element, Mapping):
+                items.append(batch_to_tensordict(element, device=device))
+            else:
+                raise TypeError(f"Unexpected batch sequence element type: {type(element)}")
+        if not items:
+            raise ValueError("Cannot create TensorDict from an empty sequence")
+        return TensorDict.stack(items, dim=0)
     if isinstance(batch, TensorDictBase):
         return batch.to(device) if device is not None else batch
     if not isinstance(batch, Mapping):
@@ -52,9 +65,14 @@ def tensordict_to_dict(
     detach: bool = True,
     cpu: bool = True,
     keys: Optional[Iterable[str]] = None,
-) -> Dict[str, Any]:
+) -> Union[Dict[str, Any], List[Dict[str, Any]]]:
     """Return a ``dict`` from a :class:`TensorDict` optionally detaching tensors."""
 
+    if isinstance(td_or_dict, Sequence) and not isinstance(td_or_dict, (bytes, str)):
+        return [
+            tensordict_to_dict(item, detach=detach, cpu=cpu, keys=keys)
+            for item in td_or_dict
+        ]
     if isinstance(td_or_dict, TensorDictBase):
         td = td_or_dict
         items = ((key, td.get(key)) for key in (keys or td.keys()))
@@ -512,8 +530,56 @@ def _preprocess_label_tensor(value: Any) -> torch.Tensor:
 
 
 def preprocess(
-    data: Union[Dict[Tuple, torch.Tensor], TensorDictBase]
+    data: BatchLike,
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
+    """Normalize user-provided samples into tensor batches.
+
+    The input may be a single mapping/TensorDict or a sequence of such
+    elements, allowing :func:`preprocess` to ingest outputs produced by
+    multi-node datasets that collate into ``List[dict]`` or
+    ``List[TensorDict]`` structures.
+    """
+    def _flatten_sequence(
+        entries: Sequence[BatchLike],
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
+        feature_chunks: List[torch.Tensor] = []
+        label_chunks: List[torch.Tensor] = []
+        keys: List[Tuple] = []
+        label_shape: Tuple[int, ...] | None = None
+        for entry in entries:
+            feats, labels, sub_keys, sub_shape = preprocess(entry)
+            feature_chunks.append(feats)
+            label_chunks.append(labels)
+            if label_shape is None:
+                label_shape = sub_shape
+            elif label_shape != sub_shape:
+                raise ValueError(
+                    "preprocess: inconsistent label shapes across sequence entries"
+                )
+            offset = len(keys)
+            if sub_keys:
+                for idx, key in enumerate(sub_keys):
+                    if isinstance(key, tuple) and len(key) == 1 and isinstance(key[0], int):
+                        keys.append((offset + key[0],))
+                    else:
+                        keys.append((offset + idx,) + tuple(key))
+            else:
+                for idx in range(int(feats.shape[0])):
+                    keys.append((offset + idx,))
+        features = torch.cat(feature_chunks, dim=0)
+        labels = torch.cat(label_chunks, dim=0)
+        resolved_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
+        if label_shape is None:
+            label_shape = resolved_shape
+        return (features, labels, keys, label_shape)
+
+    if isinstance(data, Sequence) and not isinstance(data, (bytes, str)) and len(data) > 0:
+        if all(isinstance(item, TensorDictBase) for item in data):
+            return _flatten_sequence(list(data))
+        if all(isinstance(item, Mapping) for item in data):
+            return _flatten_sequence(list(data))
+    elif isinstance(data, Sequence) and len(data) == 0:
+        raise ValueError("preprocess: received an empty sequence")
     if isinstance(data, TensorDictBase):
         if "features" not in data.keys():
             raise ValueError("preprocess(TensorDict): missing 'features'")

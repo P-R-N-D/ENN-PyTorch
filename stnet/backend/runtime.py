@@ -9,7 +9,7 @@ import sys
 import time
 import warnings
 from dataclasses import replace
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed
@@ -48,7 +48,7 @@ from ..functional.losses import (
 )
 from ..functional.optimizers import AdamW
 from ..data.pipeline import fetch
-from ..data.transforms import batch_to_tensordict, postprocess, preprocess
+from ..data.transforms import BatchLike, batch_to_tensordict, postprocess, preprocess
 from ..data.datatype import to_torch_tensor
 from ..data.nodes import SampleReader
 from ..data.stats import Metadata
@@ -109,7 +109,12 @@ def _infer_num_batches(loader: Any) -> int:
 
 
 def make_global_bar(
-    *args: Any, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device, **kwargs: Any
+    *args: Any,
+    total_epochs: int,
+    train_loader: Iterable[BatchLike] | None,
+    val_loader: Iterable[BatchLike] | None,
+    device: torch.device,
+    **kwargs: Any,
 ) -> Tuple[Optional[tqdm], int]:
 
     try:
@@ -547,8 +552,8 @@ def epochs(
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
     grad_accum_steps: int,
-    train_loader: Any,
-    val_loader: Any,
+    train_loader: Iterable[BatchLike],
+    val_loader: Optional[Iterable[BatchLike]],
     total_epochs: int,
     local_rank: int = 0,
     **kwaargs: Any,
@@ -991,7 +996,7 @@ def epochs(
 
 def infer(
     model: torch.nn.Module,
-    data_loader: Any,
+    data_loader: Iterable[BatchLike],
     *args: Any,
     device: torch.device,
     ops: RuntimeConfig,
