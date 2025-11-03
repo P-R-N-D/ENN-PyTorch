@@ -556,7 +556,7 @@ def epochs(
     val_loader: Optional[Iterable[BatchLike]],
     total_epochs: int,
     local_rank: int = 0,
-    **kwaargs: Any,
+    **kwargs: Any,
 ) -> None:
 
     if train_loader is None:
