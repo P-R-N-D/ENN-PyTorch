@@ -24,7 +24,7 @@ except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..data.nodes import SampleReader
-from ..data.transforms import preprocess
+from ..data.transforms import BatchLike, preprocess
 from ..model import Root
 from .config import (
     ModelConfig,
@@ -40,7 +40,7 @@ from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 def train(
     model: Root,
-    data: Dict[Tuple, torch.Tensor],
+    data: BatchLike,
     *args: Any,
     epochs: int = 5,
     batch_size: int = 128,
@@ -63,6 +63,12 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Root:
+    """Train ``model`` using in-memory samples.
+
+    ``data`` may be a mapping, a :class:`TensorDict`, or a sequence of those
+    structures (e.g., ``List[dict]``) to accommodate multi-node sampling
+    workflows.
+    """
 
     System.initialize_python_path()
     feats, labels, _, label_shape = preprocess(data)
@@ -162,7 +168,7 @@ def train(
 
 def predict(
     model: Root,
-    data: Dict[Tuple, torch.Tensor],
+    data: BatchLike,
     *args: Any,
     batch_size: int = 512,
     seed: int = 7,
@@ -172,6 +178,7 @@ def predict(
     rdzv_backend: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
+    """Run batched inference and return predictions keyed by sample index."""
 
     System.initialize_python_path()
     System.set_multiprocessing_env()
