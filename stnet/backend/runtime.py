@@ -14,7 +14,8 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import torch
 import torch.distributed
 import torch.nn as nn
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
+from torchrl.collectors import MultiSyncDataCollector
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -49,8 +50,9 @@ from ..functional.optimizers import AdamW
 from ..data.pipeline import fetch
 from ..data.transforms import batch_to_tensordict, postprocess, preprocess
 from ..data.datatype import to_torch_tensor
+from ..data.nodes import SampleReader
 from ..data.stats import Metadata
-from .environment import System
+from .environment import System, TorchEnvironment
 from ..functional.fx import AutoCast, Gradient, Fusion
 from .profiler import FlopCounter
 from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
@@ -555,6 +557,92 @@ def epochs(
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
 
+    # --- NEW: TorchRL MultiSyncDataCollector로 배치 수집 ---------------------------------
+    try:
+        cpu = os.cpu_count() or 1
+    except Exception:
+        cpu = 1
+    cfg_dict = getattr(ops, "cfg_dict", None)
+    worker_hint = (
+        cfg_dict.get("collector_workers", cpu // 2 or 1)
+        if isinstance(cfg_dict, dict)
+        else cpu // 2 or 1
+    )
+    num_workers = max(1, min(int(worker_hint) if worker_hint else 1, cpu))
+    per_env_bs = max(1, int(math.ceil(int(ops.batch_size or 64) / num_workers)))
+    frames_per_batch = per_env_bs * num_workers
+
+    _train_idx = len(SampleReader(ops.memmap_dir, split="train")._indices())
+    _val_idx = (
+        len(SampleReader(ops.memmap_dir, split="val")._indices())
+        if float(ops.val_frac) > 0.0
+        else 0
+    )
+    _train_steps = max(1, int(math.ceil(_train_idx / frames_per_batch)))
+    _val_steps = int(math.ceil(_val_idx / frames_per_batch)) if _val_idx > 0 else 0
+
+    def _make_env(split: str) -> TorchEnvironment:
+        return TorchEnvironment(
+            memmap_dir=ops.memmap_dir,
+            in_dim=int(ops.in_dim),
+            label_shape=tuple(ops.out_shape),
+            split=split,
+            batch_size=per_env_bs,
+            device=device,
+        )
+
+    def _no_op_policy(td: TensorDict) -> TensorDict:
+        B = td.get("observation").shape[0]
+        td.set("action", torch.zeros(B, 1, device=device, dtype=torch.float32))
+        return td
+
+    train_collector = MultiSyncDataCollector(
+        create_env_fn=[lambda: _make_env("train") for _ in range(num_workers)],
+        policy=_no_op_policy,
+        frames_per_batch=frames_per_batch,
+        total_frames=-1,
+        max_frames_per_traj=1,
+        reset_at_each_iter=False,
+        device="cpu",
+        storing_device=device,
+        cat_results="stack",
+        update_at_each_batch=True,
+    )
+    val_collector = None
+    if _val_steps > 0:
+        val_collector = MultiSyncDataCollector(
+            create_env_fn=[lambda: _make_env("val") for _ in range(num_workers)],
+            policy=_no_op_policy,
+            frames_per_batch=frames_per_batch,
+            total_frames=-1,
+            max_frames_per_traj=1,
+            reset_at_each_iter=False,
+            device="cpu",
+            storing_device=device,
+            cat_results="stack",
+            update_at_each_batch=False,
+        )
+
+    class _TDLoader:
+        def __init__(self, collector, max_steps: int) -> None:
+            self.collector = collector
+            self.max_steps = int(max_steps)
+
+        def __len__(self) -> int:
+            return self.max_steps
+
+        def __iter__(self):
+            i = 0
+            for td in self.collector:
+                yield {"X": td.get("observation"), "Y": td.get("label")}
+                i += 1
+                if i >= self.max_steps:
+                    break
+
+    train_loader = _TDLoader(train_collector, _train_steps)
+    val_loader = _TDLoader(val_collector, _val_steps) if val_collector is not None else None
+    # -------------------------------------------------------------------------------
+
     in_dim = int(ops.in_dim)
     use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
         torch, "Event"
@@ -887,6 +975,12 @@ def epochs(
             prev_io_time += float(io_time.item())
             prev_flops += float(flops.item())
             prev_io_bytes += float(io_bytes.item())
+
+    with contextlib.suppress(Exception):
+        if "train_collector" in locals() and train_collector is not None:
+            train_collector.shutdown()
+        if "val_collector" in locals() and val_collector is not None:
+            val_collector.shutdown()
 
     if status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
