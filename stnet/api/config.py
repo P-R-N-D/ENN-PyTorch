@@ -132,6 +132,7 @@ class ModelConfig:
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
+    activation_checkpoint: bool = False
 
 
 def coerce_patch_config(
@@ -300,6 +301,12 @@ def coerce_model_config(
         else:
             normalized_compile_mode = normalized_compile_mode.lower()
     args["compile_mode"] = normalized_compile_mode
+    args["activation_checkpoint"] = ensure_bool(
+        filtered.get(
+            "activation_checkpoint", getattr(defaults, "activation_checkpoint")
+        ),
+        name="activation_checkpoint",
+    )
 
     return ModelConfig(**args)
 
