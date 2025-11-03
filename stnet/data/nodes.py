@@ -441,6 +441,7 @@ if _HAS_TORCH_GDS and torch.cuda.is_available():
             for s in self._to_deregister:
                 with suppress(Exception):
                     _torch_gds.gds_deregister_buffer(s)
+            self._to_deregister.clear()
 
         def __len__(self) -> int:
             if self._end <= self._start:
