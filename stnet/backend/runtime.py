@@ -46,7 +46,7 @@ from ..functional.losses import (
     TiledLoss,
 )
 from ..functional.optimizers import AdamW
-from ..data.pipeline import launch
+from ..data.pipeline import fetch
 from ..data.transforms import batch_to_tensordict, postprocess, preprocess
 from ..data.datatype import to_torch_tensor
 from ..data.stats import Metadata
@@ -1559,7 +1559,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         keep: Any = None
         status_bar: Optional[tqdm] = None
         try:
-            train_loader, val_loader, keep = launch(
+            train_loader, val_loader, keep = fetch(
                 memmap_dir=ops.memmap_dir,
                 device=device,
                 batch_size=int(ops.batch_size or 128),
@@ -1731,7 +1731,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         model.eval()
 
-        data_loader, _, keep = launch(
+        data_loader, _, keep = fetch(
             memmap_dir=ops.memmap_dir or "",
             device=device,
             batch_size=int(ops.batch_size or 512),

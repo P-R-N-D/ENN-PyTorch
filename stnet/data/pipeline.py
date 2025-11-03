@@ -658,7 +658,7 @@ def collate(
     return sample
 
 
-def launch(
+def fetch(
     memmap_dir: str,
     device: Union[str, torch.device],
     batch_size: int,
