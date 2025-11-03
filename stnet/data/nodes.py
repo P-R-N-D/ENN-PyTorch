@@ -409,39 +409,42 @@ if _HAS_TORCH_GDS and torch.cuda.is_available():
             self._to_deregister: list[torch.UntypedStorage] = []
 
         def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-            if self._feat_fh is None:
-                self._feat_fh = _torch_gds.GdsFile(self._feat_path, os.O_RDONLY)
-                self._lab_fh = _torch_gds.GdsFile(self._lab_path, os.O_RDONLY)
-            index = int(self._start)
-            end = int(self._end)
-            while index < end:
-                nxt = min(index + self._batch, end)
-                rows = nxt - index
-                # allocate target buffers
-                xb = torch.empty((rows, self._feat_stride), dtype=self._feat_dtype, device=self._device)
-                yb = torch.empty((rows, self._lab_stride), dtype=self._lab_dtype, device=self._device)
-                # (optional) register buffers with GDS for repeated IO
-                try:
-                    _torch_gds.gds_register_buffer(xb.untyped_storage())
-                    _torch_gds.gds_register_buffer(yb.untyped_storage())
-                    self._to_deregister.extend([xb.untyped_storage(), yb.untyped_storage()])
-                except Exception:
-                    pass
-                # byte offsets
-                feat_off = index * self._feat_stride * self._feat_esize
-                lab_off = index * self._lab_stride * self._lab_esize
-                # synchronous cuFileRead
-                self._feat_fh.load_storage(xb.untyped_storage(), offset=feat_off)
-                self._lab_fh.load_storage(yb.untyped_storage(), offset=lab_off)
-                if self._label_shape:
-                    yb = yb.view(rows, *self._label_shape)
-                yield {"X": xb, "Y": yb}
-                index = nxt
-            # deregister any registered buffers
-            for s in self._to_deregister:
-                with suppress(Exception):
-                    _torch_gds.gds_deregister_buffer(s)
-            self._to_deregister.clear()
+            to_deregister = self._to_deregister
+            try:
+                if self._feat_fh is None:
+                    self._feat_fh = _torch_gds.GdsFile(self._feat_path, os.O_RDONLY)
+                    self._lab_fh = _torch_gds.GdsFile(self._lab_path, os.O_RDONLY)
+                index = int(self._start)
+                end = int(self._end)
+                while index < end:
+                    nxt = min(index + self._batch, end)
+                    rows = nxt - index
+                    # allocate target buffers
+                    xb = torch.empty((rows, self._feat_stride), dtype=self._feat_dtype, device=self._device)
+                    yb = torch.empty((rows, self._lab_stride), dtype=self._lab_dtype, device=self._device)
+                    # (optional) register buffers with GDS for repeated IO
+                    try:
+                        _torch_gds.gds_register_buffer(xb.untyped_storage())
+                        _torch_gds.gds_register_buffer(yb.untyped_storage())
+                        to_deregister.extend([xb.untyped_storage(), yb.untyped_storage()])
+                    except Exception:
+                        pass
+                    # byte offsets
+                    feat_off = index * self._feat_stride * self._feat_esize
+                    lab_off = index * self._lab_stride * self._lab_esize
+                    # synchronous cuFileRead
+                    self._feat_fh.load_storage(xb.untyped_storage(), offset=feat_off)
+                    self._lab_fh.load_storage(yb.untyped_storage(), offset=lab_off)
+                    if self._label_shape:
+                        yb = yb.view(rows, *self._label_shape)
+                    yield {"X": xb, "Y": yb}
+                    index = nxt
+            finally:
+                # deregister any registered buffers and release references
+                for storage in to_deregister:
+                    with suppress(Exception):
+                        _torch_gds.gds_deregister_buffer(storage)
+                to_deregister.clear()
 
         def __len__(self) -> int:
             if self._end <= self._start:
