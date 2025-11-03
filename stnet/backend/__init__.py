@@ -18,8 +18,9 @@ from ..functional.losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
+    TensorDictLoss,
 )
-from ..functional.optimizers import AdamW
+from ..functional.optimizers import AdamW, TensorDictOptimizer
 from .distributed import (
     Distributed,
     Join,
@@ -70,6 +71,7 @@ from .environment import (
 
 __all__ = [
     "AdamW",
+    "TensorDictOptimizer",
     "DataFidelityLoss",
     "Distributed",
     "Join",
@@ -82,6 +84,7 @@ __all__ = [
     "RuntimeConfig",
     "StandardNormalLoss",
     "StudentsTLoss",
+    "TensorDictLoss",
     "System",
     "TiledLoss",
     "broadcast_model_states",

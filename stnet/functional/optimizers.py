@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import torch
 from torch import nn, optim
+from tensordict import TensorDictBase
 
-from ..data.stats import MetaData
+from ..data.stats import Metadata
 from ..backend.environment import (
     get_device,
     is_float8_supported,
@@ -26,7 +28,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -119,7 +121,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -212,3 +214,27 @@ class AdamW:
         if logger:
             logger(f"[OPT] Using AdamW (flags={flags})")
         return opt
+
+
+class TensorDictOptimizer:
+    """Synchronize optimizer state with a :class:`TensorDict` container."""
+
+    def __init__(self, optim: optim.Optimizer, key_prefix: str = "optim") -> None:
+        self.optim = optim
+        self.key_prefix = key_prefix
+
+    def step(self, *args: Any, **kwargs: Any):
+        return self.optim.step(*args, **kwargs)
+
+    def zero_grad(self, *args: Any, **kwargs: Any):
+        return self.optim.zero_grad(*args, **kwargs)
+
+    def state_to_td(self, td: TensorDictBase, name: str = "main") -> TensorDictBase:
+        td.set_non_tensor((self.key_prefix, name, "state_dict"), deepcopy(self.optim.state_dict()))
+        return td
+
+    def load_state_from_td(self, td: TensorDictBase, name: str = "main") -> "TensorDictOptimizer":
+        state = td.get_non_tensor((self.key_prefix, name, "state_dict"))
+        if state is not None:
+            self.optim.load_state_dict(state)
+        return self

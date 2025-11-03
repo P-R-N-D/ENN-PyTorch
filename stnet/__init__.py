@@ -3,6 +3,20 @@ from __future__ import annotations
 
 from typing import Any
 
+from tensordict import set_list_to_stack
+
+set_list_to_stack(True).set()  # 리스트를 배치 차원으로 자동 스택
+
+# 동적 shape 구간은 자동으로 CUDA Graphs 캡처 스킵
+# (PyTorch inductor 설정: dynamic graph는 그래프 캡처에서 생략)
+try:
+    import torch
+    import torch._inductor.config as _inductor_cfg
+
+    _inductor_cfg.triton.cudagraph_skip_dynamic_graphs = True
+except Exception:
+    pass
+
 from .api.config import (
     BuildConfig,
     ModelConfig,
@@ -55,6 +69,7 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
+    "TensorDictLoss",
 ]
 
 
@@ -80,6 +95,7 @@ def __getattr__(name: str) -> Any:
         "StandardNormalLoss",
         "StudentsTLoss",
         "DataFidelityLoss",
+        "TensorDictLoss",
     }:
         from . import model as model_ns
 
@@ -104,6 +120,7 @@ def __getattr__(name: str) -> Any:
             "StandardNormalLoss": model_ns.StandardNormalLoss,
             "StudentsTLoss": model_ns.StudentsTLoss,
             "DataFidelityLoss": model_ns.DataFidelityLoss,
+            "TensorDictLoss": model_ns.TensorDictLoss,
         }
         return mapping[name]
     if name in {"train", "predict", "new_model", "load_model", "save_model", "joining"}:
