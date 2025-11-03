@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import torch
 import torch.distributed
 import torch.nn as nn
+from tensordict import TensorDictBase
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -46,9 +47,9 @@ from ..functional.losses import (
 )
 from ..functional.optimizers import AdamW
 from ..data.pipeline import dataloader
-from ..data.transforms import postprocess, preprocess
+from ..data.transforms import batch_to_tensordict, postprocess, preprocess
 from ..data.datatype import to_torch_tensor
-from ..data.stats import MetaData
+from ..data.stats import Metadata
 from .environment import System
 from ..functional.fx import AutoCast, Gradient, Fusion
 from .profiler import FlopCounter
@@ -661,13 +662,23 @@ def epochs(
                                 Y_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
-                                y_hat, loss_val = model(
-                                    X,
-                                    labels_flat=Y_flat,
+                                td = batch_to_tensordict(
+                                    {"features": X, "labels_flat": Y_flat}
+                                )
+                                model_out = model(
+                                    td,
                                     global_loss=top_loss,
                                     local_loss=bottom_loss,
                                     loss_weights=loss_controller.weights(),
                                 )
+                                if isinstance(model_out, TensorDictBase):
+                                    td = model_out
+                                    y_hat = td.get("pred")
+                                    loss_val = td.get("loss_total", None)
+                                    if isinstance(loss_val, torch.Tensor) and loss_val.ndim > 0:
+                                        loss_val = loss_val.mean()
+                                else:
+                                    y_hat, loss_val = model_out
 
                             accum_scale = max(1, grad_accum_steps)
                             loss_for_backprop = loss_val / float(accum_scale)
@@ -792,13 +803,23 @@ def epochs(
                                 Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
-                                _y, _loss_val = model(
-                                    X,
-                                    labels_flat=Yv_flat,
+                                tdv = batch_to_tensordict(
+                                    {"features": X, "labels_flat": Yv_flat}
+                                )
+                                model_out_val = model(
+                                    tdv,
                                     global_loss=top_loss,
                                     local_loss=bottom_loss,
                                     loss_weights=loss_controller.weights(),
                                 )
+                                if isinstance(model_out_val, TensorDictBase):
+                                    tdv = model_out_val
+                                    _y = tdv.get("pred")
+                                    _loss_val = tdv.get("loss_total", None)
+                                    if isinstance(_loss_val, torch.Tensor) and _loss_val.ndim > 0:
+                                        _loss_val = _loss_val.mean()
+                                else:
+                                    _y, _loss_val = model_out_val
 
                             if use_timer:
                                 ev_e.record()
@@ -960,13 +981,18 @@ def infer(
                             )
                             if callable(mark_step):
                                 mark_step()
-                        y_hat, _ = run_model(
-                            X,
-                            labels_flat=None,
+                        tdp = batch_to_tensordict({"features": X})
+                        pred_out = run_model(
+                            tdp,
                             global_loss=None,
                             local_loss=None,
                             loss_weights=None,
                         )
+                        if isinstance(pred_out, TensorDictBase):
+                            tdp = pred_out
+                            y_hat = tdp.get("pred")
+                        else:
+                            y_hat, _ = pred_out
                 y_hat_cpu = y_hat.detach().cpu().contiguous()
                 if streaming and rank == 0:
                     chunk_path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
@@ -1120,7 +1146,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
-        metadata = MetaData.for_device(device)
+        metadata = Metadata.for_device(device)
         meta_info = _meta(ops.memmap_dir or "")
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
@@ -1673,7 +1699,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
-        metadata = MetaData.for_device(device)
+        metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_te_module(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _materialize_all_layernorms_(_m_eval, device)

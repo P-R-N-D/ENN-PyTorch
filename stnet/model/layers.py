@@ -23,6 +23,7 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tensordict import TensorDictBase
 
 from ..api import is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
@@ -1572,7 +1573,7 @@ class Root(nn.Module):
 
     def forward(
         self,
-        features: torch.Tensor,
+        features: torch.Tensor | TensorDictBase,
         *args: Any,
         labels_flat: Optional[torch.Tensor] = None,
         net_loss: Optional[nn.Module] = None,
@@ -1582,7 +1583,29 @@ class Root(nn.Module):
             Union[Tuple[float, float], LossWeightPolicy]
         ] = None,
         **kwargs: Any,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
+        td_input: TensorDictBase | None = None
+        if isinstance(features, TensorDictBase):
+            td_input = features
+            td_labels = td_input.get("labels_flat", None)
+            td_features = td_input.get("features")
+            if td_features is None:
+                raise KeyError("TensorDict input requires a 'features' key")
+            features = td_features
+            if labels_flat is None and td_labels is not None:
+                labels_flat = td_labels
+            td_net_loss = td_input.get("net_loss", None)
+            td_global_loss = td_input.get("global_loss", None)
+            td_local_loss = td_input.get("local_loss", None)
+            if net_loss is None and td_net_loss is not None:
+                net_loss = td_net_loss
+            if global_loss is None and td_global_loss is not None:
+                global_loss = td_global_loss
+            if local_loss is None and td_local_loss is not None:
+                local_loss = td_local_loss
+            td_loss_weights = td_input.get("loss_weights", None)
+            if loss_weights is None and td_loss_weights is not None:
+                loss_weights = td_loss_weights
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
@@ -1751,7 +1774,24 @@ class Root(nn.Module):
                     device=y_hat_out.device, dtype=y_hat_out.dtype
                 )
                 loss_val = net_loss(y_hat_out, tgt)
-        return (y_hat_out.reshape(b, *self.out_shape), loss_val)
+        pred = y_hat_out.reshape(b, *self.out_shape)
+        if td_input is not None:
+            out_td = td_input.clone()
+            out_td.set("pred", pred)
+            out_td.set("refined_tokens", refined_tokens)
+            out_td.set("residual_context", residual_context)
+            if loss_val is not None:
+                loss_td = loss_val
+                if isinstance(loss_td, torch.Tensor) and loss_td.ndim == 0:
+                    batch_size = tuple(out_td.batch_size)
+                    if len(batch_size):
+                        loss_td = loss_td.expand(batch_size)
+                out_td.set("loss_total", loss_td)
+            else:
+                with contextlib.suppress(KeyError):
+                    out_td.del_("loss_total")
+            return out_td
+        return (pred, loss_val)
 
     @staticmethod
     def flatten_labels(

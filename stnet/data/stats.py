@@ -10,6 +10,7 @@ import math
 
 import numpy as np
 import torch
+from tensordict import tensorclass
 
 from ..backend.environment import (
     cuda_compute_capability,
@@ -22,7 +23,7 @@ TExtra = TypeVar("TExtra")
 
 
 @dataclass
-class MetaData(Generic[TExtra]):
+class Metadata(Generic[TExtra]):
 
     device: torch.device
     device_type: str = field(init=False, default="cpu")
@@ -137,7 +138,7 @@ class MetaData(Generic[TExtra]):
         scale_is_integral: Optional[bool] = None,
         extra: Optional[Mapping[str, TExtra]] = None,
         **kwargs: Any,
-    ) -> "MetaData[TExtra]":
+    ) -> "Metadata[TExtra]":
         dev = torch.device(device)
         meta = cls(
             device=dev,
@@ -241,6 +242,24 @@ class MetaData(Generic[TExtra]):
         return value.detach().clone() if isinstance(value, torch.Tensor) else None
 
 
+@tensorclass(shadow=True)
+class TensorDictMetadata:
+    """TensorDict-based container for runtime metadata."""
+
+    use_amp: bool = False
+    amp_dtype: Optional[Any] = None
+    device: Optional[Any] = None
+
+    def autocast(self):
+        if self.use_amp and isinstance(self.amp_dtype, torch.dtype):
+            if isinstance(self.device, torch.device):
+                dev_type = self.device.type
+            else:
+                dev_type = "cuda" if torch.cuda.is_available() else "cpu"
+            return torch.autocast(device_type=dev_type, dtype=self.amp_dtype)
+        return contextlib.nullcontext()
+
+
 def compute_y_range(
     loader: Iterable[Any],
     q_low: float = 0.005,
@@ -274,7 +293,7 @@ def recompute_y_stats(
     model: torch.nn.Module,
     loader: Iterable[Any],
     *args: Any,
-    metadata: MetaData[Any] | None = None,
+    metadata: Metadata[Any] | None = None,
     **kwargs: Any,
 ) -> None:
 
@@ -391,7 +410,7 @@ def inverse_y_from_stats(
     model: torch.nn.Module,
     y_flat: torch.Tensor,
     *args: Any,
-    metadata: MetaData[Any] | None = None,
+    metadata: Metadata[Any] | None = None,
     **kwargs: Any,
 ) -> torch.Tensor:
 

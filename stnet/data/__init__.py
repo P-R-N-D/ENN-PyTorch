@@ -6,13 +6,15 @@ import sys as _sys
 from . import datatype as datatype_module
 from .pipeline import DataLoader, dataloader, fetch
 from .nodes import BatchSampler, SampleReader
-from .stats import MetaData
+from .stats import Metadata, TensorDictMetadata
 from .transforms import (
     IncrementalPCA,
     StandardScaler,
     VarianceThreshold,
+    batch_to_tensordict,
     postprocess,
     preprocess,
+    tensordict_to_dict,
 )
 from .datatype import convert, to_torch_tensor
 
@@ -22,12 +24,15 @@ __all__ = [
     "SampleReader",
     "dataloader",
     "fetch",
-    "MetaData",
+    "Metadata",
+    "TensorDictMetadata",
     "VarianceThreshold",
     "StandardScaler",
     "IncrementalPCA",
+    "batch_to_tensordict",
     "preprocess",
     "postprocess",
+    "tensordict_to_dict",
     "convert",
     "to_torch_tensor",
     "datatype",

@@ -3,13 +3,82 @@ from __future__ import annotations
 
 import math
 from contextlib import suppress
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from tensordict import TensorDict, TensorDictBase
 
 from .datatype import to_torch_tensor
+
+
+BatchLike = Union[Mapping[str, Any], TensorDictBase]
+
+
+def _infer_batch_size(d: Mapping[str, Any]) -> list[int] | list:
+    for value in d.values():
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return [value.shape[0]]
+    return []
+
+
+def batch_to_tensordict(
+    batch: BatchLike,
+    *,
+    device: Optional[torch.device] = None,
+    batch_size: Optional[Iterable[int]] = None,
+) -> TensorDict:
+    """Convert a plain mapping or TensorDict into a :class:`TensorDict` instance."""
+
+    if isinstance(batch, TensorDictBase):
+        return batch.to(device) if device is not None else batch
+    if not isinstance(batch, Mapping):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    resolved_batch = list(batch_size) if batch_size is not None else _infer_batch_size(batch)
+    td = TensorDict({}, batch_size=resolved_batch, device=device)
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            td.set(key, value.to(device) if device is not None else value)
+        else:
+            td.set_non_tensor(key, value)
+    return td
+
+
+@torch.no_grad()
+def tensordict_to_dict(
+    td_or_dict: Union[TensorDictBase, Mapping[str, Any]],
+    *,
+    detach: bool = True,
+    cpu: bool = True,
+    keys: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Return a ``dict`` from a :class:`TensorDict` optionally detaching tensors."""
+
+    if isinstance(td_or_dict, TensorDictBase):
+        td = td_or_dict
+        items = ((key, td.get(key)) for key in (keys or td.keys()))
+        out: Dict[str, Any] = {}
+        for key, value in items:
+            if torch.is_tensor(value):
+                tensor = value.detach() if detach else value
+                if cpu and tensor.is_cuda:
+                    tensor = tensor.cpu()
+                out[key] = tensor
+            elif isinstance(value, TensorDictBase):
+                out[key] = tensordict_to_dict(value, detach=detach, cpu=cpu)
+            else:
+                out[key] = value
+        return out
+    out: Dict[str, Any] = {}
+    for key, value in td_or_dict.items():
+        if torch.is_tensor(value):
+            tensor = value.detach() if detach else value
+            tensor = tensor.cpu() if cpu and tensor.is_cuda else tensor
+            out[key] = tensor
+        else:
+            out[key] = value
+    return out
 
 class _ScalerBase:
     def __init__(
@@ -443,8 +512,25 @@ def _preprocess_label_tensor(value: Any) -> torch.Tensor:
 
 
 def preprocess(
-    data: Dict[Tuple, torch.Tensor]
+    data: Union[Dict[Tuple, torch.Tensor], TensorDictBase]
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
+    if isinstance(data, TensorDictBase):
+        if "features" not in data.keys():
+            raise ValueError("preprocess(TensorDict): missing 'features'")
+        feats = torch.as_tensor(data.get("features"))
+        if feats.ndim == 1:
+            feats = feats.unsqueeze(0)
+        if "labels" in data.keys():
+            labels = torch.as_tensor(data.get("labels"))
+        elif "labels_flat" in data.keys():
+            labels = torch.as_tensor(data.get("labels_flat"))
+        else:
+            raise ValueError("preprocess(TensorDict): missing 'labels' or 'labels_flat'")
+        if labels.ndim == 1:
+            labels = labels.unsqueeze(0)
+        label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
+        keys = [(int(i),) for i in range(int(feats.shape[0]))]
+        return (feats, labels, keys, label_shape)
     if isinstance(data, dict) and "X" in data and ("Y" in data):
         x, y = (data["X"], data["Y"])
         batch_result = _preprocess_maybe_batch(x, y)

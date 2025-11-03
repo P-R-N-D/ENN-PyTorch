@@ -12,7 +12,7 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..data.stats import MetaData
+from ..data.stats import Metadata
 from ..model.kernels import DotProductAttention
 from ..backend.environment import (
     get_device,
@@ -172,7 +172,7 @@ class Gradient:
 
 def _supports_scale(
     dtype: torch.dtype,
-    meta: Optional[MetaData[Any]],
+    meta: Optional[Metadata[Any]],
     *args: Any,
     safety_margin: float = 8.0,
     **kwargs: Any,
@@ -216,7 +216,7 @@ class AutoCast:
     _int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _metadata: Optional[MetaData[Any]] = None
+    _metadata: Optional[Metadata[Any]] = None
 
     @classmethod
     def _resolve_fp8_backend(
@@ -330,9 +330,9 @@ class AutoCast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
-    ) -> MetaData[Any]:
+    ) -> Metadata[Any]:
         meta = metadata or cls._metadata
         device_hint: Optional[Union[torch.device, str]] = device
         if device_hint is None and meta is not None:
@@ -340,7 +340,7 @@ class AutoCast:
                 device_hint = torch.device(meta.device)
         dev = cls._resolve_device(device_hint)
         if meta is None:
-            meta = MetaData.for_device(dev)
+            meta = Metadata.for_device(dev)
         else:
             current_device = torch.device(getattr(meta, "device", dev))
             if current_device != dev:
@@ -383,7 +383,7 @@ class AutoCast:
         meta = AutoCast._metadata
         if meta is not None and getattr(meta, "float8_dtypes", None):
             return tuple(meta.float8_dtypes)
-        values = MetaData._float8_dtypes()
+        values = Metadata._float8_dtypes()
         if meta is not None:
             meta.float8_dtypes = values
         return values
@@ -405,7 +405,7 @@ class AutoCast:
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
-        meta: Optional[MetaData[Any]] = None,
+        meta: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         for dtype in candidates:
@@ -517,7 +517,7 @@ class AutoCast:
         cls: object,
         model: Optional[nn.Module],
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> None:
         backend: Optional[str] = None
@@ -575,7 +575,7 @@ class AutoCast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
@@ -695,7 +695,7 @@ class AutoCast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._resolve_device(device)
@@ -1022,7 +1022,7 @@ class Fusion:
     def _infer_optimal_dtype(
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
@@ -1063,14 +1063,14 @@ class Fusion:
 
     @staticmethod
     def _metadata_for(
-        model: nn.Module, metadata: Optional[MetaData[Any]] = None
-    ) -> MetaData[Any]:
+        model: nn.Module, metadata: Optional[Metadata[Any]] = None
+    ) -> Metadata[Any]:
         AutoCast.configure(model, metadata=metadata)
         meta = AutoCast._metadata
         if meta is None:
             ref = Fusion._module_reference_tensor(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
-            meta = MetaData.for_device(dev)
+            meta = Metadata.for_device(dev)
             AutoCast.configure(model, metadata=meta)
         return meta
 
@@ -1263,7 +1263,7 @@ class Fusion:
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> Tuple[nn.Module, bool, str]:
@@ -1425,7 +1425,7 @@ class Fusion:
     @staticmethod
     def enable_float8_training(
         model: nn.Module,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._metadata_for(model, metadata)
@@ -1468,7 +1468,7 @@ class Fusion:
     @staticmethod
     def enable_float8_prediction(
         model: nn.Module,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._metadata_for(model, metadata)
@@ -1519,7 +1519,7 @@ class Fusion:
     @staticmethod
     def enable_int8_training(
         model: nn.Module,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._metadata_for(model, metadata)
@@ -1544,7 +1544,7 @@ class Fusion:
     @staticmethod
     def enable_int8_prediction(
         model: nn.Module,
-        metadata: Optional[MetaData[Any]] = None,
+        metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._metadata_for(model, metadata)
