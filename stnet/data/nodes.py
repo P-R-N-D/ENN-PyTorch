@@ -23,8 +23,6 @@ from typing import (
 
 import torch
 from tensordict import MemoryMappedTensor
-from torch.utils.dlpack import from_dlpack
-
 try:
     from torchdata.nodes import IterableWrapper
 except Exception:
@@ -35,15 +33,16 @@ try:
 except Exception:
     psutil = None
 
-try:
-    import cupy as cp
-except Exception:
-    cp = None
-
-try:
-    from kvikio import CuFile
-except Exception:
-    CuFile = None
+# --- Replace kvikio+CuPy based GDS loader with PyTorch torch.cuda.gds -----------
+# We prefer the upstream prototype GDS bindings shipped with PyTorch (>=2.7).
+# They provide thin wrappers around cuFile and work directly with Tensor storages.
+# See: https://docs.pytorch.org/docs/stable/cuda.html#gpudirect-storage
+try:  # available only when built with CUDA and GDS is present
+    import torch.cuda.gds as _torch_gds
+    _HAS_TORCH_GDS = True
+except Exception:  # CPU-only build or missing GDS runtime
+    _torch_gds = None
+    _HAS_TORCH_GDS = False
 
 from .datatype import convert
 
@@ -137,16 +136,6 @@ def _device_free_bytes(dev: torch.device) -> int:
     except Exception:
         pass
     return 0
-
-
-def _torch_dtype_to_cupy(dtype: torch.dtype) -> "cp.dtype":
-    if cp is None:
-        raise RuntimeError("cupy is required for dtype conversion")
-    try:
-        np_dtype = torch.empty([], dtype=dtype).numpy().dtype
-        return cp.dtype(np_dtype)
-    except Exception as exc:
-        raise TypeError(f"unable to map torch dtype {dtype!r} to CuPy") from exc
 
 
 class SampleReader:
@@ -371,9 +360,16 @@ class BatchReader:
         return int(math.ceil(span / float(self._batch)))
 
 
-if CuFile is not None and cp is not None:
+if _HAS_TORCH_GDS and torch.cuda.is_available():
 
     class GDSBatchReader:
+        """GDS-backed batch reader implemented with torch.cuda.gds.
+
+        This replaces the previous CuPy+kvikIO based implementation and streams
+        contiguous slices from ``features.bin`` and ``labels.bin`` directly into
+        CUDA tensors via cuFile.
+        """
+
         def __init__(
             self,
             mmts: SampleReader,
@@ -384,85 +380,77 @@ if CuFile is not None and cp is not None:
             device: Optional[Union[str, torch.device]] = None,
             **kwargs: Any,
         ) -> None:
-            if CuFile is None or cp is None:
-                raise RuntimeError("GDSBatchReader requires kvikio and cupy")
+            if not _HAS_TORCH_GDS:
+                raise RuntimeError("torch.cuda.gds is not available in this PyTorch build")
             self._mmts = mmts
             self._start = int(start)
             self._end = int(end)
             self._batch = max(1, int(batch_size))
-            self._device = (
-                torch.device(device)
-                if device is not None and not isinstance(device, torch.device)
-                else device
-            )
-            if self._device is None:
-                index = torch.cuda.current_device() if torch.cuda.is_available() else 0
-                self._device = torch.device("cuda", index)
             meta = self._mmts._load_meta()
-            self._feat_dim = int(meta.get("feature_dim", 0))
-            label_shape = list(meta.get("label_shape", []))
-            self._label_shape = label_shape
-            self._label_flat = (
-                int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-            )
+            feat_dim = int(meta["feature_dim"])
+            label_shape = list(meta["label_shape"])
+            self._label_shape = tuple(label_shape)
+            self._label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
             self._feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
             self._lab_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
-            self._feat_path = os.path.join(
-                self._mmts.dir, meta.get("features_bin_filename", "features.bin")
-            )
-            self._lab_path = os.path.join(
-                self._mmts.dir, meta.get("labels_bin_filename", "labels.bin")
-            )
+            self._feat_path = os.path.join(self._mmts.dir, meta.get("features_bin_filename", "features.bin"))
+            self._lab_path = os.path.join(self._mmts.dir, meta.get("labels_bin_filename", "labels.bin"))
             if not (os.path.exists(self._feat_path) and os.path.exists(self._lab_path)):
-                raise FileNotFoundError(
-                    "GDS binary files (features.bin, labels.bin) are required"
-                )
-            self._feat_cp_dtype = _torch_dtype_to_cupy(self._feat_dtype)
-            self._lab_cp_dtype = _torch_dtype_to_cupy(self._lab_dtype)
-            self._feat_stride = int(self._feat_cp_dtype.itemsize * self._feat_dim)
-            self._lab_stride = int(self._lab_cp_dtype.itemsize * self._label_flat)
+                raise FileNotFoundError("GDS binary files (features.bin, labels.bin) are required")
+            self._feat_stride = feat_dim
+            self._lab_stride = self._label_flat
+            self._device = torch.device(device) if device is not None else torch.device("cuda")
+            # element sizes in bytes
+            self._feat_esize = torch.empty((), dtype=self._feat_dtype).element_size()
+            self._lab_esize = torch.empty((), dtype=self._lab_dtype).element_size()
+            # defer opening until first iteration
+            self._feat_fh: Optional[_torch_gds.GdsFile] = None
+            self._lab_fh: Optional[_torch_gds.GdsFile] = None
+            self._to_deregister: list[torch.UntypedStorage] = []
 
         def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-            dev = torch.device(self._device)
-            index = int(self._start)
-            feat_offset = int(self._start) * self._feat_stride
-            lab_offset = int(self._start) * self._lab_stride
-            idx = dev.index
-            if idx is None:
-                try:
-                    idx = torch.cuda.current_device()
-                except Exception:
-                    idx = cp.cuda.runtime.getDevice()
-            with cp.cuda.Device(int(idx)):
-                with CuFile(self._feat_path, "rb") as feat_handle, CuFile(
-                    self._lab_path, "rb"
-                ) as lab_handle:
-                    while index < self._end:
-                        nxt = min(index + self._batch, self._end)
-                        rows = int(nxt - index)
-                        if rows <= 0:
-                            break
-                        x_cp = cp.empty((rows, self._feat_dim), dtype=self._feat_cp_dtype)
-                        y_cp = cp.empty((rows, self._label_flat), dtype=self._lab_cp_dtype)
-                        feat_handle.pread(x_cp, feat_offset)
-                        lab_handle.pread(y_cp, lab_offset)
-                        xb = from_dlpack(x_cp.toDlpack())
-                        yb = from_dlpack(y_cp.toDlpack()).view(
-                            rows, *self._label_shape
-                        )
-                        yield {"X": xb, "Y": yb}
-                        step = rows * self._feat_stride
-                        feat_offset += step
-                        lab_offset += rows * self._lab_stride
-                        index = nxt
+            to_deregister = self._to_deregister
+            try:
+                if self._feat_fh is None:
+                    self._feat_fh = _torch_gds.GdsFile(self._feat_path, os.O_RDONLY)
+                    self._lab_fh = _torch_gds.GdsFile(self._lab_path, os.O_RDONLY)
+                index = int(self._start)
+                end = int(self._end)
+                while index < end:
+                    nxt = min(index + self._batch, end)
+                    rows = nxt - index
+                    # allocate target buffers
+                    xb = torch.empty((rows, self._feat_stride), dtype=self._feat_dtype, device=self._device)
+                    yb = torch.empty((rows, self._lab_stride), dtype=self._lab_dtype, device=self._device)
+                    # (optional) register buffers with GDS for repeated IO
+                    try:
+                        _torch_gds.gds_register_buffer(xb.untyped_storage())
+                        _torch_gds.gds_register_buffer(yb.untyped_storage())
+                        to_deregister.extend([xb.untyped_storage(), yb.untyped_storage()])
+                    except Exception:
+                        pass
+                    # byte offsets
+                    feat_off = index * self._feat_stride * self._feat_esize
+                    lab_off = index * self._lab_stride * self._lab_esize
+                    # synchronous cuFileRead
+                    self._feat_fh.load_storage(xb.untyped_storage(), offset=feat_off)
+                    self._lab_fh.load_storage(yb.untyped_storage(), offset=lab_off)
+                    if self._label_shape:
+                        yb = yb.view(rows, *self._label_shape)
+                    yield {"X": xb, "Y": yb}
+                    index = nxt
+            finally:
+                # deregister any registered buffers and release references
+                for storage in to_deregister:
+                    with suppress(Exception):
+                        _torch_gds.gds_deregister_buffer(storage)
+                to_deregister.clear()
 
         def __len__(self) -> int:
             if self._end <= self._start:
                 return 0
             span = self._end - self._start
             return int(math.ceil(span / float(self._batch)))
-
-
 else:
     GDSBatchReader = None
 

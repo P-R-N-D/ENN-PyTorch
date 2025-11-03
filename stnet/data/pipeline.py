@@ -45,8 +45,8 @@ class ThreadLoadBalancer:
     )
 
     def __init__(self, io_workers: int) -> None:
-        self._psutil = self._try_import_psutil()
-        self._allowed_cpus = self._get_allowed_cpus_psutil_first()
+        self._psutil = self._import_psutill()
+        self._allowed_cpus = self.total_procs()
         if not self._allowed_cpus:
             self._allowed_cpus = list(range(max(1, os.cpu_count() or 1)))
         self._ring = itertools.cycle(self._allowed_cpus)
@@ -59,18 +59,18 @@ class ThreadLoadBalancer:
         self._last_retune_ts = time.perf_counter()
         self._pin_attempts = 0
         self._pin_success = 0
-        self._omp_ok = self._omp_try_set_spread_best_effort()
+        self._omp_ok = self.spread_threads()
         self._enabled = (len(self._allowed_cpus) >= 2) or self._omp_ok
-        self._pre_tune(io_workers)
+        self.tune_threads(io_workers, initial=True)
 
     @staticmethod
-    def _try_import_psutil():
+    def _import_psutill():
         try:
             return importlib.import_module("psutil")
         except Exception:
             return None
 
-    def _get_allowed_cpus_psutil_first(self) -> list[int]:
+    def total_procs(self) -> list[int]:
         if self._psutil is not None:
             try:
                 proc = self._psutil.Process()
@@ -119,7 +119,7 @@ class ThreadLoadBalancer:
         return list(range(max(1, os.cpu_count() or 1)))
 
     @staticmethod
-    def _omp_try_set_spread_best_effort() -> bool:
+    def spread_threads() -> bool:
         candidates: list[str] = []
         plat = sys.platform
         if plat.startswith("linux"):
@@ -155,7 +155,7 @@ class ThreadLoadBalancer:
             return int(next(self._ring))
 
     @staticmethod
-    def _pin_windows(core: int) -> bool:
+    def _pin_thread_windows(core: int) -> bool:
         try:
             k32 = ctypes.windll.kernel32
             GetActiveProcessorGroupCount = k32.GetActiveProcessorGroupCount
@@ -212,7 +212,7 @@ class ThreadLoadBalancer:
             return False
 
     @staticmethod
-    def _pin_linux_like(core: int) -> bool:
+    def _pin_thread_linux(core: int) -> bool:
         try:
             tid = threading.get_native_id()
             os.sched_setaffinity(tid, {int(core)})
@@ -225,10 +225,10 @@ class ThreadLoadBalancer:
                 return False
 
     @staticmethod
-    def _pin_bsd(core: int) -> bool:
+    def _pin_thread_bsd(core: int) -> bool:
         return False
 
-    def _pin_once(self) -> None:
+    def pin_thread(self) -> None:
         if not self._enabled:
             return
         attempts = getattr(self._tls, "attempts", 0)
@@ -238,13 +238,13 @@ class ThreadLoadBalancer:
         core = self._next_core()
         ok = False
         if os.name == "nt":
-            ok = self._pin_windows(core)
+            ok = self._pin_thread_windows(core)
         else:
             plat = sys.platform
             if plat.startswith("linux"):
-                ok = self._pin_linux_like(core)
+                ok = self._pin_thread_linux(core)
             elif "bsd" in plat:
-                ok = self._pin_bsd(core)
+                ok = self._pin_thread_bsd(core)
             elif plat == "darwin":
                 try:
                     lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
@@ -269,7 +269,7 @@ class ThreadLoadBalancer:
             self._enabled = False
 
     @staticmethod
-    def _set_torch_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
+    def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
         if intra is not None:
             try:
                 torch.set_num_threads(max(1, int(intra)))
@@ -281,23 +281,26 @@ class ThreadLoadBalancer:
             except Exception:
                 pass
 
-    def _pre_tune(self, io_workers: int) -> None:
+    def tune_threads(self, io_workers: Optional[int] = None, *, initial: bool = False) -> None:
         if not self._enabled:
             return
-        cpus = max(1, len(self._allowed_cpus))
-        tuned_workers = max(1, min(int(io_workers), cpus))
-        self._io_workers = tuned_workers
-        try:
-            intra = int(torch.get_num_threads())
-        except Exception:
-            intra = cpus
-        if intra * tuned_workers > cpus:
-            new_intra = max(1, cpus // tuned_workers)
-            self._set_torch_threads(intra=new_intra)
-        want_inter = max(1, min(tuned_workers // 2, 4))
-        self._set_torch_threads(inter=want_inter)
+        if initial:
+            cpus = max(1, len(self._allowed_cpus))
+            tuned_workers = max(1, min(int(io_workers if io_workers is not None else self._io_workers), cpus))
+            self._io_workers = tuned_workers
+            try:
+                intra = int(torch.get_num_threads())
+            except Exception:
+                intra = cpus
+            if intra * tuned_workers > cpus:
+                new_intra = max(1, cpus // tuned_workers)
+                self.optimize_threads(intra=new_intra)
+            want_inter = max(1, min(tuned_workers // 2, 4))
+            self.optimize_threads(inter=want_inter)
+            return
+        self._retune_threads()
 
-    def _retune_if_needed(self) -> None:
+    def _retune_threads(self) -> None:
         if not self._enabled:
             return
         if self._samples < 128:
@@ -321,20 +324,20 @@ class ThreadLoadBalancer:
             target_intra = max(1, cpus // workers)
             if cpus >= 8:
                 target_intra = min(target_intra, 2)
-            self._set_torch_threads(intra=target_intra)
-            self._set_torch_threads(inter=max(1, min(2, workers)))
+            self.optimize_threads(intra=target_intra)
+            self.optimize_threads(inter=max(1, min(2, workers)))
         else:
             relaxed = min(4, max(1, cpus // max(1, workers // 2)))
             current = max(1, torch.get_num_threads())
             if current < relaxed:
-                self._set_torch_threads(intra=relaxed)
+                self.optimize_threads(intra=relaxed)
 
-    def wrap_map(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
+    def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
         if not self._enabled:
             return fn
 
         def _inner(x: Any) -> Any:
-            self._pin_once()
+            self.pin_thread()
             t0 = time.perf_counter_ns()
             thread_time = getattr(time, "thread_time_ns", None)
             tc0 = thread_time() if callable(thread_time) else 0
@@ -345,12 +348,12 @@ class ThreadLoadBalancer:
                 self._samples += 1
                 self._cpu_ns += max(0, int(tc1) - int(tc0))
                 self._wall_ns += max(0, int(t1) - int(t0))
-            self._retune_if_needed()
+            self.tune_threads()
             return y
 
         return _inner
 
-    def tune_workers(self, io_workers: int) -> int:
+    def optimize_procs(self, io_workers: int) -> int:
         if not self._enabled:
             return int(io_workers)
         cpus = max(1, len(self._allowed_cpus))
@@ -361,7 +364,7 @@ class ThreadLoadBalancer:
 
 
 
-def _convert_mapping_to_batch(
+def process_batch(
     batch: Mapping[str, Any],
     *args: Any,
     flatten_features: bool,
@@ -387,7 +390,7 @@ def _convert_mapping_to_batch(
     return {"X": features, "Y": labels_tensor}
 
 
-def _wrap_data_node(
+def compose(
     node: IterableWrapper,
     *args: Any,
     device: torch.device,
@@ -397,12 +400,12 @@ def _wrap_data_node(
     map_fn: Callable[[Any], Any],
     length: Optional[int] = None,
     **kwargs: Any,
-) -> "DataLoader":
+) -> "BatchLoader":
     io_workers = max(1, int(threads["dataloader_workers"]))
     prebatch = max(1, int(threads["prefetch_factor"]))
     load_balancer = ThreadLoadBalancer(io_workers)
-    io_workers = load_balancer.tune_workers(io_workers)
-    map_fn = load_balancer.wrap_map(map_fn)
+    io_workers = load_balancer.optimize_procs(io_workers)
+    map_fn = load_balancer.new_thread(map_fn)
 
     thread_max_concurrent = io_workers
     wrapped: BaseNode = ParallelMapper(
@@ -417,7 +420,7 @@ def _wrap_data_node(
     wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
     if device.type in {"cuda", "xpu", "mps"}:
         wrapped = PinMemory(wrapped, pin_memory_device=device.type)
-    return DataLoader(
+    return BatchLoader(
         device=device,
         node=wrapped,
         prefetch_factor=prefetch_factor,
@@ -426,7 +429,7 @@ def _wrap_data_node(
     )
 
 
-def _build_local_loaders(
+def initialize(
     memmap_dir: str,
     batch_size: int,
     val_frac: float,
@@ -440,7 +443,7 @@ def _build_local_loaders(
     sample_reader_cls: type,
     batch_reader_kwargs: Optional[Dict[str, Any]] | None = None,
     **kwargs: Any,
-) -> Tuple[Any, Optional[Any], _Keep]:
+) -> Tuple[Any, Optional[Any], _Allocated]:
     reader_tr = sample_reader_cls.from_dir(
         memmap_dir,
         split="train",
@@ -454,13 +457,13 @@ def _build_local_loaders(
     train_end = int(getattr(train_range, "stop", total if total else 0))
     if train_end <= train_start and total:
         train_end = total
-    keep = _Keep(reader_tr)
+    allocated = _Allocated(reader_tr)
     reader_kwargs = dict(batch_reader_kwargs or {})
     batcher_tr = batch_reader_cls(
         reader_tr, train_start, train_end, int(batch_size), **reader_kwargs
     )
     node_tr = IterableWrapper(batcher_tr)
-    train_loader = _wrap_data_node(
+    train_loader = compose(
         node_tr,
         device=device,
         threads=threads,
@@ -477,7 +480,7 @@ def _build_local_loaders(
             batch_size=int(batch_size),
             val_frac=val_frac,
         )
-        keep.add(reader_vl)
+        allocated.add(reader_vl)
         val_range = reader_vl._indices()
         val_start = int(getattr(val_range, "start", train_end))
         val_end = int(getattr(val_range, "stop", total))
@@ -488,7 +491,7 @@ def _build_local_loaders(
             reader_vl, val_start, val_end, int(batch_size), **reader_kwargs
         )
         node_vl = IterableWrapper(batcher_vl)
-        val_loader = _wrap_data_node(
+        val_loader = compose(
             node_vl,
             device=device,
             threads=threads,
@@ -497,10 +500,10 @@ def _build_local_loaders(
             map_fn=map_fn,
             length=len(batcher_vl),
         )
-    return (train_loader, val_loader, keep)
+    return (train_loader, val_loader, allocated)
 
 
-class DataLoader:
+class BatchLoader:
     def __init__(
         self,
         device: torch.device,
@@ -515,7 +518,7 @@ class DataLoader:
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
             raise TypeError(
-                "data.pipeline.DataLoader supports only torchdata.nodes.BaseNode instances."
+                "data.pipeline.BatchLoader supports only torchdata.nodes.BaseNode instances."
             )
         self._node = node_obj
         self._device = device
@@ -557,13 +560,13 @@ class DataLoader:
         if self._length is not None:
             return self._length
         try:
-            length = _infer_node_length(self._node)
+            length = _get_node_length(self._node)
             return length if length is not None else 1
         except Exception:
             return 1
 
 
-def _infer_node_length(node: BaseNode) -> int | None:
+def _get_node_length(node: BaseNode) -> int | None:
     candidates = [
         lambda: len(node),
         getattr(node, "length", None),
@@ -583,30 +586,30 @@ def _infer_node_length(node: BaseNode) -> int | None:
     return None
 
 
-def flatten(objs: Iterable[Any]) -> Iterable[Any]:
+def _flatten_args(objs: Iterable[Any]) -> Iterable[Any]:
     for obj in objs:
         if obj is None:
             continue
         if isinstance(obj, (list, tuple, set)):
-            for item in flatten(obj):
+            for item in _flatten_args(obj):
                 if item is not None:
                     yield item
             continue
         yield obj
 
 
-class _Keep:
+class _Allocated:
     __slots__ = ("_objs",)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._objs = list(flatten(args))
+        self._objs = list(_flatten_args(args))
         if kwargs:
-            self._objs.extend(list(flatten(kwargs.values())))
+            self._objs.extend(list(_flatten_args(kwargs.values())))
 
     def add(self, *args: Any, **kwargs: Any) -> None:
-        self._objs.extend(list(flatten(args)))
+        self._objs.extend(list(_flatten_args(args)))
         if kwargs:
-            self._objs.extend(list(flatten(kwargs.values())))
+            self._objs.extend(list(_flatten_args(kwargs.values())))
 
     def cleanup(self) -> None:
         for obj in self._objs:
@@ -631,7 +634,7 @@ class _Keep:
             if callable(obj):
                 with suppress(Exception):
                     obj()
-def fetch(
+def collate(
     sample: Any,
     *args: Any,
     labels_dtype: Optional[torch.dtype] = None,
@@ -640,7 +643,7 @@ def fetch(
     **kwargs: Any,
 ) -> Any:
     converter = partial(
-        _convert_mapping_to_batch,
+        process_batch,
         flatten_features=flatten_features,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
@@ -655,7 +658,7 @@ def fetch(
     return sample
 
 
-def dataloader(
+def launch(
     memmap_dir: str,
     device: Union[str, torch.device],
     batch_size: int,
@@ -667,7 +670,7 @@ def dataloader(
     sanitize: bool = False,
     flatten_features: bool = False,
     **kwargs: Any,
-) -> Tuple[Any, Optional[Any], _Keep]:
+) -> Tuple[Any, Optional[Any], _Allocated]:
     device_obj = (
         torch.device(device)
         if not isinstance(device, torch.device)
@@ -675,7 +678,7 @@ def dataloader(
     )
     threads = System.optimize_threads()
     map_fn = partial(
-        fetch,
+        collate,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
         flatten_features=flatten_features,
@@ -686,6 +689,7 @@ def dataloader(
         value = os.environ.get(name, default)
         return value not in {"", "0", "false", "False"}
 
+    # Prefer torch.cuda.gds-backed reader when available.
     use_gds = (
         isinstance(device_obj, torch.device)
         and device_obj.type == "cuda"
@@ -710,7 +714,7 @@ def dataloader(
         batch_reader_kwargs=batch_reader_kwargs,
     )
 
-    return _build_local_loaders(
+    return initialize(
         memmap_dir,
         int(batch_size),
         val_frac,

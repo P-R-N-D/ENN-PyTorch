@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys as _sys
 
 from . import datatype as datatype_module
-from .pipeline import DataLoader, dataloader, fetch
+from .pipeline import BatchLoader, collate, launch
 from .nodes import BatchSampler, SampleReader
 from .stats import Metadata, TensorDictMetadata
 from .transforms import (
@@ -20,10 +20,10 @@ from .datatype import convert, to_torch_tensor
 
 __all__ = [
     "BatchSampler",
-    "DataLoader",
+    "BatchLoader",
     "SampleReader",
-    "dataloader",
-    "fetch",
+    "collate",
+    "launch",
     "Metadata",
     "TensorDictMetadata",
     "VarianceThreshold",

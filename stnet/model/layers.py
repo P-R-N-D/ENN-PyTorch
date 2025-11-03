@@ -25,6 +25,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDictBase
 
+try:
+    from torch.utils.checkpoint import checkpoint as activation_checkpoint
+except Exception:
+    activation_checkpoint = None
+
 from ..api import is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
 from ..functional.fx import AutoCast, Gradient, reshape_for_heads
@@ -1523,6 +1528,9 @@ class Root(nn.Module):
             raise ValueError(
                 f"config.microbatch must be >= 1, got {config.microbatch}"
             )
+        self._activation_checkpoint = bool(
+            getattr(config, "activation_checkpoint", False)
+        )
         try:
             self.register_buffer(
                 "output_baked_flag",
@@ -1620,6 +1628,7 @@ class Root(nn.Module):
         num_slices = (b + self.microbatch - 1) // self.microbatch
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []
+        use_activation_checkpoint = bool(self._activation_checkpoint and not infer_mode)
         if not infer_mode:
             self.local_net.train()
             self.global_net.train()
@@ -1700,23 +1709,36 @@ class Root(nn.Module):
             )
         else:
             with torch.enable_grad():
-                with (
-                    AutoCast.float(device)
-                    if amp_enabled
-                    else AutoCast.suspend(device)
-                ):
-                    refined_tokens, _ = self.global_net(tokens_centered)
+
+                def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
+                    with (
+                        AutoCast.float(device)
+                        if amp_enabled
+                        else AutoCast.suspend(device)
+                    ):
+                        out, _ = self.global_net(inp)
+                    return out
+
+                if use_activation_checkpoint and activation_checkpoint is not None:
+                    refined_tokens = activation_checkpoint(_global_tokens, tokens_centered)
+                else:
+                    refined_tokens = _global_tokens(tokens_centered)
                 refined_tokens = torch.nan_to_num(
                     refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
                 )
-                with (
-                    AutoCast.float(device)
-                    if amp_enabled
-                    else AutoCast.suspend(device)
-                ):
-                    residual_context = self.local_net.decode(
-                        refined_tokens, apply_norm=True
-                    )
+
+                def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
+                    with (
+                        AutoCast.float(device)
+                        if amp_enabled
+                        else AutoCast.suspend(device)
+                    ):
+                        return self.local_net.decode(inp, apply_norm=True)
+
+                if use_activation_checkpoint and activation_checkpoint is not None:
+                    residual_context = activation_checkpoint(_decode_tokens, refined_tokens)
+                else:
+                    residual_context = _decode_tokens(refined_tokens)
                 residual_context = torch.nan_to_num(
                     residual_context, nan=0.0, posinf=0.0, neginf=0.0
                 )
