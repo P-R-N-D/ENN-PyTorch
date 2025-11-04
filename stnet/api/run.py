@@ -7,7 +7,7 @@ import shutil
 import warnings
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.multiprocessing as mp
@@ -24,7 +24,7 @@ except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..data.nodes import SampleReader
-from ..data.transforms import BatchLike, preprocess
+from ..data.transforms import preprocess
 from ..model import Root
 from .config import (
     ModelConfig,
@@ -40,7 +40,7 @@ from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 def train(
     model: Root,
-    data: BatchLike,
+    data: Dict[Tuple, torch.Tensor],
     *args: Any,
     epochs: int = 5,
     batch_size: int = 128,
@@ -63,12 +63,6 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Root:
-    """Train ``model`` using in-memory samples.
-
-    ``data`` may be a mapping, a :class:`TensorDict`, or a sequence of those
-    structures (e.g., ``List[dict]``) to accommodate multi-node sampling
-    workflows.
-    """
 
     System.initialize_python_path()
     feats, labels, _, label_shape = preprocess(data)
@@ -168,7 +162,7 @@ def train(
 
 def predict(
     model: Root,
-    data: BatchLike,
+    data: Dict[Tuple, torch.Tensor],
     *args: Any,
     batch_size: int = 512,
     seed: int = 7,
@@ -178,7 +172,6 @@ def predict(
     rdzv_backend: Optional[str] = None,
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
-    """Run batched inference and return predictions keyed by sample index."""
 
     System.initialize_python_path()
     System.set_multiprocessing_env()
@@ -200,26 +193,16 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
-    def _materialize_missing(batch: Mapping[str, Any]) -> Mapping[str, Any]:
-        if not any(value is None for value in batch.values()):
-            return batch
+    if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
-        return {
-            key: (
+        data = {
+            k: (
                 torch.zeros(dummy_shape)
-                if value is None
-                else torch.as_tensor(value).view(*dummy_shape)
+                if v is None
+                else torch.as_tensor(v).view(*dummy_shape)
             )
-            for key, value in batch.items()
+            for k, v in data.items()
         }
-
-    if isinstance(data, Mapping):
-        data = _materialize_missing(data)
-    elif isinstance(data, Sequence) and not isinstance(data, (bytes, str)):
-        data = [
-            _materialize_missing(item) if isinstance(item, Mapping) else item
-            for item in data
-        ]
     feats, labels, keys, label_shape = preprocess(data)
     SampleReader.materialize(
         {"features": feats, "labels": labels},
