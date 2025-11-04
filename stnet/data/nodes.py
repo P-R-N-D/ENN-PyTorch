@@ -22,11 +22,15 @@ from typing import (
 )
 
 import torch
+from torch.utils.data import RandomSampler, SequentialSampler
 from tensordict import MemoryMappedTensor
 try:
-    from torchdata.nodes import IterableWrapper
+    from torchdata.nodes import IterableWrapper, MapStyleWrapper
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
+    MapStyleWrapper = None
+
+BatchSamplerBase = IterableWrapper
 
 try:
     import psutil
@@ -455,7 +459,7 @@ else:
     GDSBatchReader = None
 
 
-class BatchSampler(IterableWrapper):
+class BatchSampler(BatchSamplerBase):
     def __init__(
         self,
         memmap_dir: str,
@@ -504,7 +508,18 @@ class BatchSampler(IterableWrapper):
         if current and (not drop_last):
             batches.append(current)
 
-        super().__init__([list(chunk) for chunk in batches])
+        if MapStyleWrapper is None:
+            super().__init__([list(chunk) for chunk in batches])
+        else:
+            _dataset = {i: list(chunk) for i, chunk in enumerate(batches)}
+            if shuffle:
+                generator = torch.Generator()
+                generator.manual_seed(int(seed))
+                sampler = RandomSampler(range(len(_dataset)), generator=generator)
+            else:
+                sampler = SequentialSampler(range(len(_dataset)))
+            order = [int(i) for i in sampler]
+            super().__init__([_dataset[idx] for idx in order])
 
 
 class DevicePrefetcher(Iterator[Any]):
