@@ -450,7 +450,15 @@ def compose(
         weights = {key: 1.0 for key in nodes_map}
         source_node = MultiNodeWeightedSampler(nodes_map, weights)
     else:
-        source_node = node
+        # Route a single node through MultiNodeWeightedSampler as well
+        # so that sharding behavior is consistent across Mapping[Mapping],
+        # Sequence[Mapping], and single Mapping inputs.
+        if MultiNodeWeightedSampler is None:
+            source_node = node
+        else:
+            nodes_map = {"default": node}
+            weights = {"default": 1.0}
+            source_node = MultiNodeWeightedSampler(nodes_map, weights)
 
     wrapped: BaseNode = ParallelMapper(
         source_node,
