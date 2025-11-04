@@ -6,7 +6,7 @@ import sys
 import time
 from contextlib import suppress
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import ctypes
 import importlib
@@ -15,16 +15,7 @@ import threading
 from threading import Lock
 
 import torch
-from tensordict import TensorDictBase
-from torchdata.nodes import (
-    BaseNode,
-    IterableWrapper,
-    Loader,
-    MultiNodeWeightedSampler,
-    ParallelMapper,
-    PinMemory,
-    Prefetcher,
-)
+from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
 from .datatype import to_torch_tensor
 from .nodes import DevicePrefetcher, GDSBatchReader
 from ..backend.environment import System
@@ -512,98 +503,24 @@ def initialize(
     return (train_loader, val_loader, allocated)
 
 
-def _find_weight(
-    weights: Optional[Mapping[Any, float]],
-    candidates: Iterable[Any],
-) -> Optional[float]:
-    if not weights:
-        return None
-    for candidate in candidates:
-        with suppress(KeyError):
-            value = weights[candidate]
-            if value is None:
-                continue
-            return float(value)
-    return None
-
-
-def _resolve_node_weights(
-    entries: Sequence[Tuple[str, Tuple[Any, ...]]],
-    weights: Optional[Mapping[Any, float]],
-) -> Dict[str, float]:
-    if not entries:
-        raise ValueError("Multi-node datasets require at least one node entry")
-    if not weights:
-        equal = 1.0 / len(entries)
-        return {key: equal for key, _ in entries}
-    resolved: Dict[str, Optional[float]] = {}
-    provided = False
-    for key, candidates in entries:
-        weight = _find_weight(weights, candidates)
-        if weight is not None:
-            provided = True
-        resolved[key] = weight
-    if not provided:
-        equal = 1.0 / len(entries)
-        return {key: equal for key, _ in entries}
-    return {key: (value if value is not None else 1.0) for key, value in resolved.items()}
-
-
-def _coerce_to_node(
-    node_like: Any,
-    *,
-    weights: Optional[Mapping[Any, float]] = None,
-) -> BaseNode:
-    if isinstance(node_like, BaseNode):
-        return node_like
-    if isinstance(node_like, Mapping):
-        normalized: Dict[str, BaseNode] = {}
-        entries: list[Tuple[str, Tuple[Any, ...]]] = []
-        for idx, (key, value) in enumerate(node_like.items()):
-            if not isinstance(value, BaseNode):
-                raise TypeError(
-                    "BatchLoader dataset mappings must contain BaseNode instances"
-                )
-            str_key = str(key if key is not None else idx)
-            normalized[str_key] = value
-            entries.append((str_key, (key, str_key, idx)))
-        weight_map = _resolve_node_weights(entries, weights)
-        return MultiNodeWeightedSampler(normalized, weight_map)
-    if isinstance(node_like, Sequence):
-        normalized = {str(i): value for i, value in enumerate(node_like)}
-        if any((not isinstance(v, BaseNode) for v in normalized.values())):
-            raise TypeError(
-                "BatchLoader dataset sequences must contain only BaseNode instances"
-            )
-        entries = [
-            (str(i), (i, str(i)))
-            for i in range(len(normalized))
-        ]
-        weight_map = _resolve_node_weights(entries, weights)
-        return MultiNodeWeightedSampler(normalized, weight_map)
-    raise TypeError(
-        "data.pipeline.BatchLoader supports BaseNode, mappings of BaseNodes, "
-        "or sequences of BaseNodes."
-    )
-
-
 class BatchLoader:
     def __init__(
         self,
         device: torch.device,
         *args: Any,
-        node: BaseNode | Mapping[Any, BaseNode] | Sequence[BaseNode] | None = None,
-        dataset: BaseNode | Mapping[Any, BaseNode] | Sequence[BaseNode] | None = None,
+        node: BaseNode | None = None,
+        dataset: BaseNode | None = None,
         prefetch_factor: int = 2,
         non_blocking: bool = True,
         length: Optional[int] = None,
-        node_weights: Optional[Mapping[Any, float]] = None,
         **kwargs: Any,
     ) -> None:
         node_obj = node or dataset
-        if node_obj is None:
-            raise TypeError("BatchLoader requires a node or dataset to be provided")
-        self._node = _coerce_to_node(node_obj, weights=node_weights)
+        if not isinstance(node_obj, BaseNode):
+            raise TypeError(
+                "data.pipeline.BatchLoader supports only torchdata.nodes.BaseNode instances."
+            )
+        self._node = node_obj
         self._device = device
         self._prefetch_factor = max(1, int(prefetch_factor or 2))
         self._non_blocking = bool(non_blocking)
@@ -725,26 +642,6 @@ def collate(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Any:
-    def _maybe_unpack(sample_obj: Any) -> Any:
-        if isinstance(sample_obj, Mapping) and sample_obj:
-            ordered: list[tuple[int, Any]] = []
-            for key, value in sample_obj.items():
-                try:
-                    idx = int(key)
-                except (TypeError, ValueError):
-                    break
-                ordered.append((idx, value))
-            else:
-                ordered.sort(key=lambda kv: kv[0])
-                values = [val for _, val in ordered]
-                if all(
-                    isinstance(val, Mapping) or isinstance(val, TensorDictBase)
-                    for val in values
-                ):
-                    return values
-        return sample_obj
-
-    sample = _maybe_unpack(sample)
     converter = partial(
         process_batch,
         flatten_features=flatten_features,
