@@ -6,7 +6,7 @@ import sys
 import time
 from contextlib import suppress
 from functools import partial
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import ctypes
 import importlib
@@ -15,7 +15,19 @@ import threading
 from threading import Lock
 
 import torch
-from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
+try:
+    from torchdata.nodes import (
+        BaseNode,
+        IterableWrapper,
+        Loader,
+        MultiNodeWeightedSampler,
+        ParallelMapper,
+        PinMemory,
+        Prefetcher,
+    )
+except Exception:
+    from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
+    MultiNodeWeightedSampler = None
 from .datatype import to_torch_tensor
 from .nodes import DevicePrefetcher, GDSBatchReader
 from ..backend.environment import System
@@ -391,7 +403,7 @@ def process_batch(
 
 
 def compose(
-    node: IterableWrapper,
+    node: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
     *args: Any,
     device: torch.device,
     threads: Dict[str, int],
@@ -408,8 +420,40 @@ def compose(
     map_fn = load_balancer.new_thread(map_fn)
 
     thread_max_concurrent = io_workers
+    if isinstance(node, Mapping):
+        nodes_map: Dict[str, BaseNode] = {
+            str(key): value for key, value in node.items() if isinstance(value, BaseNode)
+        }
+        if nodes_map:
+            if MultiNodeWeightedSampler is None:
+                raise RuntimeError(
+                    "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
+                )
+            weights = {key: 1.0 for key in nodes_map}
+            source_node: BaseNode = MultiNodeWeightedSampler(nodes_map, weights)
+        elif isinstance(node, BaseNode):
+            source_node = node
+        else:
+            raise TypeError(
+                "Unsupported Mapping passed to compose: expected Mapping[str, BaseNode]."
+            )
+    elif isinstance(node, (list, tuple)):
+        nodes_map = {str(index): value for index, value in enumerate(node) if isinstance(value, BaseNode)}
+        if not nodes_map:
+            raise TypeError(
+                "Empty or invalid Sequence passed to compose: expected Sequence[BaseNode]."
+            )
+        if MultiNodeWeightedSampler is None:
+            raise RuntimeError(
+                "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
+            )
+        weights = {key: 1.0 for key in nodes_map}
+        source_node = MultiNodeWeightedSampler(nodes_map, weights)
+    else:
+        source_node = node
+
     wrapped: BaseNode = ParallelMapper(
-        node,
+        source_node,
         map_fn=map_fn,
         num_workers=io_workers,
         in_order=False,
@@ -430,7 +474,7 @@ def compose(
 
 
 def initialize(
-    memmap_dir: str,
+    memmap_dir: Union[str, Sequence[str], Mapping[str, str]],
     batch_size: int,
     val_frac: float,
     *args: Any,
@@ -444,25 +488,61 @@ def initialize(
     batch_reader_kwargs: Optional[Dict[str, Any]] | None = None,
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], _Allocated]:
-    reader_tr = sample_reader_cls.from_dir(
-        memmap_dir,
-        split="train",
-        batch_size=int(batch_size),
-        val_frac=val_frac,
-    )
-    meta = reader_tr._load_meta()
-    total = int(meta.get("N", 0))
-    train_range = reader_tr._indices()
-    train_start = int(getattr(train_range, "start", 0))
-    train_end = int(getattr(train_range, "stop", total if total else 0))
-    if train_end <= train_start and total:
-        train_end = total
-    allocated = _Allocated(reader_tr)
-    reader_kwargs = dict(batch_reader_kwargs or {})
-    batcher_tr = batch_reader_cls(
-        reader_tr, train_start, train_end, int(batch_size), **reader_kwargs
-    )
-    node_tr = IterableWrapper(batcher_tr)
+    allocated = _Allocated()
+
+    def _make_train_node(directory: Union[str, os.PathLike[str]]) -> Tuple[BaseNode, int, int, int]:
+        path = os.fspath(directory)
+        reader = sample_reader_cls.from_dir(
+            path,
+            split="train",
+            batch_size=int(batch_size),
+            val_frac=val_frac,
+        )
+        allocated.add(reader)
+        meta = reader._load_meta()
+        total_samples = int(meta.get("N", 0))
+        train_range = reader._indices()
+        train_start = int(getattr(train_range, "start", 0))
+        train_end = int(getattr(train_range, "stop", total_samples if total_samples else 0))
+        if train_end <= train_start and total_samples:
+            train_end = total_samples
+        reader_kwargs_local = dict(batch_reader_kwargs or {})
+        batcher = batch_reader_cls(
+            reader, train_start, train_end, int(batch_size), **reader_kwargs_local
+        )
+        allocated.add(batcher)
+        return IterableWrapper(batcher), len(batcher), total_samples, train_end
+
+    if isinstance(memmap_dir, (list, tuple)):
+        node_tr = [_make_train_node(directory)[0] for directory in memmap_dir]
+        train_loader = compose(
+            node_tr,
+            device=device,
+            threads=threads,
+            prefetch_factor=prefetch_factor,
+            non_blocking_copy=non_blocking_copy,
+            map_fn=map_fn,
+            length=None,
+        )
+        return (train_loader, None, allocated)
+
+    if isinstance(memmap_dir, Mapping):
+        node_tr = {
+            str(key): _make_train_node(directory)[0]
+            for key, directory in memmap_dir.items()
+        }
+        train_loader = compose(
+            node_tr,
+            device=device,
+            threads=threads,
+            prefetch_factor=prefetch_factor,
+            non_blocking_copy=non_blocking_copy,
+            map_fn=map_fn,
+            length=None,
+        )
+        return (train_loader, None, allocated)
+
+    node_tr, train_length, total, train_end = _make_train_node(memmap_dir)
     train_loader = compose(
         node_tr,
         device=device,
@@ -470,7 +550,7 @@ def initialize(
         prefetch_factor=prefetch_factor,
         non_blocking_copy=non_blocking_copy,
         map_fn=map_fn,
-        length=len(batcher_tr),
+        length=train_length,
     )
     val_loader: Optional[Any] = None
     if val_frac > 0 and train_end < total:
@@ -486,10 +566,11 @@ def initialize(
         val_end = int(getattr(val_range, "stop", total))
         if val_end <= val_start:
             val_end = total
-        reader_kwargs = dict(batch_reader_kwargs or {})
+        reader_kwargs_local = dict(batch_reader_kwargs or {})
         batcher_vl = batch_reader_cls(
-            reader_vl, val_start, val_end, int(batch_size), **reader_kwargs
+            reader_vl, val_start, val_end, int(batch_size), **reader_kwargs_local
         )
+        allocated.add(batcher_vl)
         node_vl = IterableWrapper(batcher_vl)
         val_loader = compose(
             node_vl,
@@ -659,7 +740,7 @@ def collate(
 
 
 def fetch(
-    memmap_dir: str,
+    memmap_dir: Union[str, Sequence[str], Mapping[str, str]],
     device: Union[str, torch.device],
     batch_size: int,
     val_frac: float,
@@ -690,8 +771,10 @@ def fetch(
         return value not in {"", "0", "false", "False"}
 
     # Prefer torch.cuda.gds-backed reader when available.
+    memmap_is_str = isinstance(memmap_dir, str)
     use_gds = (
-        isinstance(device_obj, torch.device)
+        memmap_is_str
+        and isinstance(device_obj, torch.device)
         and device_obj.type == "cuda"
         and torch.cuda.is_available()
         and _env_flag("STNET_GDS")

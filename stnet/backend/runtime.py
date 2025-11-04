@@ -576,8 +576,10 @@ def epochs(
     with join_context:
         for epoch_idx in range(int(total_epochs)):
             if status_bar is not None:
+                _mn = isinstance(ops.memmap_dir, (list, tuple, dict))
+                _suffix = " [MultiNode]" if _mn else ""
                 status_bar.set_description(
-                    f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]"
+                    f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]{_suffix}"
                 )
 
             if is_dist_avail_and_initialized():
@@ -1147,7 +1149,32 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         metadata = Metadata.for_device(device)
-        meta_info = _meta(ops.memmap_dir or "")
+        # run.py 가 생성한 다중 데이터 매니페스트(multinode.json)를 탐지해 ops.memmap_dir 확장
+        mem_spec = ops.memmap_dir
+        if isinstance(mem_spec, str) and os.path.isdir(mem_spec):
+            mn_path = os.path.join(mem_spec, "multinode.json")
+            if os.path.isfile(mn_path):
+                with open(mn_path, "r", encoding="utf-8") as _f:
+                    _spec = json.load(_f)
+                if isinstance(_spec, dict):
+                    resolved = {str(k): os.path.join(mem_spec, str(v)) for k, v in _spec.items()}
+                elif isinstance(_spec, list):
+                    resolved = [os.path.join(mem_spec, str(v)) for v in _spec]
+                else:
+                    resolved = None
+                if resolved:
+                    ops = replace(ops, memmap_dir=resolved)
+
+        def _first_dir(obj: Any) -> str:
+            if isinstance(obj, str):
+                return obj
+            if isinstance(obj, dict) and obj:
+                return next(iter(obj.values()))
+            if isinstance(obj, (list, tuple)) and obj:
+                return obj[0]
+            raise RuntimeError("memmap_dir is empty or invalid")
+
+        meta_info = _meta(_first_dir(ops.memmap_dir or ""))
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(

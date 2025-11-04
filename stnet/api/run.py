@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import shutil
 import warnings
 from dataclasses import asdict
 from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Sequence, Mapping
 
 import torch
 import torch.multiprocessing as mp
@@ -40,7 +41,9 @@ from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
 
 def train(
     model: Root,
-    data: Dict[Tuple, torch.Tensor],
+    data: Dict[Tuple, torch.Tensor]
+    | Sequence[Dict[Tuple, torch.Tensor]]
+    | Mapping[str, Dict[Tuple, torch.Tensor]],
     *args: Any,
     epochs: int = 5,
     batch_size: int = 128,
@@ -65,17 +68,73 @@ def train(
 ) -> Root:
 
     System.initialize_python_path()
-    feats, labels, _, label_shape = preprocess(data)
     mp.allow_connection_pickling()
     System.set_multiprocessing_env()
     memmap_dir = System.new_dir("memmap_ds")
-    SampleReader.materialize(
-        {"features": feats, "labels": labels},
-        memmap_dir=memmap_dir,
-        train_frac=1.0 - float(val_frac),
-        val_frac=float(val_frac),
-        shuffle=False,
-    )
+
+    # 단일/다중 입력을 공통 처리: 다중이면 각 항목을 memmap_ds/<키>/ 로 내리고 manifest 기록
+    first_feats: Optional[torch.Tensor] = None
+    label_shape: Tuple[int, ...] = ()
+    manifest: Optional[Dict[str, str] | Sequence[str]] = None
+
+    def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+        fx, lb, _, lshape = preprocess(d)
+        SampleReader.materialize(
+            {"features": fx, "labels": lb},
+            memmap_dir=out_dir,
+            train_frac=1.0 - float(val_frac),
+            val_frac=float(val_frac),
+            shuffle=False,
+        )
+        return fx, tuple(lshape)
+
+    if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
+        # Mapping[str, Mapping] → 키 유지
+        manifest = {}
+        for k, d in data.items():
+            sub = os.path.join(memmap_dir, str(k))
+            os.makedirs(sub, exist_ok=True)
+            fx, lshape = _mat_one(d, sub)
+            if first_feats is None:
+                first_feats, label_shape = fx, lshape
+            else:
+                if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
+                    raise RuntimeError("inconsistent feature/label shapes across datasets")
+            manifest[str(k)] = str(k)  # 상대 경로 이름을 저장
+    elif isinstance(data, Sequence) and data and all(isinstance(d, Mapping) for d in data):
+        # Sequence[Mapping] → "0","1","2"... 부여
+        manifest = []
+        for i, d in enumerate(data):
+            key = str(i)
+            sub = os.path.join(memmap_dir, key)
+            os.makedirs(sub, exist_ok=True)
+            fx, lshape = _mat_one(d, sub)
+            if first_feats is None:
+                first_feats, label_shape = fx, lshape
+            else:
+                if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
+                    raise RuntimeError("inconsistent feature/label shapes across datasets")
+            manifest.append(key)
+    else:
+        # 기존 단일 데이터 경로
+        fx, lb, _, lshape = preprocess(data)  # type: ignore[arg-type]
+        SampleReader.materialize(
+            {"features": fx, "labels": lb},
+            memmap_dir=memmap_dir,
+            train_frac=1.0 - float(val_frac),
+            val_frac=float(val_frac),
+            shuffle=False,
+        )
+        first_feats, label_shape = fx, tuple(lshape)
+
+    if first_feats is None or not label_shape:
+        raise RuntimeError("no training data provided to train()")
+
+    if manifest is not None:
+        # runtime.py::main이 이 매니페스트를 읽어 MultiNode 입력으로 확장
+        with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
+            payload = manifest if isinstance(manifest, dict) else list(manifest)
+            json.dump(payload, f)
     ckpt_dir = System.new_dir("ckpt_dcp")
     init_dir = System.new_dir("init_dcp")
     with warnings.catch_warnings():
@@ -114,7 +173,7 @@ def train(
         memmap_dir=memmap_dir,
         ckpt_dir=ckpt_dir,
         init_ckpt_dir=init_dir,
-        in_dim=int(feats.shape[1]),
+        in_dim=int(first_feats.shape[1]),
         out_shape=tuple(label_shape),
         cfg_dict=cfg_dict,
     )
