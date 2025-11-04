@@ -69,7 +69,6 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
-    "TensorDictLoss",
 ]
 
 
@@ -95,7 +94,6 @@ def __getattr__(name: str) -> Any:
         "StandardNormalLoss",
         "StudentsTLoss",
         "DataFidelityLoss",
-        "TensorDictLoss",
     }:
         from . import model as model_ns
 
@@ -120,7 +118,6 @@ def __getattr__(name: str) -> Any:
             "StandardNormalLoss": model_ns.StandardNormalLoss,
             "StudentsTLoss": model_ns.StudentsTLoss,
             "DataFidelityLoss": model_ns.DataFidelityLoss,
-            "TensorDictLoss": model_ns.TensorDictLoss,
         }
         return mapping[name]
     if name in {"train", "predict", "new_model", "load_model", "save_model", "joining"}:

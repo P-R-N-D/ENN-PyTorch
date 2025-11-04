@@ -34,7 +34,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 from ..model import Root
 from ..api.config import ModelConfig, coerce_model_config
-from ..functional.fx import Gradient
+from ..functional.fx import Fusion, Gradient
 
 
 class MissingDependencyError(ImportError):
@@ -117,8 +117,15 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
-def _model_config_dict(model: Root) -> Dict[str, Any]:
+def _model_config_dict(model: nn.Module) -> Dict[str, Any]:
     cfg_obj = getattr(model, "_Root__config", None)
+    if cfg_obj is None:
+        cfg_obj = getattr(model, "__stnet_root_config__", None)
+    if cfg_obj is None:
+        for submodule in model.modules():
+            cfg_obj = getattr(submodule, "_Root__config", None)
+            if cfg_obj is not None:
+                break
     if isinstance(cfg_obj, ModelConfig):
         return asdict(coerce_model_config(cfg_obj))
     if isinstance(cfg_obj, dict):
@@ -139,7 +146,7 @@ class TorchIO:
 
     @staticmethod
     def save(
-        model: Root,
+        model: nn.Module,
         path: str | Path,
         optimizer: Optional[torch.optim.Optimizer] = None,
         extra: Optional[Dict[str, Any]] = None,
@@ -592,9 +599,11 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
-) -> Root:
+) -> nn.Module:
     cfg = coerce_model_config(config)
-    return Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    model_td = Fusion.td_from_module(core, in_key="features", out_key="pred", add_loss=True)
+    return model_td
 
 
 def load_model(
@@ -603,7 +612,7 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[str] = None,
-) -> Root:
+) -> nn.Module:
 
     if os.path.isdir(checkpoint_path):
         if in_dim is None or out_shape is None:
@@ -647,7 +656,7 @@ def load_model(
 
 
 def save_model(
-    model: Root,
+    model: nn.Module,
     path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None,
