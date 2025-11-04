@@ -31,6 +31,7 @@ The core backend depends on:
 - `torchdata>=0.11.0`
 - `tensordict>=0.8.0`
 - `triton>=3.2.0`
+- `torchrl>=0.8.1`
 - `numpy>=2.2.5`
 - `netifaces>=0.11.0`
 - `tqdm>=4.67.1`
