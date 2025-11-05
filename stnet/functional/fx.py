@@ -730,36 +730,6 @@ class AutoCast:
             yield
 
 
-def _import_callable(spec: str) -> Callable:
-    if not isinstance(spec, str) or not spec.strip():
-        raise ValueError("Empty spec for callable import")
-    raw = spec.strip()
-    root_pkg = __package__.split(".", 1)[0] if __package__ else "stnet"
-    default_module = f"{root_pkg}.functional.fx"
-    if ":" in raw:
-        mod_part, fn_part = raw.split(":", 1)
-    else:
-        mod_part, fn_part = ("", raw)
-    mod_part = mod_part.strip()
-    fn_part = fn_part.strip()
-    if not fn_part:
-        raise ValueError(f"Missing function in spec: {spec}")
-    if not mod_part:
-        mod_name = default_module
-    elif mod_part.startswith("."):
-        mod_name = f"{root_pkg}{mod_part}"
-    elif not mod_part.startswith(root_pkg + ".") and mod_part.split(".")[
-        0
-    ] not in ("importlib", "torch", "math", "sys"):
-        mod_name = f"{root_pkg}.{mod_part}"
-    else:
-        mod_name = mod_part
-    module = importlib.import_module(mod_name)
-    fn = getattr(module, fn_part, None)
-    if not callable(fn):
-        raise TypeError(f"{mod_name}:{fn_part} is not callable or not found")
-    return fn
-
 Int8DynamicActivationInt8WeightConfig: Any | None
 Int8WeightOnlyConfig: Any | None
 quantize_: Any | None

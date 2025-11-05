@@ -1574,11 +1574,6 @@ class Root(nn.Module):
             return x.to(dtype=target_dtype)
         return x
 
-    def set_input_scale_method(self, method: str = "standard") -> None:
-        self._input_scale_method = (
-            "standard" if str(method).lower() == "standard" else "none"
-        )
-
     def forward(
         self,
         features: torch.Tensor | TensorDictBase,

@@ -33,10 +33,6 @@ from .nodes import DevicePrefetcher, GDSBatchReader
 from ..backend.environment import System
 
 
-def identity(item: Any) -> Any:
-    return item
-
-
 class ThreadLoadBalancer:
 
     __slots__ = (
