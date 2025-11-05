@@ -81,21 +81,21 @@ class Metadata(Generic[TExtra]):
     def _float8_dtypes() -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
-        return _Autocast._float8_dtypes()
+        return _Autocast.float8_formats()
 
     @classmethod
     def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         # delegate to Autocast to avoid duplication
         from ..functional.fx import Autocast as _Autocast
 
-        return _Autocast._float_amp_candidates(device)
+        return _Autocast.float_amp_priority(device)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         # delegate to Autocast to avoid duplication
         from ..functional.fx import Autocast as _Autocast
 
-        return _Autocast._integer_candidates(device)
+        return _Autocast.integer_amp_priority(device)
 
     @classmethod
     def for_device(

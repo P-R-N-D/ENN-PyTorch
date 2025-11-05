@@ -65,6 +65,10 @@ def _coerce_std(
     return std
 
 
+def _to_tuple(x: Any) -> Tuple[int, ...]:
+    return tuple((int(v) for v in x))
+
+
 def normal_cdf(x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
@@ -85,6 +89,66 @@ def students_t_cdf(
     v_clamped = torch.clamp(v, min=3.0)
     z = t * torch.sqrt((v_clamped - 2.0) / v_clamped)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
+
+
+def fft_nd(
+    x: torch.Tensor,
+    shape: Sequence[int],
+    *args: Any,
+    real_input: bool = False,
+    inverse: bool = False,
+    norm: Optional[str] = "ortho",
+    **kwargs: Any,
+) -> torch.Tensor:
+    dims = tuple(range(-len(shape), 0))
+    if not inverse:
+        if real_input:
+            return torch.fft.rfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+        return torch.fft.fftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+    if real_input:
+        return torch.fft.irfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+    return torch.fft.ifftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+
+
+def nufft_nd(
+    x_cplx: torch.Tensor,
+    omega: torch.Tensor,
+    shape: Sequence[int],
+    *args: Any,
+    nufft_type: int = 2,
+    eps: float = 1e-06,
+    **kwargs: Any,
+) -> torch.Tensor:
+    try:
+        import cufinufft
+    except Exception as e:
+        raise RuntimeError("cuFINUFFT not available") from e
+    B = x_cplx.shape[0]
+    ndim = len(shape)
+    out_list = []
+    if omega.dim() == 2:
+        pts = [omega[i].contiguous() for i in range(ndim)]
+        plan = cufinufft.Plan(
+            nufft_type, _to_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
+        )
+        plan.setpts(*pts)
+        for b in range(B):
+            fk = plan.execute(x_cplx[b])
+            out_list.append(fk.unsqueeze(0))
+    else:
+        for b in range(B):
+            pts = [omega[b, i].contiguous() for i in range(ndim)]
+            plan = cufinufft.Plan(
+                nufft_type,
+                _to_tuple(shape),
+                n_trans=1,
+                eps=eps,
+                dtype="complex64",
+            )
+            plan.setpts(*pts)
+            fk = plan.execute(x_cplx[b])
+            out_list.append(fk.unsqueeze(0))
+    return torch.cat(out_list, dim=0)
 
 
 class MultipleQuantileLoss(nn.Module):
@@ -561,73 +625,6 @@ class StudentsTLoss(nn.Module):
             case _:
                 raise ValueError("Invalid penalty")
         return self.reduce(pen)
-
-
-def _to_tuple(x: Any) -> Tuple[int, ...]:
-    return tuple((int(v) for v in x))
-
-
-def fft_nd(
-    x: torch.Tensor,
-    shape: Sequence[int],
-    *args: Any,
-    real_input: bool = False,
-    inverse: bool = False,
-    norm: Optional[str] = "ortho",
-    **kwargs: Any,
-) -> torch.Tensor:
-    dims = tuple(range(-len(shape), 0))
-    if not inverse:
-        if real_input:
-            return torch.fft.rfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
-        return torch.fft.fftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
-    else:
-        if real_input:
-            return torch.fft.irfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
-        return torch.fft.ifftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
-
-
-def nufft_nd(
-    x_cplx: torch.Tensor,
-    omega: torch.Tensor,
-    shape: Sequence[int],
-    *args: Any,
-    nufft_type: int = 2,
-    eps: float = 1e-06,
-    **kwargs: Any,
-) -> torch.Tensor:
-    try:
-        import cufinufft
-    except Exception as e:
-        raise RuntimeError("cuFINUFFT not available") from e
-    B = x_cplx.shape[0]
-    ndim = len(shape)
-    out_list = []
-    if omega.dim() == 2:
-        pts = [omega[i].contiguous() for i in range(ndim)]
-        plan = cufinufft.Plan(
-            nufft_type, _to_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
-        )
-        plan.setpts(*pts)
-        for b in range(B):
-            fk = plan.execute(x_cplx[b])
-            out_list.append(fk.unsqueeze(0))
-    else:
-        for b in range(B):
-            pts = [omega[b, i].contiguous() for i in range(ndim)]
-            plan = cufinufft.Plan(
-                nufft_type,
-                _to_tuple(shape),
-                n_trans=1,
-                eps=eps,
-                dtype="complex64",
-            )
-            plan.setpts(*pts)
-            fk = plan.execute(x_cplx[b])
-            out_list.append(fk.unsqueeze(0))
-    return torch.cat(out_list, dim=0)
-
-
 class DataFidelityLoss(nn.Module):
     def __init__(
         self,

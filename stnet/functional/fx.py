@@ -11,13 +11,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from tensordict import TensorDict, TensorDictBase
-from tensordict.nn import TensorDictModule, TensorDictSequential, CudaGraphModule
-
-LossCallable = Union[nn.Module, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
+from tensordict.nn import CudaGraphModule, TensorDictModule, TensorDictSequential
 
 from ..backend.compat import patch_torch
-from ..data.stats import Metadata
-from ..model.kernels import DotProductAttention
 from ..backend.environment import (
     get_device,
     is_cpu_bf16_supported,
@@ -25,8 +21,26 @@ from ..backend.environment import (
     is_float8_supported,
     is_int8_supported,
 )
+from ..data.stats import Metadata
+from ..model.kernels import DotProductAttention
 
 patch_torch()
+
+
+LossCallable = Union[nn.Module, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
+_LOGGER = logging.getLogger(__name__)
+
+
+def _is_ptq_unavailable(
+    model: nn.Module, *args: Any, **kwargs: Any
+) -> tuple[nn.Module, bool, str]:
+    return (model, False, "PTQ backend unavailable")
+
+
+class _QATUnavailable:
+    @staticmethod
+    def initialize(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("QAT backend unavailable")
 
 
 def reshape_for_mha(
@@ -34,9 +48,6 @@ def reshape_for_mha(
 ) -> torch.Tensor:
 
     return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
-
-
-_LOGGER = logging.getLogger(__name__)
 
 
 def is_nvidia_te_available(model: torch.nn.Module) -> bool:
@@ -129,6 +140,47 @@ def is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     return False
 
 
+def is_scale_safe(
+    dtype: torch.dtype,
+    meta: Optional[Metadata[Any]],
+    *args: Any,
+    safety_margin: float = 8.0,
+    **kwargs: Any,
+) -> bool:
+    if meta is None or not getattr(meta, "has_scale", False):
+        return True
+    if not isinstance(dtype, torch.dtype):
+        return False
+    max_abs = getattr(meta, "scale_max_abs", None)
+    if max_abs is None:
+        return True
+    max_abs = float(abs(max_abs))
+    if not math.isfinite(max_abs):
+        return False
+    if getattr(dtype, "is_complex", False):
+        base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
+        return is_scale_safe(base_dtype, meta, safety_margin=safety_margin)
+    if getattr(dtype, "is_floating_point", False):
+        info = torch.finfo(dtype)
+        if max_abs > float(info.max) / safety_margin:
+            return False
+        min_pos = getattr(meta, "scale_min_positive", None)
+        if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
+            return False
+        return True
+    if dtype == torch.bool:
+        is_integral = getattr(meta, "scale_is_integral", None)
+        return (is_integral is None or is_integral) and max_abs <= 1.0
+    try:
+        info = torch.iinfo(dtype)
+    except TypeError:
+        return False
+    is_integral = getattr(meta, "scale_is_integral", None)
+    if is_integral is False:
+        return False
+    return max_abs <= float(info.max)
+
+
 class Gradient:
     @staticmethod
     def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
@@ -174,63 +226,22 @@ class Gradient:
         return compile_fn(module, **kwargs)
 
 
-def is_scale_safe(
-    dtype: torch.dtype,
-    meta: Optional[Metadata[Any]],
-    *args: Any,
-    safety_margin: float = 8.0,
-    **kwargs: Any,
-) -> bool:
-    if meta is None or not getattr(meta, "has_scale", False):
-        return True
-    if not isinstance(dtype, torch.dtype):
-        return False
-    max_abs = getattr(meta, "scale_max_abs", None)
-    if max_abs is None:
-        return True
-    max_abs = float(abs(max_abs))
-    if not math.isfinite(max_abs):
-        return False
-    if getattr(dtype, "is_complex", False):
-        base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
-        return is_scale_safe(base_dtype, meta, safety_margin=safety_margin)
-    if getattr(dtype, "is_floating_point", False):
-        info = torch.finfo(dtype)
-        if max_abs > float(info.max) / safety_margin:
-            return False
-        min_pos = getattr(meta, "scale_min_positive", None)
-        if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
-            return False
-        return True
-    if dtype == torch.bool:
-        is_integral = getattr(meta, "scale_is_integral", None)
-        return (is_integral is None or is_integral) and max_abs <= 1.0
-    try:
-        info = torch.iinfo(dtype)
-    except TypeError:
-        return False
-    is_integral = getattr(meta, "scale_is_integral", None)
-    if is_integral is False:
-        return False
-    return max_abs <= float(info.max)
-
-
 class Autocast:
-    _fp8_backend: Optional[str] = None
-    _int_backend: Optional[str] = None
+    _preferred_fp8_backend: Optional[str] = None
+    _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
     _metadata: Optional[Metadata[Any]] = None
 
     @classmethod
-    def _resolve_fp8_backend(
+    def _fp8_backend(
         cls: object,
         preferred: Optional[str],
         *args: Any,
         device: Optional[torch.device] = None,
         **kwargs: Any,
     ) -> Optional[str]:
-        dev = device if device is not None else cls._resolve_device(None)
+        dev = device if device is not None else cls._device(None)
         order: Tuple[str, ...]
         if preferred == "te":
             order = ("te", "ao")
@@ -254,7 +265,7 @@ class Autocast:
                 except Exception as exc:
                     _LOGGER.debug("Autocast FP8 TE import failed: %s", exc)
                     continue
-                cls._fp8_backend = "te"
+                cls._preferred_fp8_backend = "te"
                 return "te"
             if backend == "ao":
                 try:
@@ -265,20 +276,20 @@ class Autocast:
                 except Exception as exc:
                     _LOGGER.debug("Autocast FP8 torchao import failed: %s", exc)
                     continue
-                cls._fp8_backend = "ao"
+                cls._preferred_fp8_backend = "ao"
                 return "ao"
-        cls._fp8_backend = None
+        cls._preferred_fp8_backend = None
         return None
 
     @classmethod
-    def _resolve_int_backend(
+    def _int_backend(
         cls: object,
         preferred: Optional[str],
         *args: Any,
         device: Optional[torch.device] = None,
         **kwargs: Any,
     ) -> Optional[str]:
-        dev = device if device is not None else cls._resolve_device(None)
+        dev = device if device is not None else cls._device(None)
         order: Tuple[str, ...]
         if preferred == "te":
             order = ("te", "ao")
@@ -302,7 +313,7 @@ class Autocast:
                 except Exception as exc:
                     _LOGGER.debug("Autocast INT8 TE import failed: %s", exc)
                     continue
-                cls._int_backend = "te"
+                cls._preferred_int_backend = "te"
                 return "te"
             if backend == "ao":
                 try:
@@ -314,13 +325,13 @@ class Autocast:
                 except Exception as exc:
                     _LOGGER.debug("Autocast INT8 torchao import failed: %s", exc)
                     continue
-                cls._int_backend = "ao"
+                cls._preferred_int_backend = "ao"
                 return "ao"
-        cls._int_backend = None
+        cls._preferred_int_backend = None
         return None
 
     @staticmethod
-    def _resolve_device(
+    def _device(
         device: Optional[Union[torch.device, str]] = None,
     ) -> torch.device:
         if device is None:
@@ -330,7 +341,7 @@ class Autocast:
         return torch.device(device)
 
     @classmethod
-    def _ensure_metadata(
+    def _coerce_metadata(
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
@@ -342,7 +353,7 @@ class Autocast:
         if device_hint is None and meta is not None:
             with contextlib.suppress(Exception):
                 device_hint = torch.device(meta.device)
-        dev = cls._resolve_device(device_hint)
+        dev = cls._device(device_hint)
         if meta is None:
             meta = Metadata.for_device(dev)
         else:
@@ -375,15 +386,15 @@ class Autocast:
         return None
 
     @classmethod
-    def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        meta = cls._ensure_metadata(device)
+    def float_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+        meta = cls._coerce_metadata(device)
         candidates = getattr(meta, "float_dtypes", ())
         if candidates:
             return tuple(candidates)
         return (torch.float32,)
 
     @staticmethod
-    def _float8_dtypes() -> Tuple[torch.dtype, ...]:
+    def float8_formats() -> Tuple[torch.dtype, ...]:
         meta = Autocast._metadata
         if meta is not None and getattr(meta, "float8_dtypes", None):
             return tuple(meta.float8_dtypes)
@@ -404,15 +415,15 @@ class Autocast:
         return values
 
     @classmethod
-    def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        meta = cls._ensure_metadata(device)
+    def integer_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+        meta = cls._coerce_metadata(device)
         candidates = getattr(meta, "int_dtypes", ())
         if candidates:
             return tuple(candidates)
         return (torch.int64,)
 
     @classmethod
-    def _select_dtype(
+    def negotiate(
         cls: object,
         candidates: Tuple[torch.dtype, ...],
         *args: Any,
@@ -452,7 +463,7 @@ class Autocast:
         return fallback
 
     @classmethod
-    def _te_fp8_context(
+    def nvidia_float8(
         cls: object, device: torch.device, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
@@ -468,11 +479,11 @@ class Autocast:
                 raise AttributeError("transformer_engine.fp8_autocast missing")
         except Exception as exc:
             _LOGGER.debug("Autocast FP8 TE failed: %s", exc)
-            cls._fp8_backend = None
+            cls._preferred_fp8_backend = None
         return contexts
 
     @classmethod
-    def _ao_fp8_context(
+    def torch_float8(
         cls: object, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
@@ -488,11 +499,11 @@ class Autocast:
                 raise AttributeError("torchao.float8.fp8_autocast missing")
         except Exception as exc:
             _LOGGER.debug("Autocast FP8 torchao failed: %s", exc)
-            cls._fp8_backend = None
+            cls._preferred_fp8_backend = None
         return contexts
 
     @classmethod
-    def _int8_context(
+    def torch_int8(
         cls: object,
         device: torch.device,
         enabled: bool,
@@ -500,7 +511,7 @@ class Autocast:
         contexts: List[contextlib.AbstractContextManager[None]] = []
         if not enabled:
             return contexts
-        backend = cls._int_backend
+        backend = cls._preferred_int_backend
         if backend == "te":
             try:
                 te = importlib.import_module("transformer_engine.pytorch")
@@ -512,7 +523,7 @@ class Autocast:
                     raise AttributeError("transformer_engine.int8_autocast missing")
             except Exception as exc:
                 _LOGGER.debug("Autocast INT8 TE failed: %s", exc)
-                cls._int_backend = None
+                cls._preferred_int_backend = None
         elif backend == "ao":
             try:
                 quant_mod = importlib.import_module("torchao.quantization")
@@ -524,7 +535,7 @@ class Autocast:
                     raise AttributeError("torchao.quantization.int8_autocast missing")
             except Exception as exc:
                 _LOGGER.debug("Autocast INT8 torchao failed: %s", exc)
-                cls._int_backend = None
+                cls._preferred_int_backend = None
         return contexts
 
     @classmethod
@@ -566,8 +577,8 @@ class Autocast:
                 )
                 ):
                     int_backend = "ao"
-        cls._fp8_backend = backend
-        cls._int_backend = int_backend
+        cls._preferred_fp8_backend = backend
+        cls._preferred_int_backend = int_backend
         meta = metadata
         device: Optional[torch.device] = None
         if meta is not None:
@@ -581,7 +592,7 @@ class Autocast:
                     tensor = next(model.buffers())
             if tensor is not None:
                 device = tensor.device
-        meta = cls._ensure_metadata(device, metadata=meta)
+        meta = cls._coerce_metadata(device, metadata=meta)
         cls._metadata = meta
 
     @classmethod
@@ -593,10 +604,10 @@ class Autocast:
         metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
-        dev = cls._resolve_device(device)
-        meta = cls._ensure_metadata(dev, metadata=metadata)
+        dev = cls._device(device)
+        meta = cls._coerce_metadata(dev, metadata=metadata)
         amp_candidates = tuple(meta.float_dtypes) if meta.float_dtypes else (torch.float32,)
-        amp_dtype = cls._select_dtype(
+        amp_dtype = cls.negotiate(
             amp_candidates,
             fallback=torch.float32,
             logger=_LOGGER,
@@ -606,11 +617,11 @@ class Autocast:
         )
         contexts: List[contextlib.AbstractContextManager[None]] = []
 
-        backend = cls._resolve_fp8_backend(cls._fp8_backend, device=dev)
+        backend = cls._fp8_backend(cls._preferred_fp8_backend, device=dev)
         float8_dtypes = (
             tuple(meta.float8_dtypes)
             if meta.float8_dtypes
-            else cls._float8_dtypes()
+            else cls.float8_formats()
         )
         wants_fp8 = backend is not None
         if wants_fp8 and getattr(meta, "has_scale", False):
@@ -626,18 +637,18 @@ class Autocast:
                 )
         if wants_fp8:
             if backend == "te":
-                contexts.extend(cls._te_fp8_context(dev, True))
+                contexts.extend(cls.nvidia_float8(dev, True))
                 if not contexts:
-                    backend = cls._resolve_fp8_backend("ao", device=dev)
+                    backend = cls._fp8_backend("ao", device=dev)
                     if backend == "ao":
-                        contexts.extend(cls._ao_fp8_context(True))
+                        contexts.extend(cls.torch_float8(True))
             elif backend == "ao":
-                contexts.extend(cls._ao_fp8_context(True))
+                contexts.extend(cls.torch_float8(True))
             else:
                 _LOGGER.debug(
                     "Autocast FP8 backend '%s' unsupported; disabling", backend
                 )
-                cls._fp8_backend = None
+                cls._preferred_fp8_backend = None
 
         requested_dtype = amp_dtype
         if (
@@ -692,9 +703,9 @@ class Autocast:
     @classmethod
     @contextlib.contextmanager
     def suspend(
-        cls:object, device: Optional[Union[torch.device, str]] = None
+        cls: object, device: Optional[Union[torch.device, str]] = None
     ) -> contextlib.AbstractContextManager[None]:
-        dev = cls._resolve_device(device)
+        dev = cls._device(device)
         with contextlib.ExitStack() as stack:
             try:
                 stack.enter_context(
@@ -713,10 +724,10 @@ class Autocast:
         metadata: Optional[Metadata[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
-        dev = cls._resolve_device(device)
-        meta = cls._ensure_metadata(dev, metadata=metadata)
+        dev = cls._device(device)
+        meta = cls._coerce_metadata(dev, metadata=metadata)
         int_candidates = tuple(meta.int_dtypes) if meta.int_dtypes else (torch.int64,)
-        int_dtype = cls._select_dtype(
+        int_dtype = cls.negotiate(
             int_candidates,
             fallback=torch.int64,
             logger=_LOGGER,
@@ -724,12 +735,12 @@ class Autocast:
             device=dev,
             meta=meta,
         )
-        backend = cls._resolve_int_backend(cls._int_backend, device=dev)
-        contexts = cls._int8_context(dev, True) if backend else []
+        backend = cls._int_backend(cls._preferred_int_backend, device=dev)
+        contexts = cls.torch_int8(dev, True) if backend else []
         if not contexts and backend == "te":
-            fallback_backend = cls._resolve_int_backend("ao", device=dev)
+            fallback_backend = cls._int_backend("ao", device=dev)
             if fallback_backend == "ao":
-                contexts = cls._int8_context(dev, True)
+                contexts = cls.torch_int8(dev, True)
         if not contexts:
             contexts.append(contextlib.nullcontext())
 
@@ -817,27 +828,11 @@ try:
     QAT = _qat_module if hasattr(_qat_module, "initialize") else None
 except Exception:
     QAT = None
-
-
-def _ptq_unavailable(
-    model: nn.Module,
-    *args: Any,
-    **kwargs: Any,
-) -> tuple[nn.Module, bool, str]:
-    return (model, False, "PTQ backend unavailable")
-
-
 if ptq is None:
-    ptq = _ptq_unavailable
+    ptq = _is_ptq_unavailable
 
 
 if QAT is None:
-
-    class _QATUnavailable:
-        @staticmethod
-        def initialize(*args: Any, **kwargs: Any) -> Any:
-            raise RuntimeError("QAT backend unavailable")
-
     QAT = _QATUnavailable()
 
 
@@ -864,10 +859,10 @@ class Quantization:
 
     @classmethod
     def is_ptq_available(cls: object) -> bool:
-        return callable(cls.ptq) and cls.ptq is not _ptq_unavailable
+        return callable(cls.ptq) and cls.ptq is not _is_ptq_unavailable
 
     @classmethod
-    def prepare_qat(
+    def _prepare_qat(
         cls: object,
         model: nn.Module,
         *args: Any,
@@ -887,7 +882,7 @@ class Quantization:
         )
 
     @classmethod
-    def apply_ptq(
+    def _apply_ptq(
         cls: object,
         model: nn.Module,
         *args: Any,
@@ -907,7 +902,7 @@ class Quantization:
         )
 
     @classmethod
-    def enable_ptq(
+    def _enable_ptq(
         cls: object,
         model: nn.Module,
         *args: Any,
@@ -955,7 +950,7 @@ class Quantization:
         last_err: Optional[Exception] = None
         if cls.is_qat_available():
             try:
-                base_cfg = cls.prepare_qat(
+                base_cfg = cls._prepare_qat(
                     model,
                     dynamic_activations=dynamic_activations,
                     group_size=group_size,
@@ -972,7 +967,7 @@ class Quantization:
                 if logger:
                     logger(f"[INT8][QAT] prepare failed: {exc}")
         try:
-            m2, ok, why = cls.apply_ptq(
+            m2, ok, why = cls._apply_ptq(
                 model,
                 dynamic_activations=dynamic_activations,
                 group_size=group_size,
@@ -986,25 +981,9 @@ class Quantization:
             return (m2, True, f"PTQ({why})")
         return (model, False, f"PTQ failed: {why}")
 
-    @classmethod
-    def enable_prediction(
-        cls: object,
-        model: nn.Module,
-        *args: Any,
-        dynamic_activations: bool,
-        logger: Optional[Callable[[str], None]] = None,
-        **kwargs: Any,
-    ) -> tuple[nn.Module, bool, str]:
-        if not cls.is_available():
-            msg = "torchao.quantization not installed (INT8 disabled)"
-            if logger:
-                logger(f"[INT8] {msg}")
-            return (model, False, msg)
-        return cls.enable_ptq(model, dynamic_activations=dynamic_activations, logger=logger)
-
 class Fusion:
     @staticmethod
-    def _infer_optimal_dtype(
+    def negotiate(
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
         metadata: Optional[Metadata[Any]] = None,
@@ -1039,7 +1018,7 @@ class Fusion:
         )
 
     @staticmethod
-    def _module_reference_tensor(module: nn.Module) -> Optional[torch.Tensor]:
+    def _peek_layer(module: nn.Module) -> Optional[torch.Tensor]:
         with contextlib.suppress(StopIteration):
             return next(module.parameters())
         with contextlib.suppress(StopIteration):
@@ -1047,25 +1026,25 @@ class Fusion:
         return None
 
     @staticmethod
-    def _metadata_for(
+    def _coerce_metadata(
         model: nn.Module, metadata: Optional[Metadata[Any]] = None
     ) -> Metadata[Any]:
         Autocast.configure(model, metadata=metadata)
         meta = Autocast._metadata
         if meta is None:
-            ref = Fusion._module_reference_tensor(model)
+            ref = Fusion._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
             meta = Metadata.for_device(dev)
             Autocast.configure(model, metadata=meta)
         return meta
 
     @staticmethod
-    def _align_module_like(
+    def _align_layers(
         src: nn.Module,
         dst: nn.Module,
         params_dtype: Optional[torch.dtype],
     ) -> None:
-        ref = Fusion._module_reference_tensor(src)
+        ref = Fusion._peek_layer(src)
         if ref is not None:
             with contextlib.suppress(Exception):
                 dst.to(device=ref.device)
@@ -1074,14 +1053,14 @@ class Fusion:
                 dst.to(dtype=params_dtype)
 
     @staticmethod
-    def _copy_state(
+    def _clone_state(
         src: nn.Module, dst: nn.Module, params_dtype: Optional[torch.dtype]
     ) -> None:
         try:
             state = src.state_dict()
         except Exception:
             return
-        ref = Fusion._module_reference_tensor(dst)
+        ref = Fusion._peek_layer(dst)
         device = ref.device if ref is not None else None
         converted = {}
         for key, value in state.items():
@@ -1098,7 +1077,7 @@ class Fusion:
             dst.load_state_dict(converted, strict=False)
 
     @staticmethod
-    def _make_te_linear(
+    def _nvidia_linear(
         module: nn.Linear,
         params_dtype: Optional[torch.dtype],
         te: Any,
@@ -1117,12 +1096,12 @@ class Fusion:
             replacement = te_linear(**kwargs)
         except Exception:
             return None
-        Fusion._align_module_like(module, replacement, params_dtype)
-        Fusion._copy_state(module, replacement, params_dtype)
+        Fusion._align_layers(module, replacement, params_dtype)
+        Fusion._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
-    def _make_te_layer_norm(
+    def _nvidia_layer_norm(
         module: nn.LayerNorm,
         params_dtype: Optional[torch.dtype],
         te: Any,
@@ -1140,13 +1119,13 @@ class Fusion:
             replacement = te_layer_norm(**kwargs)
         except Exception:
             return None
-        Fusion._align_module_like(module, replacement, params_dtype)
+        Fusion._align_layers(module, replacement, params_dtype)
         if module.elementwise_affine:
-            Fusion._copy_state(module, replacement, params_dtype)
+            Fusion._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
-    def _make_te_rms_norm(
+    def _nvidia_rms_norm(
         module: nn.Module,
         params_dtype: Optional[torch.dtype],
         te: Any,
@@ -1166,22 +1145,12 @@ class Fusion:
             replacement = te_rms_norm(**kwargs)
         except Exception:
             return None
-        Fusion._align_module_like(module, replacement, params_dtype)
-        Fusion._copy_state(module, replacement, params_dtype)
+        Fusion._align_layers(module, replacement, params_dtype)
+        Fusion._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
-    def _fuse_sequential_to_te(
-        model: nn.Module, *, params_dtype: Optional[torch.dtype]
-    ) -> Tuple[nn.Module, int]:
-        try:
-            importlib.import_module("transformer_engine.pytorch")
-        except Exception:
-            return (model, 0)
-        return (model, 0)
-
-    @staticmethod
-    def _apply_te_module(
+    def _to_nvidia_layers(
         model: nn.Module,
         *args: Any,
         apply_te_linear: bool,
@@ -1202,11 +1171,11 @@ class Fusion:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = Fusion._make_te_linear(
+                        replacement = Fusion._nvidia_linear(
                             child, params_dtype, te
                         )
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = Fusion._make_te_layer_norm(
+                    replacement = Fusion._nvidia_layer_norm(
                         child, params_dtype, te
                     )
                 else:
@@ -1216,7 +1185,7 @@ class Fusion:
                         and rms_cls is not None
                         and isinstance(child, rms_cls)
                     ):
-                        replacement = Fusion._make_te_rms_norm(
+                        replacement = Fusion._nvidia_rms_norm(
                             child, params_dtype, te
                         )
                 if replacement is not None:
@@ -1230,7 +1199,7 @@ class Fusion:
         return (model, count)
 
     @staticmethod
-    def _apply_te_attention(
+    def _to_nvidia_attention(
         model: nn.Module, *args: Any, params_dtype: Optional[torch.dtype], **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         swapped = 0
@@ -1263,11 +1232,8 @@ class Fusion:
         fp8_ok, why = is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Fusion._infer_optimal_dtype(dev, metadata=metadata)
-        model, n_fused = Fusion._fuse_sequential_to_te(
-            model, params_dtype=params_dtype
-        )
-        model, n_basic = Fusion._apply_te_module(
+        params_dtype = Fusion.negotiate(dev, metadata=metadata)
+        model, n_layers = Fusion._to_nvidia_layers(
             model,
             apply_te_linear=True,
             apply_te_layer_norm=True,
@@ -1276,30 +1242,30 @@ class Fusion:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = Fusion._apply_te_attention(
+            model, attn_swapped = Fusion._to_nvidia_attention(
                 model, params_dtype=params_dtype
             )
         except Exception:
             attn_swapped = 0
-        n_total = (n_fused or 0) + (n_basic or 0) + (attn_swapped or 0)
+        n_total = (n_layers or 0) + (attn_swapped or 0)
         if logger:
             logger(
-                f"[TE] swapped {n_total} modules (fused:{n_fused}, basic:{n_basic}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}"
+                f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}"
             )
         return (
             model,
             n_total > 0,
-            f"TE applied (swapped {n_total}, dtype={params_dtype}, fp8={('on' if fp8_ok else 'off')}, backend={te_backend})",
+            f"TE applied (swapped {n_total}, layers={n_layers}, attn={attn_swapped}, dtype={params_dtype}, fp8={('on' if fp8_ok else 'off')}, backend={te_backend})",
         )
 
     @staticmethod
-    def _try_enable_te_training(
+    def _enable_nvidia_training(
         model: nn.Module,
         params_dtype: torch.dtype,
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped_model, n = Fusion._apply_te_module(
+            swapped_model, n = Fusion._to_nvidia_layers(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1318,7 +1284,7 @@ class Fusion:
             return (model, False, f"TE swap failed: {exc}")
 
     @staticmethod
-    def _try_enable_ao_training(
+    def _enable_torchao_training(
         model: nn.Module,
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
@@ -1335,13 +1301,13 @@ class Fusion:
             return (model, False, f"torchao convert failed: {exc}")
 
     @staticmethod
-    def _try_enable_te_inference_swap(
+    def _enable_nvidia_inference(
         model: nn.Module,
         params_dtype: torch.dtype,
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped, n = Fusion._apply_te_module(
+            swapped, n = Fusion._to_nvidia_layers(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1362,7 +1328,7 @@ class Fusion:
             return (model, False, f"TE swap failed: {exc}")
 
     @staticmethod
-    def _try_use_existing_te(
+    def _reuse_nvidia_layers(
         model: nn.Module,
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
@@ -1382,7 +1348,7 @@ class Fusion:
         return (model, False, "TE layers not present")
 
     @staticmethod
-    def _try_enable_ao_inference(
+    def _enable_torchao_inference(
         model: nn.Module,
         dynamic_activations: bool,
         logger: Optional[Callable[[str], None]],
@@ -1413,14 +1379,14 @@ class Fusion:
         metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._metadata_for(model, metadata)
+        meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
         if getattr(meta, "has_scale", False):
-            float8_dtypes = Autocast._float8_dtypes()
+            float8_dtypes = Autocast.float8_formats()
             if not any(
                 is_scale_safe(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
@@ -1431,15 +1397,15 @@ class Fusion:
                     )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Fusion._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = Fusion.negotiate(device, metadata=meta)
 
         for backend in ("te", "torchao"):
             if backend == "te":
-                m2, ok2, why = Fusion._try_enable_te_training(
+                m2, ok2, why = Fusion._enable_nvidia_training(
                     model, params_dtype, logger
                 )
             else:
-                m2, ok2, why = Fusion._try_enable_ao_training(model, logger)
+                m2, ok2, why = Fusion._enable_torchao_training(model, logger)
             if ok2:
                 if logger:
                     logger(f"[FP8] training enabled via {why} ({reason})")
@@ -1456,14 +1422,14 @@ class Fusion:
         metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._metadata_for(model, metadata)
+        meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         ok, reason = is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
         if getattr(meta, "has_scale", False):
-            float8_dtypes = Autocast._float8_dtypes()
+            float8_dtypes = Autocast.float8_formats()
             if not any(
                 is_scale_safe(dtype, meta, safety_margin=2.0)
                 for dtype in float8_dtypes
@@ -1474,7 +1440,7 @@ class Fusion:
                     )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Fusion._infer_optimal_dtype(device, metadata=meta)
+        params_dtype = Fusion.negotiate(device, metadata=meta)
         dynamic_activations = not (
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
@@ -1482,13 +1448,13 @@ class Fusion:
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
-                m2, ok2, why = Fusion._try_enable_te_inference_swap(
+                m2, ok2, why = Fusion._enable_nvidia_inference(
                     model, params_dtype, logger
                 )
             elif step == "te_present":
-                m2, ok2, why = Fusion._try_use_existing_te(model, logger)
+                m2, ok2, why = Fusion._reuse_nvidia_layers(model, logger)
             else:
-                m2, ok2, why = Fusion._try_enable_ao_inference(
+                m2, ok2, why = Fusion._enable_torchao_inference(
                     model, dynamic_activations, logger
                 )
             if ok2:
@@ -1507,7 +1473,7 @@ class Fusion:
         metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._metadata_for(model, metadata)
+        meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1532,7 +1498,7 @@ class Fusion:
         metadata: Optional[Metadata[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._metadata_for(model, metadata)
+        meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1540,7 +1506,7 @@ class Fusion:
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
         )
-        m2, ok, why = Quantization.enable_prediction(
+        m2, ok, why = Quantization._enable_ptq(
             model, dynamic_activations=dynamic_activations, logger=logger
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
@@ -1548,7 +1514,7 @@ class Fusion:
 
     # === TensorDict recursive wrapping with provenance ===
     @staticmethod
-    def _wrap_leaf_tdmodule(
+    def _wrap_leaf_layer(
         module: nn.Module,
         in_key: str,
         out_key: str,
@@ -1597,7 +1563,7 @@ class Fusion:
         return f"{parent_key}__{name}" if parent_key else name
 
     @classmethod
-    def _wrap_recursive(
+    def _wrap_recursively(
         cls,
         module: nn.Module,
         *,
@@ -1610,7 +1576,7 @@ class Fusion:
         children = list(module.named_children())
         if not children:
             return TensorDictSequential(
-                cls._wrap_leaf_tdmodule(
+                cls._wrap_leaf_layer(
                     module,
                     in_key,
                     out_key,
@@ -1626,7 +1592,7 @@ class Fusion:
             next_key = cls._auto_key(current_key, name)
             next_path = f"{parent_path}.{name}" if parent_path else name
             if any(True for _ in child.named_children()):
-                sub_seq = cls._wrap_recursive(
+                sub_seq = cls._wrap_recursively(
                     child,
                     in_key=current_key,
                     out_key=next_key,
@@ -1635,7 +1601,7 @@ class Fusion:
                 seq.append(sub_seq)
             else:
                 seq.append(
-                    cls._wrap_leaf_tdmodule(
+                    cls._wrap_leaf_layer(
                         child,
                         current_key,
                         next_key,
@@ -1682,7 +1648,7 @@ class Fusion:
     ) -> nn.Module:
         """Wrap ``module`` in a TensorDict pipeline with optional loss handling."""
 
-        pipeline: TensorDictSequential = cls._wrap_recursive(
+        pipeline: TensorDictSequential = cls._wrap_recursively(
             module,
             in_key=in_key,
             out_key=out_key,
