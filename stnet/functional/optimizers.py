@@ -30,14 +30,14 @@ from ..data.stats import Metadata
 from .fx import Autocast, Fusion, is_scale_safe
 
 
-try:  # pragma: no cover - optional dependency
+try:
     from torch.optim.swa_utils import AveragedModel as _SWA
     from torch.optim.swa_utils import SWALR
     from torch.optim.swa_utils import update_bn as _update_bn
-except Exception:  # pragma: no cover - defensive fallback
-    _SWA = None  # type: ignore[assignment]
-    SWALR = None  # type: ignore[assignment]
-    _update_bn = None  # type: ignore[assignment]
+except Exception:
+    _SWA = None
+    SWALR = None
+    _update_bn = None
 
 
 class _TensorDictCompat(nn.Module):
@@ -46,19 +46,19 @@ class _TensorDictCompat(nn.Module):
         self._averaged_module = averaged_module
         self._key = key
 
-    def forward(self, x: torch.Tensor) -> Any:  # pragma: no cover - thin wrapper
+    def forward(self, x: torch.Tensor) -> Any:
         td = TensorDict({self._key: x}, batch_size=[x.shape[0]], device=x.device)
         return self._averaged_module(td)
 
 
 def stochastic_weight_average(
     model: nn.Module,
-    *,
+    *args: Any,
     device: Optional[torch.device] = None,
     use_buffers: bool = True,
     avg_fn: Optional[Any] = None,
+    **kwargs: Any,
 ) -> "StochasticWeightAverage":
-    """Factory helper mirroring the signature of :class:`StochasticWeightAverage`."""
 
     return StochasticWeightAverage(
         model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
@@ -263,15 +263,15 @@ class AdamW:
 
 
 class StochasticWeightAverage:
-    """Utility wrapper around :class:`torch.optim.swa_utils.AveragedModel`."""
 
     def __init__(
         self,
         model: nn.Module,
-        *,
+        *args: Any,
         device: Optional[torch.device] = None,
         use_buffers: bool = True,
         avg_fn: Optional[Any] = None,
+        **kwargs: Any,
     ) -> None:
         if _SWA is None:
             raise RuntimeError("torch.optim.swa_utils is not available")
@@ -287,7 +287,6 @@ class StochasticWeightAverage:
         return self._source
 
     def update_weight(self, model: Optional[nn.Module] = None) -> None:
-        """Update the running average parameters from ``model``."""
 
         target = model if model is not None else self._source
         if target is None:
@@ -298,7 +297,6 @@ class StochasticWeightAverage:
 
     @contextlib.contextmanager
     def reduction(self, model: nn.Module) -> Iterator[None]:
-        """Temporarily swap ``model`` parameters with the averaged copy."""
 
         backup: Dict[str, torch.Tensor] = {}
         try:
@@ -317,11 +315,11 @@ class StochasticWeightAverage:
     def update_batch_norm(
         self,
         feature_iter: Iterable[TensorDictBase | Dict[str, Any] | torch.Tensor | Any],
-        *,
+        *args: Any,
         device: Optional[torch.device] = None,
         in_key: str = "features",
+        **kwargs: Any,
     ) -> None:
-        """Run ``update_bn`` using batches from ``feature_iter``."""
 
         if _update_bn is None:
             raise RuntimeError("torch.optim.swa_utils.update_bn is not available")
