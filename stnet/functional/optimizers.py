@@ -32,7 +32,8 @@ from .fx import Autocast, Fusion, is_scale_safe
 
 try:  # pragma: no cover - optional dependency
     from torch.optim.swa_utils import AveragedModel as _SWA
-    from torch.optim.swa_utils import SWALR, update_bn as _update_bn
+    from torch.optim.swa_utils import SWALR
+    from torch.optim.swa_utils import update_bn as _update_bn
 except Exception:  # pragma: no cover - defensive fallback
     _SWA = None  # type: ignore[assignment]
     SWALR = None  # type: ignore[assignment]
@@ -84,7 +85,7 @@ class AdamW:
         )
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
-            ref_tensor = Fusion._module_reference_tensor(model_or_params)
+            ref_tensor = Fusion._peek_layer(model_or_params)
         dev: torch.device
         if metadata is not None:
             dev = torch.device(metadata.device)
@@ -92,7 +93,7 @@ class AdamW:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = Autocast._coerce_metadata(dev, metadata=metadata)
+        meta = Autocast.coerce_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
@@ -177,14 +178,14 @@ class AdamW:
         )
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
-            ref_tensor = Fusion._module_reference_tensor(model_or_params)
+            ref_tensor = Fusion._peek_layer(model_or_params)
         if metadata is not None:
             dev = torch.device(metadata.device)
         elif ref_tensor is not None:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = Autocast._coerce_metadata(dev, metadata=metadata)
+        meta = Autocast.coerce_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:

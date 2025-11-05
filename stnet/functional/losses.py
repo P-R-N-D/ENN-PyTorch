@@ -10,15 +10,6 @@ from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
 
-def _expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
-    try:
-        if mask.shape != prediction.shape:
-            mask = mask.expand_as(prediction)
-    except Exception:
-        pass
-    return mask
-
-
 def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
 ) -> Tuple[int, ...]:
@@ -69,12 +60,12 @@ def _to_tuple(x: Any) -> Tuple[int, ...]:
     return tuple((int(v) for v in x))
 
 
-def normal_cdf(x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _normal_cdf(x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
 
-def students_t_cdf(
+def _students_t_cdf(
     x: torch.Tensor, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     t = (x - loc) / torch.clamp(scale, min=1e-12)
@@ -91,7 +82,7 @@ def students_t_cdf(
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
 
-def fft_nd(
+def _fft_nd(
     x: torch.Tensor,
     shape: Sequence[int],
     *args: Any,
@@ -110,7 +101,7 @@ def fft_nd(
     return torch.fft.ifftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
 
 
-def nufft_nd(
+def _nufft_nd(
     x_cplx: torch.Tensor,
     omega: torch.Tensor,
     shape: Sequence[int],
@@ -149,6 +140,15 @@ def nufft_nd(
             fk = plan.execute(x_cplx[b])
             out_list.append(fk.unsqueeze(0))
     return torch.cat(out_list, dim=0)
+
+
+def expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
+    try:
+        if mask.shape != prediction.shape:
+            mask = mask.expand_as(prediction)
+    except Exception:
+        pass
+    return mask
 
 
 class MultipleQuantileLoss(nn.Module):
@@ -377,7 +377,7 @@ class StandardNormalLoss(nn.Module):
                 except NotImplementedError:
                     one_tail = torch.clamp(
                         1.0
-                        - normal_cdf(
+                        - _normal_cdf(
                             x,
                             torch.tensor(0.0, device=x.device, dtype=x.dtype),
                             torch.tensor(1.0, device=x.device, dtype=x.dtype),
@@ -573,7 +573,7 @@ class StudentsTLoss(nn.Module):
             hi = torch.full_like(df, 50.0, dtype=dtype, device=device)
             for _ in range(32):
                 mid = (lo + hi) / 2.0
-                cdf_mid = students_t_cdf(mid, df, loc, scale)
+                cdf_mid = _students_t_cdf(mid, df, loc, scale)
                 mask = cdf_mid < target
                 lo = torch.where(mask, mid, lo)
                 hi = torch.where(mask, hi, mid)
@@ -605,7 +605,7 @@ class StudentsTLoss(nn.Module):
                     )
                 except NotImplementedError:
                     one_tail = torch.clamp(
-                        1.0 - students_t_cdf(x, df, mu, scale),
+                        1.0 - _students_t_cdf(x, df, mu, scale),
                         min=self.eps,
                     )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
@@ -678,14 +678,14 @@ class DataFidelityLoss(nn.Module):
         y = target_flat.view(B, *shape)
         match self.mode:
             case "fft":
-                Xk = fft_nd(
+                Xk = _fft_nd(
                     x.to(torch.complex64) if not torch.is_complex(x) else x,
                     shape,
                     real_input=False,
                     inverse=False,
                     norm=self.fft_norm,
                 )
-                Yk = fft_nd(
+                Yk = _fft_nd(
                     y.to(torch.complex64) if not torch.is_complex(y) else y,
                     shape,
                     real_input=False,
@@ -696,14 +696,14 @@ class DataFidelityLoss(nn.Module):
                 match self.backend:
                     case None | "cufinufft":
                         try:
-                            Xk = nufft_nd(
+                            Xk = _nufft_nd(
                                 x.to(torch.complex64).unsqueeze(1),
                                 self.ktraj,
                                 shape,
                                 nufft_type=2,
                                 eps=self.nufft_eps,
                             )
-                            Yk = nufft_nd(
+                            Yk = _nufft_nd(
                                 y.to(torch.complex64).unsqueeze(1),
                                 self.ktraj,
                                 shape,
@@ -711,14 +711,14 @@ class DataFidelityLoss(nn.Module):
                                 eps=self.nufft_eps,
                             )
                         except Exception:
-                            Xk = fft_nd(
+                            Xk = _fft_nd(
                                 x.to(torch.complex64),
                                 shape,
                                 real_input=False,
                                 inverse=False,
                                 norm=self.fft_norm,
                             )
-                            Yk = fft_nd(
+                            Yk = _fft_nd(
                                 y.to(torch.complex64),
                                 shape,
                                 real_input=False,
@@ -798,7 +798,7 @@ class TiledLoss(nn.Module):
                 return None
             case "finite":
                 try:
-                    return _expand_to_pred(torch.isfinite(target), pred)
+                    return expand_to_pred(torch.isfinite(target), pred)
                 except Exception:
                     return None
             case "neq":
@@ -810,7 +810,7 @@ class TiledLoss(nn.Module):
                         dtype=target.dtype,
                         device=target.device,
                     )
-                    return _expand_to_pred(target != base, pred)
+                    return expand_to_pred(target != base, pred)
                 except Exception:
                     return None
             case _:
