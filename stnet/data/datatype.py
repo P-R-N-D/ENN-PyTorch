@@ -1,12 +1,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
 
 import numpy as np
 import torch
+from tensordict import TensorDict, TensorDictBase
 
-_CANONICAL_DTYPE_MAP: Dict[str, Dict[str, Any]] = {
+_CANONICAL_DTYPES: Dict[str, Dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
         "numpy": np.float64,
@@ -94,7 +95,10 @@ _PLATFORM_ALIASES = {
     "canonical": "name",
 }
 
-def _canonical_dtype_name(src: Any) -> str:
+BatchLike = Union[Mapping[str, Any], TensorDictBase]
+
+
+def _canonical_dtype(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
     if isinstance(src, torch.dtype):
@@ -115,20 +119,20 @@ def _canonical_dtype_name(src: Any) -> str:
         key = key.split(".", 1)[1]
     key = key.lstrip("<>|=")
     canonical = _DTYPE_ALIASES.get(key, key)
-    if canonical not in _CANONICAL_DTYPE_MAP:
+    if canonical not in _CANONICAL_DTYPES:
         raise TypeError(f"unsupported dtype: {src!r}")
     return canonical
 
 
-def convert(src: Any, platform: str) -> Any:
+def to_platform_dtype(src: Any, platform: str) -> Any:
     platform_key = str(platform).strip().lower()
     normalized = _PLATFORM_ALIASES.get(platform_key)
     if normalized is None:
         raise ValueError(f"unsupported platform: {platform!r}")
-    canonical = _canonical_dtype_name(src)
+    canonical = _canonical_dtype(src)
     if normalized == "name":
         return canonical
-    mapping = _CANONICAL_DTYPE_MAP.get(canonical)
+    mapping = _CANONICAL_DTYPES.get(canonical)
     if mapping is None or normalized not in mapping:
         raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
     return mapping[normalized]
@@ -142,3 +146,82 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
         if callable(method):
             return method()
     return torch.as_tensor(obj)
+
+
+def _get_batch_size(d: Mapping[str, Any]) -> list[int] | list:
+    for value in d.values():
+        if torch.is_tensor(value) and value.ndim >= 1:
+            return [value.shape[0]]
+    return []
+
+
+def to_tensordict(
+    batch: BatchLike,
+    *,
+    device: Optional[torch.device] = None,
+    batch_size: Optional[Iterable[int]] = None,
+) -> TensorDict:
+    """Convert a plain mapping or TensorDict into a :class:`TensorDict` instance."""
+
+    if isinstance(batch, TensorDictBase):
+        return batch.to(device) if device is not None else batch
+    if not isinstance(batch, Mapping):
+        raise TypeError(f"Unexpected batch type: {type(batch)}")
+    resolved_batch = list(batch_size) if batch_size is not None else _get_batch_size(batch)
+    td = TensorDict({}, batch_size=resolved_batch, device=device)
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            td.set(key, value.to(device) if device is not None else value)
+        else:
+            td.set_non_tensor(key, value)
+    return td
+
+
+@torch.no_grad()
+def to_dict(
+    td_or_dict: Union[TensorDictBase, Mapping[str, Any]],
+    *,
+    detach: bool = True,
+    cpu: bool = True,
+    keys: Optional[Iterable[str]] = None,
+) -> Dict[str, Any]:
+    """Return a ``dict`` from a :class:`TensorDict` optionally detaching tensors."""
+
+    if isinstance(td_or_dict, TensorDictBase):
+        td = td_or_dict
+        items = ((key, td.get(key)) for key in (keys or td.keys()))
+        out: Dict[str, Any] = {}
+        for key, value in items:
+            if torch.is_tensor(value):
+                tensor = value.detach() if detach else value
+                if cpu and tensor.is_cuda:
+                    tensor = tensor.cpu()
+                out[key] = tensor
+            elif isinstance(value, TensorDictBase):
+                out[key] = to_dict(value, detach=detach, cpu=cpu)
+            else:
+                out[key] = value
+        return out
+    out: Dict[str, Any] = {}
+    for key, value in td_or_dict.items():
+        if torch.is_tensor(value):
+            tensor = value.detach() if detach else value
+            tensor = tensor.cpu() if cpu and tensor.is_cuda else tensor
+            out[key] = tensor
+        else:
+            out[key] = value
+    return out
+
+
+def to_tuple(x: Any) -> Tuple:
+    if isinstance(x, tuple):
+        return x
+    elif isinstance(x, list):
+        return tuple(x)
+    elif isinstance(x, torch.Tensor):
+        return tuple(x.flatten().detach().cpu().tolist())
+    elif hasattr(x, "tolist"):
+        values = x.tolist()
+        return tuple(values if isinstance(values, (list, tuple)) else [values])
+    else:
+        return (x,)

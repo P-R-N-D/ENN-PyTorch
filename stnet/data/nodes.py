@@ -1,4 +1,5 @@
-# -*- coding: utf-8 -*-
+"""Data loading and prefetching primitives for STNet."""
+
 from __future__ import annotations
 
 import json
@@ -22,20 +23,26 @@ from typing import (
 )
 
 import torch
-from torch.utils.data import RandomSampler, SequentialSampler
 from tensordict import MemoryMappedTensor
+from torch.utils.data import RandomSampler, SequentialSampler
+
 try:
     from torchdata.nodes import IterableWrapper, MapStyleWrapper
 except Exception:
     from torchdata.datapipes.iter import IterableWrapper
+
     MapStyleWrapper = None
 
-BatchSamplerBase = IterableWrapper
-
+if MapStyleWrapper is not None:
+    BatchSamplerBase = MapStyleWrapper
+else:
+    BatchSamplerBase = IterableWrapper
 try:
     import psutil
 except Exception:
     psutil = None
+
+from .datatype import to_platform_dtype
 
 # --- Replace kvikio+CuPy based GDS loader with PyTorch torch.cuda.gds -----------
 # We prefer the upstream prototype GDS bindings shipped with PyTorch (>=2.7).
@@ -48,14 +55,12 @@ except Exception:  # CPU-only build or missing GDS runtime
     _torch_gds = None
     _HAS_TORCH_GDS = False
 
-from .datatype import convert
-
 
 _INT_PROMOTION_TARGET = torch.int64
 _FLOAT_PROMOTION_TARGET = torch.float64
 
 
-def _promote_storage_dtype(tensor: torch.Tensor) -> torch.Tensor:
+def _to_high_precision(tensor: torch.Tensor) -> torch.Tensor:
 
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(tensor)
@@ -77,7 +82,7 @@ def _read_meta(memmap_dir: str) -> Dict[str, Any]:
         return json.load(handle)
 
 
-def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
+def _resolve_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
     value = meta.get(key)
     if value is None:
         suffix = "_dtype"
@@ -91,12 +96,12 @@ def _resolve_memmap_dtype(meta: Dict[str, Any], key: str) -> torch.dtype:
     if value is None:
         raise ValueError(f"missing dtype metadata for {key}")
     try:
-        return convert(value, "torch")
+        return to_platform_dtype(value, "torch")
     except Exception as exc:
         raise TypeError(f"invalid dtype metadata for {key}: {value!r}") from exc
 
 
-def _host_free_bytes() -> int:
+def _system_free_mem() -> int:
     if psutil is not None:
         try:
             return int(psutil.virtual_memory().available)
@@ -113,7 +118,7 @@ def _host_free_bytes() -> int:
     return 0
 
 
-def _device_free_bytes(dev: torch.device) -> int:
+def _device_free_mem(dev: torch.device) -> int:
     try:
         kind = getattr(dev, "type", str(dev))
         if kind == "cuda" and torch.cuda.is_available():
@@ -186,8 +191,8 @@ class SampleReader:
         **kwargs: Any,
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
-        features = _promote_storage_dtype(torch.as_tensor(data["features"]).detach())
-        labels = _promote_storage_dtype(torch.as_tensor(data["labels"]).detach())
+        features = _to_high_precision(torch.as_tensor(data["features"]).detach())
+        labels = _to_high_precision(torch.as_tensor(data["labels"]).detach())
         features = features.cpu().contiguous()
         labels = labels.cpu().contiguous()
         if features.shape[0] != labels.shape[0]:
@@ -219,8 +224,8 @@ class SampleReader:
             "N": count,
             "feature_dim": feat_dim,
             "label_shape": label_shape,
-            "features_dtype": convert(features.dtype, "name"),
-            "labels_dtype": convert(labels.dtype, "name"),
+            "features_dtype": to_platform_dtype(features.dtype, "name"),
+            "labels_dtype": to_platform_dtype(labels.dtype, "name"),
             "fractions": [float(train_frac), float(val_frac)],
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
@@ -270,8 +275,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
-        label_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
+        feat_dtype = _resolve_dtype(meta, "features_dtype")
+        label_dtype = _resolve_dtype(meta, "labels_dtype")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -298,7 +303,7 @@ class SampleReader:
     def __len__(self) -> int:
         return len(self._indices())
 
-    def batch_range(
+    def iter_batch(
         self, start: int, end: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         meta = self._load_meta()
@@ -314,8 +319,8 @@ class SampleReader:
         label_path = os.path.join(
             self.dir, meta.get("labels_filename", "labels.mmt")
         )
-        feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
-        label_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
+        feat_dtype = _resolve_dtype(meta, "features_dtype")
+        label_dtype = _resolve_dtype(meta, "labels_dtype")
         feat_mmt = MemoryMappedTensor.from_filename(
             feat_path, dtype=feat_dtype, shape=(total, feat_dim)
         )
@@ -353,7 +358,7 @@ class BatchReader:
         index = int(self._start)
         while index < self._end:
             nxt = min(index + self._batch, self._end)
-            xb, yb = self._mmts.batch_range(index, nxt)
+            xb, yb = self._mmts.iter_batch(index, nxt)
             yield {"X": xb, "Y": yb}
             index = nxt
 
@@ -395,8 +400,8 @@ if _HAS_TORCH_GDS and torch.cuda.is_available():
             label_shape = list(meta["label_shape"])
             self._label_shape = tuple(label_shape)
             self._label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-            self._feat_dtype = _resolve_memmap_dtype(meta, "features_dtype")
-            self._lab_dtype = _resolve_memmap_dtype(meta, "labels_dtype")
+            self._feat_dtype = _resolve_dtype(meta, "features_dtype")
+            self._lab_dtype = _resolve_dtype(meta, "labels_dtype")
             self._feat_path = os.path.join(self._mmts.dir, meta.get("features_bin_filename", "features.bin"))
             self._lab_path = os.path.join(self._mmts.dir, meta.get("labels_bin_filename", "labels.bin"))
             if not (os.path.exists(self._feat_path) and os.path.exists(self._lab_path)):
@@ -644,24 +649,24 @@ class DevicePrefetcher(Iterator[Any]):
             return sum((self._bytes(value) for value in obj.values()))
         return 0
 
-    def _guard_host_bytes(self, need: int) -> None:
+    def _throttle_system_io(self, need: int) -> None:
         if not self._mem_bp or need <= 0:
             return
         guard = max(0, int(self._host_guard))
         while True:
-            free = _host_free_bytes()
+            free = _system_free_mem()
             if free <= 0 or free - guard >= need:
                 break
             time.sleep(self._bp_sleep)
 
-    def _guard_device_bytes(self, need: int) -> None:
+    def _throttle_device_io(self, need: int) -> None:
         if not self._mem_bp or need <= 0:
             return
         if self._backend not in {"cuda", "xpu", "mps"}:
             return
         guard = max(0, int(self._gpu_guard))
         while True:
-            free = _device_free_bytes(self._dev)
+            free = _device_free_mem(self._dev)
             if free <= 0 or free - guard >= need:
                 break
             time.sleep(self._bp_sleep)
@@ -693,7 +698,7 @@ class DevicePrefetcher(Iterator[Any]):
                 )
             )
             if self._mem_bp and need > 0:
-                self._guard_host_bytes(need)
+                self._throttle_system_io(need)
             with suppress(Exception):
                 return tensor.pin_memory()
         return tensor
@@ -723,7 +728,7 @@ class DevicePrefetcher(Iterator[Any]):
     def _allocate_static_like(self, obj: Any) -> Any:
         return self._map(obj, self._allocate_tensor_like)
 
-    def _copy_structure(self, dst_obj: Any, src_obj: Any) -> Any:
+    def _copy(self, dst_obj: Any, src_obj: Any) -> Any:
         if isinstance(dst_obj, torch.Tensor) and isinstance(src_obj, torch.Tensor):
             dtype = self._amp_dtype or src_obj.dtype
             src_tensor = src_obj.to(dtype=dtype) if dst_obj.dtype != dtype else src_obj
@@ -734,17 +739,17 @@ class DevicePrefetcher(Iterator[Any]):
             return dst_obj
         if isinstance(dst_obj, (list, tuple)) and isinstance(src_obj, (list, tuple)):
             return type(dst_obj)(
-                (self._copy_structure(d, s) for d, s in zip(dst_obj, src_obj))
+                (self._copy(d, s) for d, s in zip(dst_obj, src_obj))
             )
         if isinstance(dst_obj, dict) and isinstance(src_obj, dict):
             return {
-                key: self._copy_structure(dst_obj[key], src_obj[key])
+                key: self._copy(dst_obj[key], src_obj[key])
                 for key in dst_obj.keys() & src_obj.keys()
             }
         return dst_obj
 
-    def _copy_into(self, dst: Any, src: Any) -> Any:
-        return self._copy_structure(dst, src)
+    def _clone_to(self, dst: Any, src: Any) -> Any:
+        return self._copy(dst, src)
 
     def _current_stream(self) -> Any:
         if self._backend == "cuda":
@@ -755,7 +760,7 @@ class DevicePrefetcher(Iterator[Any]):
             return torch.mps.current_stream()
         return None
 
-    def _stream_ctx(self, stream: Any) -> Any:
+    def _stream_context(self, stream: Any) -> Any:
         if stream is None:
             return nullcontext()
         if self._backend == "cuda":
@@ -769,16 +774,16 @@ class DevicePrefetcher(Iterator[Any]):
     def _enqueue(self, batch: Any, slot: int, expected_bytes: Optional[int] = None) -> None:
         stream = self._streams[slot] if self._streams else None
         start = time.perf_counter()
-        with self._stream_ctx(stream):
+        with self._stream_context(stream):
             need = expected_bytes if expected_bytes is not None else self._bytes(batch)
             if need > 0:
-                self._guard_device_bytes(need)
+                self._throttle_device_io(need)
             if self._graph_enabled:
                 if self._static is None:
                     self._static = self._allocate_static_like(
                         self._to_device(batch)
                     )
-                moved = self._copy_into(self._static, self._to_device(batch))
+                moved = self._clone_to(self._static, self._to_device(batch))
             else:
                 moved = self._to_device(batch)
         end = time.perf_counter()
@@ -803,7 +808,7 @@ class DevicePrefetcher(Iterator[Any]):
                 break
             need = self._bytes(batch)
             if self._mem_bp and need > 0:
-                self._guard_host_bytes(need)
+                self._throttle_system_io(need)
             batch = self._pin_cpu(batch)
             slot = self._rr % self._slots
             self._enqueue(batch, slot, expected_bytes=need)
@@ -896,10 +901,10 @@ class DevicePrefetcher(Iterator[Any]):
         with suppress(Exception):
             self.close()
 
-    def graphs_capture(self, capture_fn: Callable[[Any], Any]) -> bool:
+    def capture_graph(self, capture_fn: Callable[[Any], Any]) -> bool:
         if not self._graph_enabled:
             raise RuntimeError(
-                "graphs_capture requires enable_graphs=True and a CUDA backend."
+                "capture_graph requires enable_graphs=True and a CUDA backend."
             )
         if not self._queue:
             self._preload()
@@ -911,8 +916,8 @@ class DevicePrefetcher(Iterator[Any]):
         self._graph = graph
         return True
 
-    def graphs_replay(self) -> None:
+    def replay_graph(self) -> None:
         if self._graph is None:
-            raise RuntimeError("Call graphs_capture() before graphs_replay().")
+            raise RuntimeError("Call capture_graph() before replay_graph().")
         _ = next(self)
         self._graph.replay()

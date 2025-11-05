@@ -4,37 +4,53 @@ from __future__ import annotations
 import sys as _sys
 
 from . import datatype as datatype_module
-from .pipeline import BatchLoader, collate, fetch
-from .nodes import BatchSampler, SampleReader
+from .nodes import (
+    BatchReader,
+    BatchSampler,
+    DevicePrefetcher,
+    GDSBatchReader,
+    SampleReader,
+)
+from .pipeline import BatchLoader, Disposable, ThreadLoadBalancer, collate, fetch
 from .stats import Metadata, TensorDictMetadata
 from .transforms import (
     IncrementalPCA,
     StandardScaler,
     VarianceThreshold,
-    batch_to_tensordict,
     postprocess,
     preprocess,
-    tensordict_to_dict,
 )
-from .datatype import convert, to_torch_tensor
+from .datatype import (
+    to_dict,
+    to_platform_dtype,
+    to_tensordict,
+    to_torch_tensor,
+    to_tuple,
+)
 
 __all__ = [
+    "BatchReader",
     "BatchSampler",
     "BatchLoader",
+    "DevicePrefetcher",
+    "GDSBatchReader",
     "SampleReader",
     "collate",
     "fetch",
+    "Disposable",
+    "ThreadLoadBalancer",
     "Metadata",
     "TensorDictMetadata",
     "VarianceThreshold",
     "StandardScaler",
     "IncrementalPCA",
-    "batch_to_tensordict",
     "preprocess",
     "postprocess",
-    "tensordict_to_dict",
-    "convert",
+    "to_dict",
+    "to_tensordict",
+    "to_platform_dtype",
     "to_torch_tensor",
+    "to_tuple",
     "datatype",
     "dtypes",
 ]

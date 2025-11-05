@@ -1,20 +1,21 @@
-# -*- coding: utf-8 -*-
-from __future__ import annotations
+"""High level dataset composition and loading pipeline helpers."""
 
-import os
-import sys
-import time
-from contextlib import suppress
-from functools import partial
-from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+from __future__ import annotations
 
 import ctypes
 import importlib
 import itertools
+import os
+import sys
 import threading
+import time
+from contextlib import suppress
+from functools import partial
 from threading import Lock
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
+
 try:
     from torchdata.nodes import (
         BaseNode,
@@ -27,11 +28,13 @@ try:
     )
 except Exception:
     from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
+
     MultiNodeWeightedSampler = None
-from .datatype import to_torch_tensor
-from .nodes import DevicePrefetcher, GDSBatchReader
+
 from ..backend.environment import System
 from ..backend.environment import optimize_threads as _env_optimize_threads
+from .datatype import to_torch_tensor
+from .nodes import BatchReader, DevicePrefetcher, GDSBatchReader, SampleReader
 
 
 class ThreadLoadBalancer:
@@ -54,7 +57,7 @@ class ThreadLoadBalancer:
     )
 
     def __init__(self, io_workers: int) -> None:
-        self._psutil = self._import_psutill()
+        self._psutil = self._import_psutil()
         self._allowed_cpus = self.total_procs()
         if not self._allowed_cpus:
             self._allowed_cpus = list(range(max(1, os.cpu_count() or 1)))
@@ -73,7 +76,7 @@ class ThreadLoadBalancer:
         self.tune_threads(io_workers, initial=True)
 
     @staticmethod
-    def _import_psutill():
+    def _import_psutil():
         try:
             return importlib.import_module("psutil")
         except Exception:
@@ -376,7 +379,7 @@ class ThreadLoadBalancer:
 
 
 
-def process_batch(
+def _process_batch(
     batch: Mapping[str, Any],
     *args: Any,
     flatten_features: bool,
@@ -402,7 +405,26 @@ def process_batch(
     return {"X": features, "Y": labels_tensor}
 
 
-def compose(
+def _wrap_nodes_map(
+    nodes_map: Mapping[str, BaseNode],
+    *,
+    allow_plain: bool = False,
+) -> BaseNode:
+    if not nodes_map:
+        raise TypeError(
+            "compose expects at least one torchdata.nodes.BaseNode instance."
+        )
+    if MultiNodeWeightedSampler is None:
+        if allow_plain and len(nodes_map) == 1:
+            return next(iter(nodes_map.values()))
+        raise RuntimeError(
+            "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
+        )
+    weights = {key: 1.0 for key in nodes_map}
+    return MultiNodeWeightedSampler(nodes_map, weights)
+
+
+def _compose(
     node: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
     *args: Any,
     device: torch.device,
@@ -421,44 +443,30 @@ def compose(
 
     thread_max_concurrent = io_workers
     if isinstance(node, Mapping):
-        nodes_map: Dict[str, BaseNode] = {
-            str(key): value for key, value in node.items() if isinstance(value, BaseNode)
-        }
-        if nodes_map:
-            if MultiNodeWeightedSampler is None:
-                raise RuntimeError(
-                    "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
+        nodes_map: Dict[str, BaseNode] = {}
+        for key, value in node.items():
+            if not isinstance(value, BaseNode):
+                raise TypeError(
+                    "compose mappings must contain torchdata.nodes.BaseNode instances."
                 )
-            weights = {key: 1.0 for key in nodes_map}
-            source_node: BaseNode = MultiNodeWeightedSampler(nodes_map, weights)
-        elif isinstance(node, BaseNode):
-            source_node = node
-        else:
-            raise TypeError(
-                "Unsupported Mapping passed to compose: expected Mapping[str, BaseNode]."
-            )
+            nodes_map[str(key)] = value
+        source_node = _wrap_nodes_map(nodes_map)
     elif isinstance(node, (list, tuple)):
-        nodes_map = {str(index): value for index, value in enumerate(node) if isinstance(value, BaseNode)}
-        if not nodes_map:
-            raise TypeError(
-                "Empty or invalid Sequence passed to compose: expected Sequence[BaseNode]."
-            )
-        if MultiNodeWeightedSampler is None:
-            raise RuntimeError(
-                "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
-            )
-        weights = {key: 1.0 for key in nodes_map}
-        source_node = MultiNodeWeightedSampler(nodes_map, weights)
+        nodes_map = {}
+        for index, value in enumerate(node):
+            if not isinstance(value, BaseNode):
+                raise TypeError(
+                    "compose sequences must contain torchdata.nodes.BaseNode instances."
+                )
+            nodes_map[str(index)] = value
+        source_node = _wrap_nodes_map(nodes_map)
+    elif isinstance(node, BaseNode):
+        nodes_map = {"default": node}
+        source_node = _wrap_nodes_map(nodes_map, allow_plain=True)
     else:
-        # Route a single node through MultiNodeWeightedSampler as well
-        # so that sharding behavior is consistent across Mapping[Mapping],
-        # Sequence[Mapping], and single Mapping inputs.
-        if MultiNodeWeightedSampler is None:
-            source_node = node
-        else:
-            nodes_map = {"default": node}
-            weights = {"default": 1.0}
-            source_node = MultiNodeWeightedSampler(nodes_map, weights)
+        raise TypeError(
+            "compose expects BaseNode, Mapping[str, BaseNode], or Sequence[BaseNode]."
+        )
 
     wrapped: BaseNode = ParallelMapper(
         source_node,
@@ -481,7 +489,7 @@ def compose(
     )
 
 
-def initialize(
+def _initialize(
     memmap_dir: Union[str, Sequence[str], Mapping[str, str]],
     batch_size: int,
     val_frac: float,
@@ -495,8 +503,8 @@ def initialize(
     sample_reader_cls: type,
     batch_reader_kwargs: Optional[Dict[str, Any]] | None = None,
     **kwargs: Any,
-) -> Tuple[Any, Optional[Any], _Allocated]:
-    allocated = _Allocated()
+) -> Tuple[Any, Optional[Any], Disposable]:
+    allocated = Disposable()
 
     def _make_train_node(directory: Union[str, os.PathLike[str]]) -> Tuple[BaseNode, int, int, int]:
         path = os.fspath(directory)
@@ -523,7 +531,7 @@ def initialize(
 
     if isinstance(memmap_dir, (list, tuple)):
         node_tr = [_make_train_node(directory)[0] for directory in memmap_dir]
-        train_loader = compose(
+        train_loader = _compose(
             node_tr,
             device=device,
             threads=threads,
@@ -539,7 +547,7 @@ def initialize(
             str(key): _make_train_node(directory)[0]
             for key, directory in memmap_dir.items()
         }
-        train_loader = compose(
+        train_loader = _compose(
             node_tr,
             device=device,
             threads=threads,
@@ -551,7 +559,7 @@ def initialize(
         return (train_loader, None, allocated)
 
     node_tr, train_length, total, train_end = _make_train_node(memmap_dir)
-    train_loader = compose(
+    train_loader = _compose(
         node_tr,
         device=device,
         threads=threads,
@@ -580,7 +588,7 @@ def initialize(
         )
         allocated.add(batcher_vl)
         node_vl = IterableWrapper(batcher_vl)
-        val_loader = compose(
+        val_loader = _compose(
             node_vl,
             device=device,
             threads=threads,
@@ -687,7 +695,7 @@ def _flatten_args(objs: Iterable[Any]) -> Iterable[Any]:
         yield obj
 
 
-class _Allocated:
+class Disposable:
     __slots__ = ("_objs",)
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
@@ -723,6 +731,8 @@ class _Allocated:
             if callable(obj):
                 with suppress(Exception):
                     obj()
+
+
 def collate(
     sample: Any,
     *args: Any,
@@ -732,7 +742,7 @@ def collate(
     **kwargs: Any,
 ) -> Any:
     converter = partial(
-        process_batch,
+        _process_batch,
         flatten_features=flatten_features,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
@@ -759,7 +769,7 @@ def fetch(
     sanitize: bool = False,
     flatten_features: bool = False,
     **kwargs: Any,
-) -> Tuple[Any, Optional[Any], _Allocated]:
+) -> Tuple[Any, Optional[Any], Disposable]:
     device_obj = (
         torch.device(device)
         if not isinstance(device, torch.device)
@@ -772,8 +782,6 @@ def fetch(
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
-    from .nodes import BatchReader, SampleReader
-
     def _env_flag(name: str, default: str = "0") -> bool:
         value = os.environ.get(name, default)
         return value not in {"", "0", "false", "False"}
@@ -805,7 +813,7 @@ def fetch(
         batch_reader_kwargs=batch_reader_kwargs,
     )
 
-    return initialize(
+    return _initialize(
         memmap_dir,
         int(batch_size),
         val_frac,
