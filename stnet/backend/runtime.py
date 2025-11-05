@@ -52,8 +52,8 @@ from ..functional.losses import (
 )
 from ..functional.optimizers import AdamW
 from ..data.pipeline import fetch
-from ..data.transforms import batch_to_tensordict, postprocess, preprocess
-from ..data.datatype import to_torch_tensor
+from ..data.transforms import postprocess, preprocess
+from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.stats import Metadata
 from .environment import System
 from ..functional.fx import Autocast, Gradient, Fusion
@@ -622,7 +622,7 @@ def epochs(
                                 Y_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
-                                td = batch_to_tensordict(
+                                td = to_tensordict(
                                     {"features": X, "labels_flat": Y_flat}
                                 )
                                 model_out = model(
@@ -765,7 +765,7 @@ def epochs(
                                 Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
-                                tdv = batch_to_tensordict(
+                                tdv = to_tensordict(
                                     {"features": X, "labels_flat": Yv_flat}
                                 )
                                 model_out_val = model(
@@ -965,7 +965,7 @@ def infer(
                             )
                             if callable(mark_step):
                                 mark_step()
-                        tdp = batch_to_tensordict({"features": X})
+                        tdp = to_tensordict({"features": X})
                         pred_out = run_model(
                             tdp,
                             global_loss=None,
