@@ -10,9 +10,6 @@ from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
 
-# Internal utilities -------------------------------------------------------
-
-
 def _expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
     try:
         if mask.shape != prediction.shape:
@@ -68,9 +65,6 @@ def _coerce_std(
     return std
 
 
-# Public utilities ---------------------------------------------------------
-
-
 def normal_cdf(x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
@@ -91,9 +85,6 @@ def students_t_cdf(
     v_clamped = torch.clamp(v, min=3.0)
     z = t * torch.sqrt((v_clamped - 2.0) / v_clamped)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
-
-
-# Public implementations ----------------------------------------------------
 
 
 class MultipleQuantileLoss(nn.Module):
