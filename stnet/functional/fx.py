@@ -43,30 +43,7 @@ class _QATUnavailable:
         raise RuntimeError("QAT backend unavailable")
 
 
-def reshape_for_mha(
-    tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
-) -> torch.Tensor:
-
-    return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
-
-
-def is_nvidia_te_available(model: torch.nn.Module) -> bool:
-    te_flags = (
-        getattr(model, "__fp8_inference_te__", False),
-        getattr(model, "__fp8_training_te__", False),
-        getattr(model, "__te_fp8_default__", False),
-    )
-    if any(te_flags):
-        return True
-
-    for module in model.modules():
-        mod_name = getattr(module.__class__, "__module__", "")
-        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
-            return True
-    return False
-
-
-def is_compiled_for_inference(model: torch.nn.Module) -> bool:
+def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     compile_attrs = (
         "_is_compiled_for_inference",
         "__is_compiled_for_inference__",
@@ -111,7 +88,7 @@ def is_compiled_for_inference(model: torch.nn.Module) -> bool:
     return False
 
 
-def is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
+def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     indicator_attrs = (
         "_aot_autograd_graph",
         "_aot_autograd_cache",
@@ -136,6 +113,29 @@ def is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         class_name = module.__class__.__name__
         module_name = getattr(module.__class__, "__module__", "")
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
+            return True
+    return False
+
+
+def reshape_for_mha(
+    tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
+) -> torch.Tensor:
+
+    return tensor.view(batch_size, -1, head_count, head_dim).transpose(1, 2)
+
+
+def is_nvidia_te_available(model: torch.nn.Module) -> bool:
+    te_flags = (
+        getattr(model, "__fp8_inference_te__", False),
+        getattr(model, "__fp8_training_te__", False),
+        getattr(model, "__te_fp8_default__", False),
+    )
+    if any(te_flags):
+        return True
+
+    for module in model.modules():
+        mod_name = getattr(module.__class__, "__module__", "")
+        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
             return True
     return False
 
@@ -186,8 +186,8 @@ class Gradient:
     def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
         if (
             is_nvidia_te_available(model)
-            or is_compiled_for_inference(model)
-            or is_aot_autograd_enabled(model)
+            or _is_compiled_for_inference(model)
+            or _is_aot_autograd_enabled(model)
         ):
             return torch.no_grad()
         return torch.inference_mode()
@@ -232,6 +232,16 @@ class Autocast:
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
     _metadata: Optional[Metadata[Any]] = None
+
+    @staticmethod
+    def _device(
+        device: Optional[Union[torch.device, str]] = None,
+    ) -> torch.device:
+        if device is None:
+            return get_device()
+        if isinstance(device, torch.device):
+            return device
+        return torch.device(device)
 
     @classmethod
     def _fp8_backend(
@@ -330,18 +340,84 @@ class Autocast:
         cls._preferred_int_backend = None
         return None
 
-    @staticmethod
-    def _device(
-        device: Optional[Union[torch.device, str]] = None,
-    ) -> torch.device:
-        if device is None:
-            return get_device()
-        if isinstance(device, torch.device):
-            return device
-        return torch.device(device)
+    @classmethod
+    def _nvidia_float8(
+        cls: object, device: torch.device, enabled: bool
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            te = importlib.import_module("transformer_engine.pytorch")
+
+            fp8_ctx = getattr(te, "fp8_autocast", None)
+            if callable(fp8_ctx):
+                contexts.append(fp8_ctx(enabled=True))
+            else:
+                raise AttributeError("transformer_engine.fp8_autocast missing")
+        except Exception as exc:
+            _LOGGER.debug("Autocast FP8 TE failed: %s", exc)
+            cls._preferred_fp8_backend = None
+        return contexts
 
     @classmethod
-    def _coerce_metadata(
+    def _torchao_float8(
+        cls: object, enabled: bool
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            fp8_mod = importlib.import_module("torchao.float8")
+            fp8_autocast = getattr(fp8_mod, "fp8_autocast", None)
+
+            if callable(fp8_autocast):
+                contexts.append(fp8_autocast(enabled=True))
+            else:
+                raise AttributeError("torchao.float8.fp8_autocast missing")
+        except Exception as exc:
+            _LOGGER.debug("Autocast FP8 torchao failed: %s", exc)
+            cls._preferred_fp8_backend = None
+        return contexts
+
+    @classmethod
+    def _torchao_int8(
+        cls: object,
+        device: torch.device,
+        enabled: bool,
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        backend = cls._preferred_int_backend
+        if backend == "te":
+            try:
+                te = importlib.import_module("transformer_engine.pytorch")
+
+                int_ctx = getattr(te, "int8_autocast", None)
+                if callable(int_ctx):
+                    contexts.append(int_ctx(enabled=True))
+                else:
+                    raise AttributeError("transformer_engine.int8_autocast missing")
+            except Exception as exc:
+                _LOGGER.debug("Autocast INT8 TE failed: %s", exc)
+                cls._preferred_int_backend = None
+        elif backend == "ao":
+            try:
+                quant_mod = importlib.import_module("torchao.quantization")
+                int8_autocast = getattr(quant_mod, "int8_autocast", None)
+
+                if callable(int8_autocast):
+                    contexts.append(int8_autocast(enabled=True))
+                else:
+                    raise AttributeError("torchao.quantization.int8_autocast missing")
+            except Exception as exc:
+                _LOGGER.debug("Autocast INT8 torchao failed: %s", exc)
+                cls._preferred_int_backend = None
+        return contexts
+
+    @classmethod
+    def coerce_metadata(
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
@@ -375,19 +451,9 @@ class Autocast:
         cls._metadata = meta
         return meta
 
-    @staticmethod
-    def _coerce_dtype(value: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
-        if isinstance(value, torch.dtype):
-            return value
-        if isinstance(value, str):
-            candidate = getattr(torch, value, None)
-            if isinstance(candidate, torch.dtype):
-                return candidate
-        return None
-
     @classmethod
     def float_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        meta = cls._coerce_metadata(device)
+        meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "float_dtypes", ())
         if candidates:
             return tuple(candidates)
@@ -416,7 +482,7 @@ class Autocast:
 
     @classmethod
     def integer_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        meta = cls._coerce_metadata(device)
+        meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "int_dtypes", ())
         if candidates:
             return tuple(candidates)
@@ -463,7 +529,7 @@ class Autocast:
         return fallback
 
     @classmethod
-    def nvidia_float8(
+    def _nvidia_float8(
         cls: object, device: torch.device, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
@@ -483,7 +549,7 @@ class Autocast:
         return contexts
 
     @classmethod
-    def torch_float8(
+    def _torchao_float8(
         cls: object, enabled: bool
     ) -> List[contextlib.AbstractContextManager[None]]:
         contexts: List[contextlib.AbstractContextManager[None]] = []
@@ -503,7 +569,7 @@ class Autocast:
         return contexts
 
     @classmethod
-    def torch_int8(
+    def _torchao_int8(
         cls: object,
         device: torch.device,
         enabled: bool,
@@ -592,7 +658,7 @@ class Autocast:
                     tensor = next(model.buffers())
             if tensor is not None:
                 device = tensor.device
-        meta = cls._coerce_metadata(device, metadata=meta)
+        meta = cls.coerce_metadata(device, metadata=meta)
         cls._metadata = meta
 
     @classmethod
@@ -605,7 +671,7 @@ class Autocast:
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
-        meta = cls._coerce_metadata(dev, metadata=metadata)
+        meta = cls.coerce_metadata(dev, metadata=metadata)
         amp_candidates = tuple(meta.float_dtypes) if meta.float_dtypes else (torch.float32,)
         amp_dtype = cls.negotiate(
             amp_candidates,
@@ -637,13 +703,13 @@ class Autocast:
                 )
         if wants_fp8:
             if backend == "te":
-                contexts.extend(cls.nvidia_float8(dev, True))
+                contexts.extend(cls._nvidia_float8(dev, True))
                 if not contexts:
                     backend = cls._fp8_backend("ao", device=dev)
                     if backend == "ao":
-                        contexts.extend(cls.torch_float8(True))
+                        contexts.extend(cls._torchao_float8(True))
             elif backend == "ao":
-                contexts.extend(cls.torch_float8(True))
+                contexts.extend(cls._torchao_float8(True))
             else:
                 _LOGGER.debug(
                     "Autocast FP8 backend '%s' unsupported; disabling", backend
@@ -725,7 +791,7 @@ class Autocast:
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
-        meta = cls._coerce_metadata(dev, metadata=metadata)
+        meta = cls.coerce_metadata(dev, metadata=metadata)
         int_candidates = tuple(meta.int_dtypes) if meta.int_dtypes else (torch.int64,)
         int_dtype = cls.negotiate(
             int_candidates,
@@ -736,11 +802,11 @@ class Autocast:
             meta=meta,
         )
         backend = cls._int_backend(cls._preferred_int_backend, device=dev)
-        contexts = cls.torch_int8(dev, True) if backend else []
+        contexts = cls._torchao_int8(dev, True) if backend else []
         if not contexts and backend == "te":
             fallback_backend = cls._int_backend("ao", device=dev)
             if fallback_backend == "ao":
-                contexts = cls.torch_int8(dev, True)
+                contexts = cls._torchao_int8(dev, True)
         if not contexts:
             contexts.append(contextlib.nullcontext())
 

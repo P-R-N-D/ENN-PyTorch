@@ -9,19 +9,21 @@ from .losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-    _expand_to_pred,
+    expand_to_pred,
 )
-from .optimizers import AdamW
+from .optimizers import AdamW, StochasticWeightAverage, stochastic_weight_average
 from .fx import (
     Autocast,
     Gradient,
     Fusion,
+    Quantization,
+    is_scale_safe,
     is_nvidia_te_available,
     reshape_for_mha,
 )
 
 __all__ = [
-    "_expand_to_pred",
+    "expand_to_pred",
     "MultipleQuantileLoss",
     "StandardNormalLoss",
     "StudentsTLoss",
@@ -30,9 +32,13 @@ __all__ = [
     "TiledLoss",
     "LossWeightController",
     "AdamW",
+    "StochasticWeightAverage",
+    "stochastic_weight_average",
     "Autocast",
     "Fusion",
+    "Quantization",
     "Gradient",
+    "is_scale_safe",
     "is_nvidia_te_available",
     "reshape_for_mha",
 ]
