@@ -28,6 +28,21 @@ from torch.optim import Optimizer
 
 from .environment import System
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    """Parse boolean env var with typical truthy strings."""
+    val = os.environ.get(name)
+    if val is None:
+        return bool(default)
+    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
 except ImportError:
@@ -657,6 +672,23 @@ def broadcast_model_states(
             continue
 
 
+def sync_model_states(
+    module: torch.nn.Module,
+    device: Optional[torch.device] = None,
+    src: int = 0,
+) -> None:
+    """
+    Broadcast all buffers and parameters from ``src`` rank and then block on a cross-rank barrier.
+    Safe to call when torch.distributed is disabled/uninitialized (no-op), and supports DTensor params.
+    """
+    if not is_dist_avail_and_initialized():
+        return
+    # Unwrap DDP if needed
+    _m = module.module if hasattr(module, "module") else module
+    broadcast_model_states(_m, src=src)
+    distributed_barrier(device)
+
+
 def wrap_ddp_if_needed(
     module: torch.nn.Module,
     *args: Any,
@@ -677,6 +709,22 @@ def wrap_ddp_if_needed(
     }
     if device_ids is not None:
         ddp_kwargs["device_ids"] = list(device_ids)
+    # Extra DDP optimizations (env-tunable).
+    try:
+        sig = inspect.signature(DDP.__init__)
+        params = set(sig.parameters.keys())
+    except Exception:
+        params = set()
+    # bucket size in MB
+    bucket_mb = _env_int("STNET_DDP_BUCKET_MB", 25)
+    if "bucket_cap_mb" in params:
+        ddp_kwargs["bucket_cap_mb"] = bucket_mb
+    # use gradient views to avoid copies
+    if "gradient_as_bucket_view" in params:
+        ddp_kwargs["gradient_as_bucket_view"] = _env_flag("STNET_DDP_BUCKET_VIEW", True)
+    # static graph can reduce 오버헤드 (모델이 고정 그래프일 때만)
+    if "static_graph" in params:
+        ddp_kwargs["static_graph"] = _env_flag("STNET_DDP_STATIC_GRAPH", False)
     return DDP(module, **ddp_kwargs)
 
 
@@ -696,6 +744,13 @@ def wrap_fsdp_module(
 
     args = [module]
     kwargs = {}
+    # Commonly effective FSDP options (버전 지원 시에만 적용)
+    if "forward_prefetch" in params:
+        kwargs["forward_prefetch"] = _env_flag("STNET_FSDP_FWD_PREFETCH", True)
+    if "limit_all_gathers" in params:
+        kwargs["limit_all_gathers"] = _env_flag("STNET_FSDP_LIMIT_AG", True)
+    if "use_orig_params" in params:
+        kwargs["use_orig_params"] = _env_flag("STNET_FSDP_USE_ORIG_PARAMS", True)
 
     if "mesh" in params:
         kwargs["mesh"] = mesh
@@ -725,6 +780,7 @@ __all__ = [
     "Network",
     "Distributed",
     "broadcast_model_states",
+    "sync_model_states",
     "coerce_host",
     "distributed_barrier",
     "format_endpoint_host",
