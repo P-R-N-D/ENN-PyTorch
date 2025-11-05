@@ -9,10 +9,9 @@ from .losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-    TensorDictLoss,
     expand_mask_like_prediction,
 )
-from .optimizers import AdamW, TensorDictOptimizer
+from .optimizers import AdamW
 from .fx import (
     AutoCast,
     Gradient,
@@ -30,9 +29,7 @@ __all__ = [
     "LinearCombinationLoss",
     "TiledLoss",
     "LossWeightController",
-    "TensorDictLoss",
     "AdamW",
-    "TensorDictOptimizer",
     "AutoCast",
     "Fusion",
     "Gradient",

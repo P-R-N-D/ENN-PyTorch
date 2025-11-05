@@ -18,7 +18,6 @@ from ..functional.losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-    TensorDictLoss,
 )
 from .layers import (
     CrossAttention,
@@ -76,7 +75,6 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
-    "TensorDictLoss",
     "TiledLoss",
     "StochasticDepth",
     "norm_layer",

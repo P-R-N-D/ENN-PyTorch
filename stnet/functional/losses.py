@@ -8,12 +8,6 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union
 import torch
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
-from tensordict import TensorDictBase
-from torchrl.objectives import LossModule
-
-
-LossLike = Union[nn.Module, Callable[[Tensor, Tensor], Tensor]]
-
 
 def expand_mask_like_prediction(
     mask: torch.Tensor, prediction: torch.Tensor
@@ -959,55 +953,3 @@ class LossWeightController:
                 1.0 - self.momentum
             ) * max(bottom_val, self.eps)
 
-
-class TensorDictLoss(LossModule):
-    """Wrap callable or ``nn.Module`` losses to operate on :class:`TensorDict` batches."""
-
-    def __init__(
-        self,
-        net_loss: Optional[LossLike] = None,
-        global_loss: Optional[LossLike] = None,
-        local_loss: Optional[LossLike] = None,
-        weights: Tuple[float, float] = (1.0, 1.0),
-    ) -> None:
-        super().__init__()
-        self.net_loss = net_loss
-        self.global_loss = global_loss
-        self.local_loss = local_loss
-        self.weights = tuple(float(w) for w in (weights or (1.0, 1.0)))
-
-    def _apply_loss(self, loss_fn: LossLike, pred: Tensor, target: Tensor) -> Tensor:
-        return loss_fn(pred, target) if callable(loss_fn) else loss_fn(pred, target)
-
-    def forward(self, td: TensorDictBase) -> TensorDictBase:
-        predictions = td["pred"]
-        batch = predictions.shape[0]
-        flat_pred = predictions.reshape(batch, -1)
-        target = td.get("labels_flat")
-        total_loss: Tensor | None = None
-        if target is not None:
-            target = target.to(device=flat_pred.device)
-            if self.global_loss is not None or self.local_loss is not None:
-                global_loss = (
-                    self._apply_loss(self.global_loss, flat_pred, target)
-                    if self.global_loss is not None
-                    else 0.0
-                )
-                if "residual_context" in td and self.local_loss is not None:
-                    residual = td["residual_context"].reshape(batch, -1).to(device=target.device)
-                    local_loss = self._apply_loss(self.local_loss, residual, target)
-                else:
-                    local_loss = 0.0
-                total_loss = self.weights[0] * global_loss + self.weights[1] * local_loss
-            elif self.net_loss is not None:
-                total_loss = self._apply_loss(self.net_loss, flat_pred, target)
-        if total_loss is not None:
-            loss_td = total_loss
-            if not isinstance(loss_td, torch.Tensor):
-                loss_td = torch.as_tensor(loss_td, device=flat_pred.device)
-            if loss_td.ndim == 0:
-                batch_size = tuple(td.batch_size)
-                if len(batch_size):
-                    loss_td = loss_td.expand(batch_size)
-            td.set("loss_total", loss_td)
-        return td
