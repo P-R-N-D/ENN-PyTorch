@@ -387,7 +387,18 @@ class AutoCast:
         meta = AutoCast._metadata
         if meta is not None and getattr(meta, "float8_dtypes", None):
             return tuple(meta.float8_dtypes)
-        values = Metadata._float8_dtypes()
+        names = (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+        )
+        values: list[torch.dtype] = []
+        for name in names:
+            candidate = getattr(torch, name, None)
+            if isinstance(candidate, torch.dtype):
+                values.append(candidate)
+        values = tuple(values)
         if meta is not None:
             meta.float8_dtypes = values
         return values

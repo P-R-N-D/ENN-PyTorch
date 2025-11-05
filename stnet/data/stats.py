@@ -88,14 +88,14 @@ class Metadata(Generic[TExtra]):
         # delegate to AutoCast to avoid duplication
         from ..functional.fx import AutoCast as _AutoCast
 
-        return _AutoCast._float_amp_candidates(cls, device)
+        return _AutoCast._float_amp_candidates(device)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         # delegate to AutoCast to avoid duplication
         from ..functional.fx import AutoCast as _AutoCast
 
-        return _AutoCast._integer_candidates(cls, device)
+        return _AutoCast._integer_candidates(device)
 
     @classmethod
     def for_device(
