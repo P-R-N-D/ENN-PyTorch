@@ -9,7 +9,7 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
-def expand_mask_like_prediction(
+def _expand_to_pred(
     mask: torch.Tensor, prediction: torch.Tensor
 ) -> torch.Tensor:
     try:
@@ -19,7 +19,7 @@ def expand_mask_like_prediction(
         pass
     return mask
 
-def _canon_dims(
+def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
 ) -> Tuple[int, ...]:
     nd = x.ndim
@@ -37,7 +37,7 @@ def _canon_dims(
         return (1,) if nd > 1 else (0,)
     return out
 
-def _stable_std(
+def _coerce_std(
     x: torch.Tensor, dim: Tuple[int, ...] | int | None, ddof: int, eps: float
 ) -> torch.Tensor:
     if dim is None:
@@ -65,13 +65,13 @@ def _stable_std(
         std = torch.clamp(std, min=eps)
     return std
 
-def _normal_cdf_loc_scale(
+def normal_cdf(
     x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
-def _student_t_cdf_loc_scale(
+def students_t_cdf(
     x: torch.Tensor, df: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
 ) -> torch.Tensor:
     t = (x - loc) / torch.clamp(scale, min=1e-12)
@@ -221,7 +221,7 @@ class StandardNormalLoss(nn.Module):
     def _safe_std(
         x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
     ) -> torch.Tensor:
-        return _stable_std(x, dim, ddof, eps)
+        return _coerce_std(x, dim, ddof, eps)
 
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         match self.reduction:
@@ -234,12 +234,12 @@ class StandardNormalLoss(nn.Module):
         return x
 
     def _get_dims(self, pred: torch.Tensor) -> Tuple[int, ...]:
-        return _canon_dims(pred, self.dim, keep_batch=False)
+        return _canonize_dims(pred, self.dim, keep_batch=False)
 
     def _compute_mu(
         self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
-        dims = _canon_dims(pred, dims)
+        dims = _canonize_dims(pred, dims)
         match self.mu_mode:
             case "target":
                 mu = target.mean(dim=dims, keepdim=True)
@@ -328,7 +328,7 @@ class StandardNormalLoss(nn.Module):
                 except NotImplementedError:
                     one_tail = torch.clamp(
                         1.0
-                        - _normal_cdf_loc_scale(
+                        - normal_cdf(
                             x,
                             torch.tensor(0.0, device=x.device, dtype=x.dtype),
                             torch.tensor(1.0, device=x.device, dtype=x.dtype),
@@ -432,7 +432,7 @@ class StudentsTLoss(nn.Module):
     def _safe_std(
         x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
     ) -> torch.Tensor:
-        return _stable_std(x, dim, ddof, eps)
+        return _coerce_std(x, dim, ddof, eps)
 
     def _reduce(self, x: torch.Tensor) -> torch.Tensor:
         match self.reduction:
@@ -454,7 +454,7 @@ class StudentsTLoss(nn.Module):
     def _compute_mu(
         self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
-        dims = _canon_dims(pred, dims)
+        dims = _canonize_dims(pred, dims)
         match self.mu_mode:
             case "target":
                 mu = target.mean(dim=dims, keepdim=True)
@@ -535,7 +535,7 @@ class StudentsTLoss(nn.Module):
             hi = torch.full_like(df, 50.0, dtype=dtype, device=device)
             for _ in range(32):
                 mid = (lo + hi) / 2.0
-                cdf_mid = _student_t_cdf_loc_scale(mid, df, loc, scale)
+                cdf_mid = students_t_cdf(mid, df, loc, scale)
                 mask = cdf_mid < target
                 lo = torch.where(mask, mid, lo)
                 hi = torch.where(mask, hi, mid)
@@ -569,7 +569,7 @@ class StudentsTLoss(nn.Module):
                     )
                 except NotImplementedError:
                     one_tail = torch.clamp(
-                        1.0 - _student_t_cdf_loc_scale(x, df, mu, scale),
+                        1.0 - students_t_cdf(x, df, mu, scale),
                         min=self.eps,
                     )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
@@ -592,10 +592,10 @@ class StudentsTLoss(nn.Module):
                 raise ValueError("Invalid penalty")
         return self._reduce(pen)
 
-def _as_tuple(x: Any) -> Tuple[int, ...]:
+def _to_tuple(x: Any) -> Tuple[int, ...]:
     return tuple((int(v) for v in x))
 
-def _fftn_nd(
+def fft_nd(
     x: torch.Tensor,
     shape: Sequence[int],
     *args: Any,
@@ -607,14 +607,14 @@ def _fftn_nd(
     dims = tuple(range(-len(shape), 0))
     if not inverse:
         if real_input:
-            return torch.fft.rfftn(x, s=_as_tuple(shape), dim=dims, norm=norm)
-        return torch.fft.fftn(x, s=_as_tuple(shape), dim=dims, norm=norm)
+            return torch.fft.rfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+        return torch.fft.fftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
     else:
         if real_input:
-            return torch.fft.irfftn(x, s=_as_tuple(shape), dim=dims, norm=norm)
-        return torch.fft.ifftn(x, s=_as_tuple(shape), dim=dims, norm=norm)
+            return torch.fft.irfftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
+        return torch.fft.ifftn(x, s=_to_tuple(shape), dim=dims, norm=norm)
 
-def _nufft_nd_cufinufft(
+def nufft_nd(
     x_cplx: torch.Tensor,
     omega: torch.Tensor,
     shape: Sequence[int],
@@ -633,7 +633,7 @@ def _nufft_nd_cufinufft(
     if omega.dim() == 2:
         pts = [omega[i].contiguous() for i in range(ndim)]
         plan = cufinufft.Plan(
-            nufft_type, _as_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
+            nufft_type, _to_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
         )
         plan.setpts(*pts)
         for b in range(B):
@@ -644,7 +644,7 @@ def _nufft_nd_cufinufft(
             pts = [omega[b, i].contiguous() for i in range(ndim)]
             plan = cufinufft.Plan(
                 nufft_type,
-                _as_tuple(shape),
+                _to_tuple(shape),
                 n_trans=1,
                 eps=eps,
                 dtype="complex64",
@@ -669,7 +669,7 @@ class DataFidelityLoss(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.out_shape = _as_tuple(out_shape)
+        self.out_shape = _to_tuple(out_shape)
         self.ndim = len(self.out_shape)
         self.mode = str(mode).lower()
         self.backend = None if backend is None else str(backend).lower()
@@ -711,14 +711,14 @@ class DataFidelityLoss(nn.Module):
         y = target_flat.view(B, *shape)
         match self.mode:
             case "fft":
-                Xk = _fftn_nd(
+                Xk = fft_nd(
                     x.to(torch.complex64) if not torch.is_complex(x) else x,
                     shape,
                     real_input=False,
                     inverse=False,
                     norm=self.fft_norm,
                 )
-                Yk = _fftn_nd(
+                Yk = fft_nd(
                     y.to(torch.complex64) if not torch.is_complex(y) else y,
                     shape,
                     real_input=False,
@@ -729,14 +729,14 @@ class DataFidelityLoss(nn.Module):
                 match self.backend:
                     case None | "cufinufft":
                         try:
-                            Xk = _nufft_nd_cufinufft(
+                            Xk = nufft_nd(
                                 x.to(torch.complex64).unsqueeze(1),
                                 self.ktraj,
                                 shape,
                                 nufft_type=2,
                                 eps=self.nufft_eps,
                             )
-                            Yk = _nufft_nd_cufinufft(
+                            Yk = nufft_nd(
                                 y.to(torch.complex64).unsqueeze(1),
                                 self.ktraj,
                                 shape,
@@ -744,14 +744,14 @@ class DataFidelityLoss(nn.Module):
                                 eps=self.nufft_eps,
                             )
                         except Exception:
-                            Xk = _fftn_nd(
+                            Xk = fft_nd(
                                 x.to(torch.complex64),
                                 shape,
                                 real_input=False,
                                 inverse=False,
                                 norm=self.fft_norm,
                             )
-                            Yk = _fftn_nd(
+                            Yk = fft_nd(
                                 y.to(torch.complex64),
                                 shape,
                                 real_input=False,
@@ -834,7 +834,7 @@ class TiledLoss(nn.Module):
                 return None
             case "finite":
                 try:
-                    return expand_mask_like_prediction(torch.isfinite(target), pred)
+                    return _expand_to_pred(torch.isfinite(target), pred)
                 except Exception:
                     return None
             case "neq":
@@ -846,7 +846,7 @@ class TiledLoss(nn.Module):
                         dtype=target.dtype,
                         device=target.device,
                     )
-                    return expand_mask_like_prediction(target != base, pred)
+                    return _expand_to_pred(target != base, pred)
                 except Exception:
                     return None
             case _:

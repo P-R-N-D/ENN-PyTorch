@@ -32,7 +32,7 @@ except Exception:
 
 from ..api import is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
-from ..functional.fx import AutoCast, Gradient, reshape_for_heads
+from ..functional.fx import Autocast, Gradient, reshape_for_mha
 from .activations import SwiGLU
 from .kernels import (
     DotProductAttention,
@@ -436,9 +436,9 @@ class CrossAttention(nn.Module):
         kv = self.kv_proj(kv)
         k, v = kv.chunk(2, dim=-1)
         qh, kh, vh = (
-            reshape_for_heads(qn, B, self.nhead, self.head_dim),
-            reshape_for_heads(k, B, self.nhead, self.head_dim),
-            reshape_for_heads(v, B, self.nhead, self.head_dim),
+            reshape_for_mha(qn, B, self.nhead, self.head_dim),
+            reshape_for_mha(k, B, self.nhead, self.head_dim),
+            reshape_for_mha(v, B, self.nhead, self.head_dim),
         )
         yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
@@ -491,9 +491,9 @@ class PatchAttention(nn.Module):
         qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
         qh, kh, vh = (
-            reshape_for_heads(q, B, self.nhead, self.head_dim),
-            reshape_for_heads(k, B, self.nhead, self.head_dim),
-            reshape_for_heads(v, B, self.nhead, self.head_dim),
+            reshape_for_mha(q, B, self.nhead, self.head_dim),
+            reshape_for_mha(k, B, self.nhead, self.head_dim),
+            reshape_for_mha(v, B, self.nhead, self.head_dim),
         )
         rel = coords.unsqueeze(2) - coords.unsqueeze(1)
         rel_bias = self.rel_bias(rel).permute(0, 3, 1, 2)
@@ -1643,7 +1643,7 @@ class Root(nn.Module):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
                 x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
-                ctx = AutoCast.float(device) if amp_enabled else AutoCast.suspend(device)
+                ctx = Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 with ctx:
                     out: Payload = self.local_net(x_slice)
                 out_tokens = torch.nan_to_num(
@@ -1664,9 +1664,9 @@ class Root(nn.Module):
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(Gradient.inference(self.local_net))
                     stack.enter_context(
-                        AutoCast.float(device)
+                        Autocast.float(device)
                         if amp_enabled
-                        else AutoCast.suspend(device)
+                        else Autocast.suspend(device)
                     )
                     out = self.local_net(x_slice)
                 out_tokens = torch.nan_to_num(
@@ -1693,9 +1693,9 @@ class Root(nn.Module):
         if infer_mode:
             with Gradient.inference(self.global_net):
                 with (
-                    AutoCast.float(device)
+                    Autocast.float(device)
                     if amp_enabled
-                    else AutoCast.suspend(device)
+                    else Autocast.suspend(device)
                 ):
                     refined_tokens, _ = self.global_net(tokens_centered)
             refined_tokens = torch.nan_to_num(
@@ -1704,9 +1704,9 @@ class Root(nn.Module):
             decode_tokens = refined_tokens.detach().clone()
             with Gradient.inference(self.local_net):
                 with (
-                    AutoCast.float(device)
+                    Autocast.float(device)
                     if amp_enabled
-                    else AutoCast.suspend(device)
+                    else Autocast.suspend(device)
                 ):
                     residual_context = self.local_net.decode(
                         decode_tokens, apply_norm=True
@@ -1719,9 +1719,9 @@ class Root(nn.Module):
 
                 def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
                     with (
-                        AutoCast.float(device)
+                        Autocast.float(device)
                         if amp_enabled
-                        else AutoCast.suspend(device)
+                        else Autocast.suspend(device)
                     ):
                         out, _ = self.global_net(inp)
                     return out
@@ -1736,9 +1736,9 @@ class Root(nn.Module):
 
                 def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
                     with (
-                        AutoCast.float(device)
+                        Autocast.float(device)
                         if amp_enabled
-                        else AutoCast.suspend(device)
+                        else Autocast.suspend(device)
                     ):
                         return self.local_net.decode(inp, apply_norm=True)
 
