@@ -27,7 +27,7 @@ from ..backend.environment import (
     is_int8_supported,
     optimal_optimizer_params,
 )
-from .fx import AutoCast, Fusion, _supports_scale
+from .fx import Autocast, Fusion, is_scale_safe
 
 
 class AdamW:
@@ -58,7 +58,7 @@ class AdamW:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = AutoCast._ensure_metadata(dev, metadata=metadata)
+        meta = Autocast._ensure_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
@@ -76,9 +76,9 @@ class AdamW:
         if hasattr(dev, "type") and dev.type == "cuda":
             fp8_allowed = True
             if getattr(meta, "has_scale", False):
-                float8_dtypes = AutoCast._float8_dtypes()
+                float8_dtypes = Autocast._float8_dtypes()
                 if not any(
-                    _supports_scale(dtype, meta, safety_margin=2.0)
+                    is_scale_safe(dtype, meta, safety_margin=2.0)
                     for dtype in float8_dtypes
                 ):
                     fp8_allowed = False
@@ -150,7 +150,7 @@ class AdamW:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = AutoCast._ensure_metadata(dev, metadata=metadata)
+        meta = Autocast._ensure_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
@@ -236,7 +236,7 @@ except Exception:  # pragma: no cover - defensive fallback
     _update_bn = None  # type: ignore[assignment]
 
 
-class SWAAverager:
+class StochasticWeightAverage:
     """Utility wrapper around :class:`torch.optim.swa_utils.AveragedModel`."""
 
     def __init__(
@@ -260,16 +260,18 @@ class SWAAverager:
     def source(self) -> nn.Module:
         return self._source
 
-    def update(self, model: Optional[nn.Module] = None) -> None:
+    def update_weight(self, model: Optional[nn.Module] = None) -> None:
         """Update the running average parameters from ``model``."""
 
         target = model if model is not None else self._source
         if target is None:
-            raise RuntimeError("SWAAverager was initialised without a source model")
+            raise RuntimeError(
+                "StochasticWeightAverage was initialised without a source model"
+            )
         self._averaged.update_parameters(target)
 
     @contextlib.contextmanager
-    def use_shadow(self, model: nn.Module) -> Iterator[None]:
+    def reduction(self, model: nn.Module) -> Iterator[None]:
         """Temporarily swap ``model`` parameters with the averaged copy."""
 
         backup: Dict[str, torch.Tensor] = {}
@@ -286,7 +288,7 @@ class SWAAverager:
                 if cached is not None:
                     param.data.copy_(cached)
 
-    def bn_update(
+    def update_batch_norm(
         self,
         feature_iter: Iterable[TensorDictBase | Dict[str, Any] | torch.Tensor | Any],
         *,
@@ -329,24 +331,31 @@ class SWAAverager:
         adapter = _TDAdapter(self._averaged, in_key)
         _update_bn(_features(feature_iter), adapter, device=device)
 
-    def state_dict(self) -> Dict[str, Any]:
+    def save_state_dict(self) -> Dict[str, Any]:
         return self._averaged.state_dict()
 
     def load_state_dict(self, state: Dict[str, Any]) -> Any:
         return self._averaged.load_state_dict(state)
 
 
-def make_swa_averager(
+def stochastic_weight_average(
     model: nn.Module,
     *,
     device: Optional[torch.device] = None,
     use_buffers: bool = True,
     avg_fn: Optional[Any] = None,
-) -> SWAAverager:
-    """Factory helper mirroring the signature of :class:`SWAAverager`."""
+) -> StochasticWeightAverage:
+    """Factory helper mirroring the signature of :class:`StochasticWeightAverage`."""
 
-    return SWAAverager(model, device=device, use_buffers=use_buffers, avg_fn=avg_fn)
+    return StochasticWeightAverage(
+        model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
+    )
 
 
-__all__ = ["AdamW", "SWAAverager", "make_swa_averager", "SWALR"]
+__all__ = [
+    "AdamW",
+    "StochasticWeightAverage",
+    "stochastic_weight_average",
+    "SWALR",
+]
 

@@ -9,19 +9,19 @@ from .losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-    expand_mask_like_prediction,
+    _expand_to_pred,
 )
 from .optimizers import AdamW
 from .fx import (
-    AutoCast,
+    Autocast,
     Gradient,
     Fusion,
-    is_transformer_engine_enabled,
-    reshape_for_heads,
+    is_nvidia_te_available,
+    reshape_for_mha,
 )
 
 __all__ = [
-    "expand_mask_like_prediction",
+    "_expand_to_pred",
     "MultipleQuantileLoss",
     "StandardNormalLoss",
     "StudentsTLoss",
@@ -30,9 +30,9 @@ __all__ = [
     "TiledLoss",
     "LossWeightController",
     "AdamW",
-    "AutoCast",
+    "Autocast",
     "Fusion",
     "Gradient",
-    "is_transformer_engine_enabled",
-    "reshape_for_heads",
+    "is_nvidia_te_available",
+    "reshape_for_mha",
 ]

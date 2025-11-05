@@ -15,7 +15,11 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from ..functional.optimizers import SWAAverager, make_swa_averager, SWALR
+from ..functional.optimizers import (
+    StochasticWeightAverage,
+    SWALR,
+    stochastic_weight_average,
+)
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -52,7 +56,7 @@ from ..data.transforms import batch_to_tensordict, postprocess, preprocess
 from ..data.datatype import to_torch_tensor
 from ..data.stats import Metadata
 from .environment import System
-from ..functional.fx import AutoCast, Gradient, Fusion
+from ..functional.fx import Autocast, Gradient, Fusion
 from .profiler import FlopCounter
 from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
 from .distributed import (
@@ -476,7 +480,7 @@ def epochs(
     total_epochs: int,
     local_rank: int = 0,
     scheduler_step_per_batch: bool = True,
-    swa_helper: Optional[SWAAverager] = None,
+    swa_helper: Optional[StochasticWeightAverage] = None,
     swa_start_epoch: int = 0,
     swa_bn_update: bool = False,
     swa_in_key: str = "features",
@@ -614,7 +618,7 @@ def epochs(
                         model, enable=(grad_accum_steps > 1 and (not should_sync))
                     ):
                         with flop_counter_train.step(display=False) as train_counter:
-                            with AutoCast.float(device):
+                            with Autocast.float(device):
                                 Y_flat = Y.reshape(Y.shape[0], -1).to(
                                     device, dtype=param_dtype
                                 )
@@ -701,7 +705,7 @@ def epochs(
                 flop_counter_val = FlopCounter(model, mode="eval", device=device)
                 with flop_counter_val:
                     model.eval()
-                    with Gradient.inference(model), AutoCast.float(device):
+                    with Gradient.inference(model), Autocast.float(device):
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             feat, label, *_ = preprocess(_raw)
@@ -844,14 +848,14 @@ def epochs(
             updated_this_epoch = False
             if swa_enabled and epoch_idx >= swa_start_epoch:
                 with contextlib.suppress(Exception):
-                    swa_helper.update()
+                    swa_helper.update_weight()
                     updated_this_epoch = True
             if not scheduler_step_per_batch:
                 with contextlib.suppress(Exception):
                     sched.step()
             if bn_update_enabled and (swa_has_updated or updated_this_epoch):
                 with contextlib.suppress(Exception):
-                    swa_helper.bn_update(
+                    swa_helper.update_batch_norm(
                         _swa_feature_iter(), device=device, in_key=swa_in_key
                     )
             if updated_this_epoch:
@@ -864,7 +868,7 @@ def epochs(
 
     if bn_update_enabled and swa_has_updated:
         with contextlib.suppress(Exception):
-            swa_helper.bn_update(
+            swa_helper.update_batch_norm(
                 _swa_feature_iter(), device=device, in_key=swa_in_key
             )
 
@@ -908,7 +912,7 @@ def infer(
     rank = torch.distributed.get_rank() if is_dist else 0
 
     try:
-        with flop_counter, Gradient.inference(run_model), AutoCast.float(device):
+        with flop_counter, Gradient.inference(run_model), Autocast.float(device):
             for _idx, _raw in enumerate(data_loader):
                 feat, _label, *_ = preprocess(_raw)
                 X = to_torch_tensor(feat)
@@ -1182,8 +1186,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        model, _, _ = Fusion.use_te_module(model, device=device)
-        AutoCast.configure(model, metadata=metadata)
+        model, _, _ = Fusion.use_nvidia_layers(model, device=device)
+        Autocast.configure(model, metadata=metadata)
         param_dtype = _ensure_uniform_param_dtype(
             model,
             prefer=(
@@ -1210,7 +1214,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         else:
             disable_note = fp8_reason
         if not fp8_enabled:
-            AutoCast.configure(model, metadata=metadata)
+            Autocast.configure(model, metadata=metadata)
             if disable_note:
                 _float8_log(f"[FP8] disabled: {disable_note}")
         model.train()
@@ -1610,7 +1614,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 optimizer, lr_lambda=_scheduler
             )
             scheduler_step_per_batch = True
-            swa_helper: Optional[SWAAverager] = None
+            swa_helper: Optional[StochasticWeightAverage] = None
             swa_start_epoch = total_epochs
             swa_bn_update = False
 
@@ -1627,7 +1631,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     not in {"", "0", "false"}
                 )
                 try:
-                    swa_helper = make_swa_averager(tracked_module, use_buffers=use_buffers)
+                    swa_helper = stochastic_weight_average(
+                        tracked_module, use_buffers=use_buffers
+                    )
                 except Exception:
                     swa_helper = None
                 if swa_helper is not None:
@@ -1770,7 +1776,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 )
         model.to(device, non_blocking=True).eval()
         metadata = Metadata.for_device(device)
-        model, _, _ = Fusion.use_te_module(model, device=device)
+        model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _materialize_all_layernorms_(_m_eval, device)
         _validate_layernorm_dtypes(_m_eval, device)
@@ -1788,7 +1794,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 else None
             ),
         )
-        AutoCast.configure(model, metadata=metadata)
+        Autocast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = System.is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = Fusion.enable_float8_prediction(
@@ -1797,7 +1803,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 logger=_float8_log,
             )
         else:
-            AutoCast.configure(model, metadata=metadata)
+            Autocast.configure(model, metadata=metadata)
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         model.eval()
 

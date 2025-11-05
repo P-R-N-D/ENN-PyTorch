@@ -606,7 +606,7 @@ def new_model(
 ) -> nn.Module:
     cfg = coerce_model_config(config)
     core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
-    model_td = Fusion.td_from_module(core, in_key="features", out_key="pred", add_loss=True)
+    model_td = Fusion.use_tensordict_layers(core, in_key="features", out_key="pred", add_loss=True)
     return model_td
 
 
