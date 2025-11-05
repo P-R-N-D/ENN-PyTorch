@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
 from functools import partial
 from importlib import import_module, util
 from typing import Any, Iterable, Iterator, Sequence
@@ -236,90 +235,3 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
 
 
-def lazy_import(module_name: str) -> Any:
-    spec = util.find_spec(module_name)
-    if spec is None or spec.loader is None:
-        raise ModuleNotFoundError(module_name)
-    loader = util.LazyLoader(spec.loader)
-    spec.loader = loader
-    module = util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    loader.exec_module(module)
-    return module
-
-
-def has_fsdp2() -> bool:
-    try:
-        __import__("torch.distributed.fsdp.fully_shard")
-        return True
-    except Exception:
-        return False
-
-
-def has_cuda_ipc() -> bool:
-    try:
-        available = bool(getattr(torch.cuda, "is_available", lambda: False)())
-        return available and hasattr(torch.cuda, "ipc_collect")
-    except Exception:
-        return False
-
-
-def has_gds() -> bool:
-    try:
-        if util.find_spec("kvikio") is not None:
-            return True
-    except Exception:
-        pass
-    try:
-        if os.path.exists("/proc/modules"):
-            with open("/proc/modules", "r", encoding="utf-8") as handle:
-                if "nvidia_fs" in handle.read():
-                    return True
-    except Exception:
-        pass
-    return os.path.exists("/etc/cufile.json")
-
-
-@dataclass(frozen=True)
-class EnvInfo:
-    torch_version: str
-    cuda_available: bool
-    cuda_device_count: int
-    has_fsdp2: bool
-    has_cuda_ipc: bool
-    has_gds: bool
-
-
-def env_info() -> EnvInfo:
-    cuda_available = bool(getattr(torch.cuda, "is_available", lambda: False)())
-    cuda_devices = int(getattr(torch.cuda, "device_count", lambda: 0)())
-    return EnvInfo(
-        torch_version=str(getattr(torch, "__version__", "unknown")),
-        cuda_available=cuda_available,
-        cuda_device_count=cuda_devices,
-        has_fsdp2=has_fsdp2(),
-        has_cuda_ipc=has_cuda_ipc(),
-        has_gds=has_gds(),
-    )
-
-
-def _to_sdpa_backends(backends: Iterable[Any] | None = None) -> list[Any]:
-    if backends is None:
-        candidates: Iterable[Any] = (
-            "FLASH_ATTENTION",
-            "EFFICIENT_ATTENTION",
-            "CUDNN_ATTENTION",
-            "MATH",
-        )
-    else:
-        candidates = backends
-    resolved: list[Any] = []
-    for candidate in candidates:
-        if isinstance(candidate, str):
-            attr = candidate.upper()
-            if hasattr(SDPBackend, attr):
-                resolved.append(getattr(SDPBackend, attr))
-            continue
-        if candidate is not None:
-            resolved.append(candidate)
-    return resolved
