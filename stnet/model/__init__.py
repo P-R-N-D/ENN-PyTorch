@@ -20,6 +20,7 @@ from ..functional.losses import (
     TiledLoss,
 )
 from .layers import (
+    CompatLayer,
     CrossAttention,
     CrossTransformer,
     DilatedAttention,
@@ -58,6 +59,7 @@ __all__ = [
     "LocalProcessor",
     "PatchEmbedding",
     "PatchAttention",
+    "CompatLayer",
     "PointTransformer",
     "Retention",
     "RetNet",

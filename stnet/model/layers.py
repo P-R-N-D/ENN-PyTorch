@@ -75,6 +75,18 @@ if TYPE_CHECKING:
 LayerNorm = nn.LayerNorm
 
 
+class CompatLayer(nn.Module):
+    """Expose tensor-only forward for modules returning (output, loss)."""
+
+    def __init__(self, net: nn.Module) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
+        return y_flat
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, axes: Tuple[str, ...]) -> None:
         super().__init__()
