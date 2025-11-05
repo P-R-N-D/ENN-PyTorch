@@ -19,7 +19,6 @@ import torch
 from torch import nn, optim
 from tensordict import TensorDict, TensorDictBase
 
-from ..data.stats import Metadata
 from ..backend.environment import (
     get_device,
     is_float8_supported,
@@ -27,7 +26,42 @@ from ..backend.environment import (
     is_int8_supported,
     optimal_optimizer_params,
 )
+from ..data.stats import Metadata
 from .fx import Autocast, Fusion, is_scale_safe
+
+
+try:  # pragma: no cover - optional dependency
+    from torch.optim.swa_utils import AveragedModel as _SWA
+    from torch.optim.swa_utils import SWALR, update_bn as _update_bn
+except Exception:  # pragma: no cover - defensive fallback
+    _SWA = None  # type: ignore[assignment]
+    SWALR = None  # type: ignore[assignment]
+    _update_bn = None  # type: ignore[assignment]
+
+
+class _TensorDictCompat(nn.Module):
+    def __init__(self, averaged_module: nn.Module, key: str) -> None:
+        super().__init__()
+        self._averaged_module = averaged_module
+        self._key = key
+
+    def forward(self, x: torch.Tensor) -> Any:  # pragma: no cover - thin wrapper
+        td = TensorDict({self._key: x}, batch_size=[x.shape[0]], device=x.device)
+        return self._averaged_module(td)
+
+
+def stochastic_weight_average(
+    model: nn.Module,
+    *,
+    device: Optional[torch.device] = None,
+    use_buffers: bool = True,
+    avg_fn: Optional[Any] = None,
+) -> "StochasticWeightAverage":
+    """Factory helper mirroring the signature of :class:`StochasticWeightAverage`."""
+
+    return StochasticWeightAverage(
+        model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
+    )
 
 
 class AdamW:
@@ -58,7 +92,7 @@ class AdamW:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = Autocast._ensure_metadata(dev, metadata=metadata)
+        meta = Autocast._coerce_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
@@ -76,7 +110,7 @@ class AdamW:
         if hasattr(dev, "type") and dev.type == "cuda":
             fp8_allowed = True
             if getattr(meta, "has_scale", False):
-                float8_dtypes = Autocast._float8_dtypes()
+                float8_dtypes = Autocast.float8_formats()
                 if not any(
                     is_scale_safe(dtype, meta, safety_margin=2.0)
                     for dtype in float8_dtypes
@@ -150,7 +184,7 @@ class AdamW:
             dev = ref_tensor.device
         else:
             dev = get_device()
-        meta = Autocast._ensure_metadata(dev, metadata=metadata)
+        meta = Autocast._coerce_metadata(dev, metadata=metadata)
         dev = torch.device(meta.device)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
@@ -225,15 +259,6 @@ class AdamW:
         if logger:
             logger(f"[OPT] Using AdamW (flags={flags})")
         return opt
-
-
-try:  # pragma: no cover - optional dependency
-    from torch.optim.swa_utils import AveragedModel as _SWA
-    from torch.optim.swa_utils import SWALR, update_bn as _update_bn
-except Exception:  # pragma: no cover - defensive fallback
-    _SWA = None  # type: ignore[assignment]
-    SWALR = None  # type: ignore[assignment]
-    _update_bn = None  # type: ignore[assignment]
 
 
 class StochasticWeightAverage:
@@ -318,17 +343,7 @@ class StochasticWeightAverage:
                 if tensor is not None:
                     yield tensor
 
-        class _TDAdapter(nn.Module):
-            def __init__(self, averaged_module: nn.Module, key: str) -> None:
-                super().__init__()
-                self._averaged_module = averaged_module
-                self._key = key
-
-            def forward(self, x: torch.Tensor) -> Any:  # pragma: no cover - thin wrapper
-                td = TensorDict({self._key: x}, batch_size=[x.shape[0]], device=x.device)
-                return self._averaged_module(td)
-
-        adapter = _TDAdapter(self._averaged, in_key)
+        adapter = _TensorDictCompat(self._averaged, in_key)
         _update_bn(_features(feature_iter), adapter, device=device)
 
     def save_state_dict(self) -> Dict[str, Any]:
@@ -336,26 +351,3 @@ class StochasticWeightAverage:
 
     def load_state_dict(self, state: Dict[str, Any]) -> Any:
         return self._averaged.load_state_dict(state)
-
-
-def stochastic_weight_average(
-    model: nn.Module,
-    *,
-    device: Optional[torch.device] = None,
-    use_buffers: bool = True,
-    avg_fn: Optional[Any] = None,
-) -> StochasticWeightAverage:
-    """Factory helper mirroring the signature of :class:`StochasticWeightAverage`."""
-
-    return StochasticWeightAverage(
-        model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
-    )
-
-
-__all__ = [
-    "AdamW",
-    "StochasticWeightAverage",
-    "stochastic_weight_average",
-    "SWALR",
-]
-
