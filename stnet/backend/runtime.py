@@ -57,13 +57,13 @@ from .profiler import FlopCounter
 from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
 from .distributed import (
     Distributed,
-    broadcast_model_states,
     distributed_barrier,
     is_dist_avail_and_initialized,
     joining,
     no_synchronization,
     wrap_ddp_if_needed,
     wrap_fsdp_module,
+    sync_model_states,
 )
 
 
@@ -381,6 +381,21 @@ def _backend_type(device: torch.device) -> str:
 
 
 def _set_backend(device: torch.device) -> None:
+    with contextlib.suppress(Exception):
+        # FP32 matmul을 빠르게: 내부 정밀도 'high' (GPU에선 TF32 경로 활용)
+        # conv/matmul TF32 허용 및 cuDNN autotune 활성화
+        with contextlib.suppress(Exception):
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                try:
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                except Exception:
+                    # 신버전은 fp32_precision로 대체
+                    with contextlib.suppress(Exception):
+                        torch.backends.cuda.matmul.fp32_precision = "high"
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.allow_tf32 = True
+                torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
@@ -524,8 +539,7 @@ def epochs(
 
             if is_dist_avail_and_initialized():
                 target_module = model.module if hasattr(model, "module") else model
-                broadcast_model_states(target_module)
-                distributed_barrier(device)
+                sync_model_states(target_module, device=device)
 
             flop_breakdown_epoch: Dict[str, float] = {}
             io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -876,7 +890,7 @@ def infer(
     run_model = wrap_ddp_if_needed(model, device=device)
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
-    broadcast_model_states(module_eval)
+    sync_model_states(module_eval, device=device)
 
     chunk_idx = 0
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
@@ -1383,7 +1397,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         _assert_no_meta_tensors(_m_post)
         _assert_no_fake_dtensor_in_ln(_m_post, allow_dtensor=True)
         _maybe_install_meta_pre_hook(_m_post)
-        broadcast_model_states(_m_post)
+        sync_model_states(_m_post, device=device)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(

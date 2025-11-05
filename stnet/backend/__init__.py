@@ -41,6 +41,7 @@ from .distributed import (
     normalize_ip_literal,
     probe_stack_support,
     resolve_host_ip,
+    sync_model_states,
     wrap_ddp_if_needed,
     wrap_fsdp_module,
 )
@@ -132,6 +133,7 @@ __all__ = [
     "runtime_config",
     "save_model",
     "set_multiprocessing_env",
+    "sync_model_states",
     "train",
     "wrap_ddp_if_needed",
     "wrap_fsdp_module",
