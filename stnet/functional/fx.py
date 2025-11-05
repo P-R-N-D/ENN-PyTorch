@@ -1578,17 +1578,17 @@ class Fusion:
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
 
-    # === TensorDict recursive wrapping with provenance ===
+
     @staticmethod
     def _wrap_leaf_layer(
         module: nn.Module,
         in_key: str,
         out_key: str,
-        *,
+        *args: Any,
         origin_name: str,
         origin_path: str,
+        **kwargs: Any,
     ) -> TensorDictModule:
-        """Wrap a leaf ``nn.Module`` to record provenance alongside outputs."""
 
         origin_type = module.__class__.__name__
 
@@ -1632,12 +1632,12 @@ class Fusion:
     def _wrap_recursively(
         cls,
         module: nn.Module,
-        *,
+        *args: Any,
         in_key: str,
         out_key: str,
         parent_path: str = "",
+        **kwargs: Any,
     ) -> TensorDictSequential:
-        """Recursively convert a module tree into a :class:`TensorDictSequential`."""
 
         children = list(module.named_children())
         if not children:
@@ -1702,7 +1702,7 @@ class Fusion:
     def use_tensordict_layers(
         cls,
         module: nn.Module,
-        *,
+        *args: Any,
         in_key: str = "features",
         out_key: str = "pred",
         add_loss: bool = True,
@@ -1711,8 +1711,8 @@ class Fusion:
         loss_weights: Tuple[float, float] = (1.0, 1.0),
         cudagraph: bool = False,
         compat_call: bool = True,
+        **kwargs: Any,
     ) -> nn.Module:
-        """Wrap ``module`` in a TensorDict pipeline with optional loss handling."""
 
         pipeline: TensorDictSequential = cls._wrap_recursively(
             module,
@@ -1726,12 +1726,13 @@ class Fusion:
             class TensorDictLoss(nn.Module):
                 def __init__(
                     self,
-                    *,
+                    *args: Any,
                     pred_key: str,
                     net_loss: Optional[LossCallable],
                     global_loss: Optional[LossCallable],
                     local_loss: Optional[LossCallable],
                     weights: Tuple[float, float],
+                    **kwargs: Any,
                 ) -> None:
                     super().__init__()
                     self.pred_key = pred_key
