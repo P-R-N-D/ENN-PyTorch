@@ -585,6 +585,23 @@ def epochs(
     prev_io_bytes = 0.0
     prev_flops = 0.0
 
+    def _swa_feature_iter() -> Iterator[Dict[str, torch.Tensor]]:
+        """Yield preprocessed feature batches for SWA BatchNorm updates."""
+
+        for _raw in train_loader:
+            feat, *_ = preprocess(_raw)
+            X = to_torch_tensor(feat)
+            X = torch.atleast_2d(X)
+            if X.dim() != 2:
+                raise RuntimeError(
+                    f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
+                )
+            if X.shape[1] != in_dim:
+                raise RuntimeError(
+                    f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
+                )
+            yield {swa_in_key: X.to(device, non_blocking=True)}
+
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
         for epoch_idx in range(int(total_epochs)):
@@ -910,7 +927,9 @@ def epochs(
                     sched.step()
             if bn_update_enabled and (swa_has_updated or updated_this_epoch):
                 with contextlib.suppress(Exception):
-                    swa_helper.bn_update(train_loader, device=device, in_key=swa_in_key)
+                    swa_helper.bn_update(
+                        _swa_feature_iter(), device=device, in_key=swa_in_key
+                    )
             if updated_this_epoch:
                 swa_has_updated = True
 
@@ -921,7 +940,9 @@ def epochs(
 
     if bn_update_enabled and swa_has_updated:
         with contextlib.suppress(Exception):
-            swa_helper.bn_update(train_loader, device=device, in_key=swa_in_key)
+            swa_helper.bn_update(
+                _swa_feature_iter(), device=device, in_key=swa_in_key
+            )
 
     if status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
