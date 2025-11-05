@@ -15,6 +15,7 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
+from ..functional.optimizers import SWAAverager, make_swa_averager, SWALR
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -549,6 +550,11 @@ def epochs(
     val_loader: Any,
     total_epochs: int,
     local_rank: int = 0,
+    scheduler_step_per_batch: bool = True,
+    swa_helper: Optional[SWAAverager] = None,
+    swa_start_epoch: int = 0,
+    swa_bn_update: bool = False,
+    swa_in_key: str = "features",
     **kwargs: Any,
 ) -> None:
 
@@ -567,10 +573,34 @@ def epochs(
         device=device,
     )
 
+    scheduler_step_per_batch = bool(scheduler_step_per_batch)
+    swa_enabled = swa_helper is not None
+    swa_start_epoch = max(0, int(swa_start_epoch))
+    swa_has_updated = False
+    bn_update_enabled = bool(swa_bn_update) and swa_enabled
+    swa_in_key = str(swa_in_key or "features")
+
     prev_io_time = 0.0
     prev_comp_time = 0.0
     prev_io_bytes = 0.0
     prev_flops = 0.0
+
+    def _swa_feature_iter() -> Iterator[Dict[str, torch.Tensor]]:
+        """Yield preprocessed feature batches for SWA BatchNorm updates."""
+
+        for _raw in train_loader:
+            feat, *_ = preprocess(_raw)
+            X = to_torch_tensor(feat)
+            X = torch.atleast_2d(X)
+            if X.dim() != 2:
+                raise RuntimeError(
+                    f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
+                )
+            if X.shape[1] != in_dim:
+                raise RuntimeError(
+                    f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
+                )
+            yield {swa_in_key: X.to(device, non_blocking=True)}
 
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
@@ -690,7 +720,9 @@ def epochs(
                                 scaler.step(optimizer)
                                 scaler.update()
                                 optimizer.zero_grad(set_to_none=True)
-                                sched.step()
+                                if scheduler_step_per_batch:
+                                    with contextlib.suppress(Exception):
+                                        sched.step()
 
                             with contextlib.suppress(Exception):
                                 flops += torch.tensor(
@@ -885,10 +917,32 @@ def epochs(
 
                 distributed_barrier(device)
 
+            updated_this_epoch = False
+            if swa_enabled and epoch_idx >= swa_start_epoch:
+                with contextlib.suppress(Exception):
+                    swa_helper.update()
+                    updated_this_epoch = True
+            if not scheduler_step_per_batch:
+                with contextlib.suppress(Exception):
+                    sched.step()
+            if bn_update_enabled and (swa_has_updated or updated_this_epoch):
+                with contextlib.suppress(Exception):
+                    swa_helper.bn_update(
+                        _swa_feature_iter(), device=device, in_key=swa_in_key
+                    )
+            if updated_this_epoch:
+                swa_has_updated = True
+
             prev_comp_time += float(comp_time.item())
             prev_io_time += float(io_time.item())
             prev_flops += float(flops.item())
             prev_io_bytes += float(io_bytes.item())
+
+    if bn_update_enabled and swa_has_updated:
+        with contextlib.suppress(Exception):
+            swa_helper.bn_update(
+                _swa_feature_iter(), device=device, in_key=swa_in_key
+            )
 
     if status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
@@ -1605,7 +1659,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             train_steps = _infer_num_batches(train_loader)
             val_steps = _infer_num_batches(val_loader)
             steps_per_epoch = max(1, train_steps + val_steps)
-            total_steps = max(1, int(ops.epochs) * steps_per_epoch)
+            total_epochs = int(ops.epochs)
+            total_steps = max(1, total_epochs * steps_per_epoch)
             if ops.warmup_ratio > 0.0:
                 warmup_steps = max(1, int(total_steps * ops.warmup_ratio))
                 main_steps = max(1, total_steps - warmup_steps)
@@ -1630,6 +1685,66 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             sched = torch.optim.lr_scheduler.LambdaLR(
                 optimizer, lr_lambda=_scheduler
             )
+            scheduler_step_per_batch = True
+            swa_helper: Optional[SWAAverager] = None
+            swa_start_epoch = total_epochs
+            swa_bn_update = False
+
+            enable_swa_env = os.environ.get("STNET_SWA_ENABLE", "0").strip().lower()
+            start_epoch_env = os.environ.get("STNET_SWA_START_EPOCH")
+            enable_swa = (
+                enable_swa_env not in {"", "0", "false"}
+                or start_epoch_env is not None
+            )
+            if enable_swa and SWALR is not None:
+                tracked_module = model.module if hasattr(model, "module") else model
+                use_buffers = (
+                    os.environ.get("STNET_SWA_USE_BUFFERS", "1").strip().lower()
+                    not in {"", "0", "false"}
+                )
+                try:
+                    swa_helper = make_swa_averager(tracked_module, use_buffers=use_buffers)
+                except Exception:
+                    swa_helper = None
+                if swa_helper is not None:
+                    scheduler_step_per_batch = False
+                    swa_start_epoch = max(
+                        0, int(os.environ.get("STNET_SWA_START_EPOCH", "0"))
+                    )
+                    swa_bn_update = (
+                        os.environ.get("STNET_SWA_BN_UPDATE", "0").strip().lower()
+                        not in {"", "0", "false"}
+                    )
+                    eta_min = float(getattr(ops, "eta_min", 0.0) or 0.0)
+                    base_lr = float(ops.base_lr)
+                    default_swa_lr = max(
+                        1e-8, eta_min if eta_min > 0.0 else 0.1 * base_lr
+                    )
+                    swa_lr = float(
+                        os.environ.get("STNET_SWA_LR", str(default_swa_lr))
+                    )
+                    anneal_epochs = max(
+                        1,
+                        int(
+                            os.environ.get(
+                                "STNET_SWA_ANNEAL_EPOCHS",
+                                str(max(1, total_epochs // 10)),
+                            )
+                        ),
+                    )
+                    try:
+                        sched = SWALR(
+                            optimizer,
+                            swa_lr=swa_lr,
+                            anneal_epochs=anneal_epochs,
+                            anneal_strategy="cos",
+                        )
+                    except Exception:
+                        scheduler_step_per_batch = True
+                        swa_helper = None
+                        swa_start_epoch = total_epochs
+                        swa_bn_update = False
+
             scaler = torch.amp.GradScaler(
                 enabled=(
                     device.type == "cuda" and (not torch.cuda.is_bf16_supported())
@@ -1649,8 +1764,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 grad_accum_steps=int(ops.grad_accum_steps),
                 train_loader=train_loader,
                 val_loader=val_loader,
-                total_epochs=int(ops.epochs),
+                total_epochs=total_epochs,
                 local_rank=local_rank,
+                scheduler_step_per_batch=scheduler_step_per_batch,
+                swa_helper=swa_helper,
+                swa_start_epoch=swa_start_epoch,
+                swa_bn_update=swa_bn_update,
             )
         finally:
             if keep is not None:

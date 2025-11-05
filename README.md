@@ -22,7 +22,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[service]
    ```
--   Additional extras include `pandas`, `polars`, `excel`, `spark`, `thread`, `torchao`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`.
+-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `thread`, `torchao`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, and `torchscale` as defined in `pyproject.toml`. The storage-focused `nvidia_gds_cu12` extra installs `cupy-cuda12x>=13.6.0` and `kvikio-cu12>=25.12.0`, while `nvidia_gds_cu13` installs `cupy-cuda13x>=13.6.0` and `kvikio-cu13>=25.12.0`.
 
 ## Dependencies
 The core backend depends on:
@@ -42,7 +42,7 @@ Optional extras listed in `pyproject.toml` include:
 - Spark pipelines (`spark`)
 - advanced optimization toolchains (`thread`, `torchao`)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
-- storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`)
+- storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`) – install the CUDA 12 pair (`cupy-cuda12x>=13.6.0`, `kvikio-cu12>=25.12.0`) or the CUDA 13 pair (`cupy-cuda13x>=13.6.0`, `kvikio-cu13>=25.12.0`)
 - retention-focused research modules (`torchscale`)
 
 Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
