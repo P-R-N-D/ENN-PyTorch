@@ -12,11 +12,7 @@ import numpy as np
 import torch
 from tensordict import tensorclass
 
-from ..backend.environment import (
-    cuda_compute_capability,
-    is_cpu_bf16_supported,
-    is_int8_supported,
-)
+from ..backend.environment import cuda_compute_capability
 
 
 TExtra = TypeVar("TExtra")
@@ -83,50 +79,23 @@ class Metadata(Generic[TExtra]):
 
     @staticmethod
     def _float8_dtypes() -> Tuple[torch.dtype, ...]:
-        names = (
-            "float8_e4m3fn",
-            "float8_e4m3fnuz",
-            "float8_e5m2",
-            "float8_e5m2fnuz",
-        )
-        values: list[torch.dtype] = []
-        for name in names:
-            candidate = getattr(torch, name, None)
-            if isinstance(candidate, torch.dtype):
-                values.append(candidate)
-        return tuple(values)
+        from ..functional.fx import AutoCast as _AutoCast
+
+        return _AutoCast._float8_dtypes()
 
     @classmethod
     def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        dev_type = device.type
-        candidates: list[torch.dtype] = []
-        if dev_type == "cuda":
-            if torch.cuda.is_bf16_supported():
-                candidates.append(torch.bfloat16)
-            candidates.append(torch.float16)
-            candidates.append(torch.float32)
-        elif dev_type == "xpu":
-            candidates.extend((torch.bfloat16, torch.float32))
-        elif dev_type == "mps":
-            candidates.extend((torch.float16, torch.float32))
-        elif dev_type == "cpu":
-            if is_cpu_bf16_supported():
-                candidates.append(torch.bfloat16)
-            candidates.extend((torch.float32, torch.float64))
-        else:
-            candidates.append(torch.float32)
-        if not candidates:
-            candidates.append(torch.float32)
-        return cls._distinct_dtypes(candidates)
+        # delegate to AutoCast to avoid duplication
+        from ..functional.fx import AutoCast as _AutoCast
+
+        return _AutoCast._float_amp_candidates(device)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        candidates: list[torch.dtype] = []
-        int8_ok, _ = is_int8_supported(device)
-        if int8_ok:
-            candidates.append(torch.int8)
-        candidates.extend((torch.int16, torch.int32, torch.int64))
-        return cls._distinct_dtypes(candidates or (torch.int64,))
+        # delegate to AutoCast to avoid duplication
+        from ..functional.fx import AutoCast as _AutoCast
+
+        return _AutoCast._integer_candidates(device)
 
     @classmethod
     def for_device(

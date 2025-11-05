@@ -31,6 +31,7 @@ except Exception:
 from .datatype import to_torch_tensor
 from .nodes import DevicePrefetcher, GDSBatchReader
 from ..backend.environment import System
+from ..backend.environment import optimize_threads as _env_optimize_threads
 
 
 class ThreadLoadBalancer:
@@ -278,6 +279,9 @@ class ThreadLoadBalancer:
 
     @staticmethod
     def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
+        if intra is None and inter is None:
+            _env_optimize_threads()
+            return
         if intra is not None:
             try:
                 torch.set_num_threads(max(1, int(intra)))
