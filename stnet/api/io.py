@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import shutil
 import subprocess
+import sys
 import warnings
 from dataclasses import asdict
 from pathlib import Path
@@ -33,11 +33,13 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..model import Root
+from ..model.layers import CompatLayer
 from ..api.config import ModelConfig, coerce_model_config
 from ..functional.fx import Fusion, Gradient
 
 
 class MissingDependencyError(ImportError):
+    """Raised when an optional dependency is required at runtime."""
     pass
 
 
@@ -60,16 +62,6 @@ def _run_cmd(cmd: Sequence[str], desc: str) -> None:
         subprocess.run(list(cmd), check=True)
     except (OSError, subprocess.CalledProcessError) as e:
         raise RuntimeError(f"{desc} failed: {e}") from e
-
-
-class _ExportCompat(nn.Module):
-    def __init__(self, net: nn.Module) -> None:
-        super().__init__()
-        self.net = net
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
-        return y_flat
 
 
 def _infer_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) -> Tuple[int, Tuple[int, ...]]:
@@ -133,7 +125,9 @@ def _model_config_dict(model: nn.Module) -> Dict[str, Any]:
     return asdict(ModelConfig())
 
 
-class TorchIO:
+class ModelIO:
+    """Native PyTorch / safetensors / DCP save helpers."""
+
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
@@ -141,7 +135,7 @@ class TorchIO:
         p = Path(path)
         suffix = p.suffix.lower()
         if suffix:
-            return suffix in TorchIO.NATIVE_EXTS
+            return suffix in ModelIO.NATIVE_EXTS
         return True
 
     @staticmethod
@@ -157,19 +151,20 @@ class TorchIO:
         suffix = p.suffix.lower()
 
         if not suffix:
-            if p.exists():
-                if p.is_file():
-                    suffix = ".pt"
-                elif p.is_dir():
-                    from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
+            # If the target is an existing directory, use DCP. Otherwise default to ".pt".
+            if p.exists() and p.is_dir():
+                from torch.distributed.checkpoint import save as dcp_save, FileSystemWriter
 
-                    opts_sd = StateDictOptions(full_state_dict=True)
-                    m_sd = get_model_state_dict(model, options=opts_sd)
-                    dcp_save(
-                        state_dict={"model": m_sd},
-                        storage_writer=FileSystemWriter(str(p)),
-                    )
-                    return p
+                opts_sd = StateDictOptions(full_state_dict=True)
+                m_sd = get_model_state_dict(model, options=opts_sd)
+                dcp_save(
+                    state_dict={"model": m_sd},
+                    storage_writer=FileSystemWriter(str(p)),
+                )
+                return p
+            # Default to a file with .pt extension when no suffix is provided.
+            p = p.with_suffix(".pt")
+            suffix = ".pt"
 
         p.parent.mkdir(parents=True, exist_ok=True)
 
@@ -179,6 +174,7 @@ class TorchIO:
 
             sd = model.state_dict()
             cpu_sd = {k: _to_cpu_if_tensor(v) for k, v in sd.items()}
+            # Save weights; keep rich metadata in a sidecar JSON for easy retrieval.
             save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
             meta = {
                 "version": 1,
@@ -191,6 +187,7 @@ class TorchIO:
             p.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
             return p
 
+        # Default: torch.save payload containing state_dict and metadata.
         payload: Dict[str, Any] = {
             "version": 1,
             "in_dim": int(getattr(model, "in_dim", 0)),
@@ -200,38 +197,21 @@ class TorchIO:
             "pytorch_version": torch.__version__,
         }
         if optimizer is not None and hasattr(optimizer, "state_dict"):
-            try:
+            with contextlib.suppress(Exception):
                 payload["optimizer_state_dict"] = optimizer.state_dict()
-            except Exception:
-                pass
         if extra:
             payload["extra"] = extra
         torch.save(payload, str(p))
         return p
 
-    @staticmethod
-    def load_state(path: str | Path, map_location: Optional[str] = None) -> Dict[str, Any] | torch.Tensor:
-        p = Path(path)
-        if p.is_dir():
-            raise RuntimeError("Use DCP-specific load with a pre-allocated model and state_dict")
-        if p.suffix.lower() == ".safetensors":
-            _require("safetensors", "pip install safetensors")
-            from safetensors.torch import load_file as load_tensors
-            return load_tensors(str(p), device=map_location or "cpu")
-        load_kwargs = {"map_location": map_location or "cpu"}
-        try:
-            return torch.load(str(p), weights_only=True, **load_kwargs)
-        except TypeError:
-            return torch.load(str(p), **load_kwargs)
 
-
-class ConverterBase(Protocol):
+class ExportBase(Protocol):
     name: str
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]: ...
 
 
-class Converter:
-    _by_name: Dict[str, ConverterBase] = {}
+class Export:
+    _by_name: Dict[str, ExportBase] = {}
     _ext_map: Dict[str, str] = {}
 
     class _OnnxLayer:
@@ -246,7 +226,7 @@ class Converter:
             **kwargs: Any,
         ) -> Path:
             _require("onnx", "pip install onnx")
-            wrapper = _ExportCompat(model).eval()
+            wrapper = CompatLayer(model).eval()
             sample = _pad_sample(model, sample_input)
             input_names = ["features"]
             output_names = ["preds_flat"]
@@ -255,11 +235,10 @@ class Converter:
                 if dynamic_batch
                 else None
             )
+            # New exporter path is recommended; fall back to legacy path if it fails.
             export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
             fallback_errors = (
-                (RuntimeError,)
-                if export_error is RuntimeError
-                else (RuntimeError, export_error)
+                (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
             )
             common_kwargs = {
                 "export_params": True,
@@ -291,7 +270,7 @@ class Converter:
         @staticmethod
         def ensure(model: nn.Module, onnx_path: Path, *args: Any, **opts: Any) -> Path:
             if not onnx_path.exists():
-                return Converter._OnnxLayer.export(model, onnx_path, **opts)
+                return Export._OnnxLayer.export(model, onnx_path, **opts)
             return onnx_path
 
     class _OrtLayer:
@@ -315,14 +294,11 @@ class Converter:
                 "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
                 "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
             }
-            level = opt_map.get(
-                optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
+            level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
             platform = (target_platform or "").lower()
             disabled_optimizers = (
                 ["NchwcTransformer"]
-                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                and platform not in {"", "amd64"}
+                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
                 else None
             )
             optimized_onnx_path: Optional[Path] = None
@@ -332,9 +308,7 @@ class Converter:
                 so_onnx.optimized_model_filepath = str(optimized_onnx_path)
                 so_onnx.graph_optimization_level = level
                 if optimization_style.lower() == "runtime":
-                    so_onnx.add_session_config_entry(
-                        "optimization.minimal_build_optimizations", "apply"
-                    )
+                    so_onnx.add_session_config_entry("optimization.minimal_build_optimizations", "apply")
                 ort.InferenceSession(
                     str(onnx_path),
                     sess_options=so_onnx,
@@ -344,32 +318,37 @@ class Converter:
             so = ort.SessionOptions()
             so.optimized_model_filepath = str(ort_path)
             so.graph_optimization_level = level
+            # Save ORT-format model
             so.add_session_config_entry("session.save_model_format", "ORT")
             if optimization_style.lower() == "runtime":
                 so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
             ort.InferenceSession(
-                str(onnx_path), sess_options=so,
-                providers=["CPUExecutionProvider"], disabled_optimizers=disabled_optimizers
+                str(onnx_path),
+                sess_options=so,
+                providers=["CPUExecutionProvider"],
+                disabled_optimizers=disabled_optimizers,
             )
             return ort_path, optimized_onnx_path
 
     @classmethod
-    def register(cls, name: str, exts: Tuple[str, ...], impl: ConverterBase) -> None:
+    def register(cls, name: str, exts: Tuple[str, ...], impl: ExportBase) -> None:
         cls._by_name[name] = impl
         for e in exts:
             cls._ext_map[e.lower()] = name
 
     @classmethod
-    def for_ext(cls, ext: str) -> Optional[ConverterBase]:
+    def for_ext(cls, ext: str) -> Optional[ExportBase]:
         name = cls._ext_map.get(ext.lower())
         return cls._by_name.get(name) if name else None
 
 
 class OnnxConverter:
     name = "onnx"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        out = Converter._OnnxLayer.export(
-            model, dst,
+        out = Export._OnnxLayer.export(
+            model,
+            dst,
             sample_input=opts.get("sample_input"),
             opset_version=int(opts.get("opset_version", 18)),
             dynamic_batch=bool(opts.get("dynamic_batch", True)),
@@ -379,16 +358,19 @@ class OnnxConverter:
 
 class OrtConverter:
     name = "ort"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
-        onnx_path = Converter._OnnxLayer.ensure(
-            model, onnx_path,
+        onnx_path = Export._OnnxLayer.ensure(
+            model,
+            onnx_path,
             sample_input=opts.get("sample_input"),
             opset_version=int(opts.get("opset_version", 18)),
             dynamic_batch=bool(opts.get("dynamic_batch", True)),
         )
-        ort_path, optimized = Converter._OrtLayer.save_ort(
-            onnx_path, dst,
+        ort_path, optimized = Export._OrtLayer.save_ort(
+            onnx_path,
+            dst,
             optimization_level=str(opts.get("optimization_level", "all")),
             optimization_style=str(opts.get("optimization_style", "fixed")),
             target_platform=opts.get("target_platform"),
@@ -399,10 +381,12 @@ class OrtConverter:
 
 class TensorRTConverter:
     name = "tensorrt"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
-        onnx_path = Converter._OnnxLayer.ensure(
-            model, onnx_path,
+        onnx_path = Export._OnnxLayer.ensure(
+            model,
+            onnx_path,
             sample_input=opts.get("sample_input"),
             opset_version=int(opts.get("opset_version", 18)),
             dynamic_batch=bool(opts.get("dynamic_batch", True)),
@@ -455,10 +439,12 @@ class TensorRTConverter:
 
 class NnefConverter:
     name = "nnef"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
-        onnx_path = Converter._OnnxLayer.ensure(
-            model, onnx_path,
+        onnx_path = Export._OnnxLayer.ensure(
+            model,
+            onnx_path,
             sample_input=opts.get("sample_input"),
             opset_version=int(opts.get("opset_version", 18)),
             dynamic_batch=bool(opts.get("dynamic_batch", True)),
@@ -473,10 +459,19 @@ class NnefConverter:
             sample = _pad_sample(model, opts.get("sample_input"))
             input_shapes = {"features": tuple(int(x) for x in sample.shape)}
         cmd = [
-            os.sys.executable, "-m", "nnef_tools.convert",
-            "--input-format", "onnx", "--output-format", "nnef",
-            "--input-model", str(onnx_path), "--output-model", str(dst),
-            "--input-shapes", json.dumps(input_shapes),
+            sys.executable,
+            "-m",
+            "nnef_tools.convert",
+            "--input-format",
+            "onnx",
+            "--output-format",
+            "nnef",
+            "--input-model",
+            str(onnx_path),
+            "--output-model",
+            str(dst),
+            "--input-shapes",
+            json.dumps(input_shapes),
         ]
         toggles = (
             ("keep_io_names", "--keep-io-names", True),
@@ -494,11 +489,13 @@ class NnefConverter:
 
 class CoreMLConverter:
     name = "coreml"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         _require("coremltools", "pip install coremltools")
         import coremltools as ct
+
         sample = _pad_sample(model, opts.get("sample_input"))
-        wrapper = _ExportCompat(model).eval()
+        wrapper = CompatLayer(model).eval()
         with Gradient.inference(wrapper):
             scripted = torch.jit.trace(wrapper, sample)
         cu_map = {
@@ -527,12 +524,13 @@ class CoreMLConverter:
 
 class LiteRTConverter:
     name = "litert"
+
     def convert(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
         sample_input = opts.get("sample_input")
         opset_version = int(opts.get("opset_version", 18))
         dynamic_batch = bool(opts.get("dynamic_batch", True))
         onnx_path = Path(opts.get("onnx_path") or dst.with_suffix(".onnx"))
-        onnx_path = Converter._OnnxLayer.ensure(
+        onnx_path = Export._OnnxLayer.ensure(
             model,
             onnx_path,
             sample_input=sample_input,
@@ -544,8 +542,13 @@ class LiteRTConverter:
                 out_dir = dst.with_suffix("")
                 out_dir.mkdir(parents=True, exist_ok=True)
                 cmd = [
-                    os.sys.executable, "-m", "onnx2tf",
-                    "-i", str(onnx_path), "-o", str(out_dir),
+                    sys.executable,
+                    "-m",
+                    "onnx2tf",
+                    "-i",
+                    str(onnx_path),
+                    "-o",
+                    str(out_dir),
                     "--copy_onnx_input_output_names_to_tflite",
                 ]
                 _run_cmd(cmd, "onnx2tf")
@@ -561,6 +564,7 @@ class LiteRTConverter:
         import onnx
         from onnx_tf.backend import prepare
         import tensorflow as tf
+
         model_onnx = onnx.load(str(onnx_path))
         from tempfile import TemporaryDirectory
 
@@ -587,12 +591,12 @@ class LiteRTConverter:
         return (dst,)
 
 
-Converter.register("onnx", (".onnx",), OnnxConverter())
-Converter.register("ort", (".ort",), OrtConverter())
-Converter.register("tensorrt", (".engine",), TensorRTConverter())
-Converter.register("nnef", (".nnef",), NnefConverter())
-Converter.register("coreml", (".mlmodel",), CoreMLConverter())
-Converter.register("litert", (".tflite",), LiteRTConverter())
+Export.register("onnx", (".onnx",), OnnxConverter())
+Export.register("ort", (".ort",), OrtConverter())
+Export.register("tensorrt", (".engine",), TensorRTConverter())
+Export.register("nnef", (".nnef",), NnefConverter())
+Export.register("coreml", (".mlmodel",), CoreMLConverter())
+Export.register("litert", (".tflite",), LiteRTConverter())
 
 
 def new_model(
@@ -607,24 +611,24 @@ def new_model(
 
 
 def load_model(
-    checkpoint_path: str,
+    checkpoint_path: str | Path,
     in_dim: Optional[int] = None,
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
-    map_location: Optional[str] = None,
+    map_location: Optional[torch.device | str] = None,
 ) -> nn.Module:
 
-    if os.path.isdir(checkpoint_path):
+    p = Path(checkpoint_path)
+    if p.is_dir():
         if in_dim is None or out_shape is None:
             raise ValueError("Loading from a checkpoint directory requires in_dim and out_shape.")
         model = new_model(int(in_dim), tuple(out_shape), config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
-        dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(checkpoint_path))
+        dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         return model
 
-    p = Path(checkpoint_path)
     if p.suffix.lower() == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
@@ -632,12 +636,11 @@ def load_model(
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
         use_out_shape = tuple(int(x) for x in (out_shape if out_shape is not None else meta.get("out_shape") or ()))
-        use_config = coerce_model_config(
-            config if config is not None else meta.get("config")
-        )
+        use_config = coerce_model_config(config if config is not None else meta.get("config"))
         model = new_model(use_in_dim, use_out_shape, use_config)
         _require("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
+
         sd = load_tensors(str(p), device=map_location or "cpu")
         model.load_state_dict(sd)
         return model
@@ -657,7 +660,7 @@ def load_model(
 
 def save_model(
     model: nn.Module,
-    path: str,
+    path: str | Path,
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None,
     *,
@@ -668,7 +671,7 @@ def save_model(
 
     p = Path(path)
 
-    if TorchIO.is_native_target(p):
+    if ModelIO.is_native_target(p):
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
@@ -676,7 +679,7 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = TorchIO.save(
+        out = ModelIO.save(
             model,
             p,
             optimizer=optimizer,
@@ -685,7 +688,7 @@ def save_model(
         )
         return str(out)
 
-    conv = Converter.for_ext(p.suffix)
+    conv = Export.for_ext(p.suffix)
     if conv is None:
         raise ValueError(f"Unknown format for path: {path}")
     conv.convert(model, p, **kwargs)
