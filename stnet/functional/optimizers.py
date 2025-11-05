@@ -32,9 +32,11 @@ from .fx import Autocast, Fusion, is_scale_safe
 
 try:  # pragma: no cover - optional dependency
     from torch.optim.swa_utils import AveragedModel as _SWA
+    from torch.optim.swa_utils import SWALR
     from torch.optim.swa_utils import update_bn as _update_bn
 except Exception:  # pragma: no cover - defensive fallback
     _SWA = None  # type: ignore[assignment]
+    SWALR = None  # type: ignore[assignment]
     _update_bn = None  # type: ignore[assignment]
 
 
