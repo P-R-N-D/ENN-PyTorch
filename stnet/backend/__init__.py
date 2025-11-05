@@ -19,7 +19,7 @@ from ..functional.losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from ..functional.optimizers import AdamW
+from ..functional.optimizers import AdamW, SWAAverager, SWALR, make_swa_averager
 from .distributed import (
     Distributed,
     Join,
@@ -70,6 +70,9 @@ from .environment import (
 
 __all__ = [
     "AdamW",
+    "SWAAverager",
+    "SWALR",
+    "make_swa_averager",
     "DataFidelityLoss",
     "Distributed",
     "Join",

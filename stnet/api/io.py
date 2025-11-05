@@ -660,14 +660,29 @@ def save_model(
     path: str,
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None,
-    *args: Any,
+    *,
+    ema_averager: Optional[Any] = None,
+    swa_averager: Optional[Any] = None,
     **kwargs: Any,
 ) -> str:
 
     p = Path(path)
 
     if TorchIO.is_native_target(p):
-        out = TorchIO.save(model, p, optimizer=optimizer, extra=extra, **kwargs)
+        merged_extra = dict(extra or {})
+        if ema_averager is not None and hasattr(ema_averager, "state_dict"):
+            with contextlib.suppress(Exception):
+                merged_extra["ema_averager_state"] = ema_averager.state_dict()
+        if swa_averager is not None and hasattr(swa_averager, "state_dict"):
+            with contextlib.suppress(Exception):
+                merged_extra["swa_averager_state"] = swa_averager.state_dict()
+        out = TorchIO.save(
+            model,
+            p,
+            optimizer=optimizer,
+            extra=merged_extra or None,
+            **kwargs,
+        )
         return str(out)
 
     conv = Converter.for_ext(p.suffix)

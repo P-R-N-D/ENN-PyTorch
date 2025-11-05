@@ -523,7 +523,7 @@ class PatchAttention(nn.Module):
         return context.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
 
-class TemporalEncoderLayer(nn.Module):
+class Retention(nn.Module):
     def __init__(self, d_model: int, nhead: int) -> None:
         super().__init__()
         self.msr = MultiScaleRetention(d_model, nhead)
@@ -901,7 +901,7 @@ class SpatialEncoder(nn.Module):
             raise RuntimeError("SpatialEncoder produced meta/fake tensor")
         return out.contiguous()
 
-class TemporalEncoderBlock(nn.Module):
+class RetNet(nn.Module):
     
     def __init__(
         self,
@@ -916,7 +916,7 @@ class TemporalEncoderBlock(nn.Module):
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(norm_type, d_model)
-        self.retention = TemporalEncoderLayer(d_model, nhead)
+        self.retention = Retention(d_model, nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = norm_layer(norm_type, d_model)
@@ -930,7 +930,7 @@ class TemporalEncoderBlock(nn.Module):
         state: Optional[dict] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         if is_meta_or_fake_tensor(x):
-            raise RuntimeError("meta/fake tensor reached TemporalEncoderBlock.forward")
+            raise RuntimeError("meta/fake tensor reached RetNet.forward")
         x = x.contiguous()
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
@@ -960,7 +960,7 @@ class TemporalEncoder(nn.Module):
         drops = schedule_stochastic_depth(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
-                TemporalEncoderBlock(
+                RetNet(
                     d_model,
                     nhead,
                     mlp_ratio=mlp_ratio,
