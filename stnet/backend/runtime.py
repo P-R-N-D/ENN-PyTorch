@@ -55,13 +55,13 @@ from ..data.pipeline import fetch
 from ..data.transforms import postprocess, preprocess
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.stats import Metadata
-from .environment import System
+from .environment import get_device, initialize_python_path, is_float8_supported
 from ..functional.fx import Autocast, Gradient, Fusion
 from .profiler import FlopCounter
-from .compat import is_meta_or_fake_tensor, maybe_mark_cudagraph_step_end
+from .compat import is_meta_or_fake_tensor, cudagraph_step_end
 from .distributed import (
-    Distributed,
     distributed_barrier,
+    get_world_size,
     is_dist_avail_and_initialized,
     joining,
     no_synchronization,
@@ -85,7 +85,7 @@ ignored_sentences = [
     "TypedStorage is deprecated.*",
 ]
 
-def _infer_num_batches(loader: Any) -> int:
+def _num_batches(loader: Any) -> int:
 
     if loader is None:
         return 0
@@ -111,7 +111,7 @@ def _infer_num_batches(loader: Any) -> int:
     return 0
 
 
-def make_global_bar(
+def get_tqdm(
     *args: Any, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device, **kwargs: Any
 ) -> Tuple[Optional[tqdm], int]:
 
@@ -120,7 +120,7 @@ def make_global_bar(
             return None, 0
     except Exception:
         pass
-    per_epoch = _infer_num_batches(train_loader) + _infer_num_batches(val_loader)
+    per_epoch = _num_batches(train_loader) + _num_batches(val_loader)
     total = int(total_epochs) * per_epoch
     if total <= 0:
         return None, per_epoch
@@ -138,7 +138,7 @@ def make_global_bar(
     return bar, per_epoch
 
 
-def tick_bar(
+def update_tqdm(
     bar: Optional[tqdm], *args: Any, mbps: Optional[float] = None, tflops: Optional[float] = None, **kwargs: Any
 ) -> None:
 
@@ -153,7 +153,7 @@ _DL_STATE_FILE = "dataloader.json"
 _FLOAT8_LOG_MESSAGES: set[str] = set()
 
 
-def dl_state_path(directory: str) -> str:
+def loader_state_path(directory: str) -> str:
     return os.path.join(directory, _DL_STATE_FILE)
 
 
@@ -185,7 +185,7 @@ def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
-def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
+def _enable_meta_monitor(model: torch.nn.Module) -> None:
     hook_mode = os.environ.get("STNET_META_HOOK", "0").strip().lower()
     if hook_mode in {"0", "", "false", "off"}:
         return
@@ -205,7 +205,7 @@ def _maybe_install_meta_pre_hook(model: torch.nn.Module) -> None:
         submodule.register_forward_pre_hook(_pre, with_kwargs=False)
 
 
-def _assert_no_fake_dtensor_in_ln(
+def _assert_no_fake_dtensor(
     root: nn.Module, *args: Any, allow_dtensor: bool = False, **kwargs: Any
 ) -> None:
     try:
@@ -237,7 +237,7 @@ def _assert_no_fake_dtensor_in_ln(
         )
 
 
-def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -> None:
+def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
 
     def _reset_parameter(
         module: nn.LayerNorm,
@@ -316,7 +316,7 @@ def _materialize_all_layernorms_(model: torch.nn.Module, device: torch.device) -
                 bias = module.bias
 
 
-def _validate_layernorm_dtypes(model: torch.nn.Module, device: torch.device) -> None:
+def _assert_unified_layer_dtype(model: torch.nn.Module, device: torch.device) -> None:
 
     mismatches: list[str] = []
     for name, module in model.named_modules():
@@ -362,7 +362,7 @@ def _validate_layernorm_dtypes(model: torch.nn.Module, device: torch.device) -> 
         )
 
 
-def _prune_dcp_state_keys(state: Any) -> Any:
+def _trim_dcp_keys(state: Any) -> Any:
     try:
         keys = []
         for key in state.keys():
@@ -428,13 +428,13 @@ def _set_backend(device: torch.device) -> None:
             pass
 
 
-def _meta(memmap_dir: str) -> Dict[str, Any]:
+def _from_meta(memmap_dir: str) -> Dict[str, Any]:
     meta_path = os.path.join(memmap_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
-def _ensure_uniform_param_dtype(
+def _unify_param_dtype(
     model: Any, prefer: Optional[torch.dtype] = None
 ) -> Optional[torch.dtype]:
     dtypes = set((p.dtype for p in model.parameters() if p is not None))
@@ -495,7 +495,7 @@ def epochs(
         torch, "Event"
     )
 
-    status_bar, _ = make_global_bar(
+    status_bar, _ = get_tqdm(
         total_epochs=int(total_epochs),
         train_loader=train_loader,
         val_loader=val_loader,
@@ -684,7 +684,7 @@ def epochs(
                         )
 
                     with contextlib.suppress(Exception):
-                        maybe_mark_cudagraph_step_end()
+                        cudagraph_step_end()
 
                     if status_bar is not None:
                         io_elapsed = prev_io_time + float(io_time.item())
@@ -697,7 +697,7 @@ def epochs(
                             / max(comp_elapsed, 1e-06)
                             / 1_000_000_000_000.0
                         )
-                        tick_bar(status_bar, mbps=mbps_cur, tflops=tflops_cur)
+                        update_tqdm(status_bar, mbps=mbps_cur, tflops=tflops_cur)
 
                     t_fetch_start = time.perf_counter_ns()
 
@@ -827,7 +827,7 @@ def epochs(
                                     / max(comp_elapsed, 1e-06)
                                     / 1_000_000_000_000.0
                                 )
-                                tick_bar(status_bar, mbps=mbps_cur, tflops=tflops_cur)
+                                update_tqdm(status_bar, mbps=mbps_cur, tflops=tflops_cur)
 
                             t_fetch_start = time.perf_counter_ns()
 
@@ -837,7 +837,7 @@ def epochs(
                         t, op=torch.distributed.ReduceOp.SUM
                     )
 
-                world = max(1, Distributed.get_world_size(device))
+                world = max(1, get_world_size(device))
                 comp_time /= world
                 io_time /= world
                 flops /= world
@@ -1076,7 +1076,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
 
-    System.initialize_python_path()
+    initialize_python_path()
 
     if os.environ.get("STNET_DISABLE_MKLDNN", "0") == "1":
         mkldnn_backend = getattr(getattr(torch, "backends", None), "mkldnn", None)
@@ -1107,7 +1107,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
 
-        device = System.get_device()
+        device = get_device()
         _set_backend(device)
         backend = _backend_type(device)
         init_kwargs: Dict[str, Any] = {"backend": backend}
@@ -1122,7 +1122,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
                 m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _prune_dcp_state_keys(m_sd)
+                m_sd = _trim_dcp_keys(m_sd)
                 load(
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.init_ckpt_dir),
@@ -1156,7 +1156,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 return obj[0]
             raise RuntimeError("memmap_dir is empty or invalid")
 
-        meta_info = _meta(_first_dir(ops.memmap_dir or ""))
+        meta_info = _from_meta(_first_dir(ops.memmap_dir or ""))
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(
@@ -1188,7 +1188,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 ops = replace(ops, val_frac=actual_val_frac)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         Autocast.configure(model, metadata=metadata)
-        param_dtype = _ensure_uniform_param_dtype(
+        param_dtype = _unify_param_dtype(
             model,
             prefer=(
                 torch.bfloat16
@@ -1199,7 +1199,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         )
         if param_dtype is None:
             param_dtype = torch.float32
-        fp8_ok, fp8_reason = System.is_float8_supported(device)
+        fp8_ok, fp8_reason = is_float8_supported(device)
         fp8_enabled = False
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
@@ -1218,7 +1218,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             if disable_note:
                 _float8_log(f"[FP8] disabled: {disable_note}")
         model.train()
-        world = Distributed.get_world_size(device)
+        world = get_world_size(device)
         mesh = init_device_mesh(
             "cuda" if device.type == "cuda" else device.type, (world,)
         )
@@ -1367,10 +1367,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
-        _materialize_all_layernorms_(_m_pre, device)
-        _validate_layernorm_dtypes(_m_pre, device)
+        _materialize_layers(_m_pre, device)
+        _assert_unified_layer_dtype(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
-        _assert_no_fake_dtensor_in_ln(_m_pre)
+        _assert_no_fake_dtensor(_m_pre)
 
         try:
             for submodule in _collect_block_modules(
@@ -1397,10 +1397,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             _ensure_dtensor(parameter)
 
         _m_post = model.module if hasattr(model, "module") else model
-        _validate_layernorm_dtypes(_m_post, device)
+        _assert_unified_layer_dtype(_m_post, device)
         _assert_no_meta_tensors(_m_post)
-        _assert_no_fake_dtensor_in_ln(_m_post, allow_dtensor=True)
-        _maybe_install_meta_pre_hook(_m_post)
+        _assert_no_fake_dtensor(_m_post, allow_dtensor=True)
+        _enable_meta_monitor(_m_post)
         sync_model_states(_m_post, device=device)
 
         net_params = [p for p in model.parameters()]
@@ -1540,9 +1540,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             reduction="mean",
         )
         loss_controller = LossWeightController()
-        ckpt_state_path = dl_state_path(ops.ckpt_dir or "")
+        ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
         init_state_path = (
-            dl_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
+            loader_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
         )
         state_train: Dict[str, Any] = {}
         state_val: Dict[str, Any] = {}
@@ -1584,8 +1584,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         val_loader.load_state_dict(state_val)
                 restore_dl_state = False
 
-            train_steps = _infer_num_batches(train_loader)
-            val_steps = _infer_num_batches(val_loader)
+            train_steps = _num_batches(train_loader)
+            val_steps = _num_batches(val_loader)
             steps_per_epoch = max(1, train_steps + val_steps)
             total_epochs = int(ops.epochs)
             total_steps = max(1, total_epochs * steps_per_epoch)
@@ -1731,7 +1731,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     ),
                 }
                 with open(
-                    dl_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
+                    loader_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
                 ) as _f:
                     json.dump(_dl, _f)
         torch.distributed.barrier(
@@ -1751,7 +1751,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
-        device = System.get_device()
+        device = get_device()
         _set_backend(device)
         backend = _backend_type(device)
         if not torch.distributed.is_initialized():
@@ -1766,7 +1766,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _prune_dcp_state_keys(m_sd)
+                m_sd = _trim_dcp_keys(m_sd)
                 load(
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.model_ckpt_dir),
@@ -1778,12 +1778,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
-        _materialize_all_layernorms_(_m_eval, device)
-        _validate_layernorm_dtypes(_m_eval, device)
+        _materialize_layers(_m_eval, device)
+        _assert_unified_layer_dtype(_m_eval, device)
         _assert_no_meta_tensors(_m_eval)
-        _assert_no_fake_dtensor_in_ln(_m_eval)
-        _maybe_install_meta_pre_hook(_m_eval)
-        _ensure_uniform_param_dtype(
+        _assert_no_fake_dtensor(_m_eval)
+        _enable_meta_monitor(_m_eval)
+        _unify_param_dtype(
             model,
             prefer=(
                 torch.bfloat16
@@ -1795,7 +1795,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             ),
         )
         Autocast.configure(model, metadata=metadata)
-        fp8_infer_ok, fp8_infer_reason = System.is_float8_supported(device)
+        fp8_infer_ok, fp8_infer_reason = is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = Fusion.enable_float8_prediction(
                 model,
@@ -1815,7 +1815,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             prefetch_factor=ops.prefetch_factor,
             non_blocking_copy=True,
         )
-        total_batches = _infer_num_batches(data_loader)
+        total_batches = _num_batches(data_loader)
         status_bar: Optional[tqdm]
         try:
             if torch.distributed.get_rank() != 0:

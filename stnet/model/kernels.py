@@ -12,7 +12,7 @@ import torch
 import torch._dynamo
 from torch import nn
 
-from ..backend.profiler import FLOP_PROFILER, attention_flops_bshd
+from ..backend.profiler import FLOP_PROFILER, capture
 from ..backend.environment import (
     cuda_compute_capability,
     get_device,
@@ -489,7 +489,7 @@ class DotProductAttention(nn.Module):
         v_bshd = v.contiguous()
         if _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
             try:
-                attention_flops_bshd(
+                capture(
                     q_bshd,
                     bwd_factor=2.0 if training else 0.0,
                     dropout_p=float(dropout_p),
@@ -783,7 +783,7 @@ class MultiScaleRetentionCompat(nn.Module):
             gate = torch.nn.functional.silu(self.g_proj(x_in))
             y = y * gate
         if manual_flops > 0.0:
-            FLOP_PROFILER.add_manual("Retention", manual_flops)
+            FLOP_PROFILER.add("Retention", manual_flops)
         out = self.o_proj(y)
         if restore_dtype is not None:
             out = out.to(restore_dtype)

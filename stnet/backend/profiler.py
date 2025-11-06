@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 
-def _infer_linear_mkn(
+def _compute_mkn(
     inp: torch.Tensor, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
     if weight is not None and weight.ndim >= 2:
@@ -24,14 +24,14 @@ def _infer_linear_mkn(
     return (m_dim, k_dim, n_dim)
 
 
-def _compute_linear_flops(
+def _flops_linear(
     inp: torch.Tensor,
     out: Any,
     weight: Optional[torch.Tensor],
     include_bias: bool,
     effective_bwd: float,
 ) -> float:
-    m_dim, k_dim, n_dim = _infer_linear_mkn(inp, weight)
+    m_dim, k_dim, n_dim = _compute_mkn(inp, weight)
     if isinstance(out, torch.Tensor) and out.numel() > 0 and n_dim > 0:
         m_dim = max(m_dim, int(out.numel() // max(n_dim, 1)))
     if m_dim <= 0 or k_dim <= 0 or n_dim <= 0:
@@ -41,7 +41,7 @@ def _compute_linear_flops(
     return float(fwd * (1.0 + max(0.0, float(effective_bwd))))
 
 
-def _compute_conv_flops(
+def _flops_conv(
     inp: torch.Tensor,
     out: Any,
     weight: Optional[torch.Tensor],
@@ -68,7 +68,7 @@ def _compute_conv_flops(
         return 0.0
 
 
-def _linear_forward_hook(
+def _register_to_linear(
     mod: nn.Module,
     inp: Tuple[Any, ...],
     out: Any,
@@ -85,12 +85,12 @@ def _linear_forward_hook(
     x = inp[0] if inp else None
     if not isinstance(x, torch.Tensor) or weight is None:
         return
-    val = _compute_linear_flops(x, out, weight, include_bias, effective_bwd)
+    val = _flops_linear(x, out, weight, include_bias, effective_bwd)
     if val > 0.0:
-        profiler.add_manual(type(mod).__name__, val)
+        profiler.add(type(mod).__name__, val)
 
 
-def _conv_forward_hook(
+def _register_to_conv(
     mod: nn.Module,
     inp: Tuple[Any, ...],
     out: Any,
@@ -104,12 +104,12 @@ def _conv_forward_hook(
     if not isinstance(x, torch.Tensor) or weight is None:
         return
     groups = getattr(mod, "groups", 1)
-    val = _compute_conv_flops(x, out, weight, groups, effective_bwd)
+    val = _flops_conv(x, out, weight, groups, effective_bwd)
     if val > 0.0:
-        profiler.add_manual(type(mod).__name__, val)
+        profiler.add(type(mod).__name__, val)
 
 
-def estimate_attention_flops(
+def flops_attention(
     batch: int,
     seq_len: int,
     num_heads: int,
@@ -145,7 +145,7 @@ class _FlopProfiler:
         self._nvtx_soft_counter: float = 0.0
         self._nvtx_getter: Optional[Callable[[], float]] = None
 
-    def is_tracking_active(self) -> bool:
+    def is_active(self) -> bool:
         return self._tracking_depth > 0
 
     def activate(self) -> None:
@@ -154,22 +154,22 @@ class _FlopProfiler:
     def deactivate(self) -> None:
         self._tracking_depth = max(0, self._tracking_depth - 1)
 
-    def reset_manual(self) -> None:
+    def reset(self) -> None:
         self._manual_total = 0.0
         self._manual_by_type.clear()
 
-    def consume_manual_breakdown(self) -> Tuple[float, Dict[str, float]]:
+    def pop(self) -> Tuple[float, Dict[str, float]]:
         total = float(self._manual_total)
         breakdown = {k: float(v) for k, v in self._manual_by_type.items()}
-        self.reset_manual()
+        self.reset()
         return (total, breakdown)
 
-    def consume_manual(self) -> float:
-        total, _ = self.consume_manual_breakdown()
+    def get(self) -> float:
+        total, _ = self.pop()
         return total
 
-    def add_manual(self, typ: str, value: float) -> None:
-        if self.is_tracking_active():
+    def add(self, typ: str, value: float) -> None:
+        if self.is_active():
             try:
                 fv = float(value)
             except Exception:
@@ -179,26 +179,26 @@ class _FlopProfiler:
             self._manual_total += fv
             self._manual_by_type[typ] = self._manual_by_type.get(typ, 0.0) + fv
 
-    def _nvtx_soft_add(self, value: float) -> None:
+    def _add_ntvx(self, value: float) -> None:
         try:
             self._nvtx_soft_counter += float(value) if float(value) > 0 else 0.0
         except Exception:
             pass
 
-    def _nvtx_soft_getter(self) -> float:
+    def _get_ntvx(self) -> float:
         return float(self._nvtx_soft_counter)
 
-    def ensure_nvtx_getter(self) -> None:
+    def coerce_flops_ntvx(self) -> None:
         if self._nvtx_getter is not None:
             return
         hook = os.environ.get("STF_NVTX_FLOPS_FN", "").strip()
         if not hook:
-            self._nvtx_getter = self._nvtx_soft_getter
+            self._nvtx_getter = self._get_ntvx
             return
         try:
             module_name, attr = hook.split(":", 1)
         except ValueError:
-            self._nvtx_getter = self._nvtx_soft_getter
+            self._nvtx_getter = self._get_ntvx
             return
         try:
             module = __import__(module_name, fromlist=[attr])
@@ -208,14 +208,14 @@ class _FlopProfiler:
                 return
         except Exception as exc:
             _LOGGER.debug("Failed to import NVTX getter %s: %s", hook, exc)
-        self._nvtx_getter = self._nvtx_soft_getter
+        self._nvtx_getter = self._get_ntvx
 
-    def record_nvtx_soft(self, value: float) -> None:
-        self._nvtx_soft_add(value)
+    def capture_ntvx(self, value: float) -> None:
+        self._add_ntvx(value)
 
-    def make_nvtx_counter(self, device: Optional[torch.device] = None) -> Any:
-        self.ensure_nvtx_getter()
-        getter = self._nvtx_getter or self._nvtx_soft_getter
+    def new_flops_ntvx(self, device: Optional[torch.device] = None) -> Any:
+        self.coerce_flops_ntvx()
+        getter = self._nvtx_getter or self._get_ntvx
         try:
             import torch.cuda.nvtx as nvtx
         except Exception:
@@ -244,7 +244,7 @@ class _FlopProfiler:
 
         return _NvtxScope(device)
 
-    def _torch_counter(self, display: bool = False) -> Any:
+    def _capture_torch(self, display: bool = False) -> Any:
 
         try:
             from torch.profiler import profile
@@ -253,7 +253,7 @@ class _FlopProfiler:
 
         if profile is not None:
 
-            class _TorchScope(contextlib.AbstractContextManager):
+            class _TorchFlops(contextlib.AbstractContextManager):
                 def __init__(self, show: bool) -> None:
                     self._show = show
                     self._prof = None
@@ -284,9 +284,9 @@ class _FlopProfiler:
                     except Exception:
                         return 0.0
 
-            return _TorchScope(bool(display))
+            return _TorchFlops(bool(display))
 
-        class _LegacyScope(contextlib.AbstractContextManager):
+        class _TorchFlopsCompat(contextlib.AbstractContextManager):
             def __init__(self, show: bool) -> None:
                 try:
                     from torch.utils.flop_counter import FlopCounterMode as _TorchMode
@@ -313,7 +313,7 @@ class _FlopProfiler:
                 except Exception:
                     return 0.0
 
-        return _LegacyScope(bool(display))
+        return _TorchFlopsCompat(bool(display))
 
     def start_hooks(
         self,
@@ -337,7 +337,7 @@ class _FlopProfiler:
             if isinstance(module, nn.Linear):
                 hook = module.register_forward_hook(
                     partial(
-                        _linear_forward_hook,
+                        _register_to_linear,
                         profiler=self,
                         include_bias=include_bias,
                         effective_bwd=effective_bwd,
@@ -346,7 +346,7 @@ class _FlopProfiler:
             elif isinstance(module, nn.modules.conv._ConvNd):
                 hook = module.register_forward_hook(
                     partial(
-                        _conv_forward_hook,
+                        _register_to_conv,
                         profiler=self,
                         effective_bwd=effective_bwd,
                     )
@@ -362,11 +362,11 @@ class _FlopProfiler:
             except Exception:
                 pass
 
-    def step_scope(self, device: Optional[torch.device], *, display: bool = False) -> Any:
+    def monitoring(self, device: Optional[torch.device], *, display: bool = False) -> Any:
         instrumentation = self
         self.activate()
 
-        class _StepScope:
+        class _Flops:
             def __init__(self) -> None:
                 self.manual_total = 0.0
                 self.manual_breakdown: Dict[str, float] = {}
@@ -376,18 +376,18 @@ class _FlopProfiler:
                 self._torch_scope: Any = None
                 self._nvtx_scope: Any = None
 
-            def __enter__(self) -> "_StepScope":
-                instrumentation.reset_manual()
-                self._torch_scope = instrumentation._torch_counter(display)
-                self._nvtx_scope = instrumentation.make_nvtx_counter(device)
+            def __enter__(self) -> "_Flops":
+                instrumentation.reset()
+                self._torch_scope = instrumentation._capture_torch(display)
+                self._nvtx_scope = instrumentation.new_flops_ntvx(device)
                 self._torch_scope.__enter__()
                 self._nvtx_scope.__enter__()
                 return self
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-                manual, breakdown = instrumentation.consume_manual_breakdown()
+                manual, breakdown = instrumentation.pop()
                 if manual > 0.0:
-                    instrumentation.record_nvtx_soft(manual)
+                    instrumentation.capture_ntvx(manual)
                 self.manual_total = manual
                 self.manual_breakdown = breakdown
                 if self._torch_scope is not None:
@@ -412,9 +412,9 @@ class _FlopProfiler:
             def get_manual_breakdown(self) -> Dict[str, float]:
                 return dict(self.manual_breakdown)
 
-        return _StepScope()
+        return _Flops()
 
-    def attention_flops_bshd(
+    def capture(
         self,
         q: torch.Tensor,
         *args: Any,
@@ -431,7 +431,7 @@ class _FlopProfiler:
             head_dim = int(q.shape[3])
         except Exception:
             return 0.0
-        total = estimate_attention_flops(
+        total = flops_attention(
             batch,
             seq_len,
             num_heads,
@@ -442,7 +442,7 @@ class _FlopProfiler:
             include_softmax_scale_dropout=include_softmax_scale_dropout,
         )
         if total > 0.0:
-            self.add_manual("Attention", total)
+            self.add("Attention", total)
         return total
 
 
@@ -481,7 +481,7 @@ class FlopCounter:
             include_bias=self._include_bias,
         )
         self._hook_count = len(self._handles)
-        FLOP_PROFILER.reset_manual()
+        FLOP_PROFILER.reset()
         self._active = True
         return self
 
@@ -497,14 +497,14 @@ class FlopCounter:
             raise RuntimeError(
                 "FlopCounter hooks are not active. Use `with FlopCounter(...)` before measuring FLOPs."
             )
-        return FLOP_PROFILER.step_scope(self._device, display=display)
+        return FLOP_PROFILER.monitoring(self._device, display=display)
 
     @property
     def hook_count(self) -> int:
         return int(self._hook_count)
 
 
-def attention_flops_bshd(
+def capture(
     q: torch.Tensor,
     *args: Any,
     bwd_factor: float = 2.0,
@@ -513,7 +513,7 @@ def attention_flops_bshd(
     include_softmax_scale_dropout: bool = True,
     **kwargs: Any,
 ) -> float:
-    return FLOP_PROFILER.attention_flops_bshd(
+    return FLOP_PROFILER.capture(
         q,
         *args,
         bwd_factor=bwd_factor,

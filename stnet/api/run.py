@@ -34,9 +34,20 @@ from .config import (
     coerce_model_config,
     runtime_config,
 )
-from ..backend.distributed import Distributed, Network
-from ..backend.environment import System
-from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
+from ..backend.distributed import (
+    get_available_addr,
+    get_preferred_ip,
+    initialize_master_addr,
+)
+from ..backend.environment import (
+    initialize_python_path,
+    new_dir,
+    optimize_threads,
+    optimal_procs,
+    optimal_start_method,
+    set_multiprocessing_env,
+)
+from ..backend.runtime import _trim_dcp_keys, ignored_pattern, main
 
 
 def train(
@@ -67,10 +78,10 @@ def train(
     **kwargs: Any,
 ) -> Root:
 
-    System.initialize_python_path()
+    initialize_python_path()
     mp.allow_connection_pickling()
-    System.set_multiprocessing_env()
-    memmap_dir = System.new_dir("memmap_ds")
+    set_multiprocessing_env()
+    memmap_dir = new_dir("memmap_ds")
 
     # 단일/다중 입력을 공통 처리: 다중이면 각 항목을 memmap_ds/<키>/ 로 내리고 manifest 기록
     first_feats: Optional[torch.Tensor] = None
@@ -135,8 +146,8 @@ def train(
         with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
             json.dump(payload, f)
-    ckpt_dir = System.new_dir("ckpt_dcp")
-    init_dir = System.new_dir("init_dcp")
+    ckpt_dir = new_dir("ckpt_dcp")
+    init_dir = new_dir("init_dcp")
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -145,12 +156,12 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
-    default_rdzv_host = Network.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
-    rdzv_endpoint = Network.get_available_addr(resolved_rdzv)
-    master_addr, _master_port = Distributed.initialize_master_addr(rdzv_endpoint)
-    System.optimize_threads()
-    nprocs = System.optimal_procs()["nproc_per_node"]
+    rdzv_endpoint = get_available_addr(resolved_rdzv)
+    master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
+    optimize_threads()
+    nprocs = optimal_procs()["nproc_per_node"]
     cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
@@ -166,7 +177,7 @@ def train(
         run_id=run_id,
         max_restarts=0,
         monitor_interval=5,
-        start_method=System.optimal_start_method(),
+        start_method=optimal_start_method(),
         local_addr=master_addr,
     )
     base = dict(
@@ -210,7 +221,7 @@ def train(
         warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
-        m_sd = _prune_dcp_state_keys(m_sd)
+        m_sd = _trim_dcp_keys(m_sd)
         load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ckpt_dir))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
     shutil.rmtree(memmap_dir, ignore_errors=True)
@@ -232,9 +243,9 @@ def predict(
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
 
-    System.initialize_python_path()
-    System.set_multiprocessing_env()
-    tmp_dir = System.new_dir("infer")
+    initialize_python_path()
+    set_multiprocessing_env()
+    tmp_dir = new_dir("infer")
     dcp_dir = os.path.join(tmp_dir, "dcp")
     memmap_dir = os.path.join(tmp_dir, "memmap")
     mp.allow_connection_pickling()
@@ -295,11 +306,11 @@ def predict(
         **default_kwargs,
         **kwargs,
     )
-    default_rdzv_host = Network.get_preferred_ip(allow_loopback=True) or "127.0.0.1"
-    rdzv_endpoint = Network.get_available_addr(default_rdzv_host)
-    master_addr, _ = Distributed.initialize_master_addr(rdzv_endpoint)
-    System.optimize_threads()
-    nprocs = int(System.optimal_procs()["nproc_per_node"])
+    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+    rdzv_endpoint = get_available_addr(default_rdzv_host)
+    master_addr, _ = initialize_master_addr(rdzv_endpoint)
+    optimize_threads()
+    nprocs = int(optimal_procs()["nproc_per_node"])
     manager = mp.Manager()
     ret_dict = manager.dict()
     resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
@@ -313,7 +324,7 @@ def predict(
         run_id="predict",
         max_restarts=0,
         monitor_interval=5,
-        start_method=System.optimal_start_method(),
+        start_method=optimal_start_method(),
         local_addr=master_addr,
     )
     elastic_launch(lc, main)(ops, ret_dict)

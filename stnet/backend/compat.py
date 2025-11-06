@@ -143,13 +143,13 @@ class TorchCompat:
         )
 
     def apply(self) -> None:
-        self._ensure_rmsnorm()
-        self._ensure_fmin()
-        self._ensure_nanmin()
-        self._ensure_nanmax()
-        self._ensure_nansum()
+        self._coerce_rmsnorm()
+        self._coerce_fmin()
+        self._coerce_nanmin()
+        self._coerce_nanmax()
+        self._coerce_nansum()
 
-    def _ensure_rmsnorm(self) -> None:
+    def _coerce_rmsnorm(self) -> None:
         global RMSNorm
         if hasattr(self.nn_module, "RMSNorm"):
             RMSNorm = self.nn_module.RMSNorm
@@ -172,22 +172,22 @@ class TorchCompat:
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
         RMSNorm = self.nn_module.RMSNorm
 
-    def _ensure_fmin(self) -> None:
+    def _coerce_fmin(self) -> None:
         if hasattr(self.module, "fmin"):
             return
         setattr(self.module, "fmin", partial(_fmin_impl, self.module))
 
-    def _ensure_nanmin(self) -> None:
+    def _coerce_nanmin(self) -> None:
         if hasattr(self.module, "nanmin"):
             return
         setattr(self.module, "nanmin", partial(_nanmin_impl, self.module))
 
-    def _ensure_nanmax(self) -> None:
+    def _coerce_nanmax(self) -> None:
         if hasattr(self.module, "nanmax"):
             return
         setattr(self.module, "nanmax", partial(_nanmax_impl, self.module))
 
-    def _ensure_nansum(self) -> None:
+    def _coerce_nansum(self) -> None:
         if hasattr(self.module, "nansum"):
             return
         setattr(self.module, "nansum", partial(_nansum_impl, self.module))
@@ -207,7 +207,7 @@ def patch_torch(
     return compat
 
 
-def maybe_mark_cudagraph_step_end() -> None:
+def cudagraph_step_end() -> None:
     mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
     if callable(mark_step):
         mark_step()
