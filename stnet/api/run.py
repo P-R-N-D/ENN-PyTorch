@@ -83,7 +83,6 @@ def train(
     set_multiprocessing_env()
     memmap_dir = new_dir("memmap_ds")
 
-    # 단일/다중 입력을 공통 처리: 다중이면 각 항목을 memmap_ds/<키>/ 로 내리고 manifest 기록
     first_feats: Optional[torch.Tensor] = None
     label_shape: Tuple[int, ...] = ()
     manifest: Optional[Dict[str, str] | Sequence[str]] = None
@@ -100,7 +99,6 @@ def train(
         return fx, tuple(lshape)
 
     if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
-        # Mapping[str, Mapping] → 키 유지
         manifest = {}
         for k, d in data.items():
             sub = os.path.join(memmap_dir, str(k))
@@ -111,9 +109,8 @@ def train(
             else:
                 if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
                     raise RuntimeError("inconsistent feature/label shapes across datasets")
-            manifest[str(k)] = str(k)  # 상대 경로 이름을 저장
+            manifest[str(k)] = str(k)
     elif isinstance(data, Sequence) and data and all(isinstance(d, Mapping) for d in data):
-        # Sequence[Mapping] → "0","1","2"... 부여
         manifest = []
         for i, d in enumerate(data):
             key = str(i)
@@ -127,8 +124,7 @@ def train(
                     raise RuntimeError("inconsistent feature/label shapes across datasets")
             manifest.append(key)
     else:
-        # 기존 단일 데이터 경로
-        fx, lb, _, lshape = preprocess(data)  # type: ignore[arg-type]
+        fx, lb, _, lshape = preprocess(data)
         SampleReader.materialize(
             {"features": fx, "labels": lb},
             memmap_dir=memmap_dir,
@@ -142,7 +138,6 @@ def train(
         raise RuntimeError("no training data provided to train()")
 
     if manifest is not None:
-        # runtime.py::main이 이 매니페스트를 읽어 MultiNode 입력으로 확장
         with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
             json.dump(payload, f)
