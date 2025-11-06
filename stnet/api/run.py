@@ -35,7 +35,7 @@ from .config import (
     runtime_config,
 )
 from ..backend.distributed import (
-    get_available_addr,
+    get_available_host,
     get_preferred_ip,
     initialize_master_addr,
 )
@@ -158,7 +158,7 @@ def train(
         )
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
-    rdzv_endpoint = get_available_addr(resolved_rdzv)
+    rdzv_endpoint = get_available_host(resolved_rdzv)
     master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
     optimize_threads()
     nprocs = optimal_procs()["nproc_per_node"]
@@ -307,7 +307,7 @@ def predict(
         **kwargs,
     )
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
-    rdzv_endpoint = get_available_addr(default_rdzv_host)
+    rdzv_endpoint = get_available_host(default_rdzv_host)
     master_addr, _ = initialize_master_addr(rdzv_endpoint)
     optimize_threads()
     nprocs = int(optimal_procs()["nproc_per_node"])

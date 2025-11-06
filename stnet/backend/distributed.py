@@ -1,4 +1,3 @@
-
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
@@ -62,7 +61,7 @@ else:
 JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
 
 
-def coerce_host(value: Any) -> str:
+def _strip_ip_expr(value: Any) -> str:
     if isinstance(value, str):
         return value.strip()
     if value is None:
@@ -70,7 +69,7 @@ def coerce_host(value: Any) -> str:
     return str(value).strip()
 
 
-def _strip_host_tokens(value: str) -> tuple[str, bool, bool]:
+def _strip_ipv6_expr(value: str) -> tuple[str, bool, bool]:
     stripped = value.strip()
     bracketed = False
     if stripped.startswith("[") and stripped.endswith("]"):
@@ -83,16 +82,16 @@ def _strip_host_tokens(value: str) -> tuple[str, bool, bool]:
     return stripped, bracketed, zone_removed
 
 
-def normalize_ip_literal(
+def _canonize_ip_expr(
     value: Any,
     *args: Any,
     allow_loopback: bool = False,
     **kwargs: Any,
 ) -> str | None:
-    candidate_text = coerce_host(value)
+    candidate_text = _strip_ip_expr(value)
     if not candidate_text:
         return None
-    stripped_text, _, _ = _strip_host_tokens(candidate_text)
+    stripped_text, _, _ = _strip_ipv6_expr(candidate_text)
     if not stripped_text:
         return None
     try:
@@ -106,20 +105,64 @@ def normalize_ip_literal(
     return parsed_address.compressed
 
 
-def resolve_host_ip(
+def _canonize_host_expr(endpoint_str: str, default_host: str) -> Tuple[str, int]:
+    endpoint = _strip_ip_expr(endpoint_str)
+    if not endpoint:
+        return default_host, 0
+    host_port = endpoint
+    if host_port.startswith("["):
+        host_port = host_port.lstrip("[")
+        bracketed = True
+    else:
+        bracketed = False
+    host, sep, port = host_port.partition("]" if bracketed else ":")
+    if bracketed and sep:
+        _, _, port = port.partition(":")
+    host = host.strip()
+    literal_host = _canonize_ip_expr(host, allow_loopback=True)
+    if not literal_host:
+        literal_host = default_host
+    try:
+        parsed_port = int(port.strip()) if port else 0
+    except (TypeError, ValueError):
+        parsed_port = 0
+    if parsed_port <= 0 or parsed_port > 65535:
+        parsed_port = 0
+    return literal_host, parsed_port
+
+
+def _has_join_hook(obj: Any | None) -> bool:
+    if obj is None:
+        return False
+    return getattr(obj, "join_hook", None) is not None
+
+
+def _get_device_id(device: Optional[torch.device]) -> Optional[Iterable[int]]:
+    if device is None:
+        return None
+    dev_type = getattr(device, "type", None)
+    if dev_type not in {"cuda", "xpu"}:
+        return None
+    index = getattr(device, "index", None)
+    if index is None:
+        return None
+    return [int(index)]
+
+
+def resolve_ip_expr(
     host: Any,
     *args: Any,
     allow_loopback: bool = False,
     prefer_ipv6: bool | None = None,
     **kwargs: Any,
 ) -> str | None:
-    host_text = coerce_host(host)
+    host_text = _strip_ip_expr(host)
     if not host_text:
         return None
-    literal = normalize_ip_literal(host_text, allow_loopback=allow_loopback)
+    literal = _canonize_ip_expr(host_text, allow_loopback=allow_loopback)
     if literal:
         return literal
-    stripped_text, _, _ = _strip_host_tokens(host_text)
+    stripped_text, _, _ = _strip_ipv6_expr(host_text)
     if not stripped_text:
         return None
     addrinfo: list[tuple[Any, ...]] | None = None
@@ -151,7 +194,7 @@ def resolve_host_ip(
         if not sockaddr:
             continue
         address_text = sockaddr[0]
-        literal_addr = normalize_ip_literal(
+        literal_addr = _canonize_ip_expr(
             address_text,
             allow_loopback=allow_loopback,
         )
@@ -165,7 +208,7 @@ def resolve_host_ip(
     return None
 
 
-def format_endpoint_host(
+def validate_ip_expr(
     host: Any,
     *args: Any,
     fallback: Any | None = None,
@@ -175,48 +218,22 @@ def format_endpoint_host(
     **kwargs: Any,
 ) -> str:
     if allow_hostname:
-        literal = coerce_host(host)
+        literal = _strip_ip_expr(host)
     else:
-        literal = normalize_ip_literal(host, allow_loopback=allow_loopback)
+        literal = _canonize_ip_expr(host, allow_loopback=allow_loopback)
     if literal:
         return literal
-    literal_fallback = normalize_ip_literal(
+    literal_fallback = _canonize_ip_expr(
         fallback,
         allow_loopback=allow_loopback,
     )
     if literal_fallback:
         return literal_fallback
-    return normalize_ip_literal(default, allow_loopback=True) or default
-
-
-def normalize_endpoint(endpoint_str: str, default_host: str) -> Tuple[str, int]:
-    endpoint = coerce_host(endpoint_str)
-    if not endpoint:
-        return default_host, 0
-    host_port = endpoint
-    if host_port.startswith("["):
-        host_port = host_port.lstrip("[")
-        bracketed = True
-    else:
-        bracketed = False
-    host, sep, port = host_port.partition("]" if bracketed else ":")
-    if bracketed and sep:
-        _, _, port = port.partition(":")
-    host = host.strip()
-    literal_host = normalize_ip_literal(host, allow_loopback=True)
-    if not literal_host:
-        literal_host = default_host
-    try:
-        parsed_port = int(port.strip()) if port else 0
-    except (TypeError, ValueError):
-        parsed_port = 0
-    if parsed_port <= 0 or parsed_port > 65535:
-        parsed_port = 0
-    return literal_host, parsed_port
+    return _canonize_ip_expr(default, allow_loopback=True) or default
 
 
 def is_port_available(host: str, port: int) -> bool:
-    literal_host = normalize_ip_literal(host, allow_loopback=True)
+    literal_host = _canonize_ip_expr(host, allow_loopback=True)
     if not literal_host:
         return False
     try:
@@ -228,20 +245,20 @@ def is_port_available(host: str, port: int) -> bool:
         return False
 
 
-def get_available_addr(
+def get_available_host(
     endpoint: Optional[str],
     *args: Any,
     default_host: str = "127.0.0.1",
     **kwargs: Any,
 ) -> str:
     if endpoint:
-        normalized = coerce_host(endpoint)
+        normalized = _strip_ip_expr(endpoint)
         if normalized:
-            host, port = normalize_endpoint(normalized, default_host)
+            host, port = _canonize_host_expr(normalized, default_host)
             if port > 0:
                 return f"{host}:{port}"
-    literal_default = normalize_ip_literal(default_host, allow_loopback=True)
-    host = literal_default or coerce_host(default_host) or "127.0.0.1"
+    literal_default = _canonize_ip_expr(default_host, allow_loopback=True)
+    host = literal_default or _strip_ip_expr(default_host) or "127.0.0.1"
     selected_port = 0
     try:
         parsed_host = ipaddress.ip_address(host)
@@ -272,7 +289,7 @@ def get_available_addr(
     return f"{host}:{selected_port}"
 
 
-def probe_stack_support(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
+def supported_ip_ver(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
     ipv4_ok = False
     ipv6_ok = False
     ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
@@ -412,16 +429,16 @@ def initialize_master_addr(
         allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
     )
     default_host = default_host or ("::1" if prefer_ipv6 else "127.0.0.1")
-    normalized = coerce_host(endpoint) if endpoint is not None else None
+    normalized = _strip_ip_expr(endpoint) if endpoint is not None else None
     if normalized:
-        host, port = normalize_endpoint(normalized, default_host)
+        host, port = _canonize_host_expr(normalized, default_host)
     else:
         host, port = (default_host, 0)
     host = host.strip()
     if host in {"", "0.0.0.0", "::"}:
         host = default_host
-    literal = normalize_ip_literal(host, allow_loopback=allow_loopback)
-    master_addr = literal or coerce_host(host) or default_host
+    literal = _canonize_ip_expr(host, allow_loopback=allow_loopback)
+    master_addr = literal or _strip_ip_expr(host) or default_host
     os.environ.setdefault("MASTER_ADDR", master_addr)
     if port > 0:
         os.environ.setdefault("MASTER_PORT", str(port))
@@ -484,12 +501,6 @@ def no_synchronization(
         yield
 
 
-def _has_join_hook(obj: Any | None) -> bool:
-    if obj is None:
-        return False
-    return getattr(obj, "join_hook", None) is not None
-
-
 def joining(
     model: JoinableModel,
     optimizer: Optimizer | None = None,
@@ -504,41 +515,29 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
-def is_dist_avail_and_initialized() -> bool:
+def is_distributed() -> bool:
     try:
         return dist.is_available() and dist.is_initialized()
     except Exception:
         return False
 
 
-def _device_ids_from(device: Optional[torch.device]) -> Optional[Iterable[int]]:
-    if device is None:
-        return None
-    dev_type = getattr(device, "type", None)
-    if dev_type not in {"cuda", "xpu"}:
-        return None
-    index = getattr(device, "index", None)
-    if index is None:
-        return None
-    return [int(index)]
-
-
 def distributed_barrier(device: Optional[torch.device] = None) -> None:
-    if not is_dist_avail_and_initialized():
+    if not is_distributed():
         return
     try:
-        dist.barrier(device_ids=_device_ids_from(device))
+        dist.barrier(device_ids=_get_device_id(device))
     except TypeError:
         dist.barrier()
 
 
-def broadcast_model_states(
+def distributed_broadcast(
     module: torch.nn.Module,
     *args: Any,
     src: int = 0,
     **kwargs: Any,
 ) -> None:
-    if not is_dist_avail_and_initialized():
+    if not is_distributed():
         return
 
     try:
@@ -575,7 +574,7 @@ def broadcast_model_states(
             continue
 
 
-def sync_model_states(
+def distributed_sync(
     module: torch.nn.Module,
     device: Optional[torch.device] = None,
     src: int = 0,
@@ -584,26 +583,26 @@ def sync_model_states(
     Broadcast all buffers and parameters from ``src`` rank and then block on a cross-rank barrier.
     Safe to call when torch.distributed is disabled/uninitialized (no-op), and supports DTensor params.
     """
-    if not is_dist_avail_and_initialized():
+    if not is_distributed():
         return
     _m = module.module if hasattr(module, "module") else module
-    broadcast_model_states(_m, src=src)
+    distributed_broadcast(_m, src=src)
     distributed_barrier(device)
 
 
-def wrap_ddp_if_needed(
+def to_ddp(
     module: torch.nn.Module,
     *args: Any,
     device: torch.device,
     **kwargs: Any,
 ) -> torch.nn.Module:
     module = module.to(device)
-    if not is_dist_avail_and_initialized():
+    if not is_distributed():
         return module
     if isinstance(module, DDP):
         return module
 
-    device_ids = _device_ids_from(device)
+    device_ids = _get_device_id(device)
     ddp_kwargs = {
         "broadcast_buffers": True,
         "find_unused_parameters": False,
@@ -625,7 +624,7 @@ def wrap_ddp_if_needed(
     return DDP(module, **ddp_kwargs)
 
 
-def wrap_fsdp_module(
+def to_fsdp(
     module: torch.nn.Module,
     *args: Any,
     mesh: Any | None,
@@ -667,28 +666,3 @@ def wrap_fsdp_module(
     except AttributeError:
         pass
     return sharded
-
-
-__all__ = [
-    "Join",
-    "JoinableModel",
-    "broadcast_model_states",
-    "coerce_host",
-    "distributed_barrier",
-    "format_endpoint_host",
-    "get_available_addr",
-    "get_preferred_ip",
-    "get_world_size",
-    "initialize_master_addr",
-    "is_dist_avail_and_initialized",
-    "is_port_available",
-    "joining",
-    "no_synchronization",
-    "normalize_endpoint",
-    "normalize_ip_literal",
-    "probe_stack_support",
-    "resolve_host_ip",
-    "sync_model_states",
-    "wrap_ddp_if_needed",
-    "wrap_fsdp_module",
-]

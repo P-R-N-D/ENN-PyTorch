@@ -11,6 +11,9 @@ import torch
 from torch import nn
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
 def _compute_mkn(
     inp: torch.Tensor, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
@@ -109,7 +112,7 @@ def _register_to_conv(
         profiler.add(type(mod).__name__, val)
 
 
-def flops_attention(
+def _flops_attention(
     batch: int,
     seq_len: int,
     num_heads: int,
@@ -132,9 +135,6 @@ def flops_attention(
         misc = misc_coeff * (batch * num_heads * seq_len**2)
     fwd = matmul + misc
     return float(fwd * (1.0 + max(0.0, float(bwd_factor))))
-
-
-_LOGGER = logging.getLogger(__name__)
 
 
 class _FlopProfiler:
@@ -431,7 +431,7 @@ class _FlopProfiler:
             head_dim = int(q.shape[3])
         except Exception:
             return 0.0
-        total = flops_attention(
+        total = _flops_attention(
             batch,
             seq_len,
             num_heads,

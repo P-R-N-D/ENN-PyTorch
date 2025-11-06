@@ -17,7 +17,7 @@ from ..backend.environment import (
     cuda_compute_capability,
     get_device,
     get_runtime_config,
-    initialize_sdpa_backends,
+    get_dpa_backends,
 )
 
 
@@ -691,7 +691,7 @@ class DotProductAttention(nn.Module):
                 )
             sdpa_kwargs["attn_mask"] = fm.contiguous()
             sdpa_kwargs["is_causal"] = False
-        backends = initialize_sdpa_backends()
+        backends = get_dpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
         if backends:
             try:
