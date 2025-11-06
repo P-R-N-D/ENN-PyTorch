@@ -157,11 +157,11 @@ def _get_batch_size(d: Mapping[str, Any]) -> list[int] | list:
 
 def to_tensordict(
     batch: BatchLike,
-    *,
+    *args: Any,
     device: Optional[torch.device] = None,
     batch_size: Optional[Iterable[int]] = None,
+    **kwargs: Any,
 ) -> TensorDict:
-    """Convert a plain mapping or TensorDict into a :class:`TensorDict` instance."""
 
     if isinstance(batch, TensorDictBase):
         return batch.to(device) if device is not None else batch
@@ -180,12 +180,12 @@ def to_tensordict(
 @torch.no_grad()
 def to_dict(
     td_or_dict: Union[TensorDictBase, Mapping[str, Any]],
-    *,
+    *args: Any,
     detach: bool = True,
     cpu: bool = True,
     keys: Optional[Iterable[str]] = None,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Return a ``dict`` from a :class:`TensorDict` optionally detaching tensors."""
 
     if isinstance(td_or_dict, TensorDictBase):
         td = td_or_dict
