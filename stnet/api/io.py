@@ -33,16 +33,15 @@ from ..functional.fx import Fusion
 from ..model import Root
 from .config import ModelConfig, coerce_model_config
 
-if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
+if TYPE_CHECKING:
     from ..backend.export import MissingDependencyError
 
 
 class Format(Protocol):
-    """Interface implemented by backend export format handlers."""
 
     name: str
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]: ...
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]: ...
 
 
 @lru_cache(maxsize=1)
@@ -144,7 +143,7 @@ def save_model(
     path: str | Path,
     optimizer: Optional[torch.optim.Optimizer] = None,
     extra: Optional[Dict[str, Any]] = None,
-    *,
+    *args: Any,
     ema_averager: Optional[Any] = None,
     swa_averager: Optional[Any] = None,
     **kwargs: Any,
@@ -177,7 +176,6 @@ def save_model(
 
 
 class Model:
-    """Native PyTorch / safetensors / DCP save helpers."""
 
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
