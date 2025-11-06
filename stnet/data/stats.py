@@ -89,17 +89,27 @@ class Metadata(Generic[TExtra]):
     def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
+        global _BOOTSTRAP_DEPTH
         if _BOOTSTRAP_DEPTH:
             return (torch.float32,)
-        return _Autocast.float_amp_priority(device)
+        _BOOTSTRAP_DEPTH += 1
+        try:
+            return _Autocast.float_amp_priority(device)
+        finally:
+            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
+        global _BOOTSTRAP_DEPTH
         if _BOOTSTRAP_DEPTH:
             return (torch.int64,)
-        return _Autocast.integer_amp_priority(device)
+        _BOOTSTRAP_DEPTH += 1
+        try:
+            return _Autocast.integer_amp_priority(device)
+        finally:
+            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
 
     @classmethod
     def for_device(
@@ -113,13 +123,8 @@ class Metadata(Generic[TExtra]):
         **kwargs: Any,
     ) -> "Metadata[TExtra]":
         dev = torch.device(device)
-        global _BOOTSTRAP_DEPTH
-        _BOOTSTRAP_DEPTH += 1
-        try:
-            float_candidates = cls._float_amp_candidates(dev)
-            int_candidates = cls._integer_candidates(dev)
-        finally:
-            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
+        float_candidates = cls._float_amp_candidates(dev)
+        int_candidates = cls._integer_candidates(dev)
         meta = cls(
             device=dev,
             float_dtypes=float_candidates,
