@@ -440,13 +440,13 @@ class Model:
             return ort_path, optimized_onnx_path
 
     @classmethod
-    def register(cls, name: str, exts: Tuple[str, ...], impl: Format) -> None:
+    def register(cls: object, name: str, exts: Tuple[str, ...], impl: Format) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
 
     @classmethod
-    def for_export(cls, ext: str) -> Optional[Format]:
+    def for_export(cls: object, ext: str) -> Optional[Format]:
         name = cls._ext_map.get(ext.lower())
         return cls._by_name.get(name) if name else None
 
