@@ -169,7 +169,7 @@ def save_model(
         )
         return str(out)
 
-    conv = _export_backend().Format.for_export(p.suffix)
+    conv = _export_backend().Model.for_export(p.suffix)
     if conv is None:
         raise ValueError(f"Unknown format for path: {path}")
     conv.save(model, p, **kwargs)

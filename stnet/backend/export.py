@@ -111,7 +111,7 @@ class Onnx(_Format):
     name = "onnx"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        out = Format._OnnxLayer.export(model, dst, **_onnx_options(opts))
+        out = Model._OnnxLayer.export(model, dst, **_onnx_options(opts))
         return (out,)
 
 
@@ -119,8 +119,8 @@ class Ort(_Format):
     name = "ort"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Format._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
-        ort_path, optimized = Format._OrtLayer.to_ort(
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+        ort_path, optimized = Model._OrtLayer.to_ort(
             onnx_path,
             dst,
             optimization_level=str(opts.get("optimization_level", "all")),
@@ -135,7 +135,7 @@ class TensorRT(_Format):
     name = "tensorrt"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Format._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
         try:
             import tensorrt as trt
         except ImportError as exc:
@@ -186,7 +186,7 @@ class Nnef(_Format):
     name = "nnef"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Format._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
         try:
             import importlib
 
@@ -265,7 +265,7 @@ class LiteRT(_Format):
     name = "litert"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Format._OnnxLayer.coerce(
+        onnx_path = Model._OnnxLayer.coerce(
             model,
             _resolve_onnx_path(dst, opts),
             **_onnx_options(opts),
@@ -323,7 +323,7 @@ class LiteRT(_Format):
         return (dst,)
 
 
-class Format:
+class Model:
     _by_name: Dict[str, _Format] = {}
     _ext_map: Dict[str, str] = {}
 
@@ -382,7 +382,7 @@ class Format:
         @staticmethod
         def coerce(model: nn.Module, onnx_path: Path, *args: Any, **opts: Any) -> Path:
             if not onnx_path.exists():
-                return Format._OnnxLayer.export(model, onnx_path, **opts)
+                return Model._OnnxLayer.export(model, onnx_path, **opts)
             return onnx_path
 
     class _OrtLayer:
@@ -453,12 +453,9 @@ class Format:
         return cls._by_name.get(name) if name else None
 
 
-Format.register("onnx", (".onnx",), Onnx())
-Format.register("ort", (".ort",), Ort())
-Format.register("tensorrt", (".engine",), TensorRT())
-Format.register("nnef", (".nnef",), Nnef())
-Format.register("coreml", (".mlmodel",), CoreML())
-Format.register("litert", (".tflite",), LiteRT())
-
-# Backwards compatibility: expose the legacy Export symbol.
-Export = Format
+Model.register("onnx", (".onnx",), Onnx())
+Model.register("ort", (".ort",), Ort())
+Model.register("tensorrt", (".engine",), TensorRT())
+Model.register("nnef", (".nnef",), Nnef())
+Model.register("coreml", (".mlmodel",), CoreML())
+Model.register("litert", (".tflite",), LiteRT())
