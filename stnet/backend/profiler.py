@@ -362,7 +362,7 @@ class _FlopProfiler:
             except Exception:
                 pass
 
-    def monitoring(self, device: Optional[torch.device], *, display: bool = False) -> Any:
+    def monitoring(self, device: Optional[torch.device], *args: Any, display: bool = False, **kwargs: Any) -> Any:
         instrumentation = self
         self.activate()
 
