@@ -368,14 +368,11 @@ def _backend_type(device: torch.device) -> str:
 
 def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
-        # FP32 matmul을 빠르게: 내부 정밀도 'high' (GPU에선 TF32 경로 활용)
-        # conv/matmul TF32 허용 및 cuDNN autotune 활성화
         with contextlib.suppress(Exception):
             if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
                 try:
                     torch.backends.cuda.matmul.allow_tf32 = True
                 except Exception:
-                    # 신버전은 fp32_precision로 대체
                     with contextlib.suppress(Exception):
                         torch.backends.cuda.matmul.fp32_precision = "high"
             if hasattr(torch.backends, "cudnn"):
@@ -497,7 +494,6 @@ def epochs(
     prev_flops = 0.0
 
     def _swa_feature_iter() -> Iterator[Dict[str, torch.Tensor]]:
-        """Yield preprocessed feature batches for SWA BatchNorm updates."""
 
         for _raw in train_loader:
             feat, *_ = preprocess(_raw)
@@ -1113,7 +1109,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         metadata = Metadata.for_device(device)
-        # run.py 가 생성한 다중 데이터 매니페스트(multinode.json)를 탐지해 ops.memmap_dir 확장
         mem_spec = ops.memmap_dir
         if isinstance(mem_spec, str) and os.path.isdir(mem_spec):
             mn_path = os.path.join(mem_spec, "multinode.json")
@@ -1255,8 +1250,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
 
         def _ensure_dtensor(
             param: torch.nn.Parameter,
-            *,
+            *args: Any,
             placements: Optional[Sequence[Placement]] = None,
+            **kwargs: Any,
         ) -> None:
             if not isinstance(param, torch.nn.Parameter):
                 return
@@ -1398,10 +1394,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
 
             def _as_step_tensor(
                 value: Any,
-                *,
+                *args: Any,
                 param: torch.Tensor,
                 capturable: bool,
                 fused: bool,
+                **kwargs: Any,
             ) -> torch.Tensor:
                 desired_device = (
                     param.device if (capturable or fused) else torch.device("cpu")
