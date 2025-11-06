@@ -85,14 +85,12 @@ class Metadata(Generic[TExtra]):
 
     @classmethod
     def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        # delegate to Autocast to avoid duplication
         from ..functional.fx import Autocast as _Autocast
 
         return _Autocast.float_amp_priority(device)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
-        # delegate to Autocast to avoid duplication
         from ..functional.fx import Autocast as _Autocast
 
         return _Autocast.integer_amp_priority(device)
@@ -213,7 +211,6 @@ class Metadata(Generic[TExtra]):
 
 @tensorclass(shadow=True)
 class TensorDictMetadata:
-    """TensorDict-based container for runtime metadata."""
 
     use_amp: bool = False
     amp_dtype: Optional[Any] = None
