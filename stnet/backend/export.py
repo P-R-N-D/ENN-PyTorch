@@ -459,3 +459,6 @@ Format.register("tensorrt", (".engine",), TensorRT())
 Format.register("nnef", (".nnef",), Nnef())
 Format.register("coreml", (".mlmodel",), CoreML())
 Format.register("litert", (".tflite",), LiteRT())
+
+# Backwards compatibility: expose the legacy Export symbol.
+Export = Format

@@ -23,6 +23,7 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "MissingDependencyError": ("stnet.backend.export", "MissingDependencyError"),
     "Model": ("stnet.api.io", "Model"),
     "Export": ("stnet.backend.export", "Export"),
+    "Format": ("stnet.backend.export", "Format"),
     "new_model": ("stnet.api.io", "new_model"),
     "load_model": ("stnet.api.io", "load_model"),
     "save_model": ("stnet.api.io", "save_model"),
