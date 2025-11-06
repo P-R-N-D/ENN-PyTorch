@@ -72,16 +72,16 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
-def _onnx_options(opts: Mapping[str, Any]) -> Dict[str, Any]:
+def _onnx_options(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
     return {
-        "sample_input": opts.get("sample_input"),
-        "opset_version": int(opts.get("opset_version", 18)),
-        "dynamic_batch": bool(opts.get("dynamic_batch", True)),
+        "sample_input": kwargs.get("sample_input"),
+        "opset_version": int(kwargs.get("opset_version", 18)),
+        "dynamic_batch": bool(kwargs.get("dynamic_batch", True)),
     }
 
 
-def _resolve_onnx_path(dst: Path, opts: Mapping[str, Any]) -> Path:
-    override = opts.get("onnx_path")
+def _resolve_onnx_path(dst: Path, kwargs: Mapping[str, Any]) -> Path:
+    override = kwargs.get("onnx_path")
     if override:
         return Path(override)
     return dst.with_suffix(".onnx")
@@ -108,23 +108,23 @@ class _CompatLayer(nn.Module):
 class Onnx(Format):
     name = "onnx"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        out = Model._OnnxLayer.export(model, dst, **_onnx_options(opts))
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        out = Model._OnnxLayer.export(model, dst, **_onnx_options(kwargs))
         return (out,)
 
 
 class Ort(Format):
     name = "ort"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
         ort_path, optimized = Model._OrtLayer.to_ort(
             onnx_path,
             dst,
-            optimization_level=str(opts.get("optimization_level", "all")),
-            optimization_style=str(opts.get("optimization_style", "fixed")),
-            target_platform=opts.get("target_platform"),
-            save_optimized_onnx_model=bool(opts.get("save_optimized_onnx_model", False)),
+            optimization_level=str(kwargs.get("optimization_level", "all")),
+            optimization_style=str(kwargs.get("optimization_style", "fixed")),
+            target_platform=kwargs.get("target_platform"),
+            save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
         )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -132,8 +132,8 @@ class Ort(Format):
 class TensorRT(Format):
     name = "tensorrt"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
         try:
             import tensorrt as trt
         except ImportError as exc:
@@ -142,7 +142,7 @@ class TensorRT(Format):
         trt_logger = trt.Logger(trt.Logger.WARNING)
         explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         with trt.Builder(trt_logger) as builder, builder.create_network(explicit_batch) as network, trt.OnnxParser(network, trt_logger) as parser, builder.create_builder_config() as config:
-            workspace_size_bytes = int(opts.get("workspace_size_bytes", 1 << 30))
+            workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
             if hasattr(config, "set_memory_pool_limit"):
                 config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
             else:
@@ -152,22 +152,22 @@ class TensorRT(Format):
                     for i in range(parser.num_errors):
                         print(parser.get_error(i))
                     raise RuntimeError("TensorRT failed to parse ONNX")
-            if bool(opts.get("fp16", True)) and builder.platform_has_fast_fp16:
+            if bool(kwargs.get("fp16", True)) and builder.platform_has_fast_fp16:
                 config.set_flag(trt.BuilderFlag.FP16)
-            if bool(opts.get("int8", False)):
+            if bool(kwargs.get("int8", False)):
                 if not builder.platform_has_fast_int8:
                     warnings.warn("INT8 not supported; ignoring")
                 else:
-                    calibrator = opts.get("calibrator")
+                    calibrator = kwargs.get("calibrator")
                     if calibrator is not None:
                         config.set_int8_calibrator(calibrator)
                     config.set_flag(trt.BuilderFlag.INT8)
             input_tensor = network.get_input(0)
-            sample = _pad_sample(model, opts.get("sample_input"))
+            sample = _pad_sample(model, kwargs.get("sample_input"))
             shape = tuple(int(x) for x in sample.shape)
             min_shape = (1, *shape[1:])
-            opt_shape = (int(opts.get("opt_batch", shape[0])), *shape[1:])
-            max_shape = (int(opts.get("max_batch", 8)), *shape[1:])
+            opt_shape = (int(kwargs.get("opt_batch", shape[0])), *shape[1:])
+            max_shape = (int(kwargs.get("max_batch", 8)), *shape[1:])
             profile = builder.create_optimization_profile()
             profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
             config.add_optimization_profile(profile)
@@ -183,17 +183,17 @@ class TensorRT(Format):
 class Nnef(Format):
     name = "nnef"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, opts), **_onnx_options(opts))
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
         try:
             import importlib
 
             importlib.import_module("nnef_tools.convert")
         except ImportError as exc:
             raise MissingDependencyError("nnef-tools[onnx] required") from exc
-        input_shapes = opts.get("input_shapes")
+        input_shapes = kwargs.get("input_shapes")
         if input_shapes is None:
-            sample = _pad_sample(model, opts.get("sample_input"))
+            sample = _pad_sample(model, kwargs.get("sample_input"))
             input_shapes = {"features": tuple(int(x) for x in sample.shape)}
         cmd = [
             sys.executable,
@@ -218,7 +218,7 @@ class Nnef(Format):
             ("compress", "--compress", True),
         )
         for key, flag, default in toggles:
-            if bool(opts.get(key, default)):
+            if bool(kwargs.get(key, default)):
                 cmd.append(flag)
         _in_console(cmd, "nnef convert")
         return (dst,)
@@ -227,11 +227,11 @@ class Nnef(Format):
 class CoreML(Format):
     name = "coreml"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
         is_required("coremltools", "pip install coremltools")
         import coremltools as ct
 
-        sample = _pad_sample(model, opts.get("sample_input"))
+        sample = _pad_sample(model, kwargs.get("sample_input"))
         wrapper = _CompatLayer(model).eval()
         with Gradient.inference(wrapper):
             scripted = torch.jit.trace(wrapper, sample)
@@ -241,14 +241,14 @@ class CoreML(Format):
             "CPU_AND_GPU": getattr(ct.ComputeUnit, "CPU_AND_GPU", None),
             "CPU_AND_NE": getattr(ct.ComputeUnit, "CPU_AND_NE", None),
         }
-        convert_to = str(opts.get("convert_to", "mlprogram"))
-        compute_units = cu_map.get(str(opts.get("compute_units", "ALL")).upper(), cu_map["ALL"])
+        convert_to = str(kwargs.get("convert_to", "mlprogram"))
+        compute_units = cu_map.get(str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"])
         kwargs_dict: Dict[str, Any] = {
             "inputs": [ct.TensorType(shape=tuple(int(x) for x in sample.shape))],
             "convert_to": convert_to,
             "compute_units": compute_units,
         }
-        deployment_target = opts.get("minimum_deployment_target")
+        deployment_target = kwargs.get("minimum_deployment_target")
         if deployment_target:
             target = getattr(ct.target, deployment_target, None)
             if target is not None:
@@ -262,13 +262,13 @@ class CoreML(Format):
 class LiteRT(Format):
     name = "litert"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
         onnx_path = Model._OnnxLayer.coerce(
             model,
-            _resolve_onnx_path(dst, opts),
-            **_onnx_options(opts),
+            _resolve_onnx_path(dst, kwargs),
+            **_onnx_options(kwargs),
         )
-        if bool(opts.get("prefer_onnx2tf", True)):
+        if bool(kwargs.get("prefer_onnx2tf", True)):
             try:
                 out_dir = dst.with_suffix("")
                 out_dir.mkdir(parents=True, exist_ok=True)
@@ -302,11 +302,11 @@ class LiteRT(Format):
             saved_model_dir = Path(tmpd) / "saved_model"
             prepare(model_onnx).export_graph(str(saved_model_dir))
             converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
-            if bool(opts.get("allow_fp16", False)):
+            if bool(kwargs.get("allow_fp16", False)):
                 converter.target_spec.supported_types = [tf.float16]
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            if bool(opts.get("int8_quantize", False)):
-                rep_ds = opts.get("representative_dataset")
+            if bool(kwargs.get("int8_quantize", False)):
+                rep_ds = kwargs.get("representative_dataset")
                 if rep_ds is None:
                     raise ValueError("representative_dataset required for INT8 quantization")
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -378,9 +378,9 @@ class Model:
             return onnx_path
 
         @staticmethod
-        def coerce(model: nn.Module, onnx_path: Path, *args: Any, **opts: Any) -> Path:
+        def coerce(model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any) -> Path:
             if not onnx_path.exists():
-                return Model._OnnxLayer.export(model, onnx_path, **opts)
+                return Model._OnnxLayer.export(model, onnx_path, **kwargs)
             return onnx_path
 
     class _OrtLayer:
