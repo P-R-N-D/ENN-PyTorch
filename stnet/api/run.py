@@ -47,7 +47,7 @@ from ..backend.environment import (
     optimal_start_method,
     set_multiprocessing_env,
 )
-from ..backend.runtime import _prune_dcp_state_keys, ignored_pattern, main
+from ..backend.runtime import _prune_extra_dcp_keys, ignored_pattern, main
 
 
 def train(
@@ -221,7 +221,7 @@ def train(
         warnings.filterwarnings("ignore", message=ignored_pattern)
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
-        m_sd = _prune_dcp_state_keys(m_sd)
+        m_sd = _prune_extra_dcp_keys(m_sd)
         load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ckpt_dir))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
     shutil.rmtree(memmap_dir, ignore_errors=True)
