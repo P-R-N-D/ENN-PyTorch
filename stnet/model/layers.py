@@ -69,13 +69,12 @@ LayerNorm = nn.LayerNorm
 
 
 class CompatLayer(nn.Module):
-    """Expose tensor-only forward for modules returning (output, loss)."""
 
     def __init__(self, net: nn.Module) -> None:
         super().__init__()
         self.net = net
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
         return y_flat
 
