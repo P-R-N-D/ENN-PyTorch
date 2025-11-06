@@ -18,7 +18,6 @@ from ..functional.fx import Gradient
 
 
 class MissingDependencyError(ImportError):
-    """Raised when an optional dependency is required at runtime."""
 
 
 def _in_console(cmd: Sequence[str], desc: str) -> None:
@@ -73,16 +72,6 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
-class _CompatLayer(nn.Module):
-    def __init__(self, net: nn.Module) -> None:
-        super().__init__()
-        self.net = net
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
-        return y_flat
-
-
 def _onnx_options(opts: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "sample_input": opts.get("sample_input"),
@@ -106,7 +95,16 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise MissingDependencyError(f"{module} is required for this operation{hint}") from err
 
 
-# Every backend compiler implements the shared stnet.api.io.Format protocol.
+class _CompatLayer(nn.Module):
+    def __init__(self, net: nn.Module) -> None:
+        super().__init__()
+        self.net = net
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
+        return y_flat
+
+
 class Onnx(Format):
     name = "onnx"
 
@@ -290,7 +288,7 @@ class LiteRT(Format):
                     raise RuntimeError("onnx2tf did not produce .tflite")
                 shutil.copyfile(tflites[0], dst)
                 return (dst,)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 warnings.warn(f"onnx2tf failed; fallback to onnx-tf path: {exc}")
         is_required("onnx", "pip install onnx")
         is_required("onnx-tf", "pip install onnx-tf")
