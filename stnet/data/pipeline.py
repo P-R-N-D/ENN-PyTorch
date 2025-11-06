@@ -404,7 +404,7 @@ def _process_batch(
     return {"X": features, "Y": labels_tensor}
 
 
-def _wrap_nodes_map(
+def _multiplex(
     nodes_map: Mapping[str, BaseNode],
     *args: Any,
     allow_plain: bool = False,
@@ -450,7 +450,7 @@ def _compose(
                     "compose mappings must contain torchdata.nodes.BaseNode instances."
                 )
             nodes_map[str(key)] = value
-        source_node = _wrap_nodes_map(nodes_map)
+        source_node = _multiplex(nodes_map)
     elif isinstance(node, (list, tuple)):
         nodes_map = {}
         for index, value in enumerate(node):
@@ -459,10 +459,10 @@ def _compose(
                     "compose sequences must contain torchdata.nodes.BaseNode instances."
                 )
             nodes_map[str(index)] = value
-        source_node = _wrap_nodes_map(nodes_map)
+        source_node = _multiplex(nodes_map)
     elif isinstance(node, BaseNode):
         nodes_map = {"default": node}
-        source_node = _wrap_nodes_map(nodes_map, allow_plain=True)
+        source_node = _multiplex(nodes_map, allow_plain=True)
     else:
         raise TypeError(
             "compose expects BaseNode, Mapping[str, BaseNode], or Sequence[BaseNode]."

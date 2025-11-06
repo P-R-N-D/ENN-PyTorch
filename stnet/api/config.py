@@ -19,7 +19,7 @@ from typing import (
 import torch
 
 
-def ensure_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
+def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -33,7 +33,7 @@ def ensure_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
     raise TypeError(f"{name} must be a boolean-compatible value")
 
 
-def ensure_int(
+def _coerce_int(
     value: Any,
     *args: Any,
     name: str,
@@ -52,7 +52,7 @@ def ensure_int(
     return ivalue
 
 
-def ensure_float(
+def _coerce_float(
     value: Any,
     *args: Any,
     name: str,
@@ -71,7 +71,7 @@ def ensure_float(
     return fvalue
 
 
-def ensure_int_tuple(
+def _coerce_int_tuple(
     value: Any,
     *args: Any,
     name: str,
@@ -85,19 +85,19 @@ def ensure_int_tuple(
             return None
         raise TypeError(f"{name} cannot be None")
     if isinstance(value, int):
-        ivalue = ensure_int(value, name=name, minimum=1)
+        ivalue = _coerce_int(value, name=name, minimum=1)
         if keep_scalar:
             return ivalue
         return tuple([ivalue] * dims)
     if isinstance(value, (list, tuple)):
         if len(value) != dims:
             raise ValueError(f"{name} must have length {dims}, got {len(value)}")
-        items = tuple(ensure_int(v, name=name, minimum=1) for v in value)
+        items = tuple(_coerce_int(v, name=name, minimum=1) for v in value)
         return items
     raise TypeError(f"{name} must be an int or sequence of {dims} integers")
 
 
-def ensure_int_sequence(xs: Sequence[int]) -> Tuple[int, ...]:
+def _coerce_int_sequence(xs: Sequence[int]) -> Tuple[int, ...]:
     return tuple(int(x) for x in xs)
 
 
@@ -149,52 +149,52 @@ def coerce_patch_config(
     defaults = asdict(PatchConfig())
     allowed = set(inspect.signature(PatchConfig).parameters.keys())
     filtered = {k: v for k, v in data.items() if k in allowed}
-    args: Dict[str, Any] = {}
-    args["is_square"] = ensure_bool(
+    resolved: Dict[str, Any] = {}
+    resolved["is_square"] = _coerce_bool(
         filtered.get("is_square", defaults["is_square"]), name="is_square"
     )
-    args["patch_size_1d"] = ensure_int(
+    resolved["patch_size_1d"] = _coerce_int(
         filtered.get("patch_size_1d", defaults["patch_size_1d"]),
         name="patch_size_1d",
         minimum=1,
     )
     grid2d = filtered.get("grid_size_2d", defaults["grid_size_2d"])
-    args["grid_size_2d"] = (
-        ensure_int_tuple(
+    resolved["grid_size_2d"] = (
+        _coerce_int_tuple(
             grid2d, name="grid_size_2d", dims=2, allow_none=True, keep_scalar=True
         )
         if grid2d is not None
         else None
     )
     patch2d = filtered.get("patch_size_2d", defaults["patch_size_2d"])
-    args["patch_size_2d"] = ensure_int_tuple(
+    resolved["patch_size_2d"] = _coerce_int_tuple(
         patch2d, name="patch_size_2d", dims=2, keep_scalar=True
     )
-    args["is_cube"] = ensure_bool(
+    resolved["is_cube"] = _coerce_bool(
         filtered.get("is_cube", defaults["is_cube"]), name="is_cube"
     )
     grid3d = filtered.get("grid_size_3d", defaults["grid_size_3d"])
-    args["grid_size_3d"] = (
-        ensure_int_tuple(
+    resolved["grid_size_3d"] = (
+        _coerce_int_tuple(
             grid3d, name="grid_size_3d", dims=3, allow_none=True, keep_scalar=True
         )
         if grid3d is not None
         else None
     )
     patch3d = filtered.get("patch_size_3d", defaults["patch_size_3d"])
-    args["patch_size_3d"] = ensure_int_tuple(
+    resolved["patch_size_3d"] = _coerce_int_tuple(
         patch3d, name="patch_size_3d", dims=3, keep_scalar=True
     )
-    args["dropout"] = ensure_float(
+    resolved["dropout"] = _coerce_float(
         filtered.get("dropout", defaults["dropout"]),
         name="patch.dropout",
         minimum=0.0,
         maximum=1.0,
     )
-    args["use_padding"] = ensure_bool(
+    resolved["use_padding"] = _coerce_bool(
         filtered.get("use_padding", defaults["use_padding"]), name="use_padding"
     )
-    return PatchConfig(**args)
+    return PatchConfig(**resolved)
 
 
 def coerce_model_config(
@@ -216,78 +216,78 @@ def coerce_model_config(
     patch_value = filtered.get("patch", getattr(defaults, "patch"))
     patch_cfg = coerce_patch_config(patch_value)
 
-    args: Dict[str, Any] = {"patch": patch_cfg}
+    resolved: Dict[str, Any] = {"patch": patch_cfg}
 
     device_val = filtered.get("device", getattr(defaults, "device"))
     if device_val is None or device_val == "":
-        args["device"] = None
+        resolved["device"] = None
     else:
         try:
-            args["device"] = torch.device(device_val)
+            resolved["device"] = torch.device(device_val)
         except (TypeError, RuntimeError) as exc:
             raise ValueError(f"invalid device specification: {device_val}") from exc
 
-    args["microbatch"] = ensure_int(
+    resolved["microbatch"] = _coerce_int(
         filtered.get("microbatch", getattr(defaults, "microbatch")),
         name="microbatch",
         minimum=1,
     )
-    args["dropout"] = ensure_float(
+    resolved["dropout"] = _coerce_float(
         filtered.get("dropout", getattr(defaults, "dropout")),
         name="dropout",
         minimum=0.0,
         maximum=1.0,
     )
-    args["normalization_method"] = str(
+    resolved["normalization_method"] = str(
         filtered.get(
             "normalization_method", getattr(defaults, "normalization_method")
         )
     )
-    args["depth"] = ensure_int(
+    resolved["depth"] = _coerce_int(
         filtered.get("depth", getattr(defaults, "depth")),
         name="depth",
         minimum=1,
     )
-    args["heads"] = ensure_int(
+    resolved["heads"] = _coerce_int(
         filtered.get("heads", getattr(defaults, "heads")),
         name="heads",
         minimum=1,
     )
-    args["spatial_depth"] = ensure_int(
+    resolved["spatial_depth"] = _coerce_int(
         filtered.get("spatial_depth", getattr(defaults, "spatial_depth")),
         name="spatial_depth",
         minimum=1,
     )
-    args["temporal_depth"] = ensure_int(
+    resolved["temporal_depth"] = _coerce_int(
         filtered.get("temporal_depth", getattr(defaults, "temporal_depth")),
         name="temporal_depth",
         minimum=1,
     )
-    args["mlp_ratio"] = ensure_float(
+    resolved["mlp_ratio"] = _coerce_float(
         filtered.get("mlp_ratio", getattr(defaults, "mlp_ratio")),
         name="mlp_ratio",
         minimum=0.0,
     )
-    args["drop_path"] = ensure_float(
+    resolved["drop_path"] = _coerce_float(
         filtered.get("drop_path", getattr(defaults, "drop_path")),
         name="drop_path",
         minimum=0.0,
         maximum=1.0,
     )
-    args["spatial_latents"] = ensure_int(
+    resolved["spatial_latents"] = _coerce_int(
         filtered.get("spatial_latents", getattr(defaults, "spatial_latents")),
         name="spatial_latents",
         minimum=1,
     )
-    args["temporal_latents"] = ensure_int(
+    resolved["temporal_latents"] = _coerce_int(
         filtered.get("temporal_latents", getattr(defaults, "temporal_latents")),
         name="temporal_latents",
         minimum=1,
     )
-    args["modeling_type"] = str(
+    resolved["modeling_type"] = str(
         filtered.get("modeling_type", getattr(defaults, "modeling_type"))
     )
-    args["use_linear_branch"] = ensure_bool(
+    resolved["use_linear_branch"] = _coerce_bool(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
     )
@@ -300,22 +300,21 @@ def coerce_model_config(
             normalized_compile_mode = getattr(defaults, "compile_mode")
         else:
             normalized_compile_mode = normalized_compile_mode.lower()
-    args["compile_mode"] = normalized_compile_mode
-    args["activation_checkpoint"] = ensure_bool(
+    resolved["compile_mode"] = normalized_compile_mode
+    resolved["activation_checkpoint"] = _coerce_bool(
         filtered.get(
             "activation_checkpoint", getattr(defaults, "activation_checkpoint")
         ),
         name="activation_checkpoint",
     )
 
-    return ModelConfig(**args)
+    return ModelConfig(**resolved)
 
 
 def patch_config(
     base: PatchConfig | Dict[str, Any] | None = None,
     /,
-    *args: Any,
-    **kwargs: Any,
+    **overrides: Any,
 ) -> PatchConfig:
     if base is None:
         data: Dict[str, Any] = {}
@@ -325,15 +324,14 @@ def patch_config(
         data = dict(base)
     else:
         raise TypeError("base must be PatchConfig, dict, or None")
-    data.update(kwargs)
+    data.update(overrides)
     return coerce_patch_config(data)
 
 
 def model_config(
     base: ModelConfig | Dict[str, Any] | None = None,
     /,
-    *args: Any,
-    **kwargs: Any,
+    **overrides: Any,
 ) -> ModelConfig:
     if base is None:
         data: Dict[str, Any] = {}
@@ -343,7 +341,7 @@ def model_config(
         data = dict(base)
     else:
         raise TypeError("base must be ModelConfig, dict, or None")
-    data.update(kwargs)
+    data.update(overrides)
     return coerce_model_config(data)
 
 
@@ -411,7 +409,7 @@ class RuntimeConfig:
             if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
         in_dim = int(kwargs["in_dim"])
-        out_shape = ensure_int_sequence(kwargs["out_shape"])
+        out_shape = _coerce_int_sequence(kwargs["out_shape"])
         cfg_dict = dict(kwargs["cfg_dict"])
         common_keys = {
             "in_dim",

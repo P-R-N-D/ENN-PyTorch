@@ -5,48 +5,27 @@ import importlib
 import sys as _sys
 from typing import Any, Dict, Tuple
 
-__all__ = [
-    "train",
-    "predict",
-    "launch",
-    "Autocast",
-    "DotProductAttention",
-    "MultiScaleRetention",
-    "MultiScaleRetentionCompat",
-    "AdamW",
-    "Fusion",
-    "Gradient",
-    "LossWeightController",
-    "attention_flops_bshd",
-    "FlopCounter",
-    "joining",
-    "no_synchronization",
-    "Distributed",
-    "Network",
-    "System",
-    "get_device",
-    "get_runtime_config",
-    "initialize_sdpa_backends",
-    "patch_torch",
-    "TorchCompat",
-    "SDPBackend",
-    "sdpa_kernel",
-    "VarianceThreshold",
-    "StandardScaler",
-    "IncrementalPCA",
-    "preprocess",
-    "postprocess",
-    "datatype",
-    "dtypes",
-    "is_fake_tensor",
-    "is_meta_tensor",
-    "is_meta_or_fake_tensor",
-]
-
 _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "launch": ("stnet.api.run", "launch"),
     "predict": ("stnet.api.run", "predict"),
     "train": ("stnet.api.run", "train"),
+    "ModelConfig": ("stnet.api.config", "ModelConfig"),
+    "PatchConfig": ("stnet.api.config", "PatchConfig"),
+    "RuntimeConfig": ("stnet.api.config", "RuntimeConfig"),
+    "BuildConfig": ("stnet.api.config", "BuildConfig"),
+    "OpsMode": ("stnet.api.config", "OpsMode"),
+    "coerce_model_config": ("stnet.api.config", "coerce_model_config"),
+    "coerce_patch_config": ("stnet.api.config", "coerce_patch_config"),
+    "coerce_runtime_config": ("stnet.api.config", "coerce_runtime_config"),
+    "model_config": ("stnet.api.config", "model_config"),
+    "patch_config": ("stnet.api.config", "patch_config"),
+    "runtime_config": ("stnet.api.config", "runtime_config"),
+    "MissingDependencyError": ("stnet.backend.export", "MissingDependencyError"),
+    "Model": ("stnet.api.io", "Model"),
+    "Export": ("stnet.backend.export", "Model"),
+    "new_model": ("stnet.api.io", "new_model"),
+    "load_model": ("stnet.api.io", "load_model"),
+    "save_model": ("stnet.api.io", "save_model"),
     "SDPBackend": ("stnet.backend.compat", "SDPBackend"),
     "TorchCompat": ("stnet.backend.compat", "TorchCompat"),
     "is_fake_tensor": ("stnet.backend.compat", "is_fake_tensor"),
@@ -83,6 +62,8 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "datatype": ("stnet.data.datatype", None),
     "dtypes": ("stnet.data.datatype", None),
 }
+
+__all__ = tuple(sorted(_LAZY_IMPORTS))
 
 
 def __getattr__(name: str) -> Any:
