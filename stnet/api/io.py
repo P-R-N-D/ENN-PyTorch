@@ -6,7 +6,7 @@ import json
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -32,10 +32,6 @@ from torch.distributed.checkpoint.state_dict import (
 from ..functional.fx import Fusion
 from ..model import Root
 from .config import ModelConfig, coerce_model_config
-
-if TYPE_CHECKING:
-    from ..backend.export import MissingDependencyError
-
 
 class Format(Protocol):
 
@@ -110,7 +106,7 @@ def load_model(
     if p.suffix.lower() == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError("missing sidecar JSON for safetensors model")
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
         out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
@@ -170,7 +166,7 @@ def save_model(
 
     conv = _export_backend().Model.for_export(p.suffix)
     if conv is None:
-        raise ValueError(f"Unknown format for path: {path}")
+        raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, **kwargs)
     return str(p)
 
@@ -250,6 +246,4 @@ class Model:
 
 
 def __getattr__(name: str) -> Any:
-    if name == "MissingDependencyError":
-        return _export_backend().MissingDependencyError
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

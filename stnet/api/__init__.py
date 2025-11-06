@@ -20,7 +20,6 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "model_config": ("stnet.api.config", "model_config"),
     "patch_config": ("stnet.api.config", "patch_config"),
     "runtime_config": ("stnet.api.config", "runtime_config"),
-    "MissingDependencyError": ("stnet.backend.export", "MissingDependencyError"),
     "Model": ("stnet.api.io", "Model"),
     "Export": ("stnet.backend.export", "Model"),
     "new_model": ("stnet.api.io", "new_model"),
@@ -34,7 +33,7 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "patch_torch": ("stnet.backend.compat", "patch_torch"),
     "sdpa_kernel": ("stnet.backend.compat", "sdpa_kernel"),
     "joining": ("stnet.backend.distributed", "joining"),
-    "no_synchronization": ("stnet.backend.distributed", "no_synchronization"),
+    "no_sync": ("stnet.backend.distributed", "no_sync"),
     "get_device": ("stnet.backend.environment", "get_device"),
     "get_runtime_config": ("stnet.backend.environment", "get_runtime_config"),
     "get_dpa_backends": (
