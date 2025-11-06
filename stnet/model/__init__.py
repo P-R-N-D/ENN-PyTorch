@@ -27,7 +27,6 @@ from .kernels import (
     to_additive_mask,
 )
 from .layers import (
-    CompatLayer,
     CrossAttention,
     CrossTransformer,
     DilatedAttention,
@@ -67,7 +66,6 @@ __all__ = [
     "LocalProcessor",
     "PatchEmbedding",
     "PatchAttention",
-    "CompatLayer",
     "PointTransformer",
     "Retention",
     "RetNet",
