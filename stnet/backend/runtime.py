@@ -15,17 +15,8 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from ..functional.optimizers import (
-    StochasticWeightAverage,
-    SWALR,
-    stochastic_weight_average,
-)
-from torch.distributed.checkpoint import (
-    FileSystemReader,
-    FileSystemWriter,
-    load,
-    save,
-)
+from torch.distributed._tensor import DTensor, Placement, Replicate
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
 from torch.distributed.checkpoint.api import CheckpointException
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
@@ -35,40 +26,31 @@ from torch.distributed.checkpoint.state_dict import (
     set_optimizer_state_dict,
 )
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed._tensor import DTensor, Placement, Replicate
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
-from ..model import Root
-from ..api.config import (
-    RuntimeConfig,
-    coerce_model_config,
-)
-from ..functional.losses import (
-    LossWeightController,
-    StandardNormalLoss,
-    StudentsTLoss,
-    TiledLoss,
-)
-from ..functional.optimizers import AdamW
-from ..data.pipeline import fetch
-from ..data.transforms import postprocess, preprocess
+from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
+from ..data.pipeline import fetch
 from ..data.stats import Metadata
-from .environment import get_device, initialize_python_path, is_float8_supported
-from ..functional.fx import Autocast, Gradient, Fusion
-from .profiler import FlopCounter
-from .compat import is_meta_or_fake_tensor, cudagraph_step_end
+from ..data.transforms import postprocess, preprocess
+from ..functional.fx import Autocast, Fusion, Gradient
+from ..functional.losses import LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss
+from ..functional.optimizers import AdamW, SWALR, StochasticWeightAverage, stochastic_weight_average
+from ..model import Root
+from .compat import cudagraph_step_end, is_meta_or_fake_tensor
 from .distributed import (
     distributed_barrier,
+    distributed_sync,
     get_world_size,
-    is_dist_avail_and_initialized,
+    is_distributed,
     joining,
     no_synchronization,
-    wrap_ddp_if_needed,
-    wrap_fsdp_module,
-    sync_model_states,
+    to_ddp,
+    to_fsdp,
 )
+from .environment import get_device, initialize_python_path, is_float8_supported
+from .profiler import FlopCounter
 
 
 try:
@@ -541,9 +523,9 @@ def epochs(
                     f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]{_suffix}"
                 )
 
-            if is_dist_avail_and_initialized():
+            if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
-                sync_model_states(target_module, device=device)
+                distributed_sync(target_module, device=device)
 
             flop_breakdown_epoch: Dict[str, float] = {}
             io_time = torch.tensor(0.0, device=device, dtype=torch.float64)
@@ -831,7 +813,7 @@ def epochs(
 
                             t_fetch_start = time.perf_counter_ns()
 
-            if is_dist_avail_and_initialized():
+            if is_distributed():
                 for t in (comp_time, io_time, flops, io_bytes):
                     torch.distributed.all_reduce(
                         t, op=torch.distributed.ReduceOp.SUM
@@ -891,10 +873,10 @@ def infer(
     **kwargs: Any,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
 
-    run_model = wrap_ddp_if_needed(model, device=device)
+    run_model = to_ddp(model, device=device)
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
-    sync_model_states(module_eval, device=device)
+    distributed_sync(module_eval, device=device)
 
     chunk_idx = 0
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
@@ -908,7 +890,7 @@ def infer(
     t_fetch_start = time.perf_counter_ns()
     preds: List[torch.Tensor] = []
     recovered_streaming = False
-    is_dist = is_dist_avail_and_initialized()
+    is_dist = is_distributed()
     rank = torch.distributed.get_rank() if is_dist else 0
 
     try:
@@ -1338,7 +1320,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 return target
             wrapped.add(id(target))
             per_mod_ignored = _per_module_ignored_params(target)
-            sharded = wrap_fsdp_module(
+            sharded = to_fsdp(
                 target,
                 mesh=mesh,
                 mp_policy=mp_policy,
@@ -1379,7 +1361,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 _fsdp_wrap(submodule)
             _fsdp_wrap(model)
         except (RuntimeError, ValueError, TypeError):
-            model = wrap_fsdp_module(
+            model = to_fsdp(
                 model,
                 mesh=mesh,
                 mp_policy=mp_policy,
@@ -1401,7 +1383,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         _assert_no_meta_tensors(_m_post)
         _assert_no_fake_dtensor(_m_post, allow_dtensor=True)
         _enable_meta_monitor(_m_post)
-        sync_model_states(_m_post, device=device)
+        distributed_sync(_m_post, device=device)
 
         net_params = [p for p in model.parameters()]
         optimizer = AdamW.float(

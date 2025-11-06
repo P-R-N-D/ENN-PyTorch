@@ -37,9 +37,9 @@ _LAZY_IMPORTS: Dict[str, Tuple[str, str | None]] = {
     "no_synchronization": ("stnet.backend.distributed", "no_synchronization"),
     "get_device": ("stnet.backend.environment", "get_device"),
     "get_runtime_config": ("stnet.backend.environment", "get_runtime_config"),
-    "initialize_sdpa_backends": (
+    "get_dpa_backends": (
         "stnet.backend.environment",
-        "initialize_sdpa_backends",
+        "get_dpa_backends",
     ),
     "FlopCounter": ("stnet.backend.profiler", "FlopCounter"),
     "capture": ("stnet.backend.profiler", "capture"),

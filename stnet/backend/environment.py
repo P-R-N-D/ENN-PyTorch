@@ -28,6 +28,15 @@ class _RuntimeConfig:
 _RUNTIME_CONFIG = _RuntimeConfig()
 
 
+def _num_cuda_devices() -> int:
+    if not torch.cuda.is_available():
+        return 0
+    try:
+        return max(0, int(torch.cuda.device_count()))
+    except Exception:
+        return 0
+
+
 def get_runtime_config() -> _RuntimeConfig:
     return _RUNTIME_CONFIG
 
@@ -55,7 +64,7 @@ def initialize_python_path() -> str:
     paths: List[str] = list(env_paths)
     seen: set[str] = set(env_paths)
 
-    def _ensure_front(candidate: Path | str | None) -> None:
+    def _prioritized_path(candidate: Path | str | None) -> None:
         if candidate is None:
             return
         try:
@@ -73,7 +82,7 @@ def initialize_python_path() -> str:
         if path_str not in sys.path:
             sys.path.insert(0, path_str)
 
-    def _ensure_env(entry: str) -> None:
+    def _target_path(entry: str) -> None:
         if entry in seen:
             return
         seen.add(entry)
@@ -96,7 +105,7 @@ def initialize_python_path() -> str:
                 main_dir = Path(main_file).resolve().parent
 
     for candidate in (package_dir, project_dir, main_dir, cwd_dir):
-        _ensure_front(candidate)
+        _prioritized_path(candidate)
 
     for entry in list(sys.path):
         if not entry:
@@ -107,7 +116,7 @@ def initialize_python_path() -> str:
             continue
         if not entry_str:
             continue
-        _ensure_env(entry_str)
+        _target_path(entry_str)
 
     python_path = separator.join(paths)
     os.environ["PYTHONPATH"] = python_path
@@ -159,7 +168,7 @@ def set_multiprocessing_env() -> None:
 
 def default_temp() -> str:
     return (
-        os.environ.get("TEMP", "C:\Windows\Temp")
+        os.environ.get("TEMP", r"C:\Windows\Temp")
         if sys.platform.startswith("win")
         else "/tmp"
         if os.path.isdir("/tmp")
@@ -175,7 +184,7 @@ def new_dir(prefix: str) -> str:
     return directory
 
 
-def initialize_sdpa_backends() -> List[object]:
+def get_dpa_backends() -> List[object]:
     names = _RUNTIME_CONFIG.sdpa_backends or []
     if not names:
         return []
@@ -376,17 +385,8 @@ def is_int4_supported(
     return (False, "torchao low-bit optimizers unavailable")
 
 
-def _safe_cuda_device_count() -> int:
-    try:
-        if torch.cuda.is_available():
-            return int(torch.cuda.device_count())
-    except Exception:
-        return 0
-    return 0
-
-
 def optimal_procs() -> Dict[str, Union[int, str]]:
-    n_gpu = _safe_cuda_device_count()
+    n_gpu = _num_cuda_devices()
     return {"nproc_per_node": n_gpu or 1, "device": "cuda" if n_gpu else "cpu"}
 
 
@@ -399,7 +399,7 @@ def cpu_count() -> int:
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
     n_cpu = cpu_count()
-    n_gpu = _safe_cuda_device_count()
+    n_gpu = _num_cuda_devices()
     intra = max(1, n_cpu // max(1, n_gpu))
     inter = max(1, n_cpu // 2)
     workers = max(2, n_cpu // 2)
