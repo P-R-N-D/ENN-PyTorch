@@ -362,7 +362,7 @@ def _assert_unified_layer_dtype(model: torch.nn.Module, device: torch.device) ->
         )
 
 
-def _prune_extra_dcp_keys(state: Any) -> Any:
+def _trim_dcp_keys(state: Any) -> Any:
     try:
         keys = []
         for key in state.keys():
@@ -1122,7 +1122,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
                 m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _prune_extra_dcp_keys(m_sd)
+                m_sd = _trim_dcp_keys(m_sd)
                 load(
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.init_ckpt_dir),
@@ -1766,7 +1766,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 warnings.filterwarnings("ignore", message=ignored_pattern)
                 opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _prune_extra_dcp_keys(m_sd)
+                m_sd = _trim_dcp_keys(m_sd)
                 load(
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.model_ckpt_dir),
