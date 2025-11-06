@@ -323,5 +323,3 @@ def predict(
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-
-launch = SimpleNamespace(train=train, predict=predict)
