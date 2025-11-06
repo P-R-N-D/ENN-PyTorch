@@ -1058,7 +1058,7 @@ def infer(
                 json.dump(manifest, manifest_file)
     elif not streaming:
         flat = torch.cat(preds, dim=0) if preds else torch.empty(0)
-        pred_struct = Root.unflatten_labels(flat, ops.out_shape)
+        pred_struct = Root.unflatten_y(flat, ops.out_shape)
         result = postprocess(ops.keys or [], pred_struct)
     else:
         result = None

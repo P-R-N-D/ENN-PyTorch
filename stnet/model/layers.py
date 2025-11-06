@@ -6,7 +6,6 @@ import math
 import warnings
 from dataclasses import dataclass
 from importlib import import_module
-from math import prod
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -38,7 +37,7 @@ from .kernels import (
     DotProductAttention,
     MultiHeadAttention,
     MultiScaleRetention,
-    attn_mask_to_additive,
+    to_additive_mask,
 )
 
 try:
@@ -57,12 +56,6 @@ try:
     from ..backend.compat import RMSNorm as _Norm
 except Exception:
     _Norm = nn.LayerNorm
-
-
-try:
-    from ..backend.profiler import FLOP_PROFILER
-except Exception:
-    FLOP_PROFILER = None
 
 
 patch_torch()
@@ -108,7 +101,7 @@ class PositionalEncoding(nn.Module):
         self._cache_dtype: torch.dtype | None = None
 
     @staticmethod
-    def _to_1d(n: int, dim: int, device: torch.device) -> torch.Tensor:
+    def _flatten(n: int, dim: int, device: torch.device) -> torch.Tensor:
         pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)
         div = torch.exp(
             torch.arange(0, dim, 2, device=device, dtype=torch.float32)
@@ -135,19 +128,19 @@ class PositionalEncoding(nn.Module):
             return self._cache_pe
         chunks: List[torch.Tensor] = []
         if "t" in self.axes:
-            pt = self._to_1d(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
+            pt = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
             chunks.append(pt.expand(t, h, w, self.d_axis))
         if "h" in self.axes:
-            ph = self._to_1d(h, self.d_axis, device).view(1, h, 1, self.d_axis)
+            ph = self._flatten(h, self.d_axis, device).view(1, h, 1, self.d_axis)
             chunks.append(ph.expand(t, h, w, self.d_axis))
         if "w" in self.axes:
-            pw = self._to_1d(w, self.d_axis, device).view(1, 1, w, self.d_axis)
+            pw = self._flatten(w, self.d_axis, device).view(1, 1, w, self.d_axis)
             chunks.append(pw.expand(t, h, w, self.d_axis))
         if "l" in self.axes:
-            pl = self._to_1d(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
+            pl = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
             chunks.append(pl.expand(t, 1, 1, self.d_axis))
         if "t_score" in self.axes:
-            pt_score = self._to_1d(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
+            pt_score = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
             chunks.append(pt_score.expand(t, h, w, self.d_axis))
         pe = torch.cat(chunks, dim=-1).view(-1, self.d_axis * len(self.axes))
         pe = pe.to(dtype=dtype)
@@ -191,7 +184,7 @@ def norm_layer(norm_type: str, d_model: int) -> nn.Module:
     return LayerNorm(d_model)
 
 
-def schedule_stochastic_depth(max_rate: float, depth: int) -> list[float]:
+def stochastic_depth_schedule(max_rate: float, depth: int) -> list[float]:
     if depth <= 0:
         return []
     if max_rate <= 0.0:
@@ -349,7 +342,7 @@ class PatchEmbedding(nn.Module):
         if self.static_spatial is not None:
             x = self._pad_or_crop_to_nd(x, self.static_spatial)
         elif x.shape[1] != self.patch[0] and self.pad_to_multiple:
-            x = self._pad_dynamic(x)
+            x = self._dynamic_pad(x)
         y = self.proj(x)
         match self.ndim:
             case 1:
@@ -391,7 +384,7 @@ class PatchEmbedding(nn.Module):
             slices[base + offset] = slice(0, want)
         return x[tuple(slices)]
 
-    def _pad_dynamic(self, x: torch.Tensor) -> torch.Tensor:
+    def _dynamic_pad(self, x: torch.Tensor) -> torch.Tensor:
         return self._pad(x)
 
 
@@ -508,7 +501,7 @@ class PatchAttention(nn.Module):
             mask = attn_mask
             if mask.dtype is torch.bool:
                 mask = torch.logical_not(mask)
-            additive = attn_mask_to_additive(
+            additive = to_additive_mask(
                 mask,
                 batch=B,
                 heads=self.nhead,
@@ -558,7 +551,7 @@ class Retention(nn.Module):
         return out, new_state
 
 
-def _build_dilated_mask(
+def _get_dilated_mask(
     seq_len: int,
     *args: Any,
     dilation: int = 1,
@@ -649,7 +642,7 @@ class DilatedAttention(nn.Module):
         mask_cpu = self._mask_cache_cpu.get(L)
         if mask_cpu is None:
             mask_cpu = (
-                _build_dilated_mask(
+                _get_dilated_mask(
                     L,
                     dilation=self.dilation,
                     window_size=self.window_size,
@@ -837,7 +830,7 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
     "spatio-temporal": "st",
 }
 
-def _normalize_modeling_type(value: Any) -> str:
+def _coerce_modeling_types(value: Any) -> str:
     mode = str(value).strip().lower()
     normalized = _MODELING_TYPE_ALIASES.get(mode)
     if normalized is None:
@@ -860,7 +853,7 @@ class SpatialEncoder(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        drops = schedule_stochastic_depth(drop_path, depth)
+        drops = stochastic_depth_schedule(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
                 PointTransformer(
@@ -969,7 +962,7 @@ class TemporalEncoder(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        drops = schedule_stochastic_depth(drop_path, depth)
+        drops = stochastic_depth_schedule(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
                 RetNet(
@@ -1036,7 +1029,7 @@ class CrossTransformer(nn.Module):
         mode: Optional[str] = None,
     ) -> torch.Tensor:
         if self._fixed_mode is not None:
-            mode_l = _normalize_modeling_type(self._fixed_mode)
+            mode_l = _coerce_modeling_types(self._fixed_mode)
             if mode_l == "ss":
                 return self.cross_s(spatial_tokens, temporal_tokens)
             if mode_l == "tt":
@@ -1066,15 +1059,15 @@ class CrossTransformer(nn.Module):
                 fused = self.mix(self.mix_norm(base))
                 return s_context + self.drop_path(self.dropout(fused))
         requested = mode if mode is not None else "spatiotemporal"
-        return self._forward_dynamic(spatial_tokens, temporal_tokens, requested)
+        return self._forward_dynamically(spatial_tokens, temporal_tokens, requested)
 
-    def _forward_dynamic(
+    def _forward_dynamically(
         self,
         spatial_tokens: torch.Tensor,
         temporal_tokens: torch.Tensor,
         mode: str,
     ) -> torch.Tensor:
-        mode_l = _normalize_modeling_type(mode)
+        mode_l = _coerce_modeling_types(mode)
         s_context = self.cross_s(spatial_tokens, temporal_tokens)
         t_context = self.cross_t(temporal_tokens, spatial_tokens)
         if mode_l == "ss":
@@ -1298,7 +1291,7 @@ class LocalProcessor(nn.Module):
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
         self.d_model = int(config.depth)
         self.nhead = int(config.heads)
-        self.modeling_type = _normalize_modeling_type(
+        self.modeling_type = _coerce_modeling_types(
             config.modeling_type
         )
         self.spatial_tokens = max(1, int(config.spatial_latents))
@@ -1315,7 +1308,7 @@ class LocalProcessor(nn.Module):
         )
         self.register_buffer(
             "spatial_coords_template",
-            self._build_spatial_coords(
+            self._get_spatial_coords(
                 self.spatial_tokens, device=torch.device("cpu")
             ),
             persistent=False,
@@ -1359,7 +1352,7 @@ class LocalProcessor(nn.Module):
         )
 
     @staticmethod
-    def _build_spatial_coords(
+    def _get_spatial_coords(
         n_tokens: int, device: torch.device
     ) -> torch.Tensor:
         side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
@@ -1414,21 +1407,21 @@ class LocalProcessor(nn.Module):
         temporal_out = self.temporal_encoder(temporal_tokens)
         mode = self._fixed_mode
         if mode is not None:
-            mode_l = _normalize_modeling_type(mode)
+            mode_l = _coerce_modeling_types(mode)
             if mode_l == "ss":
                 tokens = spatial_out
             elif mode_l == "tt":
                 tokens = temporal_out
             elif mode_l == "ts":
-                if hasattr(self.perception, "_forward_dynamic"):
-                    tokens = self.perception._forward_dynamic(
+                if hasattr(self.perception, "_forward_dynamically"):
+                    tokens = self.perception._forward_dynamically(
                         temporal_out, spatial_out, "ts"
                     )
                 else:
                     tokens = self.perception(temporal_out, spatial_out, mode="ts")
             elif mode_l == "st":
-                if hasattr(self.perception, "_forward_dynamic"):
-                    tokens = self.perception._forward_dynamic(
+                if hasattr(self.perception, "_forward_dynamically"):
+                    tokens = self.perception._forward_dynamically(
                         spatial_out, temporal_out, "st"
                     )
                 else:
@@ -1436,7 +1429,7 @@ class LocalProcessor(nn.Module):
             else:
                 raise RuntimeError(f"Unhandled modeling type '{mode}'")
         else:
-            tokens = self._forward_dynamic(spatial_out, temporal_out)
+            tokens = self._forward_dynamically(spatial_out, temporal_out)
         tokens = self.norm(tokens)
         tokens = tokens.contiguous()
         pooled = tokens.mean(dim=1)
@@ -1453,11 +1446,11 @@ class LocalProcessor(nn.Module):
             context_shape=self.out_shape,
         )
 
-    def _forward_dynamic(self, spatial_out, temporal_out):
+    def _forward_dynamically(self, spatial_out, temporal_out):
         mode = getattr(self, "modeling_type", None)
         if mode is None:
             raise RuntimeError("modeling_type is not set")
-        mode_l = _normalize_modeling_type(mode)
+        mode_l = _coerce_modeling_types(mode)
         if mode_l == "ss":
             return spatial_out
         if mode_l == "tt":
@@ -1502,7 +1495,7 @@ class Root(nn.Module):
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
-        self.out_dim = int(prod(self.out_shape))
+        self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -1576,7 +1569,7 @@ class Root(nn.Module):
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
 
     @staticmethod
-    def _graph_safe_cast(
+    def _cast_graph_safe(
         x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]
     ) -> torch.Tensor:
         target_dtype = dtype or x.dtype
@@ -1595,7 +1588,7 @@ class Root(nn.Module):
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
         loss_weights: Optional[
-            Union[Tuple[float, float], LossWeightPolicy]
+        Union[Tuple[float, float], LossWeightPolicy]
         ] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
@@ -1642,7 +1635,7 @@ class Root(nn.Module):
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
-                x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
+                x_slice = self._cast_graph_safe(features[s:e], device, base_dtype)
                 ctx = Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 with ctx:
                     out: Payload = self.local_net(x_slice)
@@ -1660,7 +1653,7 @@ class Root(nn.Module):
             for idx in range(num_slices):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
-                x_slice = self._graph_safe_cast(features[s:e], device, base_dtype)
+                x_slice = self._cast_graph_safe(features[s:e], device, base_dtype)
                 with contextlib.ExitStack() as stack:
                     stack.enter_context(Gradient.inference(self.local_net))
                     stack.enter_context(
@@ -1684,7 +1677,7 @@ class Root(nn.Module):
         assembled = torch.nan_to_num(context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(
-                self._graph_safe_cast(features, self._device, assembled.dtype)
+                self._cast_graph_safe(features, self._device, assembled.dtype)
             )
             assembled = assembled + bl
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
@@ -1823,7 +1816,7 @@ class Root(nn.Module):
         return (pred, loss_val)
 
     @staticmethod
-    def flatten_labels(
+    def flatten_y(
         labels: Sequence[torch.Tensor],
         *args: Any,
         dtype: Optional[torch.dtype] = None,
@@ -1838,7 +1831,7 @@ class Root(nn.Module):
         return (out.contiguous(), tuple(labels[0].shape))
 
     @staticmethod
-    def unflatten_labels(
+    def unflatten_y(
         flat: torch.Tensor, shape: Sequence[int]
     ) -> torch.Tensor:
         return flat.reshape(flat.shape[0], *shape).contiguous()
