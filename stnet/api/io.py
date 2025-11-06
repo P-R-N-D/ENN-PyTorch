@@ -37,7 +37,7 @@ if TYPE_CHECKING:  # pragma: no cover - imported for type checkers only
     from ..backend.export import MissingDependencyError
 
 
-class _Format(Protocol):
+class Format(Protocol):
     """Interface implemented by backend export format handlers."""
 
     name: str

@@ -13,7 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
-from ..api.io import _Format
+from ..api.io import Format
 from ..functional.fx import Gradient
 
 
@@ -106,8 +106,8 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         raise MissingDependencyError(f"{module} is required for this operation{hint}") from err
 
 
-# Every backend compiler implements the shared stnet.api.io._Format protocol.
-class Onnx(_Format):
+# Every backend compiler implements the shared stnet.api.io.Format protocol.
+class Onnx(Format):
     name = "onnx"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -115,7 +115,7 @@ class Onnx(_Format):
         return (out,)
 
 
-class Ort(_Format):
+class Ort(Format):
     name = "ort"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -131,7 +131,7 @@ class Ort(_Format):
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
 
-class TensorRT(_Format):
+class TensorRT(Format):
     name = "tensorrt"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -182,7 +182,7 @@ class TensorRT(_Format):
         return (dst,)
 
 
-class Nnef(_Format):
+class Nnef(Format):
     name = "nnef"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -226,7 +226,7 @@ class Nnef(_Format):
         return (dst,)
 
 
-class CoreML(_Format):
+class CoreML(Format):
     name = "coreml"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -261,7 +261,7 @@ class CoreML(_Format):
         return (dst,)
 
 
-class LiteRT(_Format):
+class LiteRT(Format):
     name = "litert"
 
     def save(self, model: nn.Module, dst: Path, *args: Any, **opts: Any) -> Tuple[Path, ...]:
@@ -324,7 +324,7 @@ class LiteRT(_Format):
 
 
 class Model:
-    _by_name: Dict[str, _Format] = {}
+    _by_name: Dict[str, Format] = {}
     _ext_map: Dict[str, str] = {}
 
     class _OnnxLayer:
@@ -442,13 +442,13 @@ class Model:
             return ort_path, optimized_onnx_path
 
     @classmethod
-    def register(cls, name: str, exts: Tuple[str, ...], impl: _Format) -> None:
+    def register(cls, name: str, exts: Tuple[str, ...], impl: Format) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
 
     @classmethod
-    def for_export(cls, ext: str) -> Optional[_Format]:
+    def for_export(cls, ext: str) -> Optional[Format]:
         name = cls._ext_map.get(ext.lower())
         return cls._by_name.get(name) if name else None
 
