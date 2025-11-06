@@ -21,11 +21,11 @@ from ..backend.environment import (
 )
 
 
-def _duplicate_last_dim(x: torch.Tensor) -> torch.Tensor:
+def _clone_last_dim(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((x, x), dim=-1).reshape(*x.shape[:-1], -1)
 
 
-def _retention_manual_flops(
+def _estimate_flops_msr(
     batch: int,
     seq_len: int,
     *args: Any,
@@ -41,7 +41,7 @@ def _retention_manual_flops(
     return 4.0 * attn + gate_cost
 
 
-def _is_contiguous_bshd(tensor: torch.Tensor) -> bool:
+def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
     if tensor.dim() != 4:
         return False
     _, seq_len, num_heads, head_dim = tensor.shape
@@ -55,7 +55,7 @@ def _is_contiguous_bshd(tensor: torch.Tensor) -> bool:
     )
 
 
-def _canonical_lengths(
+def _dpa_sequence_length(
     query: torch.Tensor, key: torch.Tensor, batch_first: bool
 ) -> tuple[int, int, int]:
 
@@ -74,7 +74,7 @@ def _canonical_lengths(
     return batch, seq_q, seq_k
 
 
-def _expand_bool_mask_to_bhss(
+def _expand_for_mha(
     mask: torch.Tensor,
     *args: Any,
     batch: int,
@@ -113,7 +113,7 @@ def _expand_bool_mask_to_bhss(
     return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
 
 
-def attn_mask_to_additive(
+def to_additive_mask(
     attn_mask: torch.Tensor | None,
     *args: Any,
     batch: int,
@@ -128,10 +128,10 @@ def attn_mask_to_additive(
     if attn_mask is None:
         return torch.zeros((batch, heads, seq_q, seq_k), dtype=dtype, device=device)
     if attn_mask.dtype is torch.bool:
-        expanded = _expand_bool_mask_to_bhss(
+        expanded = _expand_for_mha(
             attn_mask, batch=batch, heads=heads, seq_q=seq_q, seq_k=seq_k, device=device
         )
-        neg_inf = _te_addend(dtype, device)
+        neg_inf = _negative_inf(dtype, device)
         zero = torch.zeros((), dtype=neg_inf.dtype, device=device)
         return torch.where(expanded, neg_inf, zero).to(dtype)
     am = attn_mask.to(device=device, dtype=dtype, non_blocking=True)
@@ -159,14 +159,14 @@ def attn_mask_to_additive(
     raise ValueError(f"unsupported mask rank {am.dim()}")
 
 
-def _te_addend(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+def _negative_inf(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 
     if not torch.is_floating_point(torch.empty((), dtype=dtype)):
         dtype = torch.float32
     return torch.tensor(float("-inf"), dtype=dtype, device=device)
 
 
-def _te_supported_on_device() -> bool:
+def _is_nvidia_te_supported() -> bool:
 
     if os.environ.get("STF_DISABLE_TE", "") == "1":
         return False
@@ -212,7 +212,7 @@ def _te_supported_on_device() -> bool:
     return True
 
 
-def _adapt_mask_for_te(
+def _to_nvidia_mask(
     query: torch.Tensor,
     key: torch.Tensor,
     attn_mask: Optional[torch.Tensor],
@@ -226,11 +226,11 @@ def _adapt_mask_for_te(
     if attn_mask is None and key_padding_mask is None:
         return None
 
-    batch, seq_q, seq_k = _canonical_lengths(query, key, batch_first)
+    batch, seq_q, seq_k = _dpa_sequence_length(query, key, batch_first)
     device = query.device
     dtype = query.dtype
     heads = int(num_heads)
-    neg_inf = _te_addend(dtype, device)
+    neg_inf = _negative_inf(dtype, device)
     mask_dtype = neg_inf.dtype
     zero_scalar = torch.zeros((), dtype=mask_dtype, device=device)
     float_mask: Optional[torch.Tensor] = None
@@ -238,7 +238,7 @@ def _adapt_mask_for_te(
     try:
         if attn_mask is not None:
             if attn_mask.dtype is torch.bool:
-                expanded = _expand_bool_mask_to_bhss(
+                expanded = _expand_for_mha(
                     attn_mask,
                     batch=batch,
                     heads=heads,
@@ -345,11 +345,11 @@ else:
         _HAS_TE = False
 
 
-def _te_fused_mha_is_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
+def _is_nvidia_mha_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
 
     if not _HAS_TE:
         return False
-    if not _te_supported_on_device():
+    if not _is_nvidia_te_supported():
         return False
     device = get_device()
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -370,11 +370,11 @@ class DotProductAttention(nn.Module):
         self.hd = int(head_dim) if head_dim is not None else None
         cfg = get_runtime_config()
         self.te_first = bool(cfg.te_first) if te_first is None else bool(te_first)
-        ok, te_mod = self._is_te_available()
+        ok, te_mod = self._is_nvidia_te_available()
         self._te_ok = bool(
             ok
             and torch.cuda.is_available()
-            and _te_supported_on_device()
+            and _is_nvidia_te_supported()
             and (self.nh is not None)
             and (self.hd is not None)
         )
@@ -449,7 +449,7 @@ class DotProductAttention(nn.Module):
                 self._te_supports_training = "training" in params
 
     @staticmethod
-    def _is_te_available() -> Any:
+    def _is_nvidia_te_available() -> Any:
         if os.environ.get("STF_DISABLE_TE", "") == "1":
             return (False, None)
         try:
@@ -481,13 +481,13 @@ class DotProductAttention(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         training = bool(training) if training is not None else self.training
-        q = self._to_optimal_dtype(q)
-        k = self._to_optimal_dtype(k)
-        v = self._to_optimal_dtype(v)
+        q = self._negotiate_dtype(q)
+        k = self._negotiate_dtype(k)
+        v = self._negotiate_dtype(v)
         q_bshd = q.contiguous()
         k_bshd = k.contiguous()
         v_bshd = v.contiguous()
-        if _is_contiguous_bshd(q_bshd) and _is_contiguous_bshd(k_bshd):
+        if _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
             try:
                 attention_flops_bshd(
                     q_bshd,
@@ -529,7 +529,7 @@ class DotProductAttention(nn.Module):
             else:
                 mask_bool = m.to(torch.bool)
 
-            def _flatten_mask_shape(
+            def _flatten_mask(
                 mask: torch.Tensor,
             ) -> tuple[torch.Tensor, int, int]:
                 if mask.dim() == 0:
@@ -577,7 +577,7 @@ class DotProductAttention(nn.Module):
             ) -> torch.Tensor | None:
                 if x is None:
                     return None
-                mask, batch_dim, head_count = _flatten_mask_shape(x)
+                mask, batch_dim, head_count = _flatten_mask(x)
                 if batch_dim != B:
                     mask = mask.expand(B, head_count, L, S)
                     batch_dim = B
@@ -680,7 +680,7 @@ class DotProductAttention(nn.Module):
                 fm = fm.to(device=q_bhsd.device, non_blocking=True)
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
-            fm, batch_dim, head_count = _flatten_mask_shape(fm)
+            fm, batch_dim, head_count = _flatten_mask(fm)
             if batch_dim not in (1, B):
                 raise RuntimeError(
                     f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
@@ -710,7 +710,7 @@ class DotProductAttention(nn.Module):
         return sdpa_out
 
     @staticmethod
-    def _to_optimal_dtype(tensor: torch.Tensor) -> torch.Tensor:
+    def _negotiate_dtype(tensor: torch.Tensor) -> torch.Tensor:
         device_type = tensor.device.type
         if device_type == "cpu" and tensor.dtype in (torch.float16, torch.bfloat16):
             return tensor.float()
@@ -759,7 +759,7 @@ class MultiScaleRetentionCompat(nn.Module):
         head_dim = self.head_dim
         q = self.q_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
         v = self.v_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
-        manual_flops = _retention_manual_flops(
+        manual_flops = _estimate_flops_msr(
             batch,
             seq_len,
             num_heads=self.nhead,
@@ -823,7 +823,7 @@ class MultiScaleRetention(nn.Module):
         self._decay_init = 5.0
         self._decay_range = 1.0
 
-    def _build_rel_pos(self, seq_len: Any, device: Any, dtype: Any) -> Any:
+    def _get_coords(self, seq_len: Any, device: Any, dtype: Any) -> Any:
         key_dim = int(
             self._ts_key_dim
             if getattr(self, "_ts_key_dim", None) is not None
@@ -835,8 +835,8 @@ class MultiScaleRetention(nn.Module):
             0, 1, half, device=device, dtype=torch.float32
         )
         freqs = torch.einsum("n,d->nd", positions, inv_freq)
-        sin = _duplicate_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
-        cos = _duplicate_last_dim(torch.cos(freqs)).to(dtype)[None, None, :, :]
+        sin = _clone_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
+        cos = _clone_last_dim(torch.cos(freqs)).to(dtype)[None, None, :, :]
         length = seq_len
         idx_i = torch.arange(length, device=device)
         idx_j = torch.arange(length, device=device)
@@ -874,7 +874,7 @@ class MultiScaleRetention(nn.Module):
             seq_len = x.shape[1]
             dtype = x.dtype
             device = x.device
-            sin, cos, rel = self._build_rel_pos(seq_len, device, dtype)
+            sin, cos, rel = self._get_coords(seq_len, device, dtype)
             outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)
         except Exception:
             return self._fallback(x)
@@ -885,7 +885,7 @@ class MultiScaleRetention(nn.Module):
         return self._fallback(x)
 
 
-class MultiHeadAttentionCompat(nn.Module):
+class _MultiHeadAttentionCompat(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -938,7 +938,7 @@ class MultiHeadAttentionCompat(nn.Module):
         )
 
 
-class MultiHeadAttentionNvidia(nn.Module):
+class _MultiHeadAttentionNvidia(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -952,7 +952,7 @@ class MultiHeadAttentionNvidia(nn.Module):
         super().__init__()
         self.batch_first = batch_first
         self.num_heads = int(num_heads)
-        self._fallback = MultiHeadAttentionCompat(
+        self._fallback = _MultiHeadAttentionCompat(
             embed_dim,
             num_heads,
             bias=bias,
@@ -960,7 +960,7 @@ class MultiHeadAttentionNvidia(nn.Module):
             batch_first=batch_first,
             **kwargs,
         )
-        self._te_mha = self._build_te_mha(embed_dim, num_heads, dropout, kwargs)
+        self._te_mha = self._nvidia_mha(embed_dim, num_heads, dropout, kwargs)
         self._force_pt: bool = self._te_mha is None
         if self._force_pt:
             warnings.warn(
@@ -969,10 +969,10 @@ class MultiHeadAttentionNvidia(nn.Module):
             )
 
     @staticmethod
-    def _build_te_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
+    def _nvidia_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
         if not _HAS_TE:
             return None
-        if not _te_supported_on_device():
+        if not _is_nvidia_te_supported():
             return None
         candidates = []
         for name in ("MultiHeadAttention", "MultiheadAttention"):
@@ -1019,7 +1019,7 @@ class MultiHeadAttentionNvidia(nn.Module):
             )
         te_attn_mask = attn_mask
         if attn_mask is not None or key_padding_mask is not None:
-            te_attn_mask = _adapt_mask_for_te(
+            te_attn_mask = _to_nvidia_mask(
                 query,
                 key,
                 attn_mask,
@@ -1093,9 +1093,9 @@ class MultiHeadAttention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        if _te_fused_mha_is_preferred(prefer_te_min_cc):
+        if _is_nvidia_mha_preferred(prefer_te_min_cc):
             try:
-                impl = MultiHeadAttentionNvidia(
+                impl = _MultiHeadAttentionNvidia(
                     embed_dim,
                     num_heads,
                     bias=bias,
@@ -1103,11 +1103,11 @@ class MultiHeadAttention(nn.Module):
                     batch_first=batch_first,
                     **kwargs,
                 )
-                if isinstance(impl, MultiHeadAttentionNvidia) and impl._te_mha is not None:
+                if isinstance(impl, _MultiHeadAttentionNvidia) and impl._te_mha is not None:
                     self.impl = impl
                     self._backend = "te"
                 else:
-                    self.impl = MultiHeadAttentionCompat(
+                    self.impl = _MultiHeadAttentionCompat(
                         embed_dim,
                         num_heads,
                         bias=bias,
@@ -1117,7 +1117,7 @@ class MultiHeadAttention(nn.Module):
                     )
                     self._backend = "torch"
             except Exception:
-                self.impl = MultiHeadAttentionCompat(
+                self.impl = _MultiHeadAttentionCompat(
                     embed_dim,
                     num_heads,
                     bias=bias,
@@ -1127,7 +1127,7 @@ class MultiHeadAttention(nn.Module):
                 )
                 self._backend = "torch"
         else:
-            self.impl = MultiHeadAttentionCompat(
+            self.impl = _MultiHeadAttentionCompat(
                 embed_dim,
                 num_heads,
                 bias=bias,
@@ -1136,8 +1136,8 @@ class MultiHeadAttention(nn.Module):
                 **kwargs,
             )
             self._backend = "torch"
-        if isinstance(self.impl, MultiHeadAttentionNvidia):
-            self.impl._fallback = MultiHeadAttentionCompat(
+        if isinstance(self.impl, _MultiHeadAttentionNvidia):
+            self.impl._fallback = _MultiHeadAttentionCompat(
                 embed_dim,
                 num_heads,
                 bias=bias,

@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from ..backend.compat import SDPBackend, patch_torch, sdpa_kernel
 from ..api.config import (
     ModelConfig,
     PatchConfig,
@@ -10,7 +9,7 @@ from ..api.config import (
     model_config,
     patch_config,
 )
-from .activations import GeGLU, SwiGLU
+from ..backend.compat import SDPBackend, patch_torch, sdpa_kernel
 from ..functional.losses import (
     DataFidelityLoss,
     LinearCombinationLoss,
@@ -18,6 +17,14 @@ from ..functional.losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
+)
+from .activations import GeGLU, SwiGLU
+from .kernels import (
+    DotProductAttention,
+    MultiHeadAttention,
+    MultiScaleRetention,
+    MultiScaleRetentionCompat,
+    to_additive_mask,
 )
 from .layers import (
     CompatLayer,
@@ -27,6 +34,7 @@ from .layers import (
     GlobalEncoder,
     LocalProcessor,
     LongNet,
+    LossWeightPolicy,
     PatchAttention,
     PatchEmbedding,
     Payload,
@@ -39,7 +47,7 @@ from .layers import (
     RetNet,
     Retention,
     norm_layer,
-    schedule_stochastic_depth,
+    stochastic_depth_schedule,
 )
 
 patch_torch()
@@ -65,10 +73,16 @@ __all__ = [
     "RetNet",
     "DilatedAttention",
     "LongNet",
+    "LossWeightPolicy",
     "CrossTransformer",
     "Payload",
     "GlobalEncoder",
     "CrossAttention",
+    "MultiHeadAttention",
+    "DotProductAttention",
+    "MultiScaleRetention",
+    "MultiScaleRetentionCompat",
+    "to_additive_mask",
     "GeGLU",
     "PositionalEncoding",
     "SwiGLU",
@@ -80,7 +94,7 @@ __all__ = [
     "TiledLoss",
     "StochasticDepth",
     "norm_layer",
-    "schedule_stochastic_depth",
+    "stochastic_depth_schedule",
 ]
 
 ZLoss = StandardNormalLoss
