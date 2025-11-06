@@ -30,7 +30,6 @@ from .environment import get_device
 
 
 def _env_flag(name: str, default: bool) -> bool:
-    """Parse boolean env var with typical truthy strings."""
     val = os.environ.get(name)
     if val is None:
         return bool(default)
@@ -579,10 +578,7 @@ def distributed_sync(
     device: Optional[torch.device] = None,
     src: int = 0,
 ) -> None:
-    """
-    Broadcast all buffers and parameters from ``src`` rank and then block on a cross-rank barrier.
-    Safe to call when torch.distributed is disabled/uninitialized (no-op), and supports DTensor params.
-    """
+    
     if not is_distributed():
         return
     _m = module.module if hasattr(module, "module") else module
