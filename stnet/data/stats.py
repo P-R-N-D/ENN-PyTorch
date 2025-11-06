@@ -17,6 +17,8 @@ from ..backend.environment import cuda_compute_capability
 
 TExtra = TypeVar("TExtra")
 
+_BOOTSTRAP_DEPTH = 0
+
 
 @dataclass
 class Metadata(Generic[TExtra]):
@@ -87,12 +89,16 @@ class Metadata(Generic[TExtra]):
     def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
+        if _BOOTSTRAP_DEPTH:
+            return (torch.float32,)
         return _Autocast.float_amp_priority(device)
 
     @classmethod
     def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
+        if _BOOTSTRAP_DEPTH:
+            return (torch.int64,)
         return _Autocast.integer_amp_priority(device)
 
     @classmethod
@@ -107,10 +113,17 @@ class Metadata(Generic[TExtra]):
         **kwargs: Any,
     ) -> "Metadata[TExtra]":
         dev = torch.device(device)
+        global _BOOTSTRAP_DEPTH
+        _BOOTSTRAP_DEPTH += 1
+        try:
+            float_candidates = cls._float_amp_candidates(dev)
+            int_candidates = cls._integer_candidates(dev)
+        finally:
+            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
         meta = cls(
             device=dev,
-            float_dtypes=cls._float_amp_candidates(dev),
-            int_dtypes=cls._integer_candidates(dev),
+            float_dtypes=float_candidates,
+            int_dtypes=int_candidates,
             float8_dtypes=cls._float8_dtypes(),
             scale_max_abs=scale_max_abs,
             scale_min_abs=scale_min_abs,

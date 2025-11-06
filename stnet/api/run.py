@@ -151,6 +151,10 @@ def train(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
         )
+    torch.save(
+        {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        os.path.join(init_dir, "model.pt"),
+    )
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
     rdzv_endpoint = get_available_host(resolved_rdzv)
@@ -212,13 +216,23 @@ def train(
         **kwargs,
     )
     elastic_launch(lc, main)(ops)
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=ignored_pattern)
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        m_sd = get_model_state_dict(model, options=opts)
-        m_sd = _trim_dcp_keys(m_sd)
-        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ckpt_dir))
-        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+    fallback = os.path.join(ckpt_dir, "model.pt")
+    if os.path.isfile(fallback):
+        cpu_state = torch.load(fallback, map_location="cpu")
+        model.load_state_dict(cpu_state, strict=False)
+    else:
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=ignored_pattern)
+            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            m_sd = get_model_state_dict(model, options=opts)
+            m_sd = _trim_dcp_keys(m_sd)
+            load(
+                state_dict={"model": m_sd},
+                storage_reader=FileSystemReader(ckpt_dir),
+            )
+            set_model_state_dict(
+                model, m_sd, options=StateDictOptions(strict=False)
+            )
     shutil.rmtree(memmap_dir, ignore_errors=True)
     shutil.rmtree(ckpt_dir, ignore_errors=True)
     shutil.rmtree(init_dir, ignore_errors=True)
@@ -252,6 +266,10 @@ def predict(
             state_dict={"model": m_sd},
             storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
         )
+    torch.save(
+        {k: v.detach().cpu() for k, v in model.state_dict().items()},
+        os.path.join(dcp_dir, "model.pt"),
+    )
     cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)

@@ -6,7 +6,8 @@ import importlib
 import logging
 import math
 from contextlib import AbstractContextManager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -22,7 +23,8 @@ from ..backend.environment import (
     is_int8_supported,
 )
 from ..data.stats import Metadata
-from ..model.kernels import DotProductAttention
+if TYPE_CHECKING:
+    from ..model.kernels import DotProductAttention as _DotProductAttention
 
 patch_torch()
 
@@ -1269,8 +1271,9 @@ class Fusion:
         model: nn.Module, *args: Any, params_dtype: Optional[torch.dtype], **kwargs: Any
     ) -> Tuple[nn.Module, int]:
         swapped = 0
+        dot_cls = _dot_product_attention_cls()
         for module in model.modules():
-            if isinstance(module, DotProductAttention) and getattr(
+            if dot_cls is not None and isinstance(module, dot_cls) and getattr(
                 module, "_te_ok", False
             ):
                 if not getattr(module, "te_first", False):
@@ -1885,3 +1888,12 @@ class Fusion:
         for name, value in derived_attrs.items():
             setattr(pipeline, name, value)
         return pipeline
+@lru_cache(maxsize=1)
+def _dot_product_attention_cls() -> Any:
+    try:
+        from ..model.kernels import DotProductAttention as _DotProductAttention
+
+        return _DotProductAttention
+    except Exception:
+        return None
+

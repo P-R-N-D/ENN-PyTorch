@@ -475,7 +475,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
 
 
 @contextlib.contextmanager
-def no_synchronization(
+def no_sync(
     model: torch.nn.Module,
     *args: Any,
     enable: bool = True,
@@ -486,9 +486,9 @@ def no_synchronization(
 
     ctx: AbstractContextManager[None] | None = None
     try:
-        no_sync = getattr(model, "no_sync", None)
-        if callable(no_sync):
-            ctx = no_sync()
+        method = getattr(model, "no_sync", None)
+        if callable(method):
+            ctx = method()
     except Exception:
         ctx = None
 

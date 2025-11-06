@@ -26,16 +26,36 @@ from tensordict import MemoryMappedTensor
 from torch.utils.data import RandomSampler, SequentialSampler
 
 try:
-    from torchdata.nodes import IterableWrapper, MapStyleWrapper
+    from torchdata.nodes import IterableWrapper as _TDIterableWrapper, MapStyleWrapper as _TDMapWrapper
 except Exception:
-    from torchdata.datapipes.iter import IterableWrapper
+    _TDIterableWrapper = None
+    _TDMapWrapper = None
 
-    MapStyleWrapper = None
 
-if MapStyleWrapper is not None:
-    BatchSamplerBase = MapStyleWrapper
+def _is_wrapper_type(candidate: Any) -> bool:
+    return isinstance(candidate, type)
+
+
+_HAS_MAP_WRAPPER = _is_wrapper_type(_TDMapWrapper)
+_HAS_ITER_WRAPPER = _is_wrapper_type(_TDIterableWrapper)
+
+if _HAS_MAP_WRAPPER:
+    BatchSamplerBase = _TDMapWrapper  # type: ignore[assignment]
+elif _HAS_ITER_WRAPPER:
+    BatchSamplerBase = _TDIterableWrapper  # type: ignore[assignment]
 else:
-    BatchSamplerBase = IterableWrapper
+
+    class _BatchSamplerFallback:
+        def __init__(self, data: Iterable[Any]) -> None:
+            self._data = [list(chunk) for chunk in data]
+
+        def __iter__(self) -> Iterator[Any]:
+            return iter(self._data)
+
+        def __len__(self) -> int:
+            return len(self._data)
+
+    BatchSamplerBase = _BatchSamplerFallback
 try:
     import psutil
 except Exception:
@@ -495,7 +515,7 @@ class BatchSampler(BatchSamplerBase):
         if current and (not drop_last):
             batches.append(current)
 
-        if MapStyleWrapper is None:
+        if not _HAS_MAP_WRAPPER:
             super().__init__([list(chunk) for chunk in batches])
         else:
             _dataset = {i: list(chunk) for i, chunk in enumerate(batches)}

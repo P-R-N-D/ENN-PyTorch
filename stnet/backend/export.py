@@ -17,14 +17,11 @@ from ..api.io import Format
 from ..functional.fx import Gradient
 
 
-class MissingDependencyError(ImportError):
-
-
 def _in_console(cmd: Sequence[str], desc: str) -> None:
     try:
         subprocess.run(list(cmd), check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
-        raise RuntimeError(f"{desc} failed: {exc}") from exc
+        raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
 
 def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) -> Tuple[int, Tuple[int, ...]]:
@@ -56,7 +53,7 @@ def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) ->
             if len(out_shape) == 1:
                 out_shape = (out_shape[0],)
     if in_dim is None or out_shape is None:
-        raise RuntimeError("failed to infer I/O shapes")
+        raise RuntimeError("Failed to infer input and output shapes.")
     return int(in_dim), tuple(out_shape)
 
 
@@ -92,7 +89,7 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         __import__(module)
     except ImportError as err:
         hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise MissingDependencyError(f"{module} is required for this operation{hint}") from err
+        raise ImportError(f"{module} is required for this operation{hint}") from err
 
 
 class _CompatLayer(nn.Module):
@@ -137,11 +134,16 @@ class TensorRT(Format):
         try:
             import tensorrt as trt
         except ImportError as exc:
-            raise MissingDependencyError("tensorrt required") from exc
+            raise ImportError("TensorRT is required for this export.") from exc
 
         trt_logger = trt.Logger(trt.Logger.WARNING)
         explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        with trt.Builder(trt_logger) as builder, builder.create_network(explicit_batch) as network, trt.OnnxParser(network, trt_logger) as parser, builder.create_builder_config() as config:
+        with (
+            trt.Builder(trt_logger) as builder,
+            builder.create_network(explicit_batch) as network,
+            trt.OnnxParser(network, trt_logger) as parser,
+            builder.create_builder_config() as config,
+        ):
             workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
             if hasattr(config, "set_memory_pool_limit"):
                 config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
@@ -151,12 +153,12 @@ class TensorRT(Format):
                 if not parser.parse(handle.read()):
                     for i in range(parser.num_errors):
                         print(parser.get_error(i))
-                    raise RuntimeError("TensorRT failed to parse ONNX")
+                    raise RuntimeError("TensorRT could not parse the ONNX model.")
             if bool(kwargs.get("fp16", True)) and builder.platform_has_fast_fp16:
                 config.set_flag(trt.BuilderFlag.FP16)
             if bool(kwargs.get("int8", False)):
                 if not builder.platform_has_fast_int8:
-                    warnings.warn("INT8 not supported; ignoring")
+                    warnings.warn("INT8 precision is not supported on this platform; ignoring request.")
                 else:
                     calibrator = kwargs.get("calibrator")
                     if calibrator is not None:
@@ -173,7 +175,7 @@ class TensorRT(Format):
             config.add_optimization_profile(profile)
             engine_bytes = builder.build_serialized_network(network, config)
             if engine_bytes is None:
-                raise RuntimeError("engine build failed")
+                raise RuntimeError("Failed to build the TensorRT engine.")
             dst.parent.mkdir(parents=True, exist_ok=True)
             with open(dst, "wb") as handle:
                 handle.write(engine_bytes)
@@ -190,7 +192,7 @@ class Nnef(Format):
 
             importlib.import_module("nnef_tools.convert")
         except ImportError as exc:
-            raise MissingDependencyError("nnef-tools[onnx] required") from exc
+            raise ImportError("nnef-tools[onnx] is required for this export.") from exc
         input_shapes = kwargs.get("input_shapes")
         if input_shapes is None:
             sample = _pad_sample(model, kwargs.get("sample_input"))
@@ -285,11 +287,13 @@ class LiteRT(Format):
                 _in_console(cmd, "onnx2tf")
                 tflites = list(out_dir.glob("*.tflite"))
                 if not tflites:
-                    raise RuntimeError("onnx2tf did not produce .tflite")
+                    raise RuntimeError("onnx2tf did not produce a TFLite model.")
                 shutil.copyfile(tflites[0], dst)
                 return (dst,)
             except Exception as exc:
-                warnings.warn(f"onnx2tf failed; fallback to onnx-tf path: {exc}")
+                warnings.warn(
+                    f"Falling back to the onnx-tf export path because onnx2tf failed: {exc}."
+                )
         is_required("onnx", "pip install onnx")
         is_required("onnx-tf", "pip install onnx-tf")
         import onnx
@@ -308,7 +312,7 @@ class LiteRT(Format):
             if bool(kwargs.get("int8_quantize", False)):
                 rep_ds = kwargs.get("representative_dataset")
                 if rep_ds is None:
-                    raise ValueError("representative_dataset required for INT8 quantization")
+                    raise ValueError("A representative_dataset is required for INT8 quantization.")
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
                 converter.representative_dataset = rep_ds
                 converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]

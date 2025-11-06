@@ -10,7 +10,6 @@ from ..api.config import (
     coerce_runtime_config,
     runtime_config,
 )
-from ..api.io import load_model, new_model, save_model
 from ..functional.losses import (
     DataFidelityLoss,
     LinearCombinationLoss,
@@ -18,12 +17,6 @@ from ..functional.losses import (
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
-)
-from ..functional.optimizers import (
-    AdamW,
-    SWALR,
-    StochasticWeightAverage,
-    stochastic_weight_average,
 )
 from .distributed import (
     Join,
@@ -38,7 +31,7 @@ from .distributed import (
     is_distributed,
     is_port_available,
     joining,
-    no_synchronization,
+    no_sync,
     resolve_ip_expr,
     supported_ip_ver,
     to_ddp,
@@ -114,7 +107,7 @@ __all__ = [
     "load_model",
     "new_dir",
     "new_model",
-    "no_synchronization",
+    "no_sync",
     "optimal_optimizer_params",
     "optimal_procs",
     "optimal_start_method",
@@ -143,6 +136,39 @@ def __getattr__(name: str) -> Any:
             "launch": _launch,
             "learn": _train,
             "infer": _predict,
+        }
+        return mapping[name]
+    if name in {"load_model", "save_model", "new_model"}:
+        from ..api.io import (
+            load_model as _load_model,
+            new_model as _new_model,
+            save_model as _save_model,
+        )
+
+        mapping = {
+            "load_model": _load_model,
+            "new_model": _new_model,
+            "save_model": _save_model,
+        }
+        return mapping[name]
+    if name in {
+        "AdamW",
+        "StochasticWeightAverage",
+        "SWALR",
+        "stochastic_weight_average",
+    }:
+        from ..functional.optimizers import (
+            AdamW as _AdamW,
+            SWALR as _SWALR,
+            StochasticWeightAverage as _StochasticWeightAverage,
+            stochastic_weight_average as _swa_factory,
+        )
+
+        mapping = {
+            "AdamW": _AdamW,
+            "StochasticWeightAverage": _StochasticWeightAverage,
+            "SWALR": _SWALR,
+            "stochastic_weight_average": _swa_factory,
         }
         return mapping[name]
     raise AttributeError(f"module 'stnet.backend' has no attribute '{name}'")

@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import warnings
+from functools import partial
 from dataclasses import replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -45,7 +46,7 @@ from .distributed import (
     get_world_size,
     is_distributed,
     joining,
-    no_synchronization,
+    no_sync,
     to_ddp,
     to_fsdp,
 )
@@ -167,6 +168,18 @@ def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
 
+def _meta_monitor_pre_hook(
+    module: torch.nn.Module, inputs: Tuple[Any, ...], warn_only: bool
+) -> None:
+    for arg in inputs:
+        if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
+            message = f"[META] {module.__class__.__name__} got meta input"
+            if warn_only:
+                warnings.warn(message, stacklevel=3)
+                return
+            raise RuntimeError(message)
+
+
 def _enable_meta_monitor(model: torch.nn.Module) -> None:
     hook_mode = os.environ.get("STNET_META_HOOK", "0").strip().lower()
     if hook_mode in {"0", "", "false", "off"}:
@@ -174,17 +187,10 @@ def _enable_meta_monitor(model: torch.nn.Module) -> None:
 
     warn_only = hook_mode in {"warn", "warning"}
 
-    def _pre(module: torch.nn.Module, inputs: Tuple[Any, ...]) -> None:
-        for arg in inputs:
-            if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
-                message = f"[META] {module.__class__.__name__} got meta input"
-                if warn_only:
-                    warnings.warn(message, stacklevel=3)
-                    return
-                raise RuntimeError(message)
-
     for submodule in model.modules():
-        submodule.register_forward_pre_hook(_pre, with_kwargs=False)
+        submodule.register_forward_pre_hook(
+            partial(_meta_monitor_pre_hook, warn_only=warn_only), with_kwargs=False
+        )
 
 
 def _assert_no_fake_dtensor(
@@ -219,18 +225,13 @@ def _assert_no_fake_dtensor(
         )
 
 
+def _reset_layernorm_parameter(
+    module: nn.LayerNorm, name: str, data: torch.Tensor, *, requires_grad: bool
+) -> None:
+    setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
+
+
 def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
-
-    def _reset_parameter(
-        module: nn.LayerNorm,
-        name: str,
-        data: torch.Tensor,
-        *args: Any,
-        requires_grad: bool,
-        **kwargs: Any,
-    ) -> None:
-        setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
-
     for module in model.modules():
         if not isinstance(module, nn.LayerNorm):
             continue
@@ -262,7 +263,9 @@ def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
                 data = torch.ones(
                     module.normalized_shape, device=device, dtype=target_dtype
                 )
-                _reset_parameter(module, "weight", data, requires_grad=requires_grad_w)
+                _reset_layernorm_parameter(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
             if (
                 not isinstance(bias, torch.Tensor)
@@ -273,17 +276,23 @@ def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
                 data = torch.zeros(
                     module.normalized_shape, device=device, dtype=target_dtype
                 )
-                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                _reset_layernorm_parameter(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
 
         if device.type == "cpu":
             if isinstance(weight, torch.Tensor) and weight.dtype != torch.float32:
                 data = weight.to(device=device, dtype=torch.float32)
-                _reset_parameter(module, "weight", data, requires_grad=requires_grad_w)
+                _reset_layernorm_parameter(
+                    module, "weight", data, requires_grad=requires_grad_w
+                )
                 weight = module.weight
             if isinstance(bias, torch.Tensor) and bias.dtype != torch.float32:
                 data = bias.to(device=device, dtype=torch.float32)
-                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                _reset_layernorm_parameter(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
         else:
             if (
@@ -294,7 +303,9 @@ def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
                 and bias.dtype != weight.dtype
             ):
                 data = bias.to(device=device, dtype=weight.dtype)
-                _reset_parameter(module, "bias", data, requires_grad=requires_grad_b)
+                _reset_layernorm_parameter(
+                    module, "bias", data, requires_grad=requires_grad_b
+                )
                 bias = module.bias
 
 
@@ -345,16 +356,20 @@ def _assert_unified_layer_dtype(model: torch.nn.Module, device: torch.device) ->
 
 
 def _trim_dcp_keys(state: Any) -> Any:
-    try:
+    if isinstance(state, dict):
         keys = []
-        for key in state.keys():
-            s = str(key)
-            if s.endswith("._extra_state") or s.endswith("_extra_state"):
+        for key, value in list(state.items()):
+            key_str = str(key)
+            if (
+                key_str.endswith("._extra_state")
+                or key_str.endswith("_extra_state")
+                or key_str.endswith("output_baked_flag")
+            ):
                 keys.append(key)
-    except (AttributeError, TypeError):
-        return state
-    for key in keys:
-        state.pop(key, None)
+                continue
+            state[key] = _trim_dcp_keys(value)
+        for key in keys:
+            state.pop(key, None)
     return state
 
 
@@ -441,6 +456,239 @@ def _unify_param_dtype(
     return tgt
 
 
+def _x_for_swa(
+    train_loader: Any,
+    device: torch.device,
+    in_dim: int,
+    swa_in_key: str,
+) -> Iterator[Dict[str, torch.Tensor]]:
+    for _raw in train_loader:
+        feat, *_ = preprocess(_raw)
+        X = to_torch_tensor(feat)
+        X = torch.atleast_2d(X)
+        if X.dim() != 2:
+            raise RuntimeError(
+                f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
+            )
+        if X.shape[1] != in_dim:
+            raise RuntimeError(
+                f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
+            )
+        yield {swa_in_key: X.to(device, non_blocking=True)}
+
+
+def _first_dir(obj: Any) -> str:
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict) and obj:
+        return next(iter(obj.values()))
+    if isinstance(obj, (list, tuple)) and obj:
+        return obj[0]
+    raise RuntimeError("memmap_dir is empty or invalid")
+
+
+class _IdentityParamSet(Sequence[torch.nn.Parameter]):
+    def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
+        self._params = tuple(params)
+        self._ids = {id(p) for p in self._params}
+
+    def __len__(self) -> int:
+        return len(self._params)
+
+    def __iter__(self) -> Iterator[torch.nn.Parameter]:
+        return iter(self._params)
+
+    def __getitem__(self, index: int) -> torch.nn.Parameter:
+        return self._params[index]
+
+    def __contains__(self, item: object) -> bool:
+        return isinstance(item, torch.nn.Parameter) and (id(item) in self._ids)
+
+
+def _ignored_params(
+    module: torch.nn.Module, registry: _IdentityParamSet
+) -> Optional[_IdentityParamSet]:
+    if len(registry) == 0:
+        return None
+    params = [
+        param
+        for param in module.parameters(recurse=True)
+        if param in registry
+    ]
+    return _IdentityParamSet(tuple(params)) if params else None
+
+
+def _coerce_dtensor(
+    param: torch.nn.Parameter,
+    mesh: Any,
+    *args: Any,
+    placements: Optional[Sequence[Placement]] = None,
+    **kwargs: Any,
+) -> None:
+    if not isinstance(param, torch.nn.Parameter):
+        return
+
+    current_dtensor: Optional[DTensor]
+    current_dtensor = param.data if isinstance(param.data, DTensor) else None
+    placements_tuple: Optional[Tuple[Placement, ...]]
+    placements_tuple = tuple(placements) if placements is not None else None
+
+    if current_dtensor is None:
+        if (
+            getattr(param, "_is_sharded", False)
+            or hasattr(param, "_sharding_spec")
+            or param.__class__.__name__ == "FlatParameter"
+        ):
+            return
+
+        placements_tuple = placements_tuple or (Replicate(),)
+        try:
+            current_dtensor = DTensor.from_local(
+                param.data,
+                mesh,
+                placements_tuple,
+                run_check=False,
+            )
+        except Exception:
+            return
+        param.data = current_dtensor
+    else:
+        if placements_tuple is not None and tuple(current_dtensor.placements) != placements_tuple:
+            try:
+                current_dtensor = current_dtensor.redistribute(
+                    device_mesh=current_dtensor.device_mesh,
+                    placements=placements_tuple,
+                )
+                param.data = current_dtensor
+            except Exception:
+                placements_tuple = tuple(current_dtensor.placements)
+
+    if placements_tuple is None and current_dtensor is not None:
+        placements_tuple = tuple(current_dtensor.placements)
+
+    grad = param.grad
+    if grad is not None and not isinstance(grad, DTensor):
+        target_mesh = mesh if current_dtensor is None else current_dtensor.device_mesh
+        try:
+            param.grad = DTensor.from_local(
+                grad,
+                target_mesh,
+                placements_tuple or (Replicate(),),
+                run_check=False,
+            )
+        except Exception:
+            param.grad = None
+
+
+def _wrap_fsdp(
+    target: Optional[torch.nn.Module],
+    mesh: Any,
+    mp_policy: MixedPrecisionPolicy,
+    wrapped: set[int],
+    ignored_param_registry: _IdentityParamSet,
+) -> Optional[torch.nn.Module]:
+    if target is None or id(target) in wrapped:
+        return target
+    wrapped.add(id(target))
+    per_mod_ignored = _ignored_params(target, ignored_param_registry)
+    return to_fsdp(
+        target,
+        mesh=mesh,
+        mp_policy=mp_policy,
+        reshard_after_forward=False,
+        sync_module_states=True,
+        ignored_params=per_mod_ignored or None,
+    )
+
+
+def _get_layers(root: Optional[torch.nn.Module]) -> List[torch.nn.Module]:
+    if root is None:
+        return []
+    blocks: List[torch.nn.Module] = []
+    seen: set[int] = set()
+    for module in root.modules():
+        block_list = getattr(module, "blocks", None)
+        if isinstance(block_list, torch.nn.ModuleList):
+            for block in block_list:
+                if isinstance(block, torch.nn.Module) and id(block) not in seen:
+                    seen.add(id(block))
+                    blocks.append(block)
+    return blocks
+
+
+def _initialize_tensor(
+    value: Any,
+    *args: Any,
+    param: torch.Tensor,
+    capturable: bool,
+    fused: bool,
+    **kwargs: Any,
+) -> torch.Tensor:
+    desired_device = param.device if (capturable or fused) else torch.device("cpu")
+    desired_dtype = param.dtype if torch.is_floating_point(param) else torch.float32
+    if isinstance(value, torch.Tensor):
+        step_tensor = value.detach()
+        if step_tensor.ndim != 0:
+            step_tensor = step_tensor.reshape(())
+        if step_tensor.device != desired_device:
+            step_tensor = step_tensor.to(desired_device)
+        if step_tensor.dtype != desired_dtype:
+            step_tensor = step_tensor.to(desired_dtype)
+    else:
+        base = float(value) if value is not None else 0.0
+        step_tensor = torch.tensor(
+            base,
+            dtype=desired_dtype,
+            device=desired_device,
+        )
+    return step_tensor
+
+
+def _initialize_adamw(optim: torch.optim.Optimizer) -> None:
+    for group in optim.param_groups:
+        amsgrad = group.get("amsgrad", False)
+        capturable = bool(group.get("capturable", False))
+        fused = bool(group.get("fused", False))
+        for param in group.get("params", []):
+            if not getattr(param, "requires_grad", False):
+                continue
+
+            state = optim.state.get(param)
+            state = {} if state is None else state
+            step_value = state.get("step")
+            state["step"] = _initialize_tensor(
+                step_value,
+                param=param,
+                capturable=capturable,
+                fused=fused,
+            )
+            if "exp_avg" not in state:
+                state["exp_avg"] = torch.zeros_like(param)
+            if "exp_avg_sq" not in state:
+                state["exp_avg_sq"] = torch.zeros_like(param)
+            if amsgrad and "max_exp_avg_sq" not in state:
+                state["max_exp_avg_sq"] = torch.zeros_like(param)
+            optim.state[param] = state
+
+
+def _scheduler(
+    step: int,
+    *,
+    warmup_steps: int,
+    start_factor: float,
+    base: float,
+    main_steps: int,
+    emin: float,
+) -> float:
+    if warmup_steps > 0 and step < warmup_steps:
+        return start_factor + (1.0 - start_factor) * (step / max(1, warmup_steps))
+    t = step - warmup_steps
+    frac_min = emin / base if base > 0.0 else 0.0
+    return frac_min + (1.0 - frac_min) * 0.5 * (
+        1.0 + math.cos(math.pi * t / max(1, main_steps))
+    )
+
+
 def epochs(
     *args: Any,
     model: Root,
@@ -492,22 +740,6 @@ def epochs(
     prev_comp_time = 0.0
     prev_io_bytes = 0.0
     prev_flops = 0.0
-
-    def _swa_feature_iter() -> Iterator[Dict[str, torch.Tensor]]:
-
-        for _raw in train_loader:
-            feat, *_ = preprocess(_raw)
-            X = to_torch_tensor(feat)
-            X = torch.atleast_2d(X)
-            if X.dim() != 2:
-                raise RuntimeError(
-                    f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
-                )
-            if X.shape[1] != in_dim:
-                raise RuntimeError(
-                    f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
-                )
-            yield {swa_in_key: X.to(device, non_blocking=True)}
 
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
@@ -592,7 +824,7 @@ def epochs(
                     else:
                         t_comp_s = time.perf_counter_ns()
 
-                    with no_synchronization(
+                    with no_sync(
                         model, enable=(grad_accum_steps > 1 and (not should_sync))
                     ):
                         with flop_counter_train.step(display=False) as train_counter:
@@ -834,7 +1066,9 @@ def epochs(
             if bn_update_enabled and (swa_has_updated or updated_this_epoch):
                 with contextlib.suppress(Exception):
                     swa_helper.update_batch_norm(
-                        _swa_feature_iter(), device=device, in_key=swa_in_key
+                        _x_for_swa(train_loader, device, in_dim, swa_in_key),
+                        device=device,
+                        in_key=swa_in_key,
                     )
             if updated_this_epoch:
                 swa_has_updated = True
@@ -847,7 +1081,9 @@ def epochs(
     if bn_update_enabled and swa_has_updated:
         with contextlib.suppress(Exception):
             swa_helper.update_batch_norm(
-                _swa_feature_iter(), device=device, in_key=swa_in_key
+                _x_for_swa(train_loader, device, in_dim, swa_in_key),
+                device=device,
+                in_key=swa_in_key,
             )
 
     if status_bar is not None:
@@ -933,7 +1169,7 @@ def infer(
                     ev_s.record()
                 else:
                     t0 = time.perf_counter_ns()
-                with no_synchronization(run_model, enable=True):
+                with no_sync(run_model, enable=True):
                     with flop_counter.step(display=False) as step_counter:
                         with contextlib.suppress(Exception):
                             mark_step = getattr(
@@ -1095,19 +1331,26 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         )
         cfg = replace(cfg, device=device)
         model = Root(ops.in_dim, ops.out_shape, config=cfg)
+
+        wrapped: set[int] = set()
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
-                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
-                m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _trim_dcp_keys(m_sd)
-                load(
-                    state_dict={"model": m_sd},
-                    storage_reader=FileSystemReader(ops.init_ckpt_dir),
-                )
-                set_model_state_dict(
-                    model, m_sd, options=StateDictOptions(strict=False)
-                )
+            fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
+            if os.path.isfile(fallback_init):
+                cpu_state = torch.load(fallback_init, map_location="cpu")
+                model.load_state_dict(cpu_state, strict=False)
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=ignored_pattern)
+                    opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
+                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    m_sd = _trim_dcp_keys(m_sd)
+                    load(
+                        state_dict={"model": m_sd},
+                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
+                    )
+                    set_model_state_dict(
+                        model, m_sd, options=StateDictOptions(strict=False)
+                    )
         metadata = Metadata.for_device(device)
         mem_spec = ops.memmap_dir
         if isinstance(mem_spec, str) and os.path.isdir(mem_spec):
@@ -1123,15 +1366,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     resolved = None
                 if resolved:
                     ops = replace(ops, memmap_dir=resolved)
-
-        def _first_dir(obj: Any) -> str:
-            if isinstance(obj, str):
-                return obj
-            if isinstance(obj, dict) and obj:
-                return next(iter(obj.values()))
-            if isinstance(obj, (list, tuple)) and obj:
-                return obj[0]
-            raise RuntimeError("memmap_dir is empty or invalid")
 
         meta_info = _from_meta(_first_dir(ops.memmap_dir or ""))
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
@@ -1213,136 +1447,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     if isinstance(p, torch.nn.Parameter):
                         ignored_params.append(p)
 
-        class _IdentityParamSet(Sequence[torch.nn.Parameter]):
-            def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
-                self._params = tuple(params)
-                self._ids = {id(p) for p in self._params}
-
-            def __len__(self) -> int:
-                return len(self._params)
-
-            def __iter__(self) -> Iterator[torch.nn.Parameter]:
-                return iter(self._params)
-
-            def __getitem__(self, index: int) -> torch.nn.Parameter:
-                return self._params[index]
-
-            def __contains__(self, item: object) -> bool:
-                return isinstance(item, torch.nn.Parameter) and (
-                    id(item) in self._ids
-                )
-
         ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
-
-        def _per_module_ignored_params(
-            module: torch.nn.Module,
-        ) -> Optional[_IdentityParamSet]:
-            if len(ignored_param_registry) == 0:
-                return None
-            params = [
-                param
-                for param in module.parameters(recurse=True)
-                if param in ignored_param_registry
-            ]
-            return _IdentityParamSet(tuple(params)) if params else None
-
-        wrapped: set[int] = set()
-
-        def _ensure_dtensor(
-            param: torch.nn.Parameter,
-            *args: Any,
-            placements: Optional[Sequence[Placement]] = None,
-            **kwargs: Any,
-        ) -> None:
-            if not isinstance(param, torch.nn.Parameter):
-                return
-
-            current_dtensor: Optional[DTensor]
-            current_dtensor = param.data if isinstance(param.data, DTensor) else None
-            placements_tuple: Optional[Tuple[Placement, ...]]
-            placements_tuple = tuple(placements) if placements is not None else None
-
-            if current_dtensor is None:
-                if (
-                    getattr(param, "_is_sharded", False)
-                    or hasattr(param, "_sharding_spec")
-                    or param.__class__.__name__ == "FlatParameter"
-                ):
-                    return
-
-                placements_tuple = placements_tuple or (Replicate(),)
-                try:
-                    current_dtensor = DTensor.from_local(
-                        param.data,
-                        mesh,
-                        placements_tuple,
-                        run_check=False,
-                    )
-                except Exception:
-                    return
-                param.data = current_dtensor
-            else:
-                if placements_tuple is not None and tuple(current_dtensor.placements) != placements_tuple:
-                    try:
-                        current_dtensor = current_dtensor.redistribute(
-                            device_mesh=current_dtensor.device_mesh,
-                            placements=placements_tuple,
-                        )
-                        param.data = current_dtensor
-                    except Exception:
-                        placements_tuple = tuple(current_dtensor.placements)
-
-            if placements_tuple is None and current_dtensor is not None:
-                placements_tuple = tuple(current_dtensor.placements)
-
-            grad = param.grad
-            if grad is not None and not isinstance(grad, DTensor):
-                target_mesh = mesh if current_dtensor is None else current_dtensor.device_mesh
-                try:
-                    param.grad = DTensor.from_local(
-                        grad,
-                        target_mesh,
-                        placements_tuple or (Replicate(),),
-                        run_check=False,
-                    )
-                except Exception:
-                    param.grad = None
-
-        def _fsdp_wrap(
-            target: Optional[torch.nn.Module],
-        ) -> Optional[torch.nn.Module]:
-            nonlocal model
-            if target is None or id(target) in wrapped:
-                return target
-            wrapped.add(id(target))
-            per_mod_ignored = _per_module_ignored_params(target)
-            sharded = to_fsdp(
-                target,
-                mesh=mesh,
-                mp_policy=mp_policy,
-                reshard_after_forward=False,
-                sync_module_states=True,
-                ignored_params=per_mod_ignored or None,
-            )
-            if target is model:
-                model = sharded
-            return sharded
-
-        def _collect_block_modules(
-            root: Optional[torch.nn.Module],
-        ) -> List[torch.nn.Module]:
-            if root is None:
-                return []
-            blocks: List[torch.nn.Module] = []
-            seen: set[int] = set()
-            for module in root.modules():
-                block_list = getattr(module, "blocks", None)
-                if isinstance(block_list, torch.nn.ModuleList):
-                    for block in block_list:
-                        if isinstance(block, torch.nn.Module) and id(block) not in seen:
-                            seen.add(id(block))
-                            blocks.append(block)
-            return blocks
 
         _m_pre = model.module if hasattr(model, "module") else model
         _materialize_layers(_m_pre, device)
@@ -1351,11 +1456,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         _assert_no_fake_dtensor(_m_pre)
 
         try:
-            for submodule in _collect_block_modules(
+            for submodule in _get_layers(
                 getattr(model, "local_net", None)
-            ) + _collect_block_modules(getattr(model, "global_net", None)):
-                _fsdp_wrap(submodule)
-            _fsdp_wrap(model)
+            ) + _get_layers(getattr(model, "global_net", None)):
+                _wrap_fsdp(submodule, mesh, mp_policy, wrapped, ignored_param_registry)
+            model = _wrap_fsdp(
+                model,
+                mesh,
+                mp_policy,
+                wrapped,
+                ignored_param_registry,
+            ) or model
         except (RuntimeError, ValueError, TypeError):
             model = to_fsdp(
                 model,
@@ -1369,10 +1480,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             )
 
         for ignored_param in ignored_param_registry:
-            _ensure_dtensor(ignored_param, placements=(Replicate(),))
+            _coerce_dtensor(
+                ignored_param,
+                mesh,
+                placements=(Replicate(),),
+            )
 
         for parameter in model.parameters():
-            _ensure_dtensor(parameter)
+            _coerce_dtensor(parameter, mesh)
 
         _m_post = model.module if hasattr(model, "module") else model
         _assert_unified_layer_dtype(_m_post, device)
@@ -1390,68 +1505,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             logger=None,
         )
         
-        def _prime_adam_like_state(optim: torch.optim.Optimizer) -> None:
-
-            def _as_step_tensor(
-                value: Any,
-                *args: Any,
-                param: torch.Tensor,
-                capturable: bool,
-                fused: bool,
-                **kwargs: Any,
-            ) -> torch.Tensor:
-                desired_device = (
-                    param.device if (capturable or fused) else torch.device("cpu")
-                )
-                desired_dtype = (
-                    param.dtype if torch.is_floating_point(param) else torch.float32
-                )
-                if isinstance(value, torch.Tensor):
-                    step_tensor = value.detach()
-                    if step_tensor.ndim != 0:
-                        step_tensor = step_tensor.reshape(())
-                    if step_tensor.device != desired_device:
-                        step_tensor = step_tensor.to(desired_device)
-                    if step_tensor.dtype != desired_dtype:
-                        step_tensor = step_tensor.to(desired_dtype)
-                else:
-                    base = float(value) if value is not None else 0.0
-                    step_tensor = torch.tensor(
-                        base,
-                        dtype=desired_dtype,
-                        device=desired_device,
-                    )
-                return step_tensor
-
-            for group in optim.param_groups:
-                amsgrad = group.get("amsgrad", False)
-                capturable = bool(group.get("capturable", False))
-                fused = bool(group.get("fused", False))
-                for param in group.get("params", []):
-                    if not getattr(param, "requires_grad", False):
-                        continue
-
-                    state = optim.state.get(param)
-                    state = {} if state is None else state
-                    step_value = state.get("step")
-                    state["step"] = _as_step_tensor(
-                        step_value,
-                        param=param,
-                        capturable=capturable,
-                        fused=fused,
-                    )
-                    if "exp_avg" not in state:
-                        state["exp_avg"] = torch.zeros_like(param)
-                    if "exp_avg_sq" not in state:
-                        state["exp_avg_sq"] = torch.zeros_like(param)
-                    if amsgrad and "max_exp_avg_sq" not in state:
-                        state["max_exp_avg_sq"] = torch.zeros_like(param)
-                    optim.state[param] = state
-
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
-                _prime_adam_like_state(optimizer)
+                _initialize_adamw(optimizer)
                 optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
                 try:
                     load(
@@ -1474,7 +1531,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         optim_sd,
                         options=StateDictOptions(strict=False),
                     )
-                    _prime_adam_like_state(optimizer)
+                    _initialize_adamw(optimizer)
         _t = StudentsTLoss(
             confidence=0.99,
             metric="t_value",
@@ -1578,20 +1635,16 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             emin = float(ops.eta_min)
             start_factor = 0.001
 
-            def _scheduler(step: int) -> float:
-                if warmup_steps > 0 and step < warmup_steps:
-                    return start_factor + (1.0 - start_factor) * (
-                        step / max(1, warmup_steps)
-                    )
-                t = step - warmup_steps
-                frac_min = emin / base if base > 0.0 else 0.0
-                return frac_min + (1.0 - frac_min) * 0.5 * (
-                    1.0 + math.cos(math.pi * t / max(1, main_steps))
-                )
-
-            sched = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=_scheduler
+            lr_lambda = partial(
+                _scheduler,
+                warmup_steps=warmup_steps,
+                start_factor=start_factor,
+                base=base,
+                main_steps=main_steps,
+                emin=emin,
             )
+
+            sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
             scheduler_step_per_batch = True
             swa_helper: Optional[StochasticWeightAverage] = None
             swa_start_epoch = total_epochs
@@ -1696,6 +1749,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     state_dict={"model": model_sd, "optimizer": optim_sd},
                     storage_writer=writer,
                 )
+            if ops.ckpt_dir:
+                fallback_path = os.path.join(ops.ckpt_dir, "model.pt")
+                torch.save(
+                    {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    fallback_path,
+                )
             with contextlib.suppress(Exception):
                 _dl = {
                     "train": (
@@ -1741,18 +1800,23 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         )
         model = Root(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
-                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                m_sd = get_model_state_dict(model, options=opts_sd)
-                m_sd = _trim_dcp_keys(m_sd)
-                load(
-                    state_dict={"model": m_sd},
-                    storage_reader=FileSystemReader(ops.model_ckpt_dir),
-                )
-                set_model_state_dict(
-                    model, m_sd, options=StateDictOptions(strict=False)
-                )
+            fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
+            if os.path.isfile(fallback_model):
+                cpu_state = torch.load(fallback_model, map_location="cpu")
+                model.load_state_dict(cpu_state, strict=False)
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=ignored_pattern)
+                    opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    m_sd = _trim_dcp_keys(m_sd)
+                    load(
+                        state_dict={"model": m_sd},
+                        storage_reader=FileSystemReader(ops.model_ckpt_dir),
+                    )
+                    set_model_state_dict(
+                        model, m_sd, options=StateDictOptions(strict=False)
+                    )
         model.to(device, non_blocking=True).eval()
         metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
