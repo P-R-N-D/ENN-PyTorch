@@ -1,5 +1,4 @@
-"""High level dataset composition and loading pipeline helpers."""
-
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import ctypes
@@ -296,7 +295,7 @@ class ThreadLoadBalancer:
             except Exception:
                 pass
 
-    def tune_threads(self, io_workers: Optional[int] = None, *, initial: bool = False) -> None:
+    def tune_threads(self, io_workers: Optional[int] = None, *args: Any, initial: bool = False, **kwargs: Any) -> None:
         if not self._enabled:
             return
         if initial:
@@ -407,8 +406,9 @@ def _process_batch(
 
 def _wrap_nodes_map(
     nodes_map: Mapping[str, BaseNode],
-    *,
+    *args: Any,
     allow_plain: bool = False,
+    **kwargs: Any,
 ) -> BaseNode:
     if not nodes_map:
         raise TypeError(
@@ -786,7 +786,6 @@ def fetch(
         value = os.environ.get(name, default)
         return value not in {"", "0", "false", "False"}
 
-    # Prefer torch.cuda.gds-backed reader when available.
     memmap_is_str = isinstance(memmap_dir, str)
     use_gds = (
         memmap_is_str
