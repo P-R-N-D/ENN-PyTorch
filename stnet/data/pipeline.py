@@ -30,7 +30,6 @@ except Exception:
 
     MultiNodeWeightedSampler = None
 
-from ..backend.environment import System
 from ..backend.environment import optimize_threads as _env_optimize_threads
 from .datatype import to_torch_tensor
 from .nodes import BatchReader, DevicePrefetcher, GDSBatchReader, SampleReader
@@ -775,7 +774,7 @@ def fetch(
         if not isinstance(device, torch.device)
         else device
     )
-    threads = System.optimize_threads()
+    threads = _env_optimize_threads()
     map_fn = partial(
         collate,
         labels_dtype=labels_dtype,
