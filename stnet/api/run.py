@@ -25,7 +25,7 @@ except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..data.nodes import SampleReader
-from ..data.transforms import preprocess
+from ..data.transforms import preprocess, set_scaler, get_scaler, drop_scaler
 from ..model import Root
 from .config import (
     ModelConfig,
@@ -48,6 +48,77 @@ from ..backend.environment import (
     set_multiprocessing_env,
 )
 from ..backend.runtime import _trim_dcp_keys, ignored_pattern, main
+
+
+_DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
+
+
+def _coerce_buffer(
+    model: Root,
+    name: str,
+    value: torch.Tensor | float | int,
+    *args: Any,
+    persistent: bool = True,
+    ref: torch.Tensor | None = None,
+    **kwargs: Any,
+) -> torch.Tensor:
+    with torch.no_grad():
+        if ref is None:
+            ref = next(model.parameters(), None)
+            if ref is None:
+                ref = next(model.buffers(), None)
+        ref_dtype = ref.dtype if isinstance(ref, torch.Tensor) else torch.float32
+        ref_device = ref.device if isinstance(ref, torch.Tensor) else torch.device("cpu")
+
+        new_t = torch.as_tensor(value, dtype=ref_dtype, device=ref_device)
+
+        if hasattr(model, name) and isinstance(getattr(model, name), torch.Tensor):
+            buf = getattr(model, name)
+            if tuple(buf.shape) != tuple(new_t.shape):
+                try:
+                    delattr(model, name)
+                except Exception:
+                    pass
+                model.register_buffer(name, new_t, persistent=persistent)
+                return getattr(model, name)
+            if buf.dtype != ref_dtype or buf.device != ref_device:
+                buf.data = buf.data.to(dtype=ref_dtype, device=ref_device)
+            buf.copy_(new_t)
+            return buf
+        else:
+            model.register_buffer(name, new_t, persistent=persistent)
+            return getattr(model, name)
+
+
+def _attach_buffer(
+    model: Root,
+    /,
+    *args: Any,
+    persistent: bool = True,
+    ref: torch.Tensor | None = None,
+    **named_values: torch.Tensor | float | int,
+) -> None:
+    for k, v in named_values.items():
+        _coerce_buffer(model, k, v, persistent=persistent, ref=ref)
+
+
+def _attach_scaler(model: Root, mean: float, std: float) -> None:
+    try:
+        _attach_buffer(model, target_mean=float(mean), target_std=float(std))
+    except Exception:
+        pass
+
+
+def _materialize_state(value: Any) -> Any:
+    if _DTENSOR_TYPE is not None and isinstance(value, _DTENSOR_TYPE):
+        return value.to_local()
+    if isinstance(value, dict):
+        return {k: _materialize_state(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_materialize_state(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_materialize_state(v) for v in value)
+    return value
 
 
 def train(
@@ -78,17 +149,25 @@ def train(
     **kwargs: Any,
 ) -> Root:
 
-    initialize_python_path()
-    mp.allow_connection_pickling()
-    set_multiprocessing_env()
-    memmap_dir = new_dir("memmap_ds")
-
-    first_feats: Optional[torch.Tensor] = None
-    label_shape: Tuple[int, ...] = ()
-    manifest: Optional[Dict[str, str] | Sequence[str]] = None
+    def _coerce_scaler(labels: torch.Tensor) -> torch.Tensor:
+        if get_scaler() is not None:
+            return labels
+        with torch.no_grad():
+            safe = labels.detach().to(torch.float64)
+            if safe.numel() == 0:
+                return labels
+            mean = float(safe.mean().item())
+            std = float(max(safe.std().item(), 1e-6))
+        set_scaler(mean=mean, std=std)
+        _attach_scaler(model, mean, std)
+        scaled = (labels.to(torch.float64) - mean) / std
+        if torch.is_floating_point(labels):
+            scaled = scaled.to(labels.dtype)
+        return scaled
 
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
+        lb = _coerce_scaler(lb)
         SampleReader.materialize(
             {"features": fx, "labels": lb},
             memmap_dir=out_dir,
@@ -98,145 +177,159 @@ def train(
         )
         return fx, tuple(lshape)
 
-    if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
-        manifest = {}
-        for k, d in data.items():
-            sub = os.path.join(memmap_dir, str(k))
-            os.makedirs(sub, exist_ok=True)
-            fx, lshape = _mat_one(d, sub)
-            if first_feats is None:
-                first_feats, label_shape = fx, lshape
-            else:
-                if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
-                    raise RuntimeError("inconsistent feature/label shapes across datasets")
-            manifest[str(k)] = str(k)
-    elif isinstance(data, Sequence) and data and all(isinstance(d, Mapping) for d in data):
-        manifest = []
-        for i, d in enumerate(data):
-            key = str(i)
-            sub = os.path.join(memmap_dir, key)
-            os.makedirs(sub, exist_ok=True)
-            fx, lshape = _mat_one(d, sub)
-            if first_feats is None:
-                first_feats, label_shape = fx, lshape
-            else:
-                if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
-                    raise RuntimeError("inconsistent feature/label shapes across datasets")
-            manifest.append(key)
-    else:
-        fx, lb, _, lshape = preprocess(data)
-        SampleReader.materialize(
-            {"features": fx, "labels": lb},
-            memmap_dir=memmap_dir,
-            train_frac=1.0 - float(val_frac),
-            val_frac=float(val_frac),
-            shuffle=False,
-        )
-        first_feats, label_shape = fx, tuple(lshape)
+    initialize_python_path()
+    mp.allow_connection_pickling()
+    set_multiprocessing_env()
+    memmap_dir = new_dir("memmap_ds")
 
-    if first_feats is None or not label_shape:
-        raise RuntimeError("no training data provided to train()")
+    first_feats: Optional[torch.Tensor] = None
+    label_shape: Tuple[int, ...] = ()
+    manifest: Optional[Dict[str, str] | Sequence[str]] = None
 
-    if manifest is not None:
-        with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
-            payload = manifest if isinstance(manifest, dict) else list(manifest)
-            json.dump(payload, f)
-    ckpt_dir = new_dir("ckpt_dcp")
-    init_dir = new_dir("init_dcp")
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=ignored_pattern)
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        m_sd = get_model_state_dict(model, options=opts)
-        save(
-            state_dict={"model": m_sd},
-            storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
-        )
-    torch.save(
-        {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        os.path.join(init_dir, "model.pt"),
-    )
-    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
-    resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
-    rdzv_endpoint = get_available_host(resolved_rdzv)
-    master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
-    optimize_threads()
-    nprocs = optimal_procs()["nproc_per_node"]
-    cfg_obj = getattr(model, "_Root__config", None)
-    if isinstance(cfg_obj, (ModelConfig, dict)):
-        cfg_model = coerce_model_config(cfg_obj)
-    else:
-        cfg_model = ModelConfig()
-    cfg_dict: Dict[str, Any] = asdict(cfg_model)
-    lc = LaunchConfig(
-        min_nodes=1,
-        max_nodes=max_nodes,
-        nproc_per_node=nprocs,
-        rdzv_backend=rdzv_backend,
-        rdzv_endpoint=rdzv_endpoint,
-        run_id=run_id,
-        max_restarts=0,
-        monitor_interval=5,
-        start_method=optimal_start_method(),
-        local_addr=master_addr,
-    )
-    base = dict(
-        memmap_dir=memmap_dir,
-        ckpt_dir=ckpt_dir,
-        init_ckpt_dir=init_dir,
-        in_dim=int(first_feats.shape[1]),
-        out_shape=tuple(label_shape),
-        cfg_dict=cfg_dict,
-    )
-    default_kwargs = {
-        "epochs": epochs,
-        "batch_size": batch_size,
-        "val_frac": val_frac,
-        "base_lr": base_lr,
-        "weight_decay": weight_decay,
-        "warmup_ratio": warmup_ratio,
-        "eta_min": eta_min,
-        "seed": seed,
-        "prefetch_factor": prefetch_factor,
-        "grad_accum_steps": grad_accum_steps,
-        "overlap_h2d": overlap_h2d,
-        "loss_tile_dim": loss_tile_dim,
-        "loss_tile_size": loss_tile_size,
-        "loss_mask_mode": loss_mask_mode,
-        "loss_mask_value": loss_mask_value,
-    }
-    positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
-    for key in list(default_kwargs):
-        if key in positional_names or key in kwargs:
-            default_kwargs.pop(key, None)
-    ops = runtime_config(
-        "train",
-        base,
-        *args,
-        **default_kwargs,
-        **kwargs,
-    )
-    elastic_launch(lc, main)(ops)
-    fallback = os.path.join(ckpt_dir, "model.pt")
-    if os.path.isfile(fallback):
-        cpu_state = torch.load(fallback, map_location="cpu")
-        model.load_state_dict(cpu_state, strict=False)
-    else:
+    try:
+        if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
+            manifest = {}
+            for k, d in data.items():
+                sub = os.path.join(memmap_dir, str(k))
+                os.makedirs(sub, exist_ok=True)
+                fx, lshape = _mat_one(d, sub)
+                if first_feats is None:
+                    first_feats, label_shape = fx, lshape
+                else:
+                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
+                        raise RuntimeError("inconsistent feature/label shapes across datasets")
+                manifest[str(k)] = str(k)
+        elif isinstance(data, Sequence) and data and all(isinstance(d, Mapping) for d in data):
+            manifest = []
+            for i, d in enumerate(data):
+                key = str(i)
+                sub = os.path.join(memmap_dir, key)
+                os.makedirs(sub, exist_ok=True)
+                fx, lshape = _mat_one(d, sub)
+                if first_feats is None:
+                    first_feats, label_shape = fx, lshape
+                else:
+                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
+                        raise RuntimeError("inconsistent feature/label shapes across datasets")
+                manifest.append(key)
+        else:
+            fx, lb, _, lshape = preprocess(data)
+            lb = _coerce_scaler(lb)
+            SampleReader.materialize(
+                {"features": fx, "labels": lb},
+                memmap_dir=memmap_dir,
+                train_frac=1.0 - float(val_frac),
+                val_frac=float(val_frac),
+                shuffle=False,
+            )
+            first_feats, label_shape = fx, tuple(lshape)
+
+        if first_feats is None or not label_shape:
+            raise RuntimeError("no training data provided to train()")
+
+        if manifest is not None:
+            with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
+                payload = manifest if isinstance(manifest, dict) else list(manifest)
+                json.dump(payload, f)
+        ckpt_dir = new_dir("ckpt_dcp")
+        init_dir = new_dir("init_dcp")
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=ignored_pattern)
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             m_sd = get_model_state_dict(model, options=opts)
-            m_sd = _trim_dcp_keys(m_sd)
-            load(
+            save(
                 state_dict={"model": m_sd},
-                storage_reader=FileSystemReader(ckpt_dir),
+                storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
             )
-            set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
-            )
-    shutil.rmtree(memmap_dir, ignore_errors=True)
-    shutil.rmtree(ckpt_dir, ignore_errors=True)
-    shutil.rmtree(init_dir, ignore_errors=True)
-    return model
+        torch.save(
+            {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            os.path.join(init_dir, "model.pt"),
+        )
+        default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+        resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
+        rdzv_endpoint = get_available_host(resolved_rdzv)
+        master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
+        optimize_threads()
+        nprocs = optimal_procs()["nproc_per_node"]
+        cfg_obj = getattr(model, "_Root__config", None)
+        if isinstance(cfg_obj, (ModelConfig, dict)):
+            cfg_model = coerce_model_config(cfg_obj)
+        else:
+            cfg_model = ModelConfig()
+        cfg_dict: Dict[str, Any] = asdict(cfg_model)
+        lc = LaunchConfig(
+            min_nodes=1,
+            max_nodes=max_nodes,
+            nproc_per_node=nprocs,
+            rdzv_backend=rdzv_backend,
+            rdzv_endpoint=rdzv_endpoint,
+            run_id=run_id,
+            max_restarts=0,
+            monitor_interval=5,
+            start_method=optimal_start_method(),
+            local_addr=master_addr,
+        )
+        base = dict(
+            memmap_dir=memmap_dir,
+            ckpt_dir=ckpt_dir,
+            init_ckpt_dir=init_dir,
+            in_dim=int(first_feats.shape[1]),
+            out_shape=tuple(label_shape),
+            cfg_dict=cfg_dict,
+        )
+        default_kwargs = {
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "val_frac": val_frac,
+            "base_lr": base_lr,
+            "weight_decay": weight_decay,
+            "warmup_ratio": warmup_ratio,
+            "eta_min": eta_min,
+            "seed": seed,
+            "prefetch_factor": prefetch_factor,
+            "grad_accum_steps": grad_accum_steps,
+            "overlap_h2d": overlap_h2d,
+            "loss_tile_dim": loss_tile_dim,
+            "loss_tile_size": loss_tile_size,
+            "loss_mask_mode": loss_mask_mode,
+            "loss_mask_value": loss_mask_value,
+        }
+        positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
+        for key in list(default_kwargs):
+            if key in positional_names or key in kwargs:
+                default_kwargs.pop(key, None)
+        ops = runtime_config(
+            "train",
+            base,
+            *args,
+            **default_kwargs,
+            **kwargs,
+        )
+        elastic_launch(lc, main)(ops)
+        fallback = os.path.join(ckpt_dir, "model.pt")
+        if os.path.isfile(fallback):
+            cpu_state = torch.load(fallback, map_location="cpu")
+            cpu_state = _materialize_state(cpu_state)
+            model.load_state_dict(cpu_state, strict=False)
+        else:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=ignored_pattern)
+                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                m_sd = get_model_state_dict(model, options=opts)
+                m_sd = _trim_dcp_keys(m_sd)
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=FileSystemReader(ckpt_dir),
+                )
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
+        shutil.rmtree(memmap_dir, ignore_errors=True)
+        shutil.rmtree(ckpt_dir, ignore_errors=True)
+        shutil.rmtree(init_dir, ignore_errors=True)
+        return model
+    finally:
+        drop_scaler()
 
 
 def predict(
@@ -286,6 +379,14 @@ def predict(
             )
             for k, v in data.items()
         }
+    with contextlib.suppress(Exception):
+        mean_buf = getattr(model, "target_mean", None)
+        std_buf = getattr(model, "target_std", None)
+        if mean_buf is not None and std_buf is not None:
+            mean = float(torch.as_tensor(mean_buf).item())
+            std = float(max(torch.as_tensor(std_buf).item(), 1e-6))
+            set_scaler(mean=mean, std=std)
+
     feats, labels, keys, label_shape = preprocess(data)
     SampleReader.materialize(
         {"features": feats, "labels": labels},
@@ -347,3 +448,4 @@ def predict(
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        drop_scaler()
