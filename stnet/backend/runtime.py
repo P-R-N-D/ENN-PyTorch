@@ -1198,7 +1198,6 @@ def infer(
                         torch.cuda.current_stream(device=y_hat.device).synchronize()
                     y_hat_cpu = y_hat_cpu.contiguous()
                 except Exception:
-                    # safe fallback: synchronous path
                     y_hat_cpu = y_hat.detach().cpu().contiguous()
                 if streaming and rank == 0:
                     chunk_path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
