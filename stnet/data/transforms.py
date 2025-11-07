@@ -12,6 +12,36 @@ from tensordict import TensorDictBase
 
 from .datatype import to_tuple, to_torch_tensor
 
+
+_SCALER: Dict[str, float] | None = None
+
+
+def set_scaler(*args: Any, mean: float, std: float, **kwargs: Any) -> None:
+    global _SCALER
+    eps = 1e-6
+    _SCALER = {"mean": float(mean), "std": float(max(std, eps))}
+
+
+def get_scaler() -> Dict[str, float] | None:
+    return _SCALER
+
+
+def drop_scaler() -> None:
+    global _SCALER
+    _SCALER = None
+
+
+def _scale_y(labels: torch.Tensor) -> torch.Tensor:
+    scaler = get_scaler()
+    if scaler is None:
+        return labels
+    mean = float(scaler["mean"])
+    std = float(scaler["std"])
+    scaled = (labels.to(torch.float64) - mean) / std
+    if torch.is_floating_point(labels):
+        return scaled.to(labels.dtype)
+    return scaled
+
 class _ScalerBase:
     def __init__(
         self,
@@ -421,6 +451,7 @@ def _preprocess_batch(
         return None
     label_shape = tuple(label_tensor.shape[1:])
     batch_keys = [(int(index),) for index in range(batch_size)]
+    label_tensor = _scale_y(label_tensor)
     return (feature_tensor, label_tensor, batch_keys, label_shape)
 
 def _preprocess_y(value: Any) -> torch.Tensor:
@@ -447,6 +478,7 @@ def preprocess(
             raise ValueError("preprocess(TensorDict): missing 'labels' or 'labels_flat'")
         if labels.ndim == 1:
             labels = labels.unsqueeze(0)
+        labels = _scale_y(labels)
         label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
         keys = [(int(i),) for i in range(int(feats.shape[0]))]
         return (feats, labels, keys, label_shape)
@@ -461,6 +493,7 @@ def preprocess(
         )
         if yt.dim() == 0 or yt.dim() == 1:
             yt = yt.unsqueeze(0)
+        yt = _scale_y(yt)
         keys = [to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
@@ -475,6 +508,7 @@ def preprocess(
             yt = yt.unsqueeze(0)
         elif yt.shape[0] != 1:
             yt = yt.unsqueeze(0)
+        yt = _scale_y(yt)
         keys = [to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
@@ -496,6 +530,7 @@ def preprocess(
         else:
             labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
         labels = _assert_finites(labels, "label")
+        labels = _scale_y(labels)
         label_shape = tuple(labels.shape[1:])
         return (feats, labels, keys, label_shape)
     else:
@@ -524,6 +559,16 @@ def postprocess(
             if isinstance(p, torch.Tensor)
             else torch.as_tensor(p)
             for p in preds
+        ]
+    scaler = get_scaler()
+    if scaler is not None:
+        mean = float(scaler["mean"])
+        std = float(scaler["std"])
+        rows = [
+            (row.to(torch.float64) * std + mean).to(row.dtype)
+            if torch.is_floating_point(row)
+            else row
+            for row in rows
         ]
     fixed_keys: List[Tuple] = []
     seen = set()
