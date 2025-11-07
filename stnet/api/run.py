@@ -143,10 +143,6 @@ def train(
     batch_size: int = 128,
     val_frac: float = 0.1,
     shuffle: bool = False,
-    target_scaler: str = "standard",
-    robust_q: Tuple[float, float] = (25.0, 75.0),
-    robust_cap: int = 200_000,
-    scale_non_floating: bool = False,
     base_lr: float = 0.001,
     weight_decay: float = 0.0001,
     warmup_ratio: float = 0.0,
@@ -163,6 +159,10 @@ def train(
     loss_tile_size: Optional[int] = None,
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
+    target_scaler: str = "standard",
+    robust_q: Tuple[float, float] = (25.0, 75.0),
+    robust_cap: int = 200_000,
+    scale_non_floating: bool = False,
     **kwargs: Any,
 ) -> Root:
     try:

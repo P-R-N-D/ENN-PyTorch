@@ -1194,6 +1194,8 @@ def infer(
                 try:
                     y_hat_cpu = torch.empty_like(y_hat, device="cpu", pin_memory=True)
                     y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
+                    if y_hat.is_cuda and torch.cuda.is_available():
+                        torch.cuda.current_stream(device=y_hat.device).synchronize()
                     y_hat_cpu = y_hat_cpu.contiguous()
                 except Exception:
                     # safe fallback: synchronous path
