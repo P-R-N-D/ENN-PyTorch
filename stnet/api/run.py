@@ -111,15 +111,15 @@ def _attach_scaler(
         pass
 
 
-def _materialize_state(value: Any) -> Any:
+def _preload_state(value: Any) -> Any:
     if _DTENSOR_TYPE is not None and isinstance(value, _DTENSOR_TYPE):
         return value.to_local()
     if isinstance(value, dict):
-        return {k: _materialize_state(v) for k, v in value.items()}
+        return {k: _preload_state(v) for k, v in value.items()}
     if isinstance(value, list):
-        return [_materialize_state(v) for v in value]
+        return [_preload_state(v) for v in value]
     if isinstance(value, tuple):
-        return tuple(_materialize_state(v) for v in value)
+        return tuple(_preload_state(v) for v in value)
     return value
 
 
@@ -350,7 +350,7 @@ def train(
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
             cpu_state = torch.load(fallback, map_location="cpu")
-            cpu_state = _materialize_state(cpu_state)
+            cpu_state = _preload_state(cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
             with warnings.catch_warnings():
