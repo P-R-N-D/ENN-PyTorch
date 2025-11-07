@@ -262,7 +262,8 @@ def train(
         n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
         val_count = int(round(n_total * float(val_frac)))
         n_train = n_total - val_count
-        lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
+        if get_scaler() is None:
+            lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
         shuffle_for_preload = bool(shuffle and not did_manual_shuffle)
         SampleReader.preload(
             {"features": fx, "labels": lb},
@@ -409,7 +410,8 @@ def train(
             else:
                 val_count = int(round(n_total * float(val_frac)))
                 n_train = n_total - val_count
-                lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
+                if get_scaler() is None:
+                    lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
                 SampleReader.preload(
                     {"features": fx, "labels": lb},
                     memmap_dir=memmap_dir,
