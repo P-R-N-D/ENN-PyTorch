@@ -185,6 +185,7 @@ def train(
 
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
+        did_manual_shuffle = False
         if shuffle:
             n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
             if n_total_ps > 0:
@@ -193,15 +194,17 @@ def train(
                 perm = torch.randperm(n_total_ps, generator=g)
                 fx = fx.index_select(0, perm)
                 lb = lb.index_select(0, perm)
+                did_manual_shuffle = True
         n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
         n_train = int(n_total * (1.0 - float(val_frac)))
         lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
+        shuffle_for_preload = bool(shuffle and not did_manual_shuffle)
         SampleReader.preload(
             {"features": fx, "labels": lb},
             memmap_dir=out_dir,
             train_frac=1.0 - float(val_frac),
             val_frac=float(val_frac),
-            shuffle=shuffle,
+            shuffle=shuffle_for_preload,
         )
         return fx, tuple(lshape)
 
