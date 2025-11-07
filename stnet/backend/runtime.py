@@ -231,7 +231,7 @@ def _reset_layernorm_parameter(
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
 
-def _materialize_layers(model: torch.nn.Module, device: torch.device) -> None:
+def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
     for module in model.modules():
         if not isinstance(module, nn.LayerNorm):
             continue
@@ -1458,7 +1458,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
 
         _m_pre = model.module if hasattr(model, "module") else model
-        _materialize_layers(_m_pre, device)
+        _preload_layers(_m_pre, device)
         _assert_unified_layer_dtype(_m_pre, device)
         _assert_no_meta_tensors(_m_pre)
         _assert_no_fake_dtensor(_m_pre)
@@ -1836,7 +1836,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
-        _materialize_layers(_m_eval, device)
+        _preload_layers(_m_eval, device)
         _assert_unified_layer_dtype(_m_eval, device)
         _assert_no_meta_tensors(_m_eval)
         _assert_no_fake_dtensor(_m_eval)

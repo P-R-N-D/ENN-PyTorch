@@ -196,7 +196,7 @@ class SampleReader:
         )
 
     @staticmethod
-    def materialize(
+    def preload(
         data: Dict[str, Any],
         *args: Any,
         memmap_dir: str,
