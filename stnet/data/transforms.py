@@ -43,6 +43,8 @@ def drop_scaler() -> None:
 
 
 def _scale_y(labels: torch.Tensor) -> torch.Tensor:
+    if not torch.is_floating_point(labels):
+        return labels
     scaler = get_scaler()
     if scaler is None:
         return labels
