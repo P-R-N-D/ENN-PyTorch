@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import shutil
 import warnings
@@ -103,9 +102,11 @@ def _attach_buffer(
         _coerce_buffer(model, k, v, persistent=persistent, ref=ref)
 
 
-def _attach_scaler(model: Root, mean: float, std: float) -> None:
+def _attach_scaler(
+    model: Root, mean: torch.Tensor | float, std: torch.Tensor | float
+) -> None:
     try:
-        _attach_buffer(model, target_mean=float(mean), target_std=float(std))
+        _attach_buffer(model, target_mean=mean, target_std=std)
     except Exception:
         pass
 
@@ -131,6 +132,7 @@ def train(
     epochs: int = 5,
     batch_size: int = 128,
     val_frac: float = 0.1,
+    shuffle: bool = False,
     base_lr: float = 0.001,
     weight_decay: float = 0.0001,
     warmup_ratio: float = 0.0,
@@ -150,34 +152,56 @@ def train(
     **kwargs: Any,
 ) -> Root:
 
-    def _coerce_scaler(labels: torch.Tensor) -> torch.Tensor:
+    def _coerce_scaler(
+        labels: torch.Tensor, *, fit_count: int | None = None
+    ) -> torch.Tensor:
         if get_scaler() is not None:
             return labels
         with torch.no_grad():
             safe = labels.detach().to(torch.float64)
             if safe.numel() == 0:
                 return labels
-            mean = float(safe.mean().item())
-            std_val = safe.std(unbiased=False).item()
-            if math.isnan(std_val):
-                std_val = 0.0
-            std = float(max(std_val, 1e-6))
-        set_scaler(mean=mean, std=std)
-        _attach_scaler(model, mean, std)
-        scaled = (labels.to(torch.float64) - mean) / std
+            fit = (
+                safe[:fit_count]
+                if isinstance(fit_count, int)
+                and fit_count > 0
+                and fit_count <= int(safe.shape[0])
+                else safe
+            )
+            if fit.dim() == 1:
+                mean_t = fit.mean()
+                std_t = fit.std(unbiased=False)
+            else:
+                mean_t = fit.mean(dim=0)
+                std_t = fit.std(dim=0, unbiased=False)
+            std_t = torch.nan_to_num(std_t, nan=0.0)
+            std_t = torch.clamp(std_t, min=1e-6)
+        set_scaler(mean=mean_t.cpu(), std=std_t.cpu())
+        _attach_scaler(model, mean_t, std_t)
+        scaled = (labels.to(torch.float64) - mean_t) / std_t
         if torch.is_floating_point(labels):
             scaled = scaled.to(labels.dtype)
         return scaled
 
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
-        lb = _coerce_scaler(lb)
-        SampleReader.materialize(
+        if shuffle:
+            n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
+            if n_total_ps > 0:
+                g = torch.Generator(device="cpu")
+                g.manual_seed(int(seed))
+                perm = torch.randperm(n_total_ps, generator=g)
+                fx = fx.index_select(0, perm)
+                lb = lb.index_select(0, perm)
+        n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
+        n_train = int(n_total * (1.0 - float(val_frac)))
+        lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
+        SampleReader.preload(
             {"features": fx, "labels": lb},
             memmap_dir=out_dir,
             train_frac=1.0 - float(val_frac),
             val_frac=float(val_frac),
-            shuffle=False,
+            shuffle=shuffle,
         )
         return fx, tuple(lshape)
 
@@ -218,13 +242,23 @@ def train(
                 manifest.append(key)
         else:
             fx, lb, _, lshape = preprocess(data)
-            lb = _coerce_scaler(lb)
-            SampleReader.materialize(
+            if shuffle:
+                n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
+                if n_total_ps > 0:
+                    g = torch.Generator(device="cpu")
+                    g.manual_seed(int(seed))
+                    perm = torch.randperm(n_total_ps, generator=g)
+                    fx = fx.index_select(0, perm)
+                    lb = lb.index_select(0, perm)
+            n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
+            n_train = int(n_total * (1.0 - float(val_frac)))
+            lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
+            SampleReader.preload(
                 {"features": fx, "labels": lb},
                 memmap_dir=memmap_dir,
                 train_frac=1.0 - float(val_frac),
                 val_frac=float(val_frac),
-                shuffle=False,
+                shuffle=shuffle,
             )
             first_feats, label_shape = fx, tuple(lshape)
 
@@ -387,12 +421,21 @@ def predict(
         mean_buf = getattr(model, "target_mean", None)
         std_buf = getattr(model, "target_std", None)
         if mean_buf is not None and std_buf is not None:
-            mean = float(torch.as_tensor(mean_buf).item())
-            std = float(max(torch.as_tensor(std_buf).item(), 1e-6))
-            set_scaler(mean=mean, std=std)
+            mean_t = (
+                torch.as_tensor(mean_buf, dtype=torch.float64)
+                .detach()
+                .cpu()
+            )
+            std_t = (
+                torch.as_tensor(std_buf, dtype=torch.float64)
+                .detach()
+                .cpu()
+            )
+            std_t = torch.clamp(std_t, min=1e-6)
+            set_scaler(mean=mean_t, std=std_t)
 
     feats, labels, keys, label_shape = preprocess(data)
-    SampleReader.materialize(
+    SampleReader.preload(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
         train_frac=1.0,

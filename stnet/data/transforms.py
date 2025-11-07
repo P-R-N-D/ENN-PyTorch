@@ -13,16 +13,27 @@ from tensordict import TensorDictBase
 from .datatype import to_tuple, to_torch_tensor
 
 
-_SCALER: Dict[str, float] | None = None
+_SCALER: Dict[str, torch.Tensor] | None = None
 
 
-def set_scaler(*args: Any, mean: float, std: float, **kwargs: Any) -> None:
+def set_scaler(*args: Any, mean: Any, std: Any, **kwargs: Any) -> None:
     global _SCALER
-    eps = 1e-6
-    _SCALER = {"mean": float(mean), "std": float(max(std, eps))}
+    mean_t = (
+        torch.as_tensor(mean, dtype=torch.float64, device=torch.device("cpu"))
+        .detach()
+        .clone()
+    )
+    std_t = (
+        torch.as_tensor(std, dtype=torch.float64, device=torch.device("cpu"))
+        .detach()
+        .clone()
+    )
+    std_t = torch.nan_to_num(std_t, nan=0.0)
+    std_t = torch.clamp(std_t, min=1e-6)
+    _SCALER = {"mean": mean_t, "std": std_t}
 
 
-def get_scaler() -> Dict[str, float] | None:
+def get_scaler() -> Dict[str, torch.Tensor] | None:
     return _SCALER
 
 
@@ -35,9 +46,14 @@ def _scale_y(labels: torch.Tensor) -> torch.Tensor:
     scaler = get_scaler()
     if scaler is None:
         return labels
-    mean = float(scaler["mean"])
-    std = float(scaler["std"])
-    scaled = (labels.to(torch.float64) - mean) / std
+    mean_t = torch.as_tensor(
+        scaler["mean"], dtype=torch.float64, device=labels.device
+    )
+    std_t = torch.as_tensor(
+        scaler["std"], dtype=torch.float64, device=labels.device
+    )
+    std_t = torch.clamp(std_t, min=1e-6)
+    scaled = (labels.to(torch.float64) - mean_t) / std_t
     if torch.is_floating_point(labels):
         return scaled.to(labels.dtype)
     return scaled
@@ -562,10 +578,14 @@ def postprocess(
         ]
     scaler = get_scaler()
     if scaler is not None:
-        mean = float(scaler["mean"])
-        std = float(scaler["std"])
+        mean_t = torch.as_tensor(scaler["mean"], dtype=torch.float64)
+        std_t = torch.as_tensor(scaler["std"], dtype=torch.float64)
+        std_t = torch.clamp(std_t, min=1e-6)
         rows = [
-            (row.to(torch.float64) * std + mean).to(row.dtype)
+            (
+                row.to(torch.float64) * std_t.to(row.device)
+                + mean_t.to(row.device)
+            ).to(row.dtype)
             if torch.is_floating_point(row)
             else row
             for row in rows
