@@ -830,7 +830,7 @@ def epochs(
                         with flop_counter_train.step(display=False) as train_counter:
                             with Autocast.float(device):
                                 Y_flat = Y.reshape(Y.shape[0], -1).to(
-                                    device, dtype=param_dtype
+                                    device, dtype=param_dtype, non_blocking=True
                                 )
                                 td = to_tensordict(
                                     {"features": X, "labels_flat": Y_flat}
@@ -973,7 +973,7 @@ def epochs(
 
                             with flop_counter_val.step(display=False) as val_counter:
                                 Yv_flat = Y.reshape(Y.shape[0], -1).to(
-                                    device, dtype=param_dtype
+                                    device, dtype=param_dtype, non_blocking=True
                                 )
                                 tdv = to_tensordict(
                                     {"features": X, "labels_flat": Yv_flat}
@@ -1191,7 +1191,15 @@ def infer(
                             y_hat = tdp.get("pred")
                         else:
                             y_hat, _ = pred_out
-                y_hat_cpu = y_hat.detach().cpu().contiguous()
+                try:
+                    y_hat_cpu = torch.empty_like(y_hat, device="cpu", pin_memory=True)
+                    y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
+                    if y_hat.is_cuda and torch.cuda.is_available():
+                        torch.cuda.current_stream(device=y_hat.device).synchronize()
+                    y_hat_cpu = y_hat_cpu.contiguous()
+                except Exception:
+                    # safe fallback: synchronous path
+                    y_hat_cpu = y_hat.detach().cpu().contiguous()
                 if streaming and rank == 0:
                     chunk_path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
                     try:

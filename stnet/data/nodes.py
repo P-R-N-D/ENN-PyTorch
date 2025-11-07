@@ -225,6 +225,9 @@ class SampleReader:
             perm = torch.randperm(count, generator=g)
             features = features.index_select(0, perm)
             labels = labels.index_select(0, perm)
+            if seed is not None:
+                with suppress(Exception):
+                    torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
         feat_path = os.path.join(memmap_dir, "features.mmt")
         label_path = os.path.join(memmap_dir, "labels.mmt")
         MemoryMappedTensor.from_tensor(
@@ -249,9 +252,21 @@ class SampleReader:
             "fractions": [float(train_frac), float(val_frac)],
             "shuffled": bool(shuffle),
             "shuffle_seed": int(seed) if seed is not None else None,
+            "perm_filename": "perm.pt" if (shuffle and seed is not None) else None,
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
         }
+        try:
+            import hashlib
+
+            if shuffle and seed is not None:
+                h = hashlib.sha256(perm.cpu().numpy().tobytes()).hexdigest()
+                meta["perm_sha256"] = h
+        except Exception:
+            pass
+        for k in ("target_scaler", "robust_q", "robust_cap", "scale_non_floating"):
+            if k in kwargs and kwargs[k] is not None:
+                meta[k] = list(kwargs[k]) if isinstance(kwargs[k], tuple) else kwargs[k]
         with open(
             os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8"
         ) as handle:
@@ -285,6 +300,7 @@ class SampleReader:
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         meta = self._load_meta()
+        pin_env = bool(int(os.environ.get("STNET_PIN_MEMORY", "0")))
         total = int(meta["N"])
         feat_dim = int(meta["feature_dim"])
         label_shape = list(meta["label_shape"])
@@ -320,6 +336,10 @@ class SampleReader:
                 if isinstance(label, torch.Tensor)
                 else torch.as_tensor(label)
             )
+            if pin_env and hasattr(feat_tensor, "pin_memory"):
+                with suppress(Exception):
+                    feat_tensor = feat_tensor.pin_memory()
+                    label_tensor = label_tensor.pin_memory()
             yield (feat_tensor, label_tensor)
 
     def __len__(self) -> int:
@@ -329,6 +349,7 @@ class SampleReader:
         self, start: int, end: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         meta = self._load_meta()
+        pin_env = bool(int(os.environ.get("STNET_PIN_MEMORY", "0")))
         total = int(meta["N"])
         feat_dim = int(meta["feature_dim"])
         label_shape = list(meta["label_shape"])
@@ -361,6 +382,10 @@ class SampleReader:
             if isinstance(labels, torch.Tensor)
             else torch.as_tensor(labels)
         )
+        if pin_env and hasattr(features_tensor, "pin_memory"):
+            with suppress(Exception):
+                features_tensor = features_tensor.pin_memory()
+                labels_tensor = labels_tensor.pin_memory()
         return (features_tensor, labels_tensor)
 
 class BatchReader:
