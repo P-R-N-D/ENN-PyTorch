@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import shutil
 import warnings
@@ -157,7 +158,10 @@ def train(
             if safe.numel() == 0:
                 return labels
             mean = float(safe.mean().item())
-            std = float(max(safe.std().item(), 1e-6))
+            std_val = safe.std(unbiased=False).item()
+            if math.isnan(std_val):
+                std_val = 0.0
+            std = float(max(std_val, 1e-6))
         set_scaler(mean=mean, std=std)
         _attach_scaler(model, mean, std)
         scaled = (labels.to(torch.float64) - mean) / std
