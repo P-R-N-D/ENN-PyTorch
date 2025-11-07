@@ -203,6 +203,7 @@ class SampleReader:
         train_frac: float = 1.0,
         val_frac: float = 0.0,
         shuffle: bool = False,
+        seed: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         os.makedirs(memmap_dir, exist_ok=True)
@@ -217,7 +218,11 @@ class SampleReader:
         label_shape: List[int] = list(labels.shape[1:])
         label_flat = int(labels.numel() // count)
         if shuffle:
-            perm = torch.randperm(count)
+            g = torch.Generator(device="cpu")
+            if seed is not None:
+                with suppress(Exception):
+                    g.manual_seed(int(seed))
+            perm = torch.randperm(count, generator=g)
             features = features.index_select(0, perm)
             labels = labels.index_select(0, perm)
         feat_path = os.path.join(memmap_dir, "features.mmt")
@@ -242,6 +247,8 @@ class SampleReader:
             "features_dtype": to_platform_dtype(features.dtype, "name"),
             "labels_dtype": to_platform_dtype(labels.dtype, "name"),
             "fractions": [float(train_frac), float(val_frac)],
+            "shuffled": bool(shuffle),
+            "shuffle_seed": int(seed) if seed is not None else None,
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
         }
