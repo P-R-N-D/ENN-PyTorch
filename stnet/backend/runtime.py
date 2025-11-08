@@ -95,7 +95,7 @@ def _num_batches(loader: Any) -> int:
 
 
 def get_tqdm(
-    *args: Any, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device, **kwargs: Any
+    *args: Any, title: str, total_epochs: int, train_loader: Any, val_loader: Any, device: torch.device, **kwargs: Any
 ) -> Tuple[Optional[tqdm], int]:
 
     try:
@@ -105,31 +105,26 @@ def get_tqdm(
         pass
     per_epoch = _num_batches(train_loader) + _num_batches(val_loader)
     total = int(total_epochs) * per_epoch
-    print(total)
     if total <= 0:
         return None, per_epoch
     bar = tqdm(
         total=total,
-        desc=f"Training [{device.type.upper()}]",
-        unit="batch",
-        dynamic_ncols=True,
-        mininterval=0.3,
-        miniters=1,
-        leave=True,
-        file=sys.stdout,
-    )
-    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
+        desc=f'{title} ({device.type.upper()})',
+        unit='I/O < 0.01 MB/s, COM < 0.01 TFLOPS',
+        bar_format='{desc}' + '{bar} {percentage:3.0f}% ' + '({unit}) Elapsed: {elapsed}, Remaining: {remaining}',
+        colour='green',
+        position=0,
+        leave=False,
+        file=sys.stdout)
     return bar, per_epoch
 
 
 def update_tqdm(
     bar: Optional[tqdm], *args: Any, mbps: Optional[float] = None, tflops: Optional[float] = None, **kwargs: Any
 ) -> None:
-
-    if bar is None:
-        return
-    if (mbps is not None) and (tflops is not None):
-        bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
+    io_expr = f'I/O = {mbps:.2f} MB/s' if mbps >= 0.01 else 'I/O < 0.01 MB/s'
+    com_expr = f'COM = {tflops:.2f} TFLOPS' if tflops >= 0.01 else 'COM < 0.01 TFLOPS'
+    bar.unit = ', '.join([io_expr, com_expr])
     bar.update(1)
         
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
@@ -722,6 +717,7 @@ def epochs(
         torch, "Event"
     )
     status_bar, _ = get_tqdm(
+        title="Training",
         total_epochs=int(total_epochs),
         train_loader=train_loader,
         val_loader=val_loader,
