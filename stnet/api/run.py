@@ -204,10 +204,15 @@ def train(
     mode = str(target_scaler).lower().strip()
     use_none = mode == "none"
     use_robust = mode == "robust"
-    q_lo = float(robust_q[0]) / 100.0
-    q_hi = float(robust_q[1]) / 100.0
-    q_lo = max(0.0, min(q_lo, 1.0))
-    q_hi = max(0.0, min(q_hi, 1.0))
+    try:
+        q_values = list(robust_q[:2]) if isinstance(robust_q, Sequence) else list(robust_q)
+    except Exception:
+        q_values = [25.0, 75.0]
+    if len(q_values) < 2:
+        q_values = (q_values + [75.0])[:2]
+    q_values = sorted(float(q) for q in q_values)
+    q_lo = max(0.0, min(q_values[0], 100.0)) / 100.0
+    q_hi = max(0.0, min(q_values[1], 100.0)) / 100.0
     if q_hi <= q_lo:
         q_hi = min(1.0, q_lo + 1e-6)
 
@@ -329,6 +334,10 @@ def train(
 
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
+    try:
+        backend = dist.get_backend() if is_dist else None
+    except Exception:
+        backend = None
 
     if not use_none:
         g_stats = torch.Generator(device="cpu")
@@ -392,81 +401,158 @@ def train(
         mean_fit = None
         std_fit = None
     elif use_robust:
-        if len(robust_samples) == 0:
-            mean_fit = torch.zeros(1, dtype=torch.float64)
-            std_fit = torch.ones(1, dtype=torch.float64)
-        else:
-            Y = torch.cat(robust_samples, dim=0)
-            med = torch.nanmedian(Y, dim=0).values
-            nanquantile = getattr(torch, "nanquantile", None)
-            if nanquantile is not None:
-                q1 = torch.nanquantile(Y, q_lo, dim=0)
-                q3 = torch.nanquantile(Y, q_hi, dim=0)
+        if (not is_dist) or rank == 0:
+            if len(robust_samples) == 0:
+                mean_fit = torch.zeros(1, dtype=torch.float64)
+                std_fit = torch.ones(1, dtype=torch.float64)
             else:
-                cols_q1 = []
-                cols_q3 = []
-                for c in range(Y.shape[1]):
-                    col = Y[:, c]
-                    col = col[torch.isfinite(col)]
-                    if col.numel() == 0:
-                        cols_q1.append(
-                            torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
-                        )
-                        cols_q3.append(
-                            torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
-                        )
-                    else:
-                        cols_q1.append(torch.quantile(col, q_lo))
-                        cols_q3.append(torch.quantile(col, q_hi))
-                q1 = torch.stack(cols_q1)
-                q3 = torch.stack(cols_q3)
-            iqr = q3 - q1
-            iqr = torch.nan_to_num(iqr, nan=0.0).clamp(min=1e-6)
-            med = torch.nan_to_num(med, nan=0.0)
-            mean_fit = med
-            std_fit = iqr
-    else:
-        if sum_t is None or sumsq_t is None or cnt_t is None:
-            mean_fit = torch.zeros(1, dtype=torch.float64)
-            std_fit = torch.ones(1, dtype=torch.float64)
+                Y = torch.cat(robust_samples, dim=0)
+                med = torch.nanmedian(Y, dim=0).values
+                nanquantile = getattr(torch, "nanquantile", None)
+                if nanquantile is not None:
+                    q1 = torch.nanquantile(Y, q_lo, dim=0)
+                    q3 = torch.nanquantile(Y, q_hi, dim=0)
+                else:
+                    cols_q1 = []
+                    cols_q3 = []
+                    for c in range(Y.shape[1]):
+                        col = Y[:, c]
+                        col = col[torch.isfinite(col)]
+                        if col.numel() == 0:
+                            cols_q1.append(
+                                torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
+                            )
+                            cols_q3.append(
+                                torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
+                            )
+                        else:
+                            cols_q1.append(torch.quantile(col, q_lo))
+                            cols_q3.append(torch.quantile(col, q_hi))
+                    q1 = torch.stack(cols_q1)
+                    q3 = torch.stack(cols_q3)
+                iqr = q3 - q1
+                iqr = torch.nan_to_num(iqr, nan=0.0).clamp(min=1e-6)
+                med = torch.nan_to_num(med, nan=0.0)
+                mean_fit = med
+                std_fit = iqr
         else:
-            cnt_safe = torch.clamp(cnt_t, min=1.0)
-            mean_fit = sum_t / cnt_safe
-            var_fit = torch.clamp(sumsq_t / cnt_safe - mean_fit * mean_fit, min=0.0)
-            std_fit = torch.sqrt(var_fit)
-            std_fit = torch.clamp(std_fit, min=1e-6)
-            zero_cnt_mask = (cnt_t == 0) if isinstance(cnt_t, torch.Tensor) else None
-            if isinstance(zero_cnt_mask, torch.Tensor) and torch.any(zero_cnt_mask):
-                mean_fit = torch.where(zero_cnt_mask, torch.zeros_like(mean_fit), mean_fit)
-                std_fit = torch.where(zero_cnt_mask, torch.ones_like(std_fit), std_fit)
+            mean_fit = None
+            std_fit = None
+    else:
+        if (not is_dist) or rank == 0:
+            if sum_t is None or sumsq_t is None or cnt_t is None:
+                mean_fit = torch.zeros(1, dtype=torch.float64)
+                std_fit = torch.ones(1, dtype=torch.float64)
+            else:
+                cnt_safe = torch.clamp(cnt_t, min=1.0)
+                mean_fit = sum_t / cnt_safe
+                var_fit = torch.clamp(
+                    sumsq_t / cnt_safe - mean_fit * mean_fit, min=0.0
+                )
+                std_fit = torch.sqrt(var_fit)
+                std_fit = torch.clamp(std_fit, min=1e-6)
+                zero_cnt_mask = (
+                    (cnt_t == 0) if isinstance(cnt_t, torch.Tensor) else None
+                )
+                if isinstance(zero_cnt_mask, torch.Tensor) and torch.any(zero_cnt_mask):
+                    mean_fit = torch.where(
+                        zero_cnt_mask, torch.zeros_like(mean_fit), mean_fit
+                    )
+                    std_fit = torch.where(
+                        zero_cnt_mask, torch.ones_like(std_fit), std_fit
+                    )
+        else:
+            mean_fit = None
+            std_fit = None
 
     if not use_none:
-        set_scaler(mean=mean_fit.cpu(), std=std_fit.cpu())
-        _attach_scaler(model, mean_fit, std_fit)
-        with contextlib.suppress(Exception):
-            if dist.is_available() and dist.is_initialized():
-                try:
-                    backend = dist.get_backend()
-                except Exception:
-                    backend = None
-                for name_ in ("target_mean", "target_std"):
-                    buf = getattr(model, name_, None)
-                    if not isinstance(buf, torch.Tensor):
-                        continue
-                    if backend == "nccl":
-                        if torch.cuda.is_available():
-                            dev = torch.device("cuda", torch.cuda.current_device())
-                            tmp = buf.to(dev, dtype=buf.dtype)
-                            dist.broadcast(tmp, src=0)
-                            buf.copy_(tmp.to("cpu", dtype=buf.dtype))
-                        else:
-                            dist.broadcast(buf, src=0)
-                    else:
-                        dist.broadcast(buf, src=0)
-                mean_buf = getattr(model, "target_mean", None)
-                std_buf = getattr(model, "target_std", None)
-                if isinstance(mean_buf, torch.Tensor) and isinstance(std_buf, torch.Tensor):
-                    set_scaler(mean=mean_buf.detach().cpu(), std=std_buf.detach().cpu())
+        if (not is_dist) or rank == 0:
+            mean_source = torch.as_tensor(mean_fit, dtype=torch.float64)
+            std_source = torch.as_tensor(std_fit, dtype=torch.float64)
+        else:
+            mean_source = torch.empty(0, dtype=torch.float64)
+            std_source = torch.empty(0, dtype=torch.float64)
+        std_source = torch.nan_to_num(std_source, nan=0.0)
+        std_source = torch.clamp(std_source, min=1e-6)
+        mean_source = torch.nan_to_num(mean_source, nan=0.0)
+
+        if mean_source.dim() == 0 and ((not is_dist) or rank == 0):
+            mean_source = mean_source.reshape(1)
+            std_source = std_source.reshape(1)
+
+        target_shape: Tuple[int, ...]
+        if is_dist:
+            dims_tensor = torch.tensor([mean_source.dim()], dtype=torch.long)
+            if rank != 0:
+                dims_tensor.zero_()
+            dist.broadcast(dims_tensor, src=0)
+            ndims = int(dims_tensor.item())
+            if rank == 0:
+                shape_tensor = torch.tensor(
+                    list(mean_source.shape), dtype=torch.long
+                )
+            else:
+                shape_tensor = torch.zeros(ndims, dtype=torch.long)
+            if ndims > 0:
+                dist.broadcast(shape_tensor, src=0)
+                target_shape = tuple(int(v) for v in shape_tensor.tolist())
+            else:
+                target_shape = ()
+        else:
+            target_shape = tuple(mean_source.shape)
+
+        numel = int(math.prod(target_shape)) if target_shape else 1
+        if is_dist:
+            if backend == "nccl" and torch.cuda.is_available():
+                bcast_device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                bcast_device = torch.device("cpu")
+            if rank == 0:
+                mean_flat = mean_source.reshape(-1).contiguous().to(bcast_device)
+                std_flat = std_source.reshape(-1).contiguous().to(bcast_device)
+            else:
+                mean_flat = torch.empty(numel, dtype=torch.float64, device=bcast_device)
+                std_flat = torch.empty(numel, dtype=torch.float64, device=bcast_device)
+            dist.broadcast(mean_flat, src=0)
+            dist.broadcast(std_flat, src=0)
+            mean_cpu = mean_flat.to("cpu")
+            std_cpu = std_flat.to("cpu")
+        else:
+            mean_cpu = mean_source.reshape(-1).contiguous()
+            std_cpu = std_source.reshape(-1).contiguous()
+
+        if target_shape:
+            mean_cpu = mean_cpu.view(*target_shape)
+            std_cpu = std_cpu.view(*target_shape)
+        else:
+            mean_cpu = mean_cpu.view(1)
+            std_cpu = std_cpu.view(1)
+
+        _attach_scaler(model, mean_cpu, std_cpu)
+        set_scaler(mean=mean_cpu.detach().cpu(), std=std_cpu.detach().cpu())
+
+        scaler_state = get_scaler()
+        if scaler_state is not None:
+            mean_ref = torch.as_tensor(
+                scaler_state.get("mean"), dtype=torch.float64
+            )
+            std_ref = torch.as_tensor(
+                scaler_state.get("std"), dtype=torch.float64
+            )
+            mean_diff = torch.max(torch.abs(mean_ref - mean_cpu.to(torch.float64))).item()
+            std_diff = torch.max(torch.abs(std_ref - std_cpu.to(torch.float64))).item()
+            mean_match = bool(
+                torch.allclose(mean_ref, mean_cpu.to(torch.float64), atol=1e-6, rtol=1e-6)
+            )
+            std_match = bool(
+                torch.allclose(std_ref, std_cpu.to(torch.float64), atol=1e-6, rtol=1e-6)
+            )
+            print(
+                f"[target_scaler][rank={rank}] backend={backend or 'none'} "
+                f"mean_match={mean_match} std_match={std_match} "
+                f"mean_max_diff={mean_diff:.3e} std_max_diff={std_diff:.3e}",
+                flush=True,
+            )
 
     memmap_dir = new_dir("memmap_ds")
 
