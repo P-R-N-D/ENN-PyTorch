@@ -40,9 +40,9 @@ _HAS_MAP_WRAPPER = _is_wrapper_type(_TDMapWrapper)
 _HAS_ITER_WRAPPER = _is_wrapper_type(_TDIterableWrapper)
 
 if _HAS_MAP_WRAPPER:
-    BatchSamplerBase = _TDMapWrapper  # type: ignore[assignment]
+    BatchSamplerBase = _TDMapWrapper
 elif _HAS_ITER_WRAPPER:
-    BatchSamplerBase = _TDIterableWrapper  # type: ignore[assignment]
+    BatchSamplerBase = _TDIterableWrapper
 else:
 
     class _BatchSamplerFallback:
@@ -237,7 +237,6 @@ class SampleReader:
             batch_size=[count],
             device=torch.device("cpu"),
         )
-        # save as memory-mapped tensordict (function API; returns new TD)
         td = td_memmap(td, prefix=td_prefix)
         if bool(int(os.environ.get("STNET_GDS_EXPORT", "0"))):
             feat_bin = os.path.join(memmap_dir, "features.bin")
@@ -318,7 +317,6 @@ class SampleReader:
             features_td = td.get("features")
             labels_td = td.get("labels")
         else:
-            # legacy fallback: MemoryMappedTensor files (features.mmt / labels.mmt)
             feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
             label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
             feat_dtype = _resolve_dtype(meta, "features_dtype")
@@ -367,7 +365,6 @@ class SampleReader:
             features = td.get("features")[start:end]
             labels = td.get("labels")[start:end]
         else:
-            # legacy fallback
             feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
             label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
             feat_dtype = _resolve_dtype(meta, "features_dtype")
