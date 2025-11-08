@@ -105,6 +105,7 @@ def get_tqdm(
         pass
     per_epoch = _num_batches(train_loader) + _num_batches(val_loader)
     total = int(total_epochs) * per_epoch
+    print(total)
     if total <= 0:
         return None, per_epoch
     bar = tqdm(
@@ -115,7 +116,7 @@ def get_tqdm(
         mininterval=0.3,
         miniters=1,
         leave=True,
-        file=sys.stderr,
+        file=sys.stdout,
     )
     bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
     return bar, per_epoch
@@ -1889,7 +1890,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     mininterval=0.3,
                     miniters=1,
                     leave=True,
-                    file=sys.stderr,
+                    file=sys.stdout,
                 )
                 status_bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
         except Exception:
