@@ -115,9 +115,9 @@ def get_tqdm(
         mininterval=0.3,
         miniters=1,
         leave=True,
-        file=sys.stdout,
+        file=sys.stderr,
     )
-    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=False)
+    bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
     return bar, per_epoch
 
 
@@ -128,10 +128,10 @@ def update_tqdm(
     if bar is None:
         return
     if (mbps is not None) and (tflops is not None):
-        bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=False)
+        bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
     bar.update(1)
+        
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
-
 _DL_STATE_FILE = "dataloader.json"
 _FLOAT8_LOG_MESSAGES: set[str] = set()
 
@@ -693,6 +693,7 @@ def epochs(
     *args: Any,
     model: Root,
     device: torch.device,
+    local_rank: int = 0,
     ops: RuntimeConfig,
     param_dtype: torch.dtype,
     optimizer: torch.optim.Optimizer,
@@ -705,7 +706,6 @@ def epochs(
     train_loader: Any,
     val_loader: Any,
     total_epochs: int,
-    local_rank: int = 0,
     scheduler_step_per_batch: bool = True,
     swa_helper: Optional[StochasticWeightAverage] = None,
     swa_start_epoch: int = 0,
@@ -727,7 +727,7 @@ def epochs(
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-    )
+    ) if local_rank == 0 else (None, None)
 
     scheduler_step_per_batch = bool(scheduler_step_per_batch)
     swa_enabled = swa_helper is not None
@@ -744,12 +744,6 @@ def epochs(
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
         for epoch_idx in range(int(total_epochs)):
-            if status_bar is not None:
-                _mn = isinstance(ops.memmap_dir, (list, tuple, dict))
-                _suffix = " [MultiNode]" if _mn else ""
-                status_bar.set_description(
-                    f"Epoch {epoch_idx + 1}/{int(total_epochs)} [{device.type.upper()}]{_suffix}"
-                )
 
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
@@ -896,7 +890,7 @@ def epochs(
                     with contextlib.suppress(Exception):
                         cudagraph_step_end()
 
-                    if status_bar is not None:
+                    if local_rank == 0:
                         io_elapsed = prev_io_time + float(io_time.item())
                         io_transferred = prev_io_bytes + float(io_bytes.item())
                         comp_elapsed = prev_comp_time + float(comp_time.item())
@@ -1024,7 +1018,7 @@ def epochs(
                                             name, 0.0
                                         ) + float(value)
 
-                            if status_bar is not None:
+                            if local_rank == 0:
                                 io_elapsed = prev_io_time + float(io_time.item())
                                 io_transferred = prev_io_bytes + float(io_bytes.item())
                                 comp_elapsed = prev_comp_time + float(comp_time.item())
@@ -1086,7 +1080,7 @@ def epochs(
                 in_key=swa_in_key,
             )
 
-    if status_bar is not None:
+    if local_rank == 0:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
         status_bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
@@ -1095,9 +1089,10 @@ def epochs(
 
 def infer(
     model: torch.nn.Module,
+    device: torch.device,
+    local_rank: int,
     data_loader: Any,
     *args: Any,
-    device: torch.device,
     ops: RuntimeConfig,
     status_bar: Optional[tqdm] = None,
     chunk_dir: Optional[str] = None,
@@ -1252,7 +1247,7 @@ def infer(
                 total_flops += max(0.0, step_flops)
                 mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
                 tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-                if status_bar is not None:
+                if local_rank == 0:
                     status_bar.set_postfix_str(
                         f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS",
                         refresh=False,
@@ -1261,7 +1256,7 @@ def infer(
                 t_fetch_start = time.perf_counter_ns()
     finally:
         with contextlib.suppress(Exception):
-            if status_bar is not None:
+            if local_rank == 0:
                 status_bar.close()
 
     if streaming and rank == 0:
@@ -1730,6 +1725,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             epochs(
                 model=model,
                 device=device,
+                local_rank=local_rank,
                 ops=ops,
                 param_dtype=param_dtype,
                 optimizer=optimizer,
@@ -1742,7 +1738,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 train_loader=train_loader,
                 val_loader=val_loader,
                 total_epochs=total_epochs,
-                local_rank=local_rank,
                 scheduler_step_per_batch=scheduler_step_per_batch,
                 swa_helper=swa_helper,
                 swa_start_epoch=swa_start_epoch,
@@ -1894,9 +1889,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     mininterval=0.3,
                     miniters=1,
                     leave=True,
-                    file=sys.stdout,
+                    file=sys.stderr,
                 )
-                status_bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=False)
+                status_bar.set_postfix_str("0.00 MB/s, 0.00 TFLOPS", refresh=True)
         except Exception:
             status_bar = None
 
@@ -1914,9 +1909,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             chunk_dir = chunk_dir if streaming else None
 
         result = infer(
-            model,
-            data_loader,
+            model=model,
             device=device,
+            local_rank=local_rank,
+            data_loader=data_loader,
             ops=ops,
             status_bar=status_bar,
             chunk_dir=chunk_dir,
