@@ -14,6 +14,7 @@ from threading import Lock
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
+from tensordict import TensorDict, TensorDictBase, stack as td_stack
 
 try:
     from torchdata.nodes import (
@@ -746,13 +747,43 @@ def collate(
         labels_dtype=labels_dtype,
         sanitize=sanitize,
     )
+    if isinstance(sample, TensorDictBase):
+        return sample
     if isinstance(sample, (list, tuple)):
-        return [
-            converter(item) if isinstance(item, Mapping) else item
-            for item in sample
-        ]
+        batch_list = []
+        for item in sample:
+            if isinstance(item, TensorDictBase):
+                batch_list.append(item)
+                continue
+            if isinstance(item, Mapping):
+                conv = converter(item)
+                td = TensorDict(
+                    {
+                        # keep legacy keys + new aliases (same tensor refs)
+                        "X": conv["X"],
+                        "Y": conv["Y"],
+                        "features": conv["X"],
+                        "labels": conv["Y"],
+                    },
+                    batch_size=[],
+                )
+                batch_list.append(td)
+            else:
+                batch_list.append(item)
+        if all(isinstance(elem, TensorDictBase) for elem in batch_list):
+            return td_stack(batch_list, dim=0)
+        return batch_list
     if isinstance(sample, Mapping):
-        return converter(sample)
+        conv = converter(sample)
+        return TensorDict(
+            {
+                "X": conv["X"],
+                "Y": conv["Y"],
+                "features": conv["X"],
+                "labels": conv["Y"],
+            },
+            batch_size=[],
+        )
     return sample
 
 
