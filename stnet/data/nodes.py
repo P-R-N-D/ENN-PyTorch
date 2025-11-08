@@ -22,7 +22,7 @@ from typing import (
 )
 
 import torch
-from tensordict import MemoryMappedTensor
+from tensordict import TensorDict, load_memmap, memmap as td_memmap, MemoryMappedTensor
 from torch.utils.data import RandomSampler, SequentialSampler
 
 try:
@@ -228,14 +228,17 @@ class SampleReader:
             if seed is not None:
                 with suppress(Exception):
                     torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
-        feat_path = os.path.join(memmap_dir, "features.mmt")
-        label_path = os.path.join(memmap_dir, "labels.mmt")
-        MemoryMappedTensor.from_tensor(
-            features.view(count, feat_dim), filename=feat_path, existsok=True
+        td_prefix = os.path.join(memmap_dir, "td_memmap")
+        td = TensorDict(
+            {
+                "features": features.view(count, feat_dim),
+                "labels": labels.view(count, label_flat),
+            },
+            batch_size=[count],
+            device=torch.device("cpu"),
         )
-        MemoryMappedTensor.from_tensor(
-            labels.view(count, label_flat), filename=label_path, existsok=True
-        )
+        # save as memory-mapped tensordict (function API; returns new TD)
+        td = td_memmap(td, prefix=td_prefix)
         if bool(int(os.environ.get("STNET_GDS_EXPORT", "0"))):
             feat_bin = os.path.join(memmap_dir, "features.bin")
             lab_bin = os.path.join(memmap_dir, "labels.bin")
@@ -255,6 +258,7 @@ class SampleReader:
             "perm_filename": "perm.pt" if (shuffle and seed is not None) else None,
             "features_filename": "features.mmt",
             "labels_filename": "labels.mmt",
+            "tensordict_prefix": "td_memmap",
         }
         try:
             import hashlib
@@ -307,23 +311,23 @@ class SampleReader:
         label_flat = (
             int(torch.tensor(label_shape).prod().item()) if label_shape else 1
         )
-        feat_path = os.path.join(
-            self.dir, meta.get("features_filename", "features.mmt")
-        )
-        label_path = os.path.join(
-            self.dir, meta.get("labels_filename", "labels.mmt")
-        )
-        feat_dtype = _resolve_dtype(meta, "features_dtype")
-        label_dtype = _resolve_dtype(meta, "labels_dtype")
-        feat_mmt = MemoryMappedTensor.from_filename(
-            feat_path, dtype=feat_dtype, shape=(total, feat_dim)
-        )
-        label_mmt = MemoryMappedTensor.from_filename(
-            label_path, dtype=label_dtype, shape=(total, label_flat)
-        )
+        td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
+        if os.path.isdir(td_prefix):
+            nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
+            td = load_memmap(td_prefix, non_blocking=nb)
+            features_td = td.get("features")
+            labels_td = td.get("labels")
+        else:
+            # legacy fallback: MemoryMappedTensor files (features.mmt / labels.mmt)
+            feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
+            label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+            feat_dtype = _resolve_dtype(meta, "features_dtype")
+            label_dtype = _resolve_dtype(meta, "labels_dtype")
+            features_td = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
+            labels_td = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
         for index in self._indices():
-            feat = feat_mmt[index]
-            label = label_mmt[index]
+            feat = features_td[index]
+            label = labels_td[index]
             if label_shape:
                 label = label.view(*label_shape)
             feat_tensor = (
@@ -356,22 +360,22 @@ class SampleReader:
         label_flat = (
             int(torch.tensor(label_shape).prod().item()) if label_shape else 1
         )
-        feat_path = os.path.join(
-            self.dir, meta.get("features_filename", "features.mmt")
-        )
-        label_path = os.path.join(
-            self.dir, meta.get("labels_filename", "labels.mmt")
-        )
-        feat_dtype = _resolve_dtype(meta, "features_dtype")
-        label_dtype = _resolve_dtype(meta, "labels_dtype")
-        feat_mmt = MemoryMappedTensor.from_filename(
-            feat_path, dtype=feat_dtype, shape=(total, feat_dim)
-        )
-        label_mmt = MemoryMappedTensor.from_filename(
-            label_path, dtype=label_dtype, shape=(total, label_flat)
-        )
-        features = feat_mmt[start:end]
-        labels = label_mmt[start:end].view(-1, *label_shape)
+        td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
+        if os.path.isdir(td_prefix):
+            nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
+            td = load_memmap(td_prefix, non_blocking=nb)
+            features = td.get("features")[start:end]
+            labels = td.get("labels")[start:end]
+        else:
+            # legacy fallback
+            feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
+            label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+            feat_dtype = _resolve_dtype(meta, "features_dtype")
+            label_dtype = _resolve_dtype(meta, "labels_dtype")
+            features = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))[start:end]
+            labels = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))[start:end]
+        if label_shape:
+            labels = labels.view(-1, *label_shape)
         features_tensor = (
             features
             if isinstance(features, torch.Tensor)
