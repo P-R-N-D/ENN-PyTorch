@@ -759,7 +759,6 @@ def collate(
                 conv = converter(item)
                 td = TensorDict(
                     {
-                        # keep legacy keys + new aliases (same tensor refs)
                         "X": conv["X"],
                         "Y": conv["Y"],
                         "features": conv["X"],
