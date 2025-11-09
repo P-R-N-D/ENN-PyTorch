@@ -5,6 +5,7 @@ import ctypes
 import importlib
 import itertools
 import os
+import random
 import sys
 import threading
 import time
@@ -19,21 +20,24 @@ from tensordict import TensorDict, TensorDictBase, stack as td_stack
 try:
     from torchdata.nodes import (
         BaseNode,
-        IterableWrapper,
         Loader,
+        MapStyleWrapper,
         MultiNodeWeightedSampler,
         ParallelMapper,
         PinMemory,
         Prefetcher,
     )
 except Exception:
-    from torchdata.nodes import BaseNode, IterableWrapper, Loader, ParallelMapper, PinMemory, Prefetcher
+    from torchdata.nodes import BaseNode, Loader, ParallelMapper, PinMemory, Prefetcher
 
     MultiNodeWeightedSampler = None
+    MapStyleWrapper = None
 
 from ..backend.environment import optimize_threads as _env_optimize_threads
 from .datatype import to_torch_tensor
-from .nodes import BatchReader, DevicePrefetcher, GDSBatchReader, SampleReader
+from torch.utils.data import Sampler
+
+from .nodes import Dataset, DevicePrefetcher
 
 
 class ThreadLoadBalancer:
@@ -377,6 +381,43 @@ class ThreadLoadBalancer:
 
 
 
+class BatchRangeSampler(Sampler[Tuple[int, int]]):
+    """Sampler that yields inclusive-exclusive index ranges for batching."""
+
+    def __init__(
+        self,
+        N: int,
+        start: int,
+        end: int,
+        batch_size: int,
+        *,
+        shuffle: bool,
+        seed: int,
+    ) -> None:
+        self._N = int(max(0, N))
+        self._start = max(0, int(start))
+        self._end = max(self._start, min(int(end), self._N))
+        self._batch = max(1, int(batch_size))
+        self._shuffle = bool(shuffle)
+        self._rng = random.Random(int(seed))
+        self._ranges: list[Tuple[int, int]] = []
+        index = self._start
+        while index < self._end:
+            nxt = min(index + self._batch, self._end)
+            self._ranges.append((index, nxt))
+            index = nxt
+
+    def __iter__(self) -> Iterator[Tuple[int, int]]:
+        order = list(range(len(self._ranges)))
+        if self._shuffle and len(order) > 1:
+            self._rng.shuffle(order)
+        for idx in order:
+            yield self._ranges[idx]
+
+    def __len__(self) -> int:
+        return len(self._ranges)
+
+
 
 def _process_batch(
     batch: Mapping[str, Any],
@@ -503,38 +544,49 @@ def _initialize(
     prefetch_factor: int,
     non_blocking_copy: bool,
     map_fn: Callable[[Any], Any],
-    batch_reader_cls: type,
-    sample_reader_cls: type,
-    batch_reader_kwargs: Optional[Dict[str, Any]] | None = None,
+    dataset_cls: type,
+    sampler_seed: int = 0,
+    train_shuffle: bool = True,
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], Disposable]:
+    if MapStyleWrapper is None:
+        raise RuntimeError(
+            "torchdata MapStyleWrapper is required to construct the STNet data pipeline."
+        )
+    if dataset_cls is None:
+        raise ValueError("dataset_cls must be provided for map-style loading")
+
     allocated = Disposable()
 
-    def _make_train_node(directory: Union[str, os.PathLike[str]]) -> Tuple[BaseNode, int, int, int]:
+    def _make_node(
+        directory: Union[str, os.PathLike[str]],
+        *,
+        split: str,
+        shuffle: bool,
+    ) -> Tuple[BaseNode, int, int, Tuple[int, int]]:
         path = os.fspath(directory)
-        reader = sample_reader_cls.from_dir(
-            path,
-            split="train",
-            batch_size=int(batch_size),
-            val_frac=val_frac,
+        dataset = dataset_cls(path, split=split, val_frac=val_frac)
+        allocated.add(dataset)
+        total_samples = int(getattr(dataset, "total", len(dataset)))
+        span = dataset.span
+        start, end = span
+        sampler = BatchRangeSampler(
+            total_samples,
+            start,
+            end,
+            int(batch_size),
+            shuffle=bool(shuffle and (end > start)),
+            seed=sampler_seed,
         )
-        allocated.add(reader)
-        meta = reader._load_meta()
-        total_samples = int(meta.get("N", 0))
-        train_range = reader._indices()
-        train_start = int(getattr(train_range, "start", 0))
-        train_end = int(getattr(train_range, "stop", total_samples if total_samples else 0))
-        if train_end <= train_start and total_samples:
-            train_end = total_samples
-        reader_kwargs_local = dict(batch_reader_kwargs or {})
-        batcher = batch_reader_cls(
-            reader, train_start, train_end, int(batch_size), **reader_kwargs_local
-        )
-        allocated.add(batcher)
-        return IterableWrapper(batcher), len(batcher), total_samples, train_end
+        allocated.add(sampler)
+        node = MapStyleWrapper(dataset, sampler)
+        return node, len(sampler), total_samples, span
 
     if isinstance(memmap_dir, (list, tuple)):
-        node_tr = [_make_train_node(directory)[0] for directory in memmap_dir]
+        node_tr = [
+            _make_node(directory, split="train", shuffle=train_shuffle)[0]
+            for directory in memmap_dir
+        ]
         train_loader = _compose(
             node_tr,
             device=device,
@@ -548,7 +600,7 @@ def _initialize(
 
     if isinstance(memmap_dir, Mapping):
         node_tr = {
-            str(key): _make_train_node(directory)[0]
+            str(key): _make_node(directory, split="train", shuffle=train_shuffle)[0]
             for key, directory in memmap_dir.items()
         }
         train_loader = _compose(
@@ -562,7 +614,10 @@ def _initialize(
         )
         return (train_loader, None, allocated)
 
-    node_tr, train_length, total, train_end = _make_train_node(memmap_dir)
+    node_tr, train_length, total, train_span = _make_node(
+        memmap_dir, split="train", shuffle=train_shuffle
+    )
+    train_start, train_end = train_span
     train_loader = _compose(
         node_tr,
         device=device,
@@ -574,33 +629,20 @@ def _initialize(
     )
     val_loader: Optional[Any] = None
     if val_frac > 0 and train_end < total:
-        reader_vl = sample_reader_cls.from_dir(
-            memmap_dir,
-            split="val",
-            batch_size=int(batch_size),
-            val_frac=val_frac,
+        node_vl, val_length, _, val_span = _make_node(
+            memmap_dir, split="val", shuffle=False
         )
-        allocated.add(reader_vl)
-        val_range = reader_vl._indices()
-        val_start = int(getattr(val_range, "start", train_end))
-        val_end = int(getattr(val_range, "stop", total))
-        if val_end <= val_start:
-            val_end = total
-        reader_kwargs_local = dict(batch_reader_kwargs or {})
-        batcher_vl = batch_reader_cls(
-            reader_vl, val_start, val_end, int(batch_size), **reader_kwargs_local
-        )
-        allocated.add(batcher_vl)
-        node_vl = IterableWrapper(batcher_vl)
-        val_loader = _compose(
-            node_vl,
-            device=device,
-            threads=threads,
-            prefetch_factor=prefetch_factor,
-            non_blocking_copy=non_blocking_copy,
-            map_fn=map_fn,
-            length=len(batcher_vl),
-        )
+        val_start, val_end = val_span
+        if val_end > val_start and val_length > 0:
+            val_loader = _compose(
+                node_vl,
+                device=device,
+                threads=threads,
+                prefetch_factor=prefetch_factor,
+                non_blocking_copy=non_blocking_copy,
+                map_fn=map_fn,
+                length=val_length,
+            )
     return (train_loader, val_loader, allocated)
 
 
@@ -815,34 +857,24 @@ def fetch(
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
-    def _env_flag(name: str, default: str = "0") -> bool:
-        value = os.environ.get(name, default)
-        return value not in {"", "0", "false", "False"}
+    sampler_seed = int(os.environ.get("STNET_SAMPLER_SEED", "0") or "0")
+    train_shuffle = os.environ.get("STNET_SHUFFLE", "1")
+    train_shuffle_flag = train_shuffle not in {"", "0", "false", "False"}
 
-    memmap_is_str = isinstance(memmap_dir, str)
-    use_gds = (
-        memmap_is_str
-        and isinstance(device_obj, torch.device)
-        and device_obj.type == "cuda"
-        and torch.cuda.is_available()
-        and _env_flag("STNET_GDS")
-        and GDSBatchReader is not None
-        and os.path.exists(os.path.join(memmap_dir, "features.bin"))
-        and os.path.exists(os.path.join(memmap_dir, "labels.bin"))
-    )
-    batch_reader_cls = GDSBatchReader if use_gds else BatchReader
-    batch_reader_kwargs: Optional[Dict[str, Any]] = (
-        {"device": device_obj} if use_gds else None
-    )
+    if MapStyleWrapper is None:
+        raise RuntimeError(
+            "torchdata MapStyleWrapper is required to construct the STNet data pipeline."
+        )
+    dataset_cls = Dataset
     wrap_kwargs = dict(
         device=device_obj,
         threads=threads,
         prefetch_factor=prefetch_factor,
         non_blocking_copy=bool(non_blocking_copy),
         map_fn=map_fn,
-        batch_reader_cls=batch_reader_cls,
-        sample_reader_cls=SampleReader,
-        batch_reader_kwargs=batch_reader_kwargs,
+        dataset_cls=dataset_cls,
+        sampler_seed=sampler_seed,
+        train_shuffle=train_shuffle_flag,
     )
 
     return _initialize(

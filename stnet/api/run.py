@@ -28,7 +28,7 @@ try:
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from ..data.nodes import SampleReader
+from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess, set_scaler, get_scaler, drop_scaler
 from ..model import Root
 from .config import (
@@ -264,7 +264,7 @@ def train(
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
         if (not torch.is_floating_point(lb)) and (not bool(scale_non_floating)):
-            SampleReader.preload(
+            preload_memmap(
                 {"features": fx, "labels": lb},
                 memmap_dir=out_dir,
                 train_frac=1.0 - float(val_frac),
@@ -294,7 +294,7 @@ def train(
         if (not use_none) and (get_scaler() is None):
             lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
         shuffle_for_preload = bool(shuffle and not did_manual_shuffle)
-        SampleReader.preload(
+        preload_memmap(
             {"features": fx, "labels": lb},
             memmap_dir=out_dir,
             train_frac=1.0 - float(val_frac),
@@ -599,7 +599,7 @@ def train(
                     lb = lb.index_select(0, perm)
             n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
             if (not torch.is_floating_point(lb)) and (not bool(scale_non_floating)):
-                SampleReader.preload(
+                preload_memmap(
                     {"features": fx, "labels": lb},
                     memmap_dir=memmap_dir,
                     train_frac=1.0 - float(val_frac),
@@ -617,7 +617,7 @@ def train(
                 n_train = n_total - val_count
                 if (not use_none) and (get_scaler() is None):
                     lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
-                SampleReader.preload(
+                preload_memmap(
                     {"features": fx, "labels": lb},
                     memmap_dir=memmap_dir,
                     train_frac=1.0 - float(val_frac),
@@ -808,7 +808,7 @@ def predict(
             set_scaler(mean=mean_t, std=std_t)
 
     feats, labels, keys, label_shape = preprocess(data)
-    SampleReader.preload(
+    preload_memmap(
         {"features": feats, "labels": labels},
         memmap_dir=memmap_dir,
         train_frac=1.0,

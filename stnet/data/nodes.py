@@ -2,12 +2,9 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-import random
 import time
 from collections import deque
-from threading import Lock
 from contextlib import nullcontext, suppress
 from typing import (
     Any,
@@ -24,53 +21,12 @@ from typing import (
 
 import torch
 from tensordict import TensorDict, load_memmap, memmap as td_memmap, MemoryMappedTensor
-from torch.utils.data import RandomSampler, SequentialSampler
-
-try:
-    from torchdata.nodes import IterableWrapper as _TDIterableWrapper, MapStyleWrapper as _TDMapWrapper
-except Exception:
-    _TDIterableWrapper = None
-    _TDMapWrapper = None
-
-
-def _is_wrapper_type(candidate: Any) -> bool:
-    return isinstance(candidate, type)
-
-
-_HAS_MAP_WRAPPER = _is_wrapper_type(_TDMapWrapper)
-_HAS_ITER_WRAPPER = _is_wrapper_type(_TDIterableWrapper)
-
-if _HAS_MAP_WRAPPER:
-    BatchSamplerBase = _TDMapWrapper
-elif _HAS_ITER_WRAPPER:
-    BatchSamplerBase = _TDIterableWrapper
-else:
-
-    class _BatchSamplerFallback:
-        def __init__(self, data: Iterable[Any]) -> None:
-            self._data = [list(chunk) for chunk in data]
-
-        def __iter__(self) -> Iterator[Any]:
-            return iter(self._data)
-
-        def __len__(self) -> int:
-            return len(self._data)
-
-    BatchSamplerBase = _BatchSamplerFallback
 try:
     import psutil
 except Exception:
     psutil = None
 
 from .datatype import to_platform_dtype
-
-try:
-    import torch.cuda.gds as _torch_gds
-    _HAS_TORCH_GDS = True
-except Exception:
-    _torch_gds = None
-    _HAS_TORCH_GDS = False
-
 
 _INT_PROMOTION_TARGET = torch.int64
 _FLOAT_PROMOTION_TARGET = torch.float64
@@ -163,433 +119,215 @@ def _device_free_mem(dev: torch.device) -> int:
     return 0
 
 
-class SampleReader:
+class Dataset:
+    """Map-style dataset backed by STNet memmap exports."""
+
     def __init__(
         self,
-        memmap_dir: str,
-        *args: Any,
+        memmap_dir: Union[str, os.PathLike[str]],
+        *,
         split: str = "train",
         val_frac: Optional[float] = None,
-        batch_size: Optional[int] = None,
-        **kwargs: Any,
     ) -> None:
-        self.dir = memmap_dir
+        self.dir = os.fspath(memmap_dir)
         self.split = split
-        self._val_frac_override = val_frac
-        self._batch_size = batch_size
-        self._meta: Optional[Dict[str, Any]] = None
-        self._td = None
-        self._features_arr = None
-        self._labels_arr = None
-        self._feat_mmt = None
-        self._lab_mmt = None
-        self._init_lock = Lock()
-
-    @classmethod
-    def from_dir(
-        cls: object,
-        memmap_dir: str,
-        *args: Any,
-        split: str = "train",
-        batch_size: int = 1,
-        val_frac: Optional[float] = None,
-        **kwargs: Any,
-    ) -> SampleReader:
-        return cls(
-            memmap_dir,
-            split=split,
-            val_frac=val_frac,
-            batch_size=int(batch_size),
-        )
-
-    @staticmethod
-    def preload(
-        data: Dict[str, Any],
-        *args: Any,
-        memmap_dir: str,
-        train_frac: float = 1.0,
-        val_frac: float = 0.0,
-        shuffle: bool = False,
-        seed: Optional[int] = None,
-        **kwargs: Any,
-    ) -> None:
-        os.makedirs(memmap_dir, exist_ok=True)
-        features = _to_high_precision(torch.as_tensor(data["features"]).detach())
-        labels = _to_high_precision(torch.as_tensor(data["labels"]).detach())
-        features = features.cpu().contiguous()
-        labels = labels.cpu().contiguous()
-        if features.shape[0] != labels.shape[0]:
-            raise ValueError("features/labels N mismatch")
-        count = int(features.shape[0])
-        feat_dim = int(features.view(count, -1).shape[1])
-        label_shape: List[int] = list(labels.shape[1:])
-        label_flat = int(labels.numel() // count)
-        if shuffle:
-            g = torch.Generator(device="cpu")
-            if seed is not None:
-                with suppress(Exception):
-                    g.manual_seed(int(seed))
-            perm = torch.randperm(count, generator=g)
-            features = features.index_select(0, perm)
-            labels = labels.index_select(0, perm)
-            if seed is not None:
-                with suppress(Exception):
-                    torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
-        td_prefix = os.path.join(memmap_dir, "td_memmap")
-        td = TensorDict(
-            {
-                "features": features.view(count, feat_dim),
-                "labels": labels.view(count, label_flat),
-            },
-            batch_size=[count],
-            device=torch.device("cpu"),
-        )
-        td = td_memmap(td, prefix=td_prefix)
-        if bool(int(os.environ.get("STNET_GDS_EXPORT", "0"))):
-            feat_bin = os.path.join(memmap_dir, "features.bin")
-            lab_bin = os.path.join(memmap_dir, "labels.bin")
-            with open(feat_bin, "wb") as feat_handle:
-                features.view(count, feat_dim).numpy().tofile(feat_handle)
-            with open(lab_bin, "wb") as lab_handle:
-                labels.view(count, label_flat).numpy().tofile(lab_handle)
-        meta = {
-            "N": count,
-            "feature_dim": feat_dim,
-            "label_shape": label_shape,
-            "features_dtype": to_platform_dtype(features.dtype, "name"),
-            "labels_dtype": to_platform_dtype(labels.dtype, "name"),
-            "fractions": [float(train_frac), float(val_frac)],
-            "shuffled": bool(shuffle),
-            "shuffle_seed": int(seed) if seed is not None else None,
-            "perm_filename": "perm.pt" if (shuffle and seed is not None) else None,
-            "features_filename": "features.mmt",
-            "labels_filename": "labels.mmt",
-            "tensordict_prefix": "td_memmap",
-        }
-        try:
-            import hashlib
-
-            if shuffle and seed is not None:
-                h = hashlib.sha256(perm.cpu().numpy().tobytes()).hexdigest()
-                meta["perm_sha256"] = h
-        except Exception:
-            pass
-        for k in ("target_scaler", "robust_q", "robust_cap", "scale_non_floating"):
-            if k in kwargs and kwargs[k] is not None:
-                meta[k] = list(kwargs[k]) if isinstance(kwargs[k], tuple) else kwargs[k]
-        with open(
-            os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8"
-        ) as handle:
-            json.dump(meta, handle)
-
-    def _load_meta(self) -> Dict[str, Any]:
-        if self._meta is None:
-            with open(
-                os.path.join(self.dir, "meta.json"), "r", encoding="utf-8"
-            ) as handle:
-                self._meta = json.load(handle)
-        return self._meta
-
-    def _indices(self) -> range:
-        meta = self._load_meta()
-        total = int(meta["N"])
-        val_fraction = float(
-            self._val_frac_override
-            if self._val_frac_override is not None
-            else meta.get("fractions", [1.0, 0.0])[-1]
-        )
-        val_count = int(round(total * val_fraction))
-        train_count = total - val_count
-        match self.split:
-            case "train":
-                return range(0, train_count)
-            case "val":
-                return range(train_count, total)
-            case _:
-                return range(0, total)
-
-    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        meta = self._load_meta()
-        pin_env = bool(int(os.environ.get("STNET_PIN_MEMORY", "0")))
-        total = int(meta["N"])
-        feat_dim = int(meta["feature_dim"])
-        label_shape = list(meta["label_shape"])
-        label_flat = (
+        meta_path = os.path.join(self.dir, "meta.json")
+        with open(meta_path, "r", encoding="utf-8") as handle:
+            self._meta: Dict[str, Any] = json.load(handle)
+        self._N = int(self._meta.get("N", 0))
+        self._feat_dim = int(self._meta.get("feature_dim", 0))
+        label_shape: List[int] = list(self._meta.get("label_shape", []))
+        self._label_shape = tuple(label_shape)
+        self._label_flat = (
             int(torch.tensor(label_shape).prod().item()) if label_shape else 1
         )
-        td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
+
+        td_prefix = os.path.join(
+            self.dir, self._meta.get("tensordict_prefix", "td_memmap")
+        )
         if os.path.isdir(td_prefix):
             nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
-            td = load_memmap(td_prefix, non_blocking=nb)
-            features_td = td.get("features")
-            labels_td = td.get("labels")
+            self._td = load_memmap(td_prefix, non_blocking=nb)
+            self._features = self._td.get("features")
+            self._labels = self._td.get("labels")
         else:
-            feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
-            label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
-            feat_dtype = _resolve_dtype(meta, "features_dtype")
-            label_dtype = _resolve_dtype(meta, "labels_dtype")
-            features_td = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))
-            labels_td = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))
-        for index in self._indices():
-            feat = features_td[index]
-            label = labels_td[index]
-            if label_shape:
-                label = label.view(*label_shape)
-            feat_tensor = (
-                feat
-                if isinstance(feat, torch.Tensor)
-                else torch.as_tensor(feat)
+            feat_path = os.path.join(
+                self.dir, self._meta.get("features_filename", "features.mmt")
             )
-            label_tensor = (
-                label
-                if isinstance(label, torch.Tensor)
-                else torch.as_tensor(label)
+            lab_path = os.path.join(
+                self.dir, self._meta.get("labels_filename", "labels.mmt")
             )
-            if pin_env and hasattr(feat_tensor, "pin_memory"):
-                with suppress(Exception):
-                    feat_tensor = feat_tensor.pin_memory()
-                    label_tensor = label_tensor.pin_memory()
-            yield (feat_tensor, label_tensor)
+            feat_dtype = _resolve_dtype(self._meta, "features_dtype")
+            lab_dtype = _resolve_dtype(self._meta, "labels_dtype")
+            self._td = None
+            self._features = MemoryMappedTensor.from_filename(
+                feat_path,
+                dtype=feat_dtype,
+                shape=(self._N, self._feat_dim),
+            )
+            self._labels = MemoryMappedTensor.from_filename(
+                lab_path,
+                dtype=lab_dtype,
+                shape=(self._N, self._label_flat),
+            )
+
+        fractions = self._meta.get("fractions", [1.0, 0.0])
+        default_val = float(fractions[-1]) if fractions else 0.0
+        val_fraction = (
+            float(val_frac)
+            if val_frac is not None
+            else default_val
+        )
+        val_fraction = min(max(val_fraction, 0.0), 1.0)
+        val_count = int(round(self._N * val_fraction))
+        train_count = max(0, self._N - val_count)
+        default_train = (0, train_count)
+        default_val_span = (train_count, self._N)
+
+        train_start = int(self._meta.get("train_start", default_train[0]))
+        train_end = int(self._meta.get("train_end", default_train[1]))
+        val_start = int(self._meta.get("val_start", default_val_span[0]))
+        val_end = int(self._meta.get("val_end", default_val_span[1]))
+
+        train_start = max(0, min(self._N, train_start))
+        train_end = max(train_start, min(self._N, train_end))
+        val_start = max(0, min(self._N, val_start))
+        val_end = max(val_start, min(self._N, val_end))
+
+        self._train_span = (train_start, train_end)
+        self._val_span = (val_start, val_end)
+
+        if split == "val":
+            self._start, self._end = self._val_span
+        elif split == "train":
+            self._start, self._end = self._train_span
+        else:
+            self._start, self._end = (0, self._N)
+
+    @property
+    def total(self) -> int:
+        return self._N
+
+    @property
+    def span(self) -> Tuple[int, int]:
+        return self._start, self._end
 
     def __len__(self) -> int:
-        return len(self._indices())
+        return max(0, self._end - self._start)
 
-    def clear(self) -> None:
-        self._td = None
-        self._features_arr = None
-        self._labels_arr = None
-        self._feat_mmt = None
-        self._lab_mmt = None
-        self._init_lock = Lock()
-
-    def _coerce_arrays(self) -> None:
-        if self._features_arr is not None and self._labels_arr is not None:
-            return
-        with self._init_lock:
-            if self._features_arr is not None and self._labels_arr is not None:
-                return
-            meta = self._load_meta()
-            total = int(meta["N"])
-            feat_dim = int(meta["feature_dim"])
-            label_shape = list(meta["label_shape"])
-            label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-            td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
-            if os.path.isdir(td_prefix):
-                nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
-                if self._td is None:
-                    self._td = load_memmap(td_prefix, non_blocking=nb)
-                self._features_arr = self._td.get("features")
-                self._labels_arr = self._td.get("labels")
-            else:
-                feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
-                label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
-                feat_dtype = _resolve_dtype(meta, "features_dtype")
-                label_dtype = _resolve_dtype(meta, "labels_dtype")
-                if self._feat_mmt is None:
-                    self._feat_mmt = MemoryMappedTensor.from_filename(
-                        feat_path, dtype=feat_dtype, shape=(total, feat_dim)
-                    )
-                if self._lab_mmt is None:
-                    self._lab_mmt = MemoryMappedTensor.from_filename(
-                        label_path, dtype=label_dtype, shape=(total, label_flat)
-                    )
-                self._features_arr = self._feat_mmt
-                self._labels_arr = self._lab_mmt
-
-    def iter_batch(
-        self, start: int, end: int
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        meta = self._load_meta()
-        pin_env = bool(int(os.environ.get("STNET_PIN_MEMORY", "0")))
-        label_shape = list(meta["label_shape"])
-        self._coerce_arrays()
-        features = self._features_arr[start:end]
-        labels = self._labels_arr[start:end]
-        if label_shape:
-            labels = labels.view(end - start, *label_shape)
-        features_tensor = (
-            features if isinstance(features, torch.Tensor) else torch.as_tensor(features)
+    def _slice(self, start: int, end: int) -> Dict[str, torch.Tensor]:
+        features = self._features[start:end]
+        labels = self._labels[start:end]
+        if self._label_shape:
+            labels = labels.view(end - start, *self._label_shape)
+        x_tensor = (
+            features
+            if isinstance(features, torch.Tensor)
+            else torch.as_tensor(features)
         )
-        labels_tensor = (
-            labels if isinstance(labels, torch.Tensor) else torch.as_tensor(labels)
+        y_tensor = (
+            labels
+            if isinstance(labels, torch.Tensor)
+            else torch.as_tensor(labels)
         )
-        if pin_env and hasattr(features_tensor, "pin_memory"):
+        return {"X": x_tensor, "Y": y_tensor}
+
+    def __getitem__(self, index: Union[int, Tuple[int, int]]) -> Dict[str, torch.Tensor]:
+        if isinstance(index, tuple) and len(index) == 2:
+            start, end = (int(index[0]), int(index[1]))
+            start = max(self._start, start)
+            end = max(start, min(self._end, end))
+            return self._slice(start, end)
+        span = self.__len__()
+        if span <= 0:
+            raise IndexError("dataset is empty")
+        item_index = int(index)
+        if item_index < 0:
+            item_index += span
+        if item_index < 0 or item_index >= span:
+            raise IndexError("dataset index out of range")
+        absolute = self._start + item_index
+        return self._slice(absolute, absolute + 1)
+
+
+def preload_memmap(
+    data: Dict[str, Any],
+    *,
+    memmap_dir: str,
+    train_frac: float = 1.0,
+    val_frac: float = 0.0,
+    shuffle: bool = False,
+    seed: Optional[int] = None,
+    **kwargs: Any,
+) -> None:
+    os.makedirs(memmap_dir, exist_ok=True)
+    features = _to_high_precision(torch.as_tensor(data["features"]).detach())
+    labels = _to_high_precision(torch.as_tensor(data["labels"]).detach())
+    features = features.cpu().contiguous()
+    labels = labels.cpu().contiguous()
+    if features.shape[0] != labels.shape[0]:
+        raise ValueError("features/labels N mismatch")
+    count = int(features.shape[0])
+    feat_dim = int(features.view(count, -1).shape[1])
+    label_shape: List[int] = list(labels.shape[1:])
+    label_flat = int(labels.numel() // count)
+    perm: Optional[torch.Tensor] = None
+    if shuffle:
+        generator = torch.Generator(device="cpu")
+        if seed is not None:
             with suppress(Exception):
-                features_tensor = features_tensor.pin_memory()
-                labels_tensor = labels_tensor.pin_memory()
-        return (features_tensor, labels_tensor)
-
-class BatchReader:
-    def __init__(
-        self,
-        mmts: SampleReader,
-        start: int,
-        end: int,
-        batch_size: int,
-    ) -> None:
-        self._mmts = mmts
-        self._start = int(start)
-        self._end = int(end)
-        self._batch = max(1, int(batch_size))
-
-    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-        index = int(self._start)
-        while index < self._end:
-            nxt = min(index + self._batch, self._end)
-            xb, yb = self._mmts.iter_batch(index, nxt)
-            yield {"X": xb, "Y": yb}
-            index = nxt
-
-    def __len__(self) -> int:
-        if self._end <= self._start:
-            return 0
-        span = self._end - self._start
-        return int(math.ceil(span / float(self._batch)))
-
-
-if _HAS_TORCH_GDS and torch.cuda.is_available():
-
-    class GDSBatchReader:
-
-        def __init__(
-            self,
-            mmts: SampleReader,
-            start: int,
-            end: int,
-            batch_size: int,
-            *args: Any,
-            device: Optional[Union[str, torch.device]] = None,
-            **kwargs: Any,
-        ) -> None:
-            if not _HAS_TORCH_GDS:
-                raise RuntimeError("torch.cuda.gds is not available in this PyTorch build")
-            self._mmts = mmts
-            self._start = int(start)
-            self._end = int(end)
-            self._batch = max(1, int(batch_size))
-            meta = self._mmts._load_meta()
-            feat_dim = int(meta["feature_dim"])
-            label_shape = list(meta["label_shape"])
-            self._label_shape = tuple(label_shape)
-            self._label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-            self._feat_dtype = _resolve_dtype(meta, "features_dtype")
-            self._lab_dtype = _resolve_dtype(meta, "labels_dtype")
-            self._feat_path = os.path.join(self._mmts.dir, meta.get("features_bin_filename", "features.bin"))
-            self._lab_path = os.path.join(self._mmts.dir, meta.get("labels_bin_filename", "labels.bin"))
-            if not (os.path.exists(self._feat_path) and os.path.exists(self._lab_path)):
-                raise FileNotFoundError("GDS binary files (features.bin, labels.bin) are required")
-            self._feat_stride = feat_dim
-            self._lab_stride = self._label_flat
-            self._device = torch.device(device) if device is not None else torch.device("cuda")
-            self._feat_esize = torch.empty((), dtype=self._feat_dtype).element_size()
-            self._lab_esize = torch.empty((), dtype=self._lab_dtype).element_size()
-            self._feat_fh: Optional[_torch_gds.GdsFile] = None
-            self._lab_fh: Optional[_torch_gds.GdsFile] = None
-            self._to_deregister: list[torch.UntypedStorage] = []
-
-        def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
-            to_deregister = self._to_deregister
-            try:
-                if self._feat_fh is None:
-                    self._feat_fh = _torch_gds.GdsFile(self._feat_path, os.O_RDONLY)
-                    self._lab_fh = _torch_gds.GdsFile(self._lab_path, os.O_RDONLY)
-                index = int(self._start)
-                end = int(self._end)
-                while index < end:
-                    nxt = min(index + self._batch, end)
-                    rows = nxt - index
-                    xb = torch.empty((rows, self._feat_stride), dtype=self._feat_dtype, device=self._device)
-                    yb = torch.empty((rows, self._lab_stride), dtype=self._lab_dtype, device=self._device)
-                    try:
-                        _torch_gds.gds_register_buffer(xb.untyped_storage())
-                        _torch_gds.gds_register_buffer(yb.untyped_storage())
-                        to_deregister.extend([xb.untyped_storage(), yb.untyped_storage()])
-                    except Exception:
-                        pass
-                    feat_off = index * self._feat_stride * self._feat_esize
-                    lab_off = index * self._lab_stride * self._lab_esize
-                    self._feat_fh.load_storage(xb.untyped_storage(), offset=feat_off)
-                    self._lab_fh.load_storage(yb.untyped_storage(), offset=lab_off)
-                    if self._label_shape:
-                        yb = yb.view(rows, *self._label_shape)
-                    yield {"X": xb, "Y": yb}
-                    index = nxt
-            finally:
-                for storage in to_deregister:
-                    with suppress(Exception):
-                        _torch_gds.gds_deregister_buffer(storage)
-                to_deregister.clear()
-
-        def __len__(self) -> int:
-            if self._end <= self._start:
-                return 0
-            span = self._end - self._start
-            return int(math.ceil(span / float(self._batch)))
-else:
-    GDSBatchReader = None
-
-
-class BatchSampler(BatchSamplerBase):
-    def __init__(
-        self,
-        memmap_dir: str,
-        part: str,
-        batch_size: int,
-        shuffle: bool,
-        seed: int,
-        *args: Any,
-        rank: int = 0,
-        world_size: int = 1,
-        drop_last: bool = False,
-        fractions: Optional[Tuple[float, float]] = None,
-        **kwargs: Any,
-    ) -> None:
-        meta = _read_meta(memmap_dir)
-        total = int(meta["N"])
-        if fractions is not None:
-            train_frac = float(fractions[0])
-        else:
-            train_frac = 1.0
-            if "fractions" in meta:
-                try:
-                    train_frac = float(meta["fractions"][0])
-                except Exception:
-                    train_frac = 1.0
-        if part not in {"train", "val"}:
-            raise ValueError("part must be 'train' or 'val'")
-        train_count = int(math.floor(total * train_frac))
-        start, end = (
-            (0, train_count) if part == "train" else (train_count, total)
-        )
-        indices = list(range(start, end))
-        if shuffle:
-            rng = random.Random(int(seed))
-            rng.shuffle(indices)
-        if world_size > 1:
-            indices = indices[int(rank) :: int(world_size)]
-        batch_len = int(batch_size)
-        batches: List[List[int]] = []
-        current: List[int] = []
-        for idx in indices:
-            current.append(int(idx))
-            if len(current) == batch_len:
-                batches.append(current)
-                current = []
-        if current and (not drop_last):
-            batches.append(current)
-
-        if not _HAS_MAP_WRAPPER:
-            super().__init__([list(chunk) for chunk in batches])
-        else:
-            _dataset = {i: list(chunk) for i, chunk in enumerate(batches)}
-            if shuffle:
-                generator = torch.Generator()
                 generator.manual_seed(int(seed))
-                sampler = RandomSampler(range(len(_dataset)), generator=generator)
-            else:
-                sampler = SequentialSampler(range(len(_dataset)))
-            order = [int(i) for i in sampler]
-            super().__init__([_dataset[idx] for idx in order])
+        perm = torch.randperm(count, generator=generator)
+        features = features.index_select(0, perm)
+        labels = labels.index_select(0, perm)
+        if seed is not None:
+            with suppress(Exception):
+                torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
+    td_prefix = os.path.join(memmap_dir, "td_memmap")
+    td = TensorDict(
+        {
+            "features": features.view(count, feat_dim),
+            "labels": labels.view(count, label_flat),
+        },
+        batch_size=[count],
+        device=torch.device("cpu"),
+    )
+    td_memmap(td, prefix=td_prefix)
+    if bool(int(os.environ.get("STNET_GDS_EXPORT", "0"))):
+        feat_bin = os.path.join(memmap_dir, "features.bin")
+        lab_bin = os.path.join(memmap_dir, "labels.bin")
+        with open(feat_bin, "wb") as feat_handle:
+            features.view(count, feat_dim).numpy().tofile(feat_handle)
+        with open(lab_bin, "wb") as lab_handle:
+            labels.view(count, label_flat).numpy().tofile(lab_handle)
+    meta = {
+        "N": count,
+        "feature_dim": feat_dim,
+        "label_shape": label_shape,
+        "features_dtype": to_platform_dtype(features.dtype, "name"),
+        "labels_dtype": to_platform_dtype(labels.dtype, "name"),
+        "fractions": [float(train_frac), float(val_frac)],
+        "shuffled": bool(shuffle),
+        "shuffle_seed": int(seed) if seed is not None else None,
+        "perm_filename": "perm.pt" if (shuffle and seed is not None) else None,
+        "features_filename": "features.mmt",
+        "labels_filename": "labels.mmt",
+        "tensordict_prefix": "td_memmap",
+    }
+    try:
+        import hashlib
+
+        if shuffle and seed is not None and perm is not None:
+            h = hashlib.sha256(perm.cpu().numpy().tobytes()).hexdigest()
+            meta["perm_sha256"] = h
+    except Exception:
+        pass
+    for key in ("target_scaler", "robust_q", "robust_cap", "scale_non_floating"):
+        if key in kwargs and kwargs[key] is not None:
+            value = kwargs[key]
+            meta[key] = list(value) if isinstance(value, tuple) else value
+    with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
+        json.dump(meta, handle)
 
 
 class DevicePrefetcher(Iterator[Any]):
