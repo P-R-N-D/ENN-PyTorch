@@ -7,12 +7,12 @@ from functools import partial
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
-from tensordict import TensorDict, TensorDictBase, stack as td_stack
+from tensordict import TensorDict, TensorDictBase, stack
 
 try:
     from torchdata.nodes import (
         BaseNode,
-        Loader,
+        Loader as _Loader,
         MapStyleWrapper,
         MultiNodeWeightedSampler,
         ParallelMapper,
@@ -24,11 +24,11 @@ except Exception:
     MultiNodeWeightedSampler = None
     MapStyleWrapper = None
 
-from torch.utils.data import Sampler
+import torch.utils.data.Sampler as _Sampler
 
 from .nodes import Dataset, DevicePrefetcher
 
-def _process_batch(
+def _process(
     batch: Mapping[str, Any],
     *args: Any,
     flatten_features: bool,
@@ -60,7 +60,7 @@ def collate(
     **kwargs: Any,
 ) -> Any:
     converter = partial(
-        _process_batch,
+        _process,
         flatten_features=flatten_features,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
@@ -82,7 +82,7 @@ def collate(
             else:
                 batch_list.append(item)
         if all(isinstance(elem, TensorDictBase) for elem in batch_list):
-            return td_stack(batch_list, dim=0)
+            return stack(batch_list, dim=0)
         return batch_list
     if isinstance(sample, Mapping):
         conv = converter(sample)
@@ -99,8 +99,8 @@ class Disposable:
     def __iter__(self):
         return iter(self._keep)
 
-class BatchRangeSampler(Sampler[Tuple[int, int]]):
-    def __init__(self, *, start: int, end: int, batch_size: int, shuffle: bool = True, seed: int = 0) -> None:
+class Sampler(_Sampler[Tuple[int, int]]):
+    def __init__(self, *args: Any, start: int, end: int, batch_size: int, shuffle: bool = True, seed: int = 0, **kwargs: Any) -> None:
         self._start = int(start); self._end = int(end); self._B = max(1, int(batch_size))
         self._shuffle = bool(shuffle)
         self._rng = random.Random(int(seed))
@@ -127,9 +127,9 @@ class BatchRangeSampler(Sampler[Tuple[int, int]]):
         return MapStyleWrapper(dataset, self)
 
 
-class BatchMultiplexer:
+class Multiplexer:
 
-    def __init__(self, *, stop_criteria: str = "ALL_DATASETS_EXHAUSTED", weights: Optional[Mapping[str, float]] = None, seed: int = 0) -> None:
+    def __init__(self, *args: Any, stop_criteria: str = "ALL_DATASETS_EXHAUSTED", weights: Optional[Mapping[str, float]] = None, seed: int = 0, **kwargs: Any) -> None:
         self.stop_criteria = str(stop_criteria)
         self.weights = dict(weights) if isinstance(weights, Mapping) else None
         self.seed = int(seed)
@@ -153,8 +153,8 @@ class BatchMultiplexer:
         return MultiNodeWeightedSampler(sources_map, w, stop_criteria=self.stop_criteria)
 
 
-class BatchMapper:
-    def __init__(self, *, map_fn: Callable[[Any], Any], io_workers: int, prebatch: int, prefetch_factor: int, device: torch.device, non_blocking: bool = True) -> None:
+class Fetcher:
+    def __init__(self, *args: Any, map_fn: Callable[[Any], Any], io_workers: int, prebatch: int, prefetch_factor: int, device: torch.device, non_blocking: bool = True, **kwargs: Any) -> None:
         self.map_fn = map_fn
         self.io_workers = max(1, int(io_workers))
         self.prebatch = max(1, int(prebatch))
@@ -178,7 +178,7 @@ class BatchMapper:
         return node
 
 
-class BatchLoader:
+class Loader:
     def __init__(
         self,
         device: torch.device,
@@ -192,12 +192,12 @@ class BatchLoader:
     ) -> None:
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
-            raise TypeError("BatchLoader supports only torchdata.nodes.BaseNode instances.")
+            raise TypeError("Loader supports only torchdata.nodes.BaseNode instances.")
         self._device = device if isinstance(device, torch.device) else torch.device(device)
         self._prefetch_factor = max(1, int(prefetch_factor))
         self._non_blocking = bool(non_blocking)
         self._length = int(length) if length is not None else None
-        base = Loader(node_obj)
+        base = _Loader(node_obj)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
             try:
@@ -247,23 +247,24 @@ def _env_optimize_threads() -> Dict[str, int]:
 
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
-    *,
+    *args: Any,
     device: Union[str, torch.device],
     map_fn: Callable[[Any], Any],
     prefetch_factor: int,
     non_blocking_copy: bool,
     io_workers: int,
     prebatch: int,
+    **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
 
-    mux = BatchMultiplexer(
+    mux = Multiplexer(
         stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
         seed=int(os.environ.get("STNET_BLOCK_SEED", "0") or "0"),
     )
     source = mux.compose(node_or_nodes)
 
-    mapper = BatchMapper(
+    mapper = Fetcher(
         map_fn=map_fn,
         io_workers=io_workers,
         prebatch=prebatch,
@@ -302,11 +303,11 @@ def fetch(
 
     allocated = Disposable()
 
-    def _make_node_for(directory: Union[str, os.PathLike[str]], split: str, shuffle: bool) -> Tuple[BaseNode, int]:
+    def _node_for(directory: Union[str, os.PathLike[str]], split: str, shuffle: bool) -> Tuple[BaseNode, int]:
         path = os.fspath(directory)
         ds = Dataset(path, split=split, val_frac=float(val_frac))
         allocated.add(ds)
-        samp = BatchRangeSampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=int(os.environ.get("STNET_SAMPLER_SEED","0") or "0"))
+        samp = Sampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=int(os.environ.get("STNET_SAMPLER_SEED","0") or "0"))
         node = samp.compose(ds)
         return node, len(samp)
 
@@ -314,7 +315,7 @@ def fetch(
         nodes_map: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
         for key, directory in memmap_dir.items():
-            node, length = _make_node_for(directory, split="train", shuffle=True)
+            node, length = _node_for(directory, split="train", shuffle=True)
             nodes_map[str(key)] = node
             lengths[str(key)] = length
         _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
@@ -323,16 +324,16 @@ def fetch(
         nodes_list: list[BaseNode] = []
         lengths: list[int] = []
         for directory in memmap_dir:
-            node, length = _make_node_for(directory, split="train", shuffle=True)
+            node, length = _node_for(directory, split="train", shuffle=True)
             nodes_list.append(node); lengths.append(length)
         _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = sum(lengths) if lengths else None
     else:
-        node, length = _make_node_for(memmap_dir, split="train", shuffle=True)
+        node, length = _node_for(memmap_dir, split="train", shuffle=True)
         _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = length
 
-    train_loader = BatchLoader(device=device_obj, node=mapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=train_length)
+    train_loader = _Loader(device=device_obj, node=mapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=train_length)
 
     val_loader = None
     if float(val_frac) > 0.0:
@@ -340,7 +341,7 @@ def fetch(
             nodes_map = {}
             lengths = {}
             for key, directory in memmap_dir.items():
-                node, length = _make_node_for(directory, split="val", shuffle=False)
+                node, length = _node_for(directory, split="val", shuffle=False)
                 nodes_map[str(key)] = node; lengths[str(key)] = length
             _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths.values()) if lengths else None
@@ -348,14 +349,14 @@ def fetch(
             nodes_list = []
             lengths = []
             for directory in memmap_dir:
-                node, length = _make_node_for(directory, split="val", shuffle=False)
+                node, length = _node_for(directory, split="val", shuffle=False)
                 nodes_list.append(node); lengths.append(length)
             _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths) if lengths else None
         else:
-            node, length = _make_node_for(memmap_dir, split="val", shuffle=False)
+            node, length = _node_for(memmap_dir, split="val", shuffle=False)
             _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = length
-        val_loader = BatchLoader(device=device_obj, node=vmapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=val_len)
+        val_loader = _Loader(device=device_obj, node=vmapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=val_len)
 
     return (train_loader, val_loader, allocated)
