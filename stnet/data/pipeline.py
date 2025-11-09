@@ -472,7 +472,7 @@ def _compose(
         source_node,
         map_fn=map_fn,
         num_workers=io_workers,
-        in_order=False,
+        in_order=True,
         method="thread",
         max_concurrent=thread_max_concurrent,
         prebatch=prebatch,
