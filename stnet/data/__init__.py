@@ -4,13 +4,7 @@ from __future__ import annotations
 import sys as _sys
 
 from . import datatype as datatype_module
-from .nodes import (
-    BatchReader,
-    BatchSampler,
-    DevicePrefetcher,
-    GDSBatchReader,
-    SampleReader,
-)
+from .nodes import Dataset, DevicePrefetcher, preload_memmap
 from .pipeline import BatchLoader, Disposable, ThreadLoadBalancer, collate, fetch
 from .stats import Metadata, TensorDictMetadata
 from .transforms import (
@@ -29,14 +23,12 @@ from .datatype import (
 )
 
 __all__ = [
-    "BatchReader",
-    "BatchSampler",
     "BatchLoader",
     "DevicePrefetcher",
-    "GDSBatchReader",
-    "SampleReader",
+    "Dataset",
     "collate",
     "fetch",
+    "preload_memmap",
     "Disposable",
     "ThreadLoadBalancer",
     "Metadata",
