@@ -17,16 +17,16 @@ try:
         MultiNodeWeightedSampler,
         ParallelMapper,
         PinMemory,
-        Prefetcher,
+        Prefetcher as _Prefetcher,
     )
 except Exception:
-    from torchdata.nodes import BaseNode, Loader, ParallelMapper, PinMemory, Prefetcher
+    from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper, PinMemory, Prefetcher as _Prefetcher
     MultiNodeWeightedSampler = None
     MapStyleWrapper = None
 
 import torch.utils.data.Sampler as _Sampler
 
-from .nodes import Dataset, DevicePrefetcher
+from .nodes import Dataset, Prefetcher
 
 def _process(
     batch: Mapping[str, Any],
@@ -172,7 +172,7 @@ class Fetcher:
             max_concurrent=None,
             prebatch=self.prebatch,
         )
-        node = Prefetcher(node, prefetch_factor=self.prefetch_factor)
+        node = _Prefetcher(node, prefetch_factor=self.prefetch_factor)
         if self.device.type in {"cuda", "xpu", "mps"}:
             node = PinMemory(node, pin_memory_device=self.device.type)
         return node
@@ -209,7 +209,7 @@ class Loader:
                 host_guard_mb = int(os.environ.get("STNET_HOST_GUARD_MB", "1024"))
             except Exception:
                 host_guard_mb = 1024
-            self._iterable = DevicePrefetcher(
+            self._iterable = Prefetcher(
                 base,
                 device=self._device,
                 depth=self._prefetch_factor,
