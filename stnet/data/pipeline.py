@@ -1,17 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import ctypes
-import importlib
-import itertools
 import os
 import random
-import sys
-import threading
-import time
-from contextlib import suppress
 from functools import partial
-from threading import Lock
 from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
@@ -29,395 +21,12 @@ try:
     )
 except Exception:
     from torchdata.nodes import BaseNode, Loader, ParallelMapper, PinMemory, Prefetcher
-
     MultiNodeWeightedSampler = None
     MapStyleWrapper = None
 
-from ..backend.environment import optimize_threads as _env_optimize_threads
-from .datatype import to_torch_tensor
 from torch.utils.data import Sampler
 
 from .nodes import Dataset, DevicePrefetcher
-
-
-class ThreadLoadBalancer:
-
-    __slots__ = (
-        "_psutil",
-        "_allowed_cpus",
-        "_ring",
-        "_tls",
-        "_lock",
-        "_io_workers",
-        "_samples",
-        "_cpu_ns",
-        "_wall_ns",
-        "_last_retune_ts",
-        "_enabled",
-        "_pin_attempts",
-        "_pin_success",
-        "_omp_ok",
-    )
-
-    def __init__(self, io_workers: int) -> None:
-        self._psutil = self._import_psutil()
-        self._allowed_cpus = self.total_procs()
-        if not self._allowed_cpus:
-            self._allowed_cpus = list(range(max(1, os.cpu_count() or 1)))
-        self._ring = itertools.cycle(self._allowed_cpus)
-        self._tls = threading.local()
-        self._lock = Lock()
-        self._io_workers = max(1, int(io_workers))
-        self._samples = 0
-        self._cpu_ns = 0
-        self._wall_ns = 0
-        self._last_retune_ts = time.perf_counter()
-        self._pin_attempts = 0
-        self._pin_success = 0
-        self._omp_ok = self.spread_threads()
-        self._enabled = (len(self._allowed_cpus) >= 2) or self._omp_ok
-        self.tune_threads(io_workers, initial=True)
-
-    @staticmethod
-    def _import_psutil():
-        try:
-            return importlib.import_module("psutil")
-        except Exception:
-            return None
-
-    def total_procs(self) -> list[int]:
-        if self._psutil is not None:
-            try:
-                proc = self._psutil.Process()
-                if hasattr(proc, "cpu_affinity"):
-                    cpus = proc.cpu_affinity()
-                    if cpus:
-                        return sorted({int(c) for c in cpus})
-            except Exception:
-                pass
-        if os.name == "nt":
-            try:
-                k32 = ctypes.windll.kernel32
-                k32.GetActiveProcessorGroupCount.restype = ctypes.c_ushort
-                k32.GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
-                k32.GetActiveProcessorCount.restype = ctypes.c_ushort
-                group_count = int(k32.GetActiveProcessorGroupCount())
-                counts = [int(k32.GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
-                groups = list(range(group_count))
-                try:
-                    GetCurrentProcess = k32.GetCurrentProcess
-                    GetProcessGroupAffinity = getattr(k32, "GetProcessGroupAffinity", None)
-                    if GetProcessGroupAffinity:
-                        handle = GetCurrentProcess()
-                        arr_type = ctypes.c_ushort * max(1, group_count)
-                        arr = arr_type()
-                        needed = ctypes.c_ushort(group_count)
-                        if GetProcessGroupAffinity(handle, ctypes.byref(needed), arr):
-                            groups = list(arr)[: int(needed.value)]
-                except Exception:
-                    pass
-                flattened: list[int] = []
-                base = 0
-                for group_index in range(group_count):
-                    count = counts[group_index]
-                    if group_index in groups:
-                        flattened.extend(range(base, base + count))
-                    base += count
-                if flattened:
-                    return flattened
-            except Exception:
-                pass
-        try:
-            return sorted(int(c) for c in os.sched_getaffinity(0))
-        except Exception:
-            pass
-        return list(range(max(1, os.cpu_count() or 1)))
-
-    @staticmethod
-    def spread_threads() -> bool:
-        candidates: list[str] = []
-        plat = sys.platform
-        if plat.startswith("linux"):
-            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
-        elif plat == "darwin":
-            candidates = ["libomp.dylib", "libiomp5.dylib"]
-        elif os.name == "nt":
-            candidates = ["libiomp5md.dll", "vcomp140.dll"]
-        for name in candidates:
-            try:
-                lib = ctypes.CDLL(name)
-            except OSError:
-                continue
-            try:
-                fn = getattr(lib, "omp_set_proc_bind")
-                fn.argtypes = [ctypes.c_int]
-                fn.restype = None
-                fn(4)
-                return True
-            except Exception:
-                pass
-            try:
-                kmp = getattr(lib, "kmp_set_defaults")
-                kmp.restype = None
-                kmp(b"KMP_AFFINITY=granularity=fine,scatter")
-                return True
-            except Exception:
-                pass
-        return False
-
-    def _next_core(self) -> int:
-        with self._lock:
-            return int(next(self._ring))
-
-    @staticmethod
-    def _pin_thread_windows(core: int) -> bool:
-        try:
-            k32 = ctypes.windll.kernel32
-            GetActiveProcessorGroupCount = k32.GetActiveProcessorGroupCount
-            GetActiveProcessorCount = k32.GetActiveProcessorCount
-            GetCurrentThread = k32.GetCurrentThread
-            SetThreadAffinityMask = k32.SetThreadAffinityMask
-            SetThreadGroupAffinity = k32.SetThreadGroupAffinity
-            SetThreadIdealProcessorEx = getattr(k32, "SetThreadIdealProcessorEx", None)
-
-            GetActiveProcessorGroupCount.restype = ctypes.c_ushort
-            GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
-            GetActiveProcessorCount.restype = ctypes.c_ushort
-            group_count = int(GetActiveProcessorGroupCount())
-            counts = [int(GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
-            total = sum(counts) or (os.cpu_count() or 1)
-            idx = int(core) % max(1, total)
-            group = 0
-            within = idx
-            for gid, cnt in enumerate(counts):
-                if within < cnt:
-                    group = gid
-                    break
-                within -= cnt
-            thread_handle = GetCurrentThread()
-            if group_count <= 1:
-                mask = ctypes.c_size_t(1 << within)
-                prev = SetThreadAffinityMask(thread_handle, mask.value)
-                return bool(prev)
-
-            class GROUP_AFFINITY(ctypes.Structure):
-                _fields_ = [
-                    ("Mask", ctypes.c_ulonglong),
-                    ("Group", ctypes.c_ushort),
-                    ("Reserved", ctypes.c_ushort * 3),
-                ]
-
-            affinity = GROUP_AFFINITY(ctypes.c_ulonglong(1 << within), ctypes.c_ushort(group), (ctypes.c_ushort * 3)(0, 0, 0))
-            ok = SetThreadGroupAffinity(thread_handle, ctypes.byref(affinity), None)
-            if ok and SetThreadIdealProcessorEx is not None:
-                try:
-                    class PROCESSOR_NUMBER(ctypes.Structure):
-                        _fields_ = [
-                            ("Group", ctypes.c_ushort),
-                            ("Number", ctypes.c_ubyte),
-                            ("Reserved", ctypes.c_ubyte),
-                        ]
-
-                    proc_num = PROCESSOR_NUMBER(group, within, 0)
-                    SetThreadIdealProcessorEx(thread_handle, ctypes.byref(proc_num), None)
-                except Exception:
-                    pass
-            return bool(ok)
-        except Exception:
-            return False
-
-    @staticmethod
-    def _pin_thread_linux(core: int) -> bool:
-        try:
-            tid = threading.get_native_id()
-            os.sched_setaffinity(tid, {int(core)})
-            return True
-        except Exception:
-            try:
-                os.sched_setaffinity(0, {int(core)})
-                return True
-            except Exception:
-                return False
-
-    @staticmethod
-    def _pin_thread_bsd(core: int) -> bool:
-        return False
-
-    def pin_thread(self) -> None:
-        if not self._enabled:
-            return
-        attempts = getattr(self._tls, "attempts", 0)
-        if getattr(self._tls, "pinned", False) or attempts >= 4:
-            return
-        self._tls.attempts = attempts + 1
-        core = self._next_core()
-        ok = False
-        if os.name == "nt":
-            ok = self._pin_thread_windows(core)
-        else:
-            plat = sys.platform
-            if plat.startswith("linux"):
-                ok = self._pin_thread_linux(core)
-            elif "bsd" in plat:
-                ok = self._pin_thread_bsd(core)
-            elif plat == "darwin":
-                try:
-                    lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-                    THREAD_AFFINITY_POLICY = 4
-
-                    class thread_affinity_policy_data_t(ctypes.Structure):
-                        _fields_ = [("affinity_tag", ctypes.c_int)]
-
-                    policy = thread_affinity_policy_data_t(int(core) + 1)
-                    lib.mach_thread_self.restype = ctypes.c_uint
-                    lib.thread_policy_set.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint]
-                    port = lib.mach_thread_self()
-                    result = lib.thread_policy_set(port, THREAD_AFFINITY_POLICY, ctypes.byref(policy), 1)
-                    ok = result == 0
-                except Exception:
-                    ok = False
-        self._tls.pinned = bool(ok)
-        self._pin_attempts += 1
-        if ok:
-            self._pin_success += 1
-        if self._pin_attempts >= 16 and self._pin_success == 0 and not self._omp_ok:
-            self._enabled = False
-
-    @staticmethod
-    def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
-        if intra is None and inter is None:
-            _env_optimize_threads()
-            return
-        if intra is not None:
-            try:
-                torch.set_num_threads(max(1, int(intra)))
-            except Exception:
-                pass
-        if inter is not None and hasattr(torch, "set_num_interop_threads"):
-            try:
-                torch.set_num_interop_threads(max(1, int(inter)))
-            except Exception:
-                pass
-
-    def tune_threads(self, io_workers: Optional[int] = None, *args: Any, initial: bool = False, **kwargs: Any) -> None:
-        if not self._enabled:
-            return
-        if initial:
-            cpus = max(1, len(self._allowed_cpus))
-            tuned_workers = max(1, min(int(io_workers if io_workers is not None else self._io_workers), cpus))
-            self._io_workers = tuned_workers
-            try:
-                intra = int(torch.get_num_threads())
-            except Exception:
-                intra = cpus
-            if intra * tuned_workers > cpus:
-                new_intra = max(1, cpus // tuned_workers)
-                self.optimize_threads(intra=new_intra)
-            want_inter = max(1, min(tuned_workers // 2, 4))
-            self.optimize_threads(inter=want_inter)
-            return
-        self._retune_threads()
-
-    def _retune_threads(self) -> None:
-        if not self._enabled:
-            return
-        if self._samples < 128:
-            return
-        now = time.perf_counter()
-        if (now - self._last_retune_ts) < 1.0:
-            return
-        with self._lock:
-            cpu_ns = self._cpu_ns
-            wall_ns = self._wall_ns
-            self._cpu_ns = 0
-            self._wall_ns = 0
-            self._samples = 0
-        self._last_retune_ts = now
-        if wall_ns <= 0:
-            return
-        cpu_ratio = cpu_ns / float(wall_ns)
-        cpus = max(1, len(self._allowed_cpus))
-        workers = max(1, self._io_workers)
-        if cpu_ratio >= 0.5:
-            target_intra = max(1, cpus // workers)
-            if cpus >= 8:
-                target_intra = min(target_intra, 2)
-            self.optimize_threads(intra=target_intra)
-            self.optimize_threads(inter=max(1, min(2, workers)))
-        else:
-            relaxed = min(4, max(1, cpus // max(1, workers // 2)))
-            current = max(1, torch.get_num_threads())
-            if current < relaxed:
-                self.optimize_threads(intra=relaxed)
-
-    def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
-        if not self._enabled:
-            return fn
-
-        def _inner(x: Any) -> Any:
-            self.pin_thread()
-            t0 = time.perf_counter_ns()
-            thread_time = getattr(time, "thread_time_ns", None)
-            tc0 = thread_time() if callable(thread_time) else 0
-            y = fn(x)
-            tc1 = thread_time() if callable(thread_time) else 0
-            t1 = time.perf_counter_ns()
-            with self._lock:
-                self._samples += 1
-                self._cpu_ns += max(0, int(tc1) - int(tc0))
-                self._wall_ns += max(0, int(t1) - int(t0))
-            self.tune_threads()
-            return y
-
-        return _inner
-
-    def optimize_procs(self, io_workers: int) -> int:
-        if not self._enabled:
-            return int(io_workers)
-        cpus = max(1, len(self._allowed_cpus))
-        tuned = max(1, min(int(io_workers), cpus))
-        self._io_workers = tuned
-        return tuned
-
-
-
-class BatchRangeSampler(Sampler[Tuple[int, int]]):
-    """Sampler that yields inclusive-exclusive index ranges for batching."""
-
-    def __init__(
-        self,
-        N: int,
-        start: int,
-        end: int,
-        batch_size: int,
-        *,
-        shuffle: bool,
-        seed: int,
-    ) -> None:
-        self._N = int(max(0, N))
-        self._start = max(0, int(start))
-        self._end = max(self._start, min(int(end), self._N))
-        self._batch = max(1, int(batch_size))
-        self._shuffle = bool(shuffle)
-        self._rng = random.Random(int(seed))
-        self._ranges: list[Tuple[int, int]] = []
-        index = self._start
-        while index < self._end:
-            nxt = min(index + self._batch, self._end)
-            self._ranges.append((index, nxt))
-            index = nxt
-
-    def __iter__(self) -> Iterator[Tuple[int, int]]:
-        order = list(range(len(self._ranges)))
-        if self._shuffle and len(order) > 1:
-            self._rng.shuffle(order)
-        for idx in order:
-            yield self._ranges[idx]
-
-    def __len__(self) -> int:
-        return len(self._ranges)
-
-
 
 def _process_batch(
     batch: Mapping[str, Any],
@@ -435,348 +44,11 @@ def _process_batch(
         and (features.dim() >= 2)
     ):
         features = features.flatten(start_dim=1)
-    labels_tensor = to_torch_tensor(labels)
-    if labels_dtype is not None and getattr(labels_tensor, "dtype", None) != labels_dtype:
-        labels_tensor = labels_tensor.to(dtype=labels_dtype)
-    if sanitize and torch.is_floating_point(labels_tensor):
-        labels_tensor = torch.nan_to_num(
-            labels_tensor, nan=0.0, posinf=0.0, neginf=0.0
-        )
-    return {"X": features, "Y": labels_tensor}
-
-
-def _multiplex(
-    nodes_map: Mapping[str, BaseNode],
-    *args: Any,
-    allow_plain: bool = False,
-    **kwargs: Any,
-) -> BaseNode:
-    if not nodes_map:
-        raise TypeError(
-            "compose expects at least one torchdata.nodes.BaseNode instance."
-        )
-    if MultiNodeWeightedSampler is None:
-        if allow_plain and len(nodes_map) == 1:
-            return next(iter(nodes_map.values()))
-        raise RuntimeError(
-            "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
-        )
-    weights = {key: 1.0 for key in nodes_map}
-    return MultiNodeWeightedSampler(
-        nodes_map,
-        weights,
-        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
-    )
-
-
-def _compose(
-    node: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
-    *args: Any,
-    device: torch.device,
-    threads: Dict[str, int],
-    prefetch_factor: int,
-    non_blocking_copy: bool,
-    map_fn: Callable[[Any], Any],
-    length: Optional[int] = None,
-    **kwargs: Any,
-) -> "BatchLoader":
-    io_workers = max(1, int(threads["dataloader_workers"]))
-    prebatch = max(1, int(threads["prefetch_factor"]))
-    load_balancer = ThreadLoadBalancer(io_workers)
-    io_workers = load_balancer.optimize_procs(io_workers)
-    map_fn = load_balancer.new_thread(map_fn)
-
-    thread_max_concurrent = io_workers
-    if isinstance(node, Mapping):
-        nodes_map: Dict[str, BaseNode] = {}
-        for key, value in node.items():
-            if not isinstance(value, BaseNode):
-                raise TypeError(
-                    "compose mappings must contain torchdata.nodes.BaseNode instances."
-                )
-            nodes_map[str(key)] = value
-        source_node = _multiplex(nodes_map)
-    elif isinstance(node, (list, tuple)):
-        nodes_map = {}
-        for index, value in enumerate(node):
-            if not isinstance(value, BaseNode):
-                raise TypeError(
-                    "compose sequences must contain torchdata.nodes.BaseNode instances."
-                )
-            nodes_map[str(index)] = value
-        source_node = _multiplex(nodes_map)
-    elif isinstance(node, BaseNode):
-        nodes_map = {"default": node}
-        source_node = _multiplex(nodes_map, allow_plain=True)
-    else:
-        raise TypeError(
-            "compose expects BaseNode, Mapping[str, BaseNode], or Sequence[BaseNode]."
-        )
-
-    wrapped: BaseNode = ParallelMapper(
-        source_node,
-        map_fn=map_fn,
-        num_workers=io_workers,
-        in_order=False,
-        method="thread",
-        max_concurrent=None,
-        prebatch=prebatch,
-    )
-    wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
-    if device.type in {"cuda", "xpu", "mps"}:
-        wrapped = PinMemory(wrapped, pin_memory_device=device.type)
-    return BatchLoader(
-        device=device,
-        node=wrapped,
-        prefetch_factor=prefetch_factor,
-        non_blocking=bool(non_blocking_copy),
-        length=length,
-    )
-
-
-def _initialize(
-    memmap_dir: Union[str, Sequence[str], Mapping[str, str]],
-    batch_size: int,
-    val_frac: float,
-    *args: Any,
-    device: torch.device,
-    threads: Dict[str, int],
-    prefetch_factor: int,
-    non_blocking_copy: bool,
-    map_fn: Callable[[Any], Any],
-    dataset_cls: type,
-    sampler_seed: int = 0,
-    train_shuffle: bool = True,
-    **kwargs: Any,
-) -> Tuple[Any, Optional[Any], Disposable]:
-    if MapStyleWrapper is None:
-        raise RuntimeError(
-            "torchdata MapStyleWrapper is required to construct the STNet data pipeline."
-        )
-    if dataset_cls is None:
-        raise ValueError("dataset_cls must be provided for map-style loading")
-
-    allocated = Disposable()
-
-    def _make_node(
-        directory: Union[str, os.PathLike[str]],
-        *,
-        split: str,
-        shuffle: bool,
-    ) -> Tuple[BaseNode, int, int, Tuple[int, int]]:
-        path = os.fspath(directory)
-        dataset = dataset_cls(path, split=split, val_frac=val_frac)
-        allocated.add(dataset)
-        total_samples = int(getattr(dataset, "total", len(dataset)))
-        span = dataset.span
-        start, end = span
-        sampler = BatchRangeSampler(
-            total_samples,
-            start,
-            end,
-            int(batch_size),
-            shuffle=bool(shuffle and (end > start)),
-            seed=sampler_seed,
-        )
-        allocated.add(sampler)
-        node = MapStyleWrapper(dataset, sampler)
-        return node, len(sampler), total_samples, span
-
-    if isinstance(memmap_dir, (list, tuple)):
-        node_tr = [
-            _make_node(directory, split="train", shuffle=train_shuffle)[0]
-            for directory in memmap_dir
-        ]
-        train_loader = _compose(
-            node_tr,
-            device=device,
-            threads=threads,
-            prefetch_factor=prefetch_factor,
-            non_blocking_copy=non_blocking_copy,
-            map_fn=map_fn,
-            length=None,
-        )
-        return (train_loader, None, allocated)
-
-    if isinstance(memmap_dir, Mapping):
-        node_tr = {
-            str(key): _make_node(directory, split="train", shuffle=train_shuffle)[0]
-            for key, directory in memmap_dir.items()
-        }
-        train_loader = _compose(
-            node_tr,
-            device=device,
-            threads=threads,
-            prefetch_factor=prefetch_factor,
-            non_blocking_copy=non_blocking_copy,
-            map_fn=map_fn,
-            length=None,
-        )
-        return (train_loader, None, allocated)
-
-    node_tr, train_length, total, train_span = _make_node(
-        memmap_dir, split="train", shuffle=train_shuffle
-    )
-    train_start, train_end = train_span
-    train_loader = _compose(
-        node_tr,
-        device=device,
-        threads=threads,
-        prefetch_factor=prefetch_factor,
-        non_blocking_copy=non_blocking_copy,
-        map_fn=map_fn,
-        length=train_length,
-    )
-    val_loader: Optional[Any] = None
-    if val_frac > 0 and train_end < total:
-        node_vl, val_length, _, val_span = _make_node(
-            memmap_dir, split="val", shuffle=False
-        )
-        val_start, val_end = val_span
-        if val_end > val_start and val_length > 0:
-            val_loader = _compose(
-                node_vl,
-                device=device,
-                threads=threads,
-                prefetch_factor=prefetch_factor,
-                non_blocking_copy=non_blocking_copy,
-                map_fn=map_fn,
-                length=val_length,
-            )
-    return (train_loader, val_loader, allocated)
-
-
-class BatchLoader:
-    def __init__(
-        self,
-        device: torch.device,
-        *args: Any,
-        node: BaseNode | None = None,
-        dataset: BaseNode | None = None,
-        prefetch_factor: int = 2,
-        non_blocking: bool = True,
-        length: Optional[int] = None,
-        **kwargs: Any,
-    ) -> None:
-        node_obj = node or dataset
-        if not isinstance(node_obj, BaseNode):
-            raise TypeError(
-                "data.pipeline.BatchLoader supports only torchdata.nodes.BaseNode instances."
-            )
-        self._node = node_obj
-        self._device = device
-        self._prefetch_factor = max(1, int(prefetch_factor or 2))
-        self._non_blocking = bool(non_blocking)
-        self._length = int(length) if length is not None else None
-        base = Loader(self._node)
-        dev_t = getattr(self._device, "type", "cpu")
-        if dev_t in ("cuda", "mps", "xpu") and DevicePrefetcher is not None:
-            try:
-                gpu_guard_default = "2048" if dev_t == "cuda" else "512"
-                gpu_guard_mb = int(
-                    os.environ.get("STNET_GPU_GUARD_MB", gpu_guard_default)
-                )
-            except Exception:
-                gpu_guard_mb = 2048 if dev_t == "cuda" else 512
-            try:
-                host_guard_mb = int(os.environ.get("STNET_HOST_GUARD_MB", "1024"))
-            except Exception:
-                host_guard_mb = 1024
-            try:
-                self._iterable = DevicePrefetcher(
-                    base,
-                    device=self._device,
-                    depth=self._prefetch_factor,
-                    memory_backpressure=True,
-                    gpu_guard_bytes=gpu_guard_mb * (1 << 20),
-                    host_guard_bytes=host_guard_mb * (1 << 20),
-                )
-            except TypeError:
-                self._iterable = base
-        else:
-            self._iterable = base
-
-    def __iter__(self) -> Any:
-        return iter(self._iterable)
-
-    def __len__(self) -> Any:
-        if self._length is not None:
-            return self._length
-        try:
-            length = _get_node_length(self._node)
-            return length if length is not None else 1
-        except Exception:
-            return 1
-
-
-def _get_node_length(node: BaseNode) -> int | None:
-    candidates = [
-        lambda: len(node),
-        getattr(node, "length", None),
-        getattr(node, "size", None),
-        getattr(node, "num_rows", None),
-    ]
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        try:
-            value = candidate() if callable(candidate) else candidate
-            if value is None:
-                continue
-            return int(value)
-        except Exception:
-            continue
-    return None
-
-
-def _flatten_args(objs: Iterable[Any]) -> Iterable[Any]:
-    for obj in objs:
-        if obj is None:
-            continue
-        if isinstance(obj, (list, tuple, set)):
-            for item in _flatten_args(obj):
-                if item is not None:
-                    yield item
-            continue
-        yield obj
-
-
-class Disposable:
-    __slots__ = ("_objs",)
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        self._objs = list(_flatten_args(args))
-        if kwargs:
-            self._objs.extend(list(_flatten_args(kwargs.values())))
-
-    def add(self, *args: Any, **kwargs: Any) -> None:
-        self._objs.extend(list(_flatten_args(args)))
-        if kwargs:
-            self._objs.extend(list(_flatten_args(kwargs.values())))
-
-    def cleanup(self) -> None:
-        for obj in self._objs:
-            cleaned = False
-            for name in (
-                "cleanup",
-                "close",
-                "shutdown",
-                "stop",
-                "terminate",
-                "join",
-                "disconnect",
-                "release",
-            ):
-                if hasattr(obj, name):
-                    with suppress(Exception):
-                        getattr(obj, name)()
-                    cleaned = True
-                    break
-            if cleaned:
-                continue
-            if callable(obj):
-                with suppress(Exception):
-                    obj()
+    if labels_dtype is not None and isinstance(labels, torch.Tensor):
+        labels = labels.to(dtype=labels_dtype, non_blocking=True)
+    if sanitize and torch.is_floating_point(labels):
+        labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+    return {"X": features, "Y": labels}
 
 
 def collate(
@@ -799,17 +71,11 @@ def collate(
         batch_list = []
         for item in sample:
             if isinstance(item, TensorDictBase):
-                batch_list.append(item)
-                continue
+                batch_list.append(item); continue
             if isinstance(item, Mapping):
                 conv = converter(item)
                 td = TensorDict(
-                    {
-                        "X": conv["X"],
-                        "Y": conv["Y"],
-                        "features": conv["X"],
-                        "labels": conv["Y"],
-                    },
+                    {"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]},
                     batch_size=[],
                 )
                 batch_list.append(td)
@@ -820,16 +86,193 @@ def collate(
         return batch_list
     if isinstance(sample, Mapping):
         conv = converter(sample)
-        return TensorDict(
-            {
-                "X": conv["X"],
-                "Y": conv["Y"],
-                "features": conv["X"],
-                "labels": conv["Y"],
-            },
-            batch_size=[],
-        )
+        return TensorDict({"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]}, batch_size=[])
     return sample
+
+class Disposable:
+    def __init__(self) -> None:
+        self._keep: list[Any] = []
+
+    def add(self, obj: Any) -> None:
+        self._keep.append(obj)
+
+    def __iter__(self):
+        return iter(self._keep)
+
+class BatchRangeSampler(Sampler[Tuple[int, int]]):
+    def __init__(self, *, start: int, end: int, batch_size: int, shuffle: bool = True, seed: int = 0) -> None:
+        self._start = int(start); self._end = int(end); self._B = max(1, int(batch_size))
+        self._shuffle = bool(shuffle)
+        self._rng = random.Random(int(seed))
+        self._cuts = list(range(self._start, self._end, self._B))
+        if self._end > self._start and (not self._cuts or self._cuts[-1] != self._end):
+            self._cuts.append(self._end)
+
+    def __iter__(self):
+        n = max(0, len(self._cuts) - 1)
+        idxs = list(range(n))
+        if self._shuffle:
+            self._rng.shuffle(idxs)
+        for i in idxs:
+            s = self._cuts[i]; e = self._cuts[i+1]
+            if e > s:
+                yield (s, e)
+
+    def __len__(self) -> int:
+        return max(0, (self._end - self._start + self._B - 1) // self._B)
+
+    def compose(self, dataset: "Dataset") -> "BaseNode":
+        if MapStyleWrapper is None:
+            raise RuntimeError("torchdata.nodes.MapStyleWrapper is required")
+        return MapStyleWrapper(dataset, self)
+
+
+class BatchMultiplexer:
+
+    def __init__(self, *, stop_criteria: str = "ALL_DATASETS_EXHAUSTED", weights: Optional[Mapping[str, float]] = None, seed: int = 0) -> None:
+        self.stop_criteria = str(stop_criteria)
+        self.weights = dict(weights) if isinstance(weights, Mapping) else None
+        self.seed = int(seed)
+
+    def compose(self, sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode") -> "BaseNode":
+        if isinstance(sources, BaseNode):
+            return sources
+        if isinstance(sources, (list, tuple)):
+            if len(sources) == 1:
+                return sources[0]
+            sources_map = {str(i): n for i, n in enumerate(sources)}
+        elif isinstance(sources, Mapping):
+            sources_map = dict(sources)
+            if len(sources_map) == 1:
+                return next(iter(sources_map.values()))
+        else:
+            raise TypeError("sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]")
+        if MultiNodeWeightedSampler is None:
+            raise RuntimeError("torchdata.nodes.MultiNodeWeightedSampler is required for multi-source mixing")
+        w = self.weights or {k: 1.0 for k in sources_map}
+        return MultiNodeWeightedSampler(sources_map, w, stop_criteria=self.stop_criteria)
+
+
+class BatchMapper:
+    def __init__(self, *, map_fn: Callable[[Any], Any], io_workers: int, prebatch: int, prefetch_factor: int, device: torch.device, non_blocking: bool = True) -> None:
+        self.map_fn = map_fn
+        self.io_workers = max(1, int(io_workers))
+        self.prebatch = max(1, int(prebatch))
+        self.prefetch_factor = max(1, int(prefetch_factor))
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.non_blocking = bool(non_blocking)
+
+    def compose(self, source: "BaseNode") -> "BaseNode":
+        node = ParallelMapper(
+            source,
+            map_fn=self.map_fn,
+            num_workers=self.io_workers,
+            in_order=False,
+            method="thread",
+            max_concurrent=None,
+            prebatch=self.prebatch,
+        )
+        node = Prefetcher(node, prefetch_factor=self.prefetch_factor)
+        if self.device.type in {"cuda", "xpu", "mps"}:
+            node = PinMemory(node, pin_memory_device=self.device.type)
+        return node
+
+
+class BatchLoader:
+    def __init__(
+        self,
+        device: torch.device,
+        *args: Any,
+        node: BaseNode | None = None,
+        dataset: BaseNode | None = None,
+        prefetch_factor: int = 2,
+        non_blocking: bool = True,
+        length: Optional[int] = None,
+        **kwargs: Any,
+    ) -> None:
+        node_obj = node or dataset
+        if not isinstance(node_obj, BaseNode):
+            raise TypeError("BatchLoader supports only torchdata.nodes.BaseNode instances.")
+        self._device = device if isinstance(device, torch.device) else torch.device(device)
+        self._prefetch_factor = max(1, int(prefetch_factor))
+        self._non_blocking = bool(non_blocking)
+        self._length = int(length) if length is not None else None
+        base = Loader(node_obj)
+        dev_t = getattr(self._device, "type", "cpu")
+        if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
+            try:
+                gpu_guard_default = "2048" if dev_t == "cuda" else "512"
+                gpu_guard_mb = int(os.environ.get("STNET_GPU_GUARD_MB", gpu_guard_default))
+            except Exception:
+                gpu_guard_mb = 2048 if dev_t == "cuda" else 512
+            try:
+                host_guard_mb = int(os.environ.get("STNET_HOST_GUARD_MB", "1024"))
+            except Exception:
+                host_guard_mb = 1024
+            self._iterable = DevicePrefetcher(
+                base,
+                device=self._device,
+                depth=self._prefetch_factor,
+                non_blocking=True,
+                memory_backpressure=True,
+                gpu_guard_bytes=gpu_guard_mb * (1 << 20),
+                host_guard_bytes=host_guard_mb * (1 << 20),
+            )
+        else:
+            self._iterable = base
+
+    def __iter__(self):
+        return iter(self._iterable)
+
+    def __len__(self) -> int:
+        if self._length is not None:
+            return int(self._length)
+        try:
+            return 1 if self._length is None else int(self._length)
+        except Exception:
+            return 1
+
+
+def _env_optimize_threads() -> Dict[str, int]:
+    try:
+        workers = max(1, int(os.environ.get("STNET_WORKERS", "4")))
+    except Exception:
+        workers = 4
+    try:
+        pfetch = max(1, int(os.environ.get("STNET_PREFETCH", "8")))
+    except Exception:
+        pfetch = 8
+    return {"dataloader_workers": workers, "prefetch_factor": pfetch}
+
+
+def compose(
+    node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
+    *,
+    device: Union[str, torch.device],
+    map_fn: Callable[[Any], Any],
+    prefetch_factor: int,
+    non_blocking_copy: bool,
+    io_workers: int,
+    prebatch: int,
+) -> Tuple[BaseNode, BaseNode, BaseNode]:
+    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
+
+    mux = BatchMultiplexer(
+        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
+        seed=int(os.environ.get("STNET_BLOCK_SEED", "0") or "0"),
+    )
+    source = mux.compose(node_or_nodes)
+
+    mapper = BatchMapper(
+        map_fn=map_fn,
+        io_workers=io_workers,
+        prebatch=prebatch,
+        prefetch_factor=prefetch_factor,
+        device=device_obj,
+        non_blocking=bool(non_blocking_copy),
+    )
+    mapped = mapper.compose(source)
+    return source, mapped, mapped
 
 
 def fetch(
@@ -845,41 +288,74 @@ def fetch(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], Disposable]:
-    device_obj = (
-        torch.device(device)
-        if not isinstance(device, torch.device)
-        else device
-    )
+    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
     threads = _env_optimize_threads()
+    io_workers = max(1, int(threads.get("dataloader_workers", 2)))
+    prebatch = max(1, int(threads.get("prefetch_factor", 2)))
+
     map_fn = partial(
         collate,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
         flatten_features=flatten_features,
     )
-    sampler_seed = int(os.environ.get("STNET_SAMPLER_SEED", "0") or "0")
-    train_shuffle = os.environ.get("STNET_SHUFFLE", "1")
-    train_shuffle_flag = train_shuffle not in {"", "0", "false", "False"}
 
-    if MapStyleWrapper is None:
-        raise RuntimeError(
-            "torchdata MapStyleWrapper is required to construct the STNet data pipeline."
-        )
-    dataset_cls = Dataset
-    wrap_kwargs = dict(
-        device=device_obj,
-        threads=threads,
-        prefetch_factor=prefetch_factor,
-        non_blocking_copy=bool(non_blocking_copy),
-        map_fn=map_fn,
-        dataset_cls=dataset_cls,
-        sampler_seed=sampler_seed,
-        train_shuffle=train_shuffle_flag,
-    )
+    allocated = Disposable()
 
-    return _initialize(
-        memmap_dir,
-        int(batch_size),
-        val_frac,
-        **wrap_kwargs,
-    )
+    def _make_node_for(directory: Union[str, os.PathLike[str]], split: str, shuffle: bool) -> Tuple[BaseNode, int]:
+        path = os.fspath(directory)
+        ds = Dataset(path, split=split, val_frac=float(val_frac))
+        allocated.add(ds)
+        samp = BatchRangeSampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=int(os.environ.get("STNET_SAMPLER_SEED","0") or "0"))
+        node = samp.compose(ds)
+        return node, len(samp)
+
+    if isinstance(memmap_dir, Mapping):
+        nodes_map: Dict[str, BaseNode] = {}
+        lengths: Dict[str, int] = {}
+        for key, directory in memmap_dir.items():
+            node, length = _make_node_for(directory, split="train", shuffle=True)
+            nodes_map[str(key)] = node
+            lengths[str(key)] = length
+        _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        train_length = sum(lengths.values()) if lengths else None
+    elif isinstance(memmap_dir, (list, tuple)):
+        nodes_list: list[BaseNode] = []
+        lengths: list[int] = []
+        for directory in memmap_dir:
+            node, length = _make_node_for(directory, split="train", shuffle=True)
+            nodes_list.append(node); lengths.append(length)
+        _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        train_length = sum(lengths) if lengths else None
+    else:
+        node, length = _make_node_for(memmap_dir, split="train", shuffle=True)
+        _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        train_length = length
+
+    train_loader = BatchLoader(device=device_obj, node=mapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=train_length)
+
+    val_loader = None
+    if float(val_frac) > 0.0:
+        if isinstance(memmap_dir, Mapping):
+            nodes_map = {}
+            lengths = {}
+            for key, directory in memmap_dir.items():
+                node, length = _make_node_for(directory, split="val", shuffle=False)
+                nodes_map[str(key)] = node; lengths[str(key)] = length
+            _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            val_len = sum(lengths.values()) if lengths else None
+        elif isinstance(memmap_dir, (list, tuple)):
+            nodes_list = []
+            lengths = []
+            for directory in memmap_dir:
+                node, length = _make_node_for(directory, split="val", shuffle=False)
+                nodes_list.append(node); lengths.append(length)
+            _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            val_len = sum(lengths) if lengths else None
+        else:
+            node, length = _make_node_for(memmap_dir, split="val", shuffle=False)
+            _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            val_len = length
+        val_loader = BatchLoader(device=device_obj, node=vmapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=val_len)
+
+    return (train_loader, val_loader, allocated)
