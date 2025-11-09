@@ -7,6 +7,7 @@ import os
 import random
 import time
 from collections import deque
+from threading import Lock
 from contextlib import nullcontext, suppress
 from typing import (
     Any,
@@ -177,6 +178,12 @@ class SampleReader:
         self._val_frac_override = val_frac
         self._batch_size = batch_size
         self._meta: Optional[Dict[str, Any]] = None
+        self._td = None
+        self._features_arr = None
+        self._labels_arr = None
+        self._feat_mmt = None
+        self._lab_mmt = None
+        self._init_lock = Lock()
 
     @classmethod
     def from_dir(
@@ -347,41 +354,64 @@ class SampleReader:
     def __len__(self) -> int:
         return len(self._indices())
 
+    def clear(self) -> None:
+        self._td = None
+        self._features_arr = None
+        self._labels_arr = None
+        self._feat_mmt = None
+        self._lab_mmt = None
+        self._init_lock = Lock()
+
+    def _coerce_arrays(self) -> None:
+        if self._features_arr is not None and self._labels_arr is not None:
+            return
+        with self._init_lock:
+            if self._features_arr is not None and self._labels_arr is not None:
+                return
+            meta = self._load_meta()
+            total = int(meta["N"])
+            feat_dim = int(meta["feature_dim"])
+            label_shape = list(meta["label_shape"])
+            label_flat = int(torch.tensor(label_shape).prod().item()) if label_shape else 1
+            td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
+            if os.path.isdir(td_prefix):
+                nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
+                if self._td is None:
+                    self._td = load_memmap(td_prefix, non_blocking=nb)
+                self._features_arr = self._td.get("features")
+                self._labels_arr = self._td.get("labels")
+            else:
+                feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
+                label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
+                feat_dtype = _resolve_dtype(meta, "features_dtype")
+                label_dtype = _resolve_dtype(meta, "labels_dtype")
+                if self._feat_mmt is None:
+                    self._feat_mmt = MemoryMappedTensor.from_filename(
+                        feat_path, dtype=feat_dtype, shape=(total, feat_dim)
+                    )
+                if self._lab_mmt is None:
+                    self._lab_mmt = MemoryMappedTensor.from_filename(
+                        label_path, dtype=label_dtype, shape=(total, label_flat)
+                    )
+                self._features_arr = self._feat_mmt
+                self._labels_arr = self._lab_mmt
+
     def iter_batch(
         self, start: int, end: int
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         meta = self._load_meta()
         pin_env = bool(int(os.environ.get("STNET_PIN_MEMORY", "0")))
-        total = int(meta["N"])
-        feat_dim = int(meta["feature_dim"])
         label_shape = list(meta["label_shape"])
-        label_flat = (
-            int(torch.tensor(label_shape).prod().item()) if label_shape else 1
-        )
-        td_prefix = os.path.join(self.dir, meta.get("tensordict_prefix", "td_memmap"))
-        if os.path.isdir(td_prefix):
-            nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
-            td = load_memmap(td_prefix, non_blocking=nb)
-            features = td.get("features")[start:end]
-            labels = td.get("labels")[start:end]
-        else:
-            feat_path = os.path.join(self.dir, meta.get("features_filename", "features.mmt"))
-            label_path = os.path.join(self.dir, meta.get("labels_filename", "labels.mmt"))
-            feat_dtype = _resolve_dtype(meta, "features_dtype")
-            label_dtype = _resolve_dtype(meta, "labels_dtype")
-            features = MemoryMappedTensor.from_filename(feat_path, dtype=feat_dtype, shape=(total, feat_dim))[start:end]
-            labels = MemoryMappedTensor.from_filename(label_path, dtype=label_dtype, shape=(total, label_flat))[start:end]
+        self._coerce_arrays()
+        features = self._features_arr[start:end]
+        labels = self._labels_arr[start:end]
         if label_shape:
-            labels = labels.view(-1, *label_shape)
+            labels = labels.view(end - start, *label_shape)
         features_tensor = (
-            features
-            if isinstance(features, torch.Tensor)
-            else torch.as_tensor(features)
+            features if isinstance(features, torch.Tensor) else torch.as_tensor(features)
         )
         labels_tensor = (
-            labels
-            if isinstance(labels, torch.Tensor)
-            else torch.as_tensor(labels)
+            labels if isinstance(labels, torch.Tensor) else torch.as_tensor(labels)
         )
         if pin_env and hasattr(features_tensor, "pin_memory"):
             with suppress(Exception):
