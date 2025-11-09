@@ -16,6 +16,8 @@ from typing import (
     Union,
 )
 
+from ..data.nodes import SourceSpec
+
 import torch
 
 
@@ -359,7 +361,7 @@ class RuntimeConfig:
     in_dim: int
     out_shape: Tuple[int, ...]
     cfg_dict: Dict[str, Any]
-    memmap_dir: Optional[str] = None
+    sources: Optional[Union[SourceSpec, Sequence[SourceSpec], Dict[str, SourceSpec]]] = None
     ckpt_dir: Optional[str] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
@@ -417,11 +419,11 @@ class RuntimeConfig:
             "cfg_dict",
         }
         if mode == "train":
-            for k in ("memmap_dir", "ckpt_dir"):
+            for k in ("sources", "ckpt_dir"):
                 if k not in kwargs or kwargs[k] is None:
                     raise ValueError(f"RuntimeConfig(train) missing required key: {k}")
             allowed = common_keys | {
-                "memmap_dir",
+                "sources",
                 "ckpt_dir",
                 "init_ckpt_dir",
                 "epochs",
@@ -452,7 +454,7 @@ class RuntimeConfig:
                 in_dim=in_dim,
                 out_shape=out_shape,
                 cfg_dict=cfg_dict,
-                memmap_dir=str(kwargs["memmap_dir"]),
+                sources=kwargs["sources"],
                 ckpt_dir=str(kwargs["ckpt_dir"]),
                 init_ckpt_dir=kwargs.get("init_ckpt_dir"),
                 epochs=int(kwargs.get("epochs", 5)),
@@ -471,11 +473,11 @@ class RuntimeConfig:
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
                 loss_mask_value=kwargs.get("loss_mask_value"),
             )
-        for k in ("memmap_dir", "keys"):
+        for k in ("sources", "keys"):
             if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig({mode}) missing required key: {k}")
         allowed = common_keys | {
-            "memmap_dir",
+            "sources",
             "keys",
             "model_ckpt_dir",
             "batch_size",
@@ -493,7 +495,7 @@ class RuntimeConfig:
             in_dim=in_dim,
             out_shape=out_shape,
             cfg_dict=cfg_dict,
-            memmap_dir=str(kwargs["memmap_dir"]),
+            sources=kwargs["sources"],
             model_ckpt_dir=kwargs.get("model_ckpt_dir"),
             keys=list(kwargs["keys"]),
             batch_size=batch_size,

@@ -677,7 +677,7 @@ def train(
             local_addr=master_addr,
         )
         base = dict(
-            memmap_dir=memmap_dir,
+            sources={"kind": "memmap", "path": memmap_dir},
             ckpt_dir=ckpt_dir,
             init_ckpt_dir=init_dir,
             in_dim=int(first_feats.shape[1]),
@@ -818,7 +818,7 @@ def predict(
     )
     base = dict(
         model_ckpt_dir=dcp_dir,
-        memmap_dir=memmap_dir,
+        sources={"kind": "memmap", "path": memmap_dir},
         in_dim=int(feats.shape[1]),
         out_shape=tuple(label_shape),
         cfg_dict=cfg_dict,
