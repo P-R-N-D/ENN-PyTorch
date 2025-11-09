@@ -1219,6 +1219,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 val_frac=float(ops.val_frac),
                 prefetch_factor=ops.prefetch_factor,
                 non_blocking_copy=bool(ops.overlap_h2d),
+                flatten_features=True,
             )
             if restore_dl_state:
                 with contextlib.suppress(Exception):
