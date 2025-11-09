@@ -99,7 +99,7 @@ class Dataset:
         return self._slice(i, i + 1)
 
 
-class DevicePrefetcher:
+class Prefetcher:
 
     def __init__(
         self,
