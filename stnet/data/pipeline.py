@@ -421,7 +421,11 @@ def _multiplex(
             "torchdata.nodes.MultiNodeWeightedSampler is required to compose multiple nodes."
         )
     weights = {key: 1.0 for key in nodes_map}
-    return MultiNodeWeightedSampler(nodes_map, weights)
+    return MultiNodeWeightedSampler(
+        nodes_map,
+        weights,
+        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
+    )
 
 
 def _compose(
@@ -472,9 +476,9 @@ def _compose(
         source_node,
         map_fn=map_fn,
         num_workers=io_workers,
-        in_order=True,
+        in_order=False,
         method="thread",
-        max_concurrent=thread_max_concurrent,
+        max_concurrent=None,
         prebatch=prebatch,
     )
     wrapped = Prefetcher(wrapped, prefetch_factor=prefetch_factor)
