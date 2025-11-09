@@ -183,6 +183,7 @@ class SampleReader:
         self._labels_arr = None
         self._feat_mmt = None
         self._lab_mmt = None
+        self._init_lock = Lock()
 
     @classmethod
     def from_dir(
