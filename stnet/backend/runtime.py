@@ -365,12 +365,9 @@ def _x_for_swa(train_loader: Any, device: torch.device, in_dim: int, swa_in_key:
 
 
 def _first_source_path(obj: Any) -> str:
-    # Accept SourceSpec | list[SourceSpec] | dict[str, SourceSpec]
     if isinstance(obj, dict):
-        # SourceSpec?
         if "path" in obj and "kind" in obj:
             return os.fspath(obj["path"])
-        # mapping case
         if obj:
             first = next(iter(obj.values()))
             return _first_source_path(first)
@@ -380,7 +377,6 @@ def _first_source_path(obj: Any) -> str:
 
 
 def _expand(sources: Any) -> Any:
-    """Expand multinode.json from a SourceSpec root when applicable."""
 
     def _expand_from_root(spec: Any) -> Tuple[Any, bool]:
         if not isinstance(spec, dict) or "path" not in spec or "kind" not in spec:
