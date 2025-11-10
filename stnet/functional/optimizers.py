@@ -19,7 +19,7 @@ import torch
 from torch import nn, optim
 from tensordict import TensorDict, TensorDictBase
 
-from ..backend.environment import (
+from ..backend.system import (
     get_device,
     is_float8_supported,
     is_int4_supported,

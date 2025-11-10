@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from tensordict import tensorclass
 
-from ..backend.environment import cuda_compute_capability
+from ..backend.system import cuda_compute_capability
 
 
 TExtra = TypeVar("TExtra")

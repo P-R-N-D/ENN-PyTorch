@@ -15,7 +15,7 @@ from tensordict import TensorDict, TensorDictBase
 from tensordict.nn import CudaGraphModule, TensorDictModule, TensorDictSequential
 
 from ..backend.compat import patch_torch
-from ..backend.environment import (
+from ..backend.system import (
     get_device,
     is_cpu_bf16_supported,
     is_cuda_bf16_supported,
