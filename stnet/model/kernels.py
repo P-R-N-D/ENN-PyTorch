@@ -13,7 +13,7 @@ import torch._dynamo
 from torch import nn
 
 from ..backend.profiler import FLOP_PROFILER, capture
-from ..backend.environment import (
+from ..backend.system import (
     cuda_compute_capability,
     get_device,
     get_runtime_config,

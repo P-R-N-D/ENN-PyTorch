@@ -43,7 +43,7 @@ from ..backend.distributed import (
     get_preferred_ip,
     initialize_master_addr,
 )
-from ..backend.environment import (
+from ..backend.system import (
     initialize_python_path,
     new_dir,
     optimize_threads,

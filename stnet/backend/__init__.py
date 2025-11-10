@@ -38,10 +38,11 @@ from .distributed import (
     to_fsdp,
     validate_ip_expr,
 )
-from .environment import (
+from .system import (
     cpu_count,
     cuda_compute_capability,
     default_temp,
+    get_tlb,
     get_device,
     get_runtime_config,
     initialize_python_path,
@@ -59,6 +60,9 @@ from .environment import (
     optimal_threads,
     optimize_threads,
     set_multiprocessing_env,
+    worker_init_pin,
+    wrap_with_tlb,
+    Thread,
 )
 
 __all__ = [
@@ -86,6 +90,7 @@ __all__ = [
     "validate_ip_expr",
     "get_available_host",
     "get_device",
+    "get_tlb",
     "get_preferred_ip",
     "get_runtime_config",
     "get_world_size",
@@ -113,7 +118,10 @@ __all__ = [
     "optimal_start_method",
     "optimal_threads",
     "optimize_threads",
+    "Thread",
     "predict",
+    "worker_init_pin",
+    "wrap_with_tlb",
     "supported_ip_ver",
     "resolve_ip_expr",
     "runtime_config",
