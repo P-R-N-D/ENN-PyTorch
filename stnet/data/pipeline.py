@@ -26,7 +26,6 @@ from typing import Mapping as _Mapping
 
 
 def _is_source_spec(obj: Any) -> bool:
-    # 최소 요건: mapping이면서 필수 키 보유, path는 경로형
     if not isinstance(obj, _Mapping):
         return False
     if "kind" not in obj or "path" not in obj:
@@ -41,11 +40,11 @@ def _is_source_spec(obj: Any) -> bool:
 
 def dataset(
     source: SourceSpec,
-    *,
+    *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
+    **kwargs: Any,
 ) -> "Dataset":
-    """Create Dataset strictly from SourceSpec."""
     kind = str(source.get("kind"))
     if kind != "memmap":
         raise ValueError(f"Unsupported source kind: {kind!r}")
