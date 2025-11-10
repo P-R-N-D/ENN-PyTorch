@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any
+from importlib import import_module
+from typing import Any, Dict, Tuple
 
 from tensordict import set_list_to_stack
 
@@ -17,39 +18,8 @@ try:
 except Exception:
     pass
 
-from .api.config import (
-    BuildConfig,
-    ModelConfig,
-    OpsMode,
-    PatchConfig,
-    RuntimeConfig,
-    coerce_model_config,
-    coerce_patch_config,
-    coerce_runtime_config,
-    model_config,
-    patch_config,
-    runtime_config,
-)
-
-__all__ = [
+_MODEL_EXPORTS = (
     "Root",
-    "ModelConfig",
-    "PatchConfig",
-    "BuildConfig",
-    "OpsMode",
-    "RuntimeConfig",
-    "runtime_config",
-    "coerce_runtime_config",
-    "model_config",
-    "patch_config",
-    "coerce_model_config",
-    "coerce_patch_config",
-    "train",
-    "predict",
-    "new_model",
-    "load_model",
-    "save_model",
-    "joining",
     "SpatialEncoder",
     "TemporalEncoder",
     "LocalProcessor",
@@ -69,72 +39,63 @@ __all__ = [
     "StandardNormalLoss",
     "StudentsTLoss",
     "DataFidelityLoss",
+)
+
+_BACKEND_EXPORTS: Dict[str, Tuple[str, str]] = {
+    "train": ("stnet.api.run", "train"),
+    "predict": ("stnet.api.run", "predict"),
+    "new_model": ("stnet.api.io", "new_model"),
+    "load_model": ("stnet.api.io", "load_model"),
+    "save_model": ("stnet.api.io", "save_model"),
+    "joining": ("stnet.backend.distributed", "joining"),
+}
+
+_CONFIG_EXPORTS: Dict[str, Tuple[str, str]] = {
+    "ModelConfig": ("stnet.api.config", "ModelConfig"),
+    "PatchConfig": ("stnet.api.config", "PatchConfig"),
+    "BuildConfig": ("stnet.api.config", "BuildConfig"),
+    "OpsMode": ("stnet.api.config", "OpsMode"),
+    "RuntimeConfig": ("stnet.api.config", "RuntimeConfig"),
+    "runtime_config": ("stnet.api.config", "runtime_config"),
+    "coerce_runtime_config": ("stnet.api.config", "coerce_runtime_config"),
+    "model_config": ("stnet.api.config", "model_config"),
+    "patch_config": ("stnet.api.config", "patch_config"),
+    "coerce_model_config": ("stnet.api.config", "coerce_model_config"),
+    "coerce_patch_config": ("stnet.api.config", "coerce_patch_config"),
+}
+
+_LAZY_EXPORTS: Dict[str, Tuple[str, str]] = {
+    **{name: ("stnet.model", name) for name in _MODEL_EXPORTS},
+    **_BACKEND_EXPORTS,
+    **_CONFIG_EXPORTS,
+}
+
+__all__ = [
+    "ModelConfig",
+    "PatchConfig",
+    "BuildConfig",
+    "OpsMode",
+    "RuntimeConfig",
+    "runtime_config",
+    "coerce_runtime_config",
+    "model_config",
+    "patch_config",
+    "coerce_model_config",
+    "coerce_patch_config",
+    *_BACKEND_EXPORTS.keys(),
+    *_MODEL_EXPORTS,
 ]
 
 
 def __getattr__(name: str) -> Any:
-    if name in {
-        "Root",
-        "SpatialEncoder",
-        "TemporalEncoder",
-        "LocalProcessor",
-        "PatchAttention",
-        "CrossAttention",
-        "PointTransformer",
-        "Retention",
-        "RetNet",
-        "DilatedAttention",
-        "LongNet",
-        "CrossTransformer",
-        "Payload",
-        "GlobalEncoder",
-        "GeGLU",
-        "SwiGLU",
-        "MultipleQuantileLoss",
-        "StandardNormalLoss",
-        "StudentsTLoss",
-        "DataFidelityLoss",
-    }:
-        from . import model as model_ns
-
-        mapping = {
-            "Root": model_ns.Root,
-            "SpatialEncoder": model_ns.SpatialEncoder,
-            "TemporalEncoder": model_ns.TemporalEncoder,
-            "LocalProcessor": model_ns.LocalProcessor,
-            "PatchAttention": model_ns.PatchAttention,
-            "CrossAttention": model_ns.CrossAttention,
-            "PointTransformer": model_ns.PointTransformer,
-            "Retention": model_ns.Retention,
-            "RetNet": model_ns.RetNet,
-            "DilatedAttention": model_ns.DilatedAttention,
-            "LongNet": model_ns.LongNet,
-            "CrossTransformer": model_ns.CrossTransformer,
-            "Payload": model_ns.Payload,
-            "GlobalEncoder": model_ns.GlobalEncoder,
-            "GeGLU": model_ns.GeGLU,
-            "SwiGLU": model_ns.SwiGLU,
-            "MultipleQuantileLoss": model_ns.MultipleQuantileLoss,
-            "StandardNormalLoss": model_ns.StandardNormalLoss,
-            "StudentsTLoss": model_ns.StudentsTLoss,
-            "DataFidelityLoss": model_ns.DataFidelityLoss,
-        }
-        return mapping[name]
-    if name in {"train", "predict", "new_model", "load_model", "save_model", "joining"}:
-        from .backend import joining as _joining, load_model as _load_model
-        from .backend import new_model as _new_model, predict as _predict, save_model as _save_model
-        from .backend import train as _train
-
-        mapping = {
-            "train": _train,
-            "predict": _predict,
-            "new_model": _new_model,
-            "load_model": _load_model,
-            "save_model": _save_model,
-            "joining": _joining,
-        }
-        return mapping[name]
-    raise AttributeError(f"module 'stnet' has no attribute '{name}'")
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module 'stnet' has no attribute '{name}'")
+    module_name, attr_name = target
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
 
 def __dir__() -> list[str]:
