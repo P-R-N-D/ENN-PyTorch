@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, T
 
 import torch
 
+from ..backend.system import wrap_with_tlb, get_tlb
+
 try:
     from torchdata.nodes import BaseNode
 except Exception:
@@ -364,11 +366,15 @@ class Connector:
             device if isinstance(device, torch.device) else torch.device(device)
         )
         self.non_blocking = bool(non_blocking)
+        try:
+            get_tlb(io_workers=self.io_workers)
+        except Exception:
+            pass
 
     def compose(self, source: "BaseNode") -> "BaseNode":
         node = ParallelMapper(
             source,
-            map_fn=self.map_fn,
+            map_fn=wrap_with_tlb(self.map_fn),
             num_workers=self.io_workers,
             in_order=False,
             method="thread",
@@ -466,6 +472,10 @@ class Prefetcher:
         sentinel = object()
 
         def _producer():
+            try:
+                get_tlb().pin_thread()
+            except Exception:
+                pass
             try:
                 for item in it:
                     moved = _to_device(item, self._device, non_blocking=self._non_blocking)

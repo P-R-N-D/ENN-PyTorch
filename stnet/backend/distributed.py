@@ -26,7 +26,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
-from .environment import get_device
+from .system import get_device
 
 
 def _env_flag(name: str, default: bool) -> bool:

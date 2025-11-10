@@ -16,7 +16,12 @@ from typing import (
     Union,
 )
 
-from ..data.nodes import SourceSpec
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..data.nodes import SourceSpec
+else:
+    SourceSpec = Dict[str, Any]
 
 import torch
 

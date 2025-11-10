@@ -50,7 +50,7 @@ from .distributed import (
     to_ddp,
     to_fsdp,
 )
-from .environment import get_device, initialize_python_path, is_float8_supported
+from .system import get_device, initialize_python_path, is_float8_supported
 from .profiler import FlopCounter
 
 try:
