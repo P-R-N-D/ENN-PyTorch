@@ -6,7 +6,7 @@ import os
 import queue
 import random
 import threading
-from contextlib import suppress
+from contextlib import suppress, nullcontext
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple, TypedDict, Literal
 
 import torch
@@ -501,7 +501,15 @@ class Prefetcher:
                     if use_accel and streams is not None:
                         s = streams[idx % n_streams]
                         idx += 1
-                        with s:
+                        if dev_t == "cuda" and hasattr(torch, "cuda"):
+                            stream_ctx = torch.cuda.stream(s)
+                        elif dev_t == "xpu" and hasattr(torch, "xpu"):
+                            stream_ctx = torch.xpu.stream(s)
+                        elif dev_t == "mps" and hasattr(torch, "mps"):
+                            stream_ctx = torch.mps.stream(s)
+                        else:
+                            stream_ctx = nullcontext()
+                        with stream_ctx:
                             moved = _to_device(item, self._device, non_blocking=True)
                         try:
                             ev = s.record_event()
