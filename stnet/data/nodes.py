@@ -361,7 +361,11 @@ class Connector:
         self.map_fn = map_fn
         self.io_workers = max(1, int(io_workers))
         self.prebatch = max(1, int(prebatch))
+        with suppress(Exception):
+            self.prebatch = max(1, int(os.environ.get("STNET_PREBATCH", self.prebatch)))
         self.prefetch_factor = max(1, int(prefetch_factor))
+        with suppress(Exception):
+            self.prefetch_factor = max(1, int(os.environ.get("STNET_PREFETCH", self.prefetch_factor)))
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
         )
@@ -381,9 +385,9 @@ class Connector:
             max_concurrent=None,
             prebatch=self.prebatch,
         )
-        node = _Prefetcher(node, prefetch_factor=self.prefetch_factor)
         if self.device.type in {"cuda", "xpu", "mps"}:
             node = PinMemory(node, pin_memory_device=self.device.type)
+        node = _Prefetcher(node, prefetch_factor=self.prefetch_factor)
         return node
 
 
@@ -460,7 +464,11 @@ class Prefetcher:
     ) -> None:
         self._src = iterable
         self._device = torch.device(device) if not isinstance(device, torch.device) else device
-        self._depth = max(1, int(depth))
+        try:
+            _env_depth = int(os.environ.get("STNET_PREFETCH", str(depth)))
+        except Exception:
+            _env_depth = int(depth)
+        self._depth = max(1, int(_env_depth))
         self._non_blocking = bool(non_blocking)
         self._backpressure = bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
@@ -474,9 +482,39 @@ class Prefetcher:
             except Exception:
                 pass
             try:
+                dev_t = getattr(self._device, "type", "cpu")
+                use_accel = dev_t in {"cuda", "xpu", "mps"}
+                streams = None
+                n_streams = 1
+                if use_accel and self._non_blocking:
+                    try:
+                        n_streams = max(1, min(self._depth, int(os.environ.get("STNET_COPY_STREAMS", "3"))))
+                    except Exception:
+                        n_streams = max(1, min(self._depth, 3))
+                    try:
+                        streams = [torch.Stream(device=self._device) for _ in range(n_streams)]
+                    except Exception:
+                        streams = None
+                        use_accel = False
+                idx = 0
                 for item in it:
-                    moved = _to_device(item, self._device, non_blocking=self._non_blocking)
-                    q.put(moved, block=True)
+                    if use_accel and streams is not None:
+                        s = streams[idx % n_streams]
+                        idx += 1
+                        with s:
+                            moved = _to_device(item, self._device, non_blocking=True)
+                        try:
+                            ev = s.record_event()
+                        except Exception:
+                            try:
+                                s.synchronize()
+                            except Exception:
+                                pass
+                            ev = None
+                        q.put((moved, ev), block=True)
+                    else:
+                        moved = _to_device(item, self._device, non_blocking=self._non_blocking)
+                        q.put((moved, None), block=True)
             except StopIteration:
                 pass
             finally:
@@ -498,5 +536,39 @@ class Prefetcher:
             item = q.get(block=True)
             if item is sentinel:
                 break
-            yield item
+            if isinstance(item, tuple) and len(item) == 2:
+                moved, ev = item
+                dev_t = getattr(self._device, "type", "cpu")
+                if ev is not None and dev_t in {"cuda", "xpu", "mps"}:
+                    cur = None
+                    try:
+                        cur = torch.accelerator.current_stream(self._device)
+                    except Exception:
+                        pass
+                    if cur is None:
+                        try:
+                            if dev_t == "cuda":
+                                cur = torch.cuda.current_stream(self._device)
+                            elif dev_t == "xpu":
+                                import torch.xpu as txpu
+
+                                cur = txpu.current_stream(self._device)
+                        except Exception:
+                            cur = None
+                    if cur is not None:
+                        try:
+                            cur.wait_event(ev)
+                        except Exception:
+                            try:
+                                ev.wait(cur)
+                            except Exception:
+                                pass
+                    elif dev_t == "mps":
+                        try:
+                            ev.wait()
+                        except Exception:
+                            pass
+                yield moved
+            else:
+                yield item
         th.join(timeout=0.1)

@@ -1431,8 +1431,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         else:
             chunk_dir = chunk_dir if streaming else None
         try:
+            result_holder: Dict[str, Any] = {}
 
-            def _worker():
+            def _worker() -> None:
                 try:
                     get_tlb().pin_thread()
                 except Exception:
@@ -1446,12 +1447,15 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     chunk_dir=chunk_dir,
                     streaming=streaming,
                 )
-                
+                if result is not None:
+                    result_holder["value"] = result
+
             _thread = threading.Thread(target=_worker, daemon=False)
             _thread.start()
             _thread.join()
-            if result is not None and ret_sink is not None:
-                ret_sink.update(result)
+            thread_result = result_holder.get("value")
+            if thread_result is not None and ret_sink is not None:
+                ret_sink.update(thread_result)
         finally:
             if keep is not None:
                 keep.cleanup()
