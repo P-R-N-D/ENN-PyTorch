@@ -8,6 +8,8 @@ import os
 import sys
 import time
 import warnings
+import threading
+import queue
 from functools import partial
 from dataclasses import replace
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
@@ -50,7 +52,7 @@ from .distributed import (
     to_ddp,
     to_fsdp,
 )
-from .system import get_device, initialize_python_path, is_float8_supported
+from .system import get_device, initialize_python_path, is_float8_supported, get_tlb
 from .profiler import FlopCounter
 
 try:
@@ -1299,27 +1301,37 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         swa_start_epoch = total_epochs
                         swa_bn_update = False
             scaler = torch.amp.GradScaler(enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported())))
-            epochs(
-                model=model,
-                device=device,
-                local_rank=local_rank,
-                ops=ops,
-                param_dtype=param_dtype,
-                optimizer=optimizer,
-                scaler=scaler,
-                sched=sched,
-                loss_controller=loss_controller,
-                top_loss=top_loss,
-                bottom_loss=bottom_loss,
-                grad_accum_steps=int(ops.grad_accum_steps),
-                train_loader=train_loader,
-                val_loader=val_loader,
-                total_epochs=total_epochs,
-                scheduler_step_per_batch=scheduler_step_per_batch,
-                swa_helper=swa_helper,
-                swa_start_epoch=swa_start_epoch,
-                swa_bn_update=swa_bn_update,
-            )
+
+            def _worker():
+                try:
+                    get_tlb().pin_thread()
+                except Exception:
+                    pass
+                epochs(
+                    model=model,
+                    device=device,
+                    local_rank=local_rank,
+                    ops=ops,
+                    param_dtype=param_dtype,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    sched=sched,
+                    loss_controller=loss_controller,
+                    top_loss=top_loss,
+                    bottom_loss=bottom_loss,
+                    grad_accum_steps=int(ops.grad_accum_steps),
+                    train_loader=train_loader,
+                    val_loader=val_loader,
+                    total_epochs=total_epochs,
+                    scheduler_step_per_batch=scheduler_step_per_batch,
+                    swa_helper=swa_helper,
+                    swa_start_epoch=swa_start_epoch,
+                    swa_bn_update=swa_bn_update,
+                )
+
+            _thread = threading.Thread(target=_worker, daemon=False)
+            _thread.start()
+            _thread.join()
         finally:
             if keep is not None:
                 keep.cleanup()
@@ -1419,15 +1431,25 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         else:
             chunk_dir = chunk_dir if streaming else None
         try:
-            result = infer(
-                model=model,
-                device=device,
-                local_rank=local_rank,
-                ops=ops,
-                data_loader=data_loader,
-                chunk_dir=chunk_dir,
-                streaming=streaming,
-            )
+
+            def _worker():
+                try:
+                    get_tlb().pin_thread()
+                except Exception:
+                    pass
+                result = infer(
+                    model=model,
+                    device=device,
+                    local_rank=local_rank,
+                    ops=ops,
+                    data_loader=data_loader,
+                    chunk_dir=chunk_dir,
+                    streaming=streaming,
+                )
+                
+            _thread = threading.Thread(target=_worker, daemon=False)
+            _thread.start()
+            _thread.join()
             if result is not None and ret_sink is not None:
                 ret_sink.update(result)
         finally:
