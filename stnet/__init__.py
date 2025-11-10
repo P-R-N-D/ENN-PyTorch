@@ -6,10 +6,8 @@ from typing import Any, Dict, Tuple
 
 from tensordict import set_list_to_stack
 
-set_list_to_stack(True).set()  # 리스트를 배치 차원으로 자동 스택
+set_list_to_stack(True).set()
 
-# 동적 shape 구간은 자동으로 CUDA Graphs 캡처 스킵
-# (PyTorch inductor 설정: dynamic graph는 그래프 캡처에서 생략)
 try:
     import torch
     import torch._inductor.config as _inductor_cfg
@@ -100,4 +98,3 @@ def __getattr__(name: str) -> Any:
 
 def __dir__() -> list[str]:
     return sorted(set(__all__))
-
