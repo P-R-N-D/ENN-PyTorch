@@ -467,9 +467,6 @@ class Prefetcher:
         self._host_guard_bytes = int(host_guard_bytes or 0)
 
     def __iter__(self) -> Iterator[Any]:
-        it = iter(self._src)
-        q: "queue.Queue[Optional[Any]]" = queue.Queue(maxsize=self._depth)
-        sentinel = object()
 
         def _producer():
             try:
@@ -485,9 +482,18 @@ class Prefetcher:
             finally:
                 q.put(sentinel, block=True)
 
-        th = threading.Thread(target=_producer, daemon=True)
-        th.start()
+        def _producer_wrapped():
+            try:
+                get_tlb().pin_thread()
+            except Exception:
+                pass
+            return _producer()
 
+        it = iter(self._src)
+        q: "queue.Queue[Optional[Any]]" = queue.Queue(maxsize=self._depth)
+        sentinel = object()
+        th = threading.Thread(target=_producer_wrapped, daemon=True)
+        th.start()
         while True:
             item = q.get(block=True)
             if item is sentinel:
