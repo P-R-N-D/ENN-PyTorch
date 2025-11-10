@@ -8,6 +8,8 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
+from ..backend.system import get_tlb
+
 try:
     from torchdata.nodes import BaseNode, Loader as _Loader
 except Exception:
@@ -146,6 +148,10 @@ def compose(
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
+    try:
+        get_tlb(io_workers=io_workers)
+    except Exception:
+        pass
 
     mux = Multiplexer(
         stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
