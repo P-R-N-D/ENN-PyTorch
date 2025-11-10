@@ -121,8 +121,6 @@ class Dataset:
         i = self._start + int(idx)
         return self._slice(i, i + 1)
 
-# ---- Memmap utilities --------------------------------------------------------
-
 
 def _to_high_precision(value: Any) -> torch.Tensor:
     tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
@@ -135,7 +133,7 @@ def _to_high_precision(value: Any) -> torch.Tensor:
 
 def preload_memmap(
     data: Mapping[str, Any],
-    *,
+    *args: Any,
     memmap_dir: str,
     train_frac: float = 1.0,
     val_frac: float = 0.0,
