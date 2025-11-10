@@ -37,9 +37,9 @@ except Exception:
     MapStyleWrapper = None
 
 try:
-    from torch.utils.data import Sampler as _TorchSampler
+    from torch.utils.data import Sampler as _Sampler
 except Exception:
-    _TorchSampler = object
+    _Sampler = object
 
 from .datatype import to_platform_dtype
 
@@ -270,7 +270,7 @@ class Disposable:
         return iter(self._keep)
 
 
-class Sampler(_TorchSampler):
+class Sampler(_Sampler):
     def __init__(
         self,
         *args: Any,
