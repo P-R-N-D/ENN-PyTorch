@@ -154,7 +154,7 @@ def compose(
         pass
 
     mux = Multiplexer(
-        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "ALL_DATASETS_EXHAUSTED"),
+        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "CYCLE_FOREVER"),
         seed=int(os.environ.get("STNET_BLOCK_SEED", "0") or "0"),
     )
     source = mux.compose(node_or_nodes)
