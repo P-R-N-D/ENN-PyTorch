@@ -213,14 +213,9 @@ def preload_memmap(
         json.dump(meta, handle)
 
 
-# ---- Source abstraction (no legacy path strings) -----------------------------
 SourceKind = Literal["memmap"]
 
 class SourceSpec(TypedDict):
-    """Structured source spec (mandatory).
-    kind: currently only "memmap"
-    path: directory that contains meta.json and memmap shards
-    """
     kind: SourceKind
     path: str
 
