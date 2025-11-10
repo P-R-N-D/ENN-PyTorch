@@ -364,14 +364,49 @@ def _x_for_swa(train_loader: Any, device: torch.device, in_dim: int, swa_in_key:
         yield {swa_in_key: X.to(device, non_blocking=True)}
 
 
-def _first_dir(obj: Any) -> str:
-    if isinstance(obj, str):
-        return obj
-    if isinstance(obj, dict) and obj:
-        return next(iter(obj.values()))
+def _first_source_path(obj: Any) -> str:
+    # Accept SourceSpec | list[SourceSpec] | dict[str, SourceSpec]
+    if isinstance(obj, dict):
+        # SourceSpec?
+        if "path" in obj and "kind" in obj:
+            return os.fspath(obj["path"])
+        # mapping case
+        if obj:
+            first = next(iter(obj.values()))
+            return _first_source_path(first)
     if isinstance(obj, (list, tuple)) and obj:
-        return obj[0]
-    raise RuntimeError("memmap_dir is empty or invalid")
+        return _first_source_path(obj[0])
+    raise RuntimeError("sources is empty or invalid")
+
+
+def _expand(sources: Any) -> Any:
+    """Expand multinode.json from a SourceSpec root when applicable."""
+
+    def _expand_from_root(spec: Any) -> Tuple[Any, bool]:
+        if not isinstance(spec, dict) or "path" not in spec or "kind" not in spec:
+            return spec, False
+        root = os.fspath(spec.get("path") or "")
+        mn_path = os.path.join(root, "multinode.json")
+        if not os.path.isfile(mn_path):
+            return spec, False
+        with open(mn_path, "r", encoding="utf-8") as _f:
+            _spec = json.load(_f)
+        if isinstance(_spec, dict):
+            resolved = {str(k): {"kind": "memmap", "path": os.path.join(root, str(v))} for k, v in _spec.items()}
+            return resolved, True
+        if isinstance(_spec, list):
+            resolved = [{"kind": "memmap", "path": os.path.join(root, str(v))} for v in _spec]
+            return resolved, True
+        return spec, False
+
+    expanded, ok = _expand_from_root(sources)
+    if ok:
+        return expanded
+    if isinstance(sources, (list, tuple)) and len(sources) == 1:
+        expanded, ok = _expand_from_root(sources[0])
+        if ok:
+            return expanded
+    return sources
 
 
 def _coerce_dtensor(param: torch.nn.Parameter, mesh: Any, *args: Any, placements: Optional[Sequence[Placement]] = None, **kwargs: Any) -> None:
@@ -1054,22 +1089,13 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     m_sd = _trim_dcp_keys(m_sd)
                     load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
                     set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        if ops.sources is None:
+            raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Metadata.for_device(device)
-        mem_spec = ops.memmap_dir
-        if isinstance(mem_spec, str) and os.path.isdir(mem_spec):
-            mn_path = os.path.join(mem_spec, "multinode.json")
-            if os.path.isfile(mn_path):
-                with open(mn_path, "r", encoding="utf-8") as _f:
-                    _spec = json.load(_f)
-                if isinstance(_spec, dict):
-                    resolved = {str(k): os.path.join(mem_spec, str(v)) for k, v in _spec.items()}
-                elif isinstance(_spec, list):
-                    resolved = [os.path.join(mem_spec, str(v)) for v in _spec]
-                else:
-                    resolved = None
-                if resolved:
-                    ops = replace(ops, memmap_dir=resolved)
-        meta_info = _from_meta(_first_dir(ops.memmap_dir or ""))
+        expanded_sources = _expand(ops.sources)
+        if expanded_sources is not ops.sources:
+            ops = replace(ops, sources=expanded_sources)
+        meta_info = _from_meta(_first_source_path(ops.sources))
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError("dataset feature_dim mismatch: " f"meta={meta_feature_dim}, expected in_dim={ops.in_dim}")
@@ -1212,8 +1238,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         val_loader: Any = None
         keep: Any = None
         try:
+            expanded_sources = _expand(ops.sources)
+            if expanded_sources is not ops.sources:
+                ops = replace(ops, sources=expanded_sources)
             train_loader, val_loader, keep = fetch(
-                memmap_dir=ops.memmap_dir,
+                sources=ops.sources,
                 device=device,
                 batch_size=int(ops.batch_size or 128),
                 val_frac=float(ops.val_frac),
@@ -1369,9 +1398,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         else:
             Autocast.configure(model, metadata=metadata)
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
+        if ops.sources is None:
+            raise RuntimeError("RuntimeConfig.sources is required but None")
         model.eval()
+        expanded_sources = _expand(ops.sources)
+        if expanded_sources is not ops.sources:
+            ops = replace(ops, sources=expanded_sources)
         data_loader, _, keep = fetch(
-            memmap_dir=ops.memmap_dir or "",
+            sources=ops.sources,
             device=device,
             batch_size=int(ops.batch_size or 512),
             val_frac=0.0,

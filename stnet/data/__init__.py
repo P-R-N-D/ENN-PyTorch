@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys as _sys
 
 from . import datatype as datatype_module
-from .nodes import Dataset, DevicePrefetcher, preload_memmap
+from .nodes import Dataset, DevicePrefetcher, preload_memmap, dataset, SourceSpec
 from .pipeline import BatchLoader, Disposable, ThreadLoadBalancer, collate, fetch
 from .stats import Metadata, TensorDictMetadata
 from .transforms import (
@@ -29,6 +29,8 @@ __all__ = [
     "collate",
     "fetch",
     "preload_memmap",
+    "dataset",
+    "SourceSpec",
     "Disposable",
     "ThreadLoadBalancer",
     "Metadata",

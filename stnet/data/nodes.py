@@ -5,7 +5,7 @@ import json
 import os
 import queue
 import threading
-from typing import Any, Iterator, Mapping, Optional, Tuple
+from typing import Any, Iterator, Mapping, Optional, Tuple, TypedDict, Literal
 
 import torch
 
@@ -97,6 +97,40 @@ class Dataset:
             return self._slice(s, e)
         i = self._start + int(idx)
         return self._slice(i, i + 1)
+
+# ---- Source abstraction (no legacy path strings) -----------------------------
+SourceKind = Literal["memmap"]
+
+class SourceSpec(TypedDict):
+    """Structured source spec (mandatory).
+    kind: currently only "memmap"
+    path: directory that contains meta.json and memmap shards
+    """
+    kind: SourceKind
+    path: str
+
+def dataset(
+    source: SourceSpec,
+    *,
+    split: str = "train",
+    val_frac: float = 0.0,
+) -> "Dataset":
+    """Create Dataset strictly from SourceSpec."""
+    kind = str(source.get("kind"))
+    if kind != "memmap":
+        raise ValueError(f"Unsupported source kind: {kind!r}")
+    path = os.fspath(source.get("path", ""))
+    if not path:
+        raise ValueError("SourceSpec['path'] must be provided")
+    if not os.path.isdir(path):
+        raise FileNotFoundError(f"memmap directory not found: {path!r}")
+    sp = str(split or "train")
+    if sp not in ("train", "val"):
+        raise ValueError(f"split must be 'train' or 'val', got: {sp!r}")
+    vf = float(val_frac)
+    if not (0.0 <= vf <= 1.0):
+        raise ValueError(f"val_frac must be in [0,1], got: {vf}")
+    return Dataset(path, split=sp, val_frac=vf)
 
 
 class Prefetcher:

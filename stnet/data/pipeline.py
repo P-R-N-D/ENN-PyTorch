@@ -24,9 +24,26 @@ except Exception:
     MultiNodeWeightedSampler = None
     MapStyleWrapper = None
 
-import torch.utils.data.Sampler as _Sampler
+try:
+    from torch.utils.data import Sampler as _TorchSampler
+except Exception:
+    _TorchSampler = object
 
-from .nodes import Dataset, Prefetcher
+from .nodes import Dataset, Prefetcher, SourceSpec, dataset
+from typing import Mapping as _Mapping
+
+def _is_source_spec(obj: Any) -> bool:
+    # 최소 요건: mapping이면서 필수 키 보유, path는 경로형
+    if not isinstance(obj, _Mapping):
+        return False
+    if "kind" not in obj or "path" not in obj:
+        return False
+    p = obj.get("path")
+    try:
+        os.fspath(p)
+    except Exception:
+        return False
+    return True
 
 def _process(
     batch: Mapping[str, Any],
@@ -99,7 +116,7 @@ class Disposable:
     def __iter__(self):
         return iter(self._keep)
 
-class Sampler(_Sampler[Tuple[int, int]]):
+class Sampler(_TorchSampler):
     def __init__(self, *args: Any, start: int, end: int, batch_size: int, shuffle: bool = True, seed: int = 0, **kwargs: Any) -> None:
         self._start = int(start); self._end = int(end); self._B = max(1, int(batch_size))
         self._shuffle = bool(shuffle)
@@ -277,7 +294,11 @@ def compose(
 
 
 def fetch(
-    memmap_dir: Union[str, Sequence[str], Mapping[str, str]],
+    sources: Union[
+        SourceSpec,
+        Sequence[SourceSpec],
+        Mapping[str, SourceSpec],
+    ],
     device: Union[str, torch.device],
     batch_size: int,
     val_frac: float,
@@ -303,33 +324,32 @@ def fetch(
 
     allocated = Disposable()
 
-    def _node_for(directory: Union[str, os.PathLike[str]], split: str, shuffle: bool) -> Tuple[BaseNode, int]:
-        path = os.fspath(directory)
-        ds = Dataset(path, split=split, val_frac=float(val_frac))
+    def _node_for(spec: SourceSpec, split: str, shuffle: bool) -> Tuple[BaseNode, int]:
+        ds = dataset(spec, split=split, val_frac=float(val_frac))
         allocated.add(ds)
         samp = Sampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=int(os.environ.get("STNET_SAMPLER_SEED","0") or "0"))
         node = samp.compose(ds)
         return node, len(samp)
 
-    if isinstance(memmap_dir, Mapping):
+    if isinstance(sources, Mapping) and not _is_source_spec(sources):
         nodes_map: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
-        for key, directory in memmap_dir.items():
-            node, length = _node_for(directory, split="train", shuffle=True)
+        for key, spec in sources.items():
+            node, length = _node_for(spec, split="train", shuffle=True)
             nodes_map[str(key)] = node
             lengths[str(key)] = length
         _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = sum(lengths.values()) if lengths else None
-    elif isinstance(memmap_dir, (list, tuple)):
+    elif isinstance(sources, (list, tuple)):
         nodes_list: list[BaseNode] = []
         lengths: list[int] = []
-        for directory in memmap_dir:
-            node, length = _node_for(directory, split="train", shuffle=True)
+        for spec in sources:
+            node, length = _node_for(spec, split="train", shuffle=True)
             nodes_list.append(node); lengths.append(length)
         _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = sum(lengths) if lengths else None
     else:
-        node, length = _node_for(memmap_dir, split="train", shuffle=True)
+        node, length = _node_for(sources, split="train", shuffle=True)
         _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = length
 
@@ -337,24 +357,24 @@ def fetch(
 
     val_loader = None
     if float(val_frac) > 0.0:
-        if isinstance(memmap_dir, Mapping):
+        if isinstance(sources, Mapping) and not _is_source_spec(sources):
             nodes_map = {}
             lengths = {}
-            for key, directory in memmap_dir.items():
-                node, length = _node_for(directory, split="val", shuffle=False)
+            for key, spec in sources.items():
+                node, length = _node_for(spec, split="val", shuffle=False)
                 nodes_map[str(key)] = node; lengths[str(key)] = length
             _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths.values()) if lengths else None
-        elif isinstance(memmap_dir, (list, tuple)):
+        elif isinstance(sources, (list, tuple)):
             nodes_list = []
             lengths = []
-            for directory in memmap_dir:
-                node, length = _node_for(directory, split="val", shuffle=False)
+            for spec in sources:
+                node, length = _node_for(spec, split="val", shuffle=False)
                 nodes_list.append(node); lengths.append(length)
             _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths) if lengths else None
         else:
-            node, length = _node_for(memmap_dir, split="val", shuffle=False)
+            node, length = _node_for(sources, split="val", shuffle=False)
             _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = length
         val_loader = _Loader(device=device_obj, node=vmapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=val_len)
