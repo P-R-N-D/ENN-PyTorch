@@ -1235,13 +1235,19 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             expanded_sources = _expand(ops.sources)
             if expanded_sources is not ops.sources:
                 ops = replace(ops, sources=expanded_sources)
+            accelerator_types = {"cuda", "xpu", "mps"}
+            device_type = getattr(device, "type", None)
+            if not device_type:
+                device_str = str(device)
+                device_type = device_str.split(":", 1)[0]
+            non_blocking_copy = device_type in accelerator_types
             train_loader, val_loader, keep = fetch(
                 sources=ops.sources,
                 device=device,
                 batch_size=int(ops.batch_size or 128),
                 val_frac=float(ops.val_frac),
                 prefetch_factor=ops.prefetch_factor,
-                non_blocking_copy=bool(ops.overlap_h2d),
+                non_blocking_copy=non_blocking_copy,
                 flatten_features=True,
             )
             if restore_dl_state:

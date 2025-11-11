@@ -201,19 +201,6 @@ class Dataset(_Dataset):
             if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
                 idx_tensor = self._perm.index_select(0, idx_tensor)
             try:
-                import os as _os
-
-                if False:
-                    if idx_tensor.numel():
-                        _min = int(idx_tensor.min().item())
-                        _max = int(idx_tensor.max().item())
-                        if _min < 0 or _max >= self._N:
-                            raise IndexError(
-                                f"index out of range: valid [0,{self._N-1}], got [{_min},{_max}]"
-                            )
-            except Exception:
-                pass
-            try:
                 x = self._features.index_select(0, idx_tensor)
             except Exception:
                 x = (

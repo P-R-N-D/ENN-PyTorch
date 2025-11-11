@@ -167,8 +167,6 @@ def _negative_inf(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
 
 def _is_nvidia_te_supported() -> bool:
 
-    if False:
-        return False
     if not torch.cuda.is_available():
         return False
     try:
@@ -194,7 +192,7 @@ def _is_nvidia_te_supported() -> bool:
     if maj < min_major or (maj == min_major and minr < min_minor):
         return False
     try:
-        if torch._dynamo.is_compiling() and False:
+        if torch._dynamo.is_compiling():
             return False
     except Exception:
         pass
@@ -281,53 +279,49 @@ def _to_nvidia_mask(
 
 
 _HAS_TE: bool
-if False:
-    te = None
-    _HAS_TE = False
+te = None
+_should_import_te = True
+if not torch.cuda.is_available():
+    _should_import_te = False
 else:
-    _should_import_te = True
-    if not torch.cuda.is_available():
+    try:
+        device = get_device()
+    except Exception:
+        device = torch.device("cuda", 0)
+    if getattr(device, "type", "cpu") != "cuda":
         _should_import_te = False
     else:
         try:
-            device = get_device()
+            index = (
+                device.index
+                if device.index is not None
+                else torch.cuda.current_device()
+            )
         except Exception:
-            device = torch.device("cuda", 0)
-        if getattr(device, "type", "cpu") != "cuda":
-            _should_import_te = False
-        else:
-            try:
-                index = (
-                    device.index
-                    if device.index is not None
-                    else torch.cuda.current_device()
-                )
-            except Exception:
-                index = 0
-            try:
-                props = torch.cuda.get_device_properties(index)
-                major = int(getattr(props, "major", 0))
-            except Exception:
-                try:
-                    major, _ = torch.cuda.get_device_capability(index)
-                except Exception:
-                    major = 0
-            min_major = 8
-            if min_major >= 10:
-                min_major //= 10
-            if major < min_major:
-                _should_import_te = False
-    if _should_import_te:
+            index = 0
         try:
-            import transformer_engine.pytorch as te  
+            props = torch.cuda.get_device_properties(index)
+            major = int(getattr(props, "major", 0))
+        except Exception:
+            try:
+                major, _ = torch.cuda.get_device_capability(index)
+            except Exception:
+                major = 0
+        min_major = 8
+        if min_major >= 10:
+            min_major //= 10
+        if major < min_major:
+            _should_import_te = False
+if _should_import_te:
+    try:
+        import transformer_engine.pytorch as te
 
-            _HAS_TE = True
-        except Exception:  
-            te = None  
-            _HAS_TE = False
-    else:
+        _HAS_TE = True
+    except Exception:
         te = None
         _HAS_TE = False
+else:
+    _HAS_TE = False
 
 
 def _is_nvidia_mha_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
@@ -435,8 +429,6 @@ class DotProductAttention(nn.Module):
 
     @staticmethod
     def _is_nvidia_te_available() -> Any:
-        if False:
-            return (False, None)
         try:
             with contextlib.ExitStack() as stack:
                 import warnings as _warnings

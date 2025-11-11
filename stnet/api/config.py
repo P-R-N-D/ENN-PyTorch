@@ -379,7 +379,6 @@ class RuntimeConfig:
     seed: int = 42
     prefetch_factor: Optional[int] = 1
     grad_accum_steps: int = 1
-    overlap_h2d: bool = True
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
@@ -400,7 +399,6 @@ class RuntimeConfig:
         "seed",
         "prefetch_factor",
         "grad_accum_steps",
-        "overlap_h2d",
         "loss_tile_dim",
         "loss_tile_size",
         "loss_mask_mode",
@@ -447,7 +445,6 @@ class RuntimeConfig:
                 "seed",
                 "prefetch_factor",
                 "grad_accum_steps",
-                "overlap_h2d",
                 "loss_tile_dim",
                 "loss_tile_size",
                 "loss_mask_mode",
@@ -481,7 +478,6 @@ class RuntimeConfig:
                 seed=int(kwargs.get("seed", 42)),
                 prefetch_factor=kwargs.get("prefetch_factor", 1),
                 grad_accum_steps=int(kwargs.get("grad_accum_steps", 1)),
-                overlap_h2d=bool(kwargs.get("overlap_h2d", True)),
                 loss_tile_dim=kwargs.get("loss_tile_dim"),
                 loss_tile_size=kwargs.get("loss_tile_size"),
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
