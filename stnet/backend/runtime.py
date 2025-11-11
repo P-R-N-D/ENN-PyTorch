@@ -136,7 +136,7 @@ def _meta_monitor_pre_hook(module: torch.nn.Module, inputs: Tuple[Any, ...], war
 
 
 def _enable_meta_monitor(model: torch.nn.Module) -> None:
-    hook_mode = os.environ.get("STNET_META_HOOK", "0").strip().lower()
+    hook_mode = "off"
     if hook_mode in {"0", "", "false", "off"}:
         return
     warn_only = hook_mode in {"warn", "warning"}
@@ -1034,10 +1034,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
     initialize_python_path()
-    if os.environ.get("STNET_DISABLE_MKLDNN", "0") == "1":
-        mkldnn_backend = getattr(getattr(torch, "backends", None), "mkldnn", None)
-        if mkldnn_backend is not None:
-            mkldnn_backend.enabled = False
     ret_sink: Optional[Dict[Any, Any]] = None
     if isinstance(args[0], RuntimeConfig):
         ops = args[0]
@@ -1274,25 +1270,25 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             swa_helper: Optional[StochasticWeightAverage] = None
             swa_start_epoch = total_epochs
             swa_bn_update = False
-            enable_swa_env = os.environ.get("STNET_SWA_ENABLE", "0").strip().lower()
-            start_epoch_env = os.environ.get("STNET_SWA_START_EPOCH")
+            enable_swa_env = "0"
+            start_epoch_env = None
             enable_swa = (enable_swa_env not in {"", "0", "false"}) or start_epoch_env is not None
             if enable_swa and SWALR is not None:
                 tracked_module = model.module if hasattr(model, "module") else model
-                use_buffers = (os.environ.get("STNET_SWA_USE_BUFFERS", "1").strip().lower() not in {"", "0", "false"})
+                use_buffers = True
                 try:
                     swa_helper = stochastic_weight_average(tracked_module, use_buffers=use_buffers)
                 except Exception:
                     swa_helper = None
                 if swa_helper is not None:
                     scheduler_step_per_batch = False
-                    swa_start_epoch = max(0, int(os.environ.get("STNET_SWA_START_EPOCH", "0")))
-                    swa_bn_update = (os.environ.get("STNET_SWA_BN_UPDATE", "0").strip().lower() not in {"", "0", "false"})
+                    swa_start_epoch = int(start_epoch_env) if start_epoch_env is not None else max(1, total_epochs // 2)
+                    swa_bn_update = False
                     eta_min = float(getattr(ops, "eta_min", 0.0) or 0.0)
                     base_lr = float(ops.base_lr)
                     default_swa_lr = max(1e-8, eta_min if eta_min > 0.0 else 0.1 * base_lr)
-                    swa_lr = float(os.environ.get("STNET_SWA_LR", str(default_swa_lr)))
-                    anneal_epochs = max(1, int(os.environ.get("STNET_SWA_ANNEAL_EPOCHS", str(max(1, total_epochs // 10)))))
+                    swa_lr = default_swa_lr
+                    anneal_epochs = max(1, max(1, total_epochs // 10))
                     try:
                         sched = SWALR(optimizer, swa_lr=swa_lr, anneal_epochs=anneal_epochs, anneal_strategy="cos")
                     except Exception:
@@ -1420,7 +1416,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             prefetch_factor=ops.prefetch_factor,
             non_blocking_copy=True,
         )
-        chunk_dir = os.environ.get("STF_PRED_CHUNK_DIR") or (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
+        chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
         streaming = False
         if chunk_dir and torch.distributed.get_rank() == 0:
             try:

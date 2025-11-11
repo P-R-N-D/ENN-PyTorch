@@ -124,15 +124,12 @@ def collate(
         return TensorDict({"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]}, batch_size=[])
     return sample
 
-def _env_optimize_threads() -> Dict[str, int]:
-    try:
-        workers = max(1, int(os.environ.get("STNET_WORKERS", "4")))
-    except Exception:
-        workers = 4
-    try:
-        pfetch = max(1, int(os.environ.get("STNET_PREFETCH", "8")))
-    except Exception:
-        pfetch = 8
+def _default_threads(
+    dataloader_workers: Optional[int] = None, prefetch_factor: Optional[int] = None
+) -> Dict[str, int]:
+    ncpu = os.cpu_count() or 4
+    workers = int(dataloader_workers) if dataloader_workers is not None else max(1, ncpu // 2)
+    pfetch = int(prefetch_factor) if prefetch_factor is not None else 2
     return {"dataloader_workers": workers, "prefetch_factor": pfetch}
 
 
@@ -153,10 +150,7 @@ def compose(
     except Exception:
         pass
 
-    mux = Multiplexer(
-        stop_criteria=os.environ.get("STNET_MULTINODE_STOP", "CYCLE_FOREVER"),
-        seed=int(os.environ.get("STNET_BLOCK_SEED", "0") or "0"),
-    )
+    mux = Multiplexer(stop_criteria="CYCLE_FOREVER", seed=0)
     source = mux.compose(node_or_nodes)
 
     mapper = Connector(
@@ -189,7 +183,7 @@ def fetch(
     **kwargs: Any,
 ) -> Tuple[Any, Optional[Any], Disposable]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
-    threads = _env_optimize_threads()
+    threads = _default_threads()
     io_workers = max(1, int(threads.get("dataloader_workers", 2)))
     prebatch = max(1, int(threads.get("prefetch_factor", 2)))
 
@@ -205,7 +199,7 @@ def fetch(
     def _node_for(spec: SourceSpec, split: str, shuffle: bool) -> Tuple[BaseNode, int]:
         ds = dataset(spec, split=split, val_frac=float(val_frac))
         allocated.add(ds)
-        samp = Sampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=int(os.environ.get("STNET_SAMPLER_SEED","0") or "0"))
+        samp = Sampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=0)
         node = samp.compose(ds)
         return node, len(samp)
 
