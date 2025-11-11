@@ -401,33 +401,91 @@ def cpu_count() -> int:
         return os.cpu_count() or 1
 
 
+def local_accelerator_count() -> int:
+    """Return the number of accelerator devices available on the host."""
+    try:
+        import torch
+    except Exception:
+        return 0
+    # CUDA
+    try:
+        if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+            return int(torch.cuda.device_count()) or 0
+    except Exception:
+        pass
+    # Intel XPU (native XPU / IPEX)
+    try:
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+            count = int(getattr(xpu, "device_count", lambda: 1)()) or 1
+            return max(count, 1)
+    except Exception:
+        pass
+    # Apple MPS
+    try:
+        mps = getattr(getattr(torch, "backends", None), "mps", None)
+        if mps is not None and callable(getattr(mps, "is_available", None)) and mps.is_available():
+            return 1
+    except Exception:
+        pass
+    # Vulkan (prototype/unstable)
+    try:
+        if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
+            return 1
+    except Exception:
+        pass
+    return 0
+
+
 def optimal_threads() -> Dict[str, Union[int, bool]]:
-    n_cpu = cpu_count()
-    n_gpu = _num_cuda_devices()
-    intra = max(1, n_cpu // max(1, n_gpu))
-    inter = max(1, n_cpu // 2)
-    workers = max(2, n_cpu // 2)
-    if n_gpu:
-        workers = max(n_gpu * 2, workers)
+    """Heuristics for CPU/GPU threading & mapper parallelism (no env-vars).
+    Returns keys for ParallelMapper(method='threads'):
+      - "intra_ops", "inter_ops", "num_workers", "max_concurrancy"
+    """
+    ncpu = cpu_count()
+    try:
+        import torch
+        has_cuda = getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
+    except Exception:
+        has_cuda = False
+    nacc = local_accelerator_count()
+
+    if ncpu <= 2:
+        inter_ops = 1
+        intra_ops = max(1, ncpu - inter_ops)
+        num_workers = max(1, ncpu)
+    elif ncpu <= 8:
+        inter_ops = max(1, ncpu // 4)
+        intra_ops = max(1, ncpu - inter_ops)
+        num_workers = max(2, min(8, ncpu // 2))
+    else:
+        inter_ops = max(2, min(8, ncpu // 6))
+        intra_ops = max(1, ncpu - inter_ops)
+        num_workers = max(4, min(16, ncpu // 2))
+
+    # no environment-variable overrides; compute directly
+    max_concurrancy = (nacc * 2) if (nacc > 0 and has_cuda) else max(2, num_workers)
+
     return {
-        "intraop": intra,
-        "interop": inter,
-        "dataloader_workers": workers,
-        "prefetch_factor": 2,
-        "pin_memory": bool(n_gpu > 0),
+        "intra_ops": int(max(1, intra_ops)),
+        "inter_ops": int(max(1, inter_ops)),
+        "num_workers": int(max(1, num_workers)),
+        "max_concurrancy": int(max(1, max_concurrancy)),
     }
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
+    """Apply thread hints via PyTorch APIs only (no env-vars)."""
     threads = optimal_threads()
-    os.environ.setdefault("OMP_NUM_THREADS", str(threads["intraop"]))
-    os.environ.setdefault("MKL_NUM_THREADS", str(threads["intraop"]))
     try:
-        torch.set_num_threads(int(threads["intraop"]))
+        import torch
+        torch.set_num_threads(int(threads["intra_ops"]))
     except Exception:
         pass
     try:
-        torch.set_num_interop_threads(int(threads["interop"]))
+        import torch
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(int(threads["inter_ops"]))
     except Exception:
         pass
     return threads

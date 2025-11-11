@@ -497,25 +497,50 @@ class Connector:
         self,
         *args: Any,
         map_fn: Callable[[Any], Any],
-        io_workers: int,
-        prebatch: int,
-        prefetch_factor: int,
-        device: torch.device,
+        io_workers: Optional[int] = None,
+        prebatch: Optional[int] = None,
+        prefetch_factor: Optional[int] = None,
+        device: torch.device = torch.device("cpu"),
         non_blocking: bool = True,
+        pin_memory: Optional[bool] = None,
         **kwargs: Any,
     ) -> None:
         self.map_fn = map_fn
-        self.io_workers = max(1, int(io_workers))
-        self.prebatch = max(1, int(prebatch))
+        try:
+            from ..backend.system import optimal_threads
+
+            _t = optimal_threads()
+        except Exception:
+            _t = {"num_workers": 1, "max_concurrancy": 2}
+        self.io_workers = (
+            int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
+        )
+        self.io_workers = max(1, self.io_workers)
+        self.prebatch = (
+            int(prebatch) if prebatch is not None else max(1, self.io_workers * 2)
+        )
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
-        self.prefetch_factor = max(1, int(prefetch_factor))
+        prefetch = int(prefetch_factor) if prefetch_factor is not None else 2
         with suppress(Exception):
-            self.prefetch_factor = max(1, int(self.prefetch_factor))
+            prefetch = max(1, int(prefetch))
+        self._prefetch_factor = prefetch
+        self.prefetch_factor = self._prefetch_factor
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
         )
         self.non_blocking = bool(non_blocking)
+        pin = bool(pin_memory) if pin_memory is not None else (
+            getattr(self.device, "type", "cpu") in {"cuda", "xpu"}
+        )
+        self._pin_memory = pin
+        self.pin_memory = self._pin_memory
+        base_concurrency = int(
+            _t.get("max_concurrancy", max(2, self.io_workers))
+        )
+        self.max_concurrancy = max(
+            1, min(base_concurrency, self.io_workers)
+        )
         try:
             get_tlb(io_workers=self.io_workers)
         except Exception:
@@ -528,12 +553,12 @@ class Connector:
             num_workers=self.io_workers,
             in_order=False,
             method="thread",
-            max_concurrent=None,
+            max_concurrent=int(self.max_concurrancy),
             prebatch=self.prebatch,
         )
-        if self.device.type in {"cuda", "xpu", "mps"}:
+        if self._pin_memory and getattr(self.device, "type", "cpu") in {"cuda", "xpu", "mps"}:
             node = PinMemory(node, pin_memory_device=self.device.type)
-        node = _Prefetcher(node, prefetch_factor=self.prefetch_factor)
+        node = _Prefetcher(node, prefetch_factor=self._prefetch_factor)
         return node
 
 
@@ -558,6 +583,23 @@ class Loader:
         self._prefetch_factor = max(1, int(prefetch_factor))
         self._non_blocking = bool(non_blocking)
         self._length = int(length) if length is not None else None
+        self._thread2dev: Dict[int, torch.device] = {}
+        self._node = node_obj
+        self._threads_hint = (
+            self._infer_mapper_threads(node_obj) if node_obj is not None else 1
+        )
+        self._num_shards = 1
+        self._shard_id = 0
+        try:
+            from ..backend.system import local_accelerator_count
+
+            acc = max(1, int(local_accelerator_count()))
+            thr = max(1, int(self._threads_hint))
+            self._num_shards = acc * thr
+            dev_idx = self._local_device_index()
+            self._shard_id = max(0, min(self._num_shards - 1, int(dev_idx * thr)))
+        except Exception:
+            pass
         base = _Loader(node_obj)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
@@ -592,6 +634,44 @@ class Loader:
             return 1 if self._length is None else int(self._length)
         except Exception:
             return 1
+
+    def _device_for_current_thread(self) -> torch.device:
+        if isinstance(self._device, list):
+            tid = threading.get_ident()
+            dev = self._thread2dev.get(tid)
+            if dev is None:
+                idx = len(self._thread2dev) % max(1, len(self._device))
+                dev = self._device[idx]
+                self._thread2dev[tid] = dev
+            return dev
+        return self._device
+
+    def _infer_mapper_threads(self, node: Any) -> int:
+        if node is None:
+            return 1
+        if hasattr(node, "num_workers"):
+            try:
+                return int(getattr(node, "num_workers"))
+            except Exception:
+                pass
+        for key in ("child", "source", "node", "_node"):
+            sub = getattr(node, key, None)
+            if sub is not None:
+                count = self._infer_mapper_threads(sub)
+                if count > 0:
+                    return count
+        return 1
+
+    def _local_device_index(self) -> int:
+        try:
+            if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
+                return int(torch.cuda.current_device())
+            xpu = getattr(torch, "xpu", None)
+            if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+                return int(xpu.current_device())
+        except Exception:
+            pass
+        return 0
 
 
 class Prefetcher:
