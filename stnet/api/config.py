@@ -379,11 +379,13 @@ class RuntimeConfig:
     seed: int = 42
     prefetch_factor: Optional[int] = 1
     grad_accum_steps: int = 1
-    overlap_h2d: bool = True
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
     loss_mask_value: Optional[float] = None
+    swa_enabled: bool = False
+    swa_start_epoch: Optional[int] = None
+    swa_update_batch_norm: bool = False
     model_ckpt_dir: Optional[str] = None
     keys: Optional[List[Tuple[Any, ...]]] = None
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
@@ -397,11 +399,13 @@ class RuntimeConfig:
         "seed",
         "prefetch_factor",
         "grad_accum_steps",
-        "overlap_h2d",
         "loss_tile_dim",
         "loss_tile_size",
         "loss_mask_mode",
         "loss_mask_value",
+        "swa_enabled",
+        "swa_start_epoch",
+        "swa_update_batch_norm",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "batch_size",
@@ -441,11 +445,13 @@ class RuntimeConfig:
                 "seed",
                 "prefetch_factor",
                 "grad_accum_steps",
-                "overlap_h2d",
                 "loss_tile_dim",
                 "loss_tile_size",
                 "loss_mask_mode",
                 "loss_mask_value",
+                "swa_enabled",
+                "swa_start_epoch",
+                "swa_update_batch_norm",
             }
             unsupported = set(kwargs) - allowed
             if unsupported:
@@ -472,11 +478,15 @@ class RuntimeConfig:
                 seed=int(kwargs.get("seed", 42)),
                 prefetch_factor=kwargs.get("prefetch_factor", 1),
                 grad_accum_steps=int(kwargs.get("grad_accum_steps", 1)),
-                overlap_h2d=bool(kwargs.get("overlap_h2d", True)),
                 loss_tile_dim=kwargs.get("loss_tile_dim"),
                 loss_tile_size=kwargs.get("loss_tile_size"),
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
                 loss_mask_value=kwargs.get("loss_mask_value"),
+                swa_enabled=bool(kwargs.get("swa_enabled", False)),
+                swa_start_epoch=kwargs.get("swa_start_epoch"),
+                swa_update_batch_norm=bool(
+                    kwargs.get("swa_update_batch_norm", False)
+                ),
             )
         for k in ("sources", "keys"):
             if k not in kwargs or kwargs[k] is None:

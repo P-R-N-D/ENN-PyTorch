@@ -101,10 +101,10 @@ class Dataset(_Dataset):
                     self._perm = torch.load(perm_path, map_location="cpu")
                     meta_shuffled = bool((self._meta or {}).get("shuffled", False))
                     self._perm_source = "runtime" if not meta_shuffled else "metadata"
-        if self._perm is None and bool(int(os.environ.get("STNET_RANDOM_SPLIT", "0"))):
+        if self._perm is None and False:
             gen = torch.Generator(device="cpu")
             with suppress(Exception):
-                gen.manual_seed(int(os.environ.get("STNET_SPLIT_SEED", "0") or "0"))
+                gen.manual_seed(0)
             with suppress(Exception):
                 self._perm = torch.randperm(self._N, generator=gen)
                 self._perm_source = "runtime"
@@ -200,19 +200,6 @@ class Dataset(_Dataset):
             idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
             if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
                 idx_tensor = self._perm.index_select(0, idx_tensor)
-            try:
-                import os as _os
-
-                if bool(int(_os.environ.get("STNET_DEBUG_IDX", "0"))):
-                    if idx_tensor.numel():
-                        _min = int(idx_tensor.min().item())
-                        _max = int(idx_tensor.max().item())
-                        if _min < 0 or _max >= self._N:
-                            raise IndexError(
-                                f"index out of range: valid [0,{self._N-1}], got [{_min},{_max}]"
-                            )
-            except Exception:
-                pass
             try:
                 x = self._features.index_select(0, idx_tensor)
             except Exception:
@@ -521,10 +508,10 @@ class Connector:
         self.io_workers = max(1, int(io_workers))
         self.prebatch = max(1, int(prebatch))
         with suppress(Exception):
-            self.prebatch = max(1, int(os.environ.get("STNET_PREBATCH", self.prebatch)))
+            self.prebatch = max(1, int(self.prebatch))
         self.prefetch_factor = max(1, int(prefetch_factor))
         with suppress(Exception):
-            self.prefetch_factor = max(1, int(os.environ.get("STNET_PREFETCH", self.prefetch_factor)))
+            self.prefetch_factor = max(1, int(self.prefetch_factor))
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
         )
@@ -576,11 +563,11 @@ class Loader:
         if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
             try:
                 gpu_guard_default = "2048" if dev_t == "cuda" else "512"
-                gpu_guard_mb = int(os.environ.get("STNET_GPU_GUARD_MB", gpu_guard_default))
+                gpu_guard_mb = int(gpu_guard_default)
             except Exception:
                 gpu_guard_mb = 2048 if dev_t == "cuda" else 512
             try:
-                host_guard_mb = int(os.environ.get("STNET_HOST_GUARD_MB", "1024"))
+                host_guard_mb = 1024
             except Exception:
                 host_guard_mb = 1024
             self._iterable = Prefetcher(
@@ -623,11 +610,7 @@ class Prefetcher:
     ) -> None:
         self._src = iterable
         self._device = torch.device(device) if not isinstance(device, torch.device) else device
-        try:
-            _env_depth = int(os.environ.get("STNET_PREFETCH", str(depth)))
-        except Exception:
-            _env_depth = int(depth)
-        self._depth = max(1, int(_env_depth))
+        self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
         self._backpressure = bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
@@ -647,7 +630,7 @@ class Prefetcher:
                 n_streams = 1
                 if use_accel and self._non_blocking:
                     try:
-                        n_streams = max(1, min(self._depth, int(os.environ.get("STNET_COPY_STREAMS", "3"))))
+                        n_streams = max(1, min(self._depth, 3))
                     except Exception:
                         n_streams = max(1, min(self._depth, 3))
                     try:

@@ -789,17 +789,7 @@ _TLB_SINGLETON: Optional[Thread] = None
 def get_tlb(io_workers: Optional[int] = None) -> Thread:
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
-        default_workers = io_workers
-        if default_workers is None:
-            default_workers = int(
-                os.getenv(
-                    "STNET_TLB_IO_WORKERS",
-                    os.getenv("STNET_DATALOADER_WORKERS", "0"),
-                )
-                or "0"
-            )
-            if default_workers <= 0:
-                default_workers = max(1, (os.cpu_count() or 4) // 2)
+        default_workers = io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
         _TLB_SINGLETON = Thread(io_workers=default_workers)
     return _TLB_SINGLETON
 

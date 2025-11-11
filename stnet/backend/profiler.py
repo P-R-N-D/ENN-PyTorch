@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import os
 from functools import partial
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -191,7 +190,7 @@ class _FlopProfiler:
     def coerce_flops_ntvx(self) -> None:
         if self._nvtx_getter is not None:
             return
-        hook = os.environ.get("STF_NVTX_FLOPS_FN", "").strip()
+        hook = ""
         if not hook:
             self._nvtx_getter = self._get_ntvx
             return
