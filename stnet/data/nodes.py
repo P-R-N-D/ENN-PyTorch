@@ -79,18 +79,22 @@ class Dataset(_TorchDataset):
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
         # optional permutation for random split/order
         self._perm: Optional[torch.Tensor] = None
+        self._perm_runtime: bool = False
         perm_fn = (self._meta or {}).get("perm_filename", None)
         if perm_fn:
             perm_path = os.path.join(self.dir, str(perm_fn))
             if os.path.isfile(perm_path):
                 with suppress(Exception):
                     self._perm = torch.load(perm_path, map_location="cpu")
+                    meta_shuffled = bool((self._meta or {}).get("shuffled", False))
+                    self._perm_runtime = not meta_shuffled
         if self._perm is None and bool(int(os.environ.get("STNET_RANDOM_SPLIT", "0"))):
             gen = torch.Generator(device="cpu")
             with suppress(Exception):
                 gen.manual_seed(int(os.environ.get("STNET_SPLIT_SEED", "0") or "0"))
             with suppress(Exception):
                 self._perm = torch.randperm(self._N, generator=gen)
+                self._perm_runtime = True
         # validate permutation length / dtype / device
         if self._perm is not None:
             try:
@@ -112,6 +116,8 @@ class Dataset(_TorchDataset):
                             self._perm = self._perm.cpu()
             except Exception:
                 self._perm = None
+        if self._perm is None:
+            self._perm_runtime = False
         train_start = int(self._meta.get("train_start", 0))
         train_end   = int(self._meta.get("train_end",   self._N))
         val_start   = int(self._meta.get("val_start",   0))
@@ -144,7 +150,7 @@ class Dataset(_TorchDataset):
         return max(0, int(self._end) - int(self._start))
 
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
-        if getattr(self, "_perm", None) is not None:
+        if self._perm_runtime and getattr(self, "_perm", None) is not None:
             idx = self._perm[start:end]
             if idx.numel() == 0:
                 x = self._features[:0]
@@ -181,7 +187,7 @@ class Dataset(_TorchDataset):
                 return self._slice(0, 0)
             idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
             # optional permutation applied
-            if getattr(self, "_perm", None) is not None:
+            if self._perm_runtime and getattr(self, "_perm", None) is not None:
                 idx_tensor = self._perm.index_select(0, idx_tensor)
             # (2) optional runtime index-range check (debug)
             #     유효 범위: [0, self._N - 1]
