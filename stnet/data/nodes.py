@@ -19,8 +19,7 @@ except Exception:
     BaseNode = object
 
 try:
-    from tensordict import TensorDict, load_memmap
-    from tensordict import memmap as td_memmap
+    from tensordict import TensorDict, MemoryMappedTensor
 except Exception as e:
     raise RuntimeError("tensordict is required for Dataset") from e
 
@@ -63,19 +62,34 @@ class Dataset(_Dataset):
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Optional[Mapping[str, Any]] = None
-
         meta_path = os.path.join(self.dir, "meta.json")
         if not os.path.isfile(meta_path):
             raise FileNotFoundError(f"meta.json not found under: {self.dir}")
         with open(meta_path, "r", encoding="utf-8") as f:
             self._meta = json.load(f)
         self._N = int(self._meta.get("N", 0))
-        td_prefix = os.path.join(self.dir, self._meta.get("tensordict_prefix", "td_memmap"))
-        nb = bool(int(os.environ.get("STNET_TD_NONBLOCKING_LOAD", "0")))
-        td = load_memmap(td_prefix, non_blocking=nb)
-        self._features = td.get("features")
-        self._labels = td.get("labels")
-        lshape = list(self._meta.get("label_shape") or [])
+        feat_rel  = str(self._meta.get("features_path", "features.mmt"))
+        lab_rel   = str(self._meta.get("labels_path", "labels.mmt"))
+        feat_path = os.path.join(self.dir, feat_rel)
+        lab_path  = os.path.join(self.dir, lab_rel)
+        fdim      = int(self._meta.get("feature_dim", 0))
+        lshape_meta = list(self._meta.get("label_shape") or [])
+
+        def _dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
+            try:
+                return getattr(torch, str(name))
+            except Exception:
+                return default
+
+        f_dtype = _dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
+        l_dtype = _dtype_from_name(self._meta.get("labels_dtype", "int64"),   torch.int64)
+        self._features = MemoryMappedTensor.from_filename(
+            filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
+        )
+        lshape = tuple(lshape_meta) if lshape_meta else tuple()
+        self._labels = MemoryMappedTensor.from_filename(
+            filename=lab_path, dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
+        )
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
         self._perm: Optional[torch.Tensor] = None
         self._perm_source: Optional[Literal["runtime", "metadata"]] = None
@@ -295,9 +309,7 @@ def preload_memmap(
     train_start, train_end = 0, train_count
     val_start, val_end = train_end, train_end + val_count
 
-    meta: Dict[str, Any] = {
-        "N": count,
-        "feature_dim": int(feature_flat.shape[1]),
+    meta: Dict[str, Any] = {"N": count, "feature_dim": int(feature_flat.shape[1]), "features_path": "features.mmt", "labels_path": "labels.mmt",
         "label_shape": list(label_shape),
         "features_dtype": to_platform_dtype(feature_flat.dtype, "name"),
         "labels_dtype": to_platform_dtype(label_flat.dtype, "name"),
