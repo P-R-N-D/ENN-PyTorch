@@ -13,53 +13,6 @@ from tensordict import TensorDictBase
 from .datatype import to_tuple, to_torch_tensor
 
 
-_SCALER: Dict[str, torch.Tensor] | None = None
-
-
-def set_scaler(*args: Any, mean: Any, std: Any, **kwargs: Any) -> None:
-    global _SCALER
-    mean_t = (
-        torch.as_tensor(mean, dtype=torch.float64, device=torch.device("cpu"))
-        .detach()
-        .clone()
-    )
-    std_t = (
-        torch.as_tensor(std, dtype=torch.float64, device=torch.device("cpu"))
-        .detach()
-        .clone()
-    )
-    std_t = torch.nan_to_num(std_t, nan=0.0)
-    std_t = torch.clamp(std_t, min=1e-6)
-    _SCALER = {"mean": mean_t, "std": std_t}
-
-
-def get_scaler() -> Dict[str, torch.Tensor] | None:
-    return _SCALER
-
-
-def drop_scaler() -> None:
-    global _SCALER
-    _SCALER = None
-
-
-def _scale_y(labels: torch.Tensor) -> torch.Tensor:
-    if not torch.is_floating_point(labels):
-        return labels
-    scaler = get_scaler()
-    if scaler is None:
-        return labels
-    mean_t = torch.as_tensor(
-        scaler["mean"], dtype=torch.float64, device=labels.device
-    )
-    std_t = torch.as_tensor(
-        scaler["std"], dtype=torch.float64, device=labels.device
-    )
-    std_t = torch.clamp(std_t, min=1e-6)
-    scaled = (labels.to(torch.float64) - mean_t) / std_t
-    if torch.is_floating_point(labels):
-        return scaled.to(labels.dtype)
-    return scaled
-
 class _ScalerBase:
     def __init__(
         self,
@@ -469,7 +422,6 @@ def _preprocess_batch(
         return None
     label_shape = tuple(label_tensor.shape[1:])
     batch_keys = [(int(index),) for index in range(batch_size)]
-    label_tensor = _scale_y(label_tensor)
     return (feature_tensor, label_tensor, batch_keys, label_shape)
 
 def _preprocess_y(value: Any) -> torch.Tensor:
@@ -496,7 +448,6 @@ def preprocess(
             raise ValueError("preprocess(TensorDict): missing 'labels' or 'labels_flat'")
         if labels.ndim == 1:
             labels = labels.unsqueeze(0)
-        labels = _scale_y(labels)
         label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
         keys = [(int(i),) for i in range(int(feats.shape[0]))]
         return (feats, labels, keys, label_shape)
@@ -511,7 +462,6 @@ def preprocess(
         )
         if yt.dim() == 0 or yt.dim() == 1:
             yt = yt.unsqueeze(0)
-        yt = _scale_y(yt)
         keys = [to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
@@ -526,7 +476,6 @@ def preprocess(
             yt = yt.unsqueeze(0)
         elif yt.shape[0] != 1:
             yt = yt.unsqueeze(0)
-        yt = _scale_y(yt)
         keys = [to_tuple(x)]
         label_shape = tuple(yt.shape[1:])
         return (xr, yt, keys, label_shape)
@@ -548,7 +497,6 @@ def preprocess(
         else:
             labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
         labels = _assert_finites(labels, "label")
-        labels = _scale_y(labels)
         label_shape = tuple(labels.shape[1:])
         return (feats, labels, keys, label_shape)
     else:
@@ -577,20 +525,6 @@ def postprocess(
             if isinstance(p, torch.Tensor)
             else torch.as_tensor(p)
             for p in preds
-        ]
-    scaler = get_scaler()
-    if scaler is not None:
-        mean_t = torch.as_tensor(scaler["mean"], dtype=torch.float64)
-        std_t = torch.as_tensor(scaler["std"], dtype=torch.float64)
-        std_t = torch.clamp(std_t, min=1e-6)
-        rows = [
-            (
-                row.to(torch.float64) * std_t.to(row.device)
-                + mean_t.to(row.device)
-            ).to(row.dtype)
-            if torch.is_floating_point(row)
-            else row
-            for row in rows
         ]
     fixed_keys: List[Tuple] = []
     seen = set()

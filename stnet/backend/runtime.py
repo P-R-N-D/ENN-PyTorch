@@ -36,7 +36,7 @@ from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.pipeline import fetch
 from ..data.stats import Metadata
-from ..data.transforms import postprocess, preprocess, set_scaler
+from ..data.transforms import postprocess, preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..functional.optimizers import AdamW, SWALR, StochasticWeightAverage, stochastic_weight_average
@@ -1063,13 +1063,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         cfg = coerce_model_config(ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict)
         cfg = replace(cfg, device=device)
         model = Root(ops.in_dim, ops.out_shape, config=cfg)
-        with contextlib.suppress(Exception):
-            mean_buf = getattr(model, "target_mean", None)
-            std_buf = getattr(model, "target_std", None)
-            if mean_buf is not None and std_buf is not None:
-                mean = float(torch.as_tensor(mean_buf).item())
-                std = float(max(torch.as_tensor(std_buf).item(), 1e-6))
-                set_scaler(mean=mean, std=std)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
@@ -1391,13 +1384,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     m_sd = _trim_dcp_keys(m_sd)
                     load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ops.model_ckpt_dir))
                     set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-        with contextlib.suppress(Exception):
-            mean_buf = getattr(model, "target_mean", None)
-            std_buf = getattr(model, "target_std", None)
-            if mean_buf is not None and std_buf is not None:
-                mean = float(torch.as_tensor(mean_buf).item())
-                std = float(max(torch.as_tensor(std_buf).item(), 1e-6))
-                set_scaler(mean=mean, std=std)
         model.to(device, non_blocking=True).eval()
         metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)

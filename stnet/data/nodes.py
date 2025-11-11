@@ -315,10 +315,7 @@ def preload_memmap(
     if perm is not None and seed is not None:
         meta["perm_filename"] = "perm.pt"
 
-    for key in ("target_scaler", "robust_q", "robust_cap", "scale_non_floating"):
-        if key in kwargs and kwargs[key] is not None:
-            value = kwargs[key]
-            meta[key] = list(value) if isinstance(value, tuple) else value
+    # scaler-related metadata removed
 
     with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle)

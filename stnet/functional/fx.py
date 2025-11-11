@@ -746,21 +746,28 @@ class Autocast:
                     "Autocast.float falling back to fp16 on CUDA device without bf16 support"
                 )
                 requested_dtype = torch.float16
-        try:
-            ctx = torch.amp.autocast(
-                device_type=dev.type,
-                dtype=requested_dtype,
-                enabled=True,
-            )
-            contexts.append(ctx)
-        except (RuntimeError, ValueError) as exc:
-            _LOGGER.debug(
-                "Autocast.float torch.amp fallback on %s: %s", dev.type, exc
-            )
+        if dev.type == "cpu" and requested_dtype not in (
+            torch.bfloat16,
+            torch.float16,
+        ):
             contexts.append(contextlib.nullcontext())
             cls._last_float_dtype = requested_dtype
         else:
-            cls._last_float_dtype = requested_dtype
+            try:
+                ctx = torch.amp.autocast(
+                    device_type=dev.type,
+                    dtype=requested_dtype,
+                    enabled=True,
+                )
+                contexts.append(ctx)
+            except (RuntimeError, ValueError) as exc:
+                _LOGGER.debug(
+                    "Autocast.float torch.amp fallback on %s: %s", dev.type, exc
+                )
+                contexts.append(contextlib.nullcontext())
+                cls._last_float_dtype = requested_dtype
+            else:
+                cls._last_float_dtype = requested_dtype
         cls._metadata = meta
 
         with contextlib.ExitStack() as stack:
