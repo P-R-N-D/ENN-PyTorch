@@ -39,9 +39,9 @@ except Exception:
     SamplerWrapper = None
 
 try:
-    from torch.utils.data import Dataset as _TorchDataset, Sampler as _Sampler
+    from torch.utils.data import Dataset as _Dataset, Sampler as _Sampler
 except Exception:
-    _TorchDataset = object
+    _Dataset = object
     _Sampler = object
 
 from .datatype import to_platform_dtype
@@ -58,7 +58,7 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
     return batch
 
 
-class Dataset(_TorchDataset):
+class Dataset(_Dataset):
     def __init__(self, memmap_dir: str, *args: Any, split: str = "train", val_frac: float = 0.0, **kwargs: Any) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
