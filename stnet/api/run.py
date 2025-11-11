@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import json
-import math
 import os
 import random
 import shutil
@@ -29,7 +28,7 @@ except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..data.nodes import preload_memmap
-from ..data.transforms import preprocess, set_scaler, get_scaler, drop_scaler
+from ..data.transforms import preprocess
 from ..model import Root
 from .config import (
     ModelConfig,
@@ -55,70 +54,6 @@ from ..backend.runtime import _trim_dcp_keys, ignored_pattern, main
 
 
 _DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
-
-
-def _coerce_buffer(
-    model: Root,
-    name: str,
-    value: torch.Tensor | float | int,
-    *args: Any,
-    persistent: bool = True,
-    ref: torch.Tensor | None = None,
-    **kwargs: Any,
-) -> torch.Tensor:
-    with torch.no_grad():
-        if ref is None:
-            ref = next(model.parameters(), None)
-            if ref is None:
-                ref = next(model.buffers(), None)
-        ref_dtype = ref.dtype if isinstance(ref, torch.Tensor) else torch.float32
-        ref_device = ref.device if isinstance(ref, torch.Tensor) else torch.device("cpu")
-
-        new_t = torch.as_tensor(value, dtype=ref_dtype, device=ref_device)
-
-        if hasattr(model, name) and isinstance(getattr(model, name), torch.Tensor):
-            buf = getattr(model, name)
-            if tuple(buf.shape) != tuple(new_t.shape):
-                try:
-                    delattr(model, name)
-                except Exception:
-                    pass
-                model.register_buffer(name, new_t, persistent=persistent)
-                return getattr(model, name)
-            if buf.dtype != ref_dtype or buf.device != ref_device:
-                buf.data = buf.data.to(dtype=ref_dtype, device=ref_device)
-            buf.copy_(new_t)
-            return buf
-        else:
-            model.register_buffer(name, new_t, persistent=persistent)
-            return getattr(model, name)
-
-
-def _attach_buffer(
-    model: Root,
-    /,
-    *args: Any,
-    persistent: bool = True,
-    ref: torch.Tensor | None = None,
-    **named_values: torch.Tensor | float | int,
-) -> None:
-    for k, v in named_values.items():
-        _coerce_buffer(model, k, v, persistent=persistent, ref=ref)
-
-
-def _attach_scaler(
-    model: Root, mean: torch.Tensor | float, std: torch.Tensor | float
-) -> None:
-    try:
-        ref = torch.empty((), dtype=torch.float64, device="cpu")
-        _attach_buffer(
-            model,
-            target_mean=torch.as_tensor(mean, dtype=torch.float64, device="cpu"),
-            target_std=torch.as_tensor(std, dtype=torch.float64, device="cpu"),
-            ref=ref,
-        )
-    except Exception:
-        pass
 
 
 def _preload_state(value: Any) -> Any:
@@ -158,10 +93,6 @@ def train(
     loss_tile_size: Optional[int] = None,
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
-    target_scaler: str = "standard",
-    robust_q: Tuple[float, float] = (25.0, 75.0),
-    robust_cap: int = 200_000,
-    scale_non_floating: bool = False,
     **kwargs: Any,
 ) -> Root:
     try:
@@ -197,85 +128,8 @@ def train(
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
-    drop_scaler()
-    robust_cap = max(1, int(robust_cap))
-
-    mode = str(target_scaler).lower().strip()
-    use_none = mode == "none"
-    use_robust = mode == "robust"
-    try:
-        q_values = list(robust_q[:2]) if isinstance(robust_q, Sequence) else list(robust_q)
-    except Exception:
-        q_values = [25.0, 75.0]
-    if len(q_values) < 2:
-        q_values = (q_values + [75.0])[:2]
-    q_values = sorted(float(q) for q in q_values)
-    q_lo = max(0.0, min(q_values[0], 100.0)) / 100.0
-    q_hi = max(0.0, min(q_values[1], 100.0)) / 100.0
-    if q_hi <= q_lo:
-        q_hi = min(1.0, q_lo + 1e-6)
-
-    def _coerce_scaler(
-        labels: torch.Tensor, *, fit_count: int | None = None
-    ) -> torch.Tensor:
-        scaler = get_scaler()
-        if scaler is not None:
-            mean_t = torch.as_tensor(
-                scaler["mean"], dtype=torch.float64, device=labels.device
-            )
-            std_t = torch.as_tensor(
-                scaler["std"], dtype=torch.float64, device=labels.device
-            )
-            std_t = torch.clamp(std_t, min=1e-6)
-            scaled = (labels.to(torch.float64) - mean_t) / std_t
-            if torch.is_floating_point(labels):
-                scaled = scaled.to(labels.dtype)
-            return scaled
-        with torch.no_grad():
-            safe = labels.detach().to(torch.float64)
-            if use_none:
-                return labels
-            if safe.numel() == 0:
-                return labels
-            fit = (
-                safe[:fit_count]
-                if isinstance(fit_count, int)
-                and fit_count > 0
-                and fit_count <= int(safe.shape[0])
-                else safe
-            )
-            fit = torch.where(torch.isfinite(fit), fit, torch.nan)
-            if fit.dim() == 1:
-                mean_t = torch.nanmean(fit)
-                std_t = torch.nanstd(fit, unbiased=False)
-            else:
-                mean_t = torch.nanmean(fit, dim=0)
-                std_t = torch.nanstd(fit, dim=0, unbiased=False)
-            std_t = torch.nan_to_num(std_t, nan=0.0)
-            std_t = torch.clamp(std_t, min=1e-6)
-        set_scaler(mean=mean_t.cpu(), std=std_t.cpu())
-        _attach_scaler(model, mean_t, std_t)
-        scaled = (labels.to(torch.float64) - mean_t) / std_t
-        if torch.is_floating_point(labels):
-            scaled = scaled.to(labels.dtype)
-        return scaled
-
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
-        if (not torch.is_floating_point(lb)) and (not bool(scale_non_floating)):
-            preload_memmap(
-                {"features": fx, "labels": lb},
-                memmap_dir=out_dir,
-                train_frac=1.0 - float(val_frac),
-                val_frac=float(val_frac),
-                shuffle=bool(shuffle),
-                seed=seed_value,
-                target_scaler=mode,
-                robust_q=tuple(robust_q),
-                robust_cap=int(robust_cap),
-                scale_non_floating=bool(scale_non_floating),
-            )
-            return fx, tuple(lshape)
         did_manual_shuffle = False
         if shuffle:
             n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
@@ -287,11 +141,6 @@ def train(
                 fx = fx.index_select(0, perm)
                 lb = lb.index_select(0, perm)
                 did_manual_shuffle = True
-        n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
-        val_count = int(round(n_total * float(val_frac)))
-        n_train = n_total - val_count
-        if (not use_none) and (get_scaler() is None):
-            lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
         shuffle_for_preload = bool(shuffle and not did_manual_shuffle)
         preload_memmap(
             {"features": fx, "labels": lb},
@@ -300,36 +149,12 @@ def train(
             val_frac=float(val_frac),
             shuffle=shuffle_for_preload,
             seed=seed_value,
-            target_scaler=mode,
-            robust_q=tuple(robust_q),
-            robust_cap=int(robust_cap),
-            scale_non_floating=bool(scale_non_floating),
         )
         return fx, tuple(lshape)
 
     initialize_python_path()
     mp.allow_connection_pickling()
     set_multiprocessing_env()
-
-    def _iter_data(dsrc: Any):
-        if isinstance(dsrc, Mapping) and dsrc and all(
-            isinstance(v, Mapping) for v in dsrc.values()
-        ):
-            for _d in dsrc.values():
-                yield _d
-        elif isinstance(dsrc, Sequence) and dsrc and all(
-            isinstance(_d, Mapping) for _d in dsrc
-        ):
-            for _d in dsrc:
-                yield _d
-        else:
-            yield dsrc
-
-    sum_t: torch.Tensor | None = None
-    sumsq_t: torch.Tensor | None = None
-    cnt_t: torch.Tensor | None = None
-    robust_samples: list[torch.Tensor] = []
-    robust_rows = 0
 
     is_dist = dist.is_available() and dist.is_initialized()
     rank = dist.get_rank() if is_dist else 0
@@ -338,226 +163,13 @@ def train(
     except Exception:
         backend = None
 
-    if not use_none:
-        g_stats = torch.Generator(device="cpu")
-        g_samp = torch.Generator(device="cpu")
-        if seed_value is not None:
-            with contextlib.suppress(Exception):
-                g_stats.manual_seed(seed_value)
-                g_samp.manual_seed(seed_value + 1337)
-
-        iter_data = _iter_data(data) if (not is_dist or rank == 0) else []
-
-        for _d in iter_data:
-            fx_, lb_, _, _ = preprocess(_d)
-            if not torch.is_floating_point(lb_) and not bool(scale_non_floating):
-                continue
-            if shuffle:
-                n_total_ps = (
-                    int(lb_.shape[0]) if hasattr(lb_, "shape") and lb_.ndim > 0 else 0
-                )
-                if n_total_ps > 0:
-                    if seed_value is not None:
-                        with contextlib.suppress(Exception):
-                            g_stats.manual_seed(seed_value)
-                    perm_ = torch.randperm(n_total_ps, generator=g_stats)
-                    fx_ = fx_.index_select(0, perm_)
-                    lb_ = lb_.index_select(0, perm_)
-            n_total_ = int(lb_.shape[0]) if hasattr(lb_, "shape") and lb_.ndim > 0 else 0
-            val_count_ = int(round(n_total_ * float(val_frac)))
-            n_train_ = n_total_ - val_count_
-            if n_train_ <= 0:
-                continue
-            y_ = lb_[:n_train_].detach().to(torch.float64)
-            if y_.ndim == 1:
-                y_ = y_.unsqueeze(1)
-            if use_robust:
-                if robust_rows < int(robust_cap):
-                    remain = int(robust_cap) - robust_rows
-                    if y_.shape[0] > remain:
-                        if seed_value is not None:
-                            with contextlib.suppress(Exception):
-                                g_samp.manual_seed(seed_value + robust_rows)
-                        idx = torch.randperm(y_.shape[0], generator=g_samp)[:remain]
-                        y_ = y_.index_select(0, idx)
-                    robust_samples.append(y_)
-                    robust_rows += y_.shape[0]
-            else:
-                finite_ = torch.isfinite(y_)
-                zero_fill = torch.zeros((), dtype=torch.float64, device=y_.device)
-                y_masked_ = torch.where(finite_, y_, zero_fill)
-                s_ = y_masked_.sum(dim=0)
-                ss_ = (y_masked_ * y_masked_).sum(dim=0)
-                c_ = finite_.sum(dim=0).to(torch.float64)
-                if sum_t is None:
-                    sum_t, sumsq_t, cnt_t = s_, ss_, c_
-                else:
-                    sum_t = sum_t + s_
-                    sumsq_t = sumsq_t + ss_
-                    cnt_t = cnt_t + c_
-
-    if use_none:
-        mean_fit = None
-        std_fit = None
-    elif use_robust:
-        if (not is_dist) or rank == 0:
-            if len(robust_samples) == 0:
-                mean_fit = torch.zeros(1, dtype=torch.float64)
-                std_fit = torch.ones(1, dtype=torch.float64)
-            else:
-                Y = torch.cat(robust_samples, dim=0)
-                med = torch.nanmedian(Y, dim=0).values
-                nanquantile = getattr(torch, "nanquantile", None)
-                if nanquantile is not None:
-                    q1 = torch.nanquantile(Y, q_lo, dim=0)
-                    q3 = torch.nanquantile(Y, q_hi, dim=0)
-                else:
-                    cols_q1 = []
-                    cols_q3 = []
-                    for c in range(Y.shape[1]):
-                        col = Y[:, c]
-                        col = col[torch.isfinite(col)]
-                        if col.numel() == 0:
-                            cols_q1.append(
-                                torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
-                            )
-                            cols_q3.append(
-                                torch.tensor(float("nan"), dtype=Y.dtype, device=Y.device)
-                            )
-                        else:
-                            cols_q1.append(torch.quantile(col, q_lo))
-                            cols_q3.append(torch.quantile(col, q_hi))
-                    q1 = torch.stack(cols_q1)
-                    q3 = torch.stack(cols_q3)
-                iqr = q3 - q1
-                iqr = torch.nan_to_num(iqr, nan=0.0).clamp(min=1e-6)
-                med = torch.nan_to_num(med, nan=0.0)
-                mean_fit = med
-                std_fit = iqr
-        else:
-            mean_fit = None
-            std_fit = None
-    else:
-        if (not is_dist) or rank == 0:
-            if sum_t is None or sumsq_t is None or cnt_t is None:
-                mean_fit = torch.zeros(1, dtype=torch.float64)
-                std_fit = torch.ones(1, dtype=torch.float64)
-            else:
-                cnt_safe = torch.clamp(cnt_t, min=1.0)
-                mean_fit = sum_t / cnt_safe
-                var_fit = torch.clamp(
-                    sumsq_t / cnt_safe - mean_fit * mean_fit, min=0.0
-                )
-                std_fit = torch.sqrt(var_fit)
-                std_fit = torch.clamp(std_fit, min=1e-6)
-                zero_cnt_mask = (
-                    (cnt_t == 0) if isinstance(cnt_t, torch.Tensor) else None
-                )
-                if isinstance(zero_cnt_mask, torch.Tensor) and torch.any(zero_cnt_mask):
-                    mean_fit = torch.where(
-                        zero_cnt_mask, torch.zeros_like(mean_fit), mean_fit
-                    )
-                    std_fit = torch.where(
-                        zero_cnt_mask, torch.ones_like(std_fit), std_fit
-                    )
-        else:
-            mean_fit = None
-            std_fit = None
-
-    if not use_none:
-        if (not is_dist) or rank == 0:
-            mean_source = torch.as_tensor(mean_fit, dtype=torch.float64)
-            std_source = torch.as_tensor(std_fit, dtype=torch.float64)
-        else:
-            mean_source = torch.empty(0, dtype=torch.float64)
-            std_source = torch.empty(0, dtype=torch.float64)
-        std_source = torch.nan_to_num(std_source, nan=0.0)
-        std_source = torch.clamp(std_source, min=1e-6)
-        mean_source = torch.nan_to_num(mean_source, nan=0.0)
-
-        if mean_source.dim() == 0 and ((not is_dist) or rank == 0):
-            mean_source = mean_source.reshape(1)
-            std_source = std_source.reshape(1)
-
-        target_shape: Tuple[int, ...]
-        if is_dist:
-            dims_tensor = torch.tensor([mean_source.dim()], dtype=torch.long)
-            if rank != 0:
-                dims_tensor.zero_()
-            dist.broadcast(dims_tensor, src=0)
-            ndims = int(dims_tensor.item())
-            if rank == 0:
-                shape_tensor = torch.tensor(
-                    list(mean_source.shape), dtype=torch.long
-                )
-            else:
-                shape_tensor = torch.zeros(ndims, dtype=torch.long)
-            if ndims > 0:
-                dist.broadcast(shape_tensor, src=0)
-                target_shape = tuple(int(v) for v in shape_tensor.tolist())
-            else:
-                target_shape = ()
-        else:
-            target_shape = tuple(mean_source.shape)
-
-        numel = int(math.prod(target_shape)) if target_shape else 1
-        if is_dist:
-            if backend == "nccl" and torch.cuda.is_available():
-                bcast_device = torch.device("cuda", torch.cuda.current_device())
-            else:
-                bcast_device = torch.device("cpu")
-            if rank == 0:
-                mean_flat = mean_source.reshape(-1).contiguous().to(bcast_device)
-                std_flat = std_source.reshape(-1).contiguous().to(bcast_device)
-            else:
-                mean_flat = torch.empty(numel, dtype=torch.float64, device=bcast_device)
-                std_flat = torch.empty(numel, dtype=torch.float64, device=bcast_device)
-            dist.broadcast(mean_flat, src=0)
-            dist.broadcast(std_flat, src=0)
-            mean_cpu = mean_flat.to("cpu")
-            std_cpu = std_flat.to("cpu")
-        else:
-            mean_cpu = mean_source.reshape(-1).contiguous()
-            std_cpu = std_source.reshape(-1).contiguous()
-
-        if target_shape:
-            mean_cpu = mean_cpu.view(*target_shape)
-            std_cpu = std_cpu.view(*target_shape)
-        else:
-            mean_cpu = mean_cpu.view(1)
-            std_cpu = std_cpu.view(1)
-
-        _attach_scaler(model, mean_cpu, std_cpu)
-        set_scaler(mean=mean_cpu.detach().cpu(), std=std_cpu.detach().cpu())
-
-        scaler_state = get_scaler()
-        if scaler_state is not None:
-            mean_ref = torch.as_tensor(
-                scaler_state.get("mean"), dtype=torch.float64
-            )
-            std_ref = torch.as_tensor(
-                scaler_state.get("std"), dtype=torch.float64
-            )
-            mean_diff = torch.max(torch.abs(mean_ref - mean_cpu.to(torch.float64))).item()
-            std_diff = torch.max(torch.abs(std_ref - std_cpu.to(torch.float64))).item()
-            mean_match = bool(
-                torch.allclose(mean_ref, mean_cpu.to(torch.float64), atol=1e-6, rtol=1e-6)
-            )
-            std_match = bool(
-                torch.allclose(std_ref, std_cpu.to(torch.float64), atol=1e-6, rtol=1e-6)
-            )
-            print(
-                f"[target_scaler][rank={rank}] backend={backend or 'none'} "
-                f"mean_match={mean_match} std_match={std_match} "
-                f"mean_max_diff={mean_diff:.3e} std_max_diff={std_diff:.3e}",
-                flush=True,
-            )
-
     memmap_dir = new_dir("memmap_ds")
 
     first_feats: Optional[torch.Tensor] = None
     label_shape: Tuple[int, ...] = ()
     manifest: Optional[Dict[str, str] | Sequence[str]] = None
+    ckpt_dir: Optional[str] = None
+    init_dir: Optional[str] = None
 
     try:
         if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
@@ -586,49 +198,8 @@ def train(
                         raise RuntimeError("inconsistent feature/label shapes across datasets")
                 manifest.append(key)
         else:
-            fx, lb, _, lshape = preprocess(data)
-            if shuffle:
-                n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
-                if n_total_ps > 0:
-                    g = torch.Generator(device="cpu")
-                    if seed_value is not None:
-                        g.manual_seed(seed_value)
-                    perm = torch.randperm(n_total_ps, generator=g)
-                    fx = fx.index_select(0, perm)
-                    lb = lb.index_select(0, perm)
-            n_total = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
-            if (not torch.is_floating_point(lb)) and (not bool(scale_non_floating)):
-                preload_memmap(
-                    {"features": fx, "labels": lb},
-                    memmap_dir=memmap_dir,
-                    train_frac=1.0 - float(val_frac),
-                    val_frac=float(val_frac),
-                    shuffle=bool(shuffle),
-                    seed=seed_value,
-                    target_scaler=mode,
-                    robust_q=tuple(robust_q),
-                    robust_cap=int(robust_cap),
-                    scale_non_floating=bool(scale_non_floating),
-                )
-                first_feats, label_shape = fx, tuple(lshape)
-            else:
-                val_count = int(round(n_total * float(val_frac)))
-                n_train = n_total - val_count
-                if (not use_none) and (get_scaler() is None):
-                    lb = _coerce_scaler(lb, fit_count=n_train if n_train > 0 else None)
-                preload_memmap(
-                    {"features": fx, "labels": lb},
-                    memmap_dir=memmap_dir,
-                    train_frac=1.0 - float(val_frac),
-                    val_frac=float(val_frac),
-                    shuffle=False,
-                    seed=seed_value,
-                    target_scaler=mode,
-                    robust_q=tuple(robust_q),
-                    robust_cap=int(robust_cap),
-                    scale_non_floating=bool(scale_non_floating),
-                )
-                first_feats, label_shape = fx, tuple(lshape)
+            fx, lshape = _mat_one(data, memmap_dir)
+            first_feats, label_shape = fx, tuple(lshape)
 
         if first_feats is None or not label_shape:
             raise RuntimeError("no training data provided to train()")
@@ -729,12 +300,13 @@ def train(
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
-        shutil.rmtree(memmap_dir, ignore_errors=True)
-        shutil.rmtree(ckpt_dir, ignore_errors=True)
-        shutil.rmtree(init_dir, ignore_errors=True)
         return model
     finally:
-        drop_scaler()
+        shutil.rmtree(memmap_dir, ignore_errors=True)
+        if ckpt_dir is not None:
+            shutil.rmtree(ckpt_dir, ignore_errors=True)
+        if init_dir is not None:
+            shutil.rmtree(init_dir, ignore_errors=True)
 
 
 def predict(
@@ -788,23 +360,6 @@ def predict(
             )
             for k, v in data.items()
         }
-    with contextlib.suppress(Exception):
-        mean_buf = getattr(model, "target_mean", None)
-        std_buf = getattr(model, "target_std", None)
-        if mean_buf is not None and std_buf is not None:
-            mean_t = (
-                torch.as_tensor(mean_buf, dtype=torch.float64)
-                .detach()
-                .cpu()
-            )
-            std_t = (
-                torch.as_tensor(std_buf, dtype=torch.float64)
-                .detach()
-                .cpu()
-            )
-            std_t = torch.clamp(std_t, min=1e-6)
-            set_scaler(mean=mean_t, std=std_t)
-
     feats, labels, keys, label_shape = preprocess(data)
     preload_memmap(
         {"features": feats, "labels": labels},
@@ -867,4 +422,3 @@ def predict(
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
-        drop_scaler()
