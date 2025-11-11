@@ -19,7 +19,7 @@ except Exception:
     BaseNode = object
 
 try:
-    from tensordict import TensorDict, MemoryMappedTensor
+    from tensordict import MemoryMappedTensor
 except Exception as e:
     raise RuntimeError("tensordict is required for Dataset") from e
 
@@ -297,26 +297,28 @@ def preload_memmap(
             with suppress(Exception):
                 torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
 
-    td = TensorDict(
-        {"features": feature_flat, "labels": label_flat},
-        batch_size=[count],
-        device=torch.device("cpu"),
-    )
-    td_memmap(td, prefix=os.path.join(memmap_dir, "td_memmap"))
+    features_path = os.path.join(memmap_dir, "features.mmt")
+    labels_path = os.path.join(memmap_dir, "labels.mmt")
+
+    MemoryMappedTensor.from_tensor(feature_flat, filename=features_path)
+    MemoryMappedTensor.from_tensor(label_flat, filename=labels_path)
 
     val_count = max(0, min(count, int(round(count * float(val_frac)))))
     train_count = max(0, min(count, count - val_count))
     train_start, train_end = 0, train_count
     val_start, val_end = train_end, train_end + val_count
 
-    meta: Dict[str, Any] = {"N": count, "feature_dim": int(feature_flat.shape[1]), "features_path": "features.mmt", "labels_path": "labels.mmt",
+    meta: Dict[str, Any] = {
+        "N": count,
+        "feature_dim": int(feature_flat.shape[1]),
+        "features_path": "features.mmt",
+        "labels_path": "labels.mmt",
         "label_shape": list(label_shape),
         "features_dtype": to_platform_dtype(feature_flat.dtype, "name"),
         "labels_dtype": to_platform_dtype(label_flat.dtype, "name"),
         "fractions": [float(train_frac), float(val_frac)],
         "shuffled": bool(shuffle),
         "shuffle_seed": int(seed) if seed is not None else None,
-        "tensordict_prefix": "td_memmap",
         "train_start": train_start,
         "train_end": train_end,
         "val_start": val_start,
