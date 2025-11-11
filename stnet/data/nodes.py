@@ -27,20 +27,21 @@ except Exception as e:
 try:
     from torchdata.nodes import (
         Loader as _Loader,
-        MapStyleWrapper,
         MultiNodeWeightedSampler,
         ParallelMapper,
         PinMemory,
         Prefetcher as _Prefetcher,
+        SamplerWrapper,
     )
 except Exception:
     from torchdata.nodes import Loader as _Loader, ParallelMapper, PinMemory, Prefetcher as _Prefetcher
     MultiNodeWeightedSampler = None
-    MapStyleWrapper = None
+    SamplerWrapper = None
 
 try:
-    from torch.utils.data import Sampler as _Sampler
+    from torch.utils.data import Dataset as _TorchDataset, Sampler as _Sampler
 except Exception:
+    _TorchDataset = object
     _Sampler = object
 
 from .datatype import to_platform_dtype
@@ -57,7 +58,7 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
     return batch
 
 
-class Dataset:
+class Dataset(_TorchDataset):
     def __init__(self, memmap_dir: str, *args: Any, split: str = "train", val_frac: float = 0.0, **kwargs: Any) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
@@ -76,6 +77,49 @@ class Dataset:
         self._labels = td.get("labels")
         lshape = list(self._meta.get("label_shape") or [])
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
+        # optional permutation for random split/order
+        self._perm: Optional[torch.Tensor] = None
+        self._perm_source: Optional[Literal["runtime", "metadata"]] = None
+        perm_fn = (self._meta or {}).get("perm_filename", None)
+        if perm_fn:
+            perm_path = os.path.join(self.dir, str(perm_fn))
+            if os.path.isfile(perm_path):
+                with suppress(Exception):
+                    self._perm = torch.load(perm_path, map_location="cpu")
+                    meta_shuffled = bool((self._meta or {}).get("shuffled", False))
+                    self._perm_source = "runtime" if not meta_shuffled else "metadata"
+        if self._perm is None and bool(int(os.environ.get("STNET_RANDOM_SPLIT", "0"))):
+            gen = torch.Generator(device="cpu")
+            with suppress(Exception):
+                gen.manual_seed(int(os.environ.get("STNET_SPLIT_SEED", "0") or "0"))
+            with suppress(Exception):
+                self._perm = torch.randperm(self._N, generator=gen)
+                self._perm_source = "runtime"
+        # validate permutation length / dtype / device
+        if self._perm is not None:
+            try:
+                if int(self._perm.numel()) != self._N:
+                    with suppress(Exception):
+                        import warnings as _warn
+
+                        _warn.warn(
+                            f"[stnet] ignoring invalid perm: length={int(self._perm.numel())}, expected N={self._N}"
+                        )
+                    self._perm = None
+                    self._perm_source = None
+                else:
+                    # ensure proper dtype/device for fast indexing
+                    if self._perm.dtype != torch.long:
+                        with suppress(Exception):
+                            self._perm = self._perm.to(dtype=torch.long)
+                    if getattr(self._perm, "device", torch.device("cpu")).type != "cpu":
+                        with suppress(Exception):
+                            self._perm = self._perm.cpu()
+            except Exception:
+                self._perm = None
+                self._perm_source = None
+        if self._perm is None:
+            self._perm_source = None
         train_start = int(self._meta.get("train_start", 0))
         train_end   = int(self._meta.get("train_end",   self._N))
         val_start   = int(self._meta.get("val_start",   0))
@@ -108,20 +152,94 @@ class Dataset:
         return max(0, int(self._end) - int(self._start))
 
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
-        x = self._features[start:end]
-        y = self._labels[start:end]
+        if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
+            idx = self._perm[start:end]
+            if idx.numel() == 0:
+                x = self._features[:0]
+                y = self._labels[:0]
+            else:
+                try:
+                    x = self._features.index_select(0, idx)
+                except Exception:
+                    x = self._features[idx] if hasattr(self._features, "__getitem__") \
+                        else torch.as_tensor(self._features)[idx]
+                try:
+                    y = self._labels.index_select(0, idx)
+                except Exception:
+                    y = self._labels[idx] if hasattr(self._labels, "__getitem__") \
+                        else torch.as_tensor(self._labels)[idx]
+        else:
+            x = self._features[start:end]
+            y = self._labels[start:end]
         if self._label_shape:
-            y = y.view(end - start, *self._label_shape)
+            y = y.reshape(end - start, *self._label_shape)
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
         yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
         return {"X": xt, "Y": yt}
 
-    def __getitem__(self, idx: int | Tuple[int, int]) -> Mapping[str, torch.Tensor]:
+    def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int]) -> Mapping[str, torch.Tensor]:
         if isinstance(idx, tuple) and len(idx) == 2:
             s, e = int(idx[0]), int(idx[1])
             return self._slice(s, e)
+        if isinstance(idx, torch.Tensor) and idx.dtype in (torch.int64, torch.int32):
+            idx = idx.tolist()
+        if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
+            # list-index mode: gather arbitrary indices
+            if len(idx) == 0:
+                return self._slice(0, 0)
+            idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
+            # optional permutation applied
+            if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
+                idx_tensor = self._perm.index_select(0, idx_tensor)
+            # (2) optional runtime index-range check (debug)
+            #     유효 범위: [0, self._N - 1]
+            #     STNET_DEBUG_IDX=1 일 때만 검사하여 오버헤드 최소화
+            try:
+                import os as _os
+
+                if bool(int(_os.environ.get("STNET_DEBUG_IDX", "0"))):
+                    if idx_tensor.numel():
+                        _min = int(idx_tensor.min().item())
+                        _max = int(idx_tensor.max().item())
+                        if _min < 0 or _max >= self._N:
+                            raise IndexError(
+                                f"index out of range: valid [0,{self._N-1}], got [{_min},{_max}]"
+                            )
+            except Exception:
+                pass
+            try:
+                x = self._features.index_select(0, idx_tensor)
+            except Exception:
+                # MemmapTensor 등에서 index_select 미구현 시 고급 인덱싱 폴백
+                x = (
+                    self._features[idx_tensor]
+                    if hasattr(self._features, "__getitem__")
+                    else torch.as_tensor(self._features)[idx_tensor]
+                )
+            try:
+                y = self._labels.index_select(0, idx_tensor)
+            except Exception:
+                y = (
+                    self._labels[idx_tensor]
+                    if hasattr(self._labels, "__getitem__")
+                    else torch.as_tensor(self._labels)[idx_tensor]
+                )
+            if self._label_shape:
+                y = y.reshape(y.shape[0], *self._label_shape)
+            return {"X": x, "Y": y}
         i = self._start + int(idx)
-        return self._slice(i, i + 1)
+        out = self._slice(i, i + 1)
+        # standardize int-index path to single-sample (no batch dim)
+        try:
+            x = out.get("X", None)
+            y = out.get("Y", None)
+            if torch.is_tensor(x):
+                x = x.squeeze(0)
+            if torch.is_tensor(y):
+                y = y.squeeze(0)
+            return {"X": x, "Y": y}
+        except Exception:
+            return out
 
 
 def _to_high_precision(value: Any) -> torch.Tensor:
@@ -280,7 +398,21 @@ class Sampler(_Sampler):
         self._end = int(end)
         self._B = max(1, int(batch_size))
         self._shuffle = bool(shuffle)
-        self._rng = random.Random(int(seed))
+        self._seed = int(seed)
+        self._rng = random.Random(self._seed)
+        # process sharding (DDP / torchrun)
+        self._num_shards = 1
+        self._shard_id = 0
+        try:
+            dist = getattr(torch, "distributed", None)
+            if dist is not None and dist.is_available() and dist.is_initialized():
+                self._num_shards = max(1, int(dist.get_world_size()))
+                self._shard_id = max(0, int(dist.get_rank()))
+            else:
+                self._num_shards = max(1, int(os.environ.get("WORLD_SIZE", "1") or "1"))
+                self._shard_id = max(0, int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0") or "0")))
+        except Exception:
+            pass
         self._cuts = list(range(self._start, self._end, self._B))
         if self._end > self._start and (not self._cuts or self._cuts[-1] != self._end):
             self._cuts.append(self._end)
@@ -290,19 +422,47 @@ class Sampler(_Sampler):
         idxs = list(range(n))
         if self._shuffle:
             self._rng.shuffle(idxs)
+        # shard by block
+        ns = getattr(self, "_num_shards", 1)
+        si = getattr(self, "_shard_id", 0)
+        if ns > 1:
+            idxs = idxs[si::ns]
         for i in idxs:
             s = self._cuts[i]
             e = self._cuts[i + 1]
             if e > s:
-                yield (s, e)
+                # list-index mode
+                yield list(range(s, e))
 
     def __len__(self) -> int:
-        return max(0, (self._end - self._start + self._B - 1) // self._B)
+        total = max(0, (self._end - self._start + self._B - 1) // self._B)
+        ns = getattr(self, "_num_shards", 1)
+        si = getattr(self, "_shard_id", 0)
+        if ns <= 1:
+            return total
+        # ceil partition per shard
+        return max(0, (total - si + ns - 1) // ns)
+
+    # optional: epoch-aware shuffle determinism (DDP 전 과정 동일 시드 유지)
+    def set_epoch(self, epoch: int) -> None:
+        self._rng.seed(self._seed + int(epoch))
 
     def compose(self, dataset: "Dataset") -> "BaseNode":
-        if MapStyleWrapper is None:
-            raise RuntimeError("torchdata.nodes.MapStyleWrapper is required")
-        return MapStyleWrapper(dataset, self)
+        map_fn = getattr(dataset, "__getitem__", None)
+        if SamplerWrapper is None or ParallelMapper is None or not callable(map_fn):
+            raise RuntimeError("torchdata.nodes.SamplerWrapper and ParallelMapper are required")
+        sampler_node = SamplerWrapper(self)
+        return ParallelMapper(
+            sampler_node,
+            map_fn,
+            num_workers=1,
+            in_order=True,
+            method="thread",
+            multiprocessing_context=None,
+            max_concurrent=None,
+            snapshot_frequency=1,
+            prebatch=None,
+        )
 
 
 class Multiplexer:
@@ -501,16 +661,19 @@ class Prefetcher:
                     if use_accel and streams is not None:
                         s = streams[idx % n_streams]
                         idx += 1
-                        if dev_t == "cuda" and hasattr(torch, "cuda"):
-                            stream_ctx = torch.cuda.stream(s)
-                        elif dev_t == "xpu" and hasattr(torch, "xpu"):
-                            stream_ctx = torch.xpu.stream(s)
-                        elif dev_t == "mps" and hasattr(torch, "mps"):
-                            stream_ctx = torch.mps.stream(s)
-                        else:
-                            stream_ctx = nullcontext()
-                        with stream_ctx:
+                        # 공통 스트림 컨텍스트 (CUDA/XPU/MPS)
+                        with s:
                             moved = _to_device(item, self._device, non_blocking=True)
+                            # 가능 시, 텐서에 스트림 사용 기록(캐싱 할당자 수명 관리)
+                            try:
+                                if isinstance(moved, Mapping):
+                                    for _v in moved.values():
+                                        if torch.is_tensor(_v):
+                                            _v.record_stream(s)
+                                elif torch.is_tensor(moved):
+                                    moved.record_stream(s)
+                            except Exception:
+                                pass
                         try:
                             ev = s.record_event()
                         except Exception:
@@ -536,47 +699,77 @@ class Prefetcher:
             return _producer()
 
         it = iter(self._src)
+
+        # (1) consumer: 이벤트/스트림 경계에서 데이터 레디니스 보장
+        #     producer 가 (moved, ev) 를 큐에 넣었고, 여기서 현재 실행 스트림이 ev 를 기다린다.
+        #     백엔드별 current_stream 호출 후 wait_event(ev) (미지원/실패 시 ev.synchronize() 로 폴백)
+        def _wait_ready(ev):
+            if ev is None:
+                return
+            dev_t = getattr(self._device, "type", "cpu")
+            try:
+                if dev_t == "cuda" and hasattr(torch, "cuda"):
+                    torch.cuda.current_stream(self._device).wait_event(ev)
+                    return
+                if dev_t == "xpu" and hasattr(torch, "xpu"):
+                    torch.xpu.current_stream(self._device).wait_event(ev)
+                    return
+                if dev_t == "mps" and hasattr(torch, "mps"):
+                    # current_stream(device) 서명 차이 폴백
+                    try:
+                        cs = torch.mps.current_stream(self._device)
+                    except TypeError:
+                        cs = torch.mps.current_stream()
+                    # 우선 stream.wait_event(ev) 시도
+                    try:
+                        cs.wait_event(ev)
+                        return
+                    except Exception:
+                        # 역방향: ev.wait(stream)도 시도 (버전별 지원 상이)
+                        try:
+                            ev.wait(cs)  # 지원 안 하면 예외
+                            return
+                        except Exception:
+                            ev.synchronize()
+                            return
+            except Exception:
+                pass
+            # generic fallback
+            try:
+                ev.synchronize()
+            except Exception:
+                pass
+
         q: "queue.Queue[Optional[Any]]" = queue.Queue(maxsize=self._depth)
         sentinel = object()
-        th = threading.Thread(target=_producer_wrapped, daemon=True)
-        th.start()
-        while True:
-            item = q.get(block=True)
-            if item is sentinel:
-                break
-            if isinstance(item, tuple) and len(item) == 2:
+        t = threading.Thread(target=_producer_wrapped, daemon=True)
+        t.start()
+        try:
+            while True:
+                item = q.get(block=True)
+                if item is sentinel:
+                    break
                 moved, ev = item
-                dev_t = getattr(self._device, "type", "cpu")
-                if ev is not None and dev_t in {"cuda", "xpu", "mps"}:
-                    cur = None
+                # (1) consumer-side event wait
+                try:
+                    _wait_ready(ev)
+                except Exception:
+                    # 최후 폴백(이벤트가 없거나 wait가 실패한 경우 백엔드별 동기화)
+                    dev_t = getattr(self._device, "type", "cpu")
                     try:
-                        cur = torch.accelerator.current_stream(self._device)
+                        if dev_t == "cuda" and hasattr(torch, "cuda"):
+                            torch.cuda.synchronize(self._device)
+                        elif dev_t == "xpu" and hasattr(torch, "xpu"):
+                            torch.xpu.synchronize(self._device)
+                        elif dev_t == "mps" and hasattr(torch, "mps"):
+                            # mps는 장치 인자를 받지 않음
+                            torch.mps.synchronize()
                     except Exception:
+                        # 그래도 실패하면 그냥 패스(다음 배치에서 재시도)
                         pass
-                    if cur is None:
-                        try:
-                            if dev_t == "cuda":
-                                cur = torch.cuda.current_stream(self._device)
-                            elif dev_t == "xpu":
-                                import torch.xpu as txpu
-
-                                cur = txpu.current_stream(self._device)
-                        except Exception:
-                            cur = None
-                    if cur is not None:
-                        try:
-                            cur.wait_event(ev)
-                        except Exception:
-                            try:
-                                ev.wait(cur)
-                            except Exception:
-                                pass
-                    elif dev_t == "mps":
-                        try:
-                            ev.wait()
-                        except Exception:
-                            pass
                 yield moved
-            else:
-                yield item
-        th.join(timeout=0.1)
+        finally:
+            try:
+                t.join(timeout=0.1)
+            except Exception:
+                pass
