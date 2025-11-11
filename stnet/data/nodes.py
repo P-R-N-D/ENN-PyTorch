@@ -77,7 +77,6 @@ class Dataset(_TorchDataset):
         self._labels = td.get("labels")
         lshape = list(self._meta.get("label_shape") or [])
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
-        # optional permutation for random split/order
         self._perm: Optional[torch.Tensor] = None
         self._perm_source: Optional[Literal["runtime", "metadata"]] = None
         perm_fn = (self._meta or {}).get("perm_filename", None)
@@ -95,7 +94,6 @@ class Dataset(_TorchDataset):
             with suppress(Exception):
                 self._perm = torch.randperm(self._N, generator=gen)
                 self._perm_source = "runtime"
-        # validate permutation length / dtype / device
         if self._perm is not None:
             try:
                 if int(self._perm.numel()) != self._N:
@@ -108,7 +106,6 @@ class Dataset(_TorchDataset):
                     self._perm = None
                     self._perm_source = None
                 else:
-                    # ensure proper dtype/device for fast indexing
                     if self._perm.dtype != torch.long:
                         with suppress(Exception):
                             self._perm = self._perm.to(dtype=torch.long)
@@ -184,16 +181,11 @@ class Dataset(_TorchDataset):
         if isinstance(idx, torch.Tensor) and idx.dtype in (torch.int64, torch.int32):
             idx = idx.tolist()
         if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
-            # list-index mode: gather arbitrary indices
             if len(idx) == 0:
                 return self._slice(0, 0)
             idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
-            # optional permutation applied
             if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
                 idx_tensor = self._perm.index_select(0, idx_tensor)
-            # (2) optional runtime index-range check (debug)
-            #     유효 범위: [0, self._N - 1]
-            #     STNET_DEBUG_IDX=1 일 때만 검사하여 오버헤드 최소화
             try:
                 import os as _os
 
@@ -210,7 +202,6 @@ class Dataset(_TorchDataset):
             try:
                 x = self._features.index_select(0, idx_tensor)
             except Exception:
-                # MemmapTensor 등에서 index_select 미구현 시 고급 인덱싱 폴백
                 x = (
                     self._features[idx_tensor]
                     if hasattr(self._features, "__getitem__")
@@ -229,7 +220,6 @@ class Dataset(_TorchDataset):
             return {"X": x, "Y": y}
         i = self._start + int(idx)
         out = self._slice(i, i + 1)
-        # standardize int-index path to single-sample (no batch dim)
         try:
             x = out.get("X", None)
             y = out.get("Y", None)
@@ -400,7 +390,6 @@ class Sampler(_Sampler):
         self._shuffle = bool(shuffle)
         self._seed = int(seed)
         self._rng = random.Random(self._seed)
-        # process sharding (DDP / torchrun)
         self._num_shards = 1
         self._shard_id = 0
         try:
@@ -422,7 +411,6 @@ class Sampler(_Sampler):
         idxs = list(range(n))
         if self._shuffle:
             self._rng.shuffle(idxs)
-        # shard by block
         ns = getattr(self, "_num_shards", 1)
         si = getattr(self, "_shard_id", 0)
         if ns > 1:
@@ -431,7 +419,6 @@ class Sampler(_Sampler):
             s = self._cuts[i]
             e = self._cuts[i + 1]
             if e > s:
-                # list-index mode
                 yield list(range(s, e))
 
     def __len__(self) -> int:
@@ -440,10 +427,8 @@ class Sampler(_Sampler):
         si = getattr(self, "_shard_id", 0)
         if ns <= 1:
             return total
-        # ceil partition per shard
         return max(0, (total - si + ns - 1) // ns)
 
-    # optional: epoch-aware shuffle determinism (DDP 전 과정 동일 시드 유지)
     def set_epoch(self, epoch: int) -> None:
         self._rng.seed(self._seed + int(epoch))
 
@@ -661,10 +646,8 @@ class Prefetcher:
                     if use_accel and streams is not None:
                         s = streams[idx % n_streams]
                         idx += 1
-                        # 공통 스트림 컨텍스트 (CUDA/XPU/MPS)
                         with s:
                             moved = _to_device(item, self._device, non_blocking=True)
-                            # 가능 시, 텐서에 스트림 사용 기록(캐싱 할당자 수명 관리)
                             try:
                                 if isinstance(moved, Mapping):
                                     for _v in moved.values():
@@ -700,9 +683,6 @@ class Prefetcher:
 
         it = iter(self._src)
 
-        # (1) consumer: 이벤트/스트림 경계에서 데이터 레디니스 보장
-        #     producer 가 (moved, ev) 를 큐에 넣었고, 여기서 현재 실행 스트림이 ev 를 기다린다.
-        #     백엔드별 current_stream 호출 후 wait_event(ev) (미지원/실패 시 ev.synchronize() 로 폴백)
         def _wait_ready(ev):
             if ev is None:
                 return
@@ -715,26 +695,22 @@ class Prefetcher:
                     torch.xpu.current_stream(self._device).wait_event(ev)
                     return
                 if dev_t == "mps" and hasattr(torch, "mps"):
-                    # current_stream(device) 서명 차이 폴백
                     try:
                         cs = torch.mps.current_stream(self._device)
                     except TypeError:
                         cs = torch.mps.current_stream()
-                    # 우선 stream.wait_event(ev) 시도
                     try:
                         cs.wait_event(ev)
                         return
                     except Exception:
-                        # 역방향: ev.wait(stream)도 시도 (버전별 지원 상이)
                         try:
-                            ev.wait(cs)  # 지원 안 하면 예외
+                            ev.wait(cs)
                             return
                         except Exception:
                             ev.synchronize()
                             return
             except Exception:
                 pass
-            # generic fallback
             try:
                 ev.synchronize()
             except Exception:
@@ -750,11 +726,9 @@ class Prefetcher:
                 if item is sentinel:
                     break
                 moved, ev = item
-                # (1) consumer-side event wait
                 try:
                     _wait_ready(ev)
                 except Exception:
-                    # 최후 폴백(이벤트가 없거나 wait가 실패한 경우 백엔드별 동기화)
                     dev_t = getattr(self._device, "type", "cpu")
                     try:
                         if dev_t == "cuda" and hasattr(torch, "cuda"):
@@ -762,10 +736,8 @@ class Prefetcher:
                         elif dev_t == "xpu" and hasattr(torch, "xpu"):
                             torch.xpu.synchronize(self._device)
                         elif dev_t == "mps" and hasattr(torch, "mps"):
-                            # mps는 장치 인자를 받지 않음
                             torch.mps.synchronize()
                     except Exception:
-                        # 그래도 실패하면 그냥 패스(다음 배치에서 재시도)
                         pass
                 yield moved
         finally:
