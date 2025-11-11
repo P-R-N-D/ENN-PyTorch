@@ -384,6 +384,9 @@ class RuntimeConfig:
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
     loss_mask_value: Optional[float] = None
+    swa_enabled: bool = False
+    swa_start_epoch: Optional[int] = None
+    swa_update_batch_norm: bool = False
     model_ckpt_dir: Optional[str] = None
     keys: Optional[List[Tuple[Any, ...]]] = None
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
@@ -402,6 +405,9 @@ class RuntimeConfig:
         "loss_tile_size",
         "loss_mask_mode",
         "loss_mask_value",
+        "swa_enabled",
+        "swa_start_epoch",
+        "swa_update_batch_norm",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "batch_size",
@@ -446,6 +452,9 @@ class RuntimeConfig:
                 "loss_tile_size",
                 "loss_mask_mode",
                 "loss_mask_value",
+                "swa_enabled",
+                "swa_start_epoch",
+                "swa_update_batch_norm",
             }
             unsupported = set(kwargs) - allowed
             if unsupported:
@@ -477,6 +486,11 @@ class RuntimeConfig:
                 loss_tile_size=kwargs.get("loss_tile_size"),
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
                 loss_mask_value=kwargs.get("loss_mask_value"),
+                swa_enabled=bool(kwargs.get("swa_enabled", False)),
+                swa_start_epoch=kwargs.get("swa_start_epoch"),
+                swa_update_batch_norm=bool(
+                    kwargs.get("swa_update_batch_norm", False)
+                ),
             )
         for k in ("sources", "keys"):
             if k not in kwargs or kwargs[k] is None:

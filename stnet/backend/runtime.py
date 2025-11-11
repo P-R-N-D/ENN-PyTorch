@@ -1270,10 +1270,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             swa_helper: Optional[StochasticWeightAverage] = None
             swa_start_epoch = total_epochs
             swa_bn_update = False
-            enable_swa_env = "0"
-            start_epoch_env = None
-            enable_swa = (enable_swa_env not in {"", "0", "false"}) or start_epoch_env is not None
-            if enable_swa and SWALR is not None:
+            enable_swa_cfg = bool(getattr(ops, "swa_enabled", False))
+            start_epoch_cfg = getattr(ops, "swa_start_epoch", None)
+            swa_update_bn_cfg = bool(getattr(ops, "swa_update_batch_norm", False))
+            enable_swa = (enable_swa_cfg or start_epoch_cfg is not None) and SWALR is not None
+            if enable_swa:
                 tracked_module = model.module if hasattr(model, "module") else model
                 use_buffers = True
                 try:
@@ -1282,8 +1283,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     swa_helper = None
                 if swa_helper is not None:
                     scheduler_step_per_batch = False
-                    swa_start_epoch = int(start_epoch_env) if start_epoch_env is not None else max(1, total_epochs // 2)
-                    swa_bn_update = False
+                    if start_epoch_cfg is not None:
+                        try:
+                            swa_start_epoch = max(0, int(start_epoch_cfg))
+                        except (TypeError, ValueError):
+                            swa_start_epoch = max(1, total_epochs // 2)
+                    else:
+                        swa_start_epoch = max(1, total_epochs // 2)
+                    swa_bn_update = bool(swa_update_bn_cfg)
                     eta_min = float(getattr(ops, "eta_min", 0.0) or 0.0)
                     base_lr = float(ops.base_lr)
                     default_swa_lr = max(1e-8, eta_min if eta_min > 0.0 else 0.1 * base_lr)
