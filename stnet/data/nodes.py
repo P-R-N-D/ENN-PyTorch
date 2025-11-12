@@ -588,9 +588,9 @@ class Loader:
         self._num_shards = 1
         self._shard_id = 0
         try:
-            from ..backend.system import local_accelerator_count
+            from ..backend.system import num_accelerators
 
-            acc = max(1, int(local_accelerator_count()))
+            acc = max(1, int(num_accelerators()))
             thr = max(1, int(self._threads_hint))
             self._num_shards = acc * thr
             dev_idx = self._local_device_index()

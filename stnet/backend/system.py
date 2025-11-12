@@ -7,16 +7,23 @@ import importlib
 import itertools
 import multiprocessing
 import os
+import platform
 import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing as mp
+
+try:
+    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
+except Exception:  # pragma: no cover - zoneinfo may be unavailable
+    ZoneInfo = None  # type: ignore[assignment]
 
 
 @dataclass
@@ -30,6 +37,126 @@ class _RuntimeConfig:
 
 
 _RUNTIME_CONFIG = _RuntimeConfig()
+
+
+_TZ_ALIASES = {
+    "KST": "Asia/Seoul",
+    "GMT": "Etc/GMT",
+    "UTC": "UTC",
+}
+
+
+def resolve_timezone(name: Optional[str] = None) -> Optional[timezone]:
+    """Return a tzinfo instance for the given alias or IANA name."""
+    resolved = (name or "GMT").strip()
+    alias = _TZ_ALIASES.get(resolved.upper(), resolved)
+    if alias.upper() == "UTC":
+        return timezone.utc
+    if ZoneInfo is None:
+        return None
+    with contextlib.suppress(Exception):
+        return ZoneInfo(alias)
+    return None
+
+
+def posix_time(tz_name: Optional[str] = None) -> int:
+    """Current timestamp in nanoseconds for the specified timezone alias."""
+    tz = resolve_timezone(tz_name)
+    now = datetime.now(tz=tz) if tz is not None else datetime.now()
+    return int(now.timestamp() * 1_000_000_000)
+
+
+def system_info() -> Tuple[str, str, str, str]:
+    """Gather basic OS, kernel, architecture, and accelerator information."""
+    sysname = platform.system() or ""
+    release = platform.release() or ""
+    kernel = f"{sysname} {release}".strip()
+    os_name = sysname
+    with contextlib.suppress(Exception):
+        if sysname == "Linux" and hasattr(platform, "freedesktop_os_release"):
+            info = platform.freedesktop_os_release()
+            name = info.get("NAME") or "Linux"
+            version = info.get("VERSION_ID") or ""
+            os_name = (name if not version else f"{name} {version}").strip()
+        elif sysname == "Windows":
+            win = platform.win32_ver()
+            os_name = f"Windows {win[0] or ''}".strip()
+        elif sysname == "Darwin":
+            mac = platform.mac_ver()[0]
+            os_name = f"macOS {mac or ''}".strip()
+    arch = platform.machine() or ""
+    accelerators: List[str] = []
+    try:
+        if torch.cuda.is_available():
+            for idx in range(torch.cuda.device_count()):
+                accelerators.append(f"cuda:{idx}={torch.cuda.get_device_name(idx)}")
+    except Exception:
+        pass
+    try:
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            accelerators.append("mps=Apple MPS")
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "xpu") and hasattr(torch.xpu, "device_count"):
+            count = torch.xpu.device_count()  # type: ignore[attr-defined]
+            if count and count > 0:
+                get_name = getattr(torch.xpu, "get_device_name", None)
+                for idx in range(count):
+                    name = get_name(idx) if callable(get_name) else "XPU"
+                    accelerators.append(f"xpu:{idx}={name}")
+    except Exception:
+        pass
+    try:
+        if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
+            accelerators.append("vulkan=available")
+    except Exception:
+        pass
+    return os_name, kernel, arch, ";".join(accelerators)
+
+
+def cpu_info(max_bytes: Optional[int] = None) -> str:
+    """Return a semicolon-delimited list of per-core CPU names."""
+    names: List[str] = []
+    total = os.cpu_count() or 1
+    brand = ""
+    with contextlib.suppress(Exception):
+        import cpuinfo  # type: ignore
+
+        info = cpuinfo.get_cpu_info() or {}
+        brand = info.get("brand_raw") or info.get("brand") or ""
+    if not brand and os.path.exists("/proc/cpuinfo"):
+        with contextlib.suppress(Exception):
+            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+                lines = [ln.strip() for ln in handle.readlines() if "model name" in ln]
+            if lines:
+                names = [ln.split(":", 1)[1].strip() for ln in lines]
+    if not names and platform.system() == "Darwin":
+        with contextlib.suppress(Exception):
+            import subprocess
+
+            output = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"])
+            brand = output.decode("utf-8", "ignore").strip()
+    if not names and platform.system() == "Windows":
+        brand = platform.processor()
+        if not brand:
+            with contextlib.suppress(Exception):
+                import subprocess
+
+                output = subprocess.check_output(
+                    ["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"]
+                )
+                brand = output.decode("utf-8", "ignore").strip()
+    if not names:
+        fallback = brand or platform.processor() or "CPU"
+        names = [fallback] * total
+    pairs = [f"{idx}:{names[idx] if idx < len(names) else names[0]}" for idx in range(total)]
+    result = ";".join(pairs)
+    if max_bytes is not None and max_bytes > 0:
+        encoded = result.encode("utf-8")
+        if len(encoded) > max_bytes:
+            result = encoded[:max_bytes].decode("utf-8", "ignore")
+    return result
 
 
 def _num_cuda_devices() -> int:
@@ -401,7 +528,7 @@ def cpu_count() -> int:
         return os.cpu_count() or 1
 
 
-def local_accelerator_count() -> int:
+def num_accelerators() -> int:
     """Return the number of accelerator devices available on the host."""
     try:
         import torch
@@ -448,7 +575,7 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         has_cuda = getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
     except Exception:
         has_cuda = False
-    nacc = local_accelerator_count()
+    nacc = num_accelerators()
 
     if ncpu <= 2:
         inter_ops = 1
