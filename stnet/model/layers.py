@@ -763,7 +763,12 @@ class Normal(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.standardize:
             return x  # no-op
-        bn_dtype = self.bn.running_mean.dtype if isinstance(self.bn.running_mean, torch.Tensor) else x.dtype
+        bn_dtype = (
+            self.bn.running_mean.dtype
+            if isinstance(self.bn.running_mean, torch.Tensor)
+            else x.dtype
+        )
+        orig_dtype = x.dtype
         if self.mode in _NORM_MODES:
             if self.training:
                 z = self.pt(x) if self.pt is not None else x
@@ -771,18 +776,26 @@ class Normal(nn.Module):
                 if z.dtype != bn_dtype:
                     z = z.to(dtype=bn_dtype)
                 out = self.bn(z)
+                if out.dtype != orig_dtype:
+                    out = out.to(dtype=orig_dtype)
                 return out
             else:
                 z = self.pt(x) if self.pt is not None else x
                 if z.dtype != bn_dtype:
                     z = z.to(dtype=bn_dtype)
-                return self.bn(z)
+                out = self.bn(z)
+                if out.dtype != orig_dtype:
+                    out = out.to(dtype=orig_dtype)
+                return out
         elif self.mode in _DENORM_MODES:
             x_cast = x if x.dtype == bn_dtype else x.to(dtype=bn_dtype)
             std = (self.bn.running_var + self.bn.eps).sqrt().view(1, -1)
             mean = self.bn.running_mean.view(1, -1)
             y = x_cast * std + mean
-            return self.pt.inverse(y) if self.pt is not None else y
+            y = self.pt.inverse(y) if self.pt is not None else y
+            if y.dtype != orig_dtype:
+                y = y.to(dtype=orig_dtype)
+            return y
         else:
             raise ValueError(f"invalid mode: {self.mode}")
 
@@ -1037,16 +1050,23 @@ class StudentsT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.standardize:
             return x
+        bn_dtype = self.bn.running_mean.dtype if hasattr(self.bn, "running_mean") else x.dtype
+        orig_dtype = x.dtype
+        if x.dtype != bn_dtype:
+            x = x.to(dtype=bn_dtype)
         if self.mode in _NORM_MODES:
             if self.training:
                 out = self.bn(x)
                 self._accumulate_batch(x)
-                return out
-            return self.bn(x)
+                return out.to(dtype=orig_dtype)
+            return self.bn(x).to(dtype=orig_dtype)
         elif self.mode in _DENORM_MODES:
             std = (self.bn.running_var + self.bn.eps).sqrt().view(1, -1)
             mean = self.bn.running_mean.view(1, -1)
-            return x * std + mean
+            out = x * std + mean
+            if out.dtype != orig_dtype:
+                out = out.to(dtype=orig_dtype)
+            return out
         raise ValueError(f"invalid mode: {self.mode}")
 
     # ---------------------- SciPy 기반 오프라인 추정 ----------------------
@@ -2661,7 +2681,9 @@ class Root(nn.Module):
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
         # ---- (2) 입력 정규화 ----
-        features = self.input_norm(features.to(device=device))
+        norm_dtype = self.input_norm.bn.running_mean.dtype
+        features = features.to(device=device, dtype=norm_dtype)
+        features = self.input_norm(features)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         amp_enabled = device.type != "cpu"
