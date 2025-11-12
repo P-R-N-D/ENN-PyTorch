@@ -19,7 +19,10 @@ dependencies = [
   "torchrl>=0.8.1",
   "triton>=3.2.0",
   "numpy>=2.2.5",
+  "scipy>=1.14.1",
   "netifaces>=0.11.0",
+  "py-cpuinfo>=9.0.0",
+  "psutil>=7.0.0",
   "tqdm>=4.67.1"
 ]
 

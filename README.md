@@ -34,14 +34,17 @@ The core backend depends on:
 - `triton>=3.2.0`
 - `torchrl>=0.8.1`
 - `numpy>=2.2.5`
+- `scipy>=1.14.1`
 - `netifaces>=0.11.0`
+- `py-cpuinfo>=9.0.0`
+- `psutil>=7.0.0`
 - `tqdm>=4.67.1`
 
 Optional extras listed in `pyproject.toml` include:
 - dataframe integrations (`pandas`, `polars`)
 - spreadsheet tooling (`excel`)
 - Spark pipelines (`spark`)
-- advanced optimization toolchains (`thread`, `torchao`)
+- advanced optimization toolchains (`torchao`; the legacy `thread` extra now resolves to the core `psutil` requirement)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
 - storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`) – install the CUDA 12 pair (`cupy-cuda12x>=13.6.0`, `kvikio-cu12>=25.12.0`) or the CUDA 13 pair (`cupy-cuda13x>=13.6.0`, `kvikio-cu13>=25.12.0`)
 - retention-focused research modules (`torchscale`)

@@ -4,7 +4,10 @@ tensordict>=0.10
 torchrl>=0.8.1
 triton>=3.2.0
 numpy>=2.2.5
+scipy>=1.14.1
 netifaces>=0.11.0
+py-cpuinfo>=9.0.0
+psutil>=7.0.0
 tqdm>=4.67.1
 
 # Optional extras (install via `pip install -e .[extra]`):
@@ -12,7 +15,7 @@ tqdm>=4.67.1
 # polars: polars>=1.30.0
 # excel: openpyxl>=3.1.5, fastexcel>=0.14.0
 # spark: pyspark[pandas_on_spark]>=4.0.0
-# thread: psutil>=7.0.0
+# thread: (deprecated; psutil>=7.0.0 is now part of the core requirements)
 # torchao: torchao>=0.11.0
 # nvidia_gds_cu12: cupy-cuda12x>=13.6.0, kvikio-cu12>=25.12.0
 # nvidia_gds_cu13: cupy-cuda13x>=13.6.0, kvikio-cu13>=25.12.0
