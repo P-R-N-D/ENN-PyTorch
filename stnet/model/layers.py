@@ -748,8 +748,12 @@ class Normal(nn.Module):
             "hist_tz",
             "hist_cpu",
         )
+        hist_state: dict[str, torch.Tensor] = {}
         for name in hist_names:
-            state_dict.pop(prefix + name, None)
+            key = prefix + name
+            value = state_dict.pop(key, None)
+            if isinstance(value, torch.Tensor):
+                hist_state[name] = value.detach().clone()
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -759,6 +763,15 @@ class Normal(nn.Module):
             unexpected_keys,
             error_msgs,
         )
+        for key in list(hist_state):
+            full = prefix + key
+            if full in missing_keys:
+                missing_keys.remove(full)
+        for name, tensor in hist_state.items():
+            current = getattr(self, name, None)
+            if isinstance(current, torch.Tensor):
+                updated = tensor.to(device=current.device, dtype=current.dtype)
+                self._buffers[name] = updated
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.standardize:
