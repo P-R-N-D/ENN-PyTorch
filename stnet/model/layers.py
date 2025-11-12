@@ -655,29 +655,56 @@ class Normal(nn.Module):
         self.hist_world_size = torch.cat([self.hist_world_size, ws], dim=0)[-self._hist_maxlen :]
         os_name, kernel, arch, accel, tzlabel, cpu_label = _get_sys_info(tz_name)
         self.hist_os = torch.cat(
-            [self.hist_os, _fixed_bytes(os_name, _LEN_OS).unsqueeze(0)],
+            [
+                self.hist_os,
+                _fixed_bytes(os_name, _LEN_OS)
+                .unsqueeze(0)
+                .to(device=self.hist_os.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_kernel = torch.cat(
-            [self.hist_kernel, _fixed_bytes(kernel, _LEN_KERNEL).unsqueeze(0)],
+            [
+                self.hist_kernel,
+                _fixed_bytes(kernel, _LEN_KERNEL)
+                .unsqueeze(0)
+                .to(device=self.hist_kernel.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_arch = torch.cat(
-            [self.hist_arch, _fixed_bytes(arch, _LEN_ARCH).unsqueeze(0)],
+            [
+                self.hist_arch,
+                _fixed_bytes(arch, _LEN_ARCH)
+                .unsqueeze(0)
+                .to(device=self.hist_arch.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_accel = torch.cat(
-            [self.hist_accel, _fixed_bytes(accel, _LEN_ACCEL).unsqueeze(0)],
+            [
+                self.hist_accel,
+                _fixed_bytes(accel, _LEN_ACCEL)
+                .unsqueeze(0)
+                .to(device=self.hist_accel.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_tz = torch.cat(
-            [self.hist_tz, _fixed_bytes(tzlabel, _LEN_TZ).unsqueeze(0)],
+            [
+                self.hist_tz,
+                _fixed_bytes(tzlabel, _LEN_TZ)
+                .unsqueeze(0)
+                .to(device=self.hist_tz.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_cpu = torch.cat(
             [
                 self.hist_cpu,
-                _fixed_bytes(cpu_label, _LEN_CPU).unsqueeze(0),
+                _fixed_bytes(cpu_label, _LEN_CPU)
+                .unsqueeze(0)
+                .to(device=self.hist_cpu.device),
             ],
             dim=0,
         )[-self._hist_maxlen :]
@@ -909,29 +936,56 @@ class StudentsT(nn.Module):
         ]
         os_name, kernel, arch, accel, tzlabel, cpu_label = _get_sys_info(tz_name)
         self.hist_os = torch.cat(
-            [self.hist_os, _fixed_bytes(os_name, _LEN_OS).unsqueeze(0)],
+            [
+                self.hist_os,
+                _fixed_bytes(os_name, _LEN_OS)
+                .unsqueeze(0)
+                .to(device=self.hist_os.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_kernel = torch.cat(
-            [self.hist_kernel, _fixed_bytes(kernel, _LEN_KERNEL).unsqueeze(0)],
+            [
+                self.hist_kernel,
+                _fixed_bytes(kernel, _LEN_KERNEL)
+                .unsqueeze(0)
+                .to(device=self.hist_kernel.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_arch = torch.cat(
-            [self.hist_arch, _fixed_bytes(arch, _LEN_ARCH).unsqueeze(0)],
+            [
+                self.hist_arch,
+                _fixed_bytes(arch, _LEN_ARCH)
+                .unsqueeze(0)
+                .to(device=self.hist_arch.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_accel = torch.cat(
-            [self.hist_accel, _fixed_bytes(accel, _LEN_ACCEL).unsqueeze(0)],
+            [
+                self.hist_accel,
+                _fixed_bytes(accel, _LEN_ACCEL)
+                .unsqueeze(0)
+                .to(device=self.hist_accel.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_tz = torch.cat(
-            [self.hist_tz, _fixed_bytes(tzlabel, _LEN_TZ).unsqueeze(0)],
+            [
+                self.hist_tz,
+                _fixed_bytes(tzlabel, _LEN_TZ)
+                .unsqueeze(0)
+                .to(device=self.hist_tz.device),
+            ],
             dim=0,
         )[-self._hist_maxlen :]
         self.hist_cpu = torch.cat(
             [
                 self.hist_cpu,
-                _fixed_bytes(cpu_label, _LEN_CPU).unsqueeze(0),
+                _fixed_bytes(cpu_label, _LEN_CPU)
+                .unsqueeze(0)
+                .to(device=self.hist_cpu.device),
             ],
             dim=0,
         )[-self._hist_maxlen :]
@@ -2603,13 +2657,13 @@ class Root(nn.Module):
             td_loss_weights = td_input.get("loss_weights", None)
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
+        device = self._device
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
         # ---- (2) 입력 정규화 ----
-        features = self.input_norm(features)
+        features = self.input_norm(features.to(device=device))
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
-        device = self._device
         amp_enabled = device.type != "cpu"
         base_param = next(self.local_net.parameters())
         base_dtype = self._base_dtype or base_param.dtype
