@@ -78,10 +78,16 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
+    *,
+    wrap: bool = True,
 ) -> nn.Module:
     cfg = coerce_model_config(config)
     core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
-    return Fusion.use_tensordict_layers(core, in_key="features", out_key="pred", add_loss=True)
+    if not wrap:
+        return core
+    return Fusion.use_tensordict_layers(
+        core, in_key="features", out_key="pred", add_loss=True
+    )
 
 
 def load_model(
@@ -90,13 +96,15 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[torch.device | str] = None,
+    *,
+    wrap: bool = True,
 ) -> nn.Module:
 
     p = Path(checkpoint_path)
     if p.is_dir():
         if in_dim is None or out_shape is None:
             raise ValueError("Loading from a checkpoint directory requires in_dim and out_shape.")
-        model = new_model(int(in_dim), tuple(out_shape), config)
+        model = new_model(int(in_dim), tuple(out_shape), config, wrap=wrap)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
@@ -112,7 +120,7 @@ def load_model(
         out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
         use_out_shape = tuple(int(x) for x in out_shape_meta)
         use_config = coerce_model_config(config if config is not None else meta.get("config"))
-        model = new_model(use_in_dim, use_out_shape, use_config)
+        model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
@@ -128,7 +136,7 @@ def load_model(
     out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
     use_out_shape = tuple(int(x) for x in out_shape_meta)
     use_config = coerce_model_config(config if config is not None else meta_cfg)
-    model = new_model(use_in_dim, use_out_shape, use_config)
+    model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
     sd = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
     model.load_state_dict(sd)
     return model
