@@ -229,12 +229,15 @@ def _reduce_metrics(layer: nn.Module) -> None:
     dist.all_gather(M2_list, M2_local)
     dist.all_gather(M3_list, M3_local)
     if rank == 0:
-        m = torch.zeros_like(layer.gs_mean, dtype=torch.float64)
-        M2 = torch.zeros_like(layer.gs_M2, dtype=torch.float64)
-        M3 = torch.zeros_like(layer.gs_M3, dtype=torch.float64)
-        n_total = 0
+        prev_n = int(layer.gs_count.item())
+        m = layer.gs_mean.to(device=gather_device, dtype=torch.float64).clone()
+        M2 = layer.gs_M2.to(device=gather_device, dtype=torch.float64).clone()
+        M3 = layer.gs_M3.to(device=gather_device, dtype=torch.float64).clone()
+        n_total = int(prev_n)
         for idx in range(world):
             n_val = int(n_list[idx].item())
+            if n_val <= 0:
+                continue
             m_val = mean_list[idx]
             M2_val = M2_list[idx]
             M3_val = M3_list[idx]
