@@ -2680,6 +2680,27 @@ class Root(nn.Module):
         device = self._device
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
+        # ---- (1.5) 출력 통계 누적 (denorm용) ----
+        if (
+            self.training
+            and labels_flat is not None
+            and not isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
+            and self.output_denorm.standardize
+        ):
+            target_stats = labels_flat.reshape(labels_flat.shape[0], -1)
+            bn = self.output_denorm.bn
+            stats_device = (
+                bn.running_mean.device
+                if isinstance(bn.running_mean, torch.Tensor)
+                else self._device
+            )
+            stats_dtype = (
+                bn.running_mean.dtype
+                if isinstance(bn.running_mean, torch.Tensor)
+                else target_stats.dtype
+            )
+            target_stats = target_stats.to(device=stats_device, dtype=stats_dtype)
+            self.output_denorm._accumulate_batch(target_stats)
         # ---- (2) 입력 정규화 ----
         norm_dtype = self.input_norm.bn.running_mean.dtype
         features = features.to(device=device, dtype=norm_dtype)
