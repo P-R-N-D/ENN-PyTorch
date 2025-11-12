@@ -5,6 +5,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
 
 ## Key components
 - **Configurable architecture** – `stnet.api.config.ModelConfig` defines depth, attention heads, patching strategy, and compiler hints through a single `compile_mode` string (default: `"disabled"`) instead of a boolean flag. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compilation options organized. Backend helpers re-export these dataclasses so existing imports from `stnet.backend` continue to function.
+- **Precision-aware scalers** – Normal and StudentsT modules now execute BatchNorm and moment updates in their native dtype while casting inputs/outputs back to the caller, keeping AMP, BF16, and FP8 pipelines numerically stable on every device.
 - **Modeling type aliases** – `_coerce_modeling_types` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
 - **Backend facade** – `stnet.backend` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The backend consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.api.config` module for consistent configuration management, while orchestration internals now live under `stnet.api.run` for direct use when needed. The runtime helpers that previously lived under `stnet.run` now reside in `stnet.api`, so update legacy imports to `stnet.api.*` entry points.
 - **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives now live together in `stnet.model.layers` for reuse across modules.
@@ -29,18 +30,21 @@ The core backend depends on:
 
 - `torch>=2.7.0`
 - `torchdata>=0.11.0`
-- `tensordict>=0.8.0`
+- `tensordict>=0.10.0`
 - `triton>=3.2.0`
 - `torchrl>=0.8.1`
 - `numpy>=2.2.5`
+- `scipy>=1.14.1`
 - `netifaces>=0.11.0`
+- `py-cpuinfo>=9.0.0`
+- `psutil>=7.0.0`
 - `tqdm>=4.67.1`
 
 Optional extras listed in `pyproject.toml` include:
 - dataframe integrations (`pandas`, `polars`)
 - spreadsheet tooling (`excel`)
 - Spark pipelines (`spark`)
-- advanced optimization toolchains (`thread`, `torchao`)
+- advanced optimization toolchains (`torchao`; the legacy `thread` extra now resolves to the core `psutil` requirement)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
 - storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`) – install the CUDA 12 pair (`cupy-cuda12x>=13.6.0`, `kvikio-cu12>=25.12.0`) or the CUDA 13 pair (`cupy-cuda13x>=13.6.0`, `kvikio-cu13>=25.12.0`)
 - retention-focused research modules (`torchscale`)

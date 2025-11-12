@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+from copy import deepcopy
 import contextlib
 import json
 import math
@@ -41,6 +42,7 @@ from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss
 from ..functional.optimizers import AdamW, SWALR, StochasticWeightAverage, stochastic_weight_average
 from ..model import Root
+from ..model.layers import StudentsT
 from .compat import cudagraph_step_end, is_meta_or_fake_tensor
 from .distributed import (
     distributed_barrier,
@@ -52,8 +54,32 @@ from .distributed import (
     to_ddp,
     to_fsdp,
 )
-from .system import get_device, initialize_python_path, is_float8_supported, get_tlb
+from .system import (
+    get_device,
+    initialize_python_path,
+    is_float8_supported,
+    get_tlb,
+    posix_time,
+)
 from .profiler import FlopCounter
+
+# -------- StudentsT pre-fit runtime options (no config/env added) --------
+# Default sample cap and input key for collecting training samples to fit t(df,loc,scale)
+STUDENTS_T_PREFIT_SAMPLE_LIMIT: int = 32768
+STUDENTS_T_PREFIT_IN_KEY: str = "features"
+
+
+def set_students_t_prefit_options(*, limit: int | None = None, in_key: str | None = None) -> None:
+    """Adjust StudentsT pre-fit sample cap/key at runtime (global to this process)."""
+    global STUDENTS_T_PREFIT_SAMPLE_LIMIT, STUDENTS_T_PREFIT_IN_KEY
+    if limit is not None:
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive int")
+        STUDENTS_T_PREFIT_SAMPLE_LIMIT = int(limit)
+    if in_key is not None:
+        if not isinstance(in_key, str) or not in_key:
+            raise ValueError("in_key must be a non-empty str")
+        STUDENTS_T_PREFIT_IN_KEY = in_key
 
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -70,6 +96,195 @@ ignored_sentences = [
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 _DL_STATE_FILE = "dataloader.json"
 _FLOAT8_LOG_MESSAGES: set[str] = set()
+
+@torch.no_grad()
+def _sample_from(
+    loader,
+    in_key: str | None = None,
+    limit: int | None = None,
+):
+    """학습셋에서 최대 limit개 샘플을 [N,D] numpy로 수집."""
+
+    import numpy as _np
+    from tensordict import TensorDictBase
+
+    if in_key is None:
+        in_key = STUDENTS_T_PREFIT_IN_KEY
+    if limit is None:
+        limit = STUDENTS_T_PREFIT_SAMPLE_LIMIT
+    if limit is None or int(limit) <= 0:
+        raise ValueError("limit must be a positive integer")
+
+    xs: list[torch.Tensor] = []
+    n = 0
+    for batch in loader:
+        if isinstance(batch, TensorDictBase):
+            x = batch.get(in_key, None)
+            if x is None:
+                x = batch.get("features", None)
+                if x is None:
+                    continue
+        else:
+            x = batch[0] if isinstance(batch, (list, tuple)) else batch
+        if not torch.is_tensor(x):
+            continue
+        x = x.detach().cpu()
+        if x.ndim == 3 and x.shape[1] == 1:
+            x = x.reshape(x.shape[0], -1)
+        elif x.ndim != 2:
+            x = x.view(x.size(0), -1)
+        xs.append(x)
+        n += x.size(0)
+        if n >= int(limit):
+            break
+    if not xs:
+        return _np.empty((0, 0), dtype=_np.float64)
+    X = torch.cat(xs, dim=0)[: int(limit)].to(dtype=torch.float64).numpy()
+    return X
+
+
+def _reduce_moments(
+    n1: int,
+    m1: torch.Tensor,
+    M2_1: torch.Tensor,
+    M3_1: torch.Tensor,
+    n2: int,
+    m2: torch.Tensor,
+    M2_2: torch.Tensor,
+    M3_2: torch.Tensor,
+) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if n1 == 0:
+        return (int(n2), m2, M2_2, M3_2)
+    if n2 == 0:
+        return (int(n1), m1, M2_1, M3_1)
+    n = n1 + n2
+    delta = m2 - m1
+    n1f = float(n1)
+    n2f = float(n2)
+    nf = float(n)
+    m = m1 + delta * (n2f / nf)
+    M2 = M2_1 + M2_2 + (delta * delta) * (n1f * n2f / nf)
+    M3 = (
+        M3_1
+        + M3_2
+        + (delta * delta * delta) * (n1f * n2f * (n1f - n2f) / (nf * nf))
+        + 3.0 * delta * (n1f * M2_2 - n2f * M2_1) / nf
+    )
+    return (int(n), m, M2, M3)
+
+
+@torch.no_grad()
+def _reduce_metrics(layer: nn.Module) -> None:
+    dist = torch.distributed
+    if not (dist.is_available() and dist.is_initialized()):
+        return
+    bn_module = getattr(layer, "bn", None)
+    required = (
+        hasattr(layer, "stg_count")
+        and hasattr(layer, "stg_mean")
+        and hasattr(layer, "stg_M2")
+        and hasattr(layer, "stg_M3")
+        and hasattr(layer, "gs_count")
+        and hasattr(layer, "gs_mean")
+        and hasattr(layer, "gs_M2")
+        and hasattr(layer, "gs_M3")
+        and isinstance(bn_module, nn.BatchNorm1d)
+        and hasattr(bn_module, "running_mean")
+        and hasattr(bn_module, "running_var")
+    )
+    if not required:
+        return
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    # ---- (A) backend-aware gather 디바이스 결정 (NCCL은 CUDA 필요)
+    backend = str(dist.get_backend()).lower() if hasattr(dist, "get_backend") else ""
+    gather_device = layer.gs_mean.device
+    if "nccl" in backend and gather_device.type != "cuda":
+        gather_device = torch.device("cuda", torch.cuda.current_device())
+
+    # ---- (B) 형상/연속성/dtype 보장 및 사전 검증
+    # 모든 rank에서 feature 차원 D가 동일해야 함
+    D_local = torch.tensor([int(layer.stg_mean.numel())], dtype=torch.int64, device=gather_device)
+    D_list = [torch.zeros_like(D_local) for _ in range(world)]
+    dist.all_gather(D_list, D_local)
+    if any(int(d.item()) != int(D_list[0].item()) for d in D_list):
+        raise RuntimeError(
+            f"[reduce_metrics] feature dimension mismatch across ranks: {[int(d.item()) for d in D_list]}"
+        )
+
+    # 모든 통계를 공통 디바이스/float64/contiguous로 맞춰서 collective 수행
+    # NCCL/Gloo 모두에서 안전하게: 정수 카운터는 int64로 고정
+    n_local = layer.stg_count.to(device=gather_device, dtype=torch.int64)
+    mean_local = layer.stg_mean.to(device=gather_device, dtype=torch.float64).contiguous()
+    M2_local = layer.stg_M2.to(device=gather_device, dtype=torch.float64).contiguous()
+    M3_local = layer.stg_M3.to(device=gather_device, dtype=torch.float64).contiguous()
+
+    n_list = [torch.zeros_like(n_local) for _ in range(world)]
+    mean_list = [torch.empty_like(mean_local) for _ in range(world)]
+    M2_list = [torch.empty_like(M2_local) for _ in range(world)]
+    M3_list = [torch.empty_like(M3_local) for _ in range(world)]
+
+    dist.all_gather(n_list, n_local)
+    dist.all_gather(mean_list, mean_local)
+    dist.all_gather(M2_list, M2_local)
+    dist.all_gather(M3_list, M3_local)
+    if rank == 0:
+        m = torch.zeros_like(layer.gs_mean, dtype=torch.float64)
+        M2 = torch.zeros_like(layer.gs_M2, dtype=torch.float64)
+        M3 = torch.zeros_like(layer.gs_M3, dtype=torch.float64)
+        n_total = 0
+        for idx in range(world):
+            n_val = int(n_list[idx].item())
+            m_val = mean_list[idx]
+            M2_val = M2_list[idx]
+            M3_val = M3_list[idx]
+            n_total, m, M2, M3 = _reduce_moments(
+                n_total, m, M2, M3, n_val, m_val, M2_val, M3_val
+            )
+        layer.gs_count.fill_(int(n_total))
+        # 병합 결과를 원래 버퍼(디바이스)에 반영
+        layer.gs_mean.copy_(m.to(device=layer.gs_mean.device))
+        layer.gs_M2.copy_(M2.to(device=layer.gs_M2.device))
+        layer.gs_M3.copy_(M3.to(device=layer.gs_M3.device))
+    dist.barrier()
+    # 전역 누산치만 우선 동기화 (BN 러닝통계는 커밋 후 브로드캐스트)
+    for tensor in (layer.gs_count, layer.gs_mean, layer.gs_M2, layer.gs_M3):
+        dist.broadcast(tensor, src=0)
+    layer.stg_count.zero_()
+    layer.stg_mean.zero_()
+    layer.stg_M2.zero_()
+    layer.stg_M3.zero_()
+
+
+@torch.no_grad()
+def push_metrics(model: nn.Module, start_ns: int, end_ns: int) -> None:
+    target = model
+    while hasattr(target, "module"):
+        target = getattr(target, "module")
+    scalers: list[nn.Module] = []
+    for submodule in target.modules():
+        if hasattr(submodule, "commit_training_success") and hasattr(
+            submodule, "stg_count"
+        ):
+            scalers.append(submodule)
+    if not scalers:
+        return
+    for layer in scalers:
+        _reduce_metrics(layer)
+    for layer in scalers:
+        layer.commit_training_success(
+            start_ns=int(start_ns),
+            end_ns=int(end_ns),
+            tz_name="Asia/Seoul",
+        )
+    # 커밋으로 확정된 BN 러닝통계를 전 rank에 동일화
+    dist = torch.distributed
+    if dist.is_available() and dist.is_initialized():
+        for layer in scalers:
+            bn = getattr(layer, "bn", None)
+            if isinstance(bn, nn.BatchNorm1d):
+                dist.broadcast(bn.running_mean, src=0)
+                dist.broadcast(bn.running_var, src=0)
 
 
 def _num_batches(loader: Any) -> int:
@@ -635,6 +850,22 @@ def epochs(
 ) -> None:
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
+    # (1) SyncBatchNorm 변환: DDP/FSDP 래핑 이전 & 1회만. 실패 시 롤백.
+    if (
+        is_distributed()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+        and not getattr(model, "_syncbn_converted", False)
+    ):
+        _saved = deepcopy(model)
+        try:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            setattr(model, "_syncbn_converted", True)
+        except Exception as e:
+            model = _saved
+            warnings.warn(f"SyncBatchNorm conversion skipped (fallback): {e}")
+    # 타임존: 기본 GMT, 기록은 Asia/Seoul 기준
+    start_kst_ns = posix_time("Asia/Seoul")
     in_dim = int(ops.in_dim)
     use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(torch, "Event")
     train_steps = _num_batches(train_loader)
@@ -653,6 +884,33 @@ def epochs(
     prev_flops = 0.0
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
+        # ---- StudentsT: pre-fit df/loc/scale once (SciPy-backed) ----
+        try:
+            target_module = model.module if hasattr(model, "module") else model
+            st_layers = [m for m in target_module.modules() if isinstance(m, StudentsT)]
+            if st_layers and train_loader is not None:
+                do_fit = (not is_distributed()) or (
+                    torch.distributed.is_initialized() and torch.distributed.get_rank() == 0
+                )
+                if do_fit:
+                    X_np = _sample_from(train_loader)
+                    if X_np.size:
+                        for m in st_layers:
+                            with contextlib.suppress(Exception):
+                                m.fit_numpy(X_np, apply_bn=True)
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    for m in st_layers:
+                        torch.distributed.broadcast(m.bn.running_mean, src=0)
+                        torch.distributed.broadcast(m.bn.running_var, src=0)
+                        for buf in (
+                            getattr(m, "t_df", None),
+                            getattr(m, "t_loc", None),
+                            getattr(m, "t_scale", None),
+                        ):
+                            if isinstance(buf, torch.Tensor):
+                                torch.distributed.broadcast(buf, src=0)
+        except Exception as _e:  # pragma: no cover - best effort
+            warnings.warn(f"StudentsT.fit_numpy pre-fit skipped: {_e}")
         for epoch_idx in range(int(total_epochs)):
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
@@ -869,6 +1127,8 @@ def epochs(
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
         status_bar.set_postfix_str(f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True)
         status_bar.close()
+    end_kst_ns = posix_time("Asia/Seoul")
+    push_metrics(model, start_kst_ns, end_kst_ns)
 
 
 def infer(

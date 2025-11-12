@@ -22,8 +22,13 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tensordict import TensorDictBase
-
+from tensordict import TensorDict, TensorDictBase
+with contextlib.suppress(Exception):
+    import numpy as _np  # for offline fit helpers
+with contextlib.suppress(Exception):
+    import scipy.stats as _sps  # optional
+with contextlib.suppress(Exception):
+    from scipy.special import inv_boxcox as _inv_boxcox  # optional
 try:
     from torch.utils.checkpoint import checkpoint as activation_checkpoint
 except Exception:
@@ -31,6 +36,8 @@ except Exception:
 
 from ..api import is_meta_or_fake_tensor
 from ..backend.compat import patch_torch
+from ..backend.distributed import get_world_size
+from ..backend.system import cpu_info, system_info, posix_time
 from ..functional.fx import Autocast, Gradient, reshape_for_mha
 from .activations import SwiGLU
 from .kernels import (
@@ -66,6 +73,1064 @@ if TYPE_CHECKING:
 
 
 LayerNorm = nn.LayerNorm
+
+# ---------------------------------------------------------------------------
+#  Scaling layers (Normal / StudentsT) and corrective Affine
+#
+_NORM_MODES = {"norm", "normalize", "normalization"}
+_DENORM_MODES = {"denorm", "denormalize", "denormalization"}
+
+# 고정 길이(UTF-8) 문자열 버퍼 길이
+_LEN_OS, _LEN_KERNEL, _LEN_ARCH, _LEN_ACCEL, _LEN_TZ = 96, 96, 32, 256, 32
+_LEN_CPU = 2048  # CPU per-core name list (0:name;1:name;...) 고정 길이
+
+
+def _get_device_from(module: nn.Module) -> str:
+    try:
+        dev = next((p.device for p in module.parameters() if p is not None), None)
+        if dev is None:
+            dev = next((b.device for _, b in module.named_buffers()), torch.device("cpu"))
+        return str(getattr(dev, "type", "cpu"))
+    except Exception:
+        return "cpu"
+
+
+def _fixed_bytes(s: str, L: int) -> torch.Tensor:
+    b = s.encode("utf-8", errors="ignore")[:L]
+    out = torch.zeros(L, dtype=torch.uint8)
+    if b:
+        out[: len(b)] = torch.as_tensor(list(b), dtype=torch.uint8)
+    return out
+
+
+@torch.jit.ignore
+def _as_utf8(row: torch.Tensor) -> str:
+    """1D uint8 제로패딩 → UTF-8 문자열"""
+    if not isinstance(row, torch.Tensor) or row.dtype != torch.uint8 or row.dim() != 1:
+        raise TypeError("expected 1D torch.uint8 tensor")
+    data = bytes(row.detach().cpu().tolist())
+    data = data.split(b"\x00", 1)[0]
+    return data.decode("utf-8", errors="ignore")
+
+
+@torch.jit.ignore
+def _as_utf8_list(col: torch.Tensor) -> list[str]:
+    """[T, L] uint8 → 문자열 리스트"""
+    if not isinstance(col, torch.Tensor) or col.dtype != torch.uint8 or col.dim() != 2:
+        raise TypeError("expected [T, L] torch.uint8 tensor")
+    return [_as_utf8(col[i]) for i in range(col.shape[0])]
+
+
+def _get_sys_info(tz_name: Optional[str]) -> Tuple[str, str, str, str, str, str]:
+    os_name, kernel, arch, accel = system_info()
+    tzlabel = tz_name or "GMT"
+    cpu_label = cpu_info(max_bytes=_LEN_CPU)
+    return os_name, kernel, arch, accel, tzlabel, cpu_label
+
+
+
+@torch.jit.ignore
+def _accumulate_moments(x: torch.Tensor) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """배치에 대한 (N, mean, M2, M3) – dtype=float64."""
+    x64 = x.to(dtype=torch.float64)
+    n = int(x64.shape[0])
+    if n == 0:
+        d = x64.shape[-1]
+        z = x64.new_zeros(d)
+        return (0, z, z, z)
+    m = x64.mean(dim=0)
+    xc = x64 - m
+    M2 = (xc * xc).sum(dim=0)
+    M3 = (xc * xc * xc).sum(dim=0)
+    return (n, m, M2, M3)
+
+
+@torch.jit.ignore
+def _reduce_moments(n1, m1, M2_1, M3_1, n2, m2, M2_2, M3_2):
+    """
+    Pébay(2008) 결합 공식: 두 집합의 (N, mean, M2, M3) 병합.  (벡터화)
+    참조: Chan/Welford의 병렬 알고리즘 및 Pébay 공식. 
+    """
+    if n1 == 0:
+        return (n2, m2, M2_2, M3_2)
+    if n2 == 0:
+        return (n1, m1, M2_1, M3_1)
+    n = n1 + n2
+    delta = m2 - m1
+    n1f = float(n1); n2f = float(n2); nf = float(n)
+    m = m1 + delta * (n2f / nf)
+    M2 = M2_1 + M2_2 + (delta * delta) * (n1f * n2f / nf)
+    M3 = (M3_1 + M3_2
+          + (delta * delta * delta) * (n1f * n2f * (n1f - n2f) / (nf * nf))
+          + 3.0 * delta * (n1f * M2_2 - n2f * M2_1) / nf)
+    return (int(n), m, M2, M3)
+
+
+def _sample_skewness(N: int, M2: torch.Tensor, M3: torch.Tensor, eps: float) -> torch.Tensor:
+    """표본 왜도 γ1 (Pearson)."""
+    M2s = M2.clamp_min(eps)
+    return (math.sqrt(max(N, 1)) * M3) / (M2s.sqrt() * M2s)  # sqrt(N)*M3 / M2^(3/2)
+
+
+def _skew_normal_delta(gamma1: torch.Tensor) -> torch.Tensor:
+    """
+    SN의 왜도 γ1 -> δ 근사 역변환 (단조함수 근사, |γ1|<=~0.9953).
+    δ = sign(γ1) * sqrt( (π/2)*a / (a + c) ), a=|γ1|^{2/3}, c=((4-π)/2)^{2/3}
+    """
+    c = ((4.0 - math.pi) / 2.0) ** (2.0 / 3.0)
+    a = gamma1.abs().clamp_max(0.9952717464).pow(2.0 / 3.0)
+    num = (math.pi / 2.0) * a
+    den = (a + c).clamp_min(1e-12)
+    delta = (num / den).sqrt()
+    return delta.copysign(gamma1)
+
+
+def _skew_normal_vars(mu: torch.Tensor, var: torch.Tensor, gamma1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    표본 (μ, var, γ1)로부터 SN(ξ, ω, α)의 (ξ, ω, α) 방법추정.
+    μ = ξ + ω δ sqrt(2/π),  var = ω^2 (1 - 2δ^2/π),  α = δ / sqrt(1-δ^2).
+    """
+    delta = _skew_normal_delta(gamma1).clamp(-0.999999, 0.999999)
+    one = var.new_tensor(1.0)
+    omega = (var / (one - 2.0 * delta * delta / math.pi).clamp_min(1e-12)).sqrt()
+    xi = mu - omega * delta * math.sqrt(2.0 / math.pi)
+    alpha = delta / (one - delta * delta).clamp_min(1e-12).sqrt()
+    return xi, omega, alpha
+
+
+class Affine(nn.Module):
+    """출력 보정용 간단 Affine: y = x * weight + bias"""
+
+    def __init__(self, n_features: int, init_weight: float = 1.0, init_bias: float = 0.0) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.full((int(n_features),), float(init_weight)))
+        self.bias = nn.Parameter(torch.full((int(n_features),), float(init_bias)))
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.weight.view(1, -1) + self.bias.view(1, -1)
+
+
+# ---------------------------------------------------------------------------
+# Optional Nonlinear Power Transform (Yeo–Johnson / Box–Cox)
+# ---------------------------------------------------------------------------
+class PowerTransform(nn.Module):
+    """
+    Optional per-feature power transform with inverse:
+      - method: 'yeojohnson' (x∈R), 'boxcox' (x>0; shift로 양수화)
+      - mask: bool[D] (True인 feature에만 적용)
+      - lmbda, shift: per-feature buffers (학습셋 오프라인 추정 또는 외부 주입)
+    """
+
+    def __init__(self, n_features: int, method: str = "yeojohnson",
+                 mask: Optional[torch.Tensor] = None, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.n_features = int(n_features)
+        self.method = str(method or "yeojohnson").lower()
+        if self.method not in ("yeojohnson", "boxcox"):
+            raise ValueError("method must be 'yeojohnson' or 'boxcox'")
+        self.eps = float(eps)
+        m = torch.ones(self.n_features, dtype=torch.bool) if mask is None else torch.as_tensor(mask, dtype=torch.bool)
+        self.register_buffer("mask", m, persistent=True)
+        self.register_buffer("lmbda", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("shift", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)  # boxcox용
+
+    # ---------- torch-formula transforms (autograd-friendly) ----------
+    def _bc(self, x, v):  # broadcast [D] -> [1, D]
+        return v.view(1, -1).to(dtype=x.dtype, device=x.device).expand_as(x)
+
+    def _yj(self, x: torch.Tensor) -> torch.Tensor:
+        lam = self._bc(x, self.lmbda.to(x.dtype))
+        pos = x >= 0
+        out = torch.empty_like(x)
+        if pos.any():
+            xp, lp = x[pos], lam[pos]
+            out[pos] = torch.where(
+                torch.isclose(lp, torch.zeros_like(lp)),
+                torch.log1p(xp),
+                ((xp + 1.0).clamp_min(self.eps).pow(lp) - 1.0) / lp,
+            )
+        if (~pos).any():
+            xn, ln = x[~pos], lam[~pos]
+            two = x.new_tensor(2.0)
+            out[~pos] = torch.where(
+                torch.isclose(ln, two),
+                -torch.log1p((-xn).clamp_min(self.eps)),
+                -(((1.0 - xn).clamp_min(self.eps)).pow(two - ln) - 1.0) / (two - ln),
+            )
+        return out
+
+    def _inv_yj(self, y: torch.Tensor) -> torch.Tensor:
+        lam = self._bc(y, self.lmbda.to(y.dtype))
+        out = torch.empty_like(y)
+        pos = y >= 0
+        if pos.any():
+            yp, lp = y[pos], lam[pos]
+            out[pos] = torch.where(
+                torch.isclose(lp, torch.zeros_like(lp)),
+                torch.expm1(yp),
+                (lp * yp + 1.0).clamp_min(self.eps).pow(1.0 / lp) - 1.0,
+            )
+        if (~pos).any():
+            yn, ln = y[~pos], lam[~pos]
+            two = y.new_tensor(2.0)
+            out[~pos] = torch.where(
+                torch.isclose(ln, two),
+                1.0 - torch.exp(-yn),
+                1.0 - (1.0 - (two - ln) * yn).clamp_min(self.eps).pow(1.0 / (two - ln)),
+            )
+        return out
+
+    def _bcx(self, x: torch.Tensor) -> torch.Tensor:
+        z = x + self._bc(x, self.shift.to(x.dtype))
+        lam = self._bc(x, self.lmbda.to(x.dtype))
+        z = z.clamp_min(self.eps)
+        return torch.where(
+            torch.isclose(lam, torch.zeros_like(lam)),
+            torch.log(z),
+            (z.pow(lam) - 1.0) / lam,
+        )
+
+    def _inv_bcx(self, y: torch.Tensor) -> torch.Tensor:
+        lam = self._bc(y, self.lmbda.to(y.dtype))
+        z = torch.where(
+            torch.isclose(lam, torch.zeros_like(lam)),
+            torch.exp(y),
+            (lam * y + 1.0).clamp_min(self.eps).pow(1.0 / lam),
+        )
+        return z - self._bc(y, self.shift.to(y.dtype))
+
+    # ---------- public API ----------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not bool(self.mask.any()):
+            return x
+        m = self._bc(x, self.mask)
+        y = self._yj(x) if self.method.startswith("yeo") else self._bcx(x)
+        return torch.where(m, y, x)
+
+    def inverse(self, y: torch.Tensor) -> torch.Tensor:
+        if not bool(self.mask.any()):
+            return y
+        m = self._bc(y, self.mask)
+        x = self._inv_yj(y) if self.method.startswith("yeo") else self._inv_bcx(y)
+        return torch.where(m, x, y)
+
+    @torch.no_grad()
+    def set_params(
+        self,
+        lmbda: torch.Tensor,
+        shift: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        lam = torch.as_tensor(lmbda, dtype=torch.float64, device=self.lmbda.device)
+        if lam.numel() == 1:
+            lam = lam.expand_as(self.lmbda)
+        self.lmbda.copy_(lam)
+        if shift is not None:
+            sh = torch.as_tensor(shift, dtype=torch.float64, device=self.shift.device)
+            if sh.numel() == 1:
+                sh = sh.expand_as(self.shift)
+            self.shift.copy_(sh)
+        if mask is not None:
+            self.mask.copy_(torch.as_tensor(mask, dtype=torch.bool, device=self.mask.device))
+
+    @torch.no_grad()
+    def fit_params_numpy(
+        self,
+        X: "np.ndarray",
+        boxcox_shift: str = "auto",
+    ) -> Tuple["np.ndarray", "np.ndarray"]:
+        """
+        SciPy를 이용해 λ(및 Box–Cox shift)를 오프라인 추정.
+        - yeojohnson: stats.yeojohnson(x, lmbda=None)
+        - boxcox: stats.boxcox_normmax(x+shift)
+        반환: (lambda[D], shift[D])
+        """
+        if _sps is None:
+            raise RuntimeError("SciPy가 필요합니다: pip install scipy")
+        X = _np.asarray(X, dtype=_np.float64)
+        D = X.shape[-1]
+        lam = _np.zeros(D, dtype=_np.float64)
+        shf = _np.zeros(D, dtype=_np.float64)
+        for j in range(D):
+            xj = X[:, j]
+            if not self.mask[j].item():
+                continue
+            if self.method.startswith("yeo"):
+                _, lj = _sps.yeojohnson(xj, lmbda=None)
+                lam[j] = lj
+            else:
+                s = 0.0
+                if boxcox_shift == "auto":
+                    mn = _np.nanmin(xj)
+                    if mn <= 0:
+                        s = -mn + 1e-6
+                lam[j] = _sps.boxcox_normmax(xj + s)
+                shf[j] = s
+        self.set_params(torch.from_numpy(lam), torch.from_numpy(shf))
+        return lam, shf
+
+
+# ---------------------------------------------------------------------------
+# Normal (BatchNorm 기반 스케일러/역스케일러)
+# ---------------------------------------------------------------------------
+class Normal(nn.Module):
+    """
+    Normal(standardize, skew, mode) – BatchNorm 기반 스케일러/역정규화기.
+      - mode in {'norm','normalize','normalization'} → 정규화
+      - mode in {'denorm','denormalize','denormalization'} → 역정규화
+    훈련: 배치 통계/BN 러닝통계 사용 + 임시(staged) 누산
+    추론: 커밋된 누산 통계(전역, SN 방법추정)를 사용
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        *,
+        standardize: bool = True,
+        skew: bool = True,
+        mode: str = "norm",
+        momentum: float = 0.1,
+        eps: float = 1e-5,
+        power: Optional[str] = None,
+        power_mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        super().__init__()
+        self.n_features = int(n_features)
+        mode_l = str(mode or "").lower()
+        if mode_l not in _NORM_MODES and mode_l not in _DENORM_MODES:
+            raise ValueError(f"mode must be one of {_NORM_MODES | _DENORM_MODES}")
+        self.mode = mode_l
+        self.standardize = bool(standardize)
+        self.skew = bool(skew)
+        self.eps = float(eps)
+        self.bn = nn.BatchNorm1d(
+            self.n_features,
+            affine=False,
+            momentum=float(momentum),
+            eps=float(eps),
+            track_running_stats=True,
+        )
+        self.power = None if power is None else str(power).lower()
+        self.pt: Optional[PowerTransform] = None
+        if self.skew and self.power in ("yeojohnson", "boxcox"):
+            self.pt = PowerTransform(
+                self.n_features,
+                method=self.power,
+                mask=power_mask,
+                eps=self.eps,
+            )
+        # ---- staged(훈련 중) 누산치 (float64) ----
+        self.register_buffer("stg_count", torch.tensor(0, dtype=torch.long), persistent=True)
+        self.register_buffer(
+            "stg_mean",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "stg_M2",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "stg_M3",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        # ---- committed(커밋된 전역) 누산치 (float64) ----
+        self.register_buffer("gs_count", torch.tensor(0, dtype=torch.long), persistent=True)
+        self.register_buffer(
+            "gs_mean",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "gs_M2",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "gs_M3",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        # ---- 메타: 마지막 학습 시작/종료(ns), 누적 훈련 횟수(len(history)) ----
+        self.register_buffer("last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("train_runs", torch.tensor(0, dtype=torch.long), persistent=True)
+        # ---- history (증분 append; 텐서 버퍼로 저장) ----
+        self._hist_maxlen = 2000  # 선택: 상한
+        self.register_buffer("hist_step", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("hist_seen", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True)
+        self.register_buffer(
+            "hist_device_code",
+            torch.empty(0, dtype=torch.int8),
+            persistent=True,
+        )  # 0=cpu,1=cuda,2=mps,3=xpu,4=vulkan
+        self.register_buffer("hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True)
+        self.register_buffer("hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_kernel", torch.empty(0, _LEN_KERNEL, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True)
+        # (추정치 보관 버퍼) stats.t.fit 결과: df, loc, scale
+        self.register_buffer("t_df",    torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
+        self.register_buffer("t_loc",   torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
+        self.register_buffer("t_scale", torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
+
+    # ---------------------- 내부 유틸 ----------------------
+    @staticmethod
+    def _encode_device(t: str) -> int:
+        m = {"cpu": 0, "cuda": 1, "mps": 2, "xpu": 3, "vulkan": 4}
+        return int(m.get(str(t), 0))
+
+    @torch.no_grad()
+    def _accumulate_batch(self, x: torch.Tensor) -> None:
+        """훈련 배치 → staged 누산 (BN 전 입력 기준)."""
+        n2, m2, M2_2, M3_2 = _accumulate_moments(x)
+        n1 = int(self.stg_count.item())
+        n, m, M2, M3 = _reduce_moments(
+            n1,
+            self.stg_mean,
+            self.stg_M2,
+            self.stg_M3,
+            n2,
+            m2,
+            M2_2,
+            M3_2,
+        )
+        self.stg_count.fill_(n)
+        self.stg_mean.copy_(m)
+        self.stg_M2.copy_(M2)
+        self.stg_M3.copy_(M3)
+
+    @torch.no_grad()
+    def _commit_moments(self) -> None:
+        """staged → committed 전환(누산 병합)."""
+        n2 = int(self.stg_count.item())
+        if n2 <= 0:
+            return
+        n1 = int(self.gs_count.item())
+        n, m, M2, M3 = _reduce_moments(
+            n1,
+            self.gs_mean,
+            self.gs_M2,
+            self.gs_M3,
+            n2,
+            self.stg_mean,
+            self.stg_M2,
+            self.stg_M3,
+        )
+        self.gs_count.fill_(n)
+        self.gs_mean.copy_(m)
+        self.gs_M2.copy_(M2)
+        self.gs_M3.copy_(M3)
+        # reset staged
+        self.stg_count.zero_()
+        self.stg_mean.zero_()
+        self.stg_M2.zero_()
+        self.stg_M3.zero_()
+
+    # ---------------------- 공개 API ----------------------
+    @torch.no_grad()
+    def export_history(self) -> TensorDict:
+        """TensorDict(batch_size=[T])로 스냅샷 내보내기 (History[n] 인덱싱 가능)."""
+        T = int(self.hist_step.numel())
+        return TensorDict(
+            {
+                "step": self.hist_step.detach().clone(),
+                "seen": self.hist_seen.detach().clone(),
+                "t_start_ns": self.hist_start_ns.detach().clone(),
+                "t_end_ns": self.hist_end_ns.detach().clone(),
+                "device_code": self.hist_device_code.detach().clone(),
+                "world_size": self.hist_world_size.detach().clone(),
+                "os": self.hist_os.detach().clone(),
+                "kernel": self.hist_kernel.detach().clone(),
+                "arch": self.hist_arch.detach().clone(),
+                "accel": self.hist_accel.detach().clone(),
+                "tz": self.hist_tz.detach().clone(),
+                "cpu": self.hist_cpu.detach().clone(),
+            },
+            batch_size=[T],
+        )
+
+    @torch.jit.ignore
+    @torch.no_grad()
+    def export_history_text(self) -> list[dict[str, object]]:
+        """히스토리를 문자열/스칼라 dict의 리스트로 복원."""
+        T = int(self.hist_step.numel())
+        dev_map = {0: "cpu", 1: "cuda", 2: "mps", 3: "xpu", 4: "vulkan"}
+        out: list[dict[str, object]] = []
+        for i in range(T):
+            out.append(
+                {
+                    "step": int(self.hist_step[i].item()),
+                    "seen": int(self.hist_seen[i].item()),
+                    "t_start_ns": int(self.hist_start_ns[i].item()),
+                    "t_end_ns": int(self.hist_end_ns[i].item()),
+                    "device": dev_map.get(int(self.hist_device_code[i].item()), "unknown"),
+                    "world_size": int(self.hist_world_size[i].item()),
+                    "os": _as_utf8(self.hist_os[i]),
+                    "kernel": _as_utf8(self.hist_kernel[i]),
+                    "arch": _as_utf8(self.hist_arch[i]),
+                    "accelerators": _as_utf8(self.hist_accel[i]),
+                    "tz": _as_utf8(self.hist_tz[i]),
+                    "cpu": _as_utf8(self.hist_cpu[i]),
+                }
+            )
+        return out
+
+    @torch.no_grad()
+    def set_power_params(
+        self,
+        lmbda: torch.Tensor,
+        shift: Optional[torch.Tensor] = None,
+        mask: Optional[torch.Tensor] = None,
+    ) -> None:
+        if self.pt is None:
+            raise RuntimeError("power transform이 활성화되어 있지 않습니다 (power=None).")
+        self.pt.set_params(lmbda, shift, mask)
+
+    @torch.no_grad()
+    def fit_power_params_numpy(self, X: "np.ndarray", boxcox_shift: str = "auto"):
+        if self.pt is None:
+            raise RuntimeError("power transform이 활성화되어 있지 않습니다 (power=None).")
+        return self.pt.fit_params_numpy(X, boxcox_shift=boxcox_shift)
+
+    @torch.no_grad()
+    def commit_training_success(
+        self,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        tz_name: str | None = "GMT",
+    ) -> None:
+        """
+        (5) 조건: 훈련이 '성공적으로' 끝나는 시점에만 누산/히스토리 커밋.
+        - staged 누산을 committed 반영
+        - 마지막 학습 시작/종료(ns) 및 누적 훈련 횟수 갱신
+        - 히스토리(증분) append
+        - 추론 스케일 고정을 위해 BN 러닝통계를 커밋값(SN 보정)으로 동기화
+        """
+        self._commit_moments()
+        # 메타 업데이트
+        s = int(start_ns if start_ns is not None else posix_time(tz_name))
+        e = int(end_ns if end_ns is not None else posix_time(tz_name))
+        self.last_train_start_ns.fill_(s)
+        self.last_train_end_ns.fill_(e)
+        runs = int(self.train_runs.item()) + 1
+        self.train_runs.fill_(runs)
+        # history append
+        dev_code = torch.tensor(
+            [self._encode_device(_get_device_from(self))],
+            dtype=torch.int8,
+            device=self.hist_device_code.device,
+        )
+        ws = torch.tensor(
+            [get_world_size()],
+            dtype=torch.int32,
+            device=self.hist_world_size.device,
+        )
+        step = torch.tensor([runs - 1], dtype=torch.long, device=self.hist_step.device)
+        seen = torch.tensor([int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device)
+        self.hist_step = torch.cat([self.hist_step, step], dim=0)[-self._hist_maxlen :]
+        self.hist_seen = torch.cat([self.hist_seen, seen], dim=0)[-self._hist_maxlen :]
+        self.hist_start_ns = torch.cat(
+            [
+                self.hist_start_ns,
+                torch.tensor([s], dtype=torch.int64, device=self.hist_start_ns.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_end_ns = torch.cat(
+            [
+                self.hist_end_ns,
+                torch.tensor([e], dtype=torch.int64, device=self.hist_end_ns.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_device_code = torch.cat([self.hist_device_code, dev_code], dim=0)[
+            -self._hist_maxlen :
+        ]
+        self.hist_world_size = torch.cat([self.hist_world_size, ws], dim=0)[-self._hist_maxlen :]
+        os_name, kernel, arch, accel, tzlabel, cpu_label = _get_sys_info(tz_name)
+        self.hist_os = torch.cat(
+            [
+                self.hist_os,
+                _fixed_bytes(os_name, _LEN_OS)
+                .unsqueeze(0)
+                .to(device=self.hist_os.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_kernel = torch.cat(
+            [
+                self.hist_kernel,
+                _fixed_bytes(kernel, _LEN_KERNEL)
+                .unsqueeze(0)
+                .to(device=self.hist_kernel.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_arch = torch.cat(
+            [
+                self.hist_arch,
+                _fixed_bytes(arch, _LEN_ARCH)
+                .unsqueeze(0)
+                .to(device=self.hist_arch.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_accel = torch.cat(
+            [
+                self.hist_accel,
+                _fixed_bytes(accel, _LEN_ACCEL)
+                .unsqueeze(0)
+                .to(device=self.hist_accel.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_tz = torch.cat(
+            [
+                self.hist_tz,
+                _fixed_bytes(tzlabel, _LEN_TZ)
+                .unsqueeze(0)
+                .to(device=self.hist_tz.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_cpu = torch.cat(
+            [
+                self.hist_cpu,
+                _fixed_bytes(cpu_label, _LEN_CPU)
+                .unsqueeze(0)
+                .to(device=self.hist_cpu.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        # 추론용 스케일 고정 (SN 방법추정)
+        N = int(self.gs_count.item())
+        if N > 0:
+            mu = self.gs_mean.to(dtype=torch.float64)
+            var = (self.gs_M2 / max(N, 1)).clamp_min(1e-12)
+            if self.skew:
+                gamma1 = _sample_skewness(N, self.gs_M2, self.gs_M3, self.eps)
+                xi, omega, _alpha = _skew_normal_vars(mu, var, gamma1)
+                rm = xi.to(dtype=self.bn.running_mean.dtype)
+                rv = (omega * omega).to(dtype=self.bn.running_var.dtype)
+            else:
+                rm = mu.to(dtype=self.bn.running_mean.dtype)
+                rv = var.to(dtype=self.bn.running_var.dtype)
+            self.bn.running_mean.copy_(rm)
+            self.bn.running_var.copy_(rv)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        hist_names = (
+            "hist_step",
+            "hist_seen",
+            "hist_start_ns",
+            "hist_end_ns",
+            "hist_device_code",
+            "hist_world_size",
+            "hist_os",
+            "hist_kernel",
+            "hist_arch",
+            "hist_accel",
+            "hist_tz",
+            "hist_cpu",
+        )
+        for name in hist_names:
+            state_dict.pop(prefix + name, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.standardize:
+            return x  # no-op
+        bn_dtype = (
+            self.bn.running_mean.dtype
+            if isinstance(self.bn.running_mean, torch.Tensor)
+            else x.dtype
+        )
+        orig_dtype = x.dtype
+        if self.mode in _NORM_MODES:
+            if self.training:
+                z = self.pt(x) if self.pt is not None else x
+                self._accumulate_batch(z)
+                if z.dtype != bn_dtype:
+                    z = z.to(dtype=bn_dtype)
+                out = self.bn(z)
+                if out.dtype != orig_dtype:
+                    out = out.to(dtype=orig_dtype)
+                return out
+            else:
+                z = self.pt(x) if self.pt is not None else x
+                if z.dtype != bn_dtype:
+                    z = z.to(dtype=bn_dtype)
+                out = self.bn(z)
+                if out.dtype != orig_dtype:
+                    out = out.to(dtype=orig_dtype)
+                return out
+        elif self.mode in _DENORM_MODES:
+            x_cast = x if x.dtype == bn_dtype else x.to(dtype=bn_dtype)
+            std = (self.bn.running_var + self.bn.eps).sqrt().view(1, -1)
+            mean = self.bn.running_mean.view(1, -1)
+            y = x_cast * std + mean
+            y = self.pt.inverse(y) if self.pt is not None else y
+            if y.dtype != orig_dtype:
+                y = y.to(dtype=orig_dtype)
+            return y
+        else:
+            raise ValueError(f"invalid mode: {self.mode}")
+
+
+class StudentsT(nn.Module):
+    """
+    StudentsT(standardize, mode) – Normal에 의존하지 않는 독립 모듈.
+      - 학습: 배치통계/러닝통계(BN) 사용 + 누산/커밋/히스토리
+      - 추론: 커밋된 전역 통계 사용
+      - t-분포 자체의 ν·loc·scale 추정은 SciPy의 ``stats.t.fit``로 오프라인 지원(선택)
+        (추정치가 있다면 unit-variance 표준화를 위해 √((ν-2)/ν) 팩터 적용 가능; ν>2 필요)
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        *,
+        standardize: bool = True,
+        mode: str = "norm",
+        momentum: float = 0.1,
+        eps: float = 1e-5,
+    ) -> None:
+        super().__init__()
+        self.n_features = int(n_features)
+        mode_l = str(mode or "").lower()
+        if mode_l not in _NORM_MODES and mode_l not in _DENORM_MODES:
+            raise ValueError(f"mode must be one of {_NORM_MODES | _DENORM_MODES}")
+        self.mode = mode_l
+        self.standardize = bool(standardize)
+        self.eps = float(eps)
+        self.bn = nn.BatchNorm1d(
+            self.n_features,
+            affine=False,
+            momentum=float(momentum),
+            eps=float(eps),
+            track_running_stats=True,
+        )
+        # 누산/히스토리 버퍼 (Normal과 동일 구조)
+        self.register_buffer("stg_count", torch.tensor(0, dtype=torch.long), persistent=True)
+        self.register_buffer("stg_mean", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("stg_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("stg_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("gs_count", torch.tensor(0, dtype=torch.long), persistent=True)
+        self.register_buffer("gs_mean", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("gs_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("gs_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
+        self.register_buffer("last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("train_runs", torch.tensor(0, dtype=torch.long), persistent=True)
+        self._hist_maxlen = 2000
+        self.register_buffer("hist_step", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("hist_seen", torch.empty(0, dtype=torch.long), persistent=True)
+        self.register_buffer("hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True)
+        self.register_buffer("hist_device_code", torch.empty(0, dtype=torch.int8), persistent=True)
+        self.register_buffer("hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True)
+        self.register_buffer("hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_kernel", torch.empty(0, _LEN_KERNEL, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True)
+        self.register_buffer("hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True)
+
+    @torch.no_grad()
+    def _accumulate_batch(self, x: torch.Tensor) -> None:
+        n2, m2, M2_2, M3_2 = _accumulate_moments(x)
+        n1 = int(self.stg_count.item())
+        n, m, M2, M3 = _reduce_moments(
+            n1,
+            self.stg_mean,
+            self.stg_M2,
+            self.stg_M3,
+            n2,
+            m2,
+            M2_2,
+            M3_2,
+        )
+        self.stg_count.fill_(n)
+        self.stg_mean.copy_(m)
+        self.stg_M2.copy_(M2)
+        self.stg_M3.copy_(M3)
+
+    @torch.no_grad()
+    def _commit_moments(self) -> None:
+        n2 = int(self.stg_count.item())
+        if n2 <= 0:
+            return
+        n1 = int(self.gs_count.item())
+        n, m, M2, M3 = _reduce_moments(
+            n1,
+            self.gs_mean,
+            self.gs_M2,
+            self.gs_M3,
+            n2,
+            self.stg_mean,
+            self.stg_M2,
+            self.stg_M3,
+        )
+        self.gs_count.fill_(n)
+        self.gs_mean.copy_(m)
+        self.gs_M2.copy_(M2)
+        self.gs_M3.copy_(M3)
+        self.stg_count.zero_()
+        self.stg_mean.zero_()
+        self.stg_M2.zero_()
+        self.stg_M3.zero_()
+
+    @torch.no_grad()
+    def commit_training_success(
+        self,
+        start_ns: int | None = None,
+        end_ns: int | None = None,
+        tz_name: str | None = "GMT",
+    ) -> None:
+        self._commit_moments()
+        s = int(start_ns if start_ns is not None else posix_time(tz_name))
+        e = int(end_ns if end_ns is not None else posix_time(tz_name))
+        self.last_train_start_ns.fill_(s)
+        self.last_train_end_ns.fill_(e)
+        runs = int(self.train_runs.item()) + 1
+        self.train_runs.fill_(runs)
+        dev_code = torch.tensor(
+            [Normal._encode_device(_get_device_from(self))],
+            dtype=torch.int8,
+            device=self.hist_device_code.device,
+        )
+        ws = torch.tensor([get_world_size()], dtype=torch.int32, device=self.hist_world_size.device)
+        step = torch.tensor([runs - 1], dtype=torch.long, device=self.hist_step.device)
+        seen = torch.tensor([int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device)
+        self.hist_step = torch.cat([self.hist_step, step], dim=0)[-self._hist_maxlen :]
+        self.hist_seen = torch.cat([self.hist_seen, seen], dim=0)[-self._hist_maxlen :]
+        self.hist_start_ns = torch.cat(
+            [
+                self.hist_start_ns,
+                torch.tensor([s], dtype=torch.int64, device=self.hist_start_ns.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_end_ns = torch.cat(
+            [
+                self.hist_end_ns,
+                torch.tensor([e], dtype=torch.int64, device=self.hist_end_ns.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_device_code = torch.cat([self.hist_device_code, dev_code], dim=0)[
+            -self._hist_maxlen :
+        ]
+        self.hist_world_size = torch.cat([self.hist_world_size, ws], dim=0)[
+            -self._hist_maxlen :
+        ]
+        os_name, kernel, arch, accel, tzlabel, cpu_label = _get_sys_info(tz_name)
+        self.hist_os = torch.cat(
+            [
+                self.hist_os,
+                _fixed_bytes(os_name, _LEN_OS)
+                .unsqueeze(0)
+                .to(device=self.hist_os.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_kernel = torch.cat(
+            [
+                self.hist_kernel,
+                _fixed_bytes(kernel, _LEN_KERNEL)
+                .unsqueeze(0)
+                .to(device=self.hist_kernel.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_arch = torch.cat(
+            [
+                self.hist_arch,
+                _fixed_bytes(arch, _LEN_ARCH)
+                .unsqueeze(0)
+                .to(device=self.hist_arch.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_accel = torch.cat(
+            [
+                self.hist_accel,
+                _fixed_bytes(accel, _LEN_ACCEL)
+                .unsqueeze(0)
+                .to(device=self.hist_accel.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_tz = torch.cat(
+            [
+                self.hist_tz,
+                _fixed_bytes(tzlabel, _LEN_TZ)
+                .unsqueeze(0)
+                .to(device=self.hist_tz.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        self.hist_cpu = torch.cat(
+            [
+                self.hist_cpu,
+                _fixed_bytes(cpu_label, _LEN_CPU)
+                .unsqueeze(0)
+                .to(device=self.hist_cpu.device),
+            ],
+            dim=0,
+        )[-self._hist_maxlen :]
+        N = int(self.gs_count.item())
+        if N > 0:
+            mu = self.gs_mean.to(dtype=self.bn.running_mean.dtype)
+            var = (self.gs_M2 / max(N, 1)).clamp_min(1e-12).to(
+                dtype=self.bn.running_var.dtype
+            )
+            self.bn.running_mean.copy_(mu)
+            self.bn.running_var.copy_(var)
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict,
+        prefix: str,
+        local_metadata: dict,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        hist_names = (
+            "hist_step",
+            "hist_seen",
+            "hist_start_ns",
+            "hist_end_ns",
+            "hist_device_code",
+            "hist_world_size",
+            "hist_os",
+            "hist_kernel",
+            "hist_arch",
+            "hist_accel",
+            "hist_tz",
+            "hist_cpu",
+        )
+        for name in hist_names:
+            state_dict.pop(prefix + name, None)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.standardize:
+            return x
+        bn_dtype = self.bn.running_mean.dtype if hasattr(self.bn, "running_mean") else x.dtype
+        orig_dtype = x.dtype
+        if x.dtype != bn_dtype:
+            x = x.to(dtype=bn_dtype)
+        if self.mode in _NORM_MODES:
+            if self.training:
+                out = self.bn(x)
+                self._accumulate_batch(x)
+                return out.to(dtype=orig_dtype)
+            return self.bn(x).to(dtype=orig_dtype)
+        elif self.mode in _DENORM_MODES:
+            std = (self.bn.running_var + self.bn.eps).sqrt().view(1, -1)
+            mean = self.bn.running_mean.view(1, -1)
+            out = x * std + mean
+            if out.dtype != orig_dtype:
+                out = out.to(dtype=orig_dtype)
+            return out
+        raise ValueError(f"invalid mode: {self.mode}")
+
+    # ---------------------- SciPy 기반 오프라인 추정 ----------------------
+    @torch.jit.ignore
+    def fit_numpy(
+        self,
+        X: "np.ndarray",
+        *,
+        floc: Optional[Union[float, "np.ndarray"]] = None,
+        fscale: Optional[Union[float, "np.ndarray"]] = None,
+        apply_bn: bool = False,
+    ) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
+        """
+        Per-feature로 SciPy의 MLE `stats.t.fit`을 수행하여 (df, loc, scale)을 추정.
+        - X: (N, D) numpy 배열
+        - floc/fscale: loc/scale 고정(선택); 스칼라 또는 길이 D
+        - apply_bn=True면 BN 러닝통계를 (loc, scale, df)로부터 유도된 분산으로 고정
+          (Var = scale^2 * df/(df-2), df>2에서만 유효). :contentReference[oaicite:5]{index=5}
+        반환: (df[D], loc[D], scale[D]) (numpy)
+        """
+        if _sps is None:
+            raise RuntimeError("SciPy가 필요합니다: pip install scipy")
+        X = _np.asarray(X, dtype=_np.float64)
+        if X.ndim != 2 or X.shape[1] != self.n_features:
+            raise ValueError(f"X shape must be (N, {self.n_features})")
+        D = self.n_features
+        df  = _np.full(D, _np.nan, dtype=_np.float64)
+        loc = _np.full(D, _np.nan, dtype=_np.float64)
+        sc  = _np.full(D, _np.nan, dtype=_np.float64)
+        # 브로드캐스트 편의
+        def _sel(v, j):
+            if v is None: return None
+            return float(v if _np.isscalar(v) else v[j])
+        for j in range(D):
+            xj = _np.asarray(X[:, j], dtype=_np.float64)
+            xj = xj[_np.isfinite(xj)]
+            if xj.size == 0:
+                continue
+            kw = {}
+            fl = _sel(floc, j); fs = _sel(fscale, j)
+            if fl is not None: kw["floc"] = fl
+            if fs is not None: kw["fscale"] = fs
+            try:
+                dfj, locj, scj = _sps.t.fit(xj, **kw)  # MLE로 (df, loc, scale) 반환 :contentReference[oaicite:6]{index=6}
+            except Exception:
+                # fallback: moment-like 초기화
+                locj = _np.nanmean(xj)
+                s2   = _np.nanvar(xj)
+                dfj  = 10.0
+                scj  = _np.sqrt(max(s2 * (dfj - 2.0) / dfj, 1e-12))
+            df[j], loc[j], sc[j] = dfj, locj, scj
+        # 버퍼 갱신
+        self.t_df.copy_(torch.from_numpy(df))
+        self.t_loc.copy_(torch.from_numpy(loc))
+        self.t_scale.copy_(torch.from_numpy(sc))
+        # 선택: BN 러닝통계에도 반영
+        if apply_bn:
+            rm = torch.from_numpy(loc).to(self.bn.running_mean.dtype).to(self.bn.running_mean.device)
+            var_np = _np.where(df > 2.0, sc**2 * df / (df - 2.0),  # Var(t)=scale^2*df/(df-2)
+                               _np.asarray(self.bn.running_var.detach().cpu(), dtype=_np.float64))
+            rv = torch.from_numpy(var_np).to(self.bn.running_var.dtype).to(self.bn.running_var.device)
+            self.bn.running_mean.copy_(rm)
+            self.bn.running_var.copy_(rv)
+        return df, loc, sc
 
 
 class PositionalEncoding(nn.Module):
@@ -1473,7 +2538,7 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
-    
+
     def __init__(
         self,
         in_dim: int,
@@ -1484,6 +2549,12 @@ class Root(nn.Module):
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
+        # ---- (2) 입력/출력 스케일러 및 보정 레이어 배치 ----
+        # 0번째: 입력 정규화 Normal(standardize=True, skew=True, mode='norm')
+        self.input_norm = Normal(self.in_dim, standardize=True, skew=True, mode="norm")
+        # 마지막: 출력 역정규화 Normal(..., mode='denorm') + Affine 보정
+        self.output_denorm = Normal(self.out_dim, standardize=True, skew=True, mode="denorm")
+        self.output_affine = Affine(self.out_dim)
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
@@ -1553,6 +2624,10 @@ class Root(nn.Module):
             backend="inductor",
             disable=disable_compile,
         )
+        # 디바이스로 이동
+        self.input_norm = self.input_norm.to(self._device)
+        self.output_denorm = self.output_denorm.to(self._device)
+        self.output_affine = self.output_affine.to(self._device)
         self.__config = config
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
 
@@ -1602,11 +2677,36 @@ class Root(nn.Module):
             td_loss_weights = td_input.get("loss_weights", None)
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
+        device = self._device
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
+        # ---- (1.5) 출력 통계 누적 (denorm용) ----
+        if (
+            self.training
+            and labels_flat is not None
+            and not isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
+            and self.output_denorm.standardize
+        ):
+            target_stats = labels_flat.reshape(labels_flat.shape[0], -1)
+            bn = self.output_denorm.bn
+            stats_device = (
+                bn.running_mean.device
+                if isinstance(bn.running_mean, torch.Tensor)
+                else self._device
+            )
+            stats_dtype = (
+                bn.running_mean.dtype
+                if isinstance(bn.running_mean, torch.Tensor)
+                else target_stats.dtype
+            )
+            target_stats = target_stats.to(device=stats_device, dtype=stats_dtype)
+            self.output_denorm._accumulate_batch(target_stats)
+        # ---- (2) 입력 정규화 ----
+        norm_dtype = self.input_norm.bn.running_mean.dtype
+        features = features.to(device=device, dtype=norm_dtype)
+        features = self.input_norm(features)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
-        device = self._device
         amp_enabled = device.type != "cpu"
         base_param = next(self.local_net.parameters())
         base_dtype = self._base_dtype or base_param.dtype
@@ -1744,6 +2844,10 @@ class Root(nn.Module):
             else False
         )
         y_hat_out = y_hat
+        if not is_cls_loss:
+            y_hat_for_loss = self.output_affine(self.output_denorm(y_hat_out))
+        else:
+            y_hat_for_loss = y_hat_out
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
@@ -1760,12 +2864,16 @@ class Root(nn.Module):
             else:
                 controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
-            tgt = labels_flat.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
-            total = y_hat_out.new_tensor(0.0, dtype=y_hat_out.dtype)
+            tgt = labels_flat.to(
+                device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+            )
+            total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            y_top = y_hat_out
-            y_bot = assembled.to(device=y_hat_out.device, dtype=y_hat_out.dtype)
+            y_top = y_hat_for_loss
+            y_bot = assembled.to(
+                device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+            )
             if global_loss is not None:
                 top_component = global_loss(y_top, tgt)
                 total = total + weights[0] * top_component
@@ -1777,13 +2885,15 @@ class Root(nn.Module):
             loss_val = total
         elif net_loss is not None and labels_flat is not None:
             if is_cls_loss:
-                tgt = labels_flat.to(device=y_hat_out.device).long()
-                loss_val = net_loss(y_hat_out, tgt)
+                tgt = labels_flat.to(device=y_hat_for_loss.device).long()
+                loss_val = net_loss(y_hat_for_loss, tgt)
             else:
                 tgt = labels_flat.to(
-                    device=y_hat_out.device, dtype=y_hat_out.dtype
+                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
                 )
-                loss_val = net_loss(y_hat_out, tgt)
+                loss_val = net_loss(y_hat_for_loss, tgt)
+        # ---- (2) 출력 역정규화 + 보정 ----
+        y_hat_out = y_hat_for_loss
         pred = y_hat_out.reshape(b, *self.out_shape)
         if td_input is not None:
             out_td = td_input.clone()
