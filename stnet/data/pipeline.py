@@ -166,7 +166,7 @@ def fetch(
     batch_size: int,
     val_frac: float,
     non_blocking_copy: bool = True,
-    labels_dtype: Optional[torch.dtype] = torch.long,
+    labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = True,
     flatten_features: bool = True,
 ) -> Tuple[Any, Optional[Any], Disposable]:
