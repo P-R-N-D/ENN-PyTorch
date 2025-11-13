@@ -97,11 +97,12 @@ except ImportError:
 
 
 ignored_sentences = [
-    "External init callback must run in same thread as registerClient*",
-    "Initializing zero-element tensors is a no-op*",
-    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.*",
-    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
-    "TypedStorage is deprecated.*",
+    ".*External init callback must run in same thread as registerClient.*",
+    ".*Initializing zero-element tensors is a no-op.*",
+    ".*gpuGetDeviceCount failed with code.*",
+    ".*torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.*",
+    ".*torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
+    ".*TypedStorage is deprecated.*",
 ]
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 _DL_STATE_FILE = "dataloader.json"
