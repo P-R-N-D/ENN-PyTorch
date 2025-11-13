@@ -377,7 +377,6 @@ class RuntimeConfig:
     warmup_ratio: float = 0.0
     eta_min: float = 0.0
     seed: int = 42
-    prefetch_factor: Optional[int] = 1
     grad_accum_steps: int = 1
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
@@ -397,7 +396,6 @@ class RuntimeConfig:
         "warmup_ratio",
         "eta_min",
         "seed",
-        "prefetch_factor",
         "grad_accum_steps",
         "loss_tile_dim",
         "loss_tile_size",
@@ -410,7 +408,6 @@ class RuntimeConfig:
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "batch_size",
         "seed",
-        "prefetch_factor",
     )
 
     @staticmethod
@@ -443,7 +440,6 @@ class RuntimeConfig:
                 "warmup_ratio",
                 "eta_min",
                 "seed",
-                "prefetch_factor",
                 "grad_accum_steps",
                 "loss_tile_dim",
                 "loss_tile_size",
@@ -476,7 +472,6 @@ class RuntimeConfig:
                 warmup_ratio=float(kwargs.get("warmup_ratio", 0.0)),
                 eta_min=float(kwargs.get("eta_min", 0.0)),
                 seed=int(kwargs.get("seed", 42)),
-                prefetch_factor=kwargs.get("prefetch_factor", 1),
                 grad_accum_steps=int(kwargs.get("grad_accum_steps", 1)),
                 loss_tile_dim=kwargs.get("loss_tile_dim"),
                 loss_tile_size=kwargs.get("loss_tile_size"),
@@ -497,7 +492,6 @@ class RuntimeConfig:
             "model_ckpt_dir",
             "batch_size",
             "seed",
-            "prefetch_factor",
         }
         unsupported = set(kwargs) - allowed
         if unsupported:
@@ -515,7 +509,6 @@ class RuntimeConfig:
             keys=list(kwargs["keys"]),
             batch_size=batch_size,
             seed=int(kwargs.get("seed", 7)),
-            prefetch_factor=kwargs.get("prefetch_factor", 1),
         )
 
 

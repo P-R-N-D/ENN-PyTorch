@@ -1516,7 +1516,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 device=device,
                 batch_size=int(ops.batch_size or 128),
                 val_frac=float(ops.val_frac),
-                prefetch_factor=ops.prefetch_factor,
                 non_blocking_copy=non_blocking_copy,
                 flatten_features=True,
             )
@@ -1689,7 +1688,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             device=device,
             batch_size=int(ops.batch_size or 512),
             val_frac=0.0,
-            prefetch_factor=ops.prefetch_factor,
             non_blocking_copy=True,
         )
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)

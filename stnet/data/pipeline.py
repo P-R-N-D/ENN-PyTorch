@@ -8,7 +8,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
-from ..backend.system import get_tlb
+from ..backend.system import get_tlb, optimize_threads
 
 try:
     from torchdata.nodes import BaseNode, Loader as _Loader
@@ -124,15 +124,6 @@ def collate(
         return TensorDict({"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]}, batch_size=[])
     return sample
 
-def _default_threads(
-    dataloader_workers: Optional[int] = None, prefetch_factor: Optional[int] = None
-) -> Dict[str, int]:
-    ncpu = os.cpu_count() or 4
-    workers = int(dataloader_workers) if dataloader_workers is not None else max(1, ncpu // 2)
-    pfetch = int(prefetch_factor) if prefetch_factor is not None else 2
-    return {"dataloader_workers": workers, "prefetch_factor": pfetch}
-
-
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
     *args: Any,
@@ -174,18 +165,18 @@ def fetch(
     device: Union[str, torch.device],
     batch_size: int,
     val_frac: float,
-    *args: Any,
-    prefetch_factor: int = 2,
     non_blocking_copy: bool = True,
     labels_dtype: Optional[torch.dtype] = None,
-    sanitize: bool = False,
-    flatten_features: bool = False,
-    **kwargs: Any,
+    sanitize: bool = True,
+    flatten_features: bool = True,
 ) -> Tuple[Any, Optional[Any], Disposable]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
-    threads = _default_threads()
-    io_workers = max(1, int(threads.get("dataloader_workers", 2)))
-    prebatch = max(1, int(threads.get("prefetch_factor", 2)))
+
+    # Use system-level optimizer hints (sets torch threads as well)
+    hints = optimize_threads()
+    io_workers = max(1, int(hints.get("num_workers", 1)))
+    prebatch = max(1, int(hints.get("prebatch", max(1, io_workers * 2))))
+    pf_depth = max(1, int(hints.get("prefetch_factor", 1)))
 
     map_fn = partial(
         collate,
@@ -210,7 +201,7 @@ def fetch(
             node, length = _node_for(spec, split="train", shuffle=True)
             nodes_map[str(key)] = node
             lengths[str(key)] = length
-        _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = sum(lengths.values()) if lengths else None
     elif isinstance(sources, (list, tuple)):
         nodes_list: list[BaseNode] = []
@@ -218,14 +209,14 @@ def fetch(
         for spec in sources:
             node, length = _node_for(spec, split="train", shuffle=True)
             nodes_list.append(node); lengths.append(length)
-        _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = sum(lengths) if lengths else None
     else:
         node, length = _node_for(sources, split="train", shuffle=True)
-        _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+        _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
         train_length = length
 
-    train_loader = Loader(device=device_obj, node=mapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=train_length)
+    train_loader = Loader(device=device_obj, node=mapped, prefetch_factor=int(pf_depth), non_blocking=bool(non_blocking_copy), length=train_length)
 
     val_loader = None
     if float(val_frac) > 0.0:
@@ -235,7 +226,7 @@ def fetch(
             for key, spec in sources.items():
                 node, length = _node_for(spec, split="val", shuffle=False)
                 nodes_map[str(key)] = node; lengths[str(key)] = length
-            _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths.values()) if lengths else None
         elif isinstance(sources, (list, tuple)):
             nodes_list = []
@@ -243,12 +234,12 @@ def fetch(
             for spec in sources:
                 node, length = _node_for(spec, split="val", shuffle=False)
                 nodes_list.append(node); lengths.append(length)
-            _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = sum(lengths) if lengths else None
         else:
             node, length = _node_for(sources, split="val", shuffle=False)
-            _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(prefetch_factor), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
             val_len = length
-        val_loader = Loader(device=device_obj, node=vmapped, prefetch_factor=int(prefetch_factor), non_blocking=bool(non_blocking_copy), length=val_len)
+        val_loader = Loader(device=device_obj, node=vmapped, prefetch_factor=int(pf_depth), non_blocking=bool(non_blocking_copy), length=val_len)
 
     return (train_loader, val_loader, allocated)
