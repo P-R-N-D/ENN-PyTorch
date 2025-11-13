@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from copy import deepcopy
 import contextlib
+from copy import deepcopy
 import json
 import math
 import os
@@ -43,7 +43,13 @@ from ..functional.losses import LossWeightController, StandardNormalLoss, Studen
 from ..functional.optimizers import AdamW, SWALR, StochasticWeightAverage, stochastic_weight_average
 from ..model import Root
 from ..model.layers import StudentsT
-from .compat import cudagraph_step_end, is_meta_or_fake_tensor
+from .compat import (
+    cudagraph_step_end,
+    is_meta_or_fake_tensor,
+    torch_compile_disable,
+    torch_compile_safe,
+    torch_disable_dynamo,
+)
 from .distributed import (
     distributed_barrier,
     distributed_sync,
@@ -62,6 +68,8 @@ from .system import (
     posix_time,
 )
 from .profiler import FlopCounter
+
+torch_disable_dynamo()
 
 # -------- StudentsT pre-fit runtime options (no config/env added) --------
 # Default sample cap and input key for collecting training samples to fit t(df,loc,scale)
@@ -174,6 +182,9 @@ def _reduce_moments(
 
 
 @torch.no_grad()
+@torch_compile_disable(
+    reason="distributed collectives / history sync – run eager", recursive=True
+)
 def _reduce_metrics(layer: nn.Module) -> None:
     dist = torch.distributed
     if not (dist.is_available() and dist.is_initialized()):
@@ -260,6 +271,9 @@ def _reduce_metrics(layer: nn.Module) -> None:
 
 
 @torch.no_grad()
+@torch_compile_disable(
+    reason="post-step metric aggregation – run eager", recursive=True
+)
 def push_metrics(model: nn.Module, start_ns: int, end_ns: int) -> None:
     target = model
     while hasattr(target, "module"):
@@ -1721,3 +1735,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         torch.distributed.destroy_process_group()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
+
+
+torch_compile_safe(runtime_module=sys.modules[__name__])
