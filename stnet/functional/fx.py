@@ -241,6 +241,7 @@ class Gradient:
             )
         recognized_modes = {
             "default",
+            "aot_eager",
             "reduce-overhead",
             "max-autotune",
             "max-autotune-no-cudagraphs",
