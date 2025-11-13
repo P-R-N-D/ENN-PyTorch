@@ -234,14 +234,36 @@ class Gradient:
         compile_fn = getattr(torch, "compile", None)
         if compile_fn is None:
             return module
-        if normalized_mode == "max-autotune" and not _is_for_cuda(module):
-            mode = "max-autotune-no-cudagraphs"
-            normalized_mode = "max-autotune-no-cudagraphs"
+        normalized_alias = normalized_mode.replace("_", "-").replace(" ", "-")
+        if "-" in normalized_alias:
+            normalized_alias = "-".join(
+                part for part in normalized_alias.split("-") if part
+            )
+        recognized_modes = {
+            "default",
+            "reduce-overhead",
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }
+
+        canonical_mode = normalized_alias or normalized_mode
+        if canonical_mode == "max-autotune" and not _is_for_cuda(module):
+            canonical_mode = "max-autotune-no-cudagraphs"
+
+        backend_value = backend
+        mode_value: Optional[str] = None
+        if canonical_mode in {"aot_eager", "aot-eager"}:
+            backend_value = "aot_eager"
+        elif canonical_mode in recognized_modes:
+            mode_value = canonical_mode
+        elif mode is not None:
+            mode_value = str(mode)
+
         kwargs: Dict[str, Any] = {}
-        if backend is not None:
-            kwargs["backend"] = backend
-        if mode is not None:
-            kwargs["mode"] = mode
+        if backend_value is not None:
+            kwargs["backend"] = backend_value
+        if mode_value is not None:
+            kwargs["mode"] = mode_value
         if fullgraph is not None:
             kwargs["fullgraph"] = bool(fullgraph)
         if dynamic is not None:
