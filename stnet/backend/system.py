@@ -597,7 +597,7 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         "intra_ops": int(max(1, intra_ops)),
         "inter_ops": int(max(1, inter_ops)),
         "num_workers": int(max(1, num_workers)),
-        "max_concurrancy": int(max(1, max_concurrancy)),
+        "max_concurrancy": int(max(1, max_concurrancy, num_workers)),
     }
 
 
