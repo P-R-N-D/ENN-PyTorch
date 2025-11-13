@@ -508,20 +508,22 @@ class Connector:
 
             _t = optimal_threads()
         except Exception:
-            _t = {"num_workers": 1, "max_concurrancy": 2}
-        self.io_workers = (
-            int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
-        )
+            _t = {"num_workers": 1, "max_concurrancy": 1, "prebatch": 2, "prefetch_factor": 1}
+
+        # Respect explicit overrides, otherwise use optimal_threads() hints
+        self.io_workers = int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
         self.io_workers = max(1, self.io_workers)
-        self.prebatch = (
-            int(prebatch) if prebatch is not None else max(1, self.io_workers * 2)
-        )
+
+        # Default: use hint; fallback to 2 * workers
+        self.prebatch = int(prebatch) if prebatch is not None else int(_t.get("prebatch", max(1, self.io_workers * 2)))
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
-        prefetch = int(prefetch_factor) if prefetch_factor is not None else 2
+
+        # Prefetcher depth for CPU/GPU stages
+        pf = int(prefetch_factor) if prefetch_factor is not None else int(_t.get("prefetch_factor", 1))
         with suppress(Exception):
-            prefetch = max(1, int(prefetch))
-        self._prefetch_factor = prefetch
+            pf = max(1, int(pf))
+        self._prefetch_factor = pf
         self.prefetch_factor = self._prefetch_factor
         self.device = (
             device if isinstance(device, torch.device) else torch.device(device)
@@ -532,12 +534,8 @@ class Connector:
         )
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
-        base_concurrency = int(
-            _t.get("max_concurrancy", max(2, self.io_workers))
-        )
-        self.max_concurrancy = max(
-            1, min(base_concurrency, self.io_workers)
-        )
+        # Requirement: max_concurrancy == num_workers (safe & predictable)
+        self.max_concurrancy = max(1, int(self.io_workers))
         try:
             get_tlb(io_workers=self.io_workers)
         except Exception:

@@ -87,7 +87,6 @@ def train(
     max_nodes: int = 1,
     rdzv_backend: Optional[str] = "c10d",
     rdzv_endpoint: Optional[str] = None,
-    prefetch_factor: Optional[int] = 1,
     grad_accum_steps: int = 1,
     loss_tile_dim: Optional[int] = None,
     loss_tile_size: Optional[int] = None,
@@ -263,7 +262,6 @@ def train(
             "warmup_ratio": warmup_ratio,
             "eta_min": eta_min,
             "seed": seed,
-            "prefetch_factor": prefetch_factor,
             "grad_accum_steps": grad_accum_steps,
             "loss_tile_dim": loss_tile_dim,
             "loss_tile_size": loss_tile_size,
@@ -315,7 +313,6 @@ def predict(
     *args: Any,
     batch_size: int = 512,
     seed: int = 7,
-    prefetch_factor: Optional[int] = 1,
     mode: OpsMode = "predict",
     max_nodes: Optional[int] = None,
     rdzv_backend: Optional[str] = None,
@@ -381,7 +378,6 @@ def predict(
     default_kwargs = {
         "batch_size": batch_size,
         "seed": seed,
-        "prefetch_factor": prefetch_factor,
     }
     positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
     for key in list(default_kwargs):

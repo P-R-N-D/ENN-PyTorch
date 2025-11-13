@@ -183,6 +183,26 @@ def is_scale_safe(
     return max_abs <= float(info.max)
 
 
+def _is_for_cuda(module: nn.Module) -> bool:
+    try:
+        for tensor in module.parameters():
+            if getattr(tensor, "device", None) is None:
+                continue
+            if tensor.device.type == "cuda":
+                return True
+    except Exception:
+        pass
+    try:
+        for tensor in module.buffers():
+            if getattr(tensor, "device", None) is None:
+                continue
+            if tensor.device.type == "cuda":
+                return True
+    except Exception:
+        pass
+    return False
+
+
 class Gradient:
     @staticmethod
     def inference(model: torch.nn.Module) -> AbstractContextManager[None]:
@@ -214,6 +234,9 @@ class Gradient:
         compile_fn = getattr(torch, "compile", None)
         if compile_fn is None:
             return module
+        if normalized_mode == "max-autotune" and not _is_for_cuda(module):
+            mode = "max-autotune-no-cudagraphs"
+            normalized_mode = "max-autotune-no-cudagraphs"
         kwargs: Dict[str, Any] = {}
         if backend is not None:
             kwargs["backend"] = backend

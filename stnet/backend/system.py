@@ -534,12 +534,16 @@ def num_accelerators() -> int:
         import torch
     except Exception:
         return 0
-    # CUDA
-    try:
-        if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
-            return int(torch.cuda.device_count()) or 0
-    except Exception:
-        pass
+
+    # CUDA first (respecting missing attributes and availability checks)
+    cuda_iface = getattr(torch, "cuda", None)
+    if cuda_iface is not None:
+        try:
+            if cuda_iface.is_available():
+                return int(cuda_iface.device_count()) or 0
+        except Exception:
+            pass
+
     # Intel XPU (native XPU / IPEX)
     try:
         xpu = getattr(torch, "xpu", None)
@@ -548,6 +552,7 @@ def num_accelerators() -> int:
             return max(count, 1)
     except Exception:
         pass
+
     # Apple MPS
     try:
         mps = getattr(getattr(torch, "backends", None), "mps", None)
@@ -555,19 +560,25 @@ def num_accelerators() -> int:
             return 1
     except Exception:
         pass
+
     # Vulkan (prototype/unstable)
     try:
         if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
             return 1
     except Exception:
         pass
+
     return 0
 
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
-    """Heuristics for CPU/GPU threading & mapper parallelism (no env-vars).
-    Returns keys for ParallelMapper(method='threads'):
-      - "intra_ops", "inter_ops", "num_workers", "max_concurrancy"
+    """Heuristics for CPU/GPU threading & datapipe parallelism (no env vars).
+    Returns:
+      - intra_ops, inter_ops: torch CPU thread hints
+      - num_workers: ParallelMapper.num_workers
+      - max_concurrancy: == num_workers (safety constraint)
+      - prebatch: items grouped per map call (helps tiny samples)
+      - prefetch_factor: queue depth for CPU/GPU prefetchers
     """
     ncpu = cpu_count()
     try:
@@ -575,12 +586,10 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         has_cuda = getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
     except Exception:
         has_cuda = False
-    nacc = num_accelerators()
-
     if ncpu <= 2:
         inter_ops = 1
         intra_ops = max(1, ncpu - inter_ops)
-        num_workers = max(1, ncpu)
+        num_workers = max(1, ncpu)           # small CPU: keep all busy
     elif ncpu <= 8:
         inter_ops = max(1, ncpu // 4)
         intra_ops = max(1, ncpu - inter_ops)
@@ -590,19 +599,27 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         intra_ops = max(1, ncpu - inter_ops)
         num_workers = max(4, min(16, ncpu // 2))
 
-    # no environment-variable overrides; compute directly
-    max_concurrancy = (nacc * 2) if (nacc > 0 and has_cuda) else max(2, num_workers)
+    # Requirement: cap to workers: max_concurrancy == num_workers
+    max_concurrancy = int(max(1, num_workers))
+
+    # Heuristics:
+    # - prebatch: 2 * workers (helps tiny samples; bounded by memory in higher layers)
+    # - prefetch_factor: a small fixed depth; 2 on CUDA, 1 on CPU-only
+    prebatch = max(2, num_workers * 2)
+    prefetch_factor = 2 if has_cuda else 1
 
     return {
         "intra_ops": int(max(1, intra_ops)),
         "inter_ops": int(max(1, inter_ops)),
         "num_workers": int(max(1, num_workers)),
-        "max_concurrancy": int(max(1, max_concurrancy, num_workers)),
+        "max_concurrancy": int(max(1, max_concurrancy)),
+        "prebatch": int(max(1, prebatch)),
+        "prefetch_factor": int(max(1, prefetch_factor)),
     }
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
-    """Apply thread hints via PyTorch APIs only (no env-vars)."""
+    """Apply thread hints via PyTorch APIs only (no env vars)."""
     threads = optimal_threads()
     try:
         import torch
@@ -615,6 +632,7 @@ def optimize_threads() -> Dict[str, Union[int, bool]]:
             torch.set_num_interop_threads(int(threads["inter_ops"]))
     except Exception:
         pass
+    # Also return extended hints (prebatch, prefetch_factor, etc.)
     return threads
 
 
