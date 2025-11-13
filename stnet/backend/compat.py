@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from contextlib import contextmanager
+import importlib
+from contextlib import contextmanager, suppress
 from functools import partial
 from typing import Any, Iterator
 
@@ -17,6 +18,31 @@ try:
     from torch._subclasses.fake_tensor import FakeTensor
 except Exception:
     FakeTensor = tuple()
+
+try:
+    from torch import compiler as _TORCH_COMPILER
+except Exception:
+    _TORCH_COMPILER = None
+
+try:
+    import torch._dynamo as _TORCH_DYNAMO
+except Exception:
+    _TORCH_DYNAMO = None
+
+_TORCH_COMPILE_DISABLE = None
+if _TORCH_COMPILER is not None:
+    _TORCH_COMPILE_DISABLE = getattr(_TORCH_COMPILER, "disable", None)
+if _TORCH_COMPILE_DISABLE is None and _TORCH_DYNAMO is not None:
+    _TORCH_COMPILE_DISABLE = getattr(_TORCH_DYNAMO, "disable", None)
+
+_COLLECTIVE_NAMES: tuple[str, ...] = (
+    "all_gather",
+    "all_gather_into_tensor",
+    "all_reduce",
+    "reduce_scatter_tensor",
+    "broadcast",
+    "barrier",
+)
 
 
 if hasattr(nn, "RMSNorm"):
@@ -145,6 +171,7 @@ class TorchCompat:
         self._coerce_nanmin()
         self._coerce_nanmax()
         self._coerce_nansum()
+        torch_disable_dynamo()
 
     def _coerce_rmsnorm(self) -> None:
         global RMSNorm
@@ -205,7 +232,7 @@ def patch_torch(
 
 
 def cudagraph_step_end() -> None:
-    mark_step = getattr(getattr(torch, "compiler", None), "cudagraph_mark_step_end", None)
+    mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
     if callable(mark_step):
         mark_step()
 
@@ -232,3 +259,119 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
 
 
+def torch_compile_disable(
+    *, reason: str | None = None, recursive: bool = True
+):
+
+    if _TORCH_COMPILE_DISABLE is None:
+        def _identity(fn: Any) -> Any:
+            return fn
+
+        return _identity
+
+    kwargs: dict[str, Any] = {}
+    if reason is not None:
+        kwargs["reason"] = reason
+    if recursive is not None:
+        kwargs["recursive"] = recursive
+
+    attempts = [kwargs]
+    if "reason" in kwargs:
+        attempts.append({k: v for k, v in kwargs.items() if k != "recursive"})
+    if "recursive" in kwargs:
+        attempts.append({k: v for k, v in kwargs.items() if k != "reason"})
+    attempts.append({})
+
+    for opts in attempts:
+        try:
+            return _TORCH_COMPILE_DISABLE(**opts)
+        except TypeError:
+            continue
+
+    def _identity(fn: Any) -> Any:
+        return fn
+
+    return _identity
+
+
+def torch_disable_dynamo(
+    *, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
+) -> bool:
+
+    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
+        return False
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return False
+
+    disallow = getattr(_TORCH_DYNAMO, "disallow_in_graph", None)
+    if disallow is None:
+        return False
+
+    updated = False
+    for name in collectives:
+        fn = getattr(dist, name, None)
+        if fn is None:
+            continue
+        with suppress(Exception):
+            disallow(fn)
+            updated = True
+    return updated
+
+
+def torch_disable_compile(
+    target: Any,
+    attr: str,
+    *,
+    reason: str | None = None,
+    recursive: bool = True,
+) -> bool:
+
+    if target is None or not hasattr(target, attr):
+        return False
+    fn = getattr(target, attr)
+    decorator = torch_compile_disable(reason=reason, recursive=recursive)
+    try:
+        wrapped = decorator(fn)
+    except Exception:
+        return False
+    setattr(target, attr, wrapped)
+    return True
+
+
+def torch_compile_safe(
+    *,
+    runtime_module: Any | None = None,
+    layers_module: Any | None = None,
+) -> None:
+
+    if layers_module is None:
+        with suppress(Exception):
+            layers_module = importlib.import_module("stnet.model.layers")
+    if layers_module is not None:
+        torch_disable_compile(
+            getattr(layers_module, "Normal", None),
+            "commit_training_success",
+            reason="history/BN sync – eager",
+        )
+        torch_disable_compile(
+            getattr(layers_module, "StudentsT", None),
+            "commit_training_success",
+            reason="history – eager",
+        )
+
+    if runtime_module is None:
+        with suppress(Exception):
+            runtime_module = importlib.import_module("stnet.backend.runtime")
+    if runtime_module is not None:
+        torch_disable_compile(
+            runtime_module,
+            "push_metrics",
+            reason="metric aggregation – eager",
+        )
+        torch_disable_compile(
+            runtime_module,
+            "_reduce_metrics",
+            reason="distributed collectives – eager",
+        )
