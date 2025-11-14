@@ -23,12 +23,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict, TensorDictBase
+
 with contextlib.suppress(Exception):
-    import numpy as _np  # for offline fit helpers
+    import numpy as _np
 with contextlib.suppress(Exception):
-    import scipy.stats as _sps  # optional
+    import scipy.stats as _sps
 with contextlib.suppress(Exception):
-    from scipy.special import inv_boxcox as _inv_boxcox  # optional
+    from scipy.special import inv_boxcox as _inv_boxcox
 try:
     from torch.utils.checkpoint import checkpoint as activation_checkpoint
 except Exception:
@@ -74,22 +75,22 @@ if TYPE_CHECKING:
 
 LayerNorm = nn.LayerNorm
 
-# ---------------------------------------------------------------------------
-#  Scaling layers (Normal / StudentsT) and corrective Affine
-#
+
 _NORM_MODES = {"norm", "normalize", "normalization"}
 _DENORM_MODES = {"denorm", "denormalize", "denormalization"}
 
-# 고정 길이(UTF-8) 문자열 버퍼 길이
+
 _LEN_OS, _LEN_KERNEL, _LEN_ARCH, _LEN_ACCEL, _LEN_TZ = 96, 96, 32, 256, 32
-_LEN_CPU = 2048  # CPU per-core name list (0:name;1:name;...) 고정 길이
+_LEN_CPU = 2048
 
 
 def _get_device_from(module: nn.Module) -> str:
     try:
         dev = next((p.device for p in module.parameters() if p is not None), None)
         if dev is None:
-            dev = next((b.device for _, b in module.named_buffers()), torch.device("cpu"))
+            dev = next(
+                (b.device for _, b in module.named_buffers()), torch.device("cpu")
+            )
         return str(getattr(dev, "type", "cpu"))
     except Exception:
         return "cpu"
@@ -105,7 +106,6 @@ def _fixed_bytes(s: str, L: int) -> torch.Tensor:
 
 @torch.jit.ignore
 def _as_utf8(row: torch.Tensor) -> str:
-    """1D uint8 제로패딩 → UTF-8 문자열"""
     if not isinstance(row, torch.Tensor) or row.dtype != torch.uint8 or row.dim() != 1:
         raise TypeError("expected 1D torch.uint8 tensor")
     data = bytes(row.detach().cpu().tolist())
@@ -115,7 +115,6 @@ def _as_utf8(row: torch.Tensor) -> str:
 
 @torch.jit.ignore
 def _as_utf8_list(col: torch.Tensor) -> list[str]:
-    """[T, L] uint8 → 문자열 리스트"""
     if not isinstance(col, torch.Tensor) or col.dtype != torch.uint8 or col.dim() != 2:
         raise TypeError("expected [T, L] torch.uint8 tensor")
     return [_as_utf8(col[i]) for i in range(col.shape[0])]
@@ -128,10 +127,10 @@ def _get_sys_info(tz_name: Optional[str]) -> Tuple[str, str, str, str, str, str]
     return os_name, kernel, arch, accel, tzlabel, cpu_label
 
 
-
 @torch.jit.ignore
-def _accumulate_moments(x: torch.Tensor) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """배치에 대한 (N, mean, M2, M3) – dtype=float64."""
+def _accumulate_moments(
+    x: torch.Tensor,
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     x64 = x.to(dtype=torch.float64)
     n = int(x64.shape[0])
     if n == 0:
@@ -146,37 +145,44 @@ def _accumulate_moments(x: torch.Tensor) -> tuple[int, torch.Tensor, torch.Tenso
 
 
 @torch.jit.ignore
-def _reduce_moments(n1, m1, M2_1, M3_1, n2, m2, M2_2, M3_2):
-    """
-    Pébay(2008) 결합 공식: 두 집합의 (N, mean, M2, M3) 병합.  (벡터화)
-    참조: Chan/Welford의 병렬 알고리즘 및 Pébay 공식. 
-    """
+def _reduce_moments(
+    n1: int,
+    m1: torch.Tensor,
+    M2_1: torch.Tensor,
+    M3_1: torch.Tensor,
+    n2: int,
+    m2: torch.Tensor,
+    M2_2: torch.Tensor,
+    M3_2: torch.Tensor,
+) -> tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
     if n1 == 0:
         return (n2, m2, M2_2, M3_2)
     if n2 == 0:
         return (n1, m1, M2_1, M3_1)
     n = n1 + n2
     delta = m2 - m1
-    n1f = float(n1); n2f = float(n2); nf = float(n)
+    n1f = float(n1)
+    n2f = float(n2)
+    nf = float(n)
     m = m1 + delta * (n2f / nf)
     M2 = M2_1 + M2_2 + (delta * delta) * (n1f * n2f / nf)
-    M3 = (M3_1 + M3_2
-          + (delta * delta * delta) * (n1f * n2f * (n1f - n2f) / (nf * nf))
-          + 3.0 * delta * (n1f * M2_2 - n2f * M2_1) / nf)
+    M3 = (
+        M3_1
+        + M3_2
+        + (delta * delta * delta) * (n1f * n2f * (n1f - n2f) / (nf * nf))
+        + 3.0 * delta * (n1f * M2_2 - n2f * M2_1) / nf
+    )
     return (int(n), m, M2, M3)
 
 
-def _sample_skewness(N: int, M2: torch.Tensor, M3: torch.Tensor, eps: float) -> torch.Tensor:
-    """표본 왜도 γ1 (Pearson)."""
+def _sample_skewness(
+    N: int, M2: torch.Tensor, M3: torch.Tensor, eps: float
+) -> torch.Tensor:
     M2s = M2.clamp_min(eps)
-    return (math.sqrt(max(N, 1)) * M3) / (M2s.sqrt() * M2s)  # sqrt(N)*M3 / M2^(3/2)
+    return (math.sqrt(max(N, 1)) * M3) / (M2s.sqrt() * M2s)
 
 
 def _skew_normal_delta(gamma1: torch.Tensor) -> torch.Tensor:
-    """
-    SN의 왜도 γ1 -> δ 근사 역변환 (단조함수 근사, |γ1|<=~0.9953).
-    δ = sign(γ1) * sqrt( (π/2)*a / (a + c) ), a=|γ1|^{2/3}, c=((4-π)/2)^{2/3}
-    """
     c = ((4.0 - math.pi) / 2.0) ** (2.0 / 3.0)
     a = gamma1.abs().clamp_max(0.9952717464).pow(2.0 / 3.0)
     num = (math.pi / 2.0) * a
@@ -185,11 +191,9 @@ def _skew_normal_delta(gamma1: torch.Tensor) -> torch.Tensor:
     return delta.copysign(gamma1)
 
 
-def _skew_normal_vars(mu: torch.Tensor, var: torch.Tensor, gamma1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    표본 (μ, var, γ1)로부터 SN(ξ, ω, α)의 (ξ, ω, α) 방법추정.
-    μ = ξ + ω δ sqrt(2/π),  var = ω^2 (1 - 2δ^2/π),  α = δ / sqrt(1-δ^2).
-    """
+def _skew_normal_vars(
+    mu: torch.Tensor, var: torch.Tensor, gamma1: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     delta = _skew_normal_delta(gamma1).clamp(-0.999999, 0.999999)
     one = var.new_tensor(1.0)
     omega = (var / (one - 2.0 * delta * delta / math.pi).clamp_min(1e-12)).sqrt()
@@ -199,42 +203,45 @@ def _skew_normal_vars(mu: torch.Tensor, var: torch.Tensor, gamma1: torch.Tensor)
 
 
 class Affine(nn.Module):
-    """출력 보정용 간단 Affine: y = x * weight + bias"""
-
-    def __init__(self, n_features: int, init_weight: float = 1.0, init_bias: float = 0.0) -> None:
+    def __init__(
+        self, n_features: int, init_weight: float = 1.0, init_bias: float = 0.0
+    ) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.full((int(n_features),), float(init_weight)))
         self.bias = nn.Parameter(torch.full((int(n_features),), float(init_bias)))
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * self.weight.view(1, -1) + self.bias.view(1, -1)
 
 
-# ---------------------------------------------------------------------------
-# Optional Nonlinear Power Transform (Yeo–Johnson / Box–Cox)
-# ---------------------------------------------------------------------------
 class PowerTransform(nn.Module):
-    """
-    Optional per-feature power transform with inverse:
-      - method: 'yeojohnson' (x∈R), 'boxcox' (x>0; shift로 양수화)
-      - mask: bool[D] (True인 feature에만 적용)
-      - lmbda, shift: per-feature buffers (학습셋 오프라인 추정 또는 외부 주입)
-    """
-
-    def __init__(self, n_features: int, method: str = "yeojohnson",
-                 mask: Optional[torch.Tensor] = None, eps: float = 1e-6) -> None:
+    def __init__(
+        self,
+        n_features: int,
+        method: str = "yeojohnson",
+        mask: Optional[torch.Tensor] = None,
+        eps: float = 1e-6,
+    ) -> None:
         super().__init__()
         self.n_features = int(n_features)
         self.method = str(method or "yeojohnson").lower()
         if self.method not in ("yeojohnson", "boxcox"):
             raise ValueError("method must be 'yeojohnson' or 'boxcox'")
         self.eps = float(eps)
-        m = torch.ones(self.n_features, dtype=torch.bool) if mask is None else torch.as_tensor(mask, dtype=torch.bool)
+        m = (
+            torch.ones(self.n_features, dtype=torch.bool)
+            if mask is None
+            else torch.as_tensor(mask, dtype=torch.bool)
+        )
         self.register_buffer("mask", m, persistent=True)
-        self.register_buffer("lmbda", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("shift", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)  # boxcox용
+        self.register_buffer(
+            "lmbda", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "shift", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
 
-    # ---------- torch-formula transforms (autograd-friendly) ----------
-    def _bc(self, x, v):  # broadcast [D] -> [1, D]
+    def _bc(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         return v.view(1, -1).to(dtype=x.dtype, device=x.device).expand_as(x)
 
     def _yj(self, x: torch.Tensor) -> torch.Tensor:
@@ -298,7 +305,6 @@ class PowerTransform(nn.Module):
         )
         return z - self._bc(y, self.shift.to(y.dtype))
 
-    # ---------- public API ----------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not bool(self.mask.any()):
             return x
@@ -330,7 +336,9 @@ class PowerTransform(nn.Module):
                 sh = sh.expand_as(self.shift)
             self.shift.copy_(sh)
         if mask is not None:
-            self.mask.copy_(torch.as_tensor(mask, dtype=torch.bool, device=self.mask.device))
+            self.mask.copy_(
+                torch.as_tensor(mask, dtype=torch.bool, device=self.mask.device)
+            )
 
     @torch.no_grad()
     def fit_params_numpy(
@@ -338,12 +346,7 @@ class PowerTransform(nn.Module):
         X: "np.ndarray",
         boxcox_shift: str = "auto",
     ) -> Tuple["np.ndarray", "np.ndarray"]:
-        """
-        SciPy를 이용해 λ(및 Box–Cox shift)를 오프라인 추정.
-        - yeojohnson: stats.yeojohnson(x, lmbda=None)
-        - boxcox: stats.boxcox_normmax(x+shift)
-        반환: (lambda[D], shift[D])
-        """
+
         if _sps is None:
             raise RuntimeError("SciPy가 필요합니다: pip install scipy")
         X = _np.asarray(X, dtype=_np.float64)
@@ -369,18 +372,7 @@ class PowerTransform(nn.Module):
         return lam, shf
 
 
-# ---------------------------------------------------------------------------
-# Normal (BatchNorm 기반 스케일러/역스케일러)
-# ---------------------------------------------------------------------------
 class Normal(nn.Module):
-    """
-    Normal(standardize, skew, mode) – BatchNorm 기반 스케일러/역정규화기.
-      - mode in {'norm','normalize','normalization'} → 정규화
-      - mode in {'denorm','denormalize','denormalization'} → 역정규화
-    훈련: 배치 통계/BN 러닝통계 사용 + 임시(staged) 누산
-    추론: 커밋된 누산 통계(전역, SN 방법추정)를 사용
-    """
-
     def __init__(
         self,
         n_features: int,
@@ -418,8 +410,10 @@ class Normal(nn.Module):
                 mask=power_mask,
                 eps=self.eps,
             )
-        # ---- staged(훈련 중) 누산치 (float64) ----
-        self.register_buffer("stg_count", torch.tensor(0, dtype=torch.long), persistent=True)
+
+        self.register_buffer(
+            "stg_count", torch.tensor(0, dtype=torch.long), persistent=True
+        )
         self.register_buffer(
             "stg_mean",
             torch.zeros(self.n_features, dtype=torch.float64),
@@ -435,8 +429,10 @@ class Normal(nn.Module):
             torch.zeros(self.n_features, dtype=torch.float64),
             persistent=True,
         )
-        # ---- committed(커밋된 전역) 누산치 (float64) ----
-        self.register_buffer("gs_count", torch.tensor(0, dtype=torch.long), persistent=True)
+
+        self.register_buffer(
+            "gs_count", torch.tensor(0, dtype=torch.long), persistent=True
+        )
         self.register_buffer(
             "gs_mean",
             torch.zeros(self.n_features, dtype=torch.float64),
@@ -452,34 +448,75 @@ class Normal(nn.Module):
             torch.zeros(self.n_features, dtype=torch.float64),
             persistent=True,
         )
-        # ---- 메타: 마지막 학습 시작/종료(ns), 누적 훈련 횟수(len(history)) ----
-        self.register_buffer("last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("train_runs", torch.tensor(0, dtype=torch.long), persistent=True)
-        # ---- history (증분 append; 텐서 버퍼로 저장) ----
-        self._hist_maxlen = 2000  # 선택: 상한
-        self.register_buffer("hist_step", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("hist_seen", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True)
+
+        self.register_buffer(
+            "last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "train_runs", torch.tensor(0, dtype=torch.long), persistent=True
+        )
+
+        self._hist_maxlen = 2000
+        self.register_buffer(
+            "hist_step", torch.empty(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "hist_seen", torch.empty(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True
+        )
         self.register_buffer(
             "hist_device_code",
             torch.empty(0, dtype=torch.int8),
             persistent=True,
-        )  # 0=cpu,1=cuda,2=mps,3=xpu,4=vulkan
-        self.register_buffer("hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True)
-        self.register_buffer("hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_kernel", torch.empty(0, _LEN_KERNEL, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True)
-        # (추정치 보관 버퍼) stats.t.fit 결과: df, loc, scale
-        self.register_buffer("t_df",    torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
-        self.register_buffer("t_loc",   torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
-        self.register_buffer("t_scale", torch.full((self.n_features,), float("nan"), dtype=torch.float64), persistent=True)
+        )
+        self.register_buffer(
+            "hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True
+        )
+        self.register_buffer(
+            "hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_kernel",
+            torch.empty(0, _LEN_KERNEL, dtype=torch.uint8),
+            persistent=True,
+        )
+        self.register_buffer(
+            "hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True
+        )
 
-    # ---------------------- 내부 유틸 ----------------------
+        self.register_buffer(
+            "t_df",
+            torch.full((self.n_features,), float("nan"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "t_loc",
+            torch.full((self.n_features,), float("nan"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "t_scale",
+            torch.full((self.n_features,), float("nan"), dtype=torch.float64),
+            persistent=True,
+        )
+
     @staticmethod
     def _encode_device(t: str) -> int:
         m = {"cpu": 0, "cuda": 1, "mps": 2, "xpu": 3, "vulkan": 4}
@@ -487,7 +524,6 @@ class Normal(nn.Module):
 
     @torch.no_grad()
     def _accumulate_batch(self, x: torch.Tensor) -> None:
-        """훈련 배치 → staged 누산 (BN 전 입력 기준)."""
         n2, m2, M2_2, M3_2 = _accumulate_moments(x)
         n1 = int(self.stg_count.item())
         n, m, M2, M3 = _reduce_moments(
@@ -507,7 +543,6 @@ class Normal(nn.Module):
 
     @torch.no_grad()
     def _commit_moments(self) -> None:
-        """staged → committed 전환(누산 병합)."""
         n2 = int(self.stg_count.item())
         if n2 <= 0:
             return
@@ -526,16 +561,14 @@ class Normal(nn.Module):
         self.gs_mean.copy_(m)
         self.gs_M2.copy_(M2)
         self.gs_M3.copy_(M3)
-        # reset staged
+
         self.stg_count.zero_()
         self.stg_mean.zero_()
         self.stg_M2.zero_()
         self.stg_M3.zero_()
 
-    # ---------------------- 공개 API ----------------------
     @torch.no_grad()
     def export_history(self) -> TensorDict:
-        """TensorDict(batch_size=[T])로 스냅샷 내보내기 (History[n] 인덱싱 가능)."""
         T = int(self.hist_step.numel())
         return TensorDict(
             {
@@ -558,7 +591,6 @@ class Normal(nn.Module):
     @torch.jit.ignore
     @torch.no_grad()
     def export_history_text(self) -> list[dict[str, object]]:
-        """히스토리를 문자열/스칼라 dict의 리스트로 복원."""
         T = int(self.hist_step.numel())
         dev_map = {0: "cpu", 1: "cuda", 2: "mps", 3: "xpu", 4: "vulkan"}
         out: list[dict[str, object]] = []
@@ -569,7 +601,9 @@ class Normal(nn.Module):
                     "seen": int(self.hist_seen[i].item()),
                     "t_start_ns": int(self.hist_start_ns[i].item()),
                     "t_end_ns": int(self.hist_end_ns[i].item()),
-                    "device": dev_map.get(int(self.hist_device_code[i].item()), "unknown"),
+                    "device": dev_map.get(
+                        int(self.hist_device_code[i].item()), "unknown"
+                    ),
                     "world_size": int(self.hist_world_size[i].item()),
                     "os": _as_utf8(self.hist_os[i]),
                     "kernel": _as_utf8(self.hist_kernel[i]),
@@ -589,13 +623,19 @@ class Normal(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> None:
         if self.pt is None:
-            raise RuntimeError("power transform이 활성화되어 있지 않습니다 (power=None).")
+            raise RuntimeError(
+                "power transform이 활성화되어 있지 않습니다 (power=None)."
+            )
         self.pt.set_params(lmbda, shift, mask)
 
     @torch.no_grad()
-    def fit_power_params_numpy(self, X: "np.ndarray", boxcox_shift: str = "auto"):
+    def fit_power_params_numpy(
+        self, X: "np.ndarray", boxcox_shift: str = "auto"
+    ) -> Tuple["np.ndarray", "np.ndarray"]:
         if self.pt is None:
-            raise RuntimeError("power transform이 활성화되어 있지 않습니다 (power=None).")
+            raise RuntimeError(
+                "power transform이 활성화되어 있지 않습니다 (power=None)."
+            )
         return self.pt.fit_params_numpy(X, boxcox_shift=boxcox_shift)
 
     @torch.no_grad()
@@ -605,22 +645,16 @@ class Normal(nn.Module):
         end_ns: int | None = None,
         tz_name: str | None = "GMT",
     ) -> None:
-        """
-        (5) 조건: 훈련이 '성공적으로' 끝나는 시점에만 누산/히스토리 커밋.
-        - staged 누산을 committed 반영
-        - 마지막 학습 시작/종료(ns) 및 누적 훈련 횟수 갱신
-        - 히스토리(증분) append
-        - 추론 스케일 고정을 위해 BN 러닝통계를 커밋값(SN 보정)으로 동기화
-        """
+
         self._commit_moments()
-        # 메타 업데이트
+
         s = int(start_ns if start_ns is not None else posix_time(tz_name))
         e = int(end_ns if end_ns is not None else posix_time(tz_name))
         self.last_train_start_ns.fill_(s)
         self.last_train_end_ns.fill_(e)
         runs = int(self.train_runs.item()) + 1
         self.train_runs.fill_(runs)
-        # history append
+
         dev_code = torch.tensor(
             [self._encode_device(_get_device_from(self))],
             dtype=torch.int8,
@@ -632,7 +666,9 @@ class Normal(nn.Module):
             device=self.hist_world_size.device,
         )
         step = torch.tensor([runs - 1], dtype=torch.long, device=self.hist_step.device)
-        seen = torch.tensor([int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device)
+        seen = torch.tensor(
+            [int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device
+        )
         self.hist_step = torch.cat([self.hist_step, step], dim=0)[-self._hist_maxlen :]
         self.hist_seen = torch.cat([self.hist_seen, seen], dim=0)[-self._hist_maxlen :]
         self.hist_start_ns = torch.cat(
@@ -652,7 +688,9 @@ class Normal(nn.Module):
         self.hist_device_code = torch.cat([self.hist_device_code, dev_code], dim=0)[
             -self._hist_maxlen :
         ]
-        self.hist_world_size = torch.cat([self.hist_world_size, ws], dim=0)[-self._hist_maxlen :]
+        self.hist_world_size = torch.cat([self.hist_world_size, ws], dim=0)[
+            -self._hist_maxlen :
+        ]
         os_name, kernel, arch, accel, tzlabel, cpu_label = _get_sys_info(tz_name)
         self.hist_os = torch.cat(
             [
@@ -708,7 +746,7 @@ class Normal(nn.Module):
             ],
             dim=0,
         )[-self._hist_maxlen :]
-        # 추론용 스케일 고정 (SN 방법추정)
+
         N = int(self.gs_count.item())
         if N > 0:
             mu = self.gs_mean.to(dtype=torch.float64)
@@ -775,7 +813,7 @@ class Normal(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.standardize:
-            return x  # no-op
+            return x
         bn_dtype = (
             self.bn.running_mean.dtype
             if isinstance(self.bn.running_mean, torch.Tensor)
@@ -814,14 +852,6 @@ class Normal(nn.Module):
 
 
 class StudentsT(nn.Module):
-    """
-    StudentsT(standardize, mode) – Normal에 의존하지 않는 독립 모듈.
-      - 학습: 배치통계/러닝통계(BN) 사용 + 누산/커밋/히스토리
-      - 추론: 커밋된 전역 통계 사용
-      - t-분포 자체의 ν·loc·scale 추정은 SciPy의 ``stats.t.fit``로 오프라인 지원(선택)
-        (추정치가 있다면 unit-variance 표준화를 위해 √((ν-2)/ν) 팩터 적용 가능; ν>2 필요)
-    """
-
     def __init__(
         self,
         n_features: int,
@@ -846,31 +876,83 @@ class StudentsT(nn.Module):
             eps=float(eps),
             track_running_stats=True,
         )
-        # 누산/히스토리 버퍼 (Normal과 동일 구조)
-        self.register_buffer("stg_count", torch.tensor(0, dtype=torch.long), persistent=True)
-        self.register_buffer("stg_mean", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("stg_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("stg_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("gs_count", torch.tensor(0, dtype=torch.long), persistent=True)
-        self.register_buffer("gs_mean", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("gs_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("gs_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True)
-        self.register_buffer("last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("train_runs", torch.tensor(0, dtype=torch.long), persistent=True)
+
+        self.register_buffer(
+            "stg_count", torch.tensor(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "stg_mean",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "stg_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "stg_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "gs_count", torch.tensor(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "gs_mean",
+            torch.zeros(self.n_features, dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "gs_M2", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "gs_M3", torch.zeros(self.n_features, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "last_train_start_ns", torch.tensor(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "last_train_end_ns", torch.tensor(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "train_runs", torch.tensor(0, dtype=torch.long), persistent=True
+        )
         self._hist_maxlen = 2000
-        self.register_buffer("hist_step", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("hist_seen", torch.empty(0, dtype=torch.long), persistent=True)
-        self.register_buffer("hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True)
-        self.register_buffer("hist_device_code", torch.empty(0, dtype=torch.int8), persistent=True)
-        self.register_buffer("hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True)
-        self.register_buffer("hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_kernel", torch.empty(0, _LEN_KERNEL, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True)
-        self.register_buffer("hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True)
+        self.register_buffer(
+            "hist_step", torch.empty(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "hist_seen", torch.empty(0, dtype=torch.long), persistent=True
+        )
+        self.register_buffer(
+            "hist_start_ns", torch.empty(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "hist_end_ns", torch.empty(0, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "hist_device_code", torch.empty(0, dtype=torch.int8), persistent=True
+        )
+        self.register_buffer(
+            "hist_world_size", torch.empty(0, dtype=torch.int32), persistent=True
+        )
+        self.register_buffer(
+            "hist_os", torch.empty(0, _LEN_OS, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_kernel",
+            torch.empty(0, _LEN_KERNEL, dtype=torch.uint8),
+            persistent=True,
+        )
+        self.register_buffer(
+            "hist_arch", torch.empty(0, _LEN_ARCH, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_accel", torch.empty(0, _LEN_ACCEL, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_tz", torch.empty(0, _LEN_TZ, dtype=torch.uint8), persistent=True
+        )
+        self.register_buffer(
+            "hist_cpu", torch.empty(0, _LEN_CPU, dtype=torch.uint8), persistent=True
+        )
 
     @torch.no_grad()
     def _accumulate_batch(self, x: torch.Tensor) -> None:
@@ -935,9 +1017,13 @@ class StudentsT(nn.Module):
             dtype=torch.int8,
             device=self.hist_device_code.device,
         )
-        ws = torch.tensor([get_world_size()], dtype=torch.int32, device=self.hist_world_size.device)
+        ws = torch.tensor(
+            [get_world_size()], dtype=torch.int32, device=self.hist_world_size.device
+        )
         step = torch.tensor([runs - 1], dtype=torch.long, device=self.hist_step.device)
-        seen = torch.tensor([int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device)
+        seen = torch.tensor(
+            [int(self.gs_count.item())], dtype=torch.long, device=self.hist_seen.device
+        )
         self.hist_step = torch.cat([self.hist_step, step], dim=0)[-self._hist_maxlen :]
         self.hist_seen = torch.cat([self.hist_seen, seen], dim=0)[-self._hist_maxlen :]
         self.hist_start_ns = torch.cat(
@@ -1018,8 +1104,10 @@ class StudentsT(nn.Module):
         N = int(self.gs_count.item())
         if N > 0:
             mu = self.gs_mean.to(dtype=self.bn.running_mean.dtype)
-            var = (self.gs_M2 / max(N, 1)).clamp_min(1e-12).to(
-                dtype=self.bn.running_var.dtype
+            var = (
+                (self.gs_M2 / max(N, 1))
+                .clamp_min(1e-12)
+                .to(dtype=self.bn.running_var.dtype)
             )
             self.bn.running_mean.copy_(mu)
             self.bn.running_var.copy_(var)
@@ -1063,7 +1151,9 @@ class StudentsT(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.standardize:
             return x
-        bn_dtype = self.bn.running_mean.dtype if hasattr(self.bn, "running_mean") else x.dtype
+        bn_dtype = (
+            self.bn.running_mean.dtype if hasattr(self.bn, "running_mean") else x.dtype
+        )
         orig_dtype = x.dtype
         if x.dtype != bn_dtype:
             x = x.to(dtype=bn_dtype)
@@ -1082,7 +1172,6 @@ class StudentsT(nn.Module):
             return out
         raise ValueError(f"invalid mode: {self.mode}")
 
-    # ---------------------- SciPy 기반 오프라인 추정 ----------------------
     @torch.jit.ignore
     def fit_numpy(
         self,
@@ -1092,55 +1181,64 @@ class StudentsT(nn.Module):
         fscale: Optional[Union[float, "np.ndarray"]] = None,
         apply_bn: bool = False,
     ) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
-        """
-        Per-feature로 SciPy의 MLE `stats.t.fit`을 수행하여 (df, loc, scale)을 추정.
-        - X: (N, D) numpy 배열
-        - floc/fscale: loc/scale 고정(선택); 스칼라 또는 길이 D
-        - apply_bn=True면 BN 러닝통계를 (loc, scale, df)로부터 유도된 분산으로 고정
-          (Var = scale^2 * df/(df-2), df>2에서만 유효). :contentReference[oaicite:5]{index=5}
-        반환: (df[D], loc[D], scale[D]) (numpy)
-        """
+
         if _sps is None:
             raise RuntimeError("SciPy가 필요합니다: pip install scipy")
         X = _np.asarray(X, dtype=_np.float64)
         if X.ndim != 2 or X.shape[1] != self.n_features:
             raise ValueError(f"X shape must be (N, {self.n_features})")
         D = self.n_features
-        df  = _np.full(D, _np.nan, dtype=_np.float64)
+        df = _np.full(D, _np.nan, dtype=_np.float64)
         loc = _np.full(D, _np.nan, dtype=_np.float64)
-        sc  = _np.full(D, _np.nan, dtype=_np.float64)
-        # 브로드캐스트 편의
-        def _sel(v, j):
-            if v is None: return None
+        sc = _np.full(D, _np.nan, dtype=_np.float64)
+
+        def _sel(v: float | "np.ndarray" | None, j: int) -> float | None:
+            if v is None:
+                return None
             return float(v if _np.isscalar(v) else v[j])
+
         for j in range(D):
             xj = _np.asarray(X[:, j], dtype=_np.float64)
             xj = xj[_np.isfinite(xj)]
             if xj.size == 0:
                 continue
             kw = {}
-            fl = _sel(floc, j); fs = _sel(fscale, j)
-            if fl is not None: kw["floc"] = fl
-            if fs is not None: kw["fscale"] = fs
+            fl = _sel(floc, j)
+            fs = _sel(fscale, j)
+            if fl is not None:
+                kw["floc"] = fl
+            if fs is not None:
+                kw["fscale"] = fs
             try:
-                dfj, locj, scj = _sps.t.fit(xj, **kw)  # MLE로 (df, loc, scale) 반환 :contentReference[oaicite:6]{index=6}
+                dfj, locj, scj = _sps.t.fit(xj, **kw)
             except Exception:
-                # fallback: moment-like 초기화
+
                 locj = _np.nanmean(xj)
-                s2   = _np.nanvar(xj)
-                dfj  = 10.0
-                scj  = _np.sqrt(max(s2 * (dfj - 2.0) / dfj, 1e-12))
+                s2 = _np.nanvar(xj)
+                dfj = 10.0
+                scj = _np.sqrt(max(s2 * (dfj - 2.0) / dfj, 1e-12))
             df[j], loc[j], sc[j] = dfj, locj, scj
-        # 버퍼 갱신
+
         self.t_df.copy_(torch.from_numpy(df))
         self.t_loc.copy_(torch.from_numpy(loc))
         self.t_scale.copy_(torch.from_numpy(sc))
-        # 선택: BN 러닝통계에도 반영
+
         if apply_bn:
-            rm = torch.from_numpy(loc).to(self.bn.running_mean.dtype).to(self.bn.running_mean.device)
-            var_np = _np.where(df > 2.0, sc**2 * df / (df - 2.0),  # Var(t)=scale^2*df/(df-2)
-                               _np.asarray(self.bn.running_var.detach().cpu(), dtype=_np.float64))
-            rv = torch.from_numpy(var_np).to(self.bn.running_var.dtype).to(self.bn.running_var.device)
+            rm = (
+                torch.from_numpy(loc)
+                .to(self.bn.running_mean.dtype)
+                .to(self.bn.running_mean.device)
+            )
+            var_np = _np.where(
+                df > 2.0,
+                sc**2 * df / (df - 2.0),
+                _np.asarray(self.bn.running_var.detach().cpu(), dtype=_np.float64),
+            )
+            rv = (
+                torch.from_numpy(var_np)
+                .to(self.bn.running_var.dtype)
+                .to(self.bn.running_var.device)
+            )
             self.bn.running_mean.copy_(rm)
             self.bn.running_var.copy_(rv)
         return df, loc, sc
@@ -1295,7 +1393,9 @@ class PatchEmbedding(nn.Module):
         self.d_model = int(d_model)
         self.patch = patch
         self.pad_to_multiple = bool(pad_to_multiple)
-        self.static_spatial: Optional[Tuple[int, ...]] = getattr(self, "static_spatial", None)
+        self.static_spatial: Optional[Tuple[int, ...]] = getattr(
+            self, "static_spatial", None
+        )
         if self.static_spatial is None:
             hw = getattr(self, "static_hw", None)
             if hw is not None and self.ndim == 2:
@@ -1354,9 +1454,7 @@ class PatchEmbedding(nn.Module):
                     if fdim < need:
                         x = torch.nn.functional.pad(x, (0, need - fdim))
                     elif fdim > need:
-                        raise ValueError(
-                            f"[B,F] grid(H={h},W={w}) but F={fdim} > H*W."
-                        )
+                        raise ValueError(f"[B,F] grid(H={h},W={w}) but F={fdim} > H*W.")
                     return x.view(b, h, w)
                 case 3:
                     if self.grid_3d is None:
@@ -1421,15 +1519,15 @@ class PatchEmbedding(nn.Module):
                 meta = (1, h, w)
             case 3:
                 b, d, t, h, w = y.shape
-                tokens = (
-                    y.permute(0, 2, 3, 4, 1).contiguous().view(b, t * h * w, d)
-                )
+                tokens = y.permute(0, 2, 3, 4, 1).contiguous().view(b, t * h * w, d)
                 meta = (t, h, w)
             case _:
                 raise RuntimeError("Unsupported ndim for PatchEmbedding")
         return (self.dropout(tokens), meta)
 
-    def _pad_or_crop_to_nd(self, x: torch.Tensor, target: Tuple[int, ...]) -> torch.Tensor:
+    def _pad_or_crop_to_nd(
+        self, x: torch.Tensor, target: Tuple[int, ...]
+    ) -> torch.Tensor:
         if len(target) != self.ndim:
             raise ValueError(
                 f"static_spatial must have length {self.ndim}, got {len(target)}"
@@ -1534,9 +1632,7 @@ class PatchAttention(nn.Module):
             nn.SiLU(),
             nn.Linear(self.d_model, self.d_model),
         )
-        self.attn = DotProductAttention(
-            num_heads=self.nhead, head_dim=self.head_dim
-        )
+        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
 
     def forward(
         self,
@@ -1645,7 +1741,6 @@ def _get_dilated_mask(
 
 
 class DilatedAttention(nn.Module):
-
     def __init__(
         self,
         embed_dim: int,
@@ -1754,7 +1849,6 @@ class DilatedAttention(nn.Module):
 
 
 class PointTransformer(nn.Module):
-    
     def __init__(
         self,
         d_model: int,
@@ -1773,14 +1867,10 @@ class PointTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm1 = norm_layer(norm_type, self.d_model)
-        self.attn = PatchAttention(
-            self.d_model, nhead, coord_dim=self.coord_dim
-        )
+        self.attn = PatchAttention(self.d_model, nhead, coord_dim=self.coord_dim)
         self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
-        self.ffn = SwiGLU(
-            self.d_model, hid, out_dim=self.d_model, dropout=dropout
-        )
+        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
         self._ln_materialized = False
 
     def forward(
@@ -1803,6 +1893,7 @@ class PointTransformer(nn.Module):
             attn_mask = attn_mask.contiguous()
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
+
         def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
             if not isinstance(ln, nn.LayerNorm):
                 return
@@ -1817,25 +1908,19 @@ class PointTransformer(nn.Module):
             else:
                 dtensor_types = (_DTensor,)
             w_data = getattr(w, "data", None)
-            if (
-                isinstance(w, torch.Tensor)
-                and (
-                    is_meta_or_fake_tensor(w)
-                    or isinstance(w, dtensor_types)
-                    or isinstance(w_data, dtensor_types)
-                )
+            if isinstance(w, torch.Tensor) and (
+                is_meta_or_fake_tensor(w)
+                or isinstance(w, dtensor_types)
+                or isinstance(w_data, dtensor_types)
             ):
                 ln.weight = nn.Parameter(
                     torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
                 )
             b_data = getattr(b, "data", None)
-            if (
-                isinstance(b, torch.Tensor)
-                and (
-                    is_meta_or_fake_tensor(b)
-                    or isinstance(b, dtensor_types)
-                    or isinstance(b_data, dtensor_types)
-                )
+            if isinstance(b, torch.Tensor) and (
+                is_meta_or_fake_tensor(b)
+                or isinstance(b, dtensor_types)
+                or isinstance(b_data, dtensor_types)
             ):
                 ln.bias = nn.Parameter(
                     torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
@@ -1847,12 +1932,20 @@ class PointTransformer(nn.Module):
         _x = x
         if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
             raise RuntimeError("x is meta before LayerNorm")
-        if _x.device.type == "cpu" and _x.is_floating_point() and _x.dtype != torch.float32:
+        if (
+            _x.device.type == "cpu"
+            and _x.is_floating_point()
+            and _x.dtype != torch.float32
+        ):
             _x = _x.float()
         _x = self.norm1(_x)
         if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
             raise RuntimeError("x is meta after LayerNorm")
-        if _x.device.type == "cpu" and x.is_floating_point() and x.dtype != torch.float32:
+        if (
+            _x.device.type == "cpu"
+            and x.is_floating_point()
+            and x.dtype != torch.float32
+        ):
             _x = _x.to(x.dtype)
         y = self.attn(_x, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
@@ -1896,6 +1989,7 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
     "spatio-temporal": "st",
 }
 
+
 def _coerce_modeling_types(value: Any) -> str:
     mode = str(value).strip().lower()
     normalized = _MODELING_TYPE_ALIASES.get(mode)
@@ -1903,8 +1997,8 @@ def _coerce_modeling_types(value: Any) -> str:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
 
+
 class SpatialEncoder(nn.Module):
-    
     def __init__(
         self,
         d_model: int,
@@ -1963,7 +2057,9 @@ class SpatialEncoder(nn.Module):
         coords = coords.contiguous()
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
-                raise RuntimeError("attn_mask is meta/fake before SpatialEncoder.forward")
+                raise RuntimeError(
+                    "attn_mask is meta/fake before SpatialEncoder.forward"
+                )
             attn_mask = attn_mask.contiguous()
         for blk in self.blocks:
             x = blk(x, coords, attn_mask=attn_mask)
@@ -1972,8 +2068,8 @@ class SpatialEncoder(nn.Module):
             raise RuntimeError("SpatialEncoder produced meta/fake tensor")
         return out.contiguous()
 
+
 class RetNet(nn.Module):
-    
     def __init__(
         self,
         d_model: int,
@@ -2005,16 +2101,13 @@ class RetNet(nn.Module):
         x = x.contiguous()
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
-        h, state = self.retention(
-            self.norm1(x), attn_mask=causal_mask, state=state
-        )
+        h, state = self.retention(self.norm1(x), attn_mask=causal_mask, state=state)
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
         return x, state
 
 
 class TemporalEncoder(nn.Module):
-    
     def __init__(
         self,
         d_model: int,
@@ -2061,8 +2154,8 @@ class TemporalEncoder(nn.Module):
             return x, next_state
         return x
 
+
 class CrossTransformer(nn.Module):
-    
     def __init__(
         self,
         d_model: int,
@@ -2162,6 +2255,7 @@ class CrossTransformer(nn.Module):
             return s_context + self.drop_path(self.dropout(fused))
         raise RuntimeError(f"Unhandled mode: {mode_l}")
 
+
 @dataclass
 class Payload:
     tokens: torch.Tensor
@@ -2170,8 +2264,8 @@ class Payload:
     offset: torch.Tensor
     context_shape: Tuple[int, ...]
 
+
 class LongNet(nn.Module):
-    
     def __init__(
         self,
         embed_dim: int,
@@ -2299,7 +2393,6 @@ class LongNet(nn.Module):
 
 
 class GlobalEncoder(nn.Module):
-    
     def __init__(
         self,
         embed_dim: int,
@@ -2346,8 +2439,8 @@ class GlobalEncoder(nn.Module):
             need_weights=need_weights,
         )
 
+
 class LocalProcessor(nn.Module):
-    
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -2357,9 +2450,7 @@ class LocalProcessor(nn.Module):
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
         self.d_model = int(config.depth)
         self.nhead = int(config.heads)
-        self.modeling_type = _coerce_modeling_types(
-            config.modeling_type
-        )
+        self.modeling_type = _coerce_modeling_types(config.modeling_type)
         self.spatial_tokens = max(1, int(config.spatial_latents))
         self.temporal_tokens = max(1, int(config.temporal_latents))
         self.mlp_ratio = float(config.mlp_ratio)
@@ -2374,9 +2465,7 @@ class LocalProcessor(nn.Module):
         )
         self.register_buffer(
             "spatial_coords_template",
-            self._get_spatial_coords(
-                self.spatial_tokens, device=torch.device("cpu")
-            ),
+            self._get_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
             persistent=False,
         )
         self.spatial_encoder = SpatialEncoder(
@@ -2418,9 +2507,7 @@ class LocalProcessor(nn.Module):
         )
 
     @staticmethod
-    def _get_spatial_coords(
-        n_tokens: int, device: torch.device
-    ) -> torch.Tensor:
+    def _get_spatial_coords(n_tokens: int, device: torch.device) -> torch.Tensor:
         side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
         coords: List[Tuple[float, float, float]] = []
         for idx in range(n_tokens):
@@ -2455,9 +2542,9 @@ class LocalProcessor(nn.Module):
                 "spatial tokenizer output has unexpected numel: "
                 f"got {spatial_raw.numel()} vs expected {expected_spatial}"
             )
-        spatial_tokens = (
-            spatial_raw.reshape(B, self.spatial_tokens, self.d_model).contiguous()
-        )
+        spatial_tokens = spatial_raw.reshape(
+            B, self.spatial_tokens, self.d_model
+        ).contiguous()
         temporal_raw = self.temporal_tokenizer(x)
         expected_temporal = B * self.temporal_tokens * self.d_model
         if temporal_raw.numel() != expected_temporal:
@@ -2465,9 +2552,9 @@ class LocalProcessor(nn.Module):
                 "temporal tokenizer output has unexpected numel: "
                 f"got {temporal_raw.numel()} vs expected {expected_temporal}"
             )
-        temporal_tokens = (
-            temporal_raw.reshape(B, self.temporal_tokens, self.d_model).contiguous()
-        )
+        temporal_tokens = temporal_raw.reshape(
+            B, self.temporal_tokens, self.d_model
+        ).contiguous()
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_encoder(spatial_tokens, coords)
         temporal_out = self.temporal_encoder(temporal_tokens)
@@ -2512,7 +2599,9 @@ class LocalProcessor(nn.Module):
             context_shape=self.out_shape,
         )
 
-    def _forward_dynamically(self, spatial_out, temporal_out):
+    def _forward_dynamically(
+        self, spatial_out: torch.Tensor, temporal_out: torch.Tensor
+    ) -> torch.Tensor:
         mode = getattr(self, "modeling_type", None)
         if mode is None:
             raise RuntimeError("modeling_type is not set")
@@ -2538,9 +2627,7 @@ class LocalProcessor(nn.Module):
 
 
 class LossWeightPolicy(Protocol):
-    
-    def weights(self) -> Tuple[float, float]:
-        ...
+    def weights(self) -> Tuple[float, float]: ...
 
     def update(
         self,
@@ -2551,7 +2638,6 @@ class LossWeightPolicy(Protocol):
 
 
 class Root(nn.Module):
-
     def __init__(
         self,
         in_dim: int,
@@ -2562,20 +2648,27 @@ class Root(nn.Module):
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
-        # ---- (2) 입력/출력 스케일러 및 보정 레이어 배치 ----
-        # 0번째: 입력 정규화 Normal(standardize=True, skew=True, mode='norm')
+
         self.input_norm = Normal(self.in_dim, standardize=True, skew=True, mode="norm")
-        # 마지막: 출력 역정규화 Normal(..., mode='denorm') + Affine 보정
-        self.output_denorm = Normal(self.out_dim, standardize=True, skew=True, mode="denorm")
+
+        self.output_denorm = Normal(
+            self.out_dim, standardize=True, skew=True, mode="denorm"
+        )
         self.output_affine = Affine(self.out_dim)
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
             if torch.cuda.is_available():
                 device_name = "cuda"
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            elif (
+                getattr(torch.backends, "mps", None)
+                and torch.backends.mps.is_available()
+            ):
                 device_name = "mps"
-            elif getattr(torch, "is_vulkan_available", None) and torch.is_vulkan_available():
+            elif (
+                getattr(torch, "is_vulkan_available", None)
+                and torch.is_vulkan_available()
+            ):
                 device_name = "vulkan"
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 device_name = "xpu"
@@ -2588,9 +2681,9 @@ class Root(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.local_net = LocalProcessor(
-            self.in_dim, self.out_shape, config=config
-        ).to(self._device)
+        self.local_net = LocalProcessor(self.in_dim, self.out_shape, config=config).to(
+            self._device
+        )
         global_net = GlobalEncoder(
             int(config.depth),
             int(config.heads),
@@ -2602,9 +2695,7 @@ class Root(nn.Module):
         self.global_net = global_net
         self.microbatch = int(config.microbatch)
         if self.microbatch <= 0:
-            raise ValueError(
-                f"config.microbatch must be >= 1, got {config.microbatch}"
-            )
+            raise ValueError(f"config.microbatch must be >= 1, got {config.microbatch}")
         self._activation_checkpoint = bool(
             getattr(config, "activation_checkpoint", False)
         )
@@ -2637,7 +2728,7 @@ class Root(nn.Module):
             backend="inductor",
             disable=disable_compile,
         )
-        # 디바이스로 이동
+
         self.input_norm = self.input_norm.to(self._device)
         self.output_denorm = self.output_denorm.to(self._device)
         self.output_affine = self.output_affine.to(self._device)
@@ -2663,9 +2754,7 @@ class Root(nn.Module):
         net_loss: Optional[nn.Module] = None,
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
-        loss_weights: Optional[
-        Union[Tuple[float, float], LossWeightPolicy]
-        ] = None,
+        loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
         td_input: TensorDictBase | None = None
@@ -2693,7 +2782,7 @@ class Root(nn.Module):
         device = self._device
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
-        # ---- (1.5) 출력 통계 누적 (denorm용) ----
+
         if (
             self.training
             and labels_flat is not None
@@ -2714,7 +2803,7 @@ class Root(nn.Module):
             )
             target_stats = target_stats.to(device=stats_device, dtype=stats_dtype)
             self.output_denorm._accumulate_batch(target_stats)
-        # ---- (2) 입력 정규화 ----
+
         norm_dtype = self.input_norm.bn.running_mean.dtype
         features = features.to(device=device, dtype=norm_dtype)
         features = self.input_norm(features)
@@ -2737,7 +2826,9 @@ class Root(nn.Module):
                 s = idx * self.microbatch
                 e = min(b, (idx + 1) * self.microbatch)
                 x_slice = self._cast_graph_safe(features[s:e], device, base_dtype)
-                ctx = Autocast.float(device) if amp_enabled else Autocast.suspend(device)
+                ctx = (
+                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
+                )
                 with ctx:
                     out: Payload = self.local_net(x_slice)
                 out_tokens = torch.nan_to_num(
@@ -2775,7 +2866,9 @@ class Root(nn.Module):
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
         context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
-        assembled = torch.nan_to_num(context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0)
+        assembled = torch.nan_to_num(
+            context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
+        )
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(
                 self._cast_graph_safe(features, self._device, assembled.dtype)
@@ -2787,9 +2880,7 @@ class Root(nn.Module):
         if infer_mode:
             with Gradient.inference(self.global_net):
                 with (
-                    Autocast.float(device)
-                    if amp_enabled
-                    else Autocast.suspend(device)
+                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 ):
                     refined_tokens, _ = self.global_net(tokens_centered)
             refined_tokens = torch.nan_to_num(
@@ -2798,9 +2889,7 @@ class Root(nn.Module):
             decode_tokens = refined_tokens.detach().clone()
             with Gradient.inference(self.local_net):
                 with (
-                    Autocast.float(device)
-                    if amp_enabled
-                    else Autocast.suspend(device)
+                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 ):
                     residual_context = self.local_net.decode(
                         decode_tokens, apply_norm=True
@@ -2821,7 +2910,9 @@ class Root(nn.Module):
                     return out
 
                 if use_activation_checkpoint and activation_checkpoint is not None:
-                    refined_tokens = activation_checkpoint(_global_tokens, tokens_centered)
+                    refined_tokens = activation_checkpoint(
+                        _global_tokens, tokens_centered
+                    )
                 else:
                     refined_tokens = _global_tokens(tokens_centered)
                 refined_tokens = torch.nan_to_num(
@@ -2837,7 +2928,9 @@ class Root(nn.Module):
                         return self.local_net.decode(inp, apply_norm=True)
 
                 if use_activation_checkpoint and activation_checkpoint is not None:
-                    residual_context = activation_checkpoint(_decode_tokens, refined_tokens)
+                    residual_context = activation_checkpoint(
+                        _decode_tokens, refined_tokens
+                    )
                 else:
                     residual_context = _decode_tokens(refined_tokens)
                 residual_context = torch.nan_to_num(
@@ -2848,9 +2941,7 @@ class Root(nn.Module):
         )
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
-        y_hat = torch.nan_to_num(
-            assembled + residual, nan=0.0, posinf=0.0, neginf=0.0
-        )
+        y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
             if net_loss is not None
@@ -2905,7 +2996,7 @@ class Root(nn.Module):
                     device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
                 )
                 loss_val = net_loss(y_hat_for_loss, tgt)
-        # ---- (2) 출력 역정규화 + 보정 ----
+
         y_hat_out = y_hat_for_loss
         pred = y_hat_out.reshape(b, *self.out_shape)
         if td_input is not None:
@@ -2942,7 +3033,5 @@ class Root(nn.Module):
         return (out.contiguous(), tuple(labels[0].shape))
 
     @staticmethod
-    def unflatten_y(
-        flat: torch.Tensor, shape: Sequence[int]
-    ) -> torch.Tensor:
+    def unflatten_y(flat: torch.Tensor, shape: Sequence[int]) -> torch.Tensor:
         return flat.reshape(flat.shape[0], *shape).contiguous()

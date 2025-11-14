@@ -60,7 +60,9 @@ def _to_tuple(x: Any) -> Tuple[int, ...]:
     return tuple((int(v) for v in x))
 
 
-def _normal_cdf(x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+def _normal_cdf(
+    x: torch.Tensor, loc: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
     z = (x - loc) / torch.clamp(scale, min=1e-12)
     return 0.5 * (1.0 + torch.erf(z / math.sqrt(2.0)))
 
@@ -625,6 +627,8 @@ class StudentsTLoss(nn.Module):
             case _:
                 raise ValueError("Invalid penalty")
         return self.reduce(pen)
+
+
 class DataFidelityLoss(nn.Module):
     def __init__(
         self,

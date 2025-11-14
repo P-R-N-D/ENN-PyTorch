@@ -22,7 +22,6 @@ _BOOTSTRAP_DEPTH = 0
 
 @dataclass
 class Metadata(Generic[TExtra]):
-
     device: torch.device
     device_type: str = field(init=False, default="cpu")
     cuda_cc: Optional[Tuple[int, int]] = field(init=False, default=None)
@@ -34,6 +33,7 @@ class Metadata(Generic[TExtra]):
     scale_is_integral: Optional[bool] = None
     stats: MutableMapping[str, torch.Tensor] = field(default_factory=dict)
     extra: Dict[str, TExtra] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self._refresh_device_info()
 
@@ -86,7 +86,9 @@ class Metadata(Generic[TExtra]):
         return _Autocast.float8_formats()
 
     @classmethod
-    def _float_amp_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _float_amp_candidates(
+        cls: object, device: torch.device
+    ) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
         global _BOOTSTRAP_DEPTH
@@ -99,7 +101,9 @@ class Metadata(Generic[TExtra]):
             _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
 
     @classmethod
-    def _integer_candidates(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def _integer_candidates(
+        cls: object, device: torch.device
+    ) -> Tuple[torch.dtype, ...]:
         from ..functional.fx import Autocast as _Autocast
 
         global _BOOTSTRAP_DEPTH
@@ -140,7 +144,6 @@ class Metadata(Generic[TExtra]):
         return meta
 
     def refresh(self) -> None:
-
         dev = torch.device(self.device)
         self._refresh_device_info()
         self.float_dtypes = self._float_amp_candidates(dev)
@@ -174,7 +177,11 @@ class Metadata(Generic[TExtra]):
     def _scale_from_tensor(
         tensor: Optional[torch.Tensor],
     ) -> Optional[Tuple[float, Optional[float], bool]]:
-        if tensor is None or not isinstance(tensor, torch.Tensor) or tensor.numel() == 0:
+        if (
+            tensor is None
+            or not isinstance(tensor, torch.Tensor)
+            or tensor.numel() == 0
+        ):
             return None
         with torch.no_grad():
             values = tensor.detach()
@@ -187,7 +194,11 @@ class Metadata(Generic[TExtra]):
             pos_vals = abs_vals[abs_vals > 0]
             min_abs = float(pos_vals.min().item()) if pos_vals.numel() else None
             if finite_vals.is_floating_point():
-                tol = 1e-6 if finite_vals.dtype in (torch.float32, torch.float64) else 5e-4
+                tol = (
+                    1e-6
+                    if finite_vals.dtype in (torch.float32, torch.float64)
+                    else 5e-4
+                )
                 frac = (finite_vals - torch.round(finite_vals)).abs()
                 is_integral = bool(frac.lt(tol).all().item()) if frac.numel() else True
             else:
@@ -229,12 +240,11 @@ class Metadata(Generic[TExtra]):
 
 @tensorclass(shadow=True)
 class TensorDictMetadata:
-
     use_amp: bool = False
     amp_dtype: Optional[Any] = None
     device: Optional[Any] = None
 
-    def autocast(self):
+    def autocast(self) -> contextlib.AbstractContextManager[Any]:
         if self.use_amp and isinstance(self.amp_dtype, torch.dtype):
             if isinstance(self.device, torch.device):
                 dev_type = self.device.type
@@ -242,5 +252,3 @@ class TensorDictMetadata:
                 dev_type = "cuda" if torch.cuda.is_available() else "cpu"
             return torch.autocast(device_type=dev_type, dtype=self.amp_dtype)
         return contextlib.nullcontext()
-
-

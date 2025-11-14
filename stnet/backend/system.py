@@ -15,15 +15,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
+from types import ModuleType
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.multiprocessing as mp
 
 try:
-    from zoneinfo import ZoneInfo  # type: ignore[attr-defined]
-except Exception:  # pragma: no cover - zoneinfo may be unavailable
-    ZoneInfo = None  # type: ignore[assignment]
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 
 @dataclass
@@ -47,7 +48,6 @@ _TZ_ALIASES = {
 
 
 def resolve_timezone(name: Optional[str] = None) -> Optional[timezone]:
-    """Return a tzinfo instance for the given alias or IANA name."""
     resolved = (name or "GMT").strip()
     alias = _TZ_ALIASES.get(resolved.upper(), resolved)
     if alias.upper() == "UTC":
@@ -60,14 +60,12 @@ def resolve_timezone(name: Optional[str] = None) -> Optional[timezone]:
 
 
 def posix_time(tz_name: Optional[str] = None) -> int:
-    """Current timestamp in nanoseconds for the specified timezone alias."""
     tz = resolve_timezone(tz_name)
     now = datetime.now(tz=tz) if tz is not None else datetime.now()
     return int(now.timestamp() * 1_000_000_000)
 
 
 def system_info() -> Tuple[str, str, str, str]:
-    """Gather basic OS, kernel, architecture, and accelerator information."""
     sysname = platform.system() or ""
     release = platform.release() or ""
     kernel = f"{sysname} {release}".strip()
@@ -99,7 +97,7 @@ def system_info() -> Tuple[str, str, str, str]:
         pass
     try:
         if hasattr(torch, "xpu") and hasattr(torch.xpu, "device_count"):
-            count = torch.xpu.device_count()  # type: ignore[attr-defined]
+            count = torch.xpu.device_count()
             if count and count > 0:
                 get_name = getattr(torch.xpu, "get_device_name", None)
                 for idx in range(count):
@@ -116,18 +114,19 @@ def system_info() -> Tuple[str, str, str, str]:
 
 
 def cpu_info(max_bytes: Optional[int] = None) -> str:
-    """Return a semicolon-delimited list of per-core CPU names."""
     names: List[str] = []
     total = os.cpu_count() or 1
     brand = ""
     with contextlib.suppress(Exception):
-        import cpuinfo  # type: ignore
+        import cpuinfo
 
         info = cpuinfo.get_cpu_info() or {}
         brand = info.get("brand_raw") or info.get("brand") or ""
     if not brand and os.path.exists("/proc/cpuinfo"):
         with contextlib.suppress(Exception):
-            with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
+            with open(
+                "/proc/cpuinfo", "r", encoding="utf-8", errors="ignore"
+            ) as handle:
                 lines = [ln.strip() for ln in handle.readlines() if "model name" in ln]
             if lines:
                 names = [ln.split(":", 1)[1].strip() for ln in lines]
@@ -135,7 +134,9 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
         with contextlib.suppress(Exception):
             import subprocess
 
-            output = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"])
+            output = subprocess.check_output(
+                ["sysctl", "-n", "machdep.cpu.brand_string"]
+            )
             brand = output.decode("utf-8", "ignore").strip()
     if not names and platform.system() == "Windows":
         brand = platform.processor()
@@ -150,7 +151,9 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
     if not names:
         fallback = brand or platform.processor() or "CPU"
         names = [fallback] * total
-    pairs = [f"{idx}:{names[idx] if idx < len(names) else names[0]}" for idx in range(total)]
+    pairs = [
+        f"{idx}:{names[idx] if idx < len(names) else names[0]}" for idx in range(total)
+    ]
     result = ";".join(pairs)
     if max_bytes is not None and max_bytes > 0:
         encoded = result.encode("utf-8")
@@ -183,7 +186,11 @@ def is_main_loadable() -> bool:
         main_path = os.fspath(main_path)
     except TypeError:
         return False
-    if isinstance(main_path, str) and main_path.startswith("<") and main_path.endswith(">"):
+    if (
+        isinstance(main_path, str)
+        and main_path.startswith("<")
+        and main_path.endswith(">")
+    ):
         return False
     return os.path.exists(main_path)
 
@@ -265,8 +272,7 @@ def optimal_start_method() -> str:
             continue
         return method
     raise RuntimeError(
-        "No supported multiprocessing start method "
-        "(tried forkserver, spawn)."
+        "No supported multiprocessing start method " "(tried forkserver, spawn)."
     )
 
 
@@ -292,8 +298,7 @@ def set_multiprocessing_env() -> None:
             continue
         return
     raise RuntimeError(
-        "Unable to configure multiprocessing start method "
-        "(tried forkserver, spawn)."
+        "Unable to configure multiprocessing start method " "(tried forkserver, spawn)."
     ) from last_error
 
 
@@ -301,9 +306,7 @@ def default_temp() -> str:
     return (
         os.environ.get("TEMP", r"C:\Windows\Temp")
         if sys.platform.startswith("win")
-        else "/tmp"
-        if os.path.isdir("/tmp")
-        else "/var/tmp"
+        else "/tmp" if os.path.isdir("/tmp") else "/var/tmp"
     )
 
 
@@ -342,9 +345,7 @@ def get_dpa_backends() -> List[object]:
 def is_cpu_bf16_supported() -> bool:
     try:
         mkldnn_ops = getattr(torch.ops, "mkldnn", None)
-        if mkldnn_ops is not None and hasattr(
-            mkldnn_ops, "_is_mkldnn_bf16_supported"
-        ):
+        if mkldnn_ops is not None and hasattr(mkldnn_ops, "_is_mkldnn_bf16_supported"):
             return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
     except Exception:
         pass
@@ -381,31 +382,31 @@ def get_device(
     allow_val = (
         bool(allow_tf32)
         if allow_tf32 is not None
-        else bool(cfg.allow_tf32)
-        if cfg.allow_tf32 is not None and deterministic is None
-        else False
-        if det_flag
-        else True
+        else (
+            bool(cfg.allow_tf32)
+            if cfg.allow_tf32 is not None and deterministic is None
+            else False if det_flag else True
+        )
     )
     cfg.allow_tf32 = allow_val
     benchmark_val = (
         bool(cudnn_benchmark)
         if cudnn_benchmark is not None
-        else bool(cfg.cudnn_benchmark)
-        if cfg.cudnn_benchmark is not None and deterministic is None
-        else False
-        if det_flag
-        else True
+        else (
+            bool(cfg.cudnn_benchmark)
+            if cfg.cudnn_benchmark is not None and deterministic is None
+            else False if det_flag else True
+        )
     )
     cfg.cudnn_benchmark = benchmark_val
     precision_val = (
         str(matmul_precision)
         if matmul_precision is not None
-        else str(cfg.matmul_precision)
-        if cfg.matmul_precision is not None and deterministic is None
-        else "highest"
-        if det_flag
-        else "high"
+        else (
+            str(cfg.matmul_precision)
+            if cfg.matmul_precision is not None and deterministic is None
+            else "highest" if det_flag else "high"
+        )
     )
     cfg.matmul_precision = precision_val
     if sdpa_backends is not None:
@@ -529,13 +530,11 @@ def cpu_count() -> int:
 
 
 def num_accelerators() -> int:
-    """Return the number of accelerator devices available on the host."""
     try:
         import torch
     except Exception:
         return 0
 
-    # CUDA first (respecting missing attributes and availability checks)
     cuda_iface = getattr(torch, "cuda", None)
     if cuda_iface is not None:
         try:
@@ -544,24 +543,29 @@ def num_accelerators() -> int:
         except Exception:
             pass
 
-    # Intel XPU (native XPU / IPEX)
     try:
         xpu = getattr(torch, "xpu", None)
-        if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+        if (
+            xpu is not None
+            and callable(getattr(xpu, "is_available", None))
+            and xpu.is_available()
+        ):
             count = int(getattr(xpu, "device_count", lambda: 1)()) or 1
             return max(count, 1)
     except Exception:
         pass
 
-    # Apple MPS
     try:
         mps = getattr(getattr(torch, "backends", None), "mps", None)
-        if mps is not None and callable(getattr(mps, "is_available", None)) and mps.is_available():
+        if (
+            mps is not None
+            and callable(getattr(mps, "is_available", None))
+            and mps.is_available()
+        ):
             return 1
     except Exception:
         pass
 
-    # Vulkan (prototype/unstable)
     try:
         if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
             return 1
@@ -572,24 +576,19 @@ def num_accelerators() -> int:
 
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
-    """Heuristics for CPU/GPU threading & datapipe parallelism (no env vars).
-    Returns:
-      - intra_ops, inter_ops: torch CPU thread hints
-      - num_workers: ParallelMapper.num_workers
-      - max_concurrancy: == num_workers (safety constraint)
-      - prebatch: items grouped per map call (helps tiny samples)
-      - prefetch_factor: queue depth for CPU/GPU prefetchers
-    """
     ncpu = cpu_count()
     try:
         import torch
-        has_cuda = getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
+
+        has_cuda = (
+            getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
+        )
     except Exception:
         has_cuda = False
     if ncpu <= 2:
         inter_ops = 1
         intra_ops = max(1, ncpu - inter_ops)
-        num_workers = max(1, ncpu)           # small CPU: keep all busy
+        num_workers = max(1, ncpu)
     elif ncpu <= 8:
         inter_ops = max(1, ncpu // 4)
         intra_ops = max(1, ncpu - inter_ops)
@@ -599,12 +598,8 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         intra_ops = max(1, ncpu - inter_ops)
         num_workers = max(4, min(16, ncpu // 2))
 
-    # Requirement: cap to workers: max_concurrancy == num_workers
     max_concurrancy = int(max(1, num_workers))
 
-    # Heuristics:
-    # - prebatch: 2 * workers (helps tiny samples; bounded by memory in higher layers)
-    # - prefetch_factor: a small fixed depth; 2 on CUDA, 1 on CPU-only
     prebatch = max(2, num_workers * 2)
     prefetch_factor = 2 if has_cuda else 1
 
@@ -619,20 +614,21 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
-    """Apply thread hints via PyTorch APIs only (no env vars)."""
     threads = optimal_threads()
     try:
         import torch
+
         torch.set_num_threads(int(threads["intra_ops"]))
     except Exception:
         pass
     try:
         import torch
+
         if hasattr(torch, "set_num_interop_threads"):
             torch.set_num_interop_threads(int(threads["inter_ops"]))
     except Exception:
         pass
-    # Also return extended hints (prebatch, prefetch_factor, etc.)
+
     return threads
 
 
@@ -656,7 +652,9 @@ class Thread:
 
     def __init__(self, io_workers: int) -> None:
         self._psutil = self._import_psutil()
-        self._allowed_cpus = self.total_procs() or list(range(max(1, os.cpu_count() or 1)))
+        self._allowed_cpus = self.total_procs() or list(
+            range(max(1, os.cpu_count() or 1))
+        )
         self._ring = itertools.cycle(self._allowed_cpus)
         self._tls = threading.local()
         self._lock = Lock()
@@ -672,7 +670,7 @@ class Thread:
         self.tune_threads(io_workers, initial=True)
 
     @staticmethod
-    def _import_psutil():
+    def _import_psutil() -> ModuleType | None:
         try:
             return importlib.import_module("psutil")
         except Exception:
@@ -695,11 +693,16 @@ class Thread:
                 k32.GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
                 k32.GetActiveProcessorCount.restype = ctypes.c_ushort
                 group_count = int(k32.GetActiveProcessorGroupCount())
-                counts = [int(k32.GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
+                counts = [
+                    int(k32.GetActiveProcessorCount(i))
+                    for i in range(max(1, group_count))
+                ]
                 groups = list(range(group_count))
                 try:
                     GetCurrentProcess = k32.GetCurrentProcess
-                    GetProcessGroupAffinity = getattr(k32, "GetProcessGroupAffinity", None)
+                    GetProcessGroupAffinity = getattr(
+                        k32, "GetProcessGroupAffinity", None
+                    )
                     if GetProcessGroupAffinity:
                         handle = GetCurrentProcess()
                         arr_type = ctypes.c_ushort * max(1, group_count)
@@ -776,7 +779,9 @@ class Thread:
             GetActiveProcessorCount.argtypes = [ctypes.c_ushort]
             GetActiveProcessorCount.restype = ctypes.c_ushort
             group_count = int(GetActiveProcessorGroupCount())
-            counts = [int(GetActiveProcessorCount(i)) for i in range(max(1, group_count))]
+            counts = [
+                int(GetActiveProcessorCount(i)) for i in range(max(1, group_count))
+            ]
             total = sum(counts) or (os.cpu_count() or 1)
             idx = int(core) % max(1, total)
             group = 0
@@ -890,7 +895,9 @@ class Thread:
             self._enabled = False
 
     @staticmethod
-    def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
+    def optimize_threads(
+        intra: Optional[int] = None, inter: Optional[int] = None
+    ) -> None:
         if intra is not None:
             try:
                 torch.set_num_threads(max(1, int(intra)))
@@ -903,7 +910,11 @@ class Thread:
                 pass
 
     def tune_threads(
-        self, io_workers: Optional[int] = None, *_, initial: bool = False, **__
+        self,
+        io_workers: Optional[int] = None,
+        *_unused_args: Any,
+        initial: bool = False,
+        **_unused_kwargs: Any,
     ) -> None:
         if not self._enabled:
             return
@@ -992,7 +1003,9 @@ _TLB_SINGLETON: Optional[Thread] = None
 def get_tlb(io_workers: Optional[int] = None) -> Thread:
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
-        default_workers = io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
+        default_workers = (
+            io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
+        )
         _TLB_SINGLETON = Thread(io_workers=default_workers)
     return _TLB_SINGLETON
 

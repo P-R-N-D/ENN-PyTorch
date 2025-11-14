@@ -23,6 +23,7 @@ from ..backend.system import (
     is_int8_supported,
 )
 from ..data.stats import Metadata
+
 if TYPE_CHECKING:
     from ..model.kernels import DotProductAttention as _DotProductAttention
 
@@ -162,7 +163,7 @@ def is_scale_safe(
     if getattr(dtype, "is_complex", False):
         base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
         return is_scale_safe(base_dtype, meta, safety_margin=safety_margin)
-    if getattr(dtype, "is_floating_point", False):
+    elif getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
         if max_abs > float(info.max) / safety_margin:
             return False
@@ -170,17 +171,18 @@ def is_scale_safe(
         if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
             return False
         return True
-    if dtype == torch.bool:
+    elif dtype == torch.bool:
         is_integral = getattr(meta, "scale_is_integral", None)
         return (is_integral is None or is_integral) and max_abs <= 1.0
-    try:
-        info = torch.iinfo(dtype)
-    except TypeError:
-        return False
-    is_integral = getattr(meta, "scale_is_integral", None)
-    if is_integral is False:
-        return False
-    return max_abs <= float(info.max)
+    else:
+        try:
+            info = torch.iinfo(dtype)
+        except TypeError:
+            return False
+        is_integral = getattr(meta, "scale_is_integral", None)
+        if is_integral is False:
+            return False
+        return max_abs <= float(info.max)
 
 
 def _is_for_cuda(module: nn.Module) -> bool:
@@ -224,7 +226,7 @@ class Gradient:
         dynamic: Optional[bool] = None,
         options: Optional[Dict[str, Any]] = None,
         disable: bool = False,
-        **kwargs: Any
+        **kwargs: Any,
     ) -> nn.Module:
         normalized_mode = ""
         if mode is not None:
@@ -317,9 +319,7 @@ class Autocast:
                     te = importlib.import_module("transformer_engine.pytorch")
 
                     if getattr(te, "fp8_autocast", None) is None:
-                        raise AttributeError(
-                            "transformer_engine.fp8_autocast missing"
-                        )
+                        raise AttributeError("transformer_engine.fp8_autocast missing")
                 except Exception as exc:
                     _LOGGER.debug("Autocast FP8 TE import failed: %s", exc)
                     continue
@@ -365,9 +365,7 @@ class Autocast:
                     te = importlib.import_module("transformer_engine.pytorch")
 
                     if getattr(te, "int8_autocast", None) is None:
-                        raise AttributeError(
-                            "transformer_engine.int8_autocast missing"
-                        )
+                        raise AttributeError("transformer_engine.int8_autocast missing")
                 except Exception as exc:
                     _LOGGER.debug("Autocast INT8 TE import failed: %s", exc)
                     continue
@@ -379,7 +377,9 @@ class Autocast:
                     int8_autocast = getattr(quant_mod, "int8_autocast", None)
 
                     if not callable(int8_autocast):
-                        raise AttributeError("torchao.quantization.int8_autocast missing")
+                        raise AttributeError(
+                            "torchao.quantization.int8_autocast missing"
+                        )
                 except Exception as exc:
                     _LOGGER.debug("Autocast INT8 torchao import failed: %s", exc)
                     continue
@@ -489,9 +489,8 @@ class Autocast:
                 meta.ensure_device_info()
         if not getattr(meta, "float_dtypes", ()):
             meta.refresh()
-        elif (
-            not getattr(meta, "int_dtypes", ())
-            or not getattr(meta, "float8_dtypes", ())
+        elif not getattr(meta, "int_dtypes", ()) or not getattr(
+            meta, "float8_dtypes", ()
         ):
             meta.refresh()
         else:
@@ -500,7 +499,9 @@ class Autocast:
         return meta
 
     @classmethod
-    def float_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def float_amp_priority(
+        cls: object, device: torch.device
+    ) -> Tuple[torch.dtype, ...]:
         meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "float_dtypes", ())
         if candidates:
@@ -529,7 +530,9 @@ class Autocast:
         return values
 
     @classmethod
-    def integer_amp_priority(cls: object, device: torch.device) -> Tuple[torch.dtype, ...]:
+    def integer_amp_priority(
+        cls: object, device: torch.device
+    ) -> Tuple[torch.dtype, ...]:
         meta = cls.coerce_metadata(device)
         candidates = getattr(meta, "int_dtypes", ())
         if candidates:
@@ -689,8 +692,8 @@ class Autocast:
                     "__int8_training_ptq__",
                     "__int8_inference_ao__",
                 )
-                ):
-                    int_backend = "ao"
+            ):
+                int_backend = "ao"
         cls._preferred_fp8_backend = backend
         cls._preferred_int_backend = int_backend
         meta = metadata
@@ -720,7 +723,9 @@ class Autocast:
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
         meta = cls.coerce_metadata(dev, metadata=metadata)
-        amp_candidates = tuple(meta.float_dtypes) if meta.float_dtypes else (torch.float32,)
+        amp_candidates = (
+            tuple(meta.float_dtypes) if meta.float_dtypes else (torch.float32,)
+        )
         amp_dtype = cls.negotiate(
             amp_candidates,
             fallback=torch.float32,
@@ -733,15 +738,12 @@ class Autocast:
 
         backend = cls._fp8_backend(cls._preferred_fp8_backend, device=dev)
         float8_dtypes = (
-            tuple(meta.float8_dtypes)
-            if meta.float8_dtypes
-            else cls.float8_formats()
+            tuple(meta.float8_dtypes) if meta.float8_dtypes else cls.float8_formats()
         )
         wants_fp8 = backend is not None
         if wants_fp8 and getattr(meta, "has_scale", False):
             fp8_supported = any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             )
             if not fp8_supported:
                 wants_fp8 = False
@@ -885,6 +887,7 @@ try:
         Int8WeightOnlyConfig,
         quantize_,
     )
+
     ptq = getattr(quantize_, "ptq", None)
 except ImportError:
     quantize_ = None
@@ -958,7 +961,6 @@ if QAT is None:
 
 
 class Quantization:
-
     quantize: Optional[Callable[..., Any]] = quantize_
     Int8DynamicActivationInt8WeightConfig: Optional[type] = (
         Int8DynamicActivationInt8WeightConfig
@@ -1102,6 +1104,7 @@ class Quantization:
             return (m2, True, f"PTQ({why})")
         return (model, False, f"PTQ failed: {why}")
 
+
 class Fusion:
     @staticmethod
     def negotiate(
@@ -1133,9 +1136,7 @@ class Fusion:
             if is_scale_safe(dtype, metadata):
                 return dtype
         return (
-            torch.float64
-            if is_scale_safe(torch.float64, metadata)
-            else candidates[-1]
+            torch.float64 if is_scale_safe(torch.float64, metadata) else candidates[-1]
         )
 
     @staticmethod
@@ -1292,13 +1293,9 @@ class Fusion:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = Fusion._nvidia_linear(
-                            child, params_dtype, te
-                        )
+                        replacement = Fusion._nvidia_linear(child, params_dtype, te)
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = Fusion._nvidia_layer_norm(
-                        child, params_dtype, te
-                    )
+                    replacement = Fusion._nvidia_layer_norm(child, params_dtype, te)
                 else:
                     rms_cls = getattr(torch.nn, "RMSNorm", None)
                     if (
@@ -1306,9 +1303,7 @@ class Fusion:
                         and rms_cls is not None
                         and isinstance(child, rms_cls)
                     ):
-                        replacement = Fusion._nvidia_rms_norm(
-                            child, params_dtype, te
-                        )
+                        replacement = Fusion._nvidia_rms_norm(child, params_dtype, te)
                 if replacement is not None:
                     setattr(parent, name, replacement)
                     converted += 1
@@ -1326,8 +1321,10 @@ class Fusion:
         swapped = 0
         dot_cls = _dot_product_attention_cls()
         for module in model.modules():
-            if dot_cls is not None and isinstance(module, dot_cls) and getattr(
-                module, "_te_ok", False
+            if (
+                dot_cls is not None
+                and isinstance(module, dot_cls)
+                and getattr(module, "_te_ok", False)
             ):
                 if not getattr(module, "te_first", False):
                     module.te_first = True
@@ -1441,9 +1438,7 @@ class Fusion:
             if n > 0:
                 setattr(swapped, "__fp8_inference_te__", True)
                 if logger:
-                    logger(
-                        f"[FP8][TE] swapped {n} modules; using te.fp8_autocast"
-                    )
+                    logger(f"[FP8][TE] swapped {n} modules; using te.fp8_autocast")
                 return (swapped, True, f"TE swap ({n})")
             return (model, False, "no eligible Linear (dims%16)")
         except Exception as exc:
@@ -1510,13 +1505,10 @@ class Fusion:
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
                 if logger:
-                    logger(
-                        "[FP8] training disabled: data scale exceeds float8 range"
-                    )
+                    logger("[FP8] training disabled: data scale exceeds float8 range")
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = Fusion.negotiate(device, metadata=meta)
@@ -1553,13 +1545,10 @@ class Fusion:
         if getattr(meta, "has_scale", False):
             float8_dtypes = Autocast.float8_formats()
             if not any(
-                is_scale_safe(dtype, meta, safety_margin=2.0)
-                for dtype in float8_dtypes
+                is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
                 if logger:
-                    logger(
-                        "[FP8] inference disabled: data scale exceeds float8 range"
-                    )
+                    logger("[FP8] inference disabled: data scale exceeds float8 range")
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = Fusion.negotiate(device, metadata=meta)
@@ -1613,7 +1602,6 @@ class Fusion:
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
 
-
     @staticmethod
     def enable_int8_prediction(
         model: nn.Module,
@@ -1633,7 +1621,6 @@ class Fusion:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
-
 
     @staticmethod
     def _wrap_leaf_layer(
@@ -1656,7 +1643,7 @@ class Fusion:
                 self.origin_name = origin_name
                 self.origin_path = origin_path
 
-            def forward(self, x: torch.Tensor):
+            def forward(self, x: torch.Tensor) -> tuple[Any, str, str, str]:
                 out = self.module(x)
                 if isinstance(out, dict):
                     val = out.get(
@@ -1733,7 +1720,7 @@ class Fusion:
                 )
             current_key, current_path = next_key, next_path
 
-        def _alias(val, typ, nm, path):
+        def _alias(val: Any, typ: str, nm: str, path: str) -> tuple[Any, str, str, str]:
             return (val, typ, nm, path)
 
         alias = TensorDictModule(
@@ -1905,7 +1892,7 @@ class Fusion:
                     self,
                     inputs: Union[TensorDictBase, torch.Tensor],
                     **kwargs: Any,
-                ):
+                ) -> Union[TensorDictBase, tuple[torch.Tensor, Optional[torch.Tensor]]]:
                     if isinstance(inputs, TensorDictBase):
                         td = inputs.clone(False)
                         for key, value in kwargs.items():
@@ -1941,6 +1928,8 @@ class Fusion:
         for name, value in derived_attrs.items():
             setattr(pipeline, name, value)
         return pipeline
+
+
 @lru_cache(maxsize=1)
 def _dot_product_attention_cls() -> Any:
     try:
@@ -1949,4 +1938,3 @@ def _dot_product_attention_cls() -> Any:
         return _DotProductAttention
     except Exception:
         return None
-

@@ -33,10 +33,11 @@ def _coerce_bool(value: Any, *args: Any, name: str, **kwargs: Any) -> bool:
         return bool(value)
     if isinstance(value, str):
         normalized = value.strip()
-        if normalized in {"true", "True", "1"}:
-            return True
-        if normalized in {"false", "False", "0"}:
-            return False
+        match normalized.lower():
+            case "true" | "1":
+                return True
+            case "false" | "0":
+                return False
     raise TypeError(f"{name} must be a boolean-compatible value")
 
 
@@ -246,9 +247,7 @@ def coerce_model_config(
         maximum=1.0,
     )
     resolved["normalization_method"] = str(
-        filtered.get(
-            "normalization_method", getattr(defaults, "normalization_method")
-        )
+        filtered.get("normalization_method", getattr(defaults, "normalization_method"))
     )
     resolved["depth"] = _coerce_int(
         filtered.get("depth", getattr(defaults, "depth")),
@@ -366,7 +365,9 @@ class RuntimeConfig:
     in_dim: int
     out_shape: Tuple[int, ...]
     cfg_dict: Dict[str, Any]
-    sources: Optional[Union[SourceSpec, Sequence[SourceSpec], Dict[str, SourceSpec]]] = None
+    sources: Optional[
+        Union[SourceSpec, Sequence[SourceSpec], Dict[str, SourceSpec]]
+    ] = None
     ckpt_dir: Optional[str] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
@@ -479,9 +480,7 @@ class RuntimeConfig:
                 loss_mask_value=kwargs.get("loss_mask_value"),
                 swa_enabled=bool(kwargs.get("swa_enabled", False)),
                 swa_start_epoch=kwargs.get("swa_start_epoch"),
-                swa_update_batch_norm=bool(
-                    kwargs.get("swa_update_batch_norm", False)
-                ),
+                swa_update_batch_norm=bool(kwargs.get("swa_update_batch_norm", False)),
             )
         for k in ("sources", "keys"):
             if k not in kwargs or kwargs[k] is None:

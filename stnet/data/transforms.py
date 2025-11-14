@@ -12,11 +12,13 @@ from tensordict import TensorDictBase
 
 from .datatype import to_tuple, to_torch_tensor
 
+
 def _assert_finites(tensor: torch.Tensor, name: str) -> torch.Tensor:
     if torch.is_floating_point(tensor) or torch.is_complex(tensor):
         if not torch.isfinite(tensor).all():
             raise ValueError(f"{name} tensor contains non-finite values")
     return tensor
+
 
 def _preprocess_x(x_tuple: Any) -> torch.Tensor:
     try:
@@ -31,6 +33,7 @@ def _preprocess_x(x_tuple: Any) -> torch.Tensor:
             raise ValueError("preprocess: feature tuples must be finite")
     tensor = torch.as_tensor(values, dtype=torch.float64)
     return _assert_finites(tensor, "feature")
+
 
 def _preprocess_batch(
     x_value: Any, y_value: Any
@@ -85,6 +88,7 @@ def _preprocess_batch(
     batch_keys = [(int(index),) for index in range(batch_size)]
     return (feature_tensor, label_tensor, batch_keys, label_shape)
 
+
 def _preprocess_y(value: Any) -> torch.Tensor:
     tensor = to_torch_tensor(value)
     if not isinstance(tensor, torch.Tensor):
@@ -93,7 +97,7 @@ def _preprocess_y(value: Any) -> torch.Tensor:
 
 
 def preprocess(
-    data: Union[Dict[Tuple, torch.Tensor], TensorDictBase]
+    data: Union[Dict[Tuple, torch.Tensor], TensorDictBase],
 ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple], Tuple[int, ...]]:
     if isinstance(data, TensorDictBase):
         if "features" not in data.keys():
@@ -106,7 +110,9 @@ def preprocess(
         elif "labels_flat" in data.keys():
             labels = torch.as_tensor(data.get("labels_flat"))
         else:
-            raise ValueError("preprocess(TensorDict): missing 'labels' or 'labels_flat'")
+            raise ValueError(
+                "preprocess(TensorDict): missing 'labels' or 'labels_flat'"
+            )
         if labels.ndim == 1:
             labels = labels.unsqueeze(0)
         label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
@@ -149,10 +155,7 @@ def preprocess(
             )
         keys: List[Tuple] = [to_tuple(k) for k, _ in items]
         feats = torch.stack([_preprocess_x(k) for k in keys], dim=0)
-        lbl_list = [
-            _assert_finites(_preprocess_y(v), "label")
-            for _, v in items
-        ]
+        lbl_list = [_assert_finites(_preprocess_y(v), "label") for _, v in items]
         if all((t.shape == lbl_list[0].shape for t in lbl_list)):
             labels = torch.stack(lbl_list, dim=0)
         else:
@@ -165,6 +168,7 @@ def preprocess(
             "preprocess: unsupported input format. Provide a dict or an (X, Y) pair."
         )
 
+
 def postprocess(
     keys: List[Tuple], preds: torch.Tensor | Sequence[torch.Tensor]
 ) -> Dict[Tuple, torch.Tensor]:
@@ -172,19 +176,13 @@ def postprocess(
         if preds.dim() == 0:
             preds = preds.unsqueeze(0)
         if preds.shape[0] != len(keys):
-            raise ValueError(
-                f"preds batch={preds.shape[0]} != len(keys)={len(keys)}"
-            )
+            raise ValueError(f"preds batch={preds.shape[0]} != len(keys)={len(keys)}")
         rows = [preds[i].detach().cpu() for i in range(len(keys))]
     else:
         if len(preds) != len(keys):
-            raise ValueError(
-                f"len(preds)={len(preds)} != len(keys)={len(keys)}"
-            )
+            raise ValueError(f"len(preds)={len(preds)} != len(keys)={len(keys)}")
         rows = [
-            p.detach().cpu()
-            if isinstance(p, torch.Tensor)
-            else torch.as_tensor(p)
+            p.detach().cpu() if isinstance(p, torch.Tensor) else torch.as_tensor(p)
             for p in preds
         ]
     fixed_keys: List[Tuple] = []

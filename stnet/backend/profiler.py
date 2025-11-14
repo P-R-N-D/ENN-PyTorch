@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 from functools import partial
+from types import TracebackType
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -220,19 +221,27 @@ class _FlopProfiler:
         except Exception:
             return contextlib.nullcontext()
 
-        class _NvtxScope(contextlib.AbstractContextManager):
+        class _NvtxScope(contextlib.AbstractContextManager[Any]):
             def __init__(self, dev: Optional[torch.device]) -> None:
                 self._dev = dev
 
-            def __enter__(self):
+            def __enter__(self) -> "_NvtxScope":
                 try:
-                    if self._dev is not None and getattr(self._dev, "type", "") == "cuda":
+                    if (
+                        self._dev is not None
+                        and getattr(self._dev, "type", "") == "cuda"
+                    ):
                         torch.cuda.synchronize(self._dev)
                 except Exception:
                     pass
                 return self
 
-            def __exit__(self, exc_type, exc, tb):
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 return False
 
             def get_total_flops(self) -> float:
@@ -244,7 +253,6 @@ class _FlopProfiler:
         return _NvtxScope(device)
 
     def _capture_torch(self, display: bool = False) -> Any:
-
         try:
             from torch.profiler import profile
         except Exception:
@@ -252,17 +260,22 @@ class _FlopProfiler:
 
         if profile is not None:
 
-            class _TorchFlops(contextlib.AbstractContextManager):
+            class _TorchFlops(contextlib.AbstractContextManager[Any]):
                 def __init__(self, show: bool) -> None:
                     self._show = show
                     self._prof = None
 
-                def __enter__(self):
+                def __enter__(self) -> "_TorchFlops":
                     self._prof = profile(with_flops=True, record_shapes=False)
                     self._prof.__enter__()
                     return self
 
-                def __exit__(self, exc_type, exc, tb):
+                def __exit__(
+                    self,
+                    exc_type: type[BaseException] | None,
+                    exc: BaseException | None,
+                    tb: TracebackType | None,
+                ) -> bool:
                     if self._prof is not None:
                         self._prof.__exit__(exc_type, exc, tb)
                         if self._show:
@@ -277,15 +290,13 @@ class _FlopProfiler:
                         return 0.0
                     try:
                         events = self._prof.key_averages()
-                        return float(
-                            sum(getattr(e, "flops", 0.0) for e in events)
-                        )
+                        return float(sum(getattr(e, "flops", 0.0) for e in events))
                     except Exception:
                         return 0.0
 
             return _TorchFlops(bool(display))
 
-        class _TorchFlopsCompat(contextlib.AbstractContextManager):
+        class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
             def __init__(self, show: bool) -> None:
                 try:
                     from torch.utils.flop_counter import FlopCounterMode as _TorchMode
@@ -294,12 +305,17 @@ class _FlopProfiler:
                 except Exception:
                     self._impl = None
 
-            def __enter__(self):
+            def __enter__(self) -> "_TorchFlopsCompat":
                 if self._impl is not None:
                     self._impl.__enter__()
                 return self
 
-            def __exit__(self, exc_type, exc, tb):
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
                 if self._impl is not None:
                     self._impl.__exit__(exc_type, exc, tb)
                 return False
@@ -361,7 +377,13 @@ class _FlopProfiler:
             except Exception:
                 pass
 
-    def monitoring(self, device: Optional[torch.device], *args: Any, display: bool = False, **kwargs: Any) -> Any:
+    def monitoring(
+        self,
+        device: Optional[torch.device],
+        *args: Any,
+        display: bool = False,
+        **kwargs: Any,
+    ) -> Any:
         instrumentation = self
         self.activate()
 
