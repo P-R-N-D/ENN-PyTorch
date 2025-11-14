@@ -136,7 +136,6 @@ ignored_sentences = [
 ]
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 _DL_STATE_FILE = "dataloader.json"
-_FLOAT8_LOG_MESSAGES: set[str] = set()
 
 
 @torch.no_grad()
@@ -365,19 +364,7 @@ def _num_batches(loader: Any) -> int:
 def _float8_log(
     msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
 ) -> None:
-    text = str(msg)
-    if text in _FLOAT8_LOG_MESSAGES:
-        return
-    _FLOAT8_LOG_MESSAGES.add(text)
-    if not only_main_rank:
-        warnings.warn(text)
-        return
-    try:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return
-    except Exception:
-        pass
-    warnings.warn(text)
+    return None
 
 
 def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
