@@ -968,7 +968,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         self._force_pt: bool = self._te_mha is None
         if self._force_pt:
             warnings.warn(
-                "Transformer Engine MHA 사용 불가: torch.nn.MultiheadAttention으로 폴백합니다.",
+                "Unable to use Transformer Engine multi-head attention; falling back to torch.nn.MultiheadAttention.",
                 RuntimeWarning,
             )
 

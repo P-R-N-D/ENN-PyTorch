@@ -353,9 +353,9 @@ class PowerTransform(nn.Module):
     ) -> Tuple["np.ndarray", "np.ndarray"]:
 
         if _np is None:
-            raise RuntimeError("NumPy가 필요합니다: pip install numpy")
+            raise RuntimeError("NumPy is required; install it with 'pip install numpy'.")
         if _sps is None:
-            raise RuntimeError("SciPy가 필요합니다: pip install scipy")
+            raise RuntimeError("SciPy is required; install it with 'pip install scipy'.")
         X = _np.asarray(X, dtype=_np.float64)
         D = X.shape[-1]
         lam = _np.zeros(D, dtype=_np.float64)
@@ -630,9 +630,7 @@ class Normal(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> None:
         if self.pt is None:
-            raise RuntimeError(
-                "power transform이 활성화되어 있지 않습니다 (power=None)."
-            )
+            raise RuntimeError("Power transform is not enabled (power=None).")
         self.pt.set_params(lmbda, shift, mask)
 
     @torch.no_grad()
@@ -640,9 +638,7 @@ class Normal(nn.Module):
         self, X: "np.ndarray", boxcox_shift: str = "auto"
     ) -> Tuple["np.ndarray", "np.ndarray"]:
         if self.pt is None:
-            raise RuntimeError(
-                "power transform이 활성화되어 있지 않습니다 (power=None)."
-            )
+            raise RuntimeError("Power transform is not enabled (power=None).")
         return self.pt.fit_params_numpy(X, boxcox_shift=boxcox_shift)
 
     @torch.no_grad()
@@ -1190,9 +1186,9 @@ class StudentsT(nn.Module):
     ) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
 
         if _np is None:
-            raise RuntimeError("NumPy가 필요합니다: pip install numpy")
+            raise RuntimeError("NumPy is required; install it with 'pip install numpy'.")
         if _sps is None:
-            raise RuntimeError("SciPy가 필요합니다: pip install scipy")
+            raise RuntimeError("SciPy is required; install it with 'pip install scipy'.")
         X = _np.asarray(X, dtype=_np.float64)
         if X.ndim != 2 or X.shape[1] != self.n_features:
             raise ValueError(f"X shape must be (N, {self.n_features})")
@@ -2383,7 +2379,7 @@ class LongNet(nn.Module):
                 out = self._impl(out)
             except Exception as exc:
                 warnings.warn(
-                    f"torchscale LongNet 호출 실패: {exc}. 입력을 그대로 반환.",
+                    f"torchscale LongNet call failed: {exc}. Returning the input tensor.",
                     RuntimeWarning,
                 )
             if self._impl_batch_first is not True:
