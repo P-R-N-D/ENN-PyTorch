@@ -7,7 +7,7 @@ import logging
 import math
 from contextlib import AbstractContextManager
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -23,9 +23,6 @@ from ..backend.system import (
     is_int8_supported,
 )
 from ..data.stats import Metadata
-
-if TYPE_CHECKING:
-    from ..model.kernels import DotProductAttention as _DotProductAttention
 
 patch_torch()
 
@@ -1696,7 +1693,6 @@ class Fusion:
 
         seq: List[nn.Module] = []
         current_key = in_key
-        current_path = parent_path
         for name, child in children:
             next_key = cls._auto_key(current_key, name)
             next_path = f"{parent_path}.{name}" if parent_path else name
@@ -1718,7 +1714,7 @@ class Fusion:
                         origin_path=next_path,
                     )
                 )
-            current_key, current_path = next_key, next_path
+            current_key = next_key
 
         def _alias(val: Any, typ: str, nm: str, path: str) -> tuple[Any, str, str, str]:
             return (val, typ, nm, path)

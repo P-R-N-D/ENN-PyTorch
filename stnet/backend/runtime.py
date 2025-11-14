@@ -10,7 +10,6 @@ import sys
 import time
 import warnings
 import threading
-import queue
 from functools import partial
 from dataclasses import replace
 from typing import (

@@ -9,12 +9,14 @@ from tensordict import set_list_to_stack
 set_list_to_stack(True).set()
 
 try:
-    import torch
     import torch._inductor.config as _inductor_cfg
-
-    _inductor_cfg.triton.cudagraph_skip_dynamic_graphs = True
 except Exception:
-    pass
+    _inductor_cfg = None
+else:
+    try:
+        _inductor_cfg.triton.cudagraph_skip_dynamic_graphs = True
+    except Exception:
+        pass
 
 _MODEL_EXPORTS = (
     "Root",

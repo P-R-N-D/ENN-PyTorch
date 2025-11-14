@@ -217,7 +217,7 @@ class _FlopProfiler:
         self.coerce_flops_ntvx()
         getter = self._nvtx_getter or self._get_ntvx
         try:
-            import torch.cuda.nvtx as nvtx
+            getattr(torch.cuda, "nvtx")
         except Exception:
             return contextlib.nullcontext()
 

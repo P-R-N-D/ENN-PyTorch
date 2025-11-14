@@ -6,8 +6,6 @@ from contextlib import suppress
 from typing import Any, Dict, List, Sequence, Tuple, Union
 
 import torch
-import torch.nn.functional as F
-from torch import Tensor
 from tensordict import TensorDictBase
 
 from .datatype import to_tuple, to_torch_tensor
