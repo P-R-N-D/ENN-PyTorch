@@ -133,6 +133,7 @@ def compose(
     non_blocking_copy: bool,
     io_workers: int,
     prebatch: int,
+    weights: Optional[Mapping[str, float]] = None,
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
@@ -141,7 +142,11 @@ def compose(
     except Exception:
         pass
 
-    mux = Multiplexer(stop_criteria="CYCLE_FOREVER", seed=0)
+    mx_weights = None
+    if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping):
+        mx_weights = weights
+
+    mux = Multiplexer(stop_criteria="CYCLE_FOREVER", seed=0, weights=mx_weights)
     source = mux.compose(node_or_nodes)
 
     mapper = Connector(
@@ -169,6 +174,8 @@ def fetch(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = True,
     flatten_features: bool = True,
+    train_weights: Optional[Mapping[str, float]] = None,
+    val_weights: Optional[Mapping[str, float]] = None,
 ) -> Tuple[Any, Optional[Any], Disposable]:
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
 
@@ -187,59 +194,297 @@ def fetch(
 
     allocated = Disposable()
 
-    def _node_for(spec: SourceSpec, split: str, shuffle: bool) -> Tuple[BaseNode, int]:
+    def _node_for(spec: SourceSpec, split: str, shuffle: bool) -> Tuple[BaseNode, int, Any]:
+        """
+        각 source에 대해 여기서는 Dataset + SamplerWrapper까지만 만든다.
+        이후 멀티 소스 믹싱과 배치 구성은 compose(...)에서 일괄 처리.
+
+        반환:
+          - sampler_node: Sampler.compose(ds) → SamplerWrapper(self)
+          - length: sampler의 길이
+          - ds: 해당 torch.utils.data.Dataset (나중에 __getitem__에 사용)
+        """
         ds = dataset(spec, split=split, val_frac=float(val_frac))
         allocated.add(ds)
-        samp = Sampler(start=ds.start, end=ds.end, batch_size=int(batch_size), shuffle=shuffle, seed=0)
-        node = samp.compose(ds)
-        return node, len(samp)
 
+        samp = Sampler(
+            start=ds.start,
+            end=ds.end,
+            batch_size=int(batch_size),
+            shuffle=shuffle,
+            seed=0,
+        )
+
+        sampler_node = samp.compose(ds)  # SamplerWrapper(self)
+        return sampler_node, len(samp), ds
+
+    # --- train loader 구성 ---
     if isinstance(sources, Mapping) and not _is_source_spec(sources):
-        nodes_map: Dict[str, BaseNode] = {}
+        sampler_nodes: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
+        datasets: Dict[str, Any] = {}
         for key, spec in sources.items():
-            node, length = _node_for(spec, split="train", shuffle=True)
-            nodes_map[str(key)] = node
+            sampler_node, length, ds = _node_for(spec, split="train", shuffle=True)
+            sampler_nodes[str(key)] = sampler_node
             lengths[str(key)] = length
-        _, mapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            datasets[str(key)] = ds
+
+        if not sampler_nodes:
+            raise RuntimeError("No training sources provided")
+        if ParallelMapper is None:
+            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+
+        sample_nodes: Dict[str, BaseNode] = {}
+        for key, sampler_node in sampler_nodes.items():
+            ds = datasets[key]
+            getitem = getattr(ds, "__getitem__", None)
+            if not callable(getitem):
+                raise TypeError(f"Dataset for key {key!r} has no __getitem__")
+            sample_nodes[key] = ParallelMapper(
+                sampler_node,
+                getitem,
+                num_workers=1,
+                in_order=True,
+                method="thread",
+                multiprocessing_context=None,
+                max_concurrent=None,
+                snapshot_frequency=1,
+                prebatch=None,
+            )
+
+        _, mapped, _ = compose(
+            sample_nodes,
+            device=device_obj,
+            map_fn=map_fn,
+            prefetch_factor=int(pf_depth),
+            non_blocking_copy=bool(non_blocking_copy),
+            io_workers=io_workers,
+            prebatch=prebatch,
+            weights=train_weights,
+        )
         train_length = sum(lengths.values()) if lengths else None
+
     elif isinstance(sources, (list, tuple)):
-        nodes_list: list[BaseNode] = []
+        sampler_list: list[BaseNode] = []
         lengths: list[int] = []
+        datasets: list[Any] = []
         for spec in sources:
-            node, length = _node_for(spec, split="train", shuffle=True)
-            nodes_list.append(node); lengths.append(length)
-        _, mapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
+            sampler_node, length, ds = _node_for(spec, split="train", shuffle=True)
+            sampler_list.append(sampler_node)
+            lengths.append(length)
+            datasets.append(ds)
+
+        if not sampler_list:
+            raise RuntimeError("No training sources provided")
+        if ParallelMapper is None:
+            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+
+        sample_nodes: list[BaseNode] = []
+        for sampler_node, ds in zip(sampler_list, datasets):
+            getitem = getattr(ds, "__getitem__", None)
+            if not callable(getitem):
+                raise TypeError("Dataset has no __getitem__")
+            sample_nodes.append(
+                ParallelMapper(
+                    sampler_node,
+                    getitem,
+                    num_workers=1,
+                    in_order=True,
+                    method="thread",
+                    multiprocessing_context=None,
+                    max_concurrent=None,
+                    snapshot_frequency=1,
+                    prebatch=None,
+                )
+            )
+
+        _, mapped, _ = compose(
+            sample_nodes,
+            device=device_obj,
+            map_fn=map_fn,
+            prefetch_factor=int(pf_depth),
+            non_blocking_copy=bool(non_blocking_copy),
+            io_workers=io_workers,
+            prebatch=prebatch,
+            weights=train_weights,
+        )
         train_length = sum(lengths) if lengths else None
+
     else:
-        node, length = _node_for(sources, split="train", shuffle=True)
-        _, mapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
-        train_length = length
+        sampler_node, train_length, ds = _node_for(sources, split="train", shuffle=True)
+        if ParallelMapper is None:
+            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+        getitem = getattr(ds, "__getitem__", None)
+        if not callable(getitem):
+            raise TypeError("Dataset has no __getitem__")
+        sample_node = ParallelMapper(
+            sampler_node,
+            getitem,
+            num_workers=1,
+            in_order=True,
+            method="thread",
+            multiprocessing_context=None,
+            max_concurrent=None,
+            snapshot_frequency=1,
+            prebatch=None,
+        )
+        _, mapped, _ = compose(
+            sample_node,
+            device=device_obj,
+            map_fn=map_fn,
+            prefetch_factor=int(pf_depth),
+            non_blocking_copy=bool(non_blocking_copy),
+            io_workers=io_workers,
+            prebatch=prebatch,
+            weights=train_weights,
+        )
 
-    train_loader = Loader(device=device_obj, node=mapped, prefetch_factor=int(pf_depth), non_blocking=bool(non_blocking_copy), length=train_length)
+    train_loader = Loader(
+        device=device_obj,
+        node=mapped,
+        prefetch_factor=int(pf_depth),
+        non_blocking=bool(non_blocking_copy),
+        length=train_length,
+    )
 
+    # --- val loader 구성 ---
     val_loader = None
     if float(val_frac) > 0.0:
         if isinstance(sources, Mapping) and not _is_source_spec(sources):
-            nodes_map = {}
-            lengths = {}
+            sampler_nodes: Dict[str, BaseNode] = {}
+            lengths: Dict[str, int] = {}
+            datasets: Dict[str, Any] = {}
             for key, spec in sources.items():
-                node, length = _node_for(spec, split="val", shuffle=False)
-                nodes_map[str(key)] = node; lengths[str(key)] = length
-            _, vmapped, _ = compose(nodes_map, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
-            val_len = sum(lengths.values()) if lengths else None
+                sampler_node, length, ds = _node_for(spec, split="val", shuffle=False)
+                sampler_nodes[str(key)] = sampler_node
+                lengths[str(key)] = length
+                datasets[str(key)] = ds
+            if not sampler_nodes:
+                raise RuntimeError("No validation sources provided")
+            if ParallelMapper is None:
+                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+
+            sample_nodes: Dict[str, BaseNode] = {}
+            for key, sampler_node in sampler_nodes.items():
+                ds = datasets[key]
+                getitem = getattr(ds, "__getitem__", None)
+                if not callable(getitem):
+                    raise TypeError(f"Dataset for key {key!r} has no __getitem__")
+                sample_nodes[key] = ParallelMapper(
+                    sampler_node,
+                    getitem,
+                    num_workers=1,
+                    in_order=True,
+                    method="thread",
+                    multiprocessing_context=None,
+                    max_concurrent=None,
+                    snapshot_frequency=1,
+                    prebatch=None,
+                )
+
+            _, vmapped, _ = compose(
+                sample_nodes,
+                device=device_obj,
+                map_fn=map_fn,
+                prefetch_factor=int(pf_depth),
+                non_blocking_copy=bool(non_blocking_copy),
+                io_workers=io_workers,
+                prebatch=prebatch,
+                weights=val_weights,
+            )
+            val_loader = Loader(
+                device=device_obj,
+                node=vmapped,
+                prefetch_factor=int(pf_depth),
+                non_blocking=bool(non_blocking_copy),
+                length=sum(lengths.values()) if lengths else None,
+            )
+
         elif isinstance(sources, (list, tuple)):
-            nodes_list = []
-            lengths = []
+            sampler_list: list[BaseNode] = []
+            lengths: list[int] = []
+            datasets: list[Any] = []
             for spec in sources:
-                node, length = _node_for(spec, split="val", shuffle=False)
-                nodes_list.append(node); lengths.append(length)
-            _, vmapped, _ = compose(nodes_list, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
-            val_len = sum(lengths) if lengths else None
+                sampler_node, length, ds = _node_for(spec, split="val", shuffle=False)
+                sampler_list.append(sampler_node)
+                lengths.append(length)
+                datasets.append(ds)
+            if not sampler_list:
+                raise RuntimeError("No validation sources provided")
+            if ParallelMapper is None:
+                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+
+            sample_nodes: list[BaseNode] = []
+            for sampler_node, ds in zip(sampler_list, datasets):
+                getitem = getattr(ds, "__getitem__", None)
+                if not callable(getitem):
+                    raise TypeError("Dataset has no __getitem__")
+                sample_nodes.append(
+                    ParallelMapper(
+                        sampler_node,
+                        getitem,
+                        num_workers=1,
+                        in_order=True,
+                        method="thread",
+                        multiprocessing_context=None,
+                        max_concurrent=None,
+                        snapshot_frequency=1,
+                        prebatch=None,
+                    )
+                )
+
+            _, vmapped, _ = compose(
+                sample_nodes,
+                device=device_obj,
+                map_fn=map_fn,
+                prefetch_factor=int(pf_depth),
+                non_blocking_copy=bool(non_blocking_copy),
+                io_workers=io_workers,
+                prebatch=prebatch,
+                weights=val_weights,
+            )
+            val_loader = Loader(
+                device=device_obj,
+                node=vmapped,
+                prefetch_factor=int(pf_depth),
+                non_blocking=bool(non_blocking_copy),
+                length=sum(lengths) if lengths else None,
+            )
+
         else:
-            node, length = _node_for(sources, split="val", shuffle=False)
-            _, vmapped, _ = compose(node, device=device_obj, map_fn=map_fn, prefetch_factor=int(pf_depth), non_blocking_copy=bool(non_blocking_copy), io_workers=io_workers, prebatch=prebatch)
-            val_len = length
-        val_loader = Loader(device=device_obj, node=vmapped, prefetch_factor=int(pf_depth), non_blocking=bool(non_blocking_copy), length=val_len)
+            sampler_node, val_len, ds = _node_for(sources, split="val", shuffle=False)
+            if ParallelMapper is None:
+                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+            getitem = getattr(ds, "__getitem__", None)
+            if not callable(getitem):
+                raise TypeError("Dataset has no __getitem__")
+            sample_node = ParallelMapper(
+                sampler_node,
+                getitem,
+                num_workers=1,
+                in_order=True,
+                method="thread",
+                multiprocessing_context=None,
+                max_concurrent=None,
+                snapshot_frequency=1,
+                prebatch=None,
+            )
+            _, vmapped, _ = compose(
+                sample_node,
+                device=device_obj,
+                map_fn=map_fn,
+                prefetch_factor=int(pf_depth),
+                non_blocking_copy=bool(non_blocking_copy),
+                io_workers=io_workers,
+                prebatch=prebatch,
+                weights=val_weights,
+            )
+            val_loader = Loader(
+                device=device_obj,
+                node=vmapped,
+                prefetch_factor=int(pf_depth),
+                non_blocking=bool(non_blocking_copy),
+                length=val_len,
+            )
 
     return (train_loader, val_loader, allocated)

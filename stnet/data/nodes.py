@@ -14,26 +14,26 @@ import torch
 from ..backend.system import wrap_with_tlb, get_tlb
 
 try:
-    from torchdata.nodes import BaseNode
+    from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
 except Exception:
-    BaseNode = object
+    from torchdata.nodes import BaseNode, Loader as _Loader
+    ParallelMapper = None
 
 try:
     from tensordict import MemoryMappedTensor
 except Exception as e:
     raise RuntimeError("tensordict is required for Dataset") from e
 
+# 필요 시 아래와 같은 import 라인이 존재해야 합니다.
 try:
     from torchdata.nodes import (
-        Loader as _Loader,
         MultiNodeWeightedSampler,
-        ParallelMapper,
         PinMemory,
         Prefetcher as _Prefetcher,
         SamplerWrapper,
     )
 except Exception:
-    from torchdata.nodes import Loader as _Loader, ParallelMapper, PinMemory, Prefetcher as _Prefetcher
+    from torchdata.nodes import PinMemory, Prefetcher as _Prefetcher
     MultiNodeWeightedSampler = None
     SamplerWrapper = None
 
@@ -431,21 +431,13 @@ class Sampler(_Sampler):
         self._rng.seed(self._seed + int(epoch))
 
     def compose(self, dataset: "Dataset") -> "BaseNode":
-        map_fn = getattr(dataset, "__getitem__", None)
-        if SamplerWrapper is None or ParallelMapper is None or not callable(map_fn):
-            raise RuntimeError("torchdata.nodes.SamplerWrapper and ParallelMapper are required")
-        sampler_node = SamplerWrapper(self)
-        return ParallelMapper(
-            sampler_node,
-            map_fn,
-            num_workers=1,
-            in_order=True,
-            method="thread",
-            multiprocessing_context=None,
-            max_concurrent=None,
-            snapshot_frequency=1,
-            prebatch=None,
-        )
+        """
+        Sampler 단계에서는 인덱스만 스트리밍합니다.
+        실제 데이터 로딩(__getitem__)과 배치 구성(collate)은 다운스트림(Connector)에서 처리합니다.
+        """
+        if SamplerWrapper is None:
+            raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
+        return SamplerWrapper(self)
 
 
 class Multiplexer:
@@ -558,6 +550,18 @@ class Connector:
 
 
 class Loader:
+    """
+    기존 래퍼 클래스. __init__ 경로는 그대로 두되,
+    노드 체인에 _Loader를 직접 삽입할 수 있도록 compose()를 제공합니다.
+    """
+
+    @staticmethod
+    def compose(source: "BaseNode") -> "BaseNode":
+        """
+        torchdata.nodes.Loader(_Loader)를 노드 체인에 삽입합니다.
+        """
+        return _Loader(source)
+
     def __init__(
         self,
         device: torch.device,
@@ -595,7 +599,7 @@ class Loader:
             self._shard_id = max(0, min(self._num_shards - 1, int(dev_idx * thr)))
         except Exception:
             pass
-        base = _Loader(node_obj)
+        base = node_obj if isinstance(node_obj, _Loader) else _Loader(node_obj)
         dev_t = getattr(self._device, "type", "cpu")
         if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
             try:
