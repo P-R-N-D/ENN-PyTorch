@@ -9,11 +9,9 @@ import shutil
 import warnings
 import numpy as np
 from dataclasses import asdict
-from types import SimpleNamespace
-from typing import Any, Dict, Optional, Tuple, Sequence, Mapping
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
-import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
 from torch.distributed.checkpoint.state_dict import (
@@ -99,31 +97,23 @@ def train(
     try:
         val_frac = float(val_frac)
         val_frac = 0.0 if val_frac < 0.0 else (1.0 if val_frac > 1.0 else val_frac)
-    except Exception:
+    except (TypeError, ValueError):
         val_frac = 0.1
 
     try:
         seed_value = int(seed)
-    except Exception:
+    except (TypeError, ValueError):
         seed_value = None
 
     if seed_value is not None:
-        try:
-            torch.manual_seed(seed_value)
-        except Exception:
-            pass
-        try:
-            torch.cuda.manual_seed_all(seed_value)
-        except Exception:
-            pass
-        try:
-            random.seed(seed_value)
-        except Exception:
-            pass
-        try:
-            np.random.seed(seed_value)
-        except Exception:
-            pass
+        for setter in (
+            torch.manual_seed,
+            torch.cuda.manual_seed_all,
+            random.seed,
+            np.random.seed,
+        ):
+            with contextlib.suppress(Exception):
+                setter(seed_value)
     with contextlib.suppress(Exception):
         torch.use_deterministic_algorithms(True, warn_only=True)
     with contextlib.suppress(Exception):
@@ -157,13 +147,6 @@ def train(
     initialize_python_path()
     mp.allow_connection_pickling()
     set_multiprocessing_env()
-
-    is_dist = dist.is_available() and dist.is_initialized()
-    rank = dist.get_rank() if is_dist else 0
-    try:
-        backend = dist.get_backend() if is_dist else None
-    except Exception:
-        backend = None
 
     memmap_dir = new_dir("memmap_ds")
 

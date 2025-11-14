@@ -24,12 +24,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDict, TensorDictBase
 
-with contextlib.suppress(Exception):
+try:
     import numpy as _np
-with contextlib.suppress(Exception):
+except Exception:
+    _np = None
+
+try:
     import scipy.stats as _sps
-with contextlib.suppress(Exception):
-    from scipy.special import inv_boxcox as _inv_boxcox
+except Exception:
+    _sps = None
 try:
     from torch.utils.checkpoint import checkpoint as activation_checkpoint
 except Exception:
@@ -70,6 +73,8 @@ patch_torch()
 
 
 if TYPE_CHECKING:
+    import numpy as np
+
     from ..api.config import ModelConfig
 
 
@@ -347,6 +352,8 @@ class PowerTransform(nn.Module):
         boxcox_shift: str = "auto",
     ) -> Tuple["np.ndarray", "np.ndarray"]:
 
+        if _np is None:
+            raise RuntimeError("NumPy가 필요합니다: pip install numpy")
         if _sps is None:
             raise RuntimeError("SciPy가 필요합니다: pip install scipy")
         X = _np.asarray(X, dtype=_np.float64)
@@ -1182,6 +1189,8 @@ class StudentsT(nn.Module):
         apply_bn: bool = False,
     ) -> Tuple["np.ndarray", "np.ndarray", "np.ndarray"]:
 
+        if _np is None:
+            raise RuntimeError("NumPy가 필요합니다: pip install numpy")
         if _sps is None:
             raise RuntimeError("SciPy가 필요합니다: pip install scipy")
         X = _np.asarray(X, dtype=_np.float64)

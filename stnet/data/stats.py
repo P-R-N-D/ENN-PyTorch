@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import dataclass, field
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar
 
 import math

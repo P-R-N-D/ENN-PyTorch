@@ -6,7 +6,7 @@ import os
 import queue
 import random
 import threading
-from contextlib import suppress, nullcontext
+from contextlib import suppress
 from typing import (
     Any,
     Callable,

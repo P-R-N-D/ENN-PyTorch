@@ -11,9 +11,9 @@ from tensordict import TensorDict, TensorDictBase, stack
 from ..backend.system import get_tlb, optimize_threads
 
 try:
-    from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
+    from torchdata.nodes import BaseNode, ParallelMapper
 except Exception:
-    from torchdata.nodes import BaseNode, Loader as _Loader
+    from torchdata.nodes import BaseNode
 
     ParallelMapper = None
 
