@@ -4,7 +4,7 @@ from __future__ import annotations
 import importlib
 from contextlib import contextmanager, suppress
 from functools import partial
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 import torch
 from torch import nn
@@ -161,8 +161,8 @@ class TorchCompat:
         nn_module: Any | None = None,
     ) -> None:
         self.module = module if module is not None else torch
-        self.nn_module = nn_module if nn_module is not None else getattr(
-            self.module, "nn", nn
+        self.nn_module = (
+            nn_module if nn_module is not None else getattr(self.module, "nn", nn)
         )
 
     def apply(self) -> None:
@@ -188,9 +188,7 @@ class TorchCompat:
                 self.weight = nn_mod.Parameter(torch_mod.ones(d_model))
 
             def forward(self, x: Any) -> Any:
-                inv_rms = (
-                    x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-                )
+                inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
                 return x * inv_rms * self.weight
 
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
@@ -238,7 +236,6 @@ def cudagraph_step_end() -> None:
 
 
 def is_fake_tensor(value: Any) -> bool:
-
     if not isinstance(value, torch.Tensor):
         return False
     if _tdx_is_fake is not None:
@@ -246,25 +243,28 @@ def is_fake_tensor(value: Any) -> bool:
             return bool(_tdx_is_fake(value))
         except Exception:
             pass
-    return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+    return (
+        isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+    )
 
 
 def is_meta_tensor(value: Any) -> bool:
-
     return isinstance(value, torch.Tensor) and getattr(value, "is_meta", False)
 
 
 def is_meta_or_fake_tensor(value: Any) -> bool:
-
     return is_meta_tensor(value) or is_fake_tensor(value)
 
 
 def torch_compile_disable(
-    *, reason: str | None = None, recursive: bool = True
-):
+    *,
+    reason: str | None = None,
+    recursive: bool = True,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
 
     if _TORCH_COMPILE_DISABLE is None:
-        def _identity(fn: Any) -> Any:
+
+        def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn
 
         return _identity
@@ -288,15 +288,13 @@ def torch_compile_disable(
         except TypeError:
             continue
 
-    def _identity(fn: Any) -> Any:
+    def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn
 
     return _identity
 
 
-def torch_disable_dynamo(
-    *, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
-) -> bool:
+def torch_disable_dynamo(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
 
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False

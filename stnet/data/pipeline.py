@@ -14,6 +14,7 @@ try:
     from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
 except Exception:
     from torchdata.nodes import BaseNode, Loader as _Loader
+
     ParallelMapper = None
 
 from .nodes import (
@@ -64,6 +65,7 @@ def dataset(
         raise ValueError(f"val_frac must be in [0,1], got: {vf}")
     return Dataset(path, split=sp, val_frac=vf)
 
+
 def _process(
     batch: Mapping[str, Any],
     *args: Any,
@@ -107,11 +109,16 @@ def collate(
         batch_list = []
         for item in sample:
             if isinstance(item, TensorDictBase):
-                batch_list.append(item); continue
-            if isinstance(item, Mapping):
+                batch_list.append(item)
+            elif isinstance(item, Mapping):
                 conv = converter(item)
                 td = TensorDict(
-                    {"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]},
+                    {
+                        "X": conv["X"],
+                        "Y": conv["Y"],
+                        "features": conv["X"],
+                        "labels": conv["Y"],
+                    },
                     batch_size=[],
                 )
                 batch_list.append(td)
@@ -122,8 +129,17 @@ def collate(
         return batch_list
     if isinstance(sample, Mapping):
         conv = converter(sample)
-        return TensorDict({"X": conv["X"], "Y": conv["Y"], "features": conv["X"], "labels": conv["Y"]}, batch_size=[])
+        return TensorDict(
+            {
+                "X": conv["X"],
+                "Y": conv["Y"],
+                "features": conv["X"],
+                "labels": conv["Y"],
+            },
+            batch_size=[],
+        )
     return sample
+
 
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
@@ -137,7 +153,9 @@ def compose(
     weights: Optional[Mapping[str, float]] = None,
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
-    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
+    device_obj = (
+        torch.device(device) if not isinstance(device, torch.device) else device
+    )
     try:
         get_tlb(io_workers=io_workers)
     except Exception:
@@ -178,9 +196,10 @@ def fetch(
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
 ) -> Tuple[Any, Optional[Any], Disposable]:
-    device_obj = torch.device(device) if not isinstance(device, torch.device) else device
+    device_obj = (
+        torch.device(device) if not isinstance(device, torch.device) else device
+    )
 
-    # Use system-level optimizer hints (sets torch threads as well)
     hints = optimize_threads()
     io_workers = max(1, int(hints.get("num_workers", 1)))
     prebatch = max(1, int(hints.get("prebatch", max(1, io_workers * 2))))
@@ -195,16 +214,9 @@ def fetch(
 
     allocated = Disposable()
 
-    def _node_for(spec: SourceSpec, split: str, shuffle: bool) -> Tuple[BaseNode, int, Any]:
-        """
-        각 source에 대해 여기서는 Dataset + SamplerWrapper까지만 만든다.
-        이후 멀티 소스 믹싱과 배치 구성은 compose(...)에서 일괄 처리.
-
-        반환:
-          - sampler_node: Sampler.compose(ds) → SamplerWrapper(self)
-          - length: sampler의 길이
-          - ds: 해당 torch.utils.data.Dataset (나중에 __getitem__에 사용)
-        """
+    def _node_for(
+        spec: SourceSpec, split: str, shuffle: bool
+    ) -> Tuple[BaseNode, int, Any]:
         ds = dataset(spec, split=split, val_frac=float(val_frac))
         allocated.add(ds)
 
@@ -216,10 +228,9 @@ def fetch(
             seed=0,
         )
 
-        sampler_node = samp.compose(ds)  # SamplerWrapper(self)
+        sampler_node = samp.compose(ds)
         return sampler_node, len(samp), ds
 
-    # --- train loader 구성 ---
     if isinstance(sources, Mapping) and not _is_source_spec(sources):
         sampler_nodes: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
@@ -348,7 +359,6 @@ def fetch(
         length=train_length,
     )
 
-    # --- val loader 구성 ---
     val_loader = None
     if float(val_frac) > 0.0:
         if isinstance(sources, Mapping) and not _is_source_spec(sources):

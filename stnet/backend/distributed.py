@@ -236,7 +236,9 @@ def is_port_available(host: str, port: int) -> bool:
     if not literal_host:
         return False
     try:
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        with contextlib.closing(
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((literal_host, port))
             return True
@@ -288,12 +290,16 @@ def get_available_host(
     return f"{host}:{selected_port}"
 
 
-def supported_ip_ver(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> tuple[bool, bool]:
+def supported_ip_ver(
+    *args: Any, allow_loopback: bool = True, **kwargs: Any
+) -> tuple[bool, bool]:
     ipv4_ok = False
     ipv6_ok = False
     ipv4_host = "127.0.0.1" if allow_loopback else "0.0.0.0"
     try:
-        with contextlib.closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock4:
+        with contextlib.closing(
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        ) as sock4:
             sock4.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock4.bind((ipv4_host, 0))
             ipv4_ok = True
@@ -303,12 +309,12 @@ def supported_ip_ver(*args: Any, allow_loopback: bool = True, **kwargs: Any) -> 
     if getattr(socket, "has_ipv6", False):
         ipv6_host = "::1" if allow_loopback else "::"
         try:
-            with contextlib.closing(socket.socket(socket.AF_INET6, socket.SOCK_STREAM)) as sock6:
+            with contextlib.closing(
+                socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            ) as sock6:
                 if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
                     with contextlib.suppress(OSError):
-                        sock6.setsockopt(
-                            socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1
-                        )
+                        sock6.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
                 sock6.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock6.bind((ipv6_host, 0, 0, 0))
                 ipv6_ok = True
@@ -385,7 +391,10 @@ def get_preferred_ip(
             if key in seen:
                 continue
             seen.add(key)
-            bucket_key = ("loopback" if parsed.is_loopback else "global", parsed.version)
+            bucket_key = (
+                "loopback" if parsed.is_loopback else "global",
+                parsed.version,
+            )
             buckets.setdefault(bucket_key, []).append(parsed)
 
     if prefer_ipv6:
@@ -578,7 +587,7 @@ def distributed_sync(
     device: Optional[torch.device] = None,
     src: int = 0,
 ) -> None:
-    
+
     if not is_distributed():
         return
     _m = module.module if hasattr(module, "module") else module

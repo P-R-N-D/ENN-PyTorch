@@ -208,7 +208,9 @@ class AdamW:
                     logger("[OPT] Low-bit optimizers disabled: data is not integral")
             else:
                 max_abs = float(abs(getattr(meta, "scale_max_abs", 0.0)))
-                candidates: List[Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]] = []
+                candidates: List[
+                    Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]
+                ] = []
                 if max_abs <= 7.0:
                     candidates.append(("int4", is_int4_supported))
                 if max_abs <= 127.0:
@@ -263,7 +265,6 @@ class AdamW:
 
 
 class StochasticWeightAverage:
-
     def __init__(
         self,
         model: nn.Module,
@@ -276,7 +277,9 @@ class StochasticWeightAverage:
         if _SWA is None:
             raise RuntimeError("torch.optim.swa_utils is not available")
         self._source = model
-        self._averaged = _SWA(model, device=device, use_buffers=use_buffers, avg_fn=avg_fn)
+        self._averaged = _SWA(
+            model, device=device, use_buffers=use_buffers, avg_fn=avg_fn
+        )
 
     @property
     def module(self) -> nn.Module:
@@ -287,7 +290,6 @@ class StochasticWeightAverage:
         return self._source
 
     def update_weight(self, model: Optional[nn.Module] = None) -> None:
-
         target = model if model is not None else self._source
         if target is None:
             raise RuntimeError(
@@ -297,7 +299,6 @@ class StochasticWeightAverage:
 
     @contextlib.contextmanager
     def reduction(self, model: nn.Module) -> Iterator[None]:
-
         backup: Dict[str, torch.Tensor] = {}
         try:
             for (name, param), (_, avg_param) in zip(

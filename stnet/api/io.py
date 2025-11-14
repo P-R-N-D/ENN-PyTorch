@@ -6,6 +6,7 @@ import json
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
+from types import ModuleType
 from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import torch
@@ -33,15 +34,17 @@ from ..functional.fx import Fusion
 from ..model import Root
 from .config import ModelConfig, coerce_model_config
 
-class Format(Protocol):
 
+class Format(Protocol):
     name: str
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]: ...
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]: ...
 
 
 @lru_cache(maxsize=1)
-def _export_backend():
+def _export_backend() -> ModuleType:
     from ..backend import export as export_mod
 
     return export_mod
@@ -103,7 +106,9 @@ def load_model(
     p = Path(checkpoint_path)
     if p.is_dir():
         if in_dim is None or out_shape is None:
-            raise ValueError("Loading from a checkpoint directory requires in_dim and out_shape.")
+            raise ValueError(
+                "Loading from a checkpoint directory requires in_dim and out_shape."
+            )
         model = new_model(int(in_dim), tuple(out_shape), config, wrap=wrap)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
@@ -114,12 +119,18 @@ def load_model(
     if p.suffix.lower() == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+            raise RuntimeError(
+                "Missing sidecar JSON file for the safetensors checkpoint."
+            )
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
-        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
+        out_shape_meta = (
+            out_shape if out_shape is not None else meta.get("out_shape") or ()
+        )
         use_out_shape = tuple(int(x) for x in out_shape_meta)
-        use_config = coerce_model_config(config if config is not None else meta.get("config"))
+        use_config = coerce_model_config(
+            config if config is not None else meta.get("config")
+        )
         model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
@@ -180,7 +191,6 @@ def save_model(
 
 
 class Model:
-
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
@@ -204,7 +214,10 @@ class Model:
 
         if not suffix:
             if p.exists() and p.is_dir():
-                from torch.distributed.checkpoint import FileSystemWriter, save as dcp_save
+                from torch.distributed.checkpoint import (
+                    FileSystemWriter,
+                    save as dcp_save,
+                )
 
                 opts_sd = StateDictOptions(full_state_dict=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
@@ -233,7 +246,9 @@ class Model:
                 "pytorch_version": torch.__version__,
                 "extra": extra or {},
             }
-            p.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+            p.with_suffix(".json").write_text(
+                json.dumps(meta, indent=2), encoding="utf-8"
+            )
             return p
 
         payload: Dict[str, Any] = {

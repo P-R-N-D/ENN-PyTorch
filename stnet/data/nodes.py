@@ -7,7 +7,18 @@ import queue
 import random
 import threading
 from contextlib import suppress, nullcontext
-from typing import Any, Callable, Dict, Iterator, Mapping, Optional, Sequence, Tuple, TypedDict, Literal
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+    Literal,
+)
 
 import torch
 
@@ -17,6 +28,7 @@ try:
     from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
 except Exception:
     from torchdata.nodes import BaseNode, Loader as _Loader
+
     ParallelMapper = None
 
 try:
@@ -24,7 +36,7 @@ try:
 except Exception as e:
     raise RuntimeError("tensordict is required for Dataset") from e
 
-# 필요 시 아래와 같은 import 라인이 존재해야 합니다.
+
 try:
     from torchdata.nodes import (
         MultiNodeWeightedSampler,
@@ -34,6 +46,7 @@ try:
     )
 except Exception:
     from torchdata.nodes import PinMemory, Prefetcher as _Prefetcher
+
     MultiNodeWeightedSampler = None
     SamplerWrapper = None
 
@@ -58,7 +71,14 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
 
 
 class Dataset(_Dataset):
-    def __init__(self, memmap_dir: str, *args: Any, split: str = "train", val_frac: float = 0.0, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        memmap_dir: str,
+        *args: Any,
+        split: str = "train",
+        val_frac: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Optional[Mapping[str, Any]] = None
@@ -68,11 +88,11 @@ class Dataset(_Dataset):
         with open(meta_path, "r", encoding="utf-8") as f:
             self._meta = json.load(f)
         self._N = int(self._meta.get("N", 0))
-        feat_rel  = str(self._meta.get("features_path", "features.mmt"))
-        lab_rel   = str(self._meta.get("labels_path", "labels.mmt"))
+        feat_rel = str(self._meta.get("features_path", "features.mmt"))
+        lab_rel = str(self._meta.get("labels_path", "labels.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
-        lab_path  = os.path.join(self.dir, lab_rel)
-        fdim      = int(self._meta.get("feature_dim", 0))
+        lab_path = os.path.join(self.dir, lab_rel)
+        fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
 
         def _dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
@@ -81,8 +101,10 @@ class Dataset(_Dataset):
             except Exception:
                 return default
 
-        f_dtype = _dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
-        l_dtype = _dtype_from_name(self._meta.get("labels_dtype", "int64"),   torch.int64)
+        f_dtype = _dtype_from_name(
+            self._meta.get("features_dtype", "float64"), torch.float64
+        )
+        l_dtype = _dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
@@ -132,9 +154,9 @@ class Dataset(_Dataset):
         if self._perm is None:
             self._perm_source = None
         train_start = int(self._meta.get("train_start", 0))
-        train_end   = int(self._meta.get("train_end",   self._N))
-        val_start   = int(self._meta.get("val_start",   0))
-        val_end     = int(self._meta.get("val_end",     0))
+        train_end = int(self._meta.get("train_end", self._N))
+        val_start = int(self._meta.get("val_start", 0))
+        val_end = int(self._meta.get("val_end", 0))
 
         if val_frac and not (val_end > val_start):
             vf = float(val_frac)
@@ -143,7 +165,9 @@ class Dataset(_Dataset):
             train_start, train_end = 0, val_start
 
         if self.split == "val":
-            self._start, self._end = (val_start, val_end) if val_end > val_start else (0, 0)
+            self._start, self._end = (
+                (val_start, val_end) if val_end > val_start else (0, 0)
+            )
         else:
             self._start, self._end = (train_start, train_end)
 
@@ -172,13 +196,19 @@ class Dataset(_Dataset):
                 try:
                     x = self._features.index_select(0, idx)
                 except Exception:
-                    x = self._features[idx] if hasattr(self._features, "__getitem__") \
+                    x = (
+                        self._features[idx]
+                        if hasattr(self._features, "__getitem__")
                         else torch.as_tensor(self._features)[idx]
+                    )
                 try:
                     y = self._labels.index_select(0, idx)
                 except Exception:
-                    y = self._labels[idx] if hasattr(self._labels, "__getitem__") \
+                    y = (
+                        self._labels[idx]
+                        if hasattr(self._labels, "__getitem__")
                         else torch.as_tensor(self._labels)[idx]
+                    )
         else:
             x = self._features[start:end]
             y = self._labels[start:end]
@@ -188,7 +218,9 @@ class Dataset(_Dataset):
         yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
         return {"X": xt, "Y": yt}
 
-    def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int]) -> Mapping[str, torch.Tensor]:
+    def __getitem__(
+        self, idx: int | Tuple[int, int] | Sequence[int]
+    ) -> Mapping[str, torch.Tensor]:
         if isinstance(idx, tuple) and len(idx) == 2:
             s, e = int(idx[0]), int(idx[1])
             return self._slice(s, e)
@@ -198,7 +230,10 @@ class Dataset(_Dataset):
             if len(idx) == 0:
                 return self._slice(0, 0)
             idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
-            if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
+            if (
+                self._perm_source == "runtime"
+                and getattr(self, "_perm", None) is not None
+            ):
                 idx_tensor = self._perm.index_select(0, idx_tensor)
             try:
                 x = self._features.index_select(0, idx_tensor)
@@ -315,13 +350,12 @@ def preload_memmap(
     if perm is not None and seed is not None:
         meta["perm_filename"] = "perm.pt"
 
-    # scaler-related metadata removed
-
     with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
         json.dump(meta, handle)
 
 
 SourceKind = Literal["memmap"]
+
 
 class SourceSpec(TypedDict):
     kind: SourceKind
@@ -352,7 +386,16 @@ class Disposable:
     def cleanup(self) -> None:
         for obj in self._keep:
             cleaned = False
-            for name in ("cleanup", "close", "shutdown", "stop", "terminate", "join", "disconnect", "release"):
+            for name in (
+                "cleanup",
+                "close",
+                "shutdown",
+                "stop",
+                "terminate",
+                "join",
+                "disconnect",
+                "release",
+            ):
                 if hasattr(obj, name):
                     with suppress(Exception):
                         getattr(obj, name)()
@@ -367,7 +410,7 @@ class Disposable:
     def close(self) -> None:
         self.cleanup()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Any]:
         return iter(self._keep)
 
 
@@ -397,14 +440,19 @@ class Sampler(_Sampler):
                 self._shard_id = max(0, int(dist.get_rank()))
             else:
                 self._num_shards = max(1, int(os.environ.get("WORLD_SIZE", "1") or "1"))
-                self._shard_id = max(0, int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0") or "0")))
+                self._shard_id = max(
+                    0,
+                    int(
+                        os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0") or "0")
+                    ),
+                )
         except Exception:
             pass
         self._cuts = list(range(self._start, self._end, self._B))
         if self._end > self._start and (not self._cuts or self._cuts[-1] != self._end):
             self._cuts.append(self._end)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[list[int]]:
         n = max(0, len(self._cuts) - 1)
         idxs = list(range(n))
         if self._shuffle:
@@ -431,10 +479,6 @@ class Sampler(_Sampler):
         self._rng.seed(self._seed + int(epoch))
 
     def compose(self, dataset: "Dataset") -> "BaseNode":
-        """
-        Sampler 단계에서는 인덱스만 스트리밍합니다.
-        실제 데이터 로딩(__getitem__)과 배치 구성(collate)은 다운스트림(Connector)에서 처리합니다.
-        """
         if SamplerWrapper is None:
             raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
         return SamplerWrapper(self)
@@ -500,19 +544,31 @@ class Connector:
 
             _t = optimal_threads()
         except Exception:
-            _t = {"num_workers": 1, "max_concurrancy": 1, "prebatch": 2, "prefetch_factor": 1}
+            _t = {
+                "num_workers": 1,
+                "max_concurrancy": 1,
+                "prebatch": 2,
+                "prefetch_factor": 1,
+            }
 
-        # Respect explicit overrides, otherwise use optimal_threads() hints
-        self.io_workers = int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
+        self.io_workers = (
+            int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
+        )
         self.io_workers = max(1, self.io_workers)
 
-        # Default: use hint; fallback to 2 * workers
-        self.prebatch = int(prebatch) if prebatch is not None else int(_t.get("prebatch", max(1, self.io_workers * 2)))
+        self.prebatch = (
+            int(prebatch)
+            if prebatch is not None
+            else int(_t.get("prebatch", max(1, self.io_workers * 2)))
+        )
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
 
-        # Prefetcher depth for CPU/GPU stages
-        pf = int(prefetch_factor) if prefetch_factor is not None else int(_t.get("prefetch_factor", 1))
+        pf = (
+            int(prefetch_factor)
+            if prefetch_factor is not None
+            else int(_t.get("prefetch_factor", 1))
+        )
         with suppress(Exception):
             pf = max(1, int(pf))
         self._prefetch_factor = pf
@@ -521,12 +577,14 @@ class Connector:
             device if isinstance(device, torch.device) else torch.device(device)
         )
         self.non_blocking = bool(non_blocking)
-        pin = bool(pin_memory) if pin_memory is not None else (
-            getattr(self.device, "type", "cpu") in {"cuda", "xpu"}
+        pin = (
+            bool(pin_memory)
+            if pin_memory is not None
+            else (getattr(self.device, "type", "cpu") in {"cuda", "xpu"})
         )
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
-        # Requirement: max_concurrancy == num_workers (safe & predictable)
+
         self.max_concurrancy = max(1, int(self.io_workers))
         try:
             get_tlb(io_workers=self.io_workers)
@@ -543,23 +601,19 @@ class Connector:
             max_concurrent=int(self.max_concurrancy),
             prebatch=self.prebatch,
         )
-        if self._pin_memory and getattr(self.device, "type", "cpu") in {"cuda", "xpu", "mps"}:
+        if self._pin_memory and getattr(self.device, "type", "cpu") in {
+            "cuda",
+            "xpu",
+            "mps",
+        }:
             node = PinMemory(node, pin_memory_device=self.device.type)
         node = _Prefetcher(node, prefetch_factor=self._prefetch_factor)
         return node
 
 
 class Loader:
-    """
-    기존 래퍼 클래스. __init__ 경로는 그대로 두되,
-    노드 체인에 _Loader를 직접 삽입할 수 있도록 compose()를 제공합니다.
-    """
-
     @staticmethod
     def compose(source: "BaseNode") -> "BaseNode":
-        """
-        torchdata.nodes.Loader(_Loader)를 노드 체인에 삽입합니다.
-        """
         return _Loader(source)
 
     def __init__(
@@ -623,7 +677,7 @@ class Loader:
         else:
             self._iterable = base
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Any]:
         return iter(self._iterable)
 
     def __len__(self) -> int:
@@ -666,7 +720,11 @@ class Loader:
             if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
                 return int(torch.cuda.current_device())
             xpu = getattr(torch, "xpu", None)
-            if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+            if (
+                xpu is not None
+                and callable(getattr(xpu, "is_available", None))
+                and xpu.is_available()
+            ):
                 return int(xpu.current_device())
         except Exception:
             pass
@@ -674,7 +732,6 @@ class Loader:
 
 
 class Prefetcher:
-
     def __init__(
         self,
         iterable: Any,
@@ -688,7 +745,9 @@ class Prefetcher:
         **kwargs: Any,
     ) -> None:
         self._src = iterable
-        self._device = torch.device(device) if not isinstance(device, torch.device) else device
+        self._device = (
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
         self._backpressure = bool(oom_safe)
@@ -696,8 +755,7 @@ class Prefetcher:
         self._host_guard_bytes = int(host_guard_bytes or 0)
 
     def __iter__(self) -> Iterator[Any]:
-
-        def _producer():
+        def _producer() -> None:
             try:
                 get_tlb().pin_thread()
             except Exception:
@@ -713,7 +771,9 @@ class Prefetcher:
                     except Exception:
                         n_streams = max(1, min(self._depth, 3))
                     try:
-                        streams = [torch.Stream(device=self._device) for _ in range(n_streams)]
+                        streams = [
+                            torch.Stream(device=self._device) for _ in range(n_streams)
+                        ]
                     except Exception:
                         streams = None
                         use_accel = False
@@ -743,14 +803,16 @@ class Prefetcher:
                             ev = None
                         q.put((moved, ev), block=True)
                     else:
-                        moved = _to_device(item, self._device, non_blocking=self._non_blocking)
+                        moved = _to_device(
+                            item, self._device, non_blocking=self._non_blocking
+                        )
                         q.put((moved, None), block=True)
             except StopIteration:
                 pass
             finally:
                 q.put(sentinel, block=True)
 
-        def _producer_wrapped():
+        def _producer_wrapped() -> None:
             try:
                 get_tlb().pin_thread()
             except Exception:
@@ -759,7 +821,7 @@ class Prefetcher:
 
         it = iter(self._src)
 
-        def _wait_ready(ev):
+        def _wait_ready(ev: Any) -> None:
             if ev is None:
                 return
             dev_t = getattr(self._device, "type", "cpu")

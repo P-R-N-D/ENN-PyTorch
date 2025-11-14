@@ -70,9 +70,11 @@ def _preload_state(value: Any) -> Any:
 
 def train(
     model: Root,
-    data: Dict[Tuple, torch.Tensor]
-    | Sequence[Dict[Tuple, torch.Tensor]]
-    | Mapping[str, Dict[Tuple, torch.Tensor]],
+    data: (
+        Dict[Tuple, torch.Tensor]
+        | Sequence[Dict[Tuple, torch.Tensor]]
+        | Mapping[str, Dict[Tuple, torch.Tensor]]
+    ),
     *args: Any,
     epochs: int = 5,
     batch_size: int = 128,
@@ -127,6 +129,7 @@ def train(
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
         did_manual_shuffle = False
@@ -171,7 +174,11 @@ def train(
     init_dir: Optional[str] = None
 
     try:
-        if isinstance(data, Mapping) and data and all(isinstance(v, Mapping) for v in data.values()):
+        if (
+            isinstance(data, Mapping)
+            and data
+            and all(isinstance(v, Mapping) for v in data.values())
+        ):
             manifest = {}
             for k, d in data.items():
                 sub = os.path.join(memmap_dir, str(k))
@@ -180,10 +187,18 @@ def train(
                 if first_feats is None:
                     first_feats, label_shape = fx, lshape
                 else:
-                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
-                        raise RuntimeError("inconsistent feature/label shapes across datasets")
+                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(
+                        lshape
+                    ) != tuple(label_shape):
+                        raise RuntimeError(
+                            "inconsistent feature/label shapes across datasets"
+                        )
                 manifest[str(k)] = str(k)
-        elif isinstance(data, Sequence) and data and all(isinstance(d, Mapping) for d in data):
+        elif (
+            isinstance(data, Sequence)
+            and data
+            and all(isinstance(d, Mapping) for d in data)
+        ):
             manifest = []
             for i, d in enumerate(data):
                 key = str(i)
@@ -193,8 +208,12 @@ def train(
                 if first_feats is None:
                     first_feats, label_shape = fx, lshape
                 else:
-                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(label_shape):
-                        raise RuntimeError("inconsistent feature/label shapes across datasets")
+                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(
+                        lshape
+                    ) != tuple(label_shape):
+                        raise RuntimeError(
+                            "inconsistent feature/label shapes across datasets"
+                        )
                 manifest.append(key)
         else:
             fx, lshape = _mat_one(data, memmap_dir)
@@ -204,7 +223,9 @@ def train(
             raise RuntimeError("no training data provided to train()")
 
         if manifest is not None:
-            with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
+            with open(
+                os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8"
+            ) as f:
                 payload = manifest if isinstance(manifest, dict) else list(manifest)
                 json.dump(payload, f)
         ckpt_dir = new_dir("ckpt_dcp")
@@ -215,7 +236,9 @@ def train(
             m_sd = get_model_state_dict(model, options=opts)
             save(
                 state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(init_dir, sync_files=True, overwrite=True),
+                storage_writer=FileSystemWriter(
+                    init_dir, sync_files=True, overwrite=True
+                ),
             )
         torch.save(
             {k: v.detach().cpu() for k, v in model.state_dict().items()},

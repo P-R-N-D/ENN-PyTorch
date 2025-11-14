@@ -167,7 +167,9 @@ def to_tensordict(
         return batch.to(device) if device is not None else batch
     if not isinstance(batch, Mapping):
         raise TypeError(f"Unexpected batch type: {type(batch)}")
-    resolved_batch = list(batch_size) if batch_size is not None else _get_batch_size(batch)
+    resolved_batch = (
+        list(batch_size) if batch_size is not None else _get_batch_size(batch)
+    )
     td = TensorDict({}, batch_size=resolved_batch, device=device)
     for key, value in batch.items():
         if torch.is_tensor(value):

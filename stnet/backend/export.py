@@ -24,7 +24,9 @@ def _in_console(cmd: Sequence[str], desc: str) -> None:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
 
-def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) -> Tuple[int, Tuple[int, ...]]:
+def _get_tensor_shape(
+    model: nn.Module, sample_input: Optional[torch.Tensor]
+) -> Tuple[int, Tuple[int, ...]]:
     in_dim: Optional[int] = None
     out_shape: Optional[Tuple[int, ...]] = None
     if hasattr(model, "in_dim"):
@@ -39,7 +41,9 @@ def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) ->
         except (TypeError, ValueError):
             out_shape = None
     if (in_dim is None or out_shape is None) and sample_input is not None:
-        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
+        dev = next(
+            (p.device for p in model.parameters() if p is not None), torch.device("cpu")
+        )
         sample = sample_input.to(dev)
         model.eval()
         with Gradient.inference(model):
@@ -105,7 +109,9 @@ class _CompatLayer(nn.Module):
 class Onnx(Format):
     name = "onnx"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
         out = Model._OnnxLayer.export(model, dst, **_onnx_options(kwargs))
         return (out,)
 
@@ -113,15 +119,21 @@ class Onnx(Format):
 class Ort(Format):
     name = "ort"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(
+            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+        )
         ort_path, optimized = Model._OrtLayer.to_ort(
             onnx_path,
             dst,
             optimization_level=str(kwargs.get("optimization_level", "all")),
             optimization_style=str(kwargs.get("optimization_style", "fixed")),
             target_platform=kwargs.get("target_platform"),
-            save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
+            save_optimized_onnx_model=bool(
+                kwargs.get("save_optimized_onnx_model", False)
+            ),
         )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -129,8 +141,12 @@ class Ort(Format):
 class TensorRT(Format):
     name = "tensorrt"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(
+            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+        )
         try:
             import tensorrt as trt
         except ImportError as exc:
@@ -146,7 +162,9 @@ class TensorRT(Format):
         ):
             workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
             if hasattr(config, "set_memory_pool_limit"):
-                config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
+                config.set_memory_pool_limit(
+                    trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
+                )
             else:
                 config.max_workspace_size = workspace_size_bytes
             with open(onnx_path, "rb") as handle:
@@ -158,7 +176,9 @@ class TensorRT(Format):
                 config.set_flag(trt.BuilderFlag.FP16)
             if bool(kwargs.get("int8", False)):
                 if not builder.platform_has_fast_int8:
-                    warnings.warn("INT8 precision is not supported on this platform; ignoring request.")
+                    warnings.warn(
+                        "INT8 precision is not supported on this platform; ignoring request."
+                    )
                 else:
                     calibrator = kwargs.get("calibrator")
                     if calibrator is not None:
@@ -185,8 +205,12 @@ class TensorRT(Format):
 class Nnef(Format):
     name = "nnef"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
-        onnx_path = Model._OnnxLayer.coerce(model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs))
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
+        onnx_path = Model._OnnxLayer.coerce(
+            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+        )
         try:
             import importlib
 
@@ -229,7 +253,9 @@ class Nnef(Format):
 class CoreML(Format):
     name = "coreml"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
         is_required("coremltools", "pip install coremltools")
         import coremltools as ct
 
@@ -244,7 +270,9 @@ class CoreML(Format):
             "CPU_AND_NE": getattr(ct.ComputeUnit, "CPU_AND_NE", None),
         }
         convert_to = str(kwargs.get("convert_to", "mlprogram"))
-        compute_units = cu_map.get(str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"])
+        compute_units = cu_map.get(
+            str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"]
+        )
         kwargs_dict: Dict[str, Any] = {
             "inputs": [ct.TensorType(shape=tuple(int(x) for x in sample.shape))],
             "convert_to": convert_to,
@@ -264,7 +292,9 @@ class CoreML(Format):
 class LiteRT(Format):
     name = "litert"
 
-    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+    def save(
+        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
+    ) -> Tuple[Path, ...]:
         onnx_path = Model._OnnxLayer.coerce(
             model,
             _resolve_onnx_path(dst, kwargs),
@@ -312,10 +342,14 @@ class LiteRT(Format):
             if bool(kwargs.get("int8_quantize", False)):
                 rep_ds = kwargs.get("representative_dataset")
                 if rep_ds is None:
-                    raise ValueError("A representative_dataset is required for INT8 quantization.")
+                    raise ValueError(
+                        "A representative_dataset is required for INT8 quantization."
+                    )
                 converter.optimizations = [tf.lite.Optimize.DEFAULT]
                 converter.representative_dataset = rep_ds
-                converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+                converter.target_spec.supported_ops = [
+                    tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+                ]
                 converter.inference_input_type = tf.int8
                 converter.inference_output_type = tf.int8
             tflite_model = converter.convert()
@@ -352,7 +386,9 @@ class Model:
             )
             export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
             fallback_errors = (
-                (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
+                (RuntimeError,)
+                if export_error is RuntimeError
+                else (RuntimeError, export_error)
             )
             common_kwargs = {
                 "export_params": True,
@@ -382,7 +418,9 @@ class Model:
             return onnx_path
 
         @staticmethod
-        def coerce(model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any) -> Path:
+        def coerce(
+            model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any
+        ) -> Path:
             if not onnx_path.exists():
                 return Model._OnnxLayer.export(model, onnx_path, **kwargs)
             return onnx_path
@@ -408,11 +446,14 @@ class Model:
                 "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
                 "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
             }
-            level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
+            level = opt_map.get(
+                optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            )
             platform = (target_platform or "").lower()
             disabled_optimizers = (
                 ["NchwcTransformer"]
-                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
+                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                and platform not in {"", "amd64"}
                 else None
             )
             optimized_onnx_path: Optional[Path] = None
@@ -422,7 +463,9 @@ class Model:
                 so_onnx.optimized_model_filepath = str(optimized_onnx_path)
                 so_onnx.graph_optimization_level = level
                 if optimization_style.lower() == "runtime":
-                    so_onnx.add_session_config_entry("optimization.minimal_build_optimizations", "apply")
+                    so_onnx.add_session_config_entry(
+                        "optimization.minimal_build_optimizations", "apply"
+                    )
                 ort.InferenceSession(
                     str(onnx_path),
                     sess_options=so_onnx,
@@ -434,7 +477,9 @@ class Model:
             so.graph_optimization_level = level
             so.add_session_config_entry("session.save_model_format", "ORT")
             if optimization_style.lower() == "runtime":
-                so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
+                so.add_session_config_entry(
+                    "optimization.minimal_build_optimizations", "save"
+                )
             ort.InferenceSession(
                 str(onnx_path),
                 sess_options=so,

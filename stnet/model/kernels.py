@@ -60,13 +60,17 @@ def _dpa_sequence_length(
 
     if batch_first:
         if query.dim() < 2 or key.dim() < 2:
-            raise ValueError("expected query/key tensors with at least 2 dims when batch_first=True")
+            raise ValueError(
+                "expected query/key tensors with at least 2 dims when batch_first=True"
+            )
         batch = int(query.shape[0])
         seq_q = int(query.shape[1])
         seq_k = int(key.shape[1])
     else:
         if query.dim() < 2 or key.dim() < 2:
-            raise ValueError("expected query/key tensors with at least 2 dims when batch_first=False")
+            raise ValueError(
+                "expected query/key tensors with at least 2 dims when batch_first=False"
+            )
         batch = int(query.shape[1])
         seq_q = int(query.shape[0])
         seq_k = int(key.shape[0])
@@ -88,11 +92,15 @@ def _expand_for_mha(
         raise TypeError("expected boolean mask")
     if mask.dim() == 2:
         if mask.shape != (seq_q, seq_k):
-            raise ValueError(f"mask shape {tuple(mask.shape)} incompatible with ({seq_q}, {seq_k})")
+            raise ValueError(
+                f"mask shape {tuple(mask.shape)} incompatible with ({seq_q}, {seq_k})"
+            )
         expanded = mask.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k)
     elif mask.dim() == 3:
         if mask.shape == (batch, seq_q, seq_k):
-            expanded = mask.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k)
+            expanded = mask.view(batch, 1, seq_q, seq_k).expand(
+                batch, heads, seq_q, seq_k
+            )
         else:
             raise ValueError(f"unsupported 3D mask shape {tuple(mask.shape)}")
     elif mask.dim() == 4:
@@ -106,7 +114,9 @@ def _expand_for_mha(
         elif h == heads:
             expanded = mask
         else:
-            raise ValueError(f"mask head dimension {h} does not match expected heads {heads}")
+            raise ValueError(
+                f"mask head dimension {h} does not match expected heads {heads}"
+            )
     else:
         raise ValueError(f"unsupported mask rank {mask.dim()}")
     return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
@@ -126,47 +136,60 @@ def to_additive_mask(
 
     if attn_mask is None:
         return torch.zeros((batch, heads, seq_q, seq_k), dtype=dtype, device=device)
-    if attn_mask.dtype is torch.bool:
+    elif attn_mask.dtype is torch.bool:
         expanded = _expand_for_mha(
             attn_mask, batch=batch, heads=heads, seq_q=seq_q, seq_k=seq_k, device=device
         )
         neg_inf = _negative_inf(dtype, device)
         zero = torch.zeros((), dtype=neg_inf.dtype, device=device)
         return torch.where(expanded, neg_inf, zero).to(dtype)
+
     am = attn_mask.to(device=device, dtype=dtype, non_blocking=True)
-    if am.dim() == 2:
-        if am.shape != (seq_q, seq_k):
-            raise ValueError(f"mask shape {tuple(am.shape)} incompatible with ({seq_q}, {seq_k})")
-        return am.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).contiguous()
-    if am.dim() == 3:
-        if am.shape != (batch, seq_q, seq_k):
-            raise ValueError(
-                f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+    match am.dim():
+        case 2:
+            if am.shape != (seq_q, seq_k):
+                raise ValueError(
+                    f"mask shape {tuple(am.shape)} incompatible with ({seq_q}, {seq_k})"
+                )
+            return (
+                am.view(1, 1, seq_q, seq_k)
+                .expand(batch, heads, seq_q, seq_k)
+                .contiguous()
             )
-        return am.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).contiguous()
-    if am.dim() == 4:
-        b, h, sq, sk = am.shape
-        if b != batch or sq != seq_q or sk != seq_k:
-            raise ValueError(
-                f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+        case 3:
+            if am.shape != (batch, seq_q, seq_k):
+                raise ValueError(
+                    f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+                )
+            return (
+                am.view(batch, 1, seq_q, seq_k)
+                .expand(batch, heads, seq_q, seq_k)
+                .contiguous()
             )
-        if h == 1:
-            return am.expand(batch, heads, seq_q, seq_k).contiguous()
-        if h == heads:
-            return am.contiguous()
-        raise ValueError(f"mask head dimension {h} does not match expected heads {heads}")
-    raise ValueError(f"unsupported mask rank {am.dim()}")
+        case 4:
+            b, h, sq, sk = am.shape
+            if b != batch or sq != seq_q or sk != seq_k:
+                raise ValueError(
+                    f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
+                )
+            if h == 1:
+                return am.expand(batch, heads, seq_q, seq_k).contiguous()
+            if h == heads:
+                return am.contiguous()
+            raise ValueError(
+                f"mask head dimension {h} does not match expected heads {heads}"
+            )
+        case _:
+            raise ValueError(f"unsupported mask rank {am.dim()}")
 
 
 def _negative_inf(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-
     if not torch.is_floating_point(torch.empty((), dtype=dtype)):
         dtype = torch.float32
     return torch.tensor(float("-inf"), dtype=dtype, device=device)
 
 
 def _is_nvidia_te_supported() -> bool:
-
     if not torch.cuda.is_available():
         return False
     try:
@@ -176,7 +199,9 @@ def _is_nvidia_te_supported() -> bool:
     if device.type != "cuda":
         return False
     try:
-        index = device.index if device.index is not None else torch.cuda.current_device()
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
     except Exception:
         index = 0
     try:
@@ -239,13 +264,25 @@ def _to_nvidia_mask(
                 if am.dim() == 2:
                     if am.shape != (seq_q, seq_k):
                         return None
-                    float_mask = am.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).clone()
+                    float_mask = (
+                        am.view(1, 1, seq_q, seq_k)
+                        .expand(batch, heads, seq_q, seq_k)
+                        .clone()
+                    )
                 elif am.dim() == 3:
                     if am.shape != (batch, seq_q, seq_k):
                         return None
-                    float_mask = am.view(batch, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k).clone()
+                    float_mask = (
+                        am.view(batch, 1, seq_q, seq_k)
+                        .expand(batch, heads, seq_q, seq_k)
+                        .clone()
+                    )
                 elif am.dim() == 4:
-                    if am.shape[0] != batch or am.shape[2] != seq_q or am.shape[3] != seq_k:
+                    if (
+                        am.shape[0] != batch
+                        or am.shape[2] != seq_q
+                        or am.shape[3] != seq_k
+                    ):
                         return None
                     if am.shape[1] == 1:
                         float_mask = am.expand(batch, heads, seq_q, seq_k).clone()
@@ -260,7 +297,9 @@ def _to_nvidia_mask(
 
         if key_padding_mask is not None:
             if key_padding_mask.dtype is not torch.bool:
-                key_padding_mask = key_padding_mask.to(device=device, dtype=torch.bool, non_blocking=True)
+                key_padding_mask = key_padding_mask.to(
+                    device=device, dtype=torch.bool, non_blocking=True
+                )
             else:
                 key_padding_mask = key_padding_mask.to(device=device, non_blocking=True)
             if key_padding_mask.dim() != 2 or key_padding_mask.shape != (batch, seq_k):
@@ -325,7 +364,6 @@ else:
 
 
 def _is_nvidia_mha_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
-
     if not _HAS_TE:
         return False
     if not _is_nvidia_te_supported():
@@ -412,18 +450,12 @@ class DotProductAttention(nn.Module):
                 if "core_attention_bias_type" in params:
                     self._te_core_bias_type_param = "core_attention_bias_type"
                 self._te_supports_mask = self._te_mask_param is not None
-                self._te_supports_mask_type = (
-                    self._te_mask_type_param is not None
-                )
-                self._te_supports_core_bias = (
-                    self._te_core_bias_param is not None
-                )
+                self._te_supports_mask_type = self._te_mask_type_param is not None
+                self._te_supports_core_bias = self._te_core_bias_param is not None
                 self._te_supports_core_bias_type = (
                     self._te_core_bias_type_param is not None
                 )
-                self._te_supports_attention_dropout = (
-                    "attention_dropout" in params
-                )
+                self._te_supports_attention_dropout = "attention_dropout" in params
                 self._te_supports_is_causal = "is_causal" in params
                 self._te_supports_training = "training" in params
 
@@ -580,7 +612,9 @@ class DotProductAttention(nn.Module):
             ):
                 finfo = torch.finfo(q_bshd.dtype)
                 zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                neg_inf = torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device)
+                neg_inf = torch.full(
+                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                )
                 bias_float = torch.where(mask_bool, neg_inf, zero)
                 mask_bool = None
 
@@ -631,7 +665,9 @@ class DotProductAttention(nn.Module):
         if mask_bool is not None:
             finfo = torch.finfo(q_bshd.dtype)
             zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-            neg_inf = torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device)
+            neg_inf = torch.full(
+                (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+            )
             sdpa_bias = torch.where(mask_bool, neg_inf, zero).expand(B, H, L, S)
         if bias_float is not None:
             base = (
@@ -640,7 +676,9 @@ class DotProductAttention(nn.Module):
                 else torch.zeros(B, H, L, S, device=q_bshd.device, dtype=q_bshd.dtype)
             )
             sdpa_bias = base + bias_float
-        final_mask = attn_mask if (attn_mask is not None and sdpa_bias is None) else sdpa_bias
+        final_mask = (
+            attn_mask if (attn_mask is not None and sdpa_bias is None) else sdpa_bias
+        )
         sdpa_kwargs = {
             "attn_mask": final_mask,
             "dropout_p": dropout_val,
@@ -697,9 +735,7 @@ class DotProductAttention(nn.Module):
 
 
 class MultiScaleRetentionCompat(nn.Module):
-    def __init__(
-        self, d_model: int, nhead: int, use_gate: bool = True
-    ) -> None:
+    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
         super().__init__()
         self.d_model = int(d_model)
         self.nhead = int(nhead)
@@ -709,9 +745,7 @@ class MultiScaleRetentionCompat(nn.Module):
         self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
         self.g_proj = (
-            nn.Linear(self.d_model, self.d_model, bias=False)
-            if self.use_gate
-            else None
+            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
         )
         self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
         self.norm = nn.LayerNorm(self.d_model)
@@ -768,9 +802,7 @@ class MultiScaleRetentionCompat(nn.Module):
 
 
 class MultiScaleRetention(nn.Module):
-    def __init__(
-        self, d_model: int, nhead: int, use_gate: bool = True
-    ) -> None:
+    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
         super().__init__()
         self.d_model, self.nhead, self.use_gate = (
             int(d_model),
@@ -822,14 +854,9 @@ class MultiScaleRetention(nn.Module):
         heads = torch.arange(self.nhead, device=device, dtype=dtype)
         gammas = 1.0 - torch.pow(
             2.0,
-            -(
-                self._decay_init
-                + self._decay_range * (heads / max(self.nhead, 1))
-            ),
+            -(self._decay_init + self._decay_range * (heads / max(self.nhead, 1))),
         )
-        gammas = torch.clamp(
-            gammas, min=torch.finfo(dtype).tiny, max=1 - 1e-09
-        )
+        gammas = torch.clamp(gammas, min=torch.finfo(dtype).tiny, max=1 - 1e-09)
         powers = torch.pow(gammas.view(self.nhead, 1, 1), diff.abs().to(dtype))
         rel = tril * powers
         sin = sin.expand(self.nhead, -1, -1, -1)
@@ -946,7 +973,9 @@ class _MultiHeadAttentionNvidia(nn.Module):
             )
 
     @staticmethod
-    def _nvidia_mha(embed_dim: int, num_heads: int, dropout: float, kwargs: dict):
+    def _nvidia_mha(
+        embed_dim: int, num_heads: int, dropout: float, kwargs: dict[str, Any]
+    ) -> Any | None:
         if not _HAS_TE:
             return None
         if not _is_nvidia_te_supported():
@@ -962,7 +991,11 @@ class _MultiHeadAttentionNvidia(nn.Module):
                     num_attention_heads=num_heads,
                     attention_dropout=dropout,
                 ),
-                dict(hidden_size=embed_dim, num_heads=num_heads, attention_dropout=dropout),
+                dict(
+                    hidden_size=embed_dim,
+                    num_heads=num_heads,
+                    attention_dropout=dropout,
+                ),
                 dict(embed_dim=embed_dim, num_heads=num_heads, dropout=dropout),
             )
             for ckw in ctor_variants:
@@ -983,7 +1016,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self._force_pt or (self._te_mha is None):
             return self._fallback(
                 query,
@@ -1018,7 +1051,11 @@ class _MultiHeadAttentionNvidia(nn.Module):
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
-            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+            _q, _k, _v = (
+                query.transpose(0, 1),
+                key.transpose(0, 1),
+                value.transpose(0, 1),
+            )
         for variant in (
             dict(
                 query=_q,
@@ -1029,7 +1066,13 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 is_causal=is_causal,
             ),
             dict(query=_q, attn_mask=te_attn_mask, need_weights=need_weights),
-            dict(query=_q, key=_k, value=_v, attention_mask=te_attn_mask, need_weights=need_weights),
+            dict(
+                query=_q,
+                key=_k,
+                value=_v,
+                attention_mask=te_attn_mask,
+                need_weights=need_weights,
+            ),
         ):
             try:
                 out = self._te_mha(**variant)
@@ -1057,7 +1100,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-
     def __init__(
         self,
         embed_dim: int,
@@ -1080,7 +1122,10 @@ class MultiHeadAttention(nn.Module):
                     batch_first=batch_first,
                     **kwargs,
                 )
-                if isinstance(impl, _MultiHeadAttentionNvidia) and impl._te_mha is not None:
+                if (
+                    isinstance(impl, _MultiHeadAttentionNvidia)
+                    and impl._te_mha is not None
+                ):
                     self.impl = impl
                     self._backend = "te"
                 else:
@@ -1136,7 +1181,7 @@ class MultiHeadAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self.impl(
             query,
             key,
