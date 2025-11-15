@@ -94,9 +94,7 @@ def collate(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Any:
-    """
-    Keep it simple: stack per-key when possible. Pre/post-processing is done in map_fn.
-    """
+
     converter = partial(
         _process,
         flatten_features=flatten_features,
@@ -167,15 +165,11 @@ def compose(
         get_tlb(io_workers=io_workers)
     except Exception:
         pass
-
     mx_weights = None
     if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping):
         mx_weights = weights
-
-    # 유한 스트림: 한 번 소진되면 종료
     sampler = Sampler(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=0, weights=mx_weights)
     source = sampler.compose(node_or_nodes)
-
     mapper = Connector(
         map_fn=map_fn,
         io_workers=io_workers,
@@ -247,7 +241,6 @@ def fetch(
                 lengths[str(key)] = length
                 datasets[str(key)] = ds
 
-        # 길이 0 소스 제거 후 가중치 정리
         if isinstance(train_weights, Mapping):
             train_weights = {k: v for k, v in dict(train_weights).items() if k in sampler_nodes}
 
