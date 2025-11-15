@@ -298,8 +298,22 @@ class Dataset(_Sampler):
                 self._num_shards = max(1, int(dist.get_world_size()))
                 self._shard_id = max(0, int(dist.get_rank()))
             else:
-                self._num_shards = 1
-                self._shard_id = 0
+                env_world = os.environ.get("WORLD_SIZE")
+                env_rank = os.environ.get("RANK")
+                try:
+                    env_world_int = int(env_world) if env_world is not None else 1
+                except Exception:
+                    env_world_int = 1
+                try:
+                    env_rank_int = int(env_rank) if env_rank is not None else 0
+                except Exception:
+                    env_rank_int = 0
+                if env_world_int > 1:
+                    self._num_shards = env_world_int
+                    self._shard_id = max(0, min(env_world_int - 1, env_rank_int))
+                else:
+                    self._num_shards = 1
+                    self._shard_id = 0
         except Exception:
             self._num_shards = 1
             self._shard_id = 0

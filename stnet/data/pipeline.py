@@ -86,15 +86,37 @@ def _process(
     return {"X": features, "Y": labels}
 
 
-def collate(batch: Any, *args: Any, labels_dtype: Optional[torch.dtype] = None, **kwargs: Any) -> Any:
+def collate(
+    batch: Any,
+    *args: Any,
+    labels_dtype: Optional[torch.dtype] = None,
+    sanitize: bool = False,
+    flatten_features: bool = False,
+    **kwargs: Any,
+) -> Any:
     """
     Keep it simple: stack per-key when possible. Pre/post-processing is done in map_fn.
     """
+    converter = partial(
+        _process,
+        flatten_features=flatten_features,
+        labels_dtype=labels_dtype,
+        sanitize=sanitize,
+    )
     if isinstance(batch, (list, tuple)):
         if not batch:
             return batch
         if all(isinstance(elem, TensorDictBase) for elem in batch):
-            return stack(list(batch), dim=0)
+            stacked = stack(list(batch), dim=0)
+            try:
+                conv = converter(stacked)
+            except Exception:
+                return stacked
+            stacked["X"] = conv["X"]
+            stacked["Y"] = conv["Y"]
+            stacked["features"] = conv["X"]
+            stacked["labels"] = conv["Y"]
+            return stacked
         if all(isinstance(elem, Mapping) for elem in batch):
             Xs = [elem.get("X") for elem in batch]
             Ys = [elem.get("Y") for elem in batch]
@@ -108,15 +130,21 @@ def collate(batch: Any, *args: Any, labels_dtype: Optional[torch.dtype] = None, 
                     Ys = torch.stack(Ys, dim=0)
             except Exception:
                 pass
-            if labels_dtype is not None and isinstance(Ys, torch.Tensor):
-                Ys = Ys.to(dtype=labels_dtype, non_blocking=True)
+            try:
+                conv = converter({"X": Xs, "Y": Ys})
+            except Exception:
+                conv = {"X": Xs, "Y": Ys}
+            Xs = conv.get("X", Xs)
+            Ys = conv.get("Y", Ys)
             return TensorDict({"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}, batch_size=[])
         return batch
     if isinstance(batch, Mapping):
-        X = batch.get("X")
-        Y = batch.get("Y")
-        if labels_dtype is not None and isinstance(Y, torch.Tensor):
-            Y = Y.to(dtype=labels_dtype, non_blocking=True)
+        try:
+            conv = converter(batch)
+        except Exception:
+            conv = batch
+        X = conv.get("X", batch.get("X"))
+        Y = conv.get("Y", batch.get("Y"))
         return TensorDict({"X": X, "Y": Y, "features": X, "labels": Y}, batch_size=[])
     return batch
 
