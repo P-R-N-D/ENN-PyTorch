@@ -31,10 +31,7 @@ except Exception:
 
     ParallelMapper = None
 
-try:
-    from tensordict import MemoryMappedTensor
-except Exception as e:
-    raise RuntimeError("tensordict is required for Dataset") from e
+from tensordict import MemoryMappedTensor
 
 
 try:
@@ -43,20 +40,24 @@ try:
         PinMemory,
         Prefetcher as _Prefetcher,
         SamplerWrapper,
+        Batcher as _Batcher,
+        Unbatcher as _Unbatcher,
     )
 except Exception:
     from torchdata.nodes import PinMemory, Prefetcher as _Prefetcher
 
     MultiNodeWeightedSampler = None
     SamplerWrapper = None
+    _Batcher = None
+    _Unbatcher = None
 
 try:
-    from torch.utils.data import Dataset as _Dataset, Sampler as _Sampler
+    from torch.utils.data import Sampler as _Sampler
 except Exception:
-    _Dataset = object
     _Sampler = object
 
 from .datatype import to_platform_dtype
+from ..functional.fx import Gradient as FxGradient
 
 
 def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> Any:
@@ -70,7 +71,7 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
     return batch
 
 
-class Dataset(_Dataset):
+class Dataset(_Sampler):
     def __init__(
         self,
         memmap_dir: str,
@@ -112,6 +113,20 @@ class Dataset(_Dataset):
         self._labels = MemoryMappedTensor.from_filename(
             filename=lab_path, dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
         )
+        self._memmap_features = self._features
+        self._memmap_labels = self._labels
+        self._X = self._memmap_features
+        self._Y = self._memmap_labels
+
+        # --- Sampler-like state (initialized in compose) ---
+        self._S_B = 1
+        self._S_shuffle = True
+        self._S_seed = 0
+        self._S_rng = random.Random(0)
+        self._S_cuts: list[int] = []
+        self._num_shards = 1
+        self._shard_id = 0
+        self._key = ""
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
         self._perm: Optional[torch.Tensor] = None
         self._perm_source: Optional[Literal["runtime", "metadata"]] = None
@@ -182,9 +197,6 @@ class Dataset(_Dataset):
     @property
     def meta(self) -> Mapping[str, Any]:
         return dict(self._meta or {})
-
-    def __len__(self) -> int:
-        return max(0, int(self._end) - int(self._start))
 
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
@@ -266,6 +278,149 @@ class Dataset(_Dataset):
             return {"X": x, "Y": y}
         except Exception:
             return out
+
+    # ----------------------------
+    # Sampler-ish API on Dataset
+    # ----------------------------
+    def _rebuild_cuts(self) -> None:
+        start = int(getattr(self, "start", 0))
+        end = int(getattr(self, "end", 0))
+        B = max(1, int(self._S_B))
+        cuts = list(range(start, end + 1, B))
+        if cuts and cuts[-1] != end:
+            cuts.append(end)
+        elif not cuts:
+            cuts = [start, end]
+        self._S_cuts = cuts
+        try:
+            dist = getattr(torch, "distributed", None)
+            if dist is not None and dist.is_available() and dist.is_initialized():
+                self._num_shards = max(1, int(dist.get_world_size()))
+                self._shard_id = max(0, int(dist.get_rank()))
+            else:
+                env_world = os.environ.get("WORLD_SIZE")
+                env_rank = os.environ.get("RANK")
+                try:
+                    env_world_int = int(env_world) if env_world is not None else 1
+                except Exception:
+                    env_world_int = 1
+                try:
+                    env_rank_int = int(env_rank) if env_rank is not None else 0
+                except Exception:
+                    env_rank_int = 0
+                if env_world_int > 1:
+                    self._num_shards = env_world_int
+                    self._shard_id = max(0, min(env_world_int - 1, env_rank_int))
+                else:
+                    self._num_shards = 1
+                    self._shard_id = 0
+        except Exception:
+            self._num_shards = 1
+            self._shard_id = 0
+
+    def compose(
+        self,
+        *,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 0,
+        key: str = "",
+    ) -> "BaseNode":
+        """Return a node that yields (key, (start, end)) half-open ranges."""
+
+        self._S_B = max(1, int(batch_size))
+        self._S_shuffle = bool(shuffle)
+        self._S_seed = int(seed)
+        self._S_rng = random.Random(self._S_seed)
+        self._key = str(key)
+        self._rebuild_cuts()
+        if SamplerWrapper is None:
+            raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
+        return SamplerWrapper(self)
+
+    def __iter__(self):
+        cuts = getattr(self, "_S_cuts", None)
+        if not cuts:
+            self._rebuild_cuts()
+            cuts = self._S_cuts
+        n = max(0, len(cuts) - 1)
+        idxs = list(range(n))
+        if self._S_shuffle:
+            try:
+                self._S_rng.shuffle(idxs)
+            except Exception:
+                pass
+        ns = getattr(self, "_num_shards", 1)
+        si = getattr(self, "_shard_id", 0)
+        if ns > 1:
+            idxs = idxs[si::ns]
+        for i in idxs:
+            s = cuts[i]
+            e = cuts[i + 1]
+            if e > s:
+                yield (self._key, (int(s), int(e)))
+
+    def __len__(self) -> int:
+        # 항상 현재 start/end와 배치 크기 기반으로 계산 (초기화 순서/상태 변화에 안전)
+        start = int(getattr(self, "start", 0))
+        end = int(getattr(self, "end", 0))
+        B = max(1, int(self._S_B))
+        total = max(0, (end - start + B - 1) // B)
+        ns = getattr(self, "_num_shards", 1)
+        si = getattr(self, "_shard_id", 0)
+        if ns <= 1:
+            return total
+        return max(0, (total - si + ns - 1) // ns)
+
+    def set_epoch(self, epoch: int) -> None:
+        try:
+            self._S_rng.seed(self._S_seed + int(epoch))
+        except Exception:
+            pass
+
+    def get(self, start: int, end: int) -> Mapping[str, Any]:
+        """
+        Zero-copy range load from memory-mapped tensors (narrow/view).
+        If an accelerator backend (CUDA/XPU/MPS) is available, additionally
+        stage pinned host buffers to accelerate downstream H2D copies.
+        """
+        s = int(start)
+        e = int(end)
+        n = max(0, e - s)
+
+        def _is_accelerator_available() -> bool:
+            if torch.cuda.is_available():
+                return True
+            try:
+                if hasattr(torch, "xpu") and torch.xpu.is_available():
+                    return True
+            except Exception:
+                pass
+            try:
+                if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                    return True
+            except Exception:
+                pass
+            return False
+
+        with FxGradient.inference(torch.nn.Module()):
+            if n <= 0:
+                X = self._X.narrow(0, 0, 0)
+                Y = self._Y.narrow(0, 0, 0)
+                return {"X": X, "Y": Y}
+            # zero-copy views
+            X = self._X.narrow(0, s, n)
+            Y = self._Y.narrow(0, s, n)
+            if self._label_shape:
+                Y = Y.view(n, *self._label_shape)  # view는 연속인 경우 제로카피
+            # optional: pre-pin for accelerator devices (copy to pinned host)
+            if _is_accelerator_available():
+                try:
+                    X = X.pin_memory()
+                    Y = Y.pin_memory()
+                except Exception:
+                    pass
+            return {"X": X, "Y": Y}
 
 
 def _to_high_precision(value: Any) -> torch.Tensor:
@@ -414,77 +569,7 @@ class Disposable:
         return iter(self._keep)
 
 
-class Sampler(_Sampler):
-    def __init__(
-        self,
-        *args: Any,
-        start: int,
-        end: int,
-        batch_size: int,
-        shuffle: bool = True,
-        seed: int = 0,
-        **kwargs: Any,
-    ) -> None:
-        self._start = int(start)
-        self._end = int(end)
-        self._B = max(1, int(batch_size))
-        self._shuffle = bool(shuffle)
-        self._seed = int(seed)
-        self._rng = random.Random(self._seed)
-        self._num_shards = 1
-        self._shard_id = 0
-        try:
-            dist = getattr(torch, "distributed", None)
-            if dist is not None and dist.is_available() and dist.is_initialized():
-                self._num_shards = max(1, int(dist.get_world_size()))
-                self._shard_id = max(0, int(dist.get_rank()))
-            else:
-                self._num_shards = max(1, int(os.environ.get("WORLD_SIZE", "1") or "1"))
-                self._shard_id = max(
-                    0,
-                    int(
-                        os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0") or "0")
-                    ),
-                )
-        except Exception:
-            pass
-        self._cuts = list(range(self._start, self._end, self._B))
-        if self._end > self._start and (not self._cuts or self._cuts[-1] != self._end):
-            self._cuts.append(self._end)
-
-    def __iter__(self) -> Iterator[list[int]]:
-        n = max(0, len(self._cuts) - 1)
-        idxs = list(range(n))
-        if self._shuffle:
-            self._rng.shuffle(idxs)
-        ns = getattr(self, "_num_shards", 1)
-        si = getattr(self, "_shard_id", 0)
-        if ns > 1:
-            idxs = idxs[si::ns]
-        for i in idxs:
-            s = self._cuts[i]
-            e = self._cuts[i + 1]
-            if e > s:
-                yield list(range(s, e))
-
-    def __len__(self) -> int:
-        total = max(0, (self._end - self._start + self._B - 1) // self._B)
-        ns = getattr(self, "_num_shards", 1)
-        si = getattr(self, "_shard_id", 0)
-        if ns <= 1:
-            return total
-        return max(0, (total - si + ns - 1) // ns)
-
-    def set_epoch(self, epoch: int) -> None:
-        self._rng.seed(self._seed + int(epoch))
-
-    def compose(self, dataset: "Dataset") -> "BaseNode":
-        if SamplerWrapper is None:
-            raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
-        return SamplerWrapper(self)
-
-
-class Multiplexer:
+class Sampler:
     def __init__(
         self,
         *args: Any,
@@ -592,29 +677,68 @@ class Connector:
             pass
 
     def compose(self, source: "BaseNode") -> "BaseNode":
+        """
+        Only-place ParallelMapper.
+        If prebatch > 1, we first Batcher() to group upstream samples (which are (key,(s,e)) ranges),
+        map over the *list of ranges* in a single thread slice, and Unbatcher() to flatten per-item results.
+        """
+        node: BaseNode = source
+        mapper = self.map_fn
+
+        if (self.prebatch or 0) and int(self.prebatch) > 1:
+            if _Batcher is None or _Unbatcher is None:
+                raise RuntimeError("torchdata.nodes Batcher/Unbatcher are required for prebatch>1")
+            B = max(1, int(self.prebatch))
+            node = _Batcher(node, batch_size=B, drop_last=False)
+
+            def iterate(ranges: Sequence[Any]) -> Sequence[Any]:
+                # map_fn is expected to accept both a single range or a list of ranges.
+                return mapper(ranges)
+
+            pm_map_fn = wrap_with_tlb(iterate)
+        else:
+            pm_map_fn = wrap_with_tlb(mapper)
+
         node = ParallelMapper(
-            source,
-            map_fn=wrap_with_tlb(self.map_fn),
+            node,
+            map_fn=pm_map_fn,
             num_workers=self.io_workers,
             in_order=False,
             method="thread",
             max_concurrent=int(self.max_concurrancy),
-            prebatch=self.prebatch,
         )
-        if self._pin_memory and getattr(self.device, "type", "cpu") in {
-            "cuda",
-            "xpu",
-            "mps",
-        }:
-            node = PinMemory(node, pin_memory_device=self.device.type)
-        node = _Prefetcher(node, prefetch_factor=self._prefetch_factor)
+
+        if (self.prebatch or 0) and int(self.prebatch) > 1:
+            node = _Unbatcher(node)
         return node
 
 
 class Loader:
     @staticmethod
-    def compose(source: "BaseNode") -> "BaseNode":
-        return _Loader(source)
+    def compose(source: "BaseNode", *, device: torch.device, prefetch_factor: int = 2, non_blocking: bool = True, length: Optional[int] = None, pin_memory: Optional[bool] = None) -> "Loader":
+        """Compose the host- and device-side loading graph.
+
+        Stages:
+          - Optional PinMemory on host
+          - torchdata Prefetcher on host
+          - torchdata Loader node
+          - Custom device Prefetcher (applied by Loader.__init__)
+
+        Returns a fully configured Loader instance ready to iterate.
+        """
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        node = source
+        do_pin = bool(pin_memory) if pin_memory is not None else (getattr(dev, 'type', 'cpu') in {'cuda','xpu','mps'})
+        if do_pin:
+            node = PinMemory(node, pin_memory_device=dev.type)
+        node = _Prefetcher(node, prefetch_factor=int(prefetch_factor))
+        return Loader(
+            dev,
+            node=node,
+            prefetch_factor=int(prefetch_factor),
+            non_blocking=bool(non_blocking),
+            length=length,
+        )
 
     def __init__(
         self,
