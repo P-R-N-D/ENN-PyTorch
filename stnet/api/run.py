@@ -92,6 +92,7 @@ def train(
     loss_tile_size: Optional[int] = None,
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
+    launcher: str = "elastic",
     **kwargs: Any,
 ) -> Root:
     try:
@@ -230,7 +231,7 @@ def train(
         default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
-        master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
+        master_addr, master_port = initialize_master_addr(rdzv_endpoint)
         optimize_threads()
         nprocs = optimal_procs()["nproc_per_node"]
         cfg_obj = getattr(model, "_Root__config", None)
@@ -285,7 +286,32 @@ def train(
             **default_kwargs,
             **kwargs,
         )
-        elastic_launch(lc, main)(ops)
+        launcher_mode = str(launcher or "elastic").strip().lower()
+        if launcher_mode in {"elastic", "default"}:
+            elastic_launch(lc, main)(ops)
+        elif launcher_mode in {"local", "inline", "single"}:
+            env_backup = {
+                "RANK": os.environ.get("RANK"),
+                "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+                "LOCAL_RANK": os.environ.get("LOCAL_RANK"),
+                "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
+                "MASTER_PORT": os.environ.get("MASTER_PORT"),
+            }
+            try:
+                os.environ.setdefault("RANK", "0")
+                os.environ.setdefault("WORLD_SIZE", "1")
+                os.environ.setdefault("LOCAL_RANK", "0")
+                os.environ.setdefault("MASTER_ADDR", master_addr)
+                os.environ.setdefault("MASTER_PORT", str(master_port))
+                main(ops)
+            finally:
+                for key, value in env_backup.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+        else:
+            raise ValueError(f"unsupported launcher mode: {launcher}")
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
             cpu_state = torch.load(fallback, map_location="cpu")
@@ -322,6 +348,7 @@ def predict(
     mode: OpsMode = "predict",
     max_nodes: Optional[int] = None,
     rdzv_backend: Optional[str] = None,
+    launcher: str = "elastic",
     **kwargs: Any,
 ) -> Dict[Tuple, torch.Tensor]:
 
@@ -398,7 +425,7 @@ def predict(
     )
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     rdzv_endpoint = get_available_host(default_rdzv_host)
-    master_addr, _ = initialize_master_addr(rdzv_endpoint)
+    master_addr, master_port = initialize_master_addr(rdzv_endpoint)
     optimize_threads()
     nprocs = int(optimal_procs()["nproc_per_node"])
     manager = mp.Manager()
@@ -417,7 +444,32 @@ def predict(
         start_method=optimal_start_method(),
         local_addr=master_addr,
     )
-    elastic_launch(lc, main)(ops, ret_dict)
+    launcher_mode = str(launcher or "elastic").strip().lower()
+    if launcher_mode in {"elastic", "default"}:
+        elastic_launch(lc, main)(ops, ret_dict)
+    elif launcher_mode in {"local", "inline", "single"}:
+        env_backup = {
+            "RANK": os.environ.get("RANK"),
+            "WORLD_SIZE": os.environ.get("WORLD_SIZE"),
+            "LOCAL_RANK": os.environ.get("LOCAL_RANK"),
+            "MASTER_ADDR": os.environ.get("MASTER_ADDR"),
+            "MASTER_PORT": os.environ.get("MASTER_PORT"),
+        }
+        try:
+            os.environ.setdefault("RANK", "0")
+            os.environ.setdefault("WORLD_SIZE", "1")
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("MASTER_ADDR", master_addr)
+            os.environ.setdefault("MASTER_PORT", str(master_port))
+            main(ops, ret_dict)
+        finally:
+            for key, value in env_backup.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+    else:
+        raise ValueError(f"unsupported launcher mode: {launcher}")
     result: Dict[Tuple, torch.Tensor] = dict(ret_dict)
     try:
         return result
