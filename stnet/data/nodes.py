@@ -117,8 +117,6 @@ class Dataset(_Sampler):
         self._memmap_labels = self._labels
         self._X = self._memmap_features
         self._Y = self._memmap_labels
-
-        # --- Sampler-like state (initialized in compose) ---
         self._S_B = 1
         self._S_shuffle = True
         self._S_seed = 0
@@ -279,9 +277,6 @@ class Dataset(_Sampler):
         except Exception:
             return out
 
-    # ----------------------------
-    # Sampler-ish API on Dataset
-    # ----------------------------
     def _rebuild_cuts(self) -> None:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
@@ -320,13 +315,13 @@ class Dataset(_Sampler):
 
     def compose(
         self,
-        *,
+        *args: Any,
         batch_size: int,
         shuffle: bool = True,
         seed: int = 0,
         key: str = "",
+        **kwargs: Any,
     ) -> "BaseNode":
-        """Return a node that yields (key, (start, end)) half-open ranges."""
 
         self._S_B = max(1, int(batch_size))
         self._S_shuffle = bool(shuffle)
@@ -361,7 +356,6 @@ class Dataset(_Sampler):
                 yield (self._key, (int(s), int(e)))
 
     def __len__(self) -> int:
-        # 항상 현재 start/end와 배치 크기 기반으로 계산 (초기화 순서/상태 변화에 안전)
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
         B = max(1, int(self._S_B))
@@ -379,11 +373,6 @@ class Dataset(_Sampler):
             pass
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
-        """
-        Zero-copy range load from memory-mapped tensors (narrow/view).
-        If an accelerator backend (CUDA/XPU/MPS) is available, additionally
-        stage pinned host buffers to accelerate downstream H2D copies.
-        """
         s = int(start)
         e = int(end)
         n = max(0, e - s)
@@ -408,12 +397,10 @@ class Dataset(_Sampler):
                 X = self._X.narrow(0, 0, 0)
                 Y = self._Y.narrow(0, 0, 0)
                 return {"X": X, "Y": Y}
-            # zero-copy views
             X = self._X.narrow(0, s, n)
             Y = self._Y.narrow(0, s, n)
             if self._label_shape:
-                Y = Y.view(n, *self._label_shape)  # view는 연속인 경우 제로카피
-            # optional: pre-pin for accelerator devices (copy to pinned host)
+                Y = Y.view(n, *self._label_shape)
             if _is_accelerator_available():
                 try:
                     X = X.pin_memory()
@@ -677,11 +664,7 @@ class Connector:
             pass
 
     def compose(self, source: "BaseNode") -> "BaseNode":
-        """
-        Only-place ParallelMapper.
-        If prebatch > 1, we first Batcher() to group upstream samples (which are (key,(s,e)) ranges),
-        map over the *list of ranges* in a single thread slice, and Unbatcher() to flatten per-item results.
-        """
+
         node: BaseNode = source
         mapper = self.map_fn
 
@@ -692,7 +675,6 @@ class Connector:
             node = _Batcher(node, batch_size=B, drop_last=False)
 
             def iterate(ranges: Sequence[Any]) -> Sequence[Any]:
-                # map_fn is expected to accept both a single range or a list of ranges.
                 return mapper(ranges)
 
             pm_map_fn = wrap_with_tlb(iterate)
@@ -715,17 +697,8 @@ class Connector:
 
 class Loader:
     @staticmethod
-    def compose(source: "BaseNode", *, device: torch.device, prefetch_factor: int = 2, non_blocking: bool = True, length: Optional[int] = None, pin_memory: Optional[bool] = None) -> "Loader":
-        """Compose the host- and device-side loading graph.
+    def compose(source: "BaseNode", *args: Any, device: torch.device, prefetch_factor: int = 2, non_blocking: bool = True, length: Optional[int] = None, pin_memory: Optional[bool] = None, **kwargs: Any) -> "Loader":
 
-        Stages:
-          - Optional PinMemory on host
-          - torchdata Prefetcher on host
-          - torchdata Loader node
-          - Custom device Prefetcher (applied by Loader.__init__)
-
-        Returns a fully configured Loader instance ready to iterate.
-        """
         dev = device if isinstance(device, torch.device) else torch.device(device)
         node = source
         do_pin = bool(pin_memory) if pin_memory is not None else (getattr(dev, 'type', 'cpu') in {'cuda','xpu','mps'})
