@@ -11,18 +11,15 @@ from tensordict import TensorDict, TensorDictBase, stack
 from ..backend.system import get_tlb, optimize_threads
 
 try:
-    from torchdata.nodes import BaseNode, ParallelMapper
+    from torchdata.nodes import BaseNode
 except Exception:
     from torchdata.nodes import BaseNode
-
-    ParallelMapper = None
 
 from .nodes import (
     Dataset,
     Disposable,
     Connector,
     Loader,
-    Multiplexer,
     Sampler,
     SourceSpec,
 )
@@ -89,57 +86,39 @@ def _process(
     return {"X": features, "Y": labels}
 
 
-def collate(
-    sample: Any,
-    *args: Any,
-    labels_dtype: Optional[torch.dtype] = None,
-    sanitize: bool = False,
-    flatten_features: bool = False,
-    **kwargs: Any,
-) -> Any:
-    converter = partial(
-        _process,
-        flatten_features=flatten_features,
-        labels_dtype=labels_dtype,
-        sanitize=sanitize,
-    )
-    if isinstance(sample, TensorDictBase):
-        return sample
-    if isinstance(sample, (list, tuple)):
-        batch_list = []
-        for item in sample:
-            if isinstance(item, TensorDictBase):
-                batch_list.append(item)
-            elif isinstance(item, Mapping):
-                conv = converter(item)
-                td = TensorDict(
-                    {
-                        "X": conv["X"],
-                        "Y": conv["Y"],
-                        "features": conv["X"],
-                        "labels": conv["Y"],
-                    },
-                    batch_size=[],
-                )
-                batch_list.append(td)
-            else:
-                batch_list.append(item)
-        if all(isinstance(elem, TensorDictBase) for elem in batch_list):
-            return stack(batch_list, dim=0)
-        return batch_list
-    if isinstance(sample, Mapping):
-        conv = converter(sample)
-        return TensorDict(
-            {
-                "X": conv["X"],
-                "Y": conv["Y"],
-                "features": conv["X"],
-                "labels": conv["Y"],
-            },
-            batch_size=[],
-        )
-    return sample
-
+def collate(batch: Any, *args: Any, labels_dtype: Optional[torch.dtype] = None, **kwargs: Any) -> Any:
+    """
+    Keep it simple: stack per-key when possible. Pre/post-processing is done in map_fn.
+    """
+    if isinstance(batch, (list, tuple)):
+        if not batch:
+            return batch
+        if all(isinstance(elem, TensorDictBase) for elem in batch):
+            return stack(list(batch), dim=0)
+        if all(isinstance(elem, Mapping) for elem in batch):
+            Xs = [elem.get("X") for elem in batch]
+            Ys = [elem.get("Y") for elem in batch]
+            try:
+                if all(isinstance(x, torch.Tensor) for x in Xs):
+                    Xs = torch.stack(Xs, dim=0)
+            except Exception:
+                pass
+            try:
+                if all(isinstance(y, torch.Tensor) for y in Ys):
+                    Ys = torch.stack(Ys, dim=0)
+            except Exception:
+                pass
+            if labels_dtype is not None and isinstance(Ys, torch.Tensor):
+                Ys = Ys.to(dtype=labels_dtype, non_blocking=True)
+            return TensorDict({"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}, batch_size=[])
+        return batch
+    if isinstance(batch, Mapping):
+        X = batch.get("X")
+        Y = batch.get("Y")
+        if labels_dtype is not None and isinstance(Y, torch.Tensor):
+            Y = Y.to(dtype=labels_dtype, non_blocking=True)
+        return TensorDict({"X": X, "Y": Y, "features": X, "labels": Y}, batch_size=[])
+    return batch
 
 def compose(
     node_or_nodes: Union[BaseNode, Sequence[BaseNode], Mapping[str, BaseNode]],
@@ -165,8 +144,9 @@ def compose(
     if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping):
         mx_weights = weights
 
-    mux = Multiplexer(stop_criteria="CYCLE_FOREVER", seed=0, weights=mx_weights)
-    source = mux.compose(node_or_nodes)
+    # 유한 스트림: 한 번 소진되면 종료
+    sampler = Sampler(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=0, weights=mx_weights)
+    source = sampler.compose(node_or_nodes)
 
     mapper = Connector(
         map_fn=map_fn,
@@ -215,59 +195,61 @@ def fetch(
     allocated = Disposable()
 
     def _node_for(
-        spec: SourceSpec, split: str, shuffle: bool
+        spec: SourceSpec, key: str, split: str, shuffle: bool
     ) -> Tuple[BaseNode, int, Any]:
         ds = dataset(spec, split=split, val_frac=float(val_frac))
         allocated.add(ds)
 
-        samp = Sampler(
-            start=ds.start,
-            end=ds.end,
+        sampler_node = ds.compose(
             batch_size=int(batch_size),
             shuffle=shuffle,
             seed=0,
+            key=str(key),
         )
-
-        sampler_node = samp.compose(ds)
-        return sampler_node, len(samp), ds
+        return sampler_node, len(ds), ds
 
     if isinstance(sources, Mapping) and not _is_source_spec(sources):
         sampler_nodes: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
         datasets: Dict[str, Any] = {}
         for key, spec in sources.items():
-            sampler_node, length, ds = _node_for(spec, split="train", shuffle=True)
-            sampler_nodes[str(key)] = sampler_node
-            lengths[str(key)] = length
-            datasets[str(key)] = ds
+            sampler_node, length, ds = _node_for(spec, key=str(key), split="train", shuffle=True)
+            if length > 0:
+                sampler_nodes[str(key)] = sampler_node
+                lengths[str(key)] = length
+                datasets[str(key)] = ds
+
+        # 길이 0 소스 제거 후 가중치 정리
+        if isinstance(train_weights, Mapping):
+            train_weights = {k: v for k, v in dict(train_weights).items() if k in sampler_nodes}
 
         if not sampler_nodes:
-            raise RuntimeError("No training sources provided")
-        if ParallelMapper is None:
-            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+            raise RuntimeError("No non-empty training sources provided")
 
-        sample_nodes: Dict[str, BaseNode] = {}
-        for key, sampler_node in sampler_nodes.items():
-            ds = datasets[key]
-            getitem = getattr(ds, "__getitem__", None)
-            if not callable(getitem):
-                raise TypeError(f"Dataset for key {key!r} has no __getitem__")
-            sample_nodes[key] = ParallelMapper(
-                sampler_node,
-                getitem,
-                num_workers=1,
-                in_order=True,
-                method="thread",
-                multiprocessing_context=None,
-                max_concurrent=None,
-                snapshot_frequency=1,
-                prebatch=None,
-            )
+        def iterate(sample):
+            def _one(smpl):
+                if (
+                    isinstance(smpl, (list, tuple))
+                    and len(smpl) == 2
+                    and isinstance(smpl[0], str)
+                ):
+                    k, rng = smpl
+                    s, e = int(rng[0]), int(rng[1])
+                    ds = datasets.get(k)
+                    if ds is None:
+                        raise KeyError(f"Unknown dataset key: {k}")
+                    batch = ds.get(s, e)
+                    return map_fn(batch)
+                return map_fn(smpl)
+
+            if isinstance(sample, list):
+                return [_one(smpl) for smpl in sample]
+            return _one(sample)
 
         _, mapped, _ = compose(
-            sample_nodes,
+            sampler_nodes,
             device=device_obj,
-            map_fn=map_fn,
+            map_fn=iterate,
             prefetch_factor=int(pf_depth),
             non_blocking_copy=bool(non_blocking_copy),
             io_workers=io_workers,
@@ -279,41 +261,42 @@ def fetch(
     elif isinstance(sources, (list, tuple)):
         sampler_list: list[BaseNode] = []
         lengths: list[int] = []
-        datasets: list[Any] = []
-        for spec in sources:
-            sampler_node, length, ds = _node_for(spec, split="train", shuffle=True)
-            sampler_list.append(sampler_node)
-            lengths.append(length)
-            datasets.append(ds)
+        datasets: Dict[str, Any] = {}
+        for i, spec in enumerate(sources):
+            key = str(i)
+            sampler_node, length, ds = _node_for(spec, key=key, split="train", shuffle=True)
+            if length > 0:
+                sampler_list.append(sampler_node)
+                lengths.append(length)
+                datasets[key] = ds
 
         if not sampler_list:
-            raise RuntimeError("No training sources provided")
-        if ParallelMapper is None:
-            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+            raise RuntimeError("No non-empty training sources provided")
 
-        sample_nodes: list[BaseNode] = []
-        for sampler_node, ds in zip(sampler_list, datasets):
-            getitem = getattr(ds, "__getitem__", None)
-            if not callable(getitem):
-                raise TypeError("Dataset has no __getitem__")
-            sample_nodes.append(
-                ParallelMapper(
-                    sampler_node,
-                    getitem,
-                    num_workers=1,
-                    in_order=True,
-                    method="thread",
-                    multiprocessing_context=None,
-                    max_concurrent=None,
-                    snapshot_frequency=1,
-                    prebatch=None,
-                )
-            )
+        def iterate(sample):
+            def _one(smpl):
+                if (
+                    isinstance(smpl, (list, tuple))
+                    and len(smpl) == 2
+                    and isinstance(smpl[0], str)
+                ):
+                    k, rng = smpl
+                    s, e = int(rng[0]), int(rng[1])
+                    ds = datasets.get(k)
+                    if ds is None:
+                        raise KeyError(f"Unknown dataset key: {k}")
+                    batch = ds.get(s, e)
+                    return map_fn(batch)
+                return map_fn(smpl)
+
+            if isinstance(sample, list):
+                return [_one(smpl) for smpl in sample]
+            return _one(sample)
 
         _, mapped, _ = compose(
-            sample_nodes,
+            sampler_list,
             device=device_obj,
-            map_fn=map_fn,
+            map_fn=iterate,
             prefetch_factor=int(pf_depth),
             non_blocking_copy=bool(non_blocking_copy),
             io_workers=io_workers,
@@ -323,27 +306,33 @@ def fetch(
         train_length = sum(lengths) if lengths else None
 
     else:
-        sampler_node, train_length, ds = _node_for(sources, split="train", shuffle=True)
-        if ParallelMapper is None:
-            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
-        getitem = getattr(ds, "__getitem__", None)
-        if not callable(getitem):
-            raise TypeError("Dataset has no __getitem__")
-        sample_node = ParallelMapper(
-            sampler_node,
-            getitem,
-            num_workers=1,
-            in_order=True,
-            method="thread",
-            multiprocessing_context=None,
-            max_concurrent=None,
-            snapshot_frequency=1,
-            prebatch=None,
-        )
+        sampler_node, train_length, ds = _node_for(sources, key="0", split="train", shuffle=True)
+        datasets: Dict[str, Any] = {"0": ds}
+
+        def iterate(sample):
+            def _one(smpl):
+                if (
+                    isinstance(smpl, (list, tuple))
+                    and len(smpl) == 2
+                    and isinstance(smpl[0], str)
+                ):
+                    k, rng = smpl
+                    s, e = int(rng[0]), int(rng[1])
+                    ds_ = datasets.get(k)
+                    if ds_ is None:
+                        raise KeyError(f"Unknown dataset key: {k}")
+                    batch = ds_.get(s, e)
+                    return map_fn(batch)
+                return map_fn(smpl)
+
+            if isinstance(sample, list):
+                return [_one(smpl) for smpl in sample]
+            return _one(sample)
+
         _, mapped, _ = compose(
-            sample_node,
+            sampler_node,
             device=device_obj,
-            map_fn=map_fn,
+            map_fn=iterate,
             prefetch_factor=int(pf_depth),
             non_blocking_copy=bool(non_blocking_copy),
             io_workers=io_workers,
@@ -351,9 +340,9 @@ def fetch(
             weights=train_weights,
         )
 
-    train_loader = Loader(
+    train_loader = Loader.compose(
+        mapped,
         device=device_obj,
-        node=mapped,
         prefetch_factor=int(pf_depth),
         non_blocking=bool(non_blocking_copy),
         length=train_length,
@@ -366,46 +355,50 @@ def fetch(
             lengths: Dict[str, int] = {}
             datasets: Dict[str, Any] = {}
             for key, spec in sources.items():
-                sampler_node, length, ds = _node_for(spec, split="val", shuffle=False)
-                sampler_nodes[str(key)] = sampler_node
-                lengths[str(key)] = length
-                datasets[str(key)] = ds
-            if not sampler_nodes:
-                raise RuntimeError("No validation sources provided")
-            if ParallelMapper is None:
-                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+                sampler_node, length, ds = _node_for(spec, key=str(key), split="val", shuffle=False)
+                if length > 0:
+                    sampler_nodes[str(key)] = sampler_node
+                    lengths[str(key)] = length
+                    datasets[str(key)] = ds
 
-            sample_nodes: Dict[str, BaseNode] = {}
-            for key, sampler_node in sampler_nodes.items():
-                ds = datasets[key]
-                getitem = getattr(ds, "__getitem__", None)
-                if not callable(getitem):
-                    raise TypeError(f"Dataset for key {key!r} has no __getitem__")
-                sample_nodes[key] = ParallelMapper(
-                    sampler_node,
-                    getitem,
-                    num_workers=1,
-                    in_order=True,
-                    method="thread",
-                    multiprocessing_context=None,
-                    max_concurrent=None,
-                    snapshot_frequency=1,
-                    prebatch=None,
-                )
+            if isinstance(val_weights, Mapping):
+                val_weights = {k: v for k, v in dict(val_weights).items() if k in sampler_nodes}
+            if not sampler_nodes:
+                raise RuntimeError("No non-empty validation sources provided")
+
+            def iterate(sample):
+                def _one(smpl):
+                    if (
+                        isinstance(smpl, (list, tuple))
+                        and len(smpl) == 2
+                        and isinstance(smpl[0], str)
+                    ):
+                        k, rng = smpl
+                        s, e = int(rng[0]), int(rng[1])
+                        ds = datasets.get(k)
+                        if ds is None:
+                            raise KeyError(f"Unknown dataset key: {k}")
+                        batch = ds.get(s, e)
+                        return map_fn(batch)
+                    return map_fn(smpl)
+
+                if isinstance(sample, list):
+                    return [_one(smpl) for smpl in sample]
+                return _one(sample)
 
             _, vmapped, _ = compose(
-                sample_nodes,
+                sampler_nodes,
                 device=device_obj,
-                map_fn=map_fn,
+                map_fn=iterate,
                 prefetch_factor=int(pf_depth),
                 non_blocking_copy=bool(non_blocking_copy),
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
             )
-            val_loader = Loader(
+            val_loader = Loader.compose(
+                vmapped,
                 device=device_obj,
-                node=vmapped,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
                 length=sum(lengths.values()) if lengths else None,
@@ -414,85 +407,92 @@ def fetch(
         elif isinstance(sources, (list, tuple)):
             sampler_list: list[BaseNode] = []
             lengths: list[int] = []
-            datasets: list[Any] = []
-            for spec in sources:
-                sampler_node, length, ds = _node_for(spec, split="val", shuffle=False)
-                sampler_list.append(sampler_node)
-                lengths.append(length)
-                datasets.append(ds)
+            datasets: Dict[str, Any] = {}
+            for i, spec in enumerate(sources):
+                k = str(i)
+                sampler_node, length, ds = _node_for(spec, key=k, split="val", shuffle=False)
+                if length > 0:
+                    sampler_list.append(sampler_node)
+                    lengths.append(length)
+                    datasets[k] = ds
             if not sampler_list:
-                raise RuntimeError("No validation sources provided")
-            if ParallelMapper is None:
-                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+                raise RuntimeError("No non-empty validation sources provided")
 
-            sample_nodes: list[BaseNode] = []
-            for sampler_node, ds in zip(sampler_list, datasets):
-                getitem = getattr(ds, "__getitem__", None)
-                if not callable(getitem):
-                    raise TypeError("Dataset has no __getitem__")
-                sample_nodes.append(
-                    ParallelMapper(
-                        sampler_node,
-                        getitem,
-                        num_workers=1,
-                        in_order=True,
-                        method="thread",
-                        multiprocessing_context=None,
-                        max_concurrent=None,
-                        snapshot_frequency=1,
-                        prebatch=None,
-                    )
-                )
+            def iterate(sample):
+                def _one(smpl):
+                    if (
+                        isinstance(smpl, (list, tuple))
+                        and len(smpl) == 2
+                        and isinstance(smpl[0], str)
+                    ):
+                        k, rng = smpl
+                        s, e = int(rng[0]), int(rng[1])
+                        ds = datasets.get(k)
+                        if ds is None:
+                            raise KeyError(f"Unknown dataset key: {k}")
+                        batch = ds.get(s, e)
+                        return map_fn(batch)
+                    return map_fn(smpl)
+
+                if isinstance(sample, list):
+                    return [_one(smpl) for smpl in sample]
+                return _one(sample)
 
             _, vmapped, _ = compose(
-                sample_nodes,
+                sampler_list,
                 device=device_obj,
-                map_fn=map_fn,
+                map_fn=iterate,
                 prefetch_factor=int(pf_depth),
                 non_blocking_copy=bool(non_blocking_copy),
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
             )
-            val_loader = Loader(
+            val_loader = Loader.compose(
+                vmapped,
                 device=device_obj,
-                node=vmapped,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
                 length=sum(lengths) if lengths else None,
             )
 
         else:
-            sampler_node, val_len, ds = _node_for(sources, split="val", shuffle=False)
-            if ParallelMapper is None:
-                raise RuntimeError("torchdata.nodes.ParallelMapper is required")
-            getitem = getattr(ds, "__getitem__", None)
-            if not callable(getitem):
-                raise TypeError("Dataset has no __getitem__")
-            sample_node = ParallelMapper(
-                sampler_node,
-                getitem,
-                num_workers=1,
-                in_order=True,
-                method="thread",
-                multiprocessing_context=None,
-                max_concurrent=None,
-                snapshot_frequency=1,
-                prebatch=None,
-            )
+            sampler_node, val_len, ds = _node_for(sources, key="0", split="val", shuffle=False)
+            datasets: Dict[str, Any] = {"0": ds}
+
+            def iterate(sample):
+                def _one(smpl):
+                    if (
+                        isinstance(smpl, (list, tuple))
+                        and len(smpl) == 2
+                        and isinstance(smpl[0], str)
+                    ):
+                        k, rng = smpl
+                        s, e = int(rng[0]), int(rng[1])
+                        ds_ = datasets.get(k)
+                        if ds_ is None:
+                            raise KeyError(f"Unknown dataset key: {k}")
+                        batch = ds_.get(s, e)
+                        return map_fn(batch)
+                    return map_fn(smpl)
+
+                if isinstance(sample, list):
+                    return [_one(smpl) for smpl in sample]
+                return _one(sample)
+
             _, vmapped, _ = compose(
-                sample_node,
+                sampler_node,
                 device=device_obj,
-                map_fn=map_fn,
+                map_fn=iterate,
                 prefetch_factor=int(pf_depth),
                 non_blocking_copy=bool(non_blocking_copy),
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
             )
-            val_loader = Loader(
+            val_loader = Loader.compose(
+                vmapped,
                 device=device_obj,
-                node=vmapped,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
                 length=val_len,
