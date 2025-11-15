@@ -277,7 +277,7 @@ class Dataset(_Sampler):
         except Exception:
             return out
 
-    def _rebuild_cuts(self) -> None:
+    def _shard(self) -> None:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
         B = max(1, int(self._S_B))
@@ -328,7 +328,7 @@ class Dataset(_Sampler):
         self._S_seed = int(seed)
         self._S_rng = random.Random(self._S_seed)
         self._key = str(key)
-        self._rebuild_cuts()
+        self._shard()
         if SamplerWrapper is None:
             raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
         return SamplerWrapper(self)
@@ -336,7 +336,7 @@ class Dataset(_Sampler):
     def __iter__(self):
         cuts = getattr(self, "_S_cuts", None)
         if not cuts:
-            self._rebuild_cuts()
+            self._shard()
             cuts = self._S_cuts
         n = max(0, len(cuts) - 1)
         idxs = list(range(n))
