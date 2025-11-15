@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import random
 from functools import partial
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
@@ -24,6 +25,146 @@ from .nodes import (
     SourceSpec,
 )
 from typing import Mapping as _Mapping
+
+
+def _sample_size(
+    _x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]
+) -> int:
+    x_one = _x_cpu[0]
+    bx = int(x_one.numel()) * int(x_one.element_size())
+    by = 0
+    if _y_cpu is not None:
+        y_one = _y_cpu[0]
+        by = int(y_one.numel()) * int(y_one.element_size())
+    return int(bx + by)
+
+
+def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Sequence[int]:
+    capB = 1024
+    if getattr(_device, "type", "cpu") == "cuda":
+        try:
+            free, _ = torch.cuda.mem_get_info(_device)
+            if _sample_bytes > 0:
+                capB = max(1, int((free * 0.72) // max(1, _sample_bytes * 4)))
+        except Exception:
+            pass
+    capB = max(1, min(capB, int(_N)))
+    base = [
+        capB // 8,
+        capB // 4,
+        capB // 2,
+        (capB * 3) // 8,
+        (capB * 3) // 4,
+        capB,
+    ]
+    cands = sorted({max(1, c) for c in base if c > 0})
+    return [c for c in cands if c <= _N]
+
+
+@torch.no_grad()
+def _h2d_counter(
+    _x_cpu: torch.Tensor,
+    _y_cpu: Optional[torch.Tensor],
+    _device: torch.device,
+    _bs: int,
+    _steps: int = 8,
+    _warmup: int = 2,
+) -> float:
+    N = int(_x_cpu.shape[0])
+    bs = max(1, min(int(_bs), N))
+
+    def _sync():
+        if _device.type == "cuda":
+            torch.cuda.synchronize()
+        elif _device.type == "xpu":
+            torch.xpu.synchronize()
+        elif _device.type == "mps":
+            torch.mps.synchronize()
+
+    times = []
+    for s in range(_steps + _warmup):
+        start = 0
+        if N > bs:
+            start = random.randint(0, N - bs)
+        xb = _x_cpu[start : start + bs]
+        yb = None
+        if _y_cpu is not None:
+            yb = _y_cpu[start : start + bs]
+        xbp = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else (xb.pin_memory() if _device.type in {"cuda", "xpu"} else xb)
+        ybp = None
+        if yb is not None:
+            ybp = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else (yb.pin_memory() if _device.type in {"cuda", "xpu"} else yb)
+        _sync()
+        t0 = torch.cuda.Event(enable_timing=True) if _device.type == "cuda" else None
+        if t0 is not None:
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+            _ = xbp.to(_device, non_blocking=True)
+            if ybp is not None:
+                _ = ybp.to(_device, non_blocking=True)
+            t1.record()
+            _sync()
+            ms = float(t0.elapsed_time(t1))
+        else:
+            import time as _t
+
+            tns0 = _t.perf_counter_ns()
+            _ = xbp.to(_device, non_blocking=True)
+            if ybp is not None:
+                _ = ybp.to(_device, non_blocking=True)
+            _sync()
+            tns1 = _t.perf_counter_ns()
+            ms = (tns1 - tns0) / 1e6
+        if s >= _warmup:
+            times.append(ms)
+    if not times:
+        return 0.0
+    times.sort()
+    return float(times[len(times) // 2])
+
+
+def _batch_interval(
+    _ds: "Dataset",
+    _dev: torch.device,
+    _tmin_ms: float = 0.8,
+    _tmax_ms: float = 3.0,
+) -> Tuple[int, float]:
+    probe = _ds.get(0, min(8, len(_ds)))
+    x_cpu = probe["X"]
+    y_cpu = probe.get("Y", None)
+    sbytes = _sample_size(x_cpu, y_cpu)
+    if sbytes <= 0:
+        return (max(1, min(256, len(_ds))), 0.0)
+    B_cap = 1 << 16
+    if _dev.type == "cuda":
+        try:
+            free, _ = torch.cuda.mem_get_info(_dev)
+            cap = int(free * 0.72)
+            B_cap = max(1, int(cap // max(1, sbytes * 4)))
+        except Exception:
+            pass
+    B_cap = max(1, min(B_cap, len(_ds)))
+    candidates = _random_batches(sbytes, _dev, len(_ds))
+    if candidates:
+        B = min(candidates[-1], B_cap)
+    else:
+        B = min(64, B_cap)
+    med = _h2d_counter(x_cpu, y_cpu, _dev, B)
+    while med > 0.0 and med < _tmin_ms and B < B_cap:
+        B_next = min(B * 2, B_cap)
+        med_next = _h2d_counter(x_cpu, y_cpu, _dev, B_next)
+        if med_next <= 0.0:
+            break
+        B, med = B_next, med_next
+    while med > _tmax_ms and B > 1:
+        B_next = max(1, B // 2)
+        if B_next == B:
+            break
+        med_next = _h2d_counter(x_cpu, y_cpu, _dev, B_next)
+        if med_next <= 0.0:
+            break
+        B, med = B_next, med_next
+    return (max(1, int(B)), float(med))
 
 
 def _is_source_spec(obj: Any) -> bool:
@@ -78,11 +219,11 @@ def _process(
         and isinstance(features, torch.Tensor)
         and (features.dim() >= 2)
     ):
-        features = features.flatten(start_dim=1)
+        features = features.view(features.shape[0], -1)
     if labels_dtype is not None and isinstance(labels, torch.Tensor):
-        labels = labels.to(dtype=labels_dtype, non_blocking=True)
+        labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
     if sanitize and torch.is_floating_point(labels):
-        labels = torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0)
+        torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
     return {"X": features, "Y": labels}
 
 
@@ -189,8 +330,8 @@ def fetch(
         Mapping[str, SourceSpec],
     ],
     device: Union[str, torch.device],
-    batch_size: int,
-    val_frac: float,
+    val_frac: float = 0.0,
+    batch_size: Optional[int] = None,
     non_blocking_copy: bool = True,
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = True,
@@ -216,33 +357,60 @@ def fetch(
 
     allocated = Disposable()
 
-    def _node_for(
-        spec: SourceSpec, key: str, split: str, shuffle: bool
-    ) -> Tuple[BaseNode, int, Any]:
-        ds = dataset(spec, split=split, val_frac=float(val_frac))
-        allocated.add(ds)
+    def _stream_batch(_ds: Dataset, _dev: torch.device) -> Tuple[int, float]:
+        try:
+            return _batch_interval(_ds, _dev)
+        except Exception:
+            return (int(batch_size) if batch_size is not None else 0, 0.0)
 
-        sampler_node = ds.compose(
-            batch_size=int(batch_size),
-            shuffle=shuffle,
-            seed=0,
-            key=str(key),
-        )
-        return sampler_node, len(ds), ds
+    _device_obj = device_obj
+    _auto_bs_candidates: list[int] = []
+    _auto_ms_candidates: list[float] = []
 
     if isinstance(sources, Mapping) and not _is_source_spec(sources):
-        sampler_nodes: Dict[str, BaseNode] = {}
-        lengths: Dict[str, int] = {}
         datasets: Dict[str, Any] = {}
         for key, spec in sources.items():
-            sampler_node, length, ds = _node_for(spec, key=str(key), split="train", shuffle=True)
-            if length > 0:
+            ds = dataset(spec, split="train", val_frac=float(val_frac))
+            allocated.add(ds)
+            datasets[str(key)] = ds
+        if batch_size is None or int(batch_size) <= 0:
+            for _k, _ds in datasets.items():
+                B_i, ms_i = _stream_batch(_ds, _device_obj)
+                if B_i > 0:
+                    _auto_bs_candidates.append(B_i)
+                    _auto_ms_candidates.append(ms_i)
+            if _auto_bs_candidates:
+                cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+                cand_max = max(_auto_bs_candidates)
+                batch_size = max(1, min(cand_max, cand_mean))
+                if _auto_ms_candidates:
+                    _m = min(_auto_ms_candidates)
+                    if _m < 0.35:
+                        pf_depth = max(pf_depth, 6)
+                    elif _m < 0.70:
+                        pf_depth = max(pf_depth, 4)
+                    elif _m < 1.00:
+                        pf_depth = max(pf_depth, 3)
+                pf_depth = int(max(2, min(8, pf_depth)))
+            else:
+                batch_size = 1
+        sampler_nodes: Dict[str, BaseNode] = {}
+        lengths: Dict[str, int] = {}
+        for key, ds in datasets.items():
+            sampler_node = ds.compose(
+                batch_size=int(batch_size),
+                shuffle=True,
+                seed=0,
+                key=str(key),
+            )
+            if len(ds) > 0:
                 sampler_nodes[str(key)] = sampler_node
-                lengths[str(key)] = length
-                datasets[str(key)] = ds
+                lengths[str(key)] = len(ds)
 
         if isinstance(train_weights, Mapping):
-            train_weights = {k: v for k, v in dict(train_weights).items() if k in sampler_nodes}
+            train_weights = {
+                k: v for k, v in dict(train_weights).items() if k in sampler_nodes
+            }
 
         if not sampler_nodes:
             raise RuntimeError("No non-empty training sources provided")
@@ -280,16 +448,45 @@ def fetch(
         train_length = sum(lengths.values()) if lengths else None
 
     elif isinstance(sources, (list, tuple)):
-        sampler_list: list[BaseNode] = []
-        lengths: list[int] = []
         datasets: Dict[str, Any] = {}
         for i, spec in enumerate(sources):
             key = str(i)
-            sampler_node, length, ds = _node_for(spec, key=key, split="train", shuffle=True)
-            if length > 0:
+            ds = dataset(spec, split="train", val_frac=float(val_frac))
+            allocated.add(ds)
+            datasets[key] = ds
+        if batch_size is None or int(batch_size) <= 0:
+            for _k, _ds in datasets.items():
+                B_i, ms_i = _stream_batch(_ds, _device_obj)
+                if B_i > 0:
+                    _auto_bs_candidates.append(B_i)
+                    _auto_ms_candidates.append(ms_i)
+            if _auto_bs_candidates:
+                cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+                cand_max = max(_auto_bs_candidates)
+                batch_size = max(1, min(cand_max, cand_mean))
+                if _auto_ms_candidates:
+                    _m = min(_auto_ms_candidates)
+                    if _m < 0.35:
+                        pf_depth = max(pf_depth, 6)
+                    elif _m < 0.70:
+                        pf_depth = max(pf_depth, 4)
+                    elif _m < 1.00:
+                        pf_depth = max(pf_depth, 3)
+                pf_depth = int(max(2, min(8, pf_depth)))
+            else:
+                batch_size = 1
+        sampler_list: list[BaseNode] = []
+        lengths: list[int] = []
+        for key, ds in datasets.items():
+            sampler_node = ds.compose(
+                batch_size=int(batch_size),
+                shuffle=True,
+                seed=0,
+                key=str(key),
+            )
+            if len(ds) > 0:
                 sampler_list.append(sampler_node)
-                lengths.append(length)
-                datasets[key] = ds
+                lengths.append(len(ds))
 
         if not sampler_list:
             raise RuntimeError("No non-empty training sources provided")
@@ -327,7 +524,24 @@ def fetch(
         train_length = sum(lengths) if lengths else None
 
     else:
-        sampler_node, train_length, ds = _node_for(sources, key="0", split="train", shuffle=True)
+        ds = dataset(sources, split="train", val_frac=float(val_frac))
+        allocated.add(ds)
+        if batch_size is None or int(batch_size) <= 0:
+            B_i, ms_i = _stream_batch(ds, _device_obj)
+            batch_size = max(1, int(B_i) if B_i > 0 else 1)
+            if ms_i:
+                if ms_i < 0.35:
+                    pf_depth = max(pf_depth, 6)
+                elif ms_i < 0.70:
+                    pf_depth = max(pf_depth, 4)
+                elif ms_i < 1.00:
+                    pf_depth = max(pf_depth, 3)
+        sampler_node = ds.compose(
+            batch_size=int(batch_size),
+            shuffle=True,
+            seed=0,
+            key="0",
+        )
         datasets: Dict[str, Any] = {"0": ds}
 
         def iterate(sample):
@@ -360,6 +574,7 @@ def fetch(
             prebatch=prebatch,
             weights=train_weights,
         )
+        train_length = len(ds)
 
     train_loader = Loader.compose(
         mapped,
@@ -372,18 +587,49 @@ def fetch(
     val_loader = None
     if float(val_frac) > 0.0:
         if isinstance(sources, Mapping) and not _is_source_spec(sources):
-            sampler_nodes: Dict[str, BaseNode] = {}
-            lengths: Dict[str, int] = {}
             datasets: Dict[str, Any] = {}
             for key, spec in sources.items():
-                sampler_node, length, ds = _node_for(spec, key=str(key), split="val", shuffle=False)
-                if length > 0:
-                    sampler_nodes[str(key)] = sampler_node
-                    lengths[str(key)] = length
-                    datasets[str(key)] = ds
+                ds = dataset(spec, split="val", val_frac=float(val_frac))
+                allocated.add(ds)
+                datasets[str(key)] = ds
+            if batch_size is None or int(batch_size) <= 0:
+                _auto_bs_candidates.clear()
+                _auto_ms_candidates.clear()
+                for _k, _ds in datasets.items():
+                    B_i, ms_i = _stream_batch(_ds, _device_obj)
+                    if B_i > 0:
+                        _auto_bs_candidates.append(B_i)
+                        _auto_ms_candidates.append(ms_i)
+                if _auto_bs_candidates:
+                    cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+                    cand_max = max(_auto_bs_candidates)
+                    batch_size = max(1, min(cand_max, cand_mean))
+                    if _auto_ms_candidates:
+                        _m = min(_auto_ms_candidates)
+                        if _m < 0.35:
+                            pf_depth = max(pf_depth, 6)
+                        elif _m < 0.70:
+                            pf_depth = max(pf_depth, 4)
+                        elif _m < 1.00:
+                            pf_depth = max(pf_depth, 3)
+                    pf_depth = int(max(2, min(8, pf_depth)))
+            sampler_nodes: Dict[str, BaseNode] = {}
+            lengths: Dict[str, int] = {}
+            for key, ds in datasets.items():
+                sn = ds.compose(
+                    batch_size=int(batch_size),
+                    shuffle=False,
+                    seed=0,
+                    key=str(key),
+                )
+                if len(ds) > 0:
+                    sampler_nodes[str(key)] = sn
+                    lengths[str(key)] = len(ds)
 
             if isinstance(val_weights, Mapping):
-                val_weights = {k: v for k, v in dict(val_weights).items() if k in sampler_nodes}
+                val_weights = {
+                    k: v for k, v in dict(val_weights).items() if k in sampler_nodes
+                }
             if not sampler_nodes:
                 raise RuntimeError("No non-empty validation sources provided")
 
@@ -407,7 +653,7 @@ def fetch(
                     return [_one(smpl) for smpl in sample]
                 return _one(sample)
 
-            _, vmapped, _ = compose(
+            _, mapped_val, _ = compose(
                 sampler_nodes,
                 device=device_obj,
                 map_fn=iterate,
@@ -418,7 +664,7 @@ def fetch(
                 weights=val_weights,
             )
             val_loader = Loader.compose(
-                vmapped,
+                mapped_val,
                 device=device_obj,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
@@ -426,16 +672,45 @@ def fetch(
             )
 
         elif isinstance(sources, (list, tuple)):
-            sampler_list: list[BaseNode] = []
-            lengths: list[int] = []
             datasets: Dict[str, Any] = {}
             for i, spec in enumerate(sources):
                 k = str(i)
-                sampler_node, length, ds = _node_for(spec, key=k, split="val", shuffle=False)
-                if length > 0:
-                    sampler_list.append(sampler_node)
-                    lengths.append(length)
-                    datasets[k] = ds
+                ds = dataset(spec, split="val", val_frac=float(val_frac))
+                allocated.add(ds)
+                datasets[k] = ds
+            if batch_size is None or int(batch_size) <= 0:
+                _auto_bs_candidates.clear()
+                _auto_ms_candidates.clear()
+                for _k, _ds in datasets.items():
+                    B_i, ms_i = _stream_batch(_ds, _device_obj)
+                    if B_i > 0:
+                        _auto_bs_candidates.append(B_i)
+                        _auto_ms_candidates.append(ms_i)
+                if _auto_bs_candidates:
+                    cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+                    cand_max = max(_auto_bs_candidates)
+                    batch_size = max(1, min(cand_max, cand_mean))
+                    if _auto_ms_candidates:
+                        _m = min(_auto_ms_candidates)
+                        if _m < 0.35:
+                            pf_depth = max(pf_depth, 6)
+                        elif _m < 0.70:
+                            pf_depth = max(pf_depth, 4)
+                        elif _m < 1.00:
+                            pf_depth = max(pf_depth, 3)
+                    pf_depth = int(max(2, min(8, pf_depth)))
+            sampler_list: list[BaseNode] = []
+            lengths: list[int] = []
+            for k, ds in datasets.items():
+                sn = ds.compose(
+                    batch_size=int(batch_size),
+                    shuffle=False,
+                    seed=0,
+                    key=str(k),
+                )
+                if len(ds) > 0:
+                    sampler_list.append(sn)
+                    lengths.append(len(ds))
             if not sampler_list:
                 raise RuntimeError("No non-empty validation sources provided")
 
@@ -459,7 +734,7 @@ def fetch(
                     return [_one(smpl) for smpl in sample]
                 return _one(sample)
 
-            _, vmapped, _ = compose(
+            _, mapped_val, _ = compose(
                 sampler_list,
                 device=device_obj,
                 map_fn=iterate,
@@ -470,7 +745,7 @@ def fetch(
                 weights=val_weights,
             )
             val_loader = Loader.compose(
-                vmapped,
+                mapped_val,
                 device=device_obj,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
@@ -478,7 +753,24 @@ def fetch(
             )
 
         else:
-            sampler_node, val_len, ds = _node_for(sources, key="0", split="val", shuffle=False)
+            ds = dataset(sources, split="val", val_frac=float(val_frac))
+            allocated.add(ds)
+            if batch_size is None or int(batch_size) <= 0:
+                B_i, ms_i = _stream_batch(ds, _device_obj)
+                batch_size = max(1, int(B_i) if B_i > 0 else 1)
+                if ms_i:
+                    if ms_i < 0.35:
+                        pf_depth = max(pf_depth, 6)
+                    elif ms_i < 0.70:
+                        pf_depth = max(pf_depth, 4)
+                    elif ms_i < 1.00:
+                        pf_depth = max(pf_depth, 3)
+            sampler_node = ds.compose(
+                batch_size=int(batch_size),
+                shuffle=False,
+                seed=0,
+                key="0",
+            )
             datasets: Dict[str, Any] = {"0": ds}
 
             def iterate(sample):
@@ -501,7 +793,7 @@ def fetch(
                     return [_one(smpl) for smpl in sample]
                 return _one(sample)
 
-            _, vmapped, _ = compose(
+            _, mapped_val, _ = compose(
                 sampler_node,
                 device=device_obj,
                 map_fn=iterate,
@@ -512,11 +804,12 @@ def fetch(
                 weights=val_weights,
             )
             val_loader = Loader.compose(
-                vmapped,
+                mapped_val,
                 device=device_obj,
                 prefetch_factor=int(pf_depth),
                 non_blocking=bool(non_blocking_copy),
-                length=val_len,
+                length=len(ds),
             )
 
-    return (train_loader, val_loader, allocated)
+    return train_loader, val_loader, allocated
+

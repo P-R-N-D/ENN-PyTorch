@@ -600,8 +600,8 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
 
     max_concurrancy = int(max(1, num_workers))
 
-    prebatch = max(2, num_workers * 2)
-    prefetch_factor = 2 if has_cuda else 1
+    prebatch = 1
+    prefetch_factor = 3 if has_cuda else 1
 
     return {
         "intra_ops": int(max(1, intra_ops)),
@@ -628,7 +628,6 @@ def optimize_threads() -> Dict[str, Union[int, bool]]:
             torch.set_num_interop_threads(int(threads["inter_ops"]))
     except Exception:
         pass
-
     return threads
 
 
