@@ -1560,6 +1560,11 @@ def infer(
                 try:
                     y_hat_cpu = torch.empty_like(y_hat, device="cpu", pin_memory=True)
                     y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
+                    device_backend = getattr(torch, y_hat.device.type, None)
+                    if device_backend is not None:
+                        stream_getter = getattr(device_backend, "current_stream", None)
+                        if callable(stream_getter):
+                            stream_getter(y_hat.device).synchronize()
                     y_hat_cpu = y_hat_cpu.contiguous()
                 except Exception:
                     y_hat_cpu = y_hat.detach().cpu().contiguous()
