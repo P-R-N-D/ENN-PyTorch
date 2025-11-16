@@ -318,6 +318,74 @@ def new_dir(prefix: str) -> str:
     return directory
 
 
+def available_memory() -> int:
+    try:
+        import psutil
+
+        vm = psutil.virtual_memory()
+        avail = getattr(vm, "available", None)
+        if avail is not None:
+            return int(avail)
+        total = getattr(vm, "total", 0)
+        used = getattr(vm, "used", None)
+        if total and used is not None:
+            return int(total - used)
+    except Exception:
+        pass
+
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("MemAvailable:"):
+                        parts = line.split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            return int(parts[1]) * 1024
+        elif sys.platform == "darwin":
+            import subprocess
+
+            out = subprocess.check_output(["vm_stat"]).decode("utf-8", "ignore")
+            page = None
+            free = None
+            inactive = None
+            speculative = 0
+            for ln in out.splitlines():
+                if "page size of" in ln:
+                    page = int(ln.split()[-2])
+                elif ln.startswith("Pages free:"):
+                    free = int(ln.split(":")[1].split()[0])
+                elif ln.startswith("Pages inactive:"):
+                    inactive = int(ln.split(":")[1].split()[0])
+                elif ln.startswith("Pages speculative:"):
+                    speculative = int(ln.split(":")[1].split()[0])
+            if page and free is not None and inactive is not None:
+                return int((free + inactive + (speculative or 0)) * page)
+        elif os.name == "nt" or sys.platform.startswith("win"):
+            import ctypes
+
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                return int(stat.ullAvailPhys)
+    except Exception:
+        pass
+
+    return 0
+
+
 def get_dpa_backends() -> List[object]:
     names = _RUNTIME_CONFIG.sdpa_backends or []
     if not names:

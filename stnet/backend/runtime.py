@@ -94,6 +94,8 @@ from .system import (
     is_float8_supported,
     get_tlb,
     posix_time,
+    new_dir,
+    available_memory,
 )
 from .profiler import FlopCounter
 
@@ -1007,10 +1009,20 @@ def epochs(
     swa_start_epoch: int = 0,
     swa_bn_update: bool = False,
     swa_in_key: str = "features",
+    buffers_dtype: Optional[torch.dtype] = None,
     **kwargs: Any,
 ) -> None:
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
+
+    def _cast_fp_buffers(module: torch.nn.Module, dtype: torch.dtype) -> None:
+        for buf in module.buffers(recurse=True):
+            if isinstance(buf, torch.Tensor) and buf.is_floating_point():
+                try:
+                    if buf.dtype != dtype:
+                        buf.data = buf.data.to(dtype=dtype)
+                except Exception:
+                    pass
 
     if (
         is_distributed()
@@ -1026,11 +1038,13 @@ def epochs(
             model = _saved
             warnings.warn(f"SyncBatchNorm conversion skipped (fallback): {e}")
 
+    if buffers_dtype is not None:
+        target_for_buffers = model.module if hasattr(model, "module") else model
+        _cast_fp_buffers(target_for_buffers, buffers_dtype)
+
     start_kst_ns = posix_time("Asia/Seoul")
     in_dim = int(ops.in_dim)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-        torch, "Event"
-    )
+    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(torch, "Event")
     train_steps = _num_batches(train_loader)
     val_steps = _num_batches(val_loader)
     total_updates = int(total_epochs) * (int(train_steps) + int(val_steps))
@@ -1049,8 +1063,21 @@ def epochs(
     prev_comp_time = 0.0
     prev_io_bytes = 0.0
     prev_flops = 0.0
+
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
+
+        def _pin_tensor(*tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            if device.type in ("cuda", "xpu"):
+                return tuple(
+                    (
+                        t.pin_memory()
+                        if (torch.is_tensor(t) and t.device.type == "cpu")
+                        else t
+                    )
+                    for t in tensors
+                )
+            return tensors
 
         try:
             target_module = model.module if hasattr(model, "module") else model
@@ -1113,6 +1140,7 @@ def epochs(
                         )
                     Y = to_torch_tensor(label)
                     t_ready = time.perf_counter_ns()
+                    X, Y = _pin_tensor(X, Y)
                     if use_timer:
                         h2d_s_ev, h2d_e_ev = (
                             torch.Event(device=device, enable_timing=True),
@@ -1397,6 +1425,9 @@ def epochs(
                         device=device,
                         in_key=swa_in_key,
                     )
+                if buffers_dtype is not None:
+                    target_for_buffers = model.module if hasattr(model, "module") else model
+                    _cast_fp_buffers(target_for_buffers, buffers_dtype)
             if updated_this_epoch:
                 swa_has_updated = True
             prev_comp_time += float(comp_time.item())
@@ -1410,6 +1441,9 @@ def epochs(
                 device=device,
                 in_key=swa_in_key,
             )
+        if buffers_dtype is not None:
+            target_for_buffers = model.module if hasattr(model, "module") else model
+            _cast_fp_buffers(target_for_buffers, buffers_dtype)
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
@@ -1432,6 +1466,11 @@ def infer(
     streaming: bool = False,
     **kwargs: Any,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
+    spill_mb = 4096
+    reserve_mb = 2048
+    spill_bytes = max(1, spill_mb) * 1024 * 1024
+    preds_bytes = 0
+
     run_model = to_ddp(model, device=device)
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
@@ -1444,9 +1483,7 @@ def infer(
     )
     chunk_idx = 0
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(
-        torch, "Event"
-    )
+    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(torch, "Event")
     io_bytes: float = 0.0
     io_time: float = 0.0
     comp_time: float = 0.0
@@ -1456,6 +1493,7 @@ def infer(
     recovered_streaming = False
     is_dist = is_distributed()
     rank = torch.distributed.get_rank() if is_dist else 0
+
     try:
         with flop_counter, Gradient.inference(run_model), Autocast.float(device):
             for _idx, _raw in enumerate(data_loader):
@@ -1522,8 +1560,6 @@ def infer(
                 try:
                     y_hat_cpu = torch.empty_like(y_hat, device="cpu", pin_memory=True)
                     y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
-                    if y_hat.is_cuda and torch.cuda.is_available():
-                        torch.cuda.current_stream(device=y_hat.device).synchronize()
                     y_hat_cpu = y_hat_cpu.contiguous()
                 except Exception:
                     y_hat_cpu = y_hat.detach().cpu().contiguous()
@@ -1568,6 +1604,36 @@ def infer(
                         preds.append(y_hat_cpu)
                 else:
                     preds.append(y_hat_cpu)
+                    try:
+                        preds_bytes += int(y_hat_cpu.element_size() * y_hat_cpu.nelement())
+                    except Exception:
+                        pass
+                    need_spill = preds_bytes >= spill_bytes
+                    try:
+                        avail = available_memory()
+                        if avail and avail < max(1, reserve_mb) * 1024 * 1024:
+                            need_spill = True
+                    except Exception:
+                        pass
+                    if need_spill and rank == 0:
+                        if not chunk_dir:
+                            try:
+                                chunk_dir = new_dir("pred_chunks")
+                            except Exception:
+                                chunk_dir = None
+                        if chunk_dir:
+                            os.makedirs(chunk_dir, exist_ok=True)
+                            for _buf in preds:
+                                try:
+                                    chunk_path = os.path.join(chunk_dir, f"chunk_{chunk_idx:06d}.pt")
+                                    torch.save(_buf, chunk_path)
+                                    chunk_idx += 1
+                                except Exception:
+                                    streaming = False
+                                    break
+                            preds.clear()
+                            preds_bytes = 0
+                            streaming = True
                 if use_timer:
                     ev_e.record()
                     ev_e.synchronize()
@@ -1736,9 +1802,24 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         mesh = init_device_mesh(
             "cuda" if device.type == "cuda" else device.type, (world,)
         )
+        amp_candidates = Autocast.float_amp_priority(device)
+        amp_reduce_dtype = Autocast.negotiate(
+            amp_candidates,
+            fallback=torch.float32,
+            context="fsdp.reduce",
+            device=device,
+            meta=metadata,
+        )
+        amp_buffers_dtype = Autocast.negotiate(
+            amp_candidates,
+            fallback=torch.float32,
+            context="buffers.bn",
+            device=device,
+            meta=metadata,
+        )
         mp_policy = MixedPrecisionPolicy(
             param_dtype=None,
-            reduce_dtype=torch.float64,
+            reduce_dtype=amp_reduce_dtype,
             output_dtype=None,
             cast_forward_inputs=False,
         )
@@ -2026,6 +2107,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     swa_helper=swa_helper,
                     swa_start_epoch=swa_start_epoch,
                     swa_bn_update=swa_bn_update,
+                    buffers_dtype=amp_buffers_dtype,
                 )
 
             _thread = threading.Thread(target=_worker, daemon=False)
@@ -2049,10 +2131,16 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 )
             if ops.ckpt_dir:
                 fallback_path = os.path.join(ops.ckpt_dir, "model.pt")
-                torch.save(
-                    {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                    fallback_path,
-                )
+                _state: Dict[str, Any] = {}
+                for k, v in model.state_dict().items():
+                    if isinstance(v, torch.Tensor):
+                        t = v.detach().cpu()
+                        if t.is_floating_point():
+                            t = t.to(dtype=torch.float64)
+                        _state[k] = t
+                    else:
+                        _state[k] = v
+                torch.save(_state, fallback_path)
             with contextlib.suppress(Exception):
                 _dl = {
                     "train": (
