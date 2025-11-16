@@ -1916,7 +1916,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             train_loader, val_loader, keep = fetch(
                 sources=ops.sources,
                 device=device,
-                batch_size=int(ops.batch_size or 128),
                 val_frac=float(ops.val_frac),
                 non_blocking_copy=non_blocking_copy,
                 flatten_features=True,
@@ -2141,7 +2140,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         data_loader, _, keep = fetch(
             sources=ops.sources,
             device=device,
-            batch_size=int(ops.batch_size or 512),
             val_frac=0.0,
             non_blocking_copy=True,
         )

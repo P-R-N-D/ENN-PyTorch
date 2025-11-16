@@ -75,7 +75,6 @@ def train(
     ),
     *args: Any,
     epochs: int = 5,
-    batch_size: int = 128,
     val_frac: float = 0.1,
     shuffle: bool = False,
     base_lr: float = 0.001,
@@ -261,7 +260,6 @@ def train(
         )
         default_kwargs = {
             "epochs": epochs,
-            "batch_size": batch_size,
             "val_frac": val_frac,
             "base_lr": base_lr,
             "weight_decay": weight_decay,
@@ -317,7 +315,6 @@ def predict(
     model: Root,
     data: Dict[Tuple, torch.Tensor],
     *args: Any,
-    batch_size: int = 512,
     seed: int = 7,
     mode: OpsMode = "predict",
     max_nodes: Optional[int] = None,
@@ -381,10 +378,7 @@ def predict(
         keys=list(keys),
     )
     mode = mode if mode in ("predict", "infer") else "predict"
-    default_kwargs = {
-        "batch_size": batch_size,
-        "seed": seed,
-    }
+    default_kwargs = {"seed": seed}
     positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
     for key in list(default_kwargs):
         if key in positional_names or key in kwargs:

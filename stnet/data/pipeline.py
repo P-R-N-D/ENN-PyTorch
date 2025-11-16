@@ -331,7 +331,6 @@ def fetch(
     ],
     device: Union[str, torch.device],
     val_frac: float = 0.0,
-    batch_size: Optional[int] = None,
     non_blocking_copy: bool = True,
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = True,
@@ -356,6 +355,7 @@ def fetch(
     )
 
     allocated = Disposable()
+    batch_size: Optional[int] = None
 
     def _stream_batch(_ds: Dataset, _dev: torch.device) -> Tuple[int, float]:
         try:
