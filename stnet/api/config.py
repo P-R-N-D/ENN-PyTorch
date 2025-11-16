@@ -371,7 +371,6 @@ class RuntimeConfig:
     ckpt_dir: Optional[str] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5
-    batch_size: Optional[int] = None
     val_frac: float = 0.1
     base_lr: float = 1e-3
     weight_decay: float = 1e-4
@@ -390,7 +389,6 @@ class RuntimeConfig:
     keys: Optional[List[Tuple[Any, ...]]] = None
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "epochs",
-        "batch_size",
         "val_frac",
         "base_lr",
         "weight_decay",
@@ -406,10 +404,7 @@ class RuntimeConfig:
         "swa_start_epoch",
         "swa_update_batch_norm",
     )
-    PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = (
-        "batch_size",
-        "seed",
-    )
+    PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
 
     @staticmethod
     def from_partial(mode: OpsMode, *args: Any, **kwargs: Any) -> "RuntimeConfig":
@@ -434,7 +429,6 @@ class RuntimeConfig:
                 "ckpt_dir",
                 "init_ckpt_dir",
                 "epochs",
-                "batch_size",
                 "val_frac",
                 "base_lr",
                 "weight_decay",
@@ -456,7 +450,6 @@ class RuntimeConfig:
                     "RuntimeConfig(train) received unsupported parameters: "
                     f"{sorted(unsupported)}"
                 )
-            batch_size = int(kwargs.get("batch_size", 128))
             return RuntimeConfig(
                 mode="train",
                 in_dim=in_dim,
@@ -466,7 +459,6 @@ class RuntimeConfig:
                 ckpt_dir=str(kwargs["ckpt_dir"]),
                 init_ckpt_dir=kwargs.get("init_ckpt_dir"),
                 epochs=int(kwargs.get("epochs", 5)),
-                batch_size=batch_size,
                 val_frac=float(kwargs.get("val_frac", 0.1)),
                 base_lr=float(kwargs.get("base_lr", 1e-3)),
                 weight_decay=float(kwargs.get("weight_decay", 1e-4)),
@@ -489,7 +481,6 @@ class RuntimeConfig:
             "sources",
             "keys",
             "model_ckpt_dir",
-            "batch_size",
             "seed",
         }
         unsupported = set(kwargs) - allowed
@@ -497,7 +488,6 @@ class RuntimeConfig:
             raise ValueError(
                 f"RuntimeConfig({mode}) received unsupported parameters: {sorted(unsupported)}"
             )
-        batch_size = int(kwargs.get("batch_size", 512))
         return RuntimeConfig(
             mode="predict" if mode == "predict" else "infer",
             in_dim=in_dim,
@@ -506,7 +496,6 @@ class RuntimeConfig:
             sources=kwargs["sources"],
             model_ckpt_dir=kwargs.get("model_ckpt_dir"),
             keys=list(kwargs["keys"]),
-            batch_size=batch_size,
             seed=int(kwargs.get("seed", 7)),
         )
 

@@ -1913,16 +1913,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 device_str = str(device)
                 device_type = device_str.split(":", 1)[0]
             non_blocking_copy = device_type in accelerator_types
-            configured_batch_size = getattr(ops, "batch_size", None)
-            auto_batch_size = (
-                int(configured_batch_size)
-                if configured_batch_size is not None
-                else None
-            )
             train_loader, val_loader, keep = fetch(
                 sources=ops.sources,
                 device=device,
-                batch_size=auto_batch_size,
                 val_frac=float(ops.val_frac),
                 non_blocking_copy=non_blocking_copy,
                 flatten_features=True,
@@ -2144,14 +2137,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        configured_batch_size = getattr(ops, "batch_size", None)
-        auto_batch_size = (
-            int(configured_batch_size) if configured_batch_size is not None else None
-        )
         data_loader, _, keep = fetch(
             sources=ops.sources,
             device=device,
-            batch_size=auto_batch_size,
             val_frac=0.0,
             non_blocking_copy=True,
         )
