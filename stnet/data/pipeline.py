@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Unio
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
-from ..backend.system import get_tlb, optimize_threads
+from ..backend.system import get_tlb, optimize_threads, Memory
 
 try:
     from torchdata.nodes import BaseNode
@@ -41,11 +41,31 @@ def _sample_size(
 
 def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Sequence[int]:
     capB = 1024
-    if getattr(_device, "type", "cpu") == "cuda":
+    dev_t = getattr(_device, "type", "cpu")
+    if dev_t == "cuda":
         try:
             free, _ = torch.cuda.mem_get_info(_device)
             if _sample_bytes > 0:
-                capB = max(1, int((free * 0.72) // max(1, _sample_bytes * 4)))
+                capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
+        except Exception:
+            pass
+    elif dev_t == "xpu":
+        try:
+            props = getattr(torch.xpu, "get_device_properties", None)
+            mem_alloc = getattr(torch.xpu, "memory_allocated", None)
+            if callable(props) and callable(mem_alloc):
+                total = int(props(_device).total_memory)
+                used = int(mem_alloc(_device))
+                free = max(0, total - used)
+                if _sample_bytes > 0:
+                    capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
+        except Exception:
+            pass
+    elif dev_t == "mps":
+        try:
+            free_host = int(Memory.available())
+            if _sample_bytes > 0:
+                capB = max(1, int((free_host * 0.25) // max(1, _sample_bytes * 4)))
         except Exception:
             pass
     capB = max(1, min(capB, int(_N)))
@@ -139,11 +159,28 @@ def _batch_interval(
     if _dev.type == "cuda":
         try:
             free, _ = torch.cuda.mem_get_info(_dev)
-            cap = int(free * 0.72)
+            cap = int(free * 0.90)
             B_cap = max(1, int(cap // max(1, sbytes * 4)))
         except Exception:
             pass
-    B_cap = max(1, min(B_cap, len(_ds)))
+    elif _dev.type == "xpu":
+        try:
+            props = getattr(torch.xpu, "get_device_properties", None)
+            mem_alloc = getattr(torch.xpu, "memory_allocated", None)
+            if callable(props) and callable(mem_alloc):
+                total = int(props(_dev).total_memory)
+                used = int(mem_alloc(_dev))
+                cap = int(max(0, total - used) * 0.90)
+                B_cap = max(1, int(cap // max(1, sbytes * 4)))
+        except Exception:
+            pass
+    elif _dev.type == "mps":
+        try:
+            cap = int(int(Memory.available()) * 0.25)
+            B_cap = max(1, int(cap // max(1, sbytes * 4)))
+        except Exception:
+            pass
+    B_cap = max(1, min(int(B_cap * Dataset._scale), len(_ds)))
     candidates = _random_batches(sbytes, _dev, len(_ds))
     if candidates:
         B = min(candidates[-1], B_cap)

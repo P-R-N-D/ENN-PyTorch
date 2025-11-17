@@ -2698,9 +2698,13 @@ class Root(nn.Module):
             batch_first=True,
         ).to(self._device)
         self.global_net = global_net
-        self.microbatch = int(config.microbatch)
-        if self.microbatch <= 0:
-            raise ValueError(f"config.microbatch must be >= 1, got {config.microbatch}")
+        try:
+            self.microbatch = int(getattr(config, "microbatch", 0))
+        except Exception:
+            self.microbatch = 0
+        if self.microbatch < 0:
+            raise ValueError(f"config.microbatch must be >= 0, got {self.microbatch}")
+        self._auto_microbatch_pending = self.microbatch == 0
         self._activation_checkpoint = bool(
             getattr(config, "activation_checkpoint", False)
         )
@@ -2750,6 +2754,42 @@ class Root(nn.Module):
         if x.dtype != target_dtype:
             return x.to(dtype=target_dtype)
         return x
+
+    def _auto_microbatch(self, features: torch.Tensor | TensorDictBase, device: torch.device) -> int:
+        """가용 가속기 메모리 90% 리밋을 목표로 보수적 microbatch를 산정."""
+        dev_t = getattr(device, "type", "cpu")
+        if isinstance(features, TensorDictBase):
+            X = features.get("features")
+        else:
+            X = features
+        if not isinstance(X, torch.Tensor):
+            return 64
+        one = X[:1]
+        bytes_per_sample = int(one.nelement()) * int(one.element_size())
+        fudge = 8
+        max_batch = 1 << 14
+        free_bytes = None
+        if dev_t == "cuda":
+            with contextlib.suppress(Exception):
+                free, _ = torch.cuda.mem_get_info(device)
+                free_bytes = int(free)
+        elif dev_t == "xpu":
+            with contextlib.suppress(Exception):
+                props = getattr(torch.xpu, "get_device_properties", None)
+                mem_alloc = getattr(torch.xpu, "memory_allocated", None)
+                if callable(props) and callable(mem_alloc):
+                    total = int(props(device).total_memory); used = int(mem_alloc(device))
+                    free_bytes = max(0, total - used)
+        elif dev_t == "mps":
+            with contextlib.suppress(Exception):
+                from ..backend.system import Memory
+                free_bytes = int(Memory.available() * 0.25)
+        if not free_bytes or free_bytes <= 0:
+            return 64
+        budget = int(free_bytes * 0.90)
+        denom = max(1, bytes_per_sample * fudge)
+        mb = max(1, min(max_batch, budget // denom))
+        return int(mb)
 
     def forward(
         self,
@@ -2820,6 +2860,13 @@ class Root(nn.Module):
         infer_mode = labels_flat is None or (
             net_loss is None and global_loss is None and (local_loss is None)
         )
+        if self._auto_microbatch_pending:
+            try:
+                mb = self._auto_microbatch(features, device)
+                self.microbatch = max(1, int(mb))
+            except Exception:
+                self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
+            self._auto_microbatch_pending = False
         num_slices = (b + self.microbatch - 1) // self.microbatch
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []

@@ -8,8 +8,8 @@ import random
 import shutil
 import warnings
 import numpy as np
-from dataclasses import asdict
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from dataclasses import asdict
 
 import torch
 import torch.multiprocessing as mp
@@ -114,10 +114,13 @@ def train(
             with contextlib.suppress(Exception):
                 setter(seed_value)
     with contextlib.suppress(Exception):
-        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.use_deterministic_algorithms(False, warn_only=True)
     with contextlib.suppress(Exception):
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+    with contextlib.suppress(Exception):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
@@ -320,13 +323,15 @@ def predict(
     max_nodes: Optional[int] = None,
     rdzv_backend: Optional[str] = None,
     **kwargs: Any,
-) -> Dict[Tuple, torch.Tensor]:
+) -> Dict[str, Any]:
 
     initialize_python_path()
     set_multiprocessing_env()
     tmp_dir = new_dir("infer")
     dcp_dir = os.path.join(tmp_dir, "dcp")
     memmap_dir = os.path.join(tmp_dir, "memmap")
+    ckpt_dir = os.path.join(tmp_dir, "pred_ckpt")
+    os.makedirs(ckpt_dir, exist_ok=True)
     mp.allow_connection_pickling()
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -376,6 +381,7 @@ def predict(
         out_shape=tuple(label_shape),
         cfg_dict=cfg_dict,
         keys=list(keys),
+        ckpt_dir=ckpt_dir,
     )
     mode = mode if mode in ("predict", "infer") else "predict"
     default_kwargs = {"seed": seed}
@@ -395,8 +401,6 @@ def predict(
     master_addr, _ = initialize_master_addr(rdzv_endpoint)
     optimize_threads()
     nprocs = int(optimal_procs()["nproc_per_node"])
-    manager = mp.Manager()
-    ret_dict = manager.dict()
     resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
     resolved_rdzv_backend = rdzv_backend or "c10d"
     lc = LaunchConfig(
@@ -411,10 +415,16 @@ def predict(
         start_method=optimal_start_method(),
         local_addr=master_addr,
     )
-    elastic_launch(lc, main)(ops, ret_dict)
-    result: Dict[Tuple, torch.Tensor] = dict(ret_dict)
+    elastic_launch(lc, main)(ops)
     try:
-        return result
+        chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
+        if os.path.isdir(chunks_dir):
+            with open(os.path.join(chunks_dir, "keys.json"), "w", encoding="utf-8") as f:
+                json.dump(list(keys), f)
+            final_dir = new_dir("predictions")
+            shutil.move(chunks_dir, final_dir)
+            return {"chunks_dir": final_dir, "out_shape": tuple(label_shape)}
+        return {}
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
