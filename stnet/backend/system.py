@@ -318,74 +318,6 @@ def new_dir(prefix: str) -> str:
     return directory
 
 
-def available_memory() -> int:
-    try:
-        import psutil
-
-        vm = psutil.virtual_memory()
-        avail = getattr(vm, "available", None)
-        if avail is not None:
-            return int(avail)
-        total = getattr(vm, "total", 0)
-        used = getattr(vm, "used", None)
-        if total and used is not None:
-            return int(total - used)
-    except Exception:
-        pass
-
-    try:
-        if sys.platform.startswith("linux"):
-            with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
-                for line in fh:
-                    if line.startswith("MemAvailable:"):
-                        parts = line.split()
-                        if len(parts) >= 2 and parts[1].isdigit():
-                            return int(parts[1]) * 1024
-        elif sys.platform == "darwin":
-            import subprocess
-
-            out = subprocess.check_output(["vm_stat"]).decode("utf-8", "ignore")
-            page = None
-            free = None
-            inactive = None
-            speculative = 0
-            for ln in out.splitlines():
-                if "page size of" in ln:
-                    page = int(ln.split()[-2])
-                elif ln.startswith("Pages free:"):
-                    free = int(ln.split(":")[1].split()[0])
-                elif ln.startswith("Pages inactive:"):
-                    inactive = int(ln.split(":")[1].split()[0])
-                elif ln.startswith("Pages speculative:"):
-                    speculative = int(ln.split(":")[1].split()[0])
-            if page and free is not None and inactive is not None:
-                return int((free + inactive + (speculative or 0)) * page)
-        elif os.name == "nt" or sys.platform.startswith("win"):
-            import ctypes
-
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-
-            stat = MEMORYSTATUSEX()
-            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-                return int(stat.ullAvailPhys)
-    except Exception:
-        pass
-
-    return 0
-
-
 def get_dpa_backends() -> List[object]:
     names = _RUNTIME_CONFIG.sdpa_backends or []
     if not names:
@@ -1082,3 +1014,554 @@ def worker_init_pin(_: Any) -> None:
 
 def wrap_with_tlb(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     return get_tlb().new_thread(fn)
+class Memory:
+    """Static memory helpers with pinned Page/Pool for H2D and spill control."""
+
+    @staticmethod
+    def available() -> int:
+        """
+        효과적 '가용 바이트' 추정:
+          - 기본 OS 가용 메모리
+          - (Linux) cgroup v2/v1 한도
+          - (Windows) Job Object 메모리 한도
+          - (macOS/BSD/기타) rlimit (AS/DATA/RSS)
+        중 최솟값을 반환.
+        """
+        base = Memory._sys_available()
+        cgroup = Memory._linux_limit()
+        winjob = Memory._windows_limit()
+        rlim = Memory._bsd_limit()
+        candidates = [x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0]
+        return max(0, min(candidates)) if candidates else 0
+
+    @staticmethod
+    def _sys_available() -> Optional[int]:
+        try:
+            import psutil
+
+            vm = psutil.virtual_memory()
+            if getattr(vm, "available", None) is not None:
+                return int(vm.available)
+            if getattr(vm, "total", 0) and getattr(vm, "used", None) is not None:
+                return int(vm.total - vm.used)
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("linux"):
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if line.startswith("MemAvailable:"):
+                            parts = line.split()
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                return int(parts[1]) * 1024
+            elif sys.platform == "darwin":
+                import subprocess
+
+                out = subprocess.check_output(["vm_stat"]).decode("utf-8", "ignore")
+                page = None
+                free = None
+                inactive = None
+                speculative = 0
+                for ln in out.splitlines():
+                    if "page size of" in ln:
+                        page = int(ln.split()[-2])
+                    elif ln.startswith("Pages free:"):
+                        free = int(ln.split(":")[1].split()[0])
+                    elif ln.startswith("Pages inactive:"):
+                        inactive = int(ln.split(":")[1].split()[0])
+                    elif ln.startswith("Pages speculative:"):
+                        speculative = int(ln.split(":")[1].split()[0])
+                if page and free is not None and inactive is not None:
+                    return int((free + inactive + (speculative or 0)) * page)
+            elif os.name == "nt" or sys.platform.startswith("win"):
+                import ctypes
+
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return int(stat.ullAvailPhys)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _linux_limit() -> Optional[int]:
+        if not sys.platform.startswith("linux"):
+            return None
+
+        def _read_int(path: str) -> Optional[int]:
+            try:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    s = f.read().strip()
+                if not s or s == "max":
+                    return None
+                return int(s)
+            except Exception:
+                return None
+
+        try:
+            root = "/sys/fs/cgroup"
+            if os.path.exists(os.path.join(root, "cgroup.controllers")):
+                rel = "/"
+                with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                    for ln in fh:
+                        parts = ln.strip().split(":")
+                        if len(parts) >= 3 and parts[0] == "0":
+                            rel = parts[2] or "/"
+                            break
+                grp = os.path.join(root, rel.lstrip("/"))
+                lim = _read_int(os.path.join(grp, "memory.max"))
+                cur = _read_int(os.path.join(grp, "memory.current"))
+                if lim is not None and cur is not None:
+                    return max(0, lim - cur)
+            mem_rel = None
+            with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    parts = ln.strip().split(":")
+                    if len(parts) >= 3 and "memory" in parts[1].split(","):
+                        mem_rel = parts[2] or "/"
+                        break
+            if mem_rel is not None:
+                grp = os.path.join("/sys/fs/cgroup/memory", mem_rel.lstrip("/"))
+                lim = _read_int(os.path.join(grp, "memory.limit_in_bytes"))
+                use = _read_int(os.path.join(grp, "memory.usage_in_bytes"))
+                if lim is not None and use is not None:
+                    if lim >= (1 << 60):
+                        return None
+                    return max(0, lim - use)
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _windows_limit() -> Optional[int]:
+        if not (os.name == "nt" or sys.platform.startswith("win")):
+            return None
+        try:
+            import ctypes
+            import psutil
+            from ctypes import wintypes as wt
+
+            kernel32 = ctypes.windll.kernel32
+            IsProcessInJob = kernel32.IsProcessInJob
+            IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
+            IsProcessInJob.restype = wt.BOOL
+            hProc = kernel32.GetCurrentProcess()
+            inJob = wt.BOOL()
+            if not IsProcessInJob(hProc, None, ctypes.byref(inJob)) or not inJob.value:
+                return None
+
+            class LARGE_INTEGER(ctypes.Union):
+                _fields_ = [("QuadPart", ctypes.c_longlong)]
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [
+                    ("ReadOperationCount", ctypes.c_ulonglong),
+                    ("WriteOperationCount", ctypes.c_ulonglong),
+                    ("OtherOperationCount", ctypes.c_ulonglong),
+                    ("ReadTransferCount", ctypes.c_ulonglong),
+                    ("WriteTransferCount", ctypes.c_ulonglong),
+                    ("OtherTransferCount", ctypes.c_ulonglong),
+                ]
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", LARGE_INTEGER),
+                    ("PerJobUserTimeLimit", LARGE_INTEGER),
+                    ("LimitFlags", ctypes.c_uint),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", ctypes.c_uint),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", ctypes.c_uint),
+                    ("SchedulingClass", ctypes.c_uint),
+                ]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            JobObjectExtendedLimitInformation = 9
+            QueryInformationJobObject = kernel32.QueryInformationJobObject
+            QueryInformationJobObject.argtypes = [
+                wt.HANDLE,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_ulong,
+                ctypes.POINTER(ctypes.c_ulong),
+            ]
+            QueryInformationJobObject.restype = wt.BOOL
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            retlen = ctypes.c_ulong(0)
+            ok = QueryInformationJobObject(
+                None,
+                JobObjectExtendedLimitInformation,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+                ctypes.byref(retlen),
+            )
+            if not ok:
+                return None
+            JOB_OBJECT_LIMIT_WORKINGSET = 0x00000001
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY = 0x00000100
+            JOB_OBJECT_LIMIT_JOB_MEMORY = 0x00000200
+
+            flags = int(getattr(info.BasicLimitInformation, "LimitFlags", 0))
+            cand_limits: list[int] = []
+
+            if flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY:
+                v = int(getattr(info, "ProcessMemoryLimit", 0))
+                if 0 < v < (1 << 60):
+                    cand_limits.append(v)
+            if flags & JOB_OBJECT_LIMIT_JOB_MEMORY:
+                v = int(getattr(info, "JobMemoryLimit", 0))
+                if 0 < v < (1 << 60):
+                    cand_limits.append(v)
+
+            if flags & JOB_OBJECT_LIMIT_WORKINGSET:
+                v = int(getattr(info.BasicLimitInformation, "MaximumWorkingSetSize", 0))
+                if 0 < v < (1 << 60):
+                    cand_limits.append(v)
+
+            if not cand_limits:
+                return None
+
+            rss = int(psutil.Process(os.getpid()).memory_info().rss)
+            avail_candidates = [max(0, lim - rss) for lim in cand_limits]
+            return max(0, min(avail_candidates)) if avail_candidates else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _bsd_limit() -> Optional[int]:
+        try:
+            import resource
+            import psutil
+
+            rss = psutil.Process(os.getpid()).memory_info().rss
+            cand: list[int] = []
+            for name in ("RLIMIT_AS", "RLIMIT_DATA", "RLIMIT_RSS"):
+                lim = getattr(resource, name, None)
+                if lim is None:
+                    continue
+                soft, _ = resource.getrlimit(lim)
+                if soft == getattr(resource, "RLIM_INFINITY", -1) or soft <= 0:
+                    continue
+                cand.append(max(0, int(soft) - int(rss)))
+            return min(cand) if cand else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def prefer_local_numa() -> bool:
+        """가능하면 현재 스레드의 NUMA 노드에 메모리 바인딩(실패해도 안전한 no-op)."""
+
+        try:
+            import numa
+
+            if hasattr(numa, "available") and numa.available():
+                node = numa.current_node()
+                numa.set_membind([node])
+                return True
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("linux"):
+                import ctypes
+
+                lib = ctypes.CDLL("libnuma.so.1")
+                if lib.numa_available() < 0:
+                    return False
+                cpu = 0
+                if hasattr(os, "sched_getaffinity"):
+                    cpus = list(os.sched_getaffinity(0))
+                    cpu = int(cpus[0]) if cpus else 0
+                lib.numa_node_of_cpu.argtypes = [ctypes.c_int]
+                lib.numa_node_of_cpu.restype = ctypes.c_int
+                node = lib.numa_node_of_cpu(ctypes.c_int(cpu))
+                lib.numa_set_preferred.argtypes = [ctypes.c_int]
+                lib.numa_set_preferred.restype = None
+                lib.numa_set_preferred(ctypes.c_int(node))
+                return True
+        except Exception:
+            return False
+        return False
+
+    class Page:
+        """Pinned CPU tensor storage; 다양한 shape로 view 제공."""
+
+        __slots__ = ("_buf", "_numel", "_dtype")
+
+        def __init__(self, numel: int, dtype: "torch.dtype"):
+            import torch
+
+            self._numel = int(max(1, numel))
+            self._dtype = dtype
+            self._buf = torch.empty(
+                self._numel, dtype=self._dtype, device="cpu", pin_memory=True
+            )
+
+        @property
+        def numel(self) -> int:
+            return self._numel
+
+        @property
+        def dtype(self):
+            return self._dtype
+
+        def view(self, *shape: int):
+            import torch
+
+            needed = 1
+            for s in shape:
+                needed *= int(s)
+            if needed > self._numel:
+                self._numel = int(needed)
+                self._buf = torch.empty(
+                    self._numel, dtype=self._dtype, device="cpu", pin_memory=True
+                )
+            return self._buf[:needed].view(*shape)
+
+    class Pool:
+        """핀드 Page 풀: busy/펜스(Event) 기반 재사용 제어."""
+
+        class Token:
+            __slots__ = ("i", "g")
+
+            def __init__(self, i: int, g: int):
+                self.i = i
+                self.g = g
+
+        class _Entry:
+            __slots__ = ("page", "busy", "fence", "gen")
+
+            def __init__(self, page: "Memory.Page"):
+                self.page = page
+                self.busy = False
+                self.fence = None
+                self.gen = 0
+
+        def __init__(self, capacity: int = 4):
+            import threading
+
+            self._cap = max(1, int(capacity))
+            self._pages: list[Memory.Pool._Entry] = []
+            self._rr = 0
+            self._lock = threading.Lock()
+
+        def _evt_done(self, evt: object) -> bool:
+            if evt is None:
+                return True
+            try:
+                q = getattr(evt, "query", None)
+                if callable(q):
+                    return bool(q())
+            except Exception:
+                return False
+            return False
+
+        def _scavenge(self) -> None:
+            for e in self._pages:
+                if e.busy and e.fence is not None and self._evt_done(e.fence):
+                    e.busy = False
+                    e.fence = None
+
+        def _ensure_view(
+            self, e: "Memory.Pool._Entry", shape: "Tuple[int, ...]", dtype: "torch.dtype"
+        ):
+            need = 1
+            for s in shape:
+                need *= int(s)
+            if (e.page.dtype != dtype) or (e.page.numel < need):
+                e.page = Memory.Page(numel=need, dtype=dtype)
+                e.gen += 1
+            return e.page.view(*shape)
+
+        def get(
+            self,
+            shape: "Tuple[int, ...]",
+            dtype: "torch.dtype",
+            *,
+            return_handle: bool = False,
+        ):
+            with self._lock:
+                self._scavenge()
+                n = len(self._pages)
+                if n:
+                    start = self._rr
+                    for k in range(n):
+                        idx = (start + k) % n
+                        e = self._pages[idx]
+                        if not e.busy:
+                            e.busy = True
+                            e.fence = None
+                            self._rr = (idx + 1) % max(1, n)
+                            view = self._ensure_view(e, shape, dtype)
+                            if return_handle:
+                                return view, Memory.Pool.Token(idx, e.gen)
+                            return view
+                need = 1
+                for s in shape:
+                    need *= int(s)
+                new = Memory.Pool._Entry(Memory.Page(numel=need, dtype=dtype))
+                new.busy = True
+                if len(self._pages) < self._cap:
+                    self._pages.append(new)
+                    idx = len(self._pages) - 1
+                    self._rr = (idx + 1) % self._cap
+                    view = new.page.view(*shape)
+                    if return_handle:
+                        return view, Memory.Pool.Token(idx, new.gen)
+                    return view
+                start = self._rr
+                for k in range(self._cap):
+                    idx = (start + k) % self._cap
+                    if not self._pages[idx].busy:
+                        self._pages[idx] = new
+                        self._rr = (idx + 1) % self._cap
+                        view = new.page.view(*shape)
+                        if return_handle:
+                            return view, Memory.Pool.Token(idx, new.gen)
+                        return view
+                view = new.page.view(*shape)
+                if return_handle:
+                    return view, None
+                return view
+
+        def get_like(self, t: "torch.Tensor", *, return_handle: bool = False):
+            return self.get(tuple(t.shape), t.dtype, return_handle=return_handle)
+
+        def release_after(self, token: "Memory.Pool.Token", wait_event: object | None) -> None:
+            if token is None:
+                return
+            with self._lock:
+                i = int(getattr(token, "i", -1))
+                g = int(getattr(token, "g", -1))
+                if 0 <= i < len(self._pages):
+                    e = self._pages[i]
+                    if e.gen == g:
+                        e.busy = True
+                        e.fence = wait_event
+
+        def release(self, token: "Memory.Pool.Token") -> None:
+            if token is None:
+                return
+            with self._lock:
+                i = int(getattr(token, "i", -1))
+                g = int(getattr(token, "g", -1))
+                if 0 <= i < len(self._pages):
+                    e = self._pages[i]
+                    if e.gen == g:
+                        e.busy = False
+                        e.fence = None
+
+        def collect(self) -> None:
+            with self._lock:
+                self._scavenge()
+
+    class Cache:
+        """비동기 스필 라이터 캐시: torch.save를 별도 스레드로 넘겨 I/O stall 방지."""
+
+        def __init__(self, root: str, max_queue: int = 8):
+            import os
+            import queue
+            import threading
+
+            self._q = queue.Queue(maxsize=max_queue)
+            self._root = root
+            os.makedirs(root, exist_ok=True)
+            self._t = threading.Thread(target=self._run, daemon=True)
+            self._err = None
+            self._err_event = threading.Event()
+            self._t.start()
+
+        def submit(
+            self,
+            tensor: "torch.Tensor",
+            path: Optional[str] = None,
+            idx: Optional[int] = None,
+            wait_event: Optional[object] = None,
+            release_cb: Optional[object] = None,
+        ) -> None:
+            import contextlib
+            import queue
+
+            if self._err_event.is_set():
+                raise RuntimeError(f"Async writer error: {self._err!r}")
+            if path is None:
+                if idx is None:
+                    raise ValueError("either path or idx required")
+                path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
+            try:
+                self._q.put((tensor, path, wait_event, release_cb), timeout=0.05)
+            except queue.Full:
+                if wait_event is not None:
+                    with contextlib.suppress(Exception):
+                        wait_event.synchronize()
+                self._save_tensor(tensor, path)
+                if callable(release_cb):
+                    with contextlib.suppress(Exception):
+                        release_cb()
+
+        def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
+            import torch
+
+            if hasattr(tensor, "is_pinned") and tensor.is_pinned():
+                buf = torch.empty_like(tensor, device="cpu", pin_memory=False)
+                buf.copy_(tensor, non_blocking=False)
+            else:
+                buf = tensor.contiguous()
+            torch.save(buf, path)
+
+        def close(self) -> None:
+            self._q.put((None, None, None, None))
+            self._t.join()
+
+        def _run(self):
+            import contextlib
+
+            while True:
+                item = self._q.get()
+                if isinstance(item, tuple) and len(item) == 4:
+                    tensor, path, evt, rel = item
+                else:
+                    tensor, path = item
+                    evt = None
+                    rel = None
+                if tensor is None:
+                    break
+                try:
+                    if evt is not None:
+                        with contextlib.suppress(Exception):
+                            evt.synchronize()
+                    self._save_tensor(tensor, path)
+                    if callable(rel):
+                        with contextlib.suppress(Exception):
+                            rel()
+                except Exception as e:
+                    self._err = e
+                    self._err_event.set()
+                    break
+
+        def had_error(self) -> bool:
+            return bool(self._err_event.is_set())
+
