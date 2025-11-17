@@ -2149,9 +2149,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             meta=metadata,
         )
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=None,
+            param_dtype=amp_reduce_dtype,
             reduce_dtype=amp_reduce_dtype,
-            output_dtype=None,
+            output_dtype=amp_reduce_dtype,
             cast_forward_inputs=False,
         )
         ignored_params: List[torch.nn.Parameter] = []
