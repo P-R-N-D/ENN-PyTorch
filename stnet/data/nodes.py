@@ -72,6 +72,16 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
 
 
 class Dataset(_Sampler):
+    _scale: float = 1.0
+
+    @classmethod
+    def request_scale_up(cls, factor: float) -> None:
+        cls._scale = min(2.0, cls._scale * float(factor))
+
+    @classmethod
+    def request_scale_down(cls, factor: float) -> None:
+        cls._scale = max(0.5, cls._scale * float(factor))
+
     def __init__(
         self,
         memmap_dir: str,

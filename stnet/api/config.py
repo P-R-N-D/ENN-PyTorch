@@ -125,7 +125,7 @@ class PatchConfig:
 @dataclass
 class ModelConfig:
     device: Optional[torch.device | str] = None
-    microbatch: int = 64
+    microbatch: int = 0
     dropout: float = 0.1
     normalization_method: str = "layernorm"
     depth: int = 128
@@ -238,7 +238,7 @@ def coerce_model_config(
     resolved["microbatch"] = _coerce_int(
         filtered.get("microbatch", getattr(defaults, "microbatch")),
         name="microbatch",
-        minimum=1,
+        minimum=0,
     )
     resolved["dropout"] = _coerce_float(
         filtered.get("dropout", getattr(defaults, "dropout")),
@@ -482,6 +482,7 @@ class RuntimeConfig:
             "keys",
             "model_ckpt_dir",
             "seed",
+            "ckpt_dir",
         }
         unsupported = set(kwargs) - allowed
         if unsupported:
@@ -494,6 +495,7 @@ class RuntimeConfig:
             out_shape=out_shape,
             cfg_dict=cfg_dict,
             sources=kwargs["sources"],
+            ckpt_dir=kwargs.get("ckpt_dir"),
             model_ckpt_dir=kwargs.get("model_ckpt_dir"),
             keys=list(kwargs["keys"]),
             seed=int(kwargs.get("seed", 7)),

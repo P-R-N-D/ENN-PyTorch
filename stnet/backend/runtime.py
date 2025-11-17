@@ -28,6 +28,22 @@ from typing import (
 import torch
 import torch.distributed
 import torch.nn as nn
+
+try:
+    import pynvml as _nvml
+
+    try:
+        _nvml.nvmlInit()
+        _NVML_READY = True
+    except Exception:
+        _NVML_READY = False
+except Exception:
+    _nvml = None
+    _NVML_READY = False
+try:
+    import psutil as _psutil
+except Exception:
+    _psutil = None
 from tensordict import TensorDictBase
 from torch.distributed._tensor import DTensor, Placement, Replicate
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
@@ -46,6 +62,7 @@ from tqdm.auto import tqdm
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.pipeline import fetch
+from ..data.nodes import Dataset
 from ..data.stats import Metadata
 from ..data.transforms import postprocess, preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
@@ -956,6 +973,36 @@ def get_tqdm(
     return bar
 
 
+def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Returns (gpu_util_percent, mem_util_percent) if NVML is available for this CUDA device, else (None, None).
+    """
+    if not _NVML_READY or getattr(device, "type", "") != "cuda":
+        return None, None
+    try:
+        idx = device.index if device.index is not None else torch.cuda.current_device()
+        h = _nvml.nvmlDeviceGetHandleByIndex(int(idx))
+        u = _nvml.nvmlDeviceGetUtilizationRates(h)
+        mi = _nvml.nvmlDeviceGetMemoryInfo(h)
+        gpu_util = float(getattr(u, "gpu", 0.0))
+        mem_util = (
+            (100.0 * float(mi.used) / float(mi.total)) if getattr(mi, "total", 0) else None
+        )
+        return gpu_util, mem_util
+    except Exception:
+        return None, None
+
+
+def _cpu_percent_now() -> Optional[float]:
+    """Return instantaneous CPU utilization percent across all cores if psutil is available."""
+    if _psutil is None:
+        return None
+    try:
+        return float(_psutil.cpu_percent(interval=0.0))
+    except Exception:
+        return None
+
+
 def update_tqdm(
     bar: Optional[tqdm],
     finish: int,
@@ -1483,6 +1530,35 @@ def epochs(
         status_bar.close()
     end_kst_ns = posix_time("Asia/Seoul")
     push_metrics(model, start_kst_ns, end_kst_ns)
+    try:
+        dev_t = getattr(device, "type", "")
+        total_t = prev_io_time + prev_comp_time
+        if dev_t != "cpu":
+            gpu_util, mem_util = _gpu_nvml_utils(device)
+            if gpu_util is not None:
+                if gpu_util < 95.0:
+                    Dataset.request_scale_up(1.25)
+                elif gpu_util > 98.0 or (mem_util is not None and mem_util >= 90.0):
+                    Dataset.request_scale_down(0.90)
+            else:
+                if total_t > 0:
+                    util_fallback = prev_comp_time / total_t
+                    if util_fallback < 0.95:
+                        Dataset.request_scale_up(1.25)
+                    elif util_fallback > 0.99:
+                        Dataset.request_scale_down(0.90)
+        else:
+            cpu_pct = _cpu_percent_now()
+            if cpu_pct is not None:
+                if cpu_pct > 80.0:
+                    time.sleep(min(0.005, 0.001 * (cpu_pct - 80.0)))
+            else:
+                if total_t > 0:
+                    util_fallback = prev_comp_time / total_t
+                    if util_fallback > 0.80:
+                        time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
+    except Exception:
+        pass
 
 
 def infer(
@@ -1498,7 +1574,7 @@ def infer(
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
     from typing import Dict, List
 
-    SPILL_TARGET_RATIO = 0.20
+    SPILL_TARGET_RATIO = 0.80
     RESERVE_MB = 512
     MIN_LIMIT_MB = 128
     MAX_LIMIT_MB = 4096
@@ -1507,11 +1583,23 @@ def infer(
 
     BYTES_PER_MB = 1024.0 * 1024.0
     latest_avail_mb: float = float(Memory.available()) / BYTES_PER_MB
+    total_mb: float = 0.0
+    try:
+        _tot = Memory.total()
+        if _tot and _tot > 0:
+            total_mb = float(_tot) / BYTES_PER_MB
+    except Exception:
+        total_mb = 0.0
 
     def _memory_limit() -> float:
         avail_mb = latest_avail_mb
-        usable = max(0.0, avail_mb - RESERVE_MB)
-        dyn = usable * SPILL_TARGET_RATIO
+        if total_mb > 0.0:
+            used_mb = max(0.0, total_mb - avail_mb)
+            target_used_mb = total_mb * SPILL_TARGET_RATIO
+            dyn = max(0.0, target_used_mb - used_mb)
+        else:
+            usable = max(0.0, avail_mb - RESERVE_MB)
+            dyn = usable * SPILL_TARGET_RATIO
         return max(MIN_LIMIT_MB, min(MAX_LIMIT_MB, dyn))
 
     def _chunk_target_mb() -> float:
@@ -1573,10 +1661,9 @@ def infer(
             for _t, _evt, _h in chunk_accum:
                 if _evt is not None:
                     _evt.synchronize()
-                tensors.append(_t)
-                handles.append(_h)
-            big = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
-            path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
+            big = torch.cat([t for t, _, _ in chunk_accum], dim=0).contiguous()
+            handles = [h for _, _, h in chunk_accum]
+            path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.mmt")
             writer.submit(big, path=path)
             chunk_idx += 1
             if pred_pool is not None:
@@ -1586,7 +1673,7 @@ def infer(
                             pred_pool.release(_h)
         else:
             for _t, _evt, _h in chunk_accum:
-                path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.pt")
+                path = os.path.join(chunk_dir or "", f"chunk_{chunk_idx:06d}.mmt")
                 writer.submit(
                     _t,
                     path=path,
@@ -1755,72 +1842,14 @@ def infer(
                         if writer.had_error():
                             raise RuntimeError("async writer failed")
                     except Exception as err:
-                        streaming = False
                         if writer is not None:
                             with contextlib.suppress(Exception):
                                 writer.close()
                             writer = None
-                        warnings.warn(
-                            "Streaming inference disabled after failing to write predictions to disk; falling back to in-memory aggregation."
-                            f" (error: {err!r})",
-                            RuntimeWarning,
-                            stacklevel=2,
+                        raise RuntimeError(
+                            f"Streaming write failed (no in-memory fallback): {err!r}"
                         )
-                        if not recovered_streaming and chunk_idx > 0:
-                            if chunk_accum:
-                                for _t, _evt, _h in chunk_accum:
-                                    if _evt is not None:
-                                        with contextlib.suppress(Exception):
-                                            _evt.synchronize()
-                                    if hasattr(_t, "is_pinned") and _t.is_pinned():
-                                        _buf = torch.empty_like(
-                                            _t, device="cpu", pin_memory=False
-                                        )
-                                        _buf.copy_(_t, non_blocking=False)
-                                        preds.append(_buf)
-                                    else:
-                                        preds.append(_t)
-                                    if pred_pool is not None and _h is not None:
-                                        with contextlib.suppress(Exception):
-                                            pred_pool.release(_h)
-                                chunk_accum.clear()
-                                chunk_acc_bytes = 0
-                            for stored_idx in range(chunk_idx):
-                                chunk_path = os.path.join(
-                                    chunk_dir or "", f"chunk_{stored_idx:06d}.pt"
-                                )
-                                try:
-                                    preds.append(
-                                        torch.load(chunk_path, map_location="cpu")
-                                    )
-                                    with contextlib.suppress(OSError):
-                                        os.remove(chunk_path)
-                                except Exception as load_err:
-                                    warnings.warn(
-                                        f"Failed to recover streamed predictions from {chunk_path!r}: {load_err!r}",
-                                        RuntimeWarning,
-                                        stacklevel=2,
-                                    )
-                            recovered_streaming = True
-                            with contextlib.suppress(OSError):
-                                if chunk_dir and not os.listdir(chunk_dir):
-                                    os.rmdir(chunk_dir)
-                        if evt is not None:
-                            with contextlib.suppress(Exception):
-                                evt.synchronize()
-                        _host = torch.empty_like(
-                            y_hat_cpu, device="cpu", pin_memory=False
-                        )
-                        _host.copy_(y_hat_cpu, non_blocking=False)
-                        preds.append(_host)
-                        if pred_pool is not None and handle is not None:
-                            with contextlib.suppress(Exception):
-                                pred_pool.release(handle)
-                        try:
-                            preds_bytes = sum(int(t.element_size() * t.nelement()) for t in preds)
-                        except Exception:
-                            preds_bytes = 0
-                elif rank == 0:
+                elif rank == 0 and not streaming:
                     if evt is not None:
                         with contextlib.suppress(Exception):
                             evt.synchronize()
@@ -1834,6 +1863,7 @@ def infer(
                         preds_bytes += int(_host.element_size() * _host.nelement())
                     except Exception:
                         pass
+                    latest_avail_mb = float(Memory.available()) / BYTES_PER_MB
                     need_spill = (preds_bytes / (1024.0 * 1024.0)) >= _memory_limit()
                     if latest_avail_mb > 0.0 and latest_avail_mb <= RESERVE_MB:
                         need_spill = True
@@ -2564,9 +2594,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             val_frac=0.0,
             non_blocking_copy=True,
         )
-        chunk_dir = (
-            os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None
-        )
+        chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
         streaming = False
         if chunk_dir and torch.distributed.get_rank() == 0:
             try:
@@ -2574,8 +2602,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 streaming = True
             except Exception:
                 streaming = False
-        else:
-            chunk_dir = chunk_dir if streaming else None
+        if ops.mode in ("predict", "infer"):
+            if not chunk_dir or not streaming:
+                raise RuntimeError("predict/infer requires streaming (ckpt_dir not available)")
+            streaming = True
         try:
             result_holder: Dict[str, Any] = {}
 

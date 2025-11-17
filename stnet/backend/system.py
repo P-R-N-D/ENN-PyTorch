@@ -1018,6 +1018,46 @@ class Memory:
     """Static memory helpers with pinned Page/Pool for H2D and spill control."""
 
     @staticmethod
+    def total() -> Optional[int]:
+        """
+        시스템 총 물리 메모리 바이트.
+        psutil / /proc/meminfo / platform API 순으로 조회, 실패 시 None.
+        """
+        import sys
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            if getattr(vm, "total", None):
+                return int(vm.total)
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("linux"):
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if line.startswith("MemTotal:"):
+                            parts = line.split()
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                return int(parts[1]) * 1024
+            elif sys.platform == "darwin":
+                import subprocess
+                out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode("utf-8", "ignore")
+                if out.strip().isdigit():
+                    return int(out.strip())
+            elif os.name == "nt" or sys.platform.startswith("win"):
+                import ctypes
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                                ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong)]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return int(stat.ullTotalPhys)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def available() -> int:
         """
         효과적 '가용 바이트' 추정:
@@ -1524,6 +1564,21 @@ class Memory:
 
         def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
             import torch
+            import json, os
+
+            try:
+                if path.endswith(".mmt"):
+                    from tensordict import MemoryMappedTensor
+                    buf = tensor
+                    if hasattr(tensor, "is_pinned") and tensor.is_pinned():
+                        buf = torch.empty_like(tensor, device="cpu", pin_memory=False); buf.copy_(tensor, non_blocking=False)
+                    MemoryMappedTensor.from_tensor(buf.contiguous(), filename=path)
+                    meta = {"shape": list(buf.shape), "dtype": str(buf.dtype).replace("torch.", "")}
+                    with open(path + ".json", "w", encoding="utf-8") as f:
+                        json.dump(meta, f)
+                    return
+            except Exception:
+                pass
 
             if hasattr(tensor, "is_pinned") and tensor.is_pinned():
                 buf = torch.empty_like(tensor, device="cpu", pin_memory=False)
