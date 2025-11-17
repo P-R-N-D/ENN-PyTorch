@@ -2595,13 +2595,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             non_blocking_copy=True,
         )
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
-        streaming = False
+        streaming = bool(chunk_dir)
         if chunk_dir and torch.distributed.get_rank() == 0:
             try:
                 os.makedirs(chunk_dir, exist_ok=True)
                 streaming = True
             except Exception:
                 streaming = False
+        if torch.distributed.is_initialized():
+            _streaming = torch.tensor([int(streaming)], device=device)
+            torch.distributed.broadcast(_streaming, src=0)
+            streaming = bool(int(_streaming.item()))
         if ops.mode in ("predict", "infer"):
             if not chunk_dir or not streaming:
                 raise RuntimeError("predict/infer requires streaming (ckpt_dir not available)")
