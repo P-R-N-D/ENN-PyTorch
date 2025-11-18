@@ -22,6 +22,155 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from torch.nn.functional import scaled_dot_product_attention as _sdpa
+    _HAS_SDPA = True
+                                                          
+except Exception:
+    _HAS_SDPA = False
+
+                                                                
+try:
+    import triton
+    import triton.language as tl
+    _HAS_TRITON = True
+except Exception:
+    _HAS_TRITON = False
+
+@torch.no_grad()
+def _ptv3_normalize(coords: torch.Tensor, eps: float = 1e-6):
+    B, N, C = coords.shape
+    if C == 2:
+        z = torch.zeros(B, N, 1, dtype=coords.dtype, device=coords.device)
+        coords = torch.cat([coords, z], dim=-1)
+    mins = coords.amin(dim=1, keepdim=True)
+    maxs = coords.amax(dim=1, keepdim=True)
+    rng = (maxs - mins).clamp_min(eps)
+    x = (coords - mins) / rng
+    return x.clamp_(0.0, 1.0 - 1e-7)
+
+def _ptv3_expand_bits(v: torch.Tensor):
+    v = (v | (v << 16)) & 0x030000FF
+    v = (v | (v << 8))  & 0x0300F00F
+    v = (v | (v << 4))  & 0x030C30C3
+    v = (v | (v << 2))  & 0x09249249
+    return v
+
+@torch.no_grad()
+def _ptv3_morton3d(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
+    B, N, _ = coords01.shape
+    maxv = (1 << bits) - 1
+    xyz = (coords01 * maxv).to(torch.int32)
+    x, y, z = xyz.unbind(dim=-1)
+    xx = _ptv3_expand_bits(x)
+    yy = _ptv3_expand_bits(y) << 1
+    zz = _ptv3_expand_bits(z) << 2
+    return (xx | yy | zz)
+
+@torch.no_grad()
+def _ptv3_serialized_order(coords: torch.Tensor, *, bits: int, patch: int, shift_order: bool, block_index: int):
+    """Return perm, invperm for PTv3 serialization (+ optional half-patch shift)."""
+    coords01 = _ptv3_normalize(coords)
+    keys = _ptv3_morton3d(coords01, bits=bits)                            
+    perm = keys.argsort(dim=-1, stable=True)                               
+    if shift_order and (block_index % 2 == 1):
+        B, N = perm.shape
+        shift = (patch // 2) % max(N, 1)
+        if shift:
+            roll = torch.arange(N, device=perm.device).roll(shift)
+            perm = perm.gather(1, roll.unsqueeze(0).expand(B, N))
+    invperm = torch.empty_like(perm)
+    scatter_src = torch.arange(perm.size(1), device=perm.device)
+    if scatter_src.dim() < perm.dim():
+        scatter_src = scatter_src.view(1, -1).expand_as(perm)
+    invperm.scatter_(1, perm, scatter_src)
+    return perm, invperm
+
+def _block_ranges(N: int, patch: int):
+    for s in range(0, N, patch):
+        e = min(s + patch, N)
+        yield s, e
+
+                                
+                           
+                                
+if _HAS_TRITON:
+                                                                           
+                                                                                       
+    _RV_CONFIGS = [
+        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=2,  num_stages=1),
+        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=4,  num_stages=1),
+        triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  32}, num_warps=2,  num_stages=2),
+        triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
+                                 
+        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_J':  96, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_J':  96, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
+        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 128, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
+                                      
+        triton.Config({'BLOCK_J': 192, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 192, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 192, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 128}, num_warps=8,  num_stages=3),
+        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 160}, num_warps=8,  num_stages=3),
+                                               
+        triton.Config({'BLOCK_J': 384, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
+        triton.Config({'BLOCK_J': 384, 'BLOCK_DH':  96}, num_warps=8,  num_stages=3),
+        triton.Config({'BLOCK_J': 384, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  64}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  96}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_J': 512, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
+    ]
+
+                                          
+    @triton.autotune(configs=_RV_CONFIGS, key=['J', 'DH', 'K'])
+    @triton.jit
+    def _w_rv_reduce_over_keys_kernel(
+        W, RV, O,
+        B: tl.constexpr, H: tl.constexpr, K: tl.constexpr, J: tl.constexpr, DH: tl.constexpr,
+                                                               
+        SWB, SWH, SWK, SWJ,
+        SRVB, SRVH, SRVK, SRVJ, SRVDH,
+        SOB, SOH, SOK, SODH,
+        BLOCK_J: tl.constexpr, BLOCK_DH: tl.constexpr,
+    ):
+        pid_bh = tl.program_id(0)                 
+        pid_k  = tl.program_id(1)               
+        pid_d  = tl.program_id(2)                       
+
+        b = pid_bh // H
+        h = pid_bh %  H
+        k = pid_k
+
+        dh_off = pid_d * BLOCK_DH + tl.arange(0, BLOCK_DH)
+        acc = tl.zeros([BLOCK_DH], dtype=tl.float32)
+
+        j0 = 0
+        while j0 < J:
+            j_off = j0 + tl.arange(0, BLOCK_J)
+            mask_j = j_off < J
+                                          
+            w_ptr = W + b*SWB + h*SWH + k*SWK + j_off*SWJ
+            w_val = tl.load(w_ptr, mask=mask_j, other=0.0).to(tl.float32)        
+                                                        
+            rv_ptr = RV + b*SRVB + h*SRVH + k*SRVK + j_off[:, None]*SRVJ + dh_off[None, :]*SRVDH
+            mask_rv = (mask_j[:, None]) & (dh_off[None, :] < DH)
+            rv_val = tl.load(rv_ptr, mask=mask_rv, other=0.0).to(tl.float32)
+                                
+            acc += tl.sum(rv_val * w_val[:, None], axis=0)
+            j0 += BLOCK_J
+
+                                                                                            
+        o_ptr = O + b*SOB + h*SOH + k*SOK + dh_off*SODH
+        mask_o = dh_off < DH
+        old = tl.load(o_ptr, mask=mask_o, other=0.0)
+        tl.store(o_ptr, old + acc, mask=mask_o)
 from tensordict import TensorDict, TensorDictBase
 
 try:
@@ -1655,43 +1804,171 @@ class PatchAttention(nn.Module):
             reshape_for_mha(k, B, self.nhead, self.head_dim),
             reshape_for_mha(v, B, self.nhead, self.head_dim),
         )
-        rel = coords.unsqueeze(2) - coords.unsqueeze(1)
-        rel_bias = self.rel_bias(rel).permute(0, 3, 1, 2)
-        rel_value = (
-            self.rel_value(rel)
-            .view(B, N, N, self.nhead, self.head_dim)
-            .permute(0, 3, 1, 2, 4)
-        )
-        if attn_mask is None:
-            additive = torch.zeros_like(rel_bias)
+        P = N           
+                                               
+                                                                 
+        coords = coords.contiguous()
+        coords_f32 = coords if coords.dtype == torch.float32 else coords.float()
+        attn_bias = None
+        try:
+                                    
+            rel = (coords_f32.unsqueeze(2) - coords_f32.unsqueeze(1))                    
+                                                  
+            attn_bias = self.rel_bias(rel.to(x.dtype)).permute(0, 3, 1, 2).contiguous()
+        except Exception:
+            attn_bias = None
+
+                                                      
+        additive = None
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                                                                   
+                _mask = ~attn_mask
+                additive = to_additive_mask(
+                    _mask,
+                    batch=B,
+                    heads=self.nhead,
+                    seq_q=P,
+                    seq_k=P,
+                    dtype=(attn_bias.dtype if attn_bias is not None else qh.dtype),
+                    device=qh.device,
+                )
+            else:
+                                                                          
+                additive = attn_mask
+                if additive.dim() == 3:
+                    additive = additive.unsqueeze(1)                     
+                if additive.size(1) == 1 and self.nhead > 1:
+                    additive = additive.expand(B, self.nhead, P, P)
+                additive = additive.to(
+                    dtype=(attn_bias.dtype if attn_bias is not None else qh.dtype),
+                    device=qh.device,
+                )
+        if attn_bias is not None and additive is not None:
+            attn_bias = attn_bias + additive
+        elif additive is not None:
+            attn_bias = additive
+                                                          
+
+                                                           
+                                                        
+        use_shared_weights = bool(getattr(self, "reuse_weights_for_base", False))
+        if use_shared_weights:
+            base = torch.zeros((B, self.nhead, P, self.head_dim), dtype=vh.dtype, device=vh.device)
         else:
-            mask = attn_mask
-            if mask.dtype is torch.bool:
-                mask = torch.logical_not(mask)
-            additive = to_additive_mask(
-                mask,
-                batch=B,
-                heads=self.nhead,
-                seq_q=N,
-                seq_k=N,
-                dtype=rel_bias.dtype,
-                device=rel_bias.device,
+            base = self.attn(
+                qh,
+                kh,
+                vh,
+                attn_mask=(attn_bias.to(dtype=qh.dtype) if attn_bias is not None else None),
+                training=self.training,
             )
-        scores = torch.einsum("bhid,bhjd->bhij", qh, kh) / math.sqrt(
-            float(self.head_dim)
-        )
-        scores = scores + rel_bias + additive
-        attn_bias = rel_bias + additive
-        weights = torch.softmax(scores, dim=-1)
-        base = self.attn(
-            qh,
-            kh,
-            vh,
-            attn_mask=attn_bias.to(dtype=qh.dtype),
-            training=self.training,
-        )
-        rel_context = torch.einsum("bhij,bhijd->bhid", weights, rel_value)
-        context = base + rel_context
+                                                                      
+                                                                 
+        H, Dh = self.nhead, self.head_dim
+        scale = 1.0 / math.sqrt(float(self.head_dim))
+                                      
+        rtile = min(P, int(getattr(self, "rel_rtile", getattr(self, "rel_tile", 64))))
+        ctile = min(P, int(getattr(self, "rel_ctile", getattr(self, "rel_tile", 64))))
+        use_triton = (_HAS_TRITON and qh.is_cuda and (not torch.is_grad_enabled()))
+
+                        
+        rel_ctx = torch.zeros((B, H, P, Dh), dtype=qh.dtype, device=qh.device)
+
+                                                                                          
+        for s in range(0, P, rtile):
+            e = min(s + rtile, P)
+            q_blk = qh[:, :, s:e, :]              
+
+                                                                              
+            m = torch.full((B, H, e - s, 1), -float("inf"), dtype=torch.float32, device=qh.device)
+            sum_exp = torch.zeros_like(m)             
+            for t in range(0, P, ctile):
+                u = min(t + ctile, P)
+                k_blk = kh[:, :, t:u, :]              
+                                         
+                sc = torch.einsum("bhid,bhjd->bhij", q_blk, k_blk) * scale
+                if attn_bias is not None:
+                    sc = sc + attn_bias[:, :, s:e, t:u].to(dtype=sc.dtype)
+                sc = sc.float()
+                                        
+                tile_max = sc.amax(dim=-1, keepdim=True)             
+                m_new = torch.maximum(m, tile_max)
+                                                                             
+                sum_exp = sum_exp * torch.exp(m - m_new) + torch.exp(sc - m_new).sum(dim=-1, keepdim=True)
+                m = m_new
+
+                                                                             
+            all_masked = torch.isneginf(m) | (~torch.isfinite(sum_exp)) | (sum_exp <= 0)
+            if all_masked.any():
+                                                                            
+                m = torch.where(all_masked, torch.zeros_like(m), m)
+                sum_exp = torch.where(all_masked, torch.ones_like(sum_exp), sum_exp)
+
+                                                                   
+                                                           
+            if use_triton:
+                o_slice = torch.zeros_like(rel_ctx[:, :, s:e, :], dtype=torch.float32)
+
+            for t in range(0, P, ctile):
+                u = min(t + ctile, P)
+                k_blk = kh[:, :, t:u, :]              
+                sc = torch.einsum("bhid,bhjd->bhij", q_blk, k_blk) * scale             
+                if attn_bias is not None:
+                    sc = sc + attn_bias[:, :, s:e, t:u].to(dtype=sc.dtype)
+                sc = sc.float()
+                                                             
+                w_t = torch.exp(sc - m) / (sum_exp + 1e-12)
+
+                                                                                            
+                drop_p = 0.0
+                _attn_p = getattr(self.attn, "dropout_p", None)
+                if _attn_p is None:
+                    _attn_p = getattr(self.attn, "dropout", 0.0)
+                try:
+                    drop_p = float(_attn_p or 0.0)
+                except Exception:
+                    drop_p = 0.0
+                if self.training and drop_p > 0.0:
+                    w_t = F.dropout(w_t, p=drop_p, training=True)
+
+                                                            
+                rel_chunk = (coords_f32[:, s:e, :].unsqueeze(2) - coords_f32[:, t:u, :].unsqueeze(1))
+                                                                    
+                rv = self.rel_value(rel_chunk.to(x.dtype))             
+                                           
+                rv = rv.view(B, (e - s), (u - t), H, Dh).permute(0, 3, 1, 2, 4).contiguous()
+                if use_shared_weights:
+                                                              
+                    v_blk = vh[:, :, t:u, :]              
+                    _base_acc32 = (w_t.unsqueeze(-1) * v_blk.to(torch.float32).unsqueeze(2)).sum(dim=-2)
+                    base[:, :, s:e, :] += _base_acc32.to(base.dtype)
+                                                          
+                if use_triton:
+                    w_ctg = w_t.contiguous()                                  
+                                                           
+                    B_, H_, K_, J_, DH_ = B, H, (e - s), (u - t), Dh
+                                        
+                    SWB, SWH, SWK, SWJ = w_ctg.stride()
+                    SRVB, SRVH, SRVK, SRVJ, SRVDH = rv.stride()
+                    SOB, SOH, SOK, SODH = o_slice.stride()
+                                                                     
+                    _w_rv_reduce_over_keys_kernel[lambda META: (B_*H_, K_, triton.cdiv(DH_, META['BLOCK_DH']))](
+                        w_ctg, rv, o_slice,
+                        B_, H_, K_, J_, DH_,
+                        SWB, SWH, SWK, SWJ,
+                        SRVB, SRVH, SRVK, SRVJ, SRVDH,
+                        SOB, SOH, SOK, SODH,
+                    )
+                else:
+                    _acc32 = (w_t.unsqueeze(-1) * rv.to(torch.float32)).sum(dim=-2)           
+                    rel_ctx[:, :, s:e, :] += _acc32.to(qh.dtype)
+
+            if use_triton:
+                                                          
+                rel_ctx[:, :, s:e, :] += o_slice.to(dtype=qh.dtype)
+
+        context = base + rel_ctx
         return context.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
 
@@ -2060,14 +2337,51 @@ class SpatialEncoder(nn.Module):
             )
         x = x.contiguous()
         coords = coords.contiguous()
+        if coords.dtype != torch.float32:
+            coords = coords.float()
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError(
                     "attn_mask is meta/fake before SpatialEncoder.forward"
                 )
             attn_mask = attn_mask.contiguous()
-        for blk in self.blocks:
-            x = blk(x, coords, attn_mask=attn_mask)
+        for i, blk in enumerate(self.blocks):
+                                                               
+            B, N, D = x.shape
+            _patch = getattr(self, "patch_size", 512)
+            _shift = getattr(self, "shift_order", True)
+            _bits  = getattr(self, "morton_bits", 10)
+            perm, invperm = _ptv3_serialized_order(coords, bits=_bits, patch=_patch,
+                                                   shift_order=_shift, block_index=i)
+            x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
+            c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
+            out_s = torch.empty_like(x_s)
+                                                
+            m_s = None
+            if attn_mask is not None:
+                                                          
+                if attn_mask.dim() == 3:
+                    m_s = attn_mask.gather(
+                        1, perm.unsqueeze(-1).expand(B, N, N)
+                    ).gather(
+                        2, perm.unsqueeze(1).expand(B, N, N)
+                    )
+                elif attn_mask.dim() == 4:
+                    if attn_mask.size(1) != 1:
+                        raise ValueError("attn_mask with per-head shape not supported here")
+                    m_s = attn_mask.squeeze(1).gather(
+                        1, perm.unsqueeze(-1).expand(B, N, N)
+                    ).gather(
+                        2, perm.unsqueeze(1).expand(B, N, N)
+                    )
+                else:
+                    raise ValueError("attn_mask must be (B,N,N)")
+            for s, e in _block_ranges(N, _patch):
+                xb = x_s[:, s:e, :]
+                cb = c_s[:, s:e, :]
+                mb = None if m_s is None else m_s[:, s:e, s:e]
+                out_s[:, s:e, :] = blk(xb, cb, attn_mask=mb)
+            x = out_s.gather(1, invperm.unsqueeze(-1).expand(B, N, D))
         out = self.norm(x)
         if is_meta_or_fake_tensor(out):
             raise RuntimeError("SpatialEncoder produced meta/fake tensor")

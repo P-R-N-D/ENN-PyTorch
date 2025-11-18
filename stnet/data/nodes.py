@@ -860,133 +860,120 @@ class Prefetcher:
         self._backpressure = bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
+        use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu")
+        self._pin   = bool(kwargs.get("pin_host", use_accel))                             
+        self._gpu_stream = None
+
+    def _to_device(self, x, device):
+        if torch.is_tensor(x):
+            return x.to(device, non_blocking=True)
+        if isinstance(x, (list, tuple)):
+            return type(x)(self._to_device(t, device) for t in x)
+        if isinstance(x, dict):
+            return {k: self._to_device(v, device) for k, v in x.items()}
+        return x
+
+    def _pin_memory(self, x):
+        if not self._pin:
+            return x
+        if torch.is_tensor(x) and x.device.type == "cpu":
+            return x.pin_memory()
+        if isinstance(x, (list, tuple)):
+            return type(x)(self._pin_memory(t) for t in x)
+        if isinstance(x, dict):
+            return {k: self._pin_memory(v) for k, v in x.items()}
+        return x
 
     def __iter__(self) -> Iterator[Any]:
-        def _producer() -> None:
-            try:
-                get_tlb().pin_thread()
-            except Exception:
-                pass
-            try:
-                dev_t = getattr(self._device, "type", "cpu")
-                use_accel = dev_t in {"cuda", "xpu", "mps"}
-                streams = None
-                n_streams = 1
-                if use_accel and self._non_blocking:
-                    try:
-                        n_streams = max(1, min(self._depth, 3))
-                    except Exception:
-                        n_streams = max(1, min(self._depth, 3))
-                    try:
-                        streams = [
-                            torch.Stream(device=self._device) for _ in range(n_streams)
-                        ]
-                    except Exception:
-                        streams = None
-                        use_accel = False
-                idx = 0
-                for item in it:
-                    if use_accel and streams is not None:
-                        s = streams[idx % n_streams]
-                        idx += 1
-                        with s:
-                            moved = _to_device(item, self._device, non_blocking=True)
-                            try:
-                                if isinstance(moved, Mapping):
-                                    for _v in moved.values():
-                                        if torch.is_tensor(_v):
-                                            _v.record_stream(s)
-                                elif torch.is_tensor(moved):
-                                    moved.record_stream(s)
-                            except Exception:
-                                pass
-                        try:
-                            ev = s.record_event()
-                        except Exception:
-                            try:
-                                s.synchronize()
-                            except Exception:
-                                pass
-                            ev = None
-                        q.put((moved, ev), block=True)
-                    else:
-                        moved = _to_device(
-                            item, self._device, non_blocking=self._non_blocking
-                        )
-                        q.put((moved, None), block=True)
-            except StopIteration:
-                pass
-            finally:
-                q.put(sentinel, block=True)
+        from torch.utils.data import get_worker_info
+        import time
 
-        def _producer_wrapped() -> None:
-            try:
-                get_tlb().pin_thread()
-            except Exception:
-                pass
-            return _producer()
+        info = get_worker_info()
+        device = getattr(self, "_device", torch.device("cpu"))
+        use_device = (device.type in {"cuda", "mps", "xpu"})
+        use_cuda_stream = (device.type == "cuda" and hasattr(torch, "cuda") and torch.cuda.is_available())
+        iterable = getattr(self, "_iterable", self._src)
 
-        it = iter(self._src)
-
-        def _wait_ready(ev: Any) -> None:
-            if ev is None:
-                return
-            dev_t = getattr(self._device, "type", "cpu")
+                                                      
+        def _gpu_mem_ok() -> bool:
+            if not use_cuda_stream or self._gpu_guard_bytes <= 0:
+                return True
             try:
-                if dev_t == "cuda" and hasattr(torch, "cuda"):
-                    torch.cuda.current_stream(self._device).wait_event(ev)
-                    return
-                if dev_t == "xpu" and hasattr(torch, "xpu"):
-                    torch.xpu.current_stream(self._device).wait_event(ev)
-                    return
-                if dev_t == "mps" and hasattr(torch, "mps"):
-                    try:
-                        cs = torch.mps.current_stream(self._device)
-                    except TypeError:
-                        cs = torch.mps.current_stream()
-                    try:
-                        cs.wait_event(ev)
-                        return
-                    except Exception:
-                        try:
-                            ev.wait(cs)
-                            return
-                        except Exception:
-                            ev.synchronize()
-                            return
+                free_b, total_b = torch.cuda.mem_get_info(
+                    device=device if isinstance(device, torch.device) else None
+                )
+                return bool(free_b >= self._gpu_guard_bytes)
             except Exception:
-                pass
-            try:
-                ev.synchronize()
-            except Exception:
-                pass
+                return True
 
-        q: "queue.Queue[Optional[Any]]" = queue.Queue(maxsize=self._depth)
-        sentinel = object()
-        t = threading.Thread(target=_producer_wrapped, daemon=True)
-        t.start()
-        try:
-            while True:
-                item = q.get(block=True)
-                if item is sentinel:
-                    break
-                moved, ev = item
+        def _host_mem_ok() -> bool:
+            if self._host_guard_bytes <= 0:
+                return True
+            try:
+                import psutil            
+                return bool(psutil.virtual_memory().available >= self._host_guard_bytes)
+            except Exception:
+                return True
+
+        if info is not None:
+                                                               
+            for batch in iterable:
+                if self._pin:
+                    batch = self._pin_memory(batch)
+                yield batch
+                                                                                   
+                if self._backpressure:
+                    time.sleep(0)
+        else:
+                                                           
+            if use_cuda_stream and self._gpu_stream is None:
+                self._gpu_stream = torch.cuda.Stream(device=device)
+            preloaded = None
+            it = iter(iterable)
+
+            def _preload():
                 try:
-                    _wait_ready(ev)
-                except Exception:
-                    dev_t = getattr(self._device, "type", "cpu")
+                    b = next(it)
+                except StopIteration:
+                    return None
+                b = self._pin_memory(b)
+                                                       
+                tries = 0
+                if self._backpressure:
+                    while (not _host_mem_ok()) or (not _gpu_mem_ok()):
+                        time.sleep(0.001 if tries < 1000 else 0.005)
+                        tries += 1
+                if use_device:
+                    if use_cuda_stream and self._gpu_stream is not None:
+                        with torch.cuda.stream(self._gpu_stream):
+                            b = self._to_device(b, device)
+                    else:
+                                            
+                        b = self._to_device(b, device)
+                return b
+
+                       
+            preloaded = _preload()
+            while preloaded is not None:
+                if use_cuda_stream and self._gpu_stream is not None:
+                    cs = torch.cuda.current_stream(
+                        device=device if isinstance(device, torch.device) else None
+                    )
+                    cs.wait_stream(self._gpu_stream)
+                                                         
+                    def _record(x):
+                        if torch.is_tensor(x):
+                            x.record_stream(cs)
+                            return
+                        if isinstance(x, (list, tuple)):
+                            for t in x:
+                                _record(t)
+                        elif isinstance(x, dict):
+                            for t in x.values():
+                                _record(t)
                     try:
-                        if dev_t == "cuda" and hasattr(torch, "cuda"):
-                            torch.cuda.synchronize(self._device)
-                        elif dev_t == "xpu" and hasattr(torch, "xpu"):
-                            torch.xpu.synchronize(self._device)
-                        elif dev_t == "mps" and hasattr(torch, "mps"):
-                            torch.mps.synchronize()
+                        _record(preloaded)
                     except Exception:
                         pass
-                yield moved
-        finally:
-            try:
-                t.join(timeout=0.1)
-            except Exception:
-                pass
+                yield preloaded
+                preloaded = _preload()
