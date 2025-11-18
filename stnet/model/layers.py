@@ -95,27 +95,20 @@ def _block_ranges(N: int, patch: int):
                            
                                 
 if _HAS_TRITON:
-                                                                           
-                                                                                       
+                                                                                                                                                           
     _RV_CONFIGS = [
         triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=2,  num_stages=1),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=4,  num_stages=1),
         triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  32}, num_warps=2,  num_stages=2),
         triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
-
         triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
-
         triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
         triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
-
         triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  64}, num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  96}, num_warps=16, num_stages=3),
         triton.Config({'BLOCK_J': 512, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
     ]
 
