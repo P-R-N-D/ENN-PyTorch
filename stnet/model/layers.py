@@ -38,7 +38,7 @@ except Exception:
     _HAS_TRITON = False
 
 @torch.no_grad()
-def _ptv3_normalize(coords: torch.Tensor, eps: float = 1e-6):
+def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
     B, N, C = coords.shape
     if C == 2:
         z = torch.zeros(B, N, 1, dtype=coords.dtype, device=coords.device)
@@ -57,7 +57,7 @@ def _ptv3_expand_bits(v: torch.Tensor):
     return v
 
 @torch.no_grad()
-def _ptv3_morton3d(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
+def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     B, N, _ = coords01.shape
     maxv = (1 << bits) - 1
     xyz = (coords01 * maxv).to(torch.int32)
@@ -68,10 +68,10 @@ def _ptv3_morton3d(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     return (xx | yy | zz)
 
 @torch.no_grad()
-def _ptv3_serialized_order(coords: torch.Tensor, *, bits: int, patch: int, shift_order: bool, block_index: int):
+def _serialize_z_index(coords: torch.Tensor, *, bits: int, patch: int, shift_order: bool, block_index: int):
     """Return perm, invperm for PTv3 serialization (+ optional half-patch shift)."""
-    coords01 = _ptv3_normalize(coords)
-    keys = _ptv3_morton3d(coords01, bits=bits)                            
+    coords01 = _norm_vector(coords)
+    keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)                               
     if shift_order and (block_index % 2 == 1):
         B, N = perm.shape
@@ -102,27 +102,18 @@ if _HAS_TRITON:
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=4,  num_stages=1),
         triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  32}, num_warps=2,  num_stages=2),
         triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
-                                 
+
         triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J':  96, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J':  96, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
         triton.Config({'BLOCK_J': 128, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
-                                      
-        triton.Config({'BLOCK_J': 192, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 192, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 192, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
+
         triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
         triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  96}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 128}, num_warps=8,  num_stages=3),
-        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 160}, num_warps=8,  num_stages=3),
-                                               
-        triton.Config({'BLOCK_J': 384, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 384, 'BLOCK_DH':  96}, num_warps=8,  num_stages=3),
-        triton.Config({'BLOCK_J': 384, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
+        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
+
         triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  64}, num_warps=16, num_stages=3),
         triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  96}, num_warps=16, num_stages=3),
         triton.Config({'BLOCK_J': 512, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
@@ -131,7 +122,7 @@ if _HAS_TRITON:
                                           
     @triton.autotune(configs=_RV_CONFIGS, key=['J', 'DH', 'K'])
     @triton.jit
-    def _w_rv_reduce_over_keys_kernel(
+    def _reduce_weighted_sum(
         W, RV, O,
         B: tl.constexpr, H: tl.constexpr, K: tl.constexpr, J: tl.constexpr, DH: tl.constexpr,
                                                                
@@ -1953,7 +1944,7 @@ class PatchAttention(nn.Module):
                     SRVB, SRVH, SRVK, SRVJ, SRVDH = rv.stride()
                     SOB, SOH, SOK, SODH = o_slice.stride()
                                                                      
-                    _w_rv_reduce_over_keys_kernel[lambda META: (B_*H_, K_, triton.cdiv(DH_, META['BLOCK_DH']))](
+                    _reduce_weighted_sum[lambda META: (B_*H_, K_, triton.cdiv(DH_, META['BLOCK_DH']))](
                         w_ctg, rv, o_slice,
                         B_, H_, K_, J_, DH_,
                         SWB, SWH, SWK, SWJ,
@@ -2351,7 +2342,7 @@ class SpatialEncoder(nn.Module):
             _patch = getattr(self, "patch_size", 512)
             _shift = getattr(self, "shift_order", True)
             _bits  = getattr(self, "morton_bits", 10)
-            perm, invperm = _ptv3_serialized_order(coords, bits=_bits, patch=_patch,
+            perm, invperm = _serialize_z_index(coords, bits=_bits, patch=_patch,
                                                    shift_order=_shift, block_index=i)
             x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
             c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
