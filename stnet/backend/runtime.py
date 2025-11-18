@@ -1091,7 +1091,10 @@ def epochs(
 
     start_kst_ns = posix_time("Asia/Seoul")
     in_dim = int(ops.in_dim)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(torch, "Event")
+    use_timer = (
+        (device.type == "cuda" and hasattr(torch.cuda, "Event")) or
+        (device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "Event"))
+    )
     train_steps = _num_batches(train_loader)
     val_steps = _num_batches(val_loader)
     total_updates = int(total_epochs) * (int(train_steps) + int(val_steps))
@@ -1569,7 +1572,6 @@ def infer(
     *args: Any,
     data_loader: Any,
     chunk_dir: Optional[str] = None,
-    streaming: bool = False,
     **kwargs: Any,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
     from typing import Dict, List
@@ -1605,7 +1607,6 @@ def infer(
     def _chunk_target_mb() -> float:
         return max(CHUNK_MIN_MB, min(CHUNK_MAX_MB, _memory_limit() * 0.25))
 
-    preds_bytes = 0
     writer: Optional[Memory.Cache] = None
     pred_pool = Memory.Pool(capacity=4) if device.type in {"cuda", "xpu"} else None
     with contextlib.suppress(Exception):
@@ -1688,14 +1689,18 @@ def infer(
         chunk_accum.clear()
         chunk_acc_bytes = 0
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
-    use_timer = getattr(device, "type", "cpu") in ("cuda", "xpu", "mps") and hasattr(torch, "Event")
+    use_timer = (
+        (device.type == "cuda" and hasattr(torch.cuda, "Event")) or
+        (device.type == "xpu"  and hasattr(torch, "xpu") and hasattr(torch.xpu, "Event"))
+    )
     io_bytes: float = 0.0
     io_time: float = 0.0
     comp_time: float = 0.0
     total_flops: float = 0.0
     t_fetch_start = time.perf_counter_ns()
-    preds: List[torch.Tensor] = []
-    recovered_streaming = False
+    streaming = bool(chunk_dir)
+    preds: Optional[List[torch.Tensor]] = [] if not streaming else None
+    preds_bytes: int = 0
     is_dist = is_distributed()
     rank = torch.distributed.get_rank() if is_dist else 0
 
@@ -1850,6 +1855,7 @@ def infer(
                             f"Streaming write failed (no in-memory fallback): {err!r}"
                         )
                 elif rank == 0 and not streaming:
+                    assert preds is not None
                     if evt is not None:
                         with contextlib.suppress(Exception):
                             evt.synchronize()
@@ -1875,70 +1881,27 @@ def infer(
                                 chunk_dir = None
                         if chunk_dir:
                             os.makedirs(chunk_dir, exist_ok=True)
+                                          
                             if writer is None:
-                                root = chunk_dir or new_dir("pred_chunks")
+                                root = chunk_dir
                                 writer = Memory.Cache(root, max_queue=queue_depth)
-                                chunk_dir = root
-                            for _buf in preds:
-                                try:
-                                    chunk_accum.append((_buf, None, None))
-                                    chunk_acc_bytes += int(
-                                        _buf.element_size() * _buf.nelement()
-                                    )
+                                                               
+                            if preds is not None:
+                                for _host in preds:
+                                    chunk_accum.append((_host, None, None))
+                                    try:
+                                        chunk_acc_bytes += int(_host.element_size() * _host.nelement())
+                                    except Exception:
+                                        pass
                                     _flush(force=False)
-                                    if writer.had_error():
-                                        raise RuntimeError("async writer failed")
-                                except Exception:
-                                    streaming = False
-                                    if writer is not None:
-                                        with contextlib.suppress(Exception):
-                                            writer.close()
-                                        writer = None
-                                    break
-                            with contextlib.suppress(Exception):
                                 _flush(force=True)
-                            w_ok = (writer is not None) and (not writer.had_error())
-                            if not w_ok:
-                                streaming = False
-                                if chunk_accum:
-                                    for _t, _evt, _h in chunk_accum:
-                                        if _evt is not None:
-                                            with contextlib.suppress(Exception):
-                                                _evt.synchronize()
-                                        preds.append(_t)
-                                        if pred_pool is not None and _h is not None:
-                                            with contextlib.suppress(Exception):
-                                                pred_pool.release(_h)
-                                    chunk_accum.clear()
-                                    chunk_acc_bytes = 0
-                                if chunk_dir and chunk_idx > 0:
-                                    for stored_idx in range(chunk_idx):
-                                        chunk_path = os.path.join(chunk_dir, f"chunk_{stored_idx:06d}.pt")
-                                        try:
-                                            preds.append(torch.load(chunk_path, map_location="cpu"))
-                                            with contextlib.suppress(OSError):
-                                                os.remove(chunk_path)
-                                        except Exception as load_err:
-                                            warnings.warn(
-                                                f"Failed to recover streamed predictions from {chunk_path!r}: {load_err!r}",
-                                                RuntimeWarning,
-                                                stacklevel=2,
-                                            )
-                                    with contextlib.suppress(OSError):
-                                        if chunk_dir and not os.listdir(chunk_dir):
-                                            os.rmdir(chunk_dir)
-                                if writer is not None:
-                                    with contextlib.suppress(Exception):
-                                        writer.close()
-                                    writer = None
-                                try:
-                                    preds_bytes = sum(int(t.element_size() * t.nelement()) for t in preds)
-                                except Exception:
-                                    preds_bytes = 0
-                            else:
-                                preds.clear()
-                                preds_bytes = 0
-                                streaming = True
+                                                     
+                            preds = None
+                            preds_bytes = 0
+                            streaming = True
+                                      
+                            if writer.had_error():
+                                raise RuntimeError("async writer failed during spill")
                 if use_timer:
                     ev_e.record()
                     ev_e.synchronize()
@@ -1970,18 +1933,24 @@ def infer(
                         if writer is not None:
                             with contextlib.suppress(Exception):
                                 _flush(force=True)
+                            err = False
+                            with contextlib.suppress(Exception):
+                                err = writer.had_error()
                             with contextlib.suppress(Exception):
                                 writer.close()
+                            if err:
+                                raise RuntimeError("async writer failed before queue resize")
+                                                                 
                             root = chunk_dir or new_dir("pred_chunks")
                             writer = Memory.Cache(root, max_queue=queue_depth)
                             chunk_dir = root
     finally:
-        if streaming and writer is not None:
-            with contextlib.suppress(Exception):
-                _flush(force=True)
         if writer is not None:
             with contextlib.suppress(Exception):
+                _flush(force=True)
+            with contextlib.suppress(Exception):
                 writer.close()
+            writer = None
         if local_rank == 0 and status_bar is not None:
             mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
             tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
@@ -1990,6 +1959,7 @@ def infer(
             )
             status_bar.close()
     if streaming and rank == 0:
+                                                         
         if not chunk_dir:
             with contextlib.suppress(Exception):
                 chunk_dir = new_dir("pred_chunks")
@@ -1998,12 +1968,12 @@ def infer(
             "dir": chunk_dir,
             "num_chunks": int(chunk_idx),
             "out_shape": list(ops.out_shape),
+            "dtype": (str(ref_dtype).replace("torch.", "") if ref_dtype is not None else None),
         }
         if shape_inconsistent:
             manifest["variable_shape"] = True
             if ref_tail_shape is not None:
                 manifest["example_tail_shape"] = list(ref_tail_shape)
-            manifest["dtype"] = (str(ref_dtype).replace("torch.", "") if ref_dtype is not None else None)
         with contextlib.suppress(Exception):
             with open(
                 os.path.join(chunk_dir or "", "manifest.json"), "w", encoding="utf-8"
@@ -2011,6 +1981,7 @@ def infer(
                 json.dump(manifest, manifest_file)
         result = None
     elif not streaming:
+        assert preds is not None
         if not shape_inconsistent:
             if preds:
                 flat = torch.cat(preds, dim=0)
@@ -2443,39 +2414,35 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
             )
 
-            def _worker() -> None:
-                try:
-                    get_tlb().pin_thread()
-                    with contextlib.suppress(Exception):
-                        Memory.prefer_local_numa()
-                except Exception:
-                    pass
-                epochs(
-                    model=model,
-                    device=device,
-                    local_rank=local_rank,
-                    ops=ops,
-                    param_dtype=param_dtype,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    sched=sched,
-                    loss_controller=loss_controller,
-                    top_loss=top_loss,
-                    bottom_loss=bottom_loss,
-                    grad_accum_steps=int(ops.grad_accum_steps),
-                    train_loader=train_loader,
-                    val_loader=val_loader,
-                    total_epochs=total_epochs,
-                    scheduler_step_per_batch=scheduler_step_per_batch,
-                    swa_helper=swa_helper,
-                    swa_start_epoch=swa_start_epoch,
-                    swa_bn_update=swa_bn_update,
-                    buffers_dtype=amp_buffers_dtype,
-                )
-
-            _thread = threading.Thread(target=_worker, daemon=False)
-            _thread.start()
-            _thread.join()
+                                                                                        
+            try:
+                get_tlb().pin_thread()
+                with contextlib.suppress(Exception):
+                    Memory.prefer_local_numa()
+            except Exception:
+                pass
+            epochs(
+                model=model,
+                device=device,
+                local_rank=local_rank,
+                ops=ops,
+                param_dtype=param_dtype,
+                optimizer=optimizer,
+                scaler=scaler,
+                sched=sched,
+                loss_controller=loss_controller,
+                top_loss=top_loss,
+                bottom_loss=bottom_loss,
+                grad_accum_steps=int(ops.grad_accum_steps),
+                train_loader=train_loader,
+                val_loader=val_loader,
+                total_epochs=total_epochs,
+                scheduler_step_per_batch=scheduler_step_per_batch,
+                swa_helper=swa_helper,
+                swa_start_epoch=swa_start_epoch,
+                swa_bn_update=swa_bn_update,
+                buffers_dtype=amp_buffers_dtype,
+            )
         finally:
             if keep is not None:
                 keep.cleanup()
@@ -2611,33 +2578,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 raise RuntimeError("predict/infer requires streaming (ckpt_dir not available)")
             streaming = True
         try:
-            result_holder: Dict[str, Any] = {}
-
-            def _worker() -> None:
-                try:
-                    get_tlb().pin_thread()
-                    with contextlib.suppress(Exception):
-                        Memory.prefer_local_numa()
-                except Exception:
-                    pass
-                result = infer(
-                    model=model,
-                    device=device,
-                    local_rank=local_rank,
-                    ops=ops,
-                    data_loader=data_loader,
-                    chunk_dir=chunk_dir,
-                    streaming=streaming,
-                )
-                if result is not None:
-                    result_holder["value"] = result
-
-            _thread = threading.Thread(target=_worker, daemon=False)
-            _thread.start()
-            _thread.join()
-            thread_result = result_holder.get("value")
-            if thread_result is not None and ret_sink is not None:
-                ret_sink.update(thread_result)
+                                                                                    
+            result = infer(
+                model=model,
+                device=device,
+                local_rank=local_rank,
+                ops=ops,
+                data_loader=data_loader,
+                chunk_dir=chunk_dir,
+            )
+            if result is not None and ret_sink is not None:
+                ret_sink.update(result)
         finally:
             if keep is not None:
                 keep.cleanup()
