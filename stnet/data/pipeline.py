@@ -195,8 +195,8 @@ def _batch_interval(
                     cap_from_mem = int(safe_cap // max(1, per_sample))
                     if cap_from_mem > 0:
                         B_cap = max(1, min(B_cap, cap_from_mem))
-        except Exception:
-            pass
+            except Exception:
+                pass
 
     candidates = _random_batches(sbytes, _dev, len(_ds))
     if candidates:
