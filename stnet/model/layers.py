@@ -1918,6 +1918,16 @@ class PatchAttention(nn.Module):
 
                                                             
                 rel_chunk = (coords_f32[:, s:e, :].unsqueeze(2) - coords_f32[:, t:u, :].unsqueeze(1))
+                #debug
+                if rel_chunk.numel() == 0:
+                    raise RuntimeError("rel_chunk is empty?!")
+
+                print(
+                    "[DEBUG] rel_chunk shape:", tuple(rel_chunk.shape),
+                    "numel:", rel_chunk.numel(),
+                    "dtype:", rel_chunk.dtype,
+                    "device:", rel_chunk.device,
+                )
                                                                     
                 rv = self.rel_value(rel_chunk.to(x.dtype))             
                                            
