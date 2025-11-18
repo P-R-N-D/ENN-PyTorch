@@ -740,6 +740,76 @@ def _expand(sources: Any) -> Any:
     return sources
 
 
+@torch.no_grad()
+def _calibrate_per_sample_mem(
+    model: Root,
+    device: torch.device,
+    ops: RuntimeConfig,
+    max_probe_batch: int = 32,
+) -> None:
+    from ..data.nodes import Dataset
+
+    dev_type = getattr(device, "type", "")
+    if dev_type != "cuda":
+        return
+
+    try:
+        memmap_root = _first_source_path(ops.sources)
+        ds = Dataset(memmap_root, split="train", val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0))
+    except Exception:
+        return
+
+    try:
+        N = int(len(ds))
+    except Exception:
+        N = 0
+    if N <= 0:
+        return
+
+    B0 = max(1, min(int(max_probe_batch), N))
+    try:
+        batch = ds.get(0, B0)
+    except Exception:
+        return
+
+    try:
+        feats, labels, keys, label_shape = preprocess(batch)
+    except Exception:
+        return
+
+    X = to_torch_tensor(feats)
+    X = torch.atleast_2d(X)
+    if X.dim() != 2 or X.shape[1] != int(ops.in_dim):
+        return
+
+    X = X.to(device, non_blocking=True)
+
+    try:
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+    except Exception:
+        pass
+
+    with Gradient.inference(model), Autocast.float(device):
+        td = to_tensordict({"features": X})
+        _ = model(td, global_loss=None, local_loss=None, loss_weights=None)
+
+    try:
+        torch.cuda.synchronize(device)
+        peak_bytes = int(torch.cuda.max_memory_allocated(device))
+    except Exception:
+        return
+
+    if peak_bytes <= 0:
+        return
+
+    per_sample = max(1, peak_bytes // B0)
+    try:
+        Dataset._per_sample_mem_bytes = int(per_sample)
+    except Exception:
+        pass
+
+
 def _coerce_dtensor(
     param: torch.nn.Parameter,
     mesh: Any,
@@ -2552,6 +2622,13 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         model.eval()
+        with contextlib.suppress(Exception):
+            _calibrate_per_sample_mem(
+                model=model,
+                device=device,
+                ops=ops,
+            )
+
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)

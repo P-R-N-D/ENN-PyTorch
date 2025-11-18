@@ -181,6 +181,23 @@ def _batch_interval(
         except Exception:
             pass
     B_cap = max(1, min(int(B_cap * Dataset._scale), len(_ds)))
+
+    if _dev.type == "cuda":
+        try:
+            per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+        except Exception:
+            per_sample = 0
+        if per_sample > 0:
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(_dev)
+                safe_cap = int(max(0, free_bytes) * 0.80)
+                if safe_cap > 0:
+                    cap_from_mem = int(safe_cap // max(1, per_sample))
+                    if cap_from_mem > 0:
+                        B_cap = max(1, min(B_cap, cap_from_mem))
+        except Exception:
+            pass
+
     candidates = _random_batches(sbytes, _dev, len(_ds))
     if candidates:
         B = min(candidates[-1], B_cap)

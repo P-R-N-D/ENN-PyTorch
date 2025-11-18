@@ -73,6 +73,7 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
 
 class Dataset(_Sampler):
     _scale: float = 1.0
+    _per_sample_mem_bytes: int = 0
 
     @classmethod
     def request_scale_up(cls, factor: float) -> None:
