@@ -49,7 +49,7 @@ def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
     x = (coords - mins) / rng
     return x.clamp_(0.0, 1.0 - 1e-7)
 
-def _ptv3_expand_bits(v: torch.Tensor):
+def _expand_bits(v: torch.Tensor):
     v = (v | (v << 16)) & 0x030000FF
     v = (v | (v << 8))  & 0x0300F00F
     v = (v | (v << 4))  & 0x030C30C3
@@ -62,9 +62,9 @@ def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     maxv = (1 << bits) - 1
     xyz = (coords01 * maxv).to(torch.int32)
     x, y, z = xyz.unbind(dim=-1)
-    xx = _ptv3_expand_bits(x)
-    yy = _ptv3_expand_bits(y) << 1
-    zz = _ptv3_expand_bits(z) << 2
+    xx = _expand_bits(x)
+    yy = _expand_bits(y) << 1
+    zz = _expand_bits(z) << 2
     return (xx | yy | zz)
 
 @torch.no_grad()
