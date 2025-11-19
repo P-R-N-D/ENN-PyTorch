@@ -1901,10 +1901,7 @@ class PatchAttention(nn.Module):
                 if attn_bias is not None:
                     sc = sc + attn_bias[:, :, s:e, t:u].to(dtype=sc.dtype)
                 sc = sc.float()
-                                                             
                 w_t = torch.exp(sc - m) / (sum_exp + 1e-12)
-
-                                                                                            
                 drop_p = 0.0
                 _attn_p = getattr(self.attn, "dropout_p", None)
                 if _attn_p is None:
@@ -1915,38 +1912,19 @@ class PatchAttention(nn.Module):
                     drop_p = 0.0
                 if self.training and drop_p > 0.0:
                     w_t = F.dropout(w_t, p=drop_p, training=True)
-
-                                                            
                 rel_chunk = (coords_f32[:, s:e, :].unsqueeze(2) - coords_f32[:, t:u, :].unsqueeze(1))
-                #debug
-                if rel_chunk.numel() == 0:
-                    raise RuntimeError("rel_chunk is empty?!")
-
-                print(
-                    "[DEBUG] rel_chunk shape:", tuple(rel_chunk.shape),
-                    "numel:", rel_chunk.numel(),
-                    "dtype:", rel_chunk.dtype,
-                    "device:", rel_chunk.device,
-                )
-                                                                    
                 rv = self.rel_value(rel_chunk.to(x.dtype))             
-                                           
                 rv = rv.view(B, (e - s), (u - t), H, Dh).permute(0, 3, 1, 2, 4).contiguous()
                 if use_shared_weights:
-                                                              
                     v_blk = vh[:, :, t:u, :]              
                     _base_acc32 = (w_t.unsqueeze(-1) * v_blk.to(torch.float32).unsqueeze(2)).sum(dim=-2)
                     base[:, :, s:e, :] += _base_acc32.to(base.dtype)
-                                                          
                 if use_triton:
                     w_ctg = w_t.contiguous()                                  
-                                                           
                     B_, H_, K_, J_, DH_ = B, H, (e - s), (u - t), Dh
-                                        
                     SWB, SWH, SWK, SWJ = w_ctg.stride()
                     SRVB, SRVH, SRVK, SRVJ, SRVDH = rv.stride()
                     SOB, SOH, SOK, SODH = o_slice.stride()
-                                                                     
                     _reduce_weighted_sum[lambda META: (B_*H_, K_, triton.cdiv(DH_, META['BLOCK_DH']))](
                         w_ctg, rv, o_slice,
                         B_, H_, K_, J_, DH_,
