@@ -69,7 +69,6 @@ def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
 
 @torch.no_grad()
 def _serialize_z_index(coords: torch.Tensor, *, bits: int, patch: int, shift_order: bool, block_index: int):
-    """Return perm, invperm for PTv3 serialization (+ optional half-patch shift)."""
     coords01 = _norm_vector(coords)
     keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)                               
@@ -1691,6 +1690,7 @@ class PatchEmbedding(nn.Module):
 
 
 class CrossAttention(nn.Module):
+
     def __init__(
         self,
         d_model: int,
@@ -1705,20 +1705,24 @@ class CrossAttention(nn.Module):
         super().__init__()
         if d_model % nhead != 0:
             raise ValueError("d_model must be divisible by nhead for attention")
-        self.d_model = d_model
-        self.nhead = nhead
-        self.head_dim = d_model // nhead
-        self.norm_q = norm_layer(norm_type, d_model)
-        self.q_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.kv_proj = nn.Linear(d_model, 2 * d_model, bias=bias)
-        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        self.dropout = nn.Dropout(dropout)
+
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.head_dim = int(self.d_model // self.nhead)
+        self.norm_q = norm_layer(norm_type, self.d_model)
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.kv_proj = nn.Linear(self.d_model, 2 * self.d_model, bias=bias)
+        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
+        self.dropout = nn.Dropout(float(dropout))
         self.use_gate = bool(use_gate)
         if self.use_gate:
             self.gate = nn.Parameter(torch.zeros(1))
         else:
             self.register_parameter("gate", None)
-        self.sdpa = DotProductAttention()
+        self.sdpa = DotProductAttention(
+            num_heads=self.nhead,
+            head_dim=self.head_dim,
+        )
 
     def forward(
         self,
@@ -1727,18 +1731,19 @@ class CrossAttention(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         B, Nq, D = q.shape
-        qn = self.q_proj(self.norm_q(q))
-        kv = self.kv_proj(kv)
-        k, v = kv.chunk(2, dim=-1)
-        qh, kh, vh = (
-            reshape_for_mha(qn, B, self.nhead, self.head_dim),
-            reshape_for_mha(k, B, self.nhead, self.head_dim),
-            reshape_for_mha(v, B, self.nhead, self.head_dim),
-        )
+        if D != self.d_model:
+            raise ValueError(f"q.shape[-1]={D} must match d_model={self.d_model}")
+        q_norm = self.norm_q(q)
+        q_proj = self.q_proj(q_norm)
+        kv_proj = self.kv_proj(kv)
+        k_proj, v_proj = kv_proj.chunk(2, dim=-1)
+        qh = reshape_for_mha(q_proj, B, self.nhead, self.head_dim)
+        kh = reshape_for_mha(k_proj, B, self.nhead, self.head_dim)
+        vh = reshape_for_mha(v_proj, B, self.nhead, self.head_dim)
         yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
         y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
         y = self.out_proj(self.dropout(y))
-        if self.use_gate:
+        if self.use_gate and self.gate is not None:
             y = torch.sigmoid(self.gate) * y
         return q + y
 
@@ -1945,6 +1950,7 @@ class PatchAttention(nn.Module):
 
 
 class Retention(nn.Module):
+
     def __init__(self, d_model: int, nhead: int) -> None:
         super().__init__()
         self.msr = MultiScaleRetention(d_model, nhead)
@@ -1957,7 +1963,7 @@ class Retention(nn.Module):
         state: Optional[dict] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
-        h = self.msr(x, attn_mask=attn_mask, state=state)
+        h = self.msr(x, attn_mask=attn_mask, state=state, **kwargs)
         if isinstance(h, tuple):
             out, new_state = h
             if new_state is None:
@@ -1995,6 +2001,7 @@ def _get_dilated_mask(
 
 
 class DilatedAttention(nn.Module):
+
     def __init__(
         self,
         embed_dim: int,
@@ -2010,14 +2017,19 @@ class DilatedAttention(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
+        if embed_dim % max(1, num_heads) != 0:
+            raise ValueError(
+                f"embed_dim {embed_dim} must be divisible by num_heads {num_heads}"
+            )
+
+        self.embed_dim = int(embed_dim)
+        self.num_heads = int(num_heads)
         self.dilation = int(dilation)
         self.window_size = window_size
-        self.causal = causal
-        self.batch_first = batch_first
-        self.nhead = int(num_heads)
-        self.head_dim = int(embed_dim // max(self.nhead, 1))
+        self.causal = bool(causal)
+        self.batch_first = bool(batch_first)
+        self.nhead = self.num_heads
+        self.head_dim = int(self.embed_dim // max(self.nhead, 1))
         self.dropout_p = float(dropout)
         self.__stf_attention_profile__ = {
             "format": "xs",
@@ -2027,25 +2039,23 @@ class DilatedAttention(nn.Module):
             "effective_window_attr": ["window_size"],
             "include_softmax_scale_dropout": True,
         }
-
-        self.norm1 = _Norm(embed_dim)
+        self.norm1 = _Norm(self.embed_dim)
         self.attn = MultiHeadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
+            embed_dim=self.embed_dim,
+            num_heads=self.num_heads,
             dropout=dropout,
             bias=bias,
-            batch_first=batch_first,
+            batch_first=self.batch_first,
         )
         self.dropout = nn.Dropout(dropout)
-        self.norm2 = _Norm(embed_dim)
-        hidden = int(mlp_ratio * embed_dim)
+        self.norm2 = _Norm(self.embed_dim)
+        hidden = int(mlp_ratio * self.embed_dim)
         self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, hidden, bias=True),
+            nn.Linear(self.embed_dim, hidden, bias=True),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden, embed_dim, bias=True),
+            nn.Linear(hidden, self.embed_dim, bias=True),
         )
-
         self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
         self._mask_cache_gpu: Dict[Tuple[int, int], torch.Tensor] = {}
 
@@ -2054,6 +2064,7 @@ class DilatedAttention(nn.Module):
         mask_gpu = self._mask_cache_gpu.get(key)
         if mask_gpu is not None and mask_gpu.device == device:
             return mask_gpu
+
         mask_cpu = self._mask_cache_cpu.get(L)
         if mask_cpu is None:
             mask_cpu = (
@@ -2068,6 +2079,7 @@ class DilatedAttention(nn.Module):
                 .cpu()
             )
             self._mask_cache_cpu[L] = mask_cpu
+
         mask_gpu = mask_cpu.to(device=device, non_blocking=True)
         self._mask_cache_gpu[key] = mask_gpu
         return mask_gpu
@@ -2080,7 +2092,13 @@ class DilatedAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if not self.batch_first:
             x = x.transpose(0, 1)
-        B, L, _ = x.shape
+
+        B, L, D = x.shape
+        if D != self.embed_dim:
+            raise ValueError(
+                f"x.shape[-1]={D} must match embed_dim={self.embed_dim}"
+            )
+
         residual = x
         x = self.norm1(x)
         mask = self._get_mask(L, x.device)
@@ -2097,12 +2115,15 @@ class DilatedAttention(nn.Module):
         residual = x
         x = self.norm2(x)
         x = residual + self.ffn(x)
+
         if not self.batch_first:
             x = x.transpose(0, 1)
+
         return x, (attn_w if need_weights else None)
 
 
 class PointTransformer(nn.Module):
+
     def __init__(
         self,
         d_model: int,
@@ -2118,10 +2139,11 @@ class PointTransformer(nn.Module):
         super().__init__()
         self.coord_dim = int(coord_dim)
         self.d_model = int(d_model)
+        self.nhead = int(nhead)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm1 = norm_layer(norm_type, self.d_model)
-        self.attn = PatchAttention(self.d_model, nhead, coord_dim=self.coord_dim)
+        self.attn = PatchAttention(self.d_model, self.nhead, coord_dim=self.coord_dim)
         self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
@@ -2147,6 +2169,16 @@ class PointTransformer(nn.Module):
             attn_mask = attn_mask.contiguous()
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta before attention")
+            if attn_mask.dim() == 4:
+                Bm, Hm, Nm1, Nm2 = attn_mask.shape
+                if Bm != B or Nm1 != N or Nm2 != N:
+                    raise ValueError(
+                        f"attn_mask shape {tuple(attn_mask.shape)} incompatible with (B={B},H=?,N={N})"
+                    )
+                if Hm not in (1, self.nhead):
+                    raise ValueError(
+                        f"per-head attn_mask H dimension {Hm} must be 1 or match nhead={self.nhead}"
+                    )
 
         def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
             if not isinstance(ln, nn.LayerNorm):
@@ -2361,6 +2393,7 @@ class SpatialEncoder(nn.Module):
 
 
 class RetNet(nn.Module):
+
     def __init__(
         self,
         d_model: int,
@@ -2373,13 +2406,50 @@ class RetNet(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.norm1 = norm_layer(norm_type, d_model)
-        self.retention = Retention(d_model, nhead)
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+
+        self.norm1 = norm_layer(norm_type, self.d_model)
+
+        self._ts_impl: Optional[nn.Module] = None
+        try:
+            ts_retnet_mod = import_module("torchscale.architecture.retnet")
+        except Exception:
+            ts_retnet_mod = None
+
+        if ts_retnet_mod is not None:
+            candidates: list[Any] = []
+            for name in ("RetNetDecoderLayer", "RetNetLayer", "RetNetBlock"):
+                if hasattr(ts_retnet_mod, name):
+                    candidates.append(getattr(ts_retnet_mod, name))
+            for cls in candidates:
+                if not callable(cls):
+                    continue
+                ctor_variants = (
+                    dict(embed_dim=self.d_model, retention_heads=self.nhead),
+                    dict(
+                        decoder_embed_dim=self.d_model,
+                        decoder_retention_heads=self.nhead,
+                    ),
+                )
+                for ck in ctor_variants:
+                    try:
+                        self._ts_impl = cls(**ck)
+                        break
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
+                if self._ts_impl is not None:
+                    break
+
+        self.retention = Retention(self.d_model, self.nhead)
+
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm2 = norm_layer(norm_type, d_model)
-        hid = int(d_model * mlp_ratio * (2.0 / 3.0))
-        self.ffn = SwiGLU(d_model, hid, out_dim=d_model, dropout=dropout)
+        self.norm2 = norm_layer(norm_type, self.d_model)
+        hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
+        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
 
     def forward(
         self,
@@ -2392,10 +2462,36 @@ class RetNet(nn.Module):
         x = x.contiguous()
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
-        h, state = self.retention(self.norm1(x), attn_mask=causal_mask, state=state)
+
+        h: torch.Tensor
+        new_state: Optional[dict] = state
+        used_ts = False
+        if self._ts_impl is not None:
+            try:
+                out_ts = self._ts_impl(
+                    x,
+                    attn_mask=causal_mask,
+                )
+                if isinstance(out_ts, tuple):
+                    h = out_ts[0]
+                else:
+                    h = out_ts
+                used_ts = True
+            except Exception:
+                used_ts = False
+
+        if not used_ts:
+            h, new_state = self.retention(
+                self.norm1(x),
+                attn_mask=causal_mask,
+                state=state,
+            )
+        else:
+            h = self.norm1(h)
+
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
-        return x, state
+        return x, new_state
 
 
 class TemporalEncoder(nn.Module):
@@ -2478,6 +2574,21 @@ class CrossTransformer(nn.Module):
         temporal_tokens: torch.Tensor,
         mode: Optional[str] = None,
     ) -> torch.Tensor:
+        if spatial_tokens.dim() != 3 or temporal_tokens.dim() != 3:
+            raise ValueError(
+                f"CrossTransformer expects 3D tensors, got "
+                f"spatial={tuple(spatial_tokens.shape)}, temporal={tuple(temporal_tokens.shape)}"
+            )
+        Bs, Ns, Ds = spatial_tokens.shape
+        Bt, Nt, Dt = temporal_tokens.shape
+        if Bs != Bt:
+            raise ValueError(
+                f"CrossTransformer batch mismatch: spatial B={Bs}, temporal B={Bt}"
+            )
+        if Ds != Dt:
+            raise ValueError(
+                f"CrossTransformer hidden dim mismatch: spatial D={Ds}, temporal D={Dt}"
+            )
         if self._fixed_mode is not None:
             mode_l = _coerce_modeling_types(self._fixed_mode)
             if mode_l == "ss":
@@ -2518,12 +2629,15 @@ class CrossTransformer(nn.Module):
         mode: str,
     ) -> torch.Tensor:
         mode_l = _coerce_modeling_types(mode)
-        s_context = self.cross_s(spatial_tokens, temporal_tokens)
-        t_context = self.cross_t(temporal_tokens, spatial_tokens)
         if mode_l == "ss":
+            s_context = self.cross_s(spatial_tokens, temporal_tokens)
             return s_context
         if mode_l == "tt":
+            t_context = self.cross_t(temporal_tokens, spatial_tokens)
             return t_context
+        s_context = self.cross_s(spatial_tokens, temporal_tokens)
+        t_context = self.cross_t(temporal_tokens, spatial_tokens)
+
         if mode_l == "ts":
             base = torch.cat(
                 [
@@ -2584,7 +2698,7 @@ class LongNet(nn.Module):
             "effective_window_attr": ["window_size", "block_size"],
             "include_softmax_scale_dropout": True,
         }
-        self.batch_first = batch_first
+        self.batch_first = bool(batch_first)
         self._impl: Optional[nn.Module] = None
         try:
             ts_longnet = import_module("torchscale.net.longnet")
@@ -2621,7 +2735,7 @@ class LongNet(nn.Module):
             self._impl_batch_first = getattr(self._impl, "batch_first", True)
         else:
             self._using = "fallback"
-            self._impl_batch_first = True
+            self._impl_batch_first = self.batch_first
             layers: List[nn.Module] = []
             dilation = base_dilation
             for _ in range(depth):
@@ -2634,7 +2748,7 @@ class LongNet(nn.Module):
                         dropout=dropout,
                         mlp_ratio=mlp_ratio,
                         causal=causal,
-                        batch_first=True,
+                        batch_first=self.batch_first,
                     )
                 )
                 dilation = max(1, dilation * max(1, int(dilation_growth)))
@@ -2654,12 +2768,12 @@ class LongNet(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self._impl is not None:
             out = x
-            if (
-                self._impl_batch_first
-                and out.dim() == 3
-                and out.shape[0] != out.shape[1]
-                and not self._impl_batch_first
-            ):
+            need_transpose = (
+                out.dim() == 3
+                and (self.batch_first != bool(self._impl_batch_first))
+                and (out.shape[0] != out.shape[1])
+            )
+            if need_transpose:
                 out = out.transpose(0, 1)
             try:
                 out = self._impl(out)
@@ -2668,11 +2782,19 @@ class LongNet(nn.Module):
                     f"torchscale LongNet call failed: {exc}. Returning the input tensor.",
                     RuntimeWarning,
                 )
-            if self._impl_batch_first is not True:
+            if need_transpose and out.dim() == 3 and out.shape[0] != out.shape[1]:
                 out = out.transpose(0, 1)
             return out, None
+
         attn_w: Optional[torch.Tensor] = None
         out = x
+        need_transpose_fallback = (
+            out.dim() == 3
+            and (self.batch_first is False)
+            and out.shape[0] != out.shape[1]
+        )
+        if need_transpose_fallback:
+            out = out.transpose(0, 1)
         for layer in self.layers:
             out, attn_w = layer(
                 out,
@@ -2680,6 +2802,8 @@ class LongNet(nn.Module):
                 need_weights=need_weights,
             )
         out = self.norm(out)
+        if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
+            out = out.transpose(0, 1)
         return out, attn_w
 
 
@@ -3042,7 +3166,6 @@ class Root(nn.Module):
         return x
 
     def _auto_microbatch(self, features: torch.Tensor | TensorDictBase, device: torch.device) -> int:
-        """가용 가속기 메모리 90% 리밋을 목표로 보수적 microbatch를 산정."""
         dev_t = getattr(device, "type", "cpu")
         if isinstance(features, TensorDictBase):
             X = features.get("features")

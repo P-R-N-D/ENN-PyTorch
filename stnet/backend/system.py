@@ -414,7 +414,19 @@ def get_device(
     if te_first is not None:
         cfg.te_first = bool(te_first)
     if torch.cuda.is_available():
-        device = torch.device("cuda")
+        # 1 proc - 1 accelerator (LOCAL_RANK 우선)
+        try:
+            idx_env = int(os.environ.get("LOCAL_RANK", 0))
+        except Exception:
+            idx_env = 0
+        try:
+            ndev = max(1, int(torch.cuda.device_count()))
+        except Exception:
+            ndev = 1
+        idx = idx_env % ndev
+        with contextlib.suppress(Exception):
+            torch.cuda.set_device(idx)
+        device = torch.device(f"cuda:{idx}")
         torch.backends.cudnn.deterministic = cfg.deterministic
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:

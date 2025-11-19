@@ -26,6 +26,10 @@ class GeGLU(nn.Module):
         self.out_proj = nn.Linear(self.hid, self.out_dim, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.in_dim:
+            raise ValueError(
+                f"GeGLU expected last dimension {self.in_dim}, got {x.size(-1)}"
+            )
         a, b = self.in_proj(x).chunk(2, dim=-1)
         y = a * F.gelu(b)
         y = self.dropout(y)
@@ -50,6 +54,10 @@ class SwiGLU(nn.Module):
         self.out_proj = nn.Linear(self.hid, self.out_dim, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.size(-1) != self.in_dim:
+            raise ValueError(
+                f"SwiGLU expected last dimension {self.in_dim}, got {x.size(-1)}"
+            )
         a, b = self.in_proj(x).chunk(2, dim=-1)
         y = a * F.silu(b)
         y = self.dropout(y)

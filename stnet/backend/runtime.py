@@ -1836,10 +1836,8 @@ def infer(
         return True
 
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
-    use_timer = (
-        (device.type == "cuda" and hasattr(torch.cuda, "Event")) or
-        (device.type == "xpu"  and hasattr(torch, "xpu") and hasattr(torch.xpu, "Event"))
-    )
+    # 동기화(Event) 기반 타이머 비활성 – 겹치기 유지
+    use_timer = False
     io_bytes: float = 0.0
     io_time: float = 0.0
     comp_time: float = 0.0
@@ -1899,100 +1897,125 @@ def infer(
                 io_time += wait_s + h2d_s
                 with contextlib.suppress(Exception):
                     io_bytes += float(X.element_size() * X.nelement())
-                if use_timer:
-                    ev_s, ev_e = (
-                        torch.Event(device=device, enable_timing=True),
-                        torch.Event(device=device, enable_timing=True),
-                    )
-                    ev_s.record()
-                else:
-                    t0 = time.perf_counter_ns()
-                with no_sync(run_model, enable=True):
-                    with flop_counter.step(display=False) as step_counter:
-                        with contextlib.suppress(Exception):
-                            mark_step = getattr(
-                                getattr(torch, "compiler", None),
-                                "cudagraph_mark_step_begin",
-                                None,
+                t0 = time.perf_counter_ns()
+                # ---- 마이크로배칭(OOM-안전, 패턴 유지) ----
+                state = getattr(run_model, "_autobs_infer", None)
+                if state is None:
+                    state = {"mb": 0, "util_prev": None, "bps_est": None}
+                    setattr(run_model, "_autobs_infer", state)
+                B = int(X.shape[0])
+                mb = int(state["mb"] or max(1, B // 2))
+                mb = max(1, min(B, mb))
+                chunks = max(1, math.ceil(B / mb))
+                s_idx = 0
+                pre_alloc = (
+                    torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
+                )
+                for _micro in range(chunks):
+                    sl = slice(s_idx, min(B, s_idx + mb))
+                    s_idx += mb
+                    Xi = X[sl]
+                    with no_sync(run_model, enable=True):
+                        with flop_counter.step(display=False) as step_counter:
+                            with contextlib.suppress(Exception):
+                                mark_step = getattr(
+                                    getattr(torch, "compiler", None),
+                                    "cudagraph_mark_step_begin",
+                                    None,
+                                )
+                                if callable(mark_step):
+                                    mark_step()
+                            tdp = to_tensordict({"features": Xi})
+                            pred_out = run_model(
+                                tdp, global_loss=None, local_loss=None, loss_weights=None
                             )
-                            if callable(mark_step):
-                                mark_step()
-                        tdp = to_tensordict({"features": X})
-                        pred_out = run_model(
-                            tdp, global_loss=None, local_loss=None, loss_weights=None
-                        )
-                        if isinstance(pred_out, TensorDictBase):
-                            tdp = pred_out
-                            y_hat = tdp.get("pred")
-                        else:
-                            y_hat, _ = pred_out
-                try:
-                    evt: Optional[object] = None
-                    handle: Optional[object] = None
-                    if pred_pool is not None:
-                        y_hat_cpu, handle = pred_pool.get_like(
-                            y_hat, return_handle=True
-                        )
-                    else:
-                        y_hat_cpu = torch.empty_like(
-                            y_hat, device="cpu", pin_memory=True
-                        )
-                    y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
+                            if isinstance(pred_out, TensorDictBase):
+                                tdp = pred_out
+                                y_hat = tdp.get("pred")
+                            else:
+                                y_hat, _ = pred_out
                     try:
-                        if y_hat.device.type in ("cuda", "xpu"):
-                            backend = getattr(torch, y_hat.device.type)
-                            stream = backend.current_stream(y_hat.device)
-                            y_hat_cpu.record_stream(stream)
-                            evt = backend.Event()
-                            evt.record(stream)
+                        evt: Optional[object] = None
+                        handle: Optional[object] = None
+                        if pred_pool is not None:
+                            y_hat_cpu, handle = pred_pool.get_like(
+                                y_hat, return_handle=True
+                            )
+                        else:
+                            y_hat_cpu = torch.empty_like(
+                                y_hat, device="cpu", pin_memory=True
+                            )
+                        y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
+                        try:
+                            if y_hat.device.type in ("cuda", "xpu"):
+                                backend = getattr(torch, y_hat.device.type)
+                                stream = backend.current_stream(y_hat.device)
+                                y_hat_cpu.record_stream(stream)
+                                evt = backend.Event()
+                                evt.record(stream)
+                        except Exception:
+                            evt = None
+                        y_hat_cpu = y_hat_cpu.contiguous()
                     except Exception:
+                        y_hat_cpu = y_hat.detach().cpu().contiguous()
                         evt = None
-                    y_hat_cpu = y_hat_cpu.contiguous()
-                except Exception:
-                    y_hat_cpu = y_hat.detach().cpu().contiguous()
-                    evt = None
-                    handle = None
+                        handle = None
 
-                try:
-                    tail = tuple(y_hat_cpu.shape[1:])
-                    if ref_tail_shape is None:
-                        ref_tail_shape = tail
-                        ref_dtype = y_hat_cpu.dtype
-                    else:
-                        if tail != ref_tail_shape or y_hat_cpu.dtype != ref_dtype:
-                            if not shape_inconsistent:
-                                bad_tail = tail
-                            shape_inconsistent = True
-                except Exception:
-                    pass
-                if rank != 0:
-                    del y_hat_cpu
+                    # shape/dtype 체크 및 버퍼로 내리기
+                    try:
+                        tail = tuple(y_hat_cpu.shape[1:])
+                        if ref_tail_shape is None:
+                            ref_tail_shape = tail
+                            ref_dtype = y_hat_cpu.dtype
+                        else:
+                            if tail != ref_tail_shape or y_hat_cpu.dtype != ref_dtype:
+                                if not shape_inconsistent:
+                                    bad_tail = tail
+                                shape_inconsistent = True
+                    except Exception:
+                        pass
+                    if rank != 0:
+                        del y_hat_cpu
+                        if pred_pool is not None and handle is not None:
+                            with contextlib.suppress(Exception):
+                                pred_pool.release(handle)
+                        if evt is not None:
+                            del evt
+                        continue
+                    if evt is not None:
+                        with contextlib.suppress(Exception):
+                            evt.synchronize()
+                    _host = torch.empty_like(y_hat_cpu, device="cpu", pin_memory=False)
+                    _host.copy_(y_hat_cpu, non_blocking=False)
+                    buffer.put(_host)
                     if pred_pool is not None and handle is not None:
                         with contextlib.suppress(Exception):
                             pred_pool.release(handle)
-                    if evt is not None:
-                        del evt
-                    continue
-                if evt is not None:
                     with contextlib.suppress(Exception):
-                        evt.synchronize()
-                _host = torch.empty_like(y_hat_cpu, device="cpu", pin_memory=False)
-                _host.copy_(y_hat_cpu, non_blocking=False)
-                buffer.put(_host)
-                if pred_pool is not None and handle is not None:
-                    with contextlib.suppress(Exception):
-                        pred_pool.release(handle)
-                if use_timer:
-                    ev_e.record()
-                    ev_e.synchronize()
-                    comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
-                else:
-                    t1 = time.perf_counter_ns()
-                    comp_time += (t1 - t0) / 1_000_000_000.0
+                        step_flops = float(step_counter.get_total_flops())
+                    total_flops += max(0.0, step_flops)
 
-                with contextlib.suppress(Exception):
-                    step_flops = float(step_counter.get_total_flops())
-                total_flops += max(0.0, step_flops)
+                # per-step 컴퓨트 시간/유틸 계산
+                comp_time += (time.perf_counter_ns() - t0) / 1_000_000_000.0
+                # 다음 step mb: min(메모리 90% 상한, 활용 패턴 유지치)
+                util_cur = float((time.perf_counter_ns() - t0) / 1_000_000_000.0) / max(
+                    float(wait_s + h2d_s) + float((time.perf_counter_ns() - t0) / 1_000_000_000.0), 1e-6
+                )
+                grew = (state.get("util_prev") is None) or (util_cur >= state["util_prev"] - 0.02)
+                state["util_prev"] = util_cur
+                if state.get("bps_est") is None and device.type == "cuda":
+                    delta = max(0, torch.cuda.memory_allocated(device) - pre_alloc)
+                    if delta > 0:
+                        state["bps_est"] = delta / float(mb)
+                mb_mem = B
+                if device.type == "cuda" and state.get("bps_est"):
+                    free, total = torch.cuda.mem_get_info(device)
+                    alloc_now = torch.cuda.memory_allocated(device)
+                    target = int(total * 0.90)
+                    headroom = max(0, target - alloc_now)
+                    mb_mem = max(1, min(B, int(headroom / max(1, int(state["bps_est"])))))
+                mb_util = (min(B, mb + max(1, mb // 4)) if grew else max(1, int(math.ceil(mb * 0.9))))
+                state["mb"] = max(1, min(mb_mem, mb_util))
                 if local_rank == 0:
                     mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
                     tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
