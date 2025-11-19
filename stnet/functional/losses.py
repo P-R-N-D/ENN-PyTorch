@@ -47,12 +47,17 @@ def _coerce_std(
         base = x.mean(dim=dim_tuple, keepdim=True)
         return torch.full_like(base, fill_value=eps)
     correction = min(int(ddof), max(sample - 1, 0))
+    x_work = x
+    if torch.is_floating_point(x_work) and x_work.dtype != torch.float64:
+        x_work = x_work.to(torch.float64)
     try:
-        var = torch.var(x, dim=dim_tuple, correction=correction, keepdim=True)
-        std = torch.sqrt(torch.clamp(var, min=eps * eps))
+        var = torch.var(x_work, dim=dim_tuple, correction=correction, keepdim=True)
+        std = torch.sqrt(torch.clamp(var, min=float(eps) * float(eps)))
     except TypeError:
-        std = torch.std(x, dim=dim_tuple, unbiased=correction == 1, keepdim=True)
-        std = torch.clamp(std, min=eps)
+        std = torch.std(x_work, dim=dim_tuple, unbiased=correction == 1, keepdim=True)
+        std = torch.clamp(std, min=float(eps))
+    if torch.is_floating_point(x) and std.dtype != x.dtype:
+        std = std.to(dtype=x.dtype)
     return std
 
 

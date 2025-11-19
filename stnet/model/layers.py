@@ -379,7 +379,13 @@ class PowerTransform(nn.Module):
         )
 
     def _bc(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        return v.view(1, -1).to(dtype=x.dtype, device=x.device).expand_as(x)
+        v_expanded = v.view(1, -1).to(device=x.device)
+        if torch.is_floating_point(v_expanded):
+            target_dtype = torch.float64 if (
+                x.dtype == torch.float64 or v_expanded.dtype == torch.float64
+            ) else x.dtype
+            v_expanded = v_expanded.to(dtype=target_dtype)
+        return v_expanded.expand_as(x)
 
     def _yj(self, x: torch.Tensor) -> torch.Tensor:
         lam = self._bc(x, self.lmbda.to(x.dtype))
@@ -445,16 +451,30 @@ class PowerTransform(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not bool(self.mask.any()):
             return x
-        m = self._bc(x, self.mask)
-        y = self._yj(x) if self.method.startswith("yeo") else self._bcx(x)
-        return torch.where(m, y, x)
+        orig_dtype = x.dtype
+        if not torch.is_floating_point(x):
+            return x
+        x64 = x.to(torch.float64)
+        m = self._bc(x64, self.mask)
+        y64 = self._yj(x64) if self.method.startswith("yeo") else self._bcx(x64)
+        y64 = torch.where(m, y64, x64)
+        if not torch.isfinite(y64).all():
+            y64 = torch.nan_to_num(y64)
+        return y64.to(orig_dtype)
 
     def inverse(self, y: torch.Tensor) -> torch.Tensor:
         if not bool(self.mask.any()):
             return y
-        m = self._bc(y, self.mask)
-        x = self._inv_yj(y) if self.method.startswith("yeo") else self._inv_bcx(y)
-        return torch.where(m, x, y)
+        orig_dtype = y.dtype
+        if not torch.is_floating_point(y):
+            return y
+        y64 = y.to(torch.float64)
+        m = self._bc(y64, self.mask)
+        x64 = self._inv_yj(y64) if self.method.startswith("yeo") else self._inv_bcx(y64)
+        x64 = torch.where(m, x64, y64)
+        if not torch.isfinite(x64).all():
+            x64 = torch.nan_to_num(x64)
+        return x64.to(orig_dtype)
 
     @torch.no_grad()
     def set_params(
@@ -473,9 +493,10 @@ class PowerTransform(nn.Module):
                 sh = sh.expand_as(self.shift)
             self.shift.copy_(sh)
         if mask is not None:
-            self.mask.copy_(
-                torch.as_tensor(mask, dtype=torch.bool, device=self.mask.device)
-            )
+            m = torch.as_tensor(mask, dtype=torch.bool, device=self.mask.device)
+            if m.numel() == 1:
+                m = m.expand_as(self.mask)
+            self.mask.copy_(m)
 
     @torch.no_grad()
     def fit_params_numpy(
