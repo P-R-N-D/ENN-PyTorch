@@ -1118,7 +1118,6 @@ def epochs(
     loss_controller: LossWeightController,
     top_loss: TiledLoss,
     bottom_loss: TiledLoss,
-    grad_accum_steps: int,
     train_loader: Any,
     val_loader: Any,
     total_epochs: int,
@@ -1132,6 +1131,43 @@ def epochs(
 ) -> None:
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
+
+    per_batch = getattr(train_loader, "batch_size", None)
+    if per_batch is None or int(per_batch) <= 0:
+        try:
+            sample = next(iter(train_loader))
+            if isinstance(sample, (list, tuple)) and sample:
+                feats = sample[0]
+            elif isinstance(sample, dict) and sample:
+                feats = next(iter(sample.values()))
+            else:
+                feats = sample
+            per_batch = int(getattr(feats, "shape", [len(feats)])[0])
+        except Exception:
+            per_batch = 1
+
+    if per_batch <= 0:
+        per_batch = 1
+
+    factor = 2
+    with contextlib.suppress(Exception):
+        avail_bytes = Memory.available()
+        if avail_bytes and avail_bytes > 0:
+            avail_gb = avail_bytes / float(1024 ** 3)
+            est = int(max(1, min(8, avail_gb / 4.0)))
+            factor = max(factor, est)
+
+    target_global_batch = per_batch * factor
+    auto_steps = target_global_batch // per_batch
+    if auto_steps < 1:
+        auto_steps = 1
+    auto_steps = min(auto_steps, 64)
+
+    grad_accum_steps: int = int(auto_steps)
+    logging.info(
+        f"[epochs] auto grad_accum_steps={grad_accum_steps} "
+        f"(per_batch={per_batch}, target_global_batch={target_global_batch}, factor={factor})"
+    )
 
     def _cast_fp_buffers(module: torch.nn.Module, dtype: torch.dtype) -> None:
         for buf in module.buffers(recurse=True):
@@ -2434,7 +2470,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 loss_controller=loss_controller,
                 top_loss=top_loss,
                 bottom_loss=bottom_loss,
-                grad_accum_steps=int(ops.grad_accum_steps),
                 train_loader=train_loader,
                 val_loader=val_loader,
                 total_epochs=total_epochs,
