@@ -8,7 +8,7 @@ import random
 import shutil
 import warnings
 import numpy as np
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from dataclasses import asdict
 
 import torch
@@ -86,7 +86,6 @@ def train(
     max_nodes: int = 1,
     rdzv_backend: Optional[str] = "c10d",
     rdzv_endpoint: Optional[str] = None,
-    grad_accum_steps: int = 1,
     loss_tile_dim: Optional[int] = None,
     loss_tile_size: Optional[int] = None,
     loss_mask_mode: str = "none",
@@ -269,7 +268,6 @@ def train(
             "warmup_ratio": warmup_ratio,
             "eta_min": eta_min,
             "seed": seed,
-            "grad_accum_steps": grad_accum_steps,
             "loss_tile_dim": loss_tile_dim,
             "loss_tile_size": loss_tile_size,
             "loss_mask_mode": loss_mask_mode,
@@ -422,8 +420,65 @@ def predict(
             with open(os.path.join(chunks_dir, "keys.json"), "w", encoding="utf-8") as f:
                 json.dump(list(keys), f)
             final_dir = new_dir("predictions")
-            shutil.move(chunks_dir, final_dir)
-            return {"chunks_dir": final_dir, "out_shape": tuple(label_shape)}
+            moved_dir = shutil.move(chunks_dir, final_dir)
+            chunk_root = moved_dir if os.path.isdir(moved_dir) else os.path.join(
+                final_dir, os.path.basename(chunks_dir)
+            )
+            manifest_path = os.path.join(chunk_root, "manifest.json")
+            if not os.path.isfile(manifest_path):
+                return {"chunks_dir": chunk_root, "out_shape": tuple(label_shape)}
+
+            with open(manifest_path, "r", encoding="utf-8") as mf:
+                manifest = json.load(mf)
+
+            out_shape = tuple(manifest.get("out_shape") or tuple(label_shape))
+            variable_shape = bool(manifest.get("variable_shape"))
+
+            if variable_shape:
+                return {
+                    "chunks_dir": chunk_root,
+                    "out_shape": out_shape,
+                    "variable_shape": True,
+                }
+
+            num_chunks = int(manifest.get("num_chunks", 0))
+
+            chunks: List[torch.Tensor] = []
+            for idx in range(num_chunks):
+                base_mmt = os.path.join(chunk_root, f"chunk_{idx:06d}.mmt")
+                tensor = None
+                if os.path.exists(base_mmt):
+                    try:
+                        from tensordict import MemoryMappedTensor
+
+                        tensor = MemoryMappedTensor.from_filename(base_mmt)
+                    except Exception:
+                        with contextlib.suppress(Exception):
+                            tensor = torch.load(base_mmt, map_location="cpu")
+                else:
+                    alt_pt = os.path.join(chunk_root, f"chunk_{idx:06d}.pt")
+                    if os.path.exists(alt_pt):
+                        tensor = torch.load(alt_pt, map_location="cpu")
+                if tensor is not None:
+                    chunks.append(
+                        tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor)
+                    )
+
+            if chunks:
+                flat = torch.cat(chunks, dim=0)
+            else:
+                tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
+                flat = torch.empty((0, *tail), dtype=torch.float32)
+
+            pred_tensor = Root.unflatten_y(flat, out_shape)
+
+            result: Dict[Tuple, torch.Tensor] = {}
+            for i, key in enumerate(keys):
+                if i >= pred_tensor.shape[0]:
+                    break
+                result[key] = pred_tensor[i].detach().cpu()
+
+            return result
         return {}
     finally:
         with contextlib.suppress(Exception):

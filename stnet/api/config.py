@@ -125,7 +125,6 @@ class PatchConfig:
 @dataclass
 class ModelConfig:
     device: Optional[torch.device | str] = None
-    microbatch: int = 0
     dropout: float = 0.1
     normalization_method: str = "layernorm"
     depth: int = 128
@@ -235,11 +234,6 @@ def coerce_model_config(
         except (TypeError, RuntimeError) as exc:
             raise ValueError(f"invalid device specification: {device_val}") from exc
 
-    resolved["microbatch"] = _coerce_int(
-        filtered.get("microbatch", getattr(defaults, "microbatch")),
-        name="microbatch",
-        minimum=0,
-    )
     resolved["dropout"] = _coerce_float(
         filtered.get("dropout", getattr(defaults, "dropout")),
         name="dropout",
@@ -377,7 +371,6 @@ class RuntimeConfig:
     warmup_ratio: float = 0.0
     eta_min: float = 0.0
     seed: int = 42
-    grad_accum_steps: int = 1
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
@@ -395,7 +388,6 @@ class RuntimeConfig:
         "warmup_ratio",
         "eta_min",
         "seed",
-        "grad_accum_steps",
         "loss_tile_dim",
         "loss_tile_size",
         "loss_mask_mode",
@@ -435,7 +427,6 @@ class RuntimeConfig:
                 "warmup_ratio",
                 "eta_min",
                 "seed",
-                "grad_accum_steps",
                 "loss_tile_dim",
                 "loss_tile_size",
                 "loss_mask_mode",
@@ -465,7 +456,6 @@ class RuntimeConfig:
                 warmup_ratio=float(kwargs.get("warmup_ratio", 0.0)),
                 eta_min=float(kwargs.get("eta_min", 0.0)),
                 seed=int(kwargs.get("seed", 42)),
-                grad_accum_steps=int(kwargs.get("grad_accum_steps", 1)),
                 loss_tile_dim=kwargs.get("loss_tile_dim"),
                 loss_tile_size=kwargs.get("loss_tile_size"),
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),
