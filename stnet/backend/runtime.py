@@ -1937,34 +1937,34 @@ def infer(
                     if evt is not None:
                         del evt
                     continue
-        if evt is not None:
-            with contextlib.suppress(Exception):
-                evt.synchronize()
-        _host = torch.empty_like(y_hat_cpu, device="cpu", pin_memory=False)
-        _host.copy_(y_hat_cpu, non_blocking=False)
-        buffer.put(_host)
-        if pred_pool is not None and handle is not None:
-            with contextlib.suppress(Exception):
-                pred_pool.release(handle)
-        if use_timer:
-            ev_e.record()
-            ev_e.synchronize()
-            comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
-        else:
-            t1 = time.perf_counter_ns()
-            comp_time += (t1 - t0) / 1_000_000_000.0
+                if evt is not None:
+                    with contextlib.suppress(Exception):
+                        evt.synchronize()
+                _host = torch.empty_like(y_hat_cpu, device="cpu", pin_memory=False)
+                _host.copy_(y_hat_cpu, non_blocking=False)
+                buffer.put(_host)
+                if pred_pool is not None and handle is not None:
+                    with contextlib.suppress(Exception):
+                        pred_pool.release(handle)
+                if use_timer:
+                    ev_e.record()
+                    ev_e.synchronize()
+                    comp_time += float(ev_s.elapsed_time(ev_e)) / 1000.0
+                else:
+                    t1 = time.perf_counter_ns()
+                    comp_time += (t1 - t0) / 1_000_000_000.0
 
-        with contextlib.suppress(Exception):
-            step_flops = float(step_counter.get_total_flops())
-        total_flops += max(0.0, step_flops)
-        if local_rank == 0:
-            mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
-            tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-            update_tqdm(status_bar, finish=1, mbps=mbps, tflops=tflops)
-        t_fetch_start = time.perf_counter_ns()
-        if pred_pool is not None and ((_idx + 1) & 255) == 0:
-            with contextlib.suppress(Exception):
-                pred_pool.collect()
+                with contextlib.suppress(Exception):
+                    step_flops = float(step_counter.get_total_flops())
+                total_flops += max(0.0, step_flops)
+                if local_rank == 0:
+                    mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
+                    tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
+                    update_tqdm(status_bar, finish=1, mbps=mbps, tflops=tflops)
+                t_fetch_start = time.perf_counter_ns()
+                if pred_pool is not None and ((_idx + 1) & 255) == 0:
+                    with contextlib.suppress(Exception):
+                        pred_pool.collect()
     finally:
         with contextlib.suppress(Exception):
             buffer.stop()
