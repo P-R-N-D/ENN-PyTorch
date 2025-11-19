@@ -429,6 +429,15 @@ def predict(
                 manifest = json.load(mf)
 
             out_shape = tuple(manifest.get("out_shape") or tuple(label_shape))
+            variable_shape = bool(manifest.get("variable_shape"))
+
+            if variable_shape:
+                return {
+                    "chunks_dir": final_dir,
+                    "out_shape": out_shape,
+                    "variable_shape": True,
+                }
+
             num_chunks = int(manifest.get("num_chunks", 0))
 
             chunks: List[torch.Tensor] = []
