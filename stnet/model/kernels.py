@@ -19,6 +19,16 @@ from ..backend.system import (
     get_dpa_backends,
 )
 
+try:
+    import triton  # type: ignore
+    import triton.language as tl  # type: ignore
+
+    _HAS_TRITON_LIB = True
+except Exception:
+    _HAS_TRITON_LIB = False
+
+_HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
+
 
 def _clone_last_dim(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((x, x), dim=-1).reshape(*x.shape[:-1], -1)
@@ -490,6 +500,35 @@ class DotProductAttention(nn.Module):
         **kwargs: Any,
     ) -> torch.Tensor:
         training = bool(training) if training is not None else self.training
+        if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+            raise ValueError(
+                f"DotProductAttention expects q/k/v to be 4D (B,H,L,D), got "
+                f"q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
+        Bq, Hq, Lq, Dq = q.shape
+        Bk, Hk, Lk, Dk = k.shape
+        Bv, Hv, Lv, Dv = v.shape
+        if Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv:
+            raise ValueError(
+                "DotProductAttention expects matching batch and head dims for q/k/v, "
+                f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
+        if Lk != Lv:
+            raise ValueError(
+                "DotProductAttention expects matching sequence length for k and v, "
+                f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
+        if Dq != Dk:
+            raise ValueError(
+                "DotProductAttention expects matching embedding dims for q and k, "
+                f"got q={tuple(q.shape)}, k={tuple(k.shape)}"
+            )
+        if Dk != Dv:
+            raise ValueError(
+                "DotProductAttention expects matching embedding dims for k and v, "
+                f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
+            )
+
         q = self._negotiate_dtype(q)
         k = self._negotiate_dtype(k)
         v = self._negotiate_dtype(v)
@@ -628,7 +667,7 @@ class DotProductAttention(nn.Module):
             and self.te_first
             and not self._force_pt
             and (self._te_attn is not None)
-            and (not attn_mask or mask_bool is None or self._te_supports_mask)
+            and (attn_mask is None or mask_bool is None or self._te_supports_mask)
             and not is_compiling
             and q_bshd.is_cuda
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
@@ -695,6 +734,7 @@ class DotProductAttention(nn.Module):
                 fm = fm.to(device=q_bhsd.device, non_blocking=True)
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
+
             fm, batch_dim, head_count = _flatten_mask(fm)
             if batch_dim not in (1, B):
                 raise RuntimeError(
@@ -764,9 +804,13 @@ class MultiScaleRetentionCompat(nn.Module):
             restore_dtype = x.dtype
             x_in = x.to(torch.float16)
 
-        del attn_mask, kwargs
-        del state
+        sin = kwargs.pop("sin", None)
+        cos = kwargs.pop("cos", None)
+        decay = kwargs.pop("decay", None)
+
         batch, seq_len, _ = x_in.shape
+        if seq_len == 0:
+            return x_in.new_zeros(x_in.shape)
         head_dim = self.head_dim
         q = self.q_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
         v = self.v_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
@@ -777,12 +821,33 @@ class MultiScaleRetentionCompat(nn.Module):
             head_dim=head_dim,
             use_gate=self.use_gate and self.g_proj is not None,
         )
-        lam = (
-            torch.sigmoid(self._beta)
-            .view(1, self.nhead, 1)
-            .to(dtype=v.dtype, device=v.device)
-        )
-        prev = v[:, 0].clone()
+
+        if isinstance(decay, torch.Tensor) and decay.dim() == 3:
+            H = self.nhead
+            if decay.shape[0] == H and decay.shape[1] >= 2 and decay.shape[2] >= 1:
+                lam_h = decay[:, 1, 0].to(dtype=v.dtype, device=v.device)
+            else:
+                lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
+        else:
+            lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
+        lam = lam_h.view(1, self.nhead, 1)
+
+        if isinstance(state, torch.Tensor):
+            st = state
+            if st.dim() == 4 and st.shape[2] == 1:
+                st = st[:, :, 0, :]
+            if st.dim() == 3 and st.shape[:2] == (batch, self.nhead):
+                prev = st.to(dtype=v.dtype, device=v.device)
+            else:
+                prev = v[:, 0].clone()
+        else:
+            prev = v[:, 0].clone()
+
+        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2:
+            if attn_mask.shape == (batch, seq_len) and attn_mask.dtype == torch.bool:
+                mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
+                v = torch.where(mask, torch.zeros_like(v), v)
+
         states = [prev]
         for index in range(1, seq_len):
             prev = lam * prev + v[:, index]
@@ -809,7 +874,11 @@ class MultiScaleRetention(nn.Module):
             int(nhead),
             bool(use_gate),
         )
+        self._fallback = MultiScaleRetentionCompat(
+            self.d_model, self.nhead, use_gate=self.use_gate
+        )
         self._ts_ok = False
+        self._triton_ok = False
         try:
             from torchscale.component.multiscale_retention import (
                 MultiScaleRetention as _TorchScaleMSR,
@@ -825,9 +894,18 @@ class MultiScaleRetention(nn.Module):
             self._ts_ok = True
         except Exception:
             self._ts_ok = False
-            self._fallback = MultiScaleRetentionCompat(
-                self.d_model, self.nhead, use_gate=self.use_gate
-            )
+            self._ts_msr = None  # type: ignore[assignment]
+
+        self._triton_msr: Optional[MultiScaleRetentionTriton]
+        self._triton_msr = None
+        if _HAS_TRITON_MSR:
+            try:
+                self._triton_msr = MultiScaleRetentionTriton(
+                    self.d_model, self.nhead, use_gate=self.use_gate
+                )
+                self._triton_ok = True
+            except Exception:
+                self._triton_ok = False
         self._rope_theta = 10000.0
         self._decay_init = 5.0
         self._decay_range = 1.0
@@ -871,22 +949,213 @@ class MultiScaleRetention(nn.Module):
         state: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        del attn_mask, state, kwargs
-        if not self._ts_ok:
-            return self._fallback(x)
-        try:
-            seq_len = x.shape[1]
-            dtype = x.dtype
-            device = x.device
-            sin, cos, rel = self._get_coords(seq_len, device, dtype)
-            outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)
-        except Exception:
-            return self._fallback(x)
-        if isinstance(outputs, torch.Tensor):
-            return outputs
-        if isinstance(outputs, tuple) and outputs:
-            return outputs[0]
-        return self._fallback(x)
+        seq_len = x.shape[1]
+        dtype = x.dtype
+        device = x.device
+        sin, cos, rel = self._get_coords(seq_len, device, dtype)
+
+        if self._ts_ok:
+            try:
+                outputs = self._ts_msr(  # type: ignore[call-arg]
+                    x,
+                    sin=sin,
+                    cos=cos,
+                    decay=rel,
+                    attn_mask=attn_mask,
+                    state=state,
+                    **kwargs,
+                )
+            except TypeError:
+                outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)  # type: ignore[call-arg]
+            except Exception:
+                outputs = None
+
+            if isinstance(outputs, torch.Tensor):
+                return outputs
+            if isinstance(outputs, tuple) and outputs:
+                return outputs[0]
+
+        if (
+            self._triton_ok
+            and self._triton_msr is not None
+            and device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            try:
+                return self._triton_msr(
+                    x,
+                    sin,
+                    cos,
+                    rel,
+                    attn_mask=attn_mask,
+                    state=state,
+                    **kwargs,
+                )
+            except Exception:
+                pass
+
+        return self._fallback(
+            x,
+            attn_mask=attn_mask,
+            state=state,
+            sin=sin,
+            cos=cos,
+            decay=rel,
+            **kwargs,
+        )
+
+
+@triton.jit
+def _triton_retention(
+    V,
+    LAMBDA,
+    OUT,
+    B: tl.constexpr,
+    L: tl.constexpr,
+    H: tl.constexpr,
+    DH: tl.constexpr,
+    SVB, SVL, SVH, SVD,
+    SOB, SOL, SOH, SOD,
+    BLOCK_DH: tl.constexpr,
+):
+    pid_bh = tl.program_id(0)
+    pid_d  = tl.program_id(1)
+
+    b = pid_bh // H
+    h = pid_bh % H
+
+    dh_off = pid_d * BLOCK_DH + tl.arange(0, BLOCK_DH)
+    mask_d = dh_off < DH
+
+    lam = tl.load(LAMBDA + h)
+
+    state = tl.zeros([BLOCK_DH], dtype=tl.float32)
+
+    for t in range(0, L):
+        v_ptr = V + b * SVB + t * SVL + h * SVH + dh_off * SVD
+        v_t = tl.load(v_ptr, mask=mask_d, other=0.0).to(tl.float32)
+        state = lam * state + v_t
+
+        out_ptr = OUT + b * SOB + t * SOL + h * SOH + dh_off * SOD
+        tl.store(out_ptr, state, mask=mask_d)
+
+
+class MultiScaleRetentionTriton(nn.Module):
+
+    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.head_dim = self.d_model // self.nhead
+        self.use_gate = bool(use_gate)
+
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.g_proj = (
+            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
+        )
+        self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
+        self.norm = nn.LayerNorm(self.d_model)
+
+        if not (_HAS_TRITON_MSR and torch.cuda.is_available()):
+            raise RuntimeError("Triton MSR backend is not available (Triton+CUDA required).")
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        sin: torch.Tensor,
+        cos: torch.Tensor,
+        decay: torch.Tensor,
+        *args: Any,
+        attn_mask: Optional[torch.Tensor] = None,
+        state: Any = None,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        del sin, cos, kwargs
+
+        if x.dim() != 3:
+            raise ValueError(f"MultiScaleRetentionTriton expects (B,L,D), got {tuple(x.shape)}")
+        if x.device.type != "cuda":
+            raise RuntimeError("MultiScaleRetentionTriton only supports CUDA tensors.")
+
+        B, L, D = x.shape
+        if D != self.d_model:
+            raise ValueError(f"Last dimension {D} must equal d_model={self.d_model}")
+
+        x_in = x
+        restore_dtype: Optional[torch.dtype] = None
+        if x_in.device.type == "mps" and x_in.dtype == torch.bfloat16:
+            restore_dtype = x_in.dtype
+            x_in = x_in.to(torch.float16)
+
+        head_dim = self.head_dim
+        q = self.q_proj(x_in).view(B, L, self.nhead, head_dim)
+        v = self.v_proj(x_in).view(B, L, self.nhead, head_dim)
+
+        if isinstance(decay, torch.Tensor) and decay.dim() == 3:
+            H = self.nhead
+            if decay.shape[0] == H and decay.shape[1] >= 2 and decay.shape[2] >= 1:
+                lam_h = decay[:, 1, 0].to(dtype=v.dtype, device=v.device)
+            else:
+                lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
+        else:
+            lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
+        lam = lam_h
+
+        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2:
+            if attn_mask.shape == (B, L) and attn_mask.dtype == torch.bool:
+                mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
+                v = torch.where(mask, torch.zeros_like(v), v)
+
+        if isinstance(state, torch.Tensor):
+            st = state
+            if st.dim() == 4 and st.shape[2] == 1:
+                st = st[:, :, 0, :]
+            if st.dim() == 3 and st.shape[:2] == (B, self.nhead):
+                v = v.clone()
+                v[:, 0] = v[:, 0] + lam.view(1, self.nhead, 1) * st.to(
+                    dtype=v.dtype, device=v.device
+                )
+
+        v_blhc = v.contiguous()
+        out_state = torch.empty_like(v_blhc, dtype=torch.float32)
+
+        SVB, SVL, SVH, SVD = v_blhc.stride()
+        SOB, SOL, SOH, SOD = out_state.stride()
+
+        BLOCK_DH = 32
+        grid = (B * self.nhead, triton.cdiv(head_dim, BLOCK_DH))
+
+        _triton_retention[grid](
+            v_blhc,
+            lam,
+            out_state,
+            B,
+            L,
+            self.nhead,
+            head_dim,
+            SVB,
+            SVL,
+            SVH,
+            SVD,
+            SOB,
+            SOL,
+            SOH,
+            SOD,
+            BLOCK_DH=BLOCK_DH,
+        )
+
+        state_tensor = out_state.to(v.dtype)
+        y = (q * state_tensor).contiguous().view(B, L, self.d_model)
+        y = self.norm(y)
+        if self.use_gate and self.g_proj is not None:
+            gate = torch.nn.functional.silu(self.g_proj(x_in))
+            y = y * gate
+        out = self.o_proj(y)
+        if restore_dtype is not None:
+            out = out.to(restore_dtype)
+        return out
 
 
 class _MultiHeadAttentionCompat(nn.Module):
