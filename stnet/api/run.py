@@ -420,10 +420,13 @@ def predict(
             with open(os.path.join(chunks_dir, "keys.json"), "w", encoding="utf-8") as f:
                 json.dump(list(keys), f)
             final_dir = new_dir("predictions")
-            shutil.move(chunks_dir, final_dir)
-            manifest_path = os.path.join(final_dir, "manifest.json")
+            moved_dir = shutil.move(chunks_dir, final_dir)
+            chunk_root = moved_dir if os.path.isdir(moved_dir) else os.path.join(
+                final_dir, os.path.basename(chunks_dir)
+            )
+            manifest_path = os.path.join(chunk_root, "manifest.json")
             if not os.path.isfile(manifest_path):
-                return {"chunks_dir": final_dir, "out_shape": tuple(label_shape)}
+                return {"chunks_dir": chunk_root, "out_shape": tuple(label_shape)}
 
             with open(manifest_path, "r", encoding="utf-8") as mf:
                 manifest = json.load(mf)
@@ -433,7 +436,7 @@ def predict(
 
             if variable_shape:
                 return {
-                    "chunks_dir": final_dir,
+                    "chunks_dir": chunk_root,
                     "out_shape": out_shape,
                     "variable_shape": True,
                 }
@@ -442,7 +445,7 @@ def predict(
 
             chunks: List[torch.Tensor] = []
             for idx in range(num_chunks):
-                base_mmt = os.path.join(final_dir, f"chunk_{idx:06d}.mmt")
+                base_mmt = os.path.join(chunk_root, f"chunk_{idx:06d}.mmt")
                 tensor = None
                 if os.path.exists(base_mmt):
                     try:
@@ -453,7 +456,7 @@ def predict(
                         with contextlib.suppress(Exception):
                             tensor = torch.load(base_mmt, map_location="cpu")
                 else:
-                    alt_pt = os.path.join(final_dir, f"chunk_{idx:06d}.pt")
+                    alt_pt = os.path.join(chunk_root, f"chunk_{idx:06d}.pt")
                     if os.path.exists(alt_pt):
                         tensor = torch.load(alt_pt, map_location="cpu")
                 if tensor is not None:
