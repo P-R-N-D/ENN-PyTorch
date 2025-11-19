@@ -507,7 +507,7 @@ class DotProductAttention(nn.Module):
             )
         Bq, Hq, Lq, Dq = q.shape
         Bk, Hk, Lk, Dk = k.shape
-        Bv, Hv, Lv, _ = v.shape
+        Bv, Hv, Lv, Dv = v.shape
         if Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv:
             raise ValueError(
                 "DotProductAttention expects matching batch and head dims for q/k/v, "
@@ -522,6 +522,11 @@ class DotProductAttention(nn.Module):
             raise ValueError(
                 "DotProductAttention expects matching embedding dims for q and k, "
                 f"got q={tuple(q.shape)}, k={tuple(k.shape)}"
+            )
+        if Dk != Dv:
+            raise ValueError(
+                "DotProductAttention expects matching embedding dims for k and v, "
+                f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
             )
 
         q = self._negotiate_dtype(q)
