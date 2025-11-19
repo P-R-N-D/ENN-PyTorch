@@ -1620,3 +1620,40 @@ class Memory:
         def had_error(self) -> bool:
             return bool(self._err_event.is_set())
 
+    class Buffer:
+        def __init__(self, max_batches: int):
+            import queue
+            import threading
+            self.max_batches = max(1, int(max_batches))
+            self._q: "queue.Queue[torch.Tensor]" = queue.Queue(maxsize=self.max_batches)
+            self._stop = threading.Event()
+
+        def put(self, tensor: "torch.Tensor") -> None:
+            import time, logging
+
+            start = time.monotonic()
+            try:
+                self._q.put(tensor, block=True, timeout=None)
+            except Exception as e:
+                logging.error(f"Buffer.put encountered unexpected exception: {e!r}")
+                raise
+            elapsed = time.monotonic() - start
+            if elapsed > 0.1:
+                logging.warning(
+                    f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
+                )
+
+        def get(self, block: bool = True, timeout: float | None = None) -> "torch.Tensor":
+            return self._q.get(block=block, timeout=timeout)
+
+        def empty(self) -> bool:
+            return self._q.empty()
+
+        def size(self) -> int:
+            return self._q.qsize()
+
+        def stop(self) -> None:
+            self._stop.set()
+
+        def is_stopped(self) -> bool:
+            return bool(self._stop.is_set())
