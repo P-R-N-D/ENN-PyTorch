@@ -30,6 +30,8 @@ import torch
 import torch.distributed
 import torch.nn as nn
 
+_LOGGER = logging.getLogger(__name__)
+
 try:
     import pynvml as _nvml
 
@@ -384,7 +386,13 @@ def _num_batches(loader: Any) -> int:
 def _float8_log(
     msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
 ) -> None:
-    return None
+    try:
+        if only_main_rank and torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_rank() != 0:
+                return
+    except Exception:
+        pass
+    _LOGGER.info(msg, *args)
 
 
 def _assert_no_meta_tensors(module: torch.nn.Module) -> None:
@@ -412,7 +420,7 @@ def _meta_monitor_pre_hook(
 
 
 def _enable_meta_monitor(model: torch.nn.Module) -> None:
-    hook_mode = "off"
+    hook_mode = os.environ.get("STNET_META_MONITOR", "off").strip().lower()
     if hook_mode in {"0", "", "false", "off"}:
         return
     warn_only = hook_mode in {"warn", "warning"}
@@ -1045,9 +1053,6 @@ def get_tqdm(
 
 
 def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (gpu_util_percent, mem_util_percent) if NVML is available for this CUDA device, else (None, None).
-    """
     if not _NVML_READY or getattr(device, "type", "") != "cuda":
         return None, None
     try:
@@ -1065,7 +1070,6 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
 
 
 def _cpu_percent_now() -> Optional[float]:
-    """Return instantaneous CPU utilization percent across all cores if psutil is available."""
     if _psutil is None:
         return None
     try:
@@ -1129,6 +1133,7 @@ def epochs(
     buffers_dtype: Optional[torch.dtype] = None,
     **kwargs: Any,
 ) -> None:
+
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
 
@@ -1736,7 +1741,10 @@ def infer(
         2, min(16, int(max(1.0, _memory_limit() / max(1.0, _chunk_target_mb()))))
     )
 
-    assert chunk_dir, "chunk_dir 경로를 반드시 지정해야 합니다."
+    if not chunk_dir:
+        raise RuntimeError(
+            "infer: chunk_dir 경로를 반드시 지정해야 합니다 (스트리밍 저장을 위해 필요)."
+        )
     os.makedirs(chunk_dir, exist_ok=True)
     try:
         import psutil
@@ -1836,7 +1844,6 @@ def infer(
         return True
 
     flop_counter = FlopCounter(run_model, mode="eval", device=device)
-    # 동기화(Event) 기반 타이머 비활성 – 겹치기 유지
     use_timer = False
     io_bytes: float = 0.0
     io_time: float = 0.0
@@ -1898,7 +1905,6 @@ def infer(
                 with contextlib.suppress(Exception):
                     io_bytes += float(X.element_size() * X.nelement())
                 t0 = time.perf_counter_ns()
-                # ---- 마이크로배칭(OOM-안전, 패턴 유지) ----
                 state = getattr(run_model, "_autobs_infer", None)
                 if state is None:
                     state = {"mb": 0, "util_prev": None, "bps_est": None}
@@ -1961,7 +1967,6 @@ def infer(
                         evt = None
                         handle = None
 
-                    # shape/dtype 체크 및 버퍼로 내리기
                     try:
                         tail = tuple(y_hat_cpu.shape[1:])
                         if ref_tail_shape is None:
@@ -1995,9 +2000,7 @@ def infer(
                         step_flops = float(step_counter.get_total_flops())
                     total_flops += max(0.0, step_flops)
 
-                # per-step 컴퓨트 시간/유틸 계산
                 comp_time += (time.perf_counter_ns() - t0) / 1_000_000_000.0
-                # 다음 step mb: min(메모리 90% 상한, 활용 패턴 유지치)
                 util_cur = float((time.perf_counter_ns() - t0) / 1_000_000_000.0) / max(
                     float(wait_s + h2d_s) + float((time.perf_counter_ns() - t0) / 1_000_000_000.0), 1e-6
                 )
@@ -2628,12 +2631,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             non_blocking_copy=True,
         )
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
-        # streaming flag removed (always enforced)
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):
                 os.makedirs(chunk_dir, exist_ok=True)
         if torch.distributed.is_initialized():
-            # streaming sync removed
             pass
         if ops.mode in ("predict", "infer"):
             if not chunk_dir:

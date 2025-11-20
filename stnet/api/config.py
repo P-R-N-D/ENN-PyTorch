@@ -106,7 +106,10 @@ def _coerce_int_tuple(
 
 
 def _coerce_int_sequence(xs: Sequence[int]) -> Tuple[int, ...]:
-    return tuple(int(x) for x in xs)
+    try:
+        return tuple(int(x) for x in xs)
+    except Exception as exc:
+        raise TypeError(f"out_shape must be a sequence of integers, got {xs!r}") from exc
 
 
 @dataclass(frozen=True)
@@ -124,6 +127,7 @@ class PatchConfig:
 
 @dataclass
 class ModelConfig:
+
     device: Optional[torch.device | str] = None
     dropout: float = 0.1
     normalization_method: str = "layernorm"
@@ -201,6 +205,8 @@ def coerce_patch_config(
     resolved["use_padding"] = _coerce_bool(
         filtered.get("use_padding", defaults["use_padding"]), name="use_padding"
     )
+    if resolved["dropout"] < 0.0 or resolved["dropout"] > 1.0:
+        raise ValueError(f"patch.dropout must be in [0,1], got {resolved['dropout']}")
     return PatchConfig(**resolved)
 
 
@@ -240,9 +246,10 @@ def coerce_model_config(
         minimum=0.0,
         maximum=1.0,
     )
-    resolved["normalization_method"] = str(
-        filtered.get("normalization_method", getattr(defaults, "normalization_method"))
+    norm_val = filtered.get(
+        "normalization_method", getattr(defaults, "normalization_method")
     )
+    resolved["normalization_method"] = str(norm_val)
     resolved["depth"] = _coerce_int(
         filtered.get("depth", getattr(defaults, "depth")),
         name="depth",
@@ -284,9 +291,10 @@ def coerce_model_config(
         name="temporal_latents",
         minimum=1,
     )
-    resolved["modeling_type"] = str(
-        filtered.get("modeling_type", getattr(defaults, "modeling_type"))
+    model_type_val = filtered.get(
+        "modeling_type", getattr(defaults, "modeling_type")
     )
+    resolved["modeling_type"] = str(model_type_val)
     resolved["use_linear_branch"] = _coerce_bool(
         filtered.get("use_linear_branch", getattr(defaults, "use_linear_branch")),
         name="use_linear_branch",
@@ -404,8 +412,10 @@ class RuntimeConfig:
         for k in ("in_dim", "out_shape", "cfg_dict"):
             if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
-        in_dim = int(kwargs["in_dim"])
+        in_dim = _coerce_int(kwargs["in_dim"], name="in_dim", minimum=1)
         out_shape = _coerce_int_sequence(kwargs["out_shape"])
+        if not out_shape:
+            raise ValueError("RuntimeConfig.out_shape must be a non-empty sequence")
         cfg_dict = dict(kwargs["cfg_dict"])
         common_keys = {
             "in_dim",
@@ -441,6 +451,15 @@ class RuntimeConfig:
                     "RuntimeConfig(train) received unsupported parameters: "
                     f"{sorted(unsupported)}"
                 )
+            epochs = _coerce_int(kwargs.get("epochs", 5), name="epochs", minimum=1)
+            val_frac = _coerce_float(kwargs.get("val_frac", 0.1), name="val_frac")
+            if val_frac < 0.0 or val_frac > 1.0:
+                raise ValueError(f"val_frac must be in [0,1], got {val_frac}")
+            base_lr = _coerce_float(kwargs.get("base_lr", 1e-3), name="base_lr", minimum=0.0)
+            weight_decay = _coerce_float(
+                kwargs.get("weight_decay", 1e-4), name="weight_decay", minimum=0.0
+            )
+
             return RuntimeConfig(
                 mode="train",
                 in_dim=in_dim,
@@ -449,10 +468,10 @@ class RuntimeConfig:
                 sources=kwargs["sources"],
                 ckpt_dir=str(kwargs["ckpt_dir"]),
                 init_ckpt_dir=kwargs.get("init_ckpt_dir"),
-                epochs=int(kwargs.get("epochs", 5)),
-                val_frac=float(kwargs.get("val_frac", 0.1)),
-                base_lr=float(kwargs.get("base_lr", 1e-3)),
-                weight_decay=float(kwargs.get("weight_decay", 1e-4)),
+                epochs=epochs,
+                val_frac=val_frac,
+                base_lr=base_lr,
+                weight_decay=weight_decay,
                 warmup_ratio=float(kwargs.get("warmup_ratio", 0.0)),
                 eta_min=float(kwargs.get("eta_min", 0.0)),
                 seed=int(kwargs.get("seed", 42)),
@@ -514,7 +533,10 @@ def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConf
     if mode not in ("train", "predict", "infer"):
         raise ValueError(f"invalid runtime mode: {mode_value}")
     if "keys" in data and data["keys"] is not None:
-        data["keys"] = list(data["keys"])
+        try:
+            data["keys"] = list(data["keys"])
+        except Exception as exc:
+            raise TypeError("RuntimeConfig.keys must be list-like") from exc
     return RuntimeConfig.from_partial(mode=mode, **data)
 
 

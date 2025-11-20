@@ -17,6 +17,8 @@ _LOGGER = logging.getLogger(__name__)
 def _compute_mkn(
     inp: torch.Tensor, weight: Optional[torch.Tensor]
 ) -> Tuple[int, int, int]:
+    if not isinstance(inp, torch.Tensor) or inp.numel() == 0:
+        return (0, 0, 0)
     if weight is not None and weight.ndim >= 2:
         k_dim = int(weight.shape[-1])
         n_dim = int(weight.shape[0])
@@ -217,6 +219,8 @@ class _FlopProfiler:
         self.coerce_flops_ntvx()
         getter = self._nvtx_getter or self._get_ntvx
         try:
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA not available")
             getattr(torch.cuda, "nvtx")
         except Exception:
             return contextlib.nullcontext()
@@ -257,7 +261,6 @@ class _FlopProfiler:
             from torch.profiler import profile
         except Exception:
             profile = None
-
         if profile is not None:
 
             class _TorchFlops(contextlib.AbstractContextManager[Any]):
@@ -387,6 +390,7 @@ class _FlopProfiler:
         instrumentation = self
         self.activate()
 
+
         class _Flops:
             def __init__(self) -> None:
                 self.manual_total = 0.0
@@ -401,8 +405,10 @@ class _FlopProfiler:
                 instrumentation.reset()
                 self._torch_scope = instrumentation._capture_torch(display)
                 self._nvtx_scope = instrumentation.new_flops_ntvx(device)
-                self._torch_scope.__enter__()
-                self._nvtx_scope.__enter__()
+                if self._torch_scope is not None:
+                    self._torch_scope.__enter__()
+                if self._nvtx_scope is not None:
+                    self._nvtx_scope.__enter__()
                 return self
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
@@ -446,6 +452,8 @@ class _FlopProfiler:
         **kwargs: Any,
     ) -> float:
         try:
+            if not isinstance(q, torch.Tensor) or q.ndim < 4:
+                return 0.0
             batch = int(q.shape[0])
             seq_len = int(q.shape[1])
             num_heads = int(q.shape[2])

@@ -7,13 +7,19 @@ import os
 import random
 import shutil
 import warnings
-import numpy as np
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from dataclasses import asdict
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+
+import numpy as np
 
 import torch
 import torch.multiprocessing as mp
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint import (
+    FileSystemReader,
+    FileSystemWriter,
+    load,
+    save,
+)
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_model_state_dict,
@@ -66,6 +72,29 @@ def _preload_state(value: Any) -> Any:
     return value
 
 
+def _ensure_seed(seed: Optional[int]) -> Optional[int]:
+    if seed is None:
+        return None
+    try:
+        return int(seed)
+    except (TypeError, ValueError):
+        return None
+
+
+def _seed_everything(seed_value: Optional[int]) -> None:
+    if seed_value is None:
+        return
+    with contextlib.suppress(Exception):
+        torch.manual_seed(seed_value)
+    if torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            torch.cuda.manual_seed_all(seed_value)
+    with contextlib.suppress(Exception):
+        random.seed(seed_value)
+    with contextlib.suppress(Exception):
+        np.random.seed(seed_value)
+
+
 def train(
     model: Root,
     data: (
@@ -98,20 +127,9 @@ def train(
     except (TypeError, ValueError):
         val_frac = 0.1
 
-    try:
-        seed_value = int(seed)
-    except (TypeError, ValueError):
-        seed_value = None
+    seed_value = _ensure_seed(seed)
+    _seed_everything(seed_value)
 
-    if seed_value is not None:
-        for setter in (
-            torch.manual_seed,
-            torch.cuda.manual_seed_all,
-            random.seed,
-            np.random.seed,
-        ):
-            with contextlib.suppress(Exception):
-                setter(seed_value)
     with contextlib.suppress(Exception):
         torch.use_deterministic_algorithms(False, warn_only=True)
     with contextlib.suppress(Exception):
@@ -121,8 +139,29 @@ def train(
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    def _check_shapes(
+        first_feats: Optional[torch.Tensor],
+        first_label_shape: Tuple[int, ...],
+        fx: torch.Tensor,
+        lshape: Tuple[int, ...],
+    ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+        if first_feats is None:
+            return fx, tuple(lshape)
+        if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(
+            first_label_shape
+        ):
+            raise RuntimeError(
+                "inconsistent feature/label shapes across datasets: "
+                f"expected in_dim={int(first_feats.shape[1])}, out_shape={tuple(first_label_shape)} "
+                f"but got in_dim={int(fx.shape[1])}, out_shape={tuple(lshape)}"
+            )
+        return first_feats, first_label_shape
+
     def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
         fx, lb, _, lshape = preprocess(d)
+        fx = fx.detach().cpu().contiguous()
+        lb = lb.detach().cpu().contiguous()
+
         did_manual_shuffle = False
         if shuffle:
             n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
@@ -168,15 +207,9 @@ def train(
                 sub = os.path.join(memmap_dir, str(k))
                 os.makedirs(sub, exist_ok=True)
                 fx, lshape = _mat_one(d, sub)
-                if first_feats is None:
-                    first_feats, label_shape = fx, lshape
-                else:
-                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(
-                        lshape
-                    ) != tuple(label_shape):
-                        raise RuntimeError(
-                            "inconsistent feature/label shapes across datasets"
-                        )
+                first_feats, label_shape = _check_shapes(
+                    first_feats, label_shape, fx, lshape
+                )
                 manifest[str(k)] = str(k)
         elif (
             isinstance(data, Sequence)
@@ -189,15 +222,9 @@ def train(
                 sub = os.path.join(memmap_dir, key)
                 os.makedirs(sub, exist_ok=True)
                 fx, lshape = _mat_one(d, sub)
-                if first_feats is None:
-                    first_feats, label_shape = fx, lshape
-                else:
-                    if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(
-                        lshape
-                    ) != tuple(label_shape):
-                        raise RuntimeError(
-                            "inconsistent feature/label shapes across datasets"
-                        )
+                first_feats, label_shape = _check_shapes(
+                    first_feats, label_shape, fx, lshape
+                )
                 manifest.append(key)
         else:
             fx, lshape = _mat_one(data, memmap_dir)
@@ -349,10 +376,8 @@ def predict(
     else:
         cfg_model = ModelConfig()
     cfg_dict = asdict(cfg_model)
-    try:
-        seed_value = int(seed)
-    except Exception:
-        seed_value = None
+    seed_value = _ensure_seed(seed)
+    _seed_everything(seed_value)
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
