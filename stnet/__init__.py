@@ -30,13 +30,12 @@ _EXPORTS = {
     "new_model": ("stnet.api.io", "new_model"),
     "load_model": ("stnet.api.io", "load_model"),
     "save_model": ("stnet.api.io", "save_model"),
-    # Quick-start aliases
     "learn": ("stnet.api.run", "train"),
     "infer": ("stnet.api.run", "predict"),
 }
 
 
-def __getattr__(name: str):  # pragma: no cover - thin import wrapper
+def __getattr__(name: str):
     if name not in _EXPORTS:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     module_name, attr_name = _EXPORTS[name]
