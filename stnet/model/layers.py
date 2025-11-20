@@ -170,8 +170,7 @@ try:
 except Exception:
     activation_checkpoint = None
 
-from ..api import is_meta_or_fake_tensor
-from ..backend.compat import patch_torch
+from ..backend.compat import patch_torch, is_meta_or_fake_tensor
 from ..backend.distributed import get_world_size
 from ..backend.system import cpu_info, system_info, posix_time
 from ..functional.fx import Autocast, Gradient, reshape_for_mha
