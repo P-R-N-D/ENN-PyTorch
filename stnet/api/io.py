@@ -91,7 +91,7 @@ def new_model(
     wrap: bool = True,
 ) -> nn.Module:
     from ..functional.fx import Fusion
-    from ..model import Root
+    from ..model.layers import Root
     
     cfg = coerce_model_config(config)
     core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
