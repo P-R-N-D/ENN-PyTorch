@@ -23,7 +23,7 @@ This repository provides a PyTorch implementation of the STNet architecture for 
    ```bash
    pip install -e .[service]
    ```
--   Additional extras include `pandas`, `polars`, `excel`, `spark`, `thread`, `torchao`, `nvidia_gds_cu12`, `nvidia_gds_cu13`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `torchscale`, and `telemetry` as defined in `pyproject.toml`. The storage-focused `nvidia_gds_cu12` extra installs `cupy-cuda12x>=13.6.0` and `kvikio-cu12>=25.12.0`, while `nvidia_gds_cu13` installs `cupy-cuda13x>=13.6.0` and `kvikio-cu13>=25.12.0`.
+-   Additional extras include `pandas`, `polars`, `excel`, `spark`, `torchao`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `torchscale`, and `telemetry` as defined in `pyproject.toml`.
 
 ## Dependencies
 The core backend depends on:
@@ -42,11 +42,10 @@ The core backend depends on:
 
 Optional extras listed in `pyproject.toml` include:
 - dataframe integrations (`pandas`, `polars`)
-- spreadsheet tooling (`excel`)
+- spreadsheet tooling (`excel` – installs `pandas`, `openpyxl`, and `fastexcel`)
 - Spark pipelines (`spark`)
-- advanced optimization toolchains (`torchao`; the legacy `thread` extra now resolves to the core `psutil` requirement)
+- advanced optimization toolchains (`torchao`)
 - vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
-- storage pipelines (`nvidia_gds_cu12`, `nvidia_gds_cu13`) – install the CUDA 12 pair (`cupy-cuda12x>=13.6.0`, `kvikio-cu12>=25.12.0`) or the CUDA 13 pair (`cupy-cuda13x>=13.6.0`, `kvikio-cu13>=25.12.0`)
 - retention-focused research modules (`torchscale`)
 - telemetry hooks (`telemetry`) – installs `pynvml>=11.5.0` for GPU utilization reporting when available
 
@@ -77,7 +76,7 @@ config = build_config(
     depth=64,
     heads=4,
     patch=patch,
-    compile_mode="default",  # set to "disabled" (default) to keep eager execution
+    compile_mode="default",
 )
 model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
@@ -104,10 +103,6 @@ The backend helpers manage distributed checkpoints, mixed precision, exporter re
 ## Debugging backend tensor issues
 - Enable meta/fake tensor diagnostics by setting `STNET_META_HOOK=1` to raise immediately when a module receives a meta/FakeTensor input. Use `STNET_META_HOOK=warn` during inference services to log a warning instead of aborting execution.
 - Toggle the oneDNN (MKLDNN) backend with `STNET_DISABLE_MKLDNN=1`. When set, the backend will call `torch.backends.mkldnn.enabled = False` before model construction so you can confirm whether a backend-specific kernel is responsible for anomalous behavior.
-
-### Sample workbook configuration
-
-When following `notebook.ipynb` to materialize features from `raw_data.xlsx`, the CUDA profile keeps the model depth at 1152 with larger microbatches while the CPU path dials the depth back to 512 and halves the microbatch size to remain memory efficient. Both flows share the same tokenizer geometry so predictions remain shape-compatible across devices.
 
 ## Exporting for inference
 Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `service` extra to enable the full conversion toolkit.
