@@ -454,11 +454,10 @@ class PowerTransform(nn.Module):
         x64 = x.to(torch.float64)
         m = self._bc(x64, self.mask)
         y64 = self._yj(x64) if self.method.startswith("yeo") else self._bcx(x64)
-        if bool(m.any()):
-            masked_y = y64[m]
-            if masked_y.numel() and not torch.isfinite(masked_y).all():
-                y64 = y64.clone()
-                y64[m] = torch.nan_to_num(masked_y)
+        masked_y = y64[m]
+        if masked_y.numel() and not torch.isfinite(masked_y).all():
+            y64 = y64.clone()
+            y64[m] = torch.nan_to_num(masked_y)
         y64 = torch.where(m, y64, x64)
         return y64.to(orig_dtype)
 
@@ -471,11 +470,10 @@ class PowerTransform(nn.Module):
         y64 = y.to(torch.float64)
         m = self._bc(y64, self.mask)
         x64 = self._inv_yj(y64) if self.method.startswith("yeo") else self._inv_bcx(y64)
-        if bool(m.any()):
-            masked_x = x64[m]
-            if masked_x.numel() and not torch.isfinite(masked_x).all():
-                x64 = x64.clone()
-                x64[m] = torch.nan_to_num(masked_x)
+        masked_x = x64[m]
+        if masked_x.numel() and not torch.isfinite(masked_x).all():
+            x64 = x64.clone()
+            x64[m] = torch.nan_to_num(masked_x)
         x64 = torch.where(m, x64, y64)
         return x64.to(orig_dtype)
 
