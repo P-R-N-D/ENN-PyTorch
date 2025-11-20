@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import contextlib
+import copy
+import logging
+import math
 from typing import (
     Any,
     Callable,
@@ -40,6 +43,105 @@ except Exception:
     _update_bn = None
 
 
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log_info(logger: Optional[Callable[[str], None]], msg: str) -> None:
+    if logger:
+        logger(msg)
+    else:
+        _LOGGER.info(msg)
+
+
+def _log_debug(logger: Optional[Callable[[str], None]], msg: str) -> None:
+    _LOGGER.debug(msg)
+
+
+class ExponentialMovingAverage:
+    def __init__(self, model: nn.Module, decay: float = 0.9999):
+        if not 0.0 < decay < 1.0:
+            raise ValueError("EMA decay must be in (0, 1)")
+        self.decay = decay
+        self.shadow: Dict[str, torch.Tensor] = {
+            k: v.detach().clone() for k, v in model.state_dict().items()
+        }
+        self.collected: Dict[str, torch.Tensor] = {}
+        self.optim_shadow: Optional[Dict[str, Any]] = None
+        self.optim_collected: Optional[Dict[str, Any]] = None
+
+    @torch.no_grad()
+    def update(
+        self,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+    ) -> None:
+        for name, tensor in model.state_dict().items():
+            if torch.is_tensor(tensor) and tensor.dtype.is_floating_point:
+                self.shadow[name].mul_(self.decay).add_(tensor, alpha=(1.0 - self.decay))
+            else:
+                self.shadow[name] = tensor
+
+        if optimizer is None:
+            return
+
+        state = optimizer.state_dict()
+        if self.optim_shadow is None:
+            self.optim_shadow = copy.deepcopy(state)
+            return
+
+        shadow = self.optim_shadow
+        if "param_groups" in state:
+            shadow["param_groups"] = copy.deepcopy(state["param_groups"])
+
+        if "state" in state:
+            shadow_state = shadow.setdefault("state", {})
+            for pid, slot in state["state"].items():
+                s_slot = shadow_state.setdefault(pid, {})
+                for sk, sv in slot.items():
+                    if torch.is_tensor(sv) and sv.dtype.is_floating_point:
+                        if sk in s_slot and torch.is_tensor(s_slot[sk]):
+                            s_slot[sk].mul_(self.decay).add_(sv, alpha=(1.0 - self.decay))
+                        else:
+                            s_slot[sk] = sv.detach().clone()
+                    else:
+                        s_slot[sk] = copy.deepcopy(sv)
+
+    @torch.no_grad()
+    def apply_to(
+        self,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+    ) -> None:
+        model_state = model.state_dict()
+        for name, buf in self.shadow.items():
+            if name in model_state:
+                model_state[name].copy_(buf)
+
+        if optimizer is not None and self.optim_shadow is not None:
+            optimizer.load_state_dict(self.optim_shadow)
+
+    @torch.no_grad()
+    def store(
+        self,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+    ) -> None:
+        self.collected = copy.deepcopy(model.state_dict())
+        if optimizer is not None:
+            self.optim_collected = copy.deepcopy(optimizer.state_dict())
+
+    @torch.no_grad()
+    def restore(
+        self,
+        model: nn.Module,
+        optimizer: Optional[optim.Optimizer] = None,
+    ) -> None:
+        if self.collected:
+            model.load_state_dict(self.collected)
+        if optimizer is not None and self.optim_collected:
+            optimizer.load_state_dict(self.optim_collected)
+
+
 class _TensorDictCompat(nn.Module):
     def __init__(self, averaged_module: nn.Module, key: str) -> None:
         super().__init__()
@@ -67,6 +169,26 @@ def stochastic_weight_average(
 
 class AdamW:
     @staticmethod
+    def _from_metadata(
+        model_or_params: Union[
+            nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
+        ],
+        metadata: Optional["Metadata[Any]"] = None,
+    ) -> Tuple[torch.device, "Metadata[Any]"]:
+        ref_tensor: Optional[torch.Tensor] = None
+        if isinstance(model_or_params, nn.Module):
+            ref_tensor = Fusion._peek_layer(model_or_params)
+        if metadata is not None:
+            dev = torch.device(metadata.device)
+        elif ref_tensor is not None:
+            dev = ref_tensor.device
+        else:
+            dev = get_device()
+        meta = Autocast.coerce_metadata(dev, metadata=metadata)
+        dev = torch.device(meta.device)
+        return dev, meta
+
+    @staticmethod
     def float(
         model_or_params: Union[
             nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -83,18 +205,7 @@ class AdamW:
             if hasattr(model_or_params, "parameters")
             else model_or_params
         )
-        ref_tensor: Optional[torch.Tensor] = None
-        if isinstance(model_or_params, nn.Module):
-            ref_tensor = Fusion._peek_layer(model_or_params)
-        dev: torch.device
-        if metadata is not None:
-            dev = torch.device(metadata.device)
-        elif ref_tensor is not None:
-            dev = ref_tensor.device
-        else:
-            dev = get_device()
-        meta = Autocast.coerce_metadata(dev, metadata=metadata)
-        dev = torch.device(meta.device)
+        dev, meta = AdamW._from_metadata(model_or_params, metadata)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
                 from transformer_engine.pytorch.optimizers import (
@@ -176,17 +287,7 @@ class AdamW:
             if hasattr(model_or_params, "parameters")
             else model_or_params
         )
-        ref_tensor: Optional[torch.Tensor] = None
-        if isinstance(model_or_params, nn.Module):
-            ref_tensor = Fusion._peek_layer(model_or_params)
-        if metadata is not None:
-            dev = torch.device(metadata.device)
-        elif ref_tensor is not None:
-            dev = ref_tensor.device
-        else:
-            dev = get_device()
-        meta = Autocast.coerce_metadata(dev, metadata=metadata)
-        dev = torch.device(meta.device)
+        dev, meta = AdamW._from_metadata(model_or_params, metadata)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
                 from transformer_engine.pytorch.optimizers import (
@@ -295,23 +396,27 @@ class StochasticWeightAverage:
             raise RuntimeError(
                 "StochasticWeightAverage was initialised without a source model"
             )
-        self._averaged.update_parameters(target)
+        with torch.no_grad():
+            try:
+                self._averaged.update_parameters(target)
+            except Exception as e:
+                raise RuntimeError(f"SWA update failed: {e}")
 
     @contextlib.contextmanager
     def reduction(self, model: nn.Module) -> Iterator[None]:
         backup: Dict[str, torch.Tensor] = {}
-        try:
-            for (name, param), (_, avg_param) in zip(
-                model.named_parameters(), self.module.named_parameters()
-            ):
-                backup[name] = param.detach().clone()
-                param.data.copy_(avg_param.data.to(param.device, dtype=param.dtype))
-            yield
-        finally:
-            for name, param in model.named_parameters():
-                cached = backup.get(name)
-                if cached is not None:
-                    param.data.copy_(cached)
+        with torch.no_grad():
+            try:
+                for (name, param), (_, avg_param) in zip(
+                    model.named_parameters(), self.module.named_parameters()
+                ):
+                    backup[name] = param.detach().clone()
+                    param.data.copy_(avg_param.data.to(param.device, dtype=param.dtype))
+                yield
+            finally:
+                for name, param in model.named_parameters():
+                    if name in backup:
+                        param.data.copy_(backup[name])
 
     def update_batch_norm(
         self,
@@ -330,11 +435,11 @@ class StochasticWeightAverage:
                 tensor: Optional[torch.Tensor] = None
                 if isinstance(item, TensorDictBase):
                     tensor = item.get(in_key, None)
+                elif isinstance(item, torch.Tensor):
+                    tensor = item
                 elif isinstance(item, dict):
                     maybe = item.get(in_key)
                     tensor = maybe if torch.is_tensor(maybe) else None
-                elif torch.is_tensor(item):
-                    tensor = item
                 else:
                     with contextlib.suppress(Exception):
                         td = TensorDict(item, batch_size=[len(item)])

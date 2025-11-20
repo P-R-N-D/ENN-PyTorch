@@ -7,8 +7,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar
 
 import math
-
-import numpy as np
 import torch
 from tensordict import tensorclass
 
@@ -42,9 +40,12 @@ class Metadata(Generic[TExtra]):
         self.device = dev
         self.device_type = dev.type
         if dev.type == "cuda":
-            major, minor = cuda_compute_capability(dev)
+            try:
+                major, minor = cuda_compute_capability(dev)
+            except Exception:
+                major, minor = (0, 0)
             if major > 0 or minor > 0:
-                self.cuda_cc = (major, minor)
+                self.cuda_cc = (int(major), int(minor))
             else:
                 self.cuda_cc = None
         else:
@@ -65,11 +66,15 @@ class Metadata(Generic[TExtra]):
 
     @property
     def scale_min_positive(self) -> Optional[float]:
-        if self.scale_min_abs is None or not np.isfinite(self.scale_min_abs):
+        v = self.scale_min_abs
+        if v is None:
             return None
-        if self.scale_min_abs <= 0.0:
+        try:
+            if not math.isfinite(float(v)) or float(v) <= 0.0:
+                return None
+        except Exception:
             return None
-        return float(self.scale_min_abs)
+        return float(v)
 
     @staticmethod
     def _distinct_dtypes(candidates: Sequence[torch.dtype]) -> Tuple[torch.dtype, ...]:
@@ -97,6 +102,8 @@ class Metadata(Generic[TExtra]):
         _BOOTSTRAP_DEPTH += 1
         try:
             return _Autocast.float_amp_priority(device)
+        except Exception:
+            return (torch.float32,)
         finally:
             _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
 
@@ -112,6 +119,8 @@ class Metadata(Generic[TExtra]):
         _BOOTSTRAP_DEPTH += 1
         try:
             return _Autocast.integer_amp_priority(device)
+        except Exception:
+            return (torch.int64,)
         finally:
             _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
 
@@ -169,8 +178,20 @@ class Metadata(Generic[TExtra]):
         if max_abs is None and min_abs is None and is_integral is None:
             self.clear_scale()
             return
-        self.scale_max_abs = float(max_abs) if max_abs is not None else None
-        self.scale_min_abs = float(min_abs) if min_abs is not None else None
+        if max_abs is not None:
+            try:
+                v = float(max_abs)
+                if math.isfinite(v):
+                    self.scale_max_abs = v
+            except Exception:
+                pass
+        if min_abs is not None:
+            try:
+                v = float(min_abs)
+                if math.isfinite(v) and v > 0.0:
+                    self.scale_min_abs = v
+            except Exception:
+                pass
         self.scale_is_integral = bool(is_integral) if is_integral is not None else None
 
     @staticmethod
@@ -245,10 +266,20 @@ class TensorDictMetadata:
     device: Optional[Any] = None
 
     def autocast(self) -> contextlib.AbstractContextManager[Any]:
-        if self.use_amp and isinstance(self.amp_dtype, torch.dtype):
-            if isinstance(self.device, torch.device):
-                dev_type = self.device.type
-            else:
-                dev_type = "cuda" if torch.cuda.is_available() else "cpu"
-            return torch.autocast(device_type=dev_type, dtype=self.amp_dtype)
+        if not (self.use_amp and isinstance(self.amp_dtype, torch.dtype)):
+            return contextlib.nullcontext()
+
+        if isinstance(self.device, torch.device):
+            dev_type = self.device.type
+        else:
+            dev_type = "cuda" if torch.cuda.is_available() else "cpu"
+
+        autocast_fn = getattr(torch, "autocast", None)
+        amp_mod = getattr(torch, "amp", None)
+        if hasattr(amp_mod, "autocast"):
+            autocast_fn = amp_mod.autocast
+
+        if callable(autocast_fn):
+            return autocast_fn(device_type=dev_type, dtype=self.amp_dtype)
+
         return contextlib.nullcontext()

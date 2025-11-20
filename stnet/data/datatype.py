@@ -120,7 +120,7 @@ def _canonical_dtype(src: Any) -> str:
     key = key.lstrip("<>|=")
     canonical = _DTYPE_ALIASES.get(key, key)
     if canonical not in _CANONICAL_DTYPES:
-        raise TypeError(f"unsupported dtype: {src!r}")
+        raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
     return canonical
 
 
@@ -144,7 +144,14 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
     for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
         method = getattr(obj, attr, None)
         if callable(method):
-            return method()
+            with torch.no_grad():
+                out = method()
+            if isinstance(out, torch.Tensor):
+                return out
+            try:
+                return torch.as_tensor(out)
+            except Exception:
+                continue
     return torch.as_tensor(obj)
 
 
@@ -162,18 +169,23 @@ def to_tensordict(
     batch_size: Optional[Iterable[int]] = None,
     **kwargs: Any,
 ) -> TensorDict:
-
     if isinstance(batch, TensorDictBase):
-        return batch.to(device) if device is not None else batch
+        return batch.to(device) if device is not None else batch  # type: ignore[return-value]
     if not isinstance(batch, Mapping):
         raise TypeError(f"Unexpected batch type: {type(batch)}")
-    resolved_batch = (
-        list(batch_size) if batch_size is not None else _get_batch_size(batch)
-    )
+
+    resolved_batch = list(batch_size) if batch_size is not None else _get_batch_size(batch)
     td = TensorDict({}, batch_size=resolved_batch, device=device)
+
     for key, value in batch.items():
         if torch.is_tensor(value):
-            td.set(key, value.to(device) if device is not None else value)
+            tensor = value
+            if device is not None:
+                tensor = tensor.to(device)
+            td.set(key, tensor)
+        elif isinstance(value, TensorDictBase):
+            nested = value.to(device) if device is not None else value
+            td.set(key, nested)
         else:
             td.set_non_tensor(key, value)
     return td
@@ -188,10 +200,10 @@ def to_dict(
     keys: Optional[Iterable[str]] = None,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-
     if isinstance(td_or_dict, TensorDictBase):
         td = td_or_dict
-        items = ((key, td.get(key)) for key in (keys or td.keys()))
+        key_iter = keys or td.keys()
+        items = ((key, td.get(key)) for key in list(key_iter))
         out: Dict[str, Any] = {}
         for key, value in items:
             if torch.is_tensor(value):
@@ -204,6 +216,9 @@ def to_dict(
             else:
                 out[key] = value
         return out
+    if not isinstance(td_or_dict, Mapping):
+        raise TypeError(f"to_dict expects TensorDictBase or Mapping, got: {type(td_or_dict)}")
+
     out: Dict[str, Any] = {}
     for key, value in td_or_dict.items():
         if torch.is_tensor(value):

@@ -7,7 +7,7 @@ import logging
 import math
 from contextlib import AbstractContextManager
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
 import torch
 from torch import nn
@@ -27,8 +27,24 @@ from ..data.stats import Metadata
 patch_torch()
 
 
-LossCallable = Union[nn.Module, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]]
+class LossFn(Protocol):
+    def __call__(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        ...
+
+
+LossCallable = LossFn
 _LOGGER = logging.getLogger(__name__)
+
+
+def _log_info(logger: Optional[Callable[[str], None]], msg: str) -> None:
+    if logger is not None:
+        logger(msg)
+    else:
+        _LOGGER.info(msg)
+
+
+def _log_debug(logger: Optional[Callable[[str], None]], msg: str) -> None:
+    _LOGGER.debug(msg)
 
 
 def _is_ptq_unavailable(
@@ -75,7 +91,7 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
 
     try:
         modules = tuple(model.modules())
-    except Exception:
+    except (RuntimeError, AttributeError, TypeError):
         modules = ()
 
     for module in modules:
@@ -102,7 +118,7 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
 
     try:
         modules = tuple(model.modules())
-    except Exception:
+    except (RuntimeError, AttributeError, TypeError):
         modules = ()
 
     for module in modules:
@@ -189,7 +205,7 @@ def _is_for_cuda(module: nn.Module) -> bool:
                 continue
             if tensor.device.type == "cuda":
                 return True
-    except Exception:
+    except (RuntimeError, AttributeError):
         pass
     try:
         for tensor in module.buffers():
@@ -197,7 +213,7 @@ def _is_for_cuda(module: nn.Module) -> bool:
                 continue
             if tensor.device.type == "cuda":
                 return True
-    except Exception:
+    except (RuntimeError, AttributeError):
         pass
     return False
 
@@ -259,18 +275,24 @@ class Gradient:
         elif mode is not None:
             mode_value = str(mode)
 
-        kwargs: Dict[str, Any] = {}
+        compile_kwargs: Dict[str, Any] = dict(kwargs)
         if backend_value is not None:
-            kwargs["backend"] = backend_value
+            compile_kwargs["backend"] = backend_value
         if mode_value is not None:
-            kwargs["mode"] = mode_value
+            compile_kwargs["mode"] = mode_value
         if fullgraph is not None:
-            kwargs["fullgraph"] = bool(fullgraph)
+            compile_kwargs["fullgraph"] = bool(fullgraph)
         if dynamic is not None:
-            kwargs["dynamic"] = bool(dynamic)
+            compile_kwargs["dynamic"] = bool(dynamic)
         if options:
-            kwargs["options"] = dict(options)
-        return compile_fn(module, **kwargs)
+            existing = compile_kwargs.get("options", {})
+            if isinstance(existing, dict):
+                merged = {**dict(options), **existing}
+            else:
+                merged = dict(options)
+            compile_kwargs["options"] = merged
+
+        return compile_fn(module, **compile_kwargs)
 
 
 class Autocast:
@@ -384,82 +406,6 @@ class Autocast:
                 return "ao"
         cls._preferred_int_backend = None
         return None
-
-    @classmethod
-    def _nvidia_float8(
-        cls: object, device: torch.device, enabled: bool
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        try:
-            te = importlib.import_module("transformer_engine.pytorch")
-
-            fp8_ctx = getattr(te, "fp8_autocast", None)
-            if callable(fp8_ctx):
-                contexts.append(fp8_ctx(enabled=True))
-            else:
-                raise AttributeError("transformer_engine.fp8_autocast missing")
-        except Exception as exc:
-            _LOGGER.debug("Autocast FP8 TE failed: %s", exc)
-            cls._preferred_fp8_backend = None
-        return contexts
-
-    @classmethod
-    def _torchao_float8(
-        cls: object, enabled: bool
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        try:
-            fp8_mod = importlib.import_module("torchao.float8")
-            fp8_autocast = getattr(fp8_mod, "fp8_autocast", None)
-
-            if callable(fp8_autocast):
-                contexts.append(fp8_autocast(enabled=True))
-            else:
-                raise AttributeError("torchao.float8.fp8_autocast missing")
-        except Exception as exc:
-            _LOGGER.debug("Autocast FP8 torchao failed: %s", exc)
-            cls._preferred_fp8_backend = None
-        return contexts
-
-    @classmethod
-    def _torchao_int8(
-        cls: object,
-        device: torch.device,
-        enabled: bool,
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        backend = cls._preferred_int_backend
-        if backend == "te":
-            try:
-                te = importlib.import_module("transformer_engine.pytorch")
-
-                int_ctx = getattr(te, "int8_autocast", None)
-                if callable(int_ctx):
-                    contexts.append(int_ctx(enabled=True))
-                else:
-                    raise AttributeError("transformer_engine.int8_autocast missing")
-            except Exception as exc:
-                _LOGGER.debug("Autocast INT8 TE failed: %s", exc)
-                cls._preferred_int_backend = None
-        elif backend == "ao":
-            try:
-                quant_mod = importlib.import_module("torchao.quantization")
-                int8_autocast = getattr(quant_mod, "int8_autocast", None)
-
-                if callable(int8_autocast):
-                    contexts.append(int8_autocast(enabled=True))
-                else:
-                    raise AttributeError("torchao.quantization.int8_autocast missing")
-            except Exception as exc:
-                _LOGGER.debug("Autocast INT8 torchao failed: %s", exc)
-                cls._preferred_int_backend = None
-        return contexts
 
     @classmethod
     def coerce_metadata(
@@ -872,25 +818,25 @@ class Autocast:
             yield
 
 
-Int8DynamicActivationInt8WeightConfig: Any | None
-Int8WeightOnlyConfig: Any | None
-quantize_: Any | None
-ptq: Callable[..., tuple[nn.Module, bool, str]] | None
+_Int8DynamicActivationInt8WeightConfig: Any | None
+_Int8WeightOnlyConfig: Any | None
+_quantize: Any | None
+_ptq_impl: Callable[..., tuple[nn.Module, bool, str]] | None
 QAT: Any | None
 
 try:
     from torchao.quantization import (
-        Int8DynamicActivationInt8WeightConfig,
-        Int8WeightOnlyConfig,
-        quantize_,
+        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+        Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
+        quantize_ as _quantize,
     )
 
-    ptq = getattr(quantize_, "ptq", None)
+    _ptq_impl = getattr(_quantize, "ptq", None)
 except ImportError:
-    quantize_ = None
-    Int8DynamicActivationInt8WeightConfig = None
-    Int8WeightOnlyConfig = None
-    ptq = None
+    _quantize = None
+    _Int8DynamicActivationInt8WeightConfig = None
+    _Int8WeightOnlyConfig = None
+    _ptq_impl = None
 QATConfig = None
 QATStep = None
 try:
@@ -949,8 +895,8 @@ try:
     QAT = _qat_module if hasattr(_qat_module, "initialize") else None
 except Exception:
     QAT = None
-if ptq is None:
-    ptq = _is_ptq_unavailable
+if _ptq_impl is None:
+    _ptq_impl = _is_ptq_unavailable
 
 
 if QAT is None:
@@ -958,15 +904,15 @@ if QAT is None:
 
 
 class Quantization:
-    quantize: Optional[Callable[..., Any]] = quantize_
+    quantize: Optional[Callable[..., Any]] = _quantize
     Int8DynamicActivationInt8WeightConfig: Optional[type] = (
-        Int8DynamicActivationInt8WeightConfig
+        _Int8DynamicActivationInt8WeightConfig
     )
-    Int8WeightOnlyConfig: Optional[type] = Int8WeightOnlyConfig
+    Int8WeightOnlyConfig: Optional[type] = _Int8WeightOnlyConfig
     QAT: Any = QAT
     QATConfig: Any = QATConfig
     QATStep: Any = QATStep
-    ptq: Callable[..., tuple[nn.Module, bool, str]] = staticmethod(ptq)
+    ptq: Callable[..., tuple[nn.Module, bool, str]] = staticmethod(_ptq_impl)
 
     @classmethod
     def is_available(cls: object) -> bool:
@@ -1064,8 +1010,7 @@ class Quantization:
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_available():
             msg = "torchao.quantization not installed (INT8/QAT disabled)"
-            if logger:
-                logger(f"[INT8] {msg}")
+            _log_info(logger, f"[INT8] {msg}")
             return (model, False, msg)
         last_err: Optional[Exception] = None
         if cls.is_qat_available():
@@ -1077,15 +1022,14 @@ class Quantization:
                     logger=logger,
                 )
                 setattr(model, "__int8_training_qat__", True)
-                if logger:
-                    logger(
-                        f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}"
-                    )
+                _log_info(
+                    logger,
+                    f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}",
+                )
                 return (model, True, "QAT-prepare")
             except Exception as exc:
                 last_err = exc
-                if logger:
-                    logger(f"[INT8][QAT] prepare failed: {exc}")
+                _log_info(logger, f"[INT8][QAT] prepare failed: {exc}")
         try:
             m2, ok, why = cls._apply_ptq(
                 model,
@@ -1177,7 +1121,7 @@ class Fusion:
     ) -> None:
         try:
             state = src.state_dict()
-        except Exception:
+        except (RuntimeError, AttributeError):
             return
         ref = Fusion._peek_layer(dst)
         device = ref.device if ref is not None else None
@@ -1364,10 +1308,10 @@ class Fusion:
         except Exception:
             attn_swapped = 0
         n_total = (n_layers or 0) + (attn_swapped or 0)
-        if logger:
-            logger(
-                f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}"
-            )
+        _log_info(
+            logger,
+            f"[TE] swapped {n_total} modules (layers:{n_layers}, attn:{attn_swapped}); params_dtype={str(params_dtype).split('.')[-1]}, fp8={('on' if fp8_ok else 'off')} ({(why if fp8_ok else '')}), backend={te_backend}",
+        )
         return (
             model,
             n_total > 0,
@@ -1481,8 +1425,7 @@ class Fusion:
             )
             quantize_(model, cfg)
             setattr(model, "__fp8_inference_ao__", True)
-            if logger:
-                logger(f"[FP8][AO] applied {cfg.__class__.__name__}")
+            _log_info(logger, f"[FP8][AO] applied {cfg.__class__.__name__}")
             return (model, True, "torchao")
         except Exception as exc:
             return (model, False, f"AO failed: {exc}")
@@ -1504,8 +1447,9 @@ class Fusion:
             if not any(
                 is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
-                if logger:
-                    logger("[FP8] training disabled: data scale exceeds float8 range")
+                _log_info(
+                    logger, "[FP8] training disabled: data scale exceeds float8 range"
+                )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = Fusion.negotiate(device, metadata=meta)
@@ -1518,12 +1462,11 @@ class Fusion:
             else:
                 m2, ok2, why = Fusion._enable_torchao_training(model, logger)
             if ok2:
-                if logger:
-                    logger(f"[FP8] training enabled via {why} ({reason})")
+                _log_info(logger, f"[FP8] training enabled via {why} ({reason})")
                 Autocast.configure(m2, metadata=meta)
                 return (m2, True, why)
-            elif logger:
-                logger(f"[FP8] {backend} path skipped: {why}")
+            else:
+                _log_debug(logger, f"[FP8] {backend} path skipped: {why}")
         Autocast.configure(model, metadata=meta)
         return (model, False, "No usable FP8 backend")
 
@@ -1544,8 +1487,9 @@ class Fusion:
             if not any(
                 is_scale_safe(dtype, meta, safety_margin=2.0) for dtype in float8_dtypes
             ):
-                if logger:
-                    logger("[FP8] inference disabled: data scale exceeds float8 range")
+                _log_info(
+                    logger, "[FP8] inference disabled: data scale exceeds float8 range"
+                )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = Fusion.negotiate(device, metadata=meta)
@@ -1566,12 +1510,11 @@ class Fusion:
                     model, dynamic_activations, logger
                 )
             if ok2:
-                if logger:
-                    logger(f"[FP8] inference enabled via {why} ({reason})")
+                _log_info(logger, f"[FP8] inference enabled via {why} ({reason})")
                 Autocast.configure(m2, metadata=meta)
                 return (m2, True, why)
-            elif logger:
-                logger(f"[FP8] {step} skipped: {why}")
+            else:
+                _log_debug(logger, f"[FP8] {step} skipped: {why}")
         Autocast.configure(model, metadata=meta)
         return (model, False, "No usable FP8 backend")
 
@@ -1789,9 +1732,10 @@ class Fusion:
                     return loss_fn(pred, target)
 
                 def forward(self, td: TensorDictBase) -> TensorDictBase:
-                    if self.pred_key not in td.keys(include_nested=False):
+                    try:
+                        pred = td.get(self.pred_key)
+                    except KeyError:
                         return td
-                    pred = td.get(self.pred_key)
                     if pred is None:
                         return td
                     batch = pred.shape[0]
@@ -1820,6 +1764,10 @@ class Fusion:
                                     )
                                 else:
                                     local_loss_val = 0.0
+                                    _LOGGER.debug(
+                                        "TensorDictLoss: residual_context is not a Tensor (type=%s)",
+                                        type(residual),
+                                    )
                             else:
                                 local_loss_val = 0.0
                             total_loss = (
@@ -1888,7 +1836,10 @@ class Fusion:
                     self,
                     inputs: Union[TensorDictBase, torch.Tensor],
                     **kwargs: Any,
-                ) -> Union[TensorDictBase, tuple[torch.Tensor, Optional[torch.Tensor]]]:
+                ) -> Union[
+                    TensorDictBase,
+                    tuple[torch.Tensor, Optional[torch.Tensor]],
+                ]:
                     if isinstance(inputs, TensorDictBase):
                         td = inputs.clone(False)
                         for key, value in kwargs.items():
