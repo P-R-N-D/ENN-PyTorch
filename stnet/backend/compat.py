@@ -44,7 +44,6 @@ _COLLECTIVE_NAMES: tuple[str, ...] = (
     "barrier",
 )
 
-
 if hasattr(nn, "RMSNorm"):
     RMSNorm = nn.RMSNorm
 else:
@@ -144,6 +143,9 @@ def _nansum_impl(
     **kwargs: Any,
 ) -> Any:
     _ = args, kwargs
+    if dtype is not None and not isinstance(dtype, torch.dtype):
+        with suppress(Exception):
+            dtype = getattr(torch, str(dtype).split(".")[-1], None)
     x_cast = x.to(dtype) if dtype is not None else x
     mask = torch_mod.isfinite(x_cast)
     zero = torch_mod.zeros((), device=x_cast.device, dtype=x_cast.dtype)
@@ -232,7 +234,8 @@ def patch_torch(
 def cudagraph_step_end() -> None:
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
     if callable(mark_step):
-        mark_step()
+        with suppress(Exception):
+            mark_step()
 
 
 def is_fake_tensor(value: Any) -> bool:
@@ -261,7 +264,6 @@ def torch_compile_disable(
     reason: str | None = None,
     recursive: bool = True,
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-
     if _TORCH_COMPILE_DISABLE is None:
 
         def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -295,7 +297,6 @@ def torch_compile_disable(
 
 
 def torch_disable_dynamo(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
-
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -325,7 +326,6 @@ def torch_disable_compile(
     reason: str | None = None,
     recursive: bool = True,
 ) -> bool:
-
     if target is None or not hasattr(target, attr):
         return False
     fn = getattr(target, attr)
@@ -343,7 +343,6 @@ def torch_compile_safe(
     runtime_module: Any | None = None,
     layers_module: Any | None = None,
 ) -> None:
-
     if layers_module is None:
         with suppress(Exception):
             layers_module = importlib.import_module("stnet.model.layers")

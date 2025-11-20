@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import json
-from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
+from dataclasses import asdict
 from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import torch
@@ -57,6 +57,11 @@ def _is_required(module: str, pip_hint: str | None = None) -> None:
 def _to_cpu(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return value.detach().to(device="cpu")
+    if isinstance(value, dict):
+        return {k: _to_cpu(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        seq = [_to_cpu(v) for v in value]
+        return type(value)(seq) if isinstance(value, tuple) else seq
     return value
 
 
@@ -74,7 +79,10 @@ def _load_model_config(model: nn.Module) -> Dict[str, Any]:
         candidate = cfg_obj
     else:
         candidate = None
-    return asdict(coerce_model_config(candidate))
+    try:
+        return asdict(coerce_model_config(candidate))
+    except Exception:
+        return {}
 
 
 def new_model(
@@ -102,7 +110,6 @@ def load_model(
     *,
     wrap: bool = True,
 ) -> nn.Module:
-
     p = Path(checkpoint_path)
     if p.is_dir():
         if in_dim is None or out_shape is None:
@@ -115,6 +122,9 @@ def load_model(
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         return model
+
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
 
     if p.suffix.lower() == ".safetensors":
         meta_path = p.with_suffix(".json")
@@ -131,25 +141,45 @@ def load_model(
         use_config = coerce_model_config(
             config if config is not None else meta.get("config")
         )
+        if use_in_dim <= 0 or not use_out_shape:
+            raise RuntimeError(
+                f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: "
+                f"in_dim={use_in_dim}, out_shape={use_out_shape}"
+            )
+
         model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
         sd = load_tensors(str(p), device=map_location or "cpu")
-        model.load_state_dict(sd)
+        model.load_state_dict(sd, strict=False)
         return model
 
     obj = torch.load(str(p), map_location=map_location or "cpu", weights_only=False)
-    meta_in_dim = obj.get("in_dim") if isinstance(obj, dict) else None
-    meta_out_shape = obj.get("out_shape") if isinstance(obj, dict) else None
-    meta_cfg = obj.get("config") if isinstance(obj, dict) else None
+    if isinstance(obj, dict):
+        meta_in_dim = obj.get("in_dim")
+        meta_out_shape = obj.get("out_shape")
+        meta_cfg = obj.get("config")
+        sd = obj["state_dict"] if "state_dict" in obj else obj
+    else:
+        meta_in_dim = None
+        meta_out_shape = None
+        meta_cfg = None
+        sd = obj
+
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
     out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
     use_out_shape = tuple(int(x) for x in out_shape_meta)
     use_config = coerce_model_config(config if config is not None else meta_cfg)
+
+    if use_in_dim <= 0 or not use_out_shape:
+        raise RuntimeError(
+            f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: "
+            f"in_dim={use_in_dim}, out_shape={use_out_shape}"
+        )
+
     model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
-    sd = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
-    model.load_state_dict(sd)
+    model.load_state_dict(sd, strict=False)
     return model
 
 
@@ -163,7 +193,6 @@ def save_model(
     swa_averager: Optional[Any] = None,
     **kwargs: Any,
 ) -> str:
-
     p = Path(path)
 
     if Model.is_native_target(p):
@@ -197,9 +226,9 @@ class Model:
     def is_native_target(path: str | Path) -> bool:
         p = Path(path)
         suffix = p.suffix.lower()
-        if suffix:
-            return suffix in Model.NATIVE_EXTS
-        return True
+        if not suffix:
+            return True
+        return suffix in Model.NATIVE_EXTS
 
     @staticmethod
     def save(
@@ -212,20 +241,21 @@ class Model:
         p = Path(path)
         suffix = p.suffix.lower()
 
-        if not suffix:
-            if p.exists() and p.is_dir():
-                from torch.distributed.checkpoint import (
-                    FileSystemWriter,
-                    save as dcp_save,
-                )
+        if not suffix and p.exists() and p.is_dir():
+            from torch.distributed.checkpoint import (
+                FileSystemWriter,
+                save as dcp_save,
+            )
 
-                opts_sd = StateDictOptions(full_state_dict=True)
-                m_sd = get_model_state_dict(model, options=opts_sd)
-                dcp_save(
-                    state_dict={"model": m_sd},
-                    storage_writer=FileSystemWriter(str(p)),
-                )
-                return p
+            opts_sd = StateDictOptions(full_state_dict=True)
+            m_sd = get_model_state_dict(model, options=opts_sd)
+            dcp_save(
+                state_dict={"model": m_sd},
+                storage_writer=FileSystemWriter(str(p)),
+            )
+            return p
+
+        if not suffix:
             p = p.with_suffix(".pt")
             suffix = ".pt"
 

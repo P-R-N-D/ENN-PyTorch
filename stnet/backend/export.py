@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import subprocess
@@ -24,9 +25,29 @@ def _in_console(cmd: Sequence[str], desc: str) -> None:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
 
+def _prepare_serving_model(model: nn.Module) -> nn.Module:
+
+    model.eval()
+    candidate_attrs = (
+        "optimizer",
+        "optimizer_state",
+        "optim",
+        "training_history",
+        "history",
+        "metrics",
+        "_training_history",
+    )
+    for name in candidate_attrs:
+        if hasattr(model, name):
+            with contextlib.suppress(Exception):
+                delattr(model, name)
+    return model
+
+
 def _get_tensor_shape(
     model: nn.Module, sample_input: Optional[torch.Tensor]
 ) -> Tuple[int, Tuple[int, ...]]:
+
     in_dim: Optional[int] = None
     out_shape: Optional[Tuple[int, ...]] = None
     if hasattr(model, "in_dim"):
@@ -62,6 +83,7 @@ def _get_tensor_shape(
 
 
 def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch.Tensor:
+
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
@@ -74,6 +96,7 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
 
 
 def _onnx_options(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": int(kwargs.get("opset_version", 18)),
@@ -82,6 +105,7 @@ def _onnx_options(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _resolve_onnx_path(dst: Path, kwargs: Mapping[str, Any]) -> Path:
+
     override = kwargs.get("onnx_path")
     if override:
         return Path(override)
@@ -106,13 +130,15 @@ class _CompatLayer(nn.Module):
         return y_flat
 
 
+
 class Onnx(Format):
     name = "onnx"
 
     def save(
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
-        out = Model._OnnxLayer.export(model, dst, **_onnx_options(kwargs))
+        serving_model = _prepare_serving_model(model)
+        out = Model._OnnxLayer.export(serving_model, dst, **_onnx_options(kwargs))
         return (out,)
 
 
@@ -122,8 +148,9 @@ class Ort(Format):
     def save(
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
+        serving_model = _prepare_serving_model(model)
         onnx_path = Model._OnnxLayer.coerce(
-            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
         ort_path, optimized = Model._OrtLayer.to_ort(
             onnx_path,
@@ -144,8 +171,9 @@ class TensorRT(Format):
     def save(
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
+        serving_model = _prepare_serving_model(model)
         onnx_path = Model._OnnxLayer.coerce(
-            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
         try:
             import tensorrt as trt
@@ -172,9 +200,12 @@ class TensorRT(Format):
                     for i in range(parser.num_errors):
                         print(parser.get_error(i))
                     raise RuntimeError("TensorRT could not parse the ONNX model.")
-            if bool(kwargs.get("fp16", True)) and builder.platform_has_fast_fp16:
+            use_fp16 = bool(kwargs.get("fp16", True))
+            use_int8 = bool(kwargs.get("int8", False))
+
+            if use_fp16 and builder.platform_has_fast_fp16:
                 config.set_flag(trt.BuilderFlag.FP16)
-            if bool(kwargs.get("int8", False)):
+            if use_int8:
                 if not builder.platform_has_fast_int8:
                     warnings.warn(
                         "INT8 precision is not supported on this platform; ignoring request."
@@ -208,8 +239,9 @@ class Nnef(Format):
     def save(
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
+        serving_model = _prepare_serving_model(model)
         onnx_path = Model._OnnxLayer.coerce(
-            model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
         try:
             import importlib
@@ -257,10 +289,11 @@ class CoreML(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         is_required("coremltools", "pip install coremltools")
+        serving_model = _prepare_serving_model(model)
         import coremltools as ct
 
         sample = _pad_sample(model, kwargs.get("sample_input"))
-        wrapper = _CompatLayer(model).eval()
+        wrapper = _CompatLayer(serving_model).eval()
         with Gradient.inference(wrapper):
             scripted = torch.jit.trace(wrapper, sample)
         cu_map = {
@@ -295,8 +328,9 @@ class LiteRT(Format):
     def save(
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
+        serving_model = _prepare_serving_model(model)
         onnx_path = Model._OnnxLayer.coerce(
-            model,
+            serving_model,
             _resolve_onnx_path(dst, kwargs),
             **_onnx_options(kwargs),
         )
@@ -357,6 +391,119 @@ class LiteRT(Format):
             with open(dst, "wb") as handle:
                 handle.write(tflite_model)
         return (dst,)
+
+
+
+class TorchScript(Format):
+    name = "torchscript"
+
+    def save(
+        self,
+        model: nn.Module,
+        dst: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[Path, ...]:
+        method = str(kwargs.get("method", "script")).lower()
+        sample = kwargs.get("sample_input")
+        serving_model = _prepare_serving_model(model)
+        wrapper = _CompatLayer(serving_model).eval()
+
+        if method == "trace":
+            if sample is None:
+                sample = _pad_sample(model, None)
+            with Gradient.inference(wrapper):
+                scripted = torch.jit.trace(wrapper, sample)
+        else:
+            with Gradient.inference(wrapper):
+                scripted = torch.jit.script(wrapper)
+
+        if bool(kwargs.get("optimize_for_mobile", False)):
+            try:
+                from torch.utils.mobile_optimizer import optimize_for_mobile
+            except ImportError as exc:
+                raise ImportError(
+                    "torch.utils.mobile_optimizer is required for optimize_for_mobile=True"
+                ) from exc
+            backend = str(kwargs.get("mobile_backend", "cpu")).lower()
+            try:
+                scripted = optimize_for_mobile(scripted, backend=backend)
+            except TypeError:
+                scripted = optimize_for_mobile(scripted)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        scripted.save(str(dst))
+        return (dst,)
+
+
+
+class ExecuTorch(Format):
+    name = "executorch"
+
+    def save(
+        self,
+        model: nn.Module,
+        dst: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[Path, ...]:
+        is_required("executorch", "pip install executorch")
+        try:
+            from torch.export import export as torch_export
+        except ImportError as exc:
+            raise ImportError(
+                "torch.export is required for ExecuTorch export (PyTorch 2.0+)."
+            ) from exc
+
+        import executorch.exir as exir
+
+        serving_model = _prepare_serving_model(model)
+        sample = kwargs.get("sample_input")
+        sample = _pad_sample(serving_model, sample)
+        wrapper = _CompatLayer(serving_model).eval()
+
+        with Gradient.inference(wrapper):
+            exported = torch_export(wrapper, (sample,))
+
+        edge = exir.to_edge(exported)
+        exec_prog = exir.to_executorch(edge)
+
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(dst, "wb") as fh:
+            exec_prog.write_to_file(fh)
+        return (dst,)
+
+
+
+class TensorFlow(Format):
+    name = "tensorflow"
+
+    def save(
+        self,
+        model: nn.Module,
+        dst: Path,
+        *args: Any,
+        **kwargs: Any,
+    ) -> Tuple[Path, ...]:
+        serving_model = _prepare_serving_model(model)
+        onnx_path = Model._OnnxLayer.coerce(
+            serving_model,
+            _resolve_onnx_path(dst, kwargs),
+            **_onnx_options(kwargs),
+        )
+        is_required("onnx", "pip install onnx")
+        is_required("onnx-tf", "pip install onnx-tf")
+        import onnx
+        from onnx_tf.backend import prepare
+
+        model_onnx = onnx.load(str(onnx_path))
+        if dst.suffix:
+            saved_model_dir = dst.with_suffix("")
+        else:
+            saved_model_dir = dst
+        saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
+        prepare(model_onnx).export_graph(str(saved_model_dir))
+        return (saved_model_dir,)
 
 
 class Model:
@@ -506,3 +653,10 @@ Model.register("tensorrt", (".engine",), TensorRT())
 Model.register("nnef", (".nnef",), Nnef())
 Model.register("coreml", (".mlmodel",), CoreML())
 Model.register("litert", (".tflite",), LiteRT())
+Model.register("torchscript", (".ts", ".torchscript"), TorchScript())
+Model.register("executorch", (".pte",), ExecuTorch())
+Model.register(
+    "tensorflow",
+    (".savedmodel", ".pb", ".tf"),
+    TensorFlow(),
+)

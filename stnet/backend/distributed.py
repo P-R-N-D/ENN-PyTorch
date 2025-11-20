@@ -69,6 +69,7 @@ def _strip_ip_expr(value: Any) -> str:
 
 
 def _strip_ipv6_expr(value: str) -> tuple[str, bool, bool]:
+
     stripped = value.strip()
     bracketed = False
     if stripped.startswith("[") and stripped.endswith("]"):
@@ -87,6 +88,7 @@ def _canonize_ip_expr(
     allow_loopback: bool = False,
     **kwargs: Any,
 ) -> str | None:
+
     candidate_text = _strip_ip_expr(value)
     if not candidate_text:
         return None
@@ -105,6 +107,7 @@ def _canonize_ip_expr(
 
 
 def _canonize_host_expr(endpoint_str: str, default_host: str) -> Tuple[str, int]:
+
     endpoint = _strip_ip_expr(endpoint_str)
     if not endpoint:
         return default_host, 0
@@ -155,6 +158,7 @@ def resolve_ip_expr(
     prefer_ipv6: bool | None = None,
     **kwargs: Any,
 ) -> str | None:
+
     host_text = _strip_ip_expr(host)
     if not host_text:
         return None
@@ -216,6 +220,7 @@ def validate_ip_expr(
     allow_hostname: bool = True,
     **kwargs: Any,
 ) -> str:
+
     if allow_hostname:
         literal = _strip_ip_expr(host)
     else:
@@ -232,6 +237,7 @@ def validate_ip_expr(
 
 
 def is_port_available(host: str, port: int) -> bool:
+
     literal_host = _canonize_ip_expr(host, allow_loopback=True)
     if not literal_host:
         return False
@@ -252,6 +258,7 @@ def get_available_host(
     default_host: str = "127.0.0.1",
     **kwargs: Any,
 ) -> str:
+
     if endpoint:
         normalized = _strip_ip_expr(endpoint)
         if normalized:
@@ -331,6 +338,7 @@ def get_preferred_ip(
     allow_loopback: bool = True,
     **kwargs: Any,
 ) -> str:
+
     names: List[str] = []
     if hostname:
         candidate = str(hostname).strip()
@@ -433,6 +441,7 @@ def initialize_master_addr(
     allow_loopback: bool = True,
     **kwargs: Any,
 ) -> tuple[str, int]:
+
     default_host = get_preferred_ip(
         allow_loopback=allow_loopback, prefer_ipv6=prefer_ipv6
     )
@@ -513,6 +522,7 @@ def joining(
     model: JoinableModel,
     optimizer: Optimizer | None = None,
 ) -> AbstractContextManager[None]:
+
     if Join is None:
         return contextlib.nullcontext()
 
@@ -531,6 +541,7 @@ def is_distributed() -> bool:
 
 
 def distributed_barrier(device: Optional[torch.device] = None) -> None:
+
     if not is_distributed():
         return
     try:
@@ -545,6 +556,7 @@ def distributed_broadcast(
     src: int = 0,
     **kwargs: Any,
 ) -> None:
+
     if not is_distributed():
         return
 
@@ -639,6 +651,7 @@ def to_fsdp(
     ignored_params: Sequence[torch.nn.Parameter] | None = None,
     **kwargs: Any,
 ) -> torch.nn.Module:
+
     sig = inspect.signature(fully_shard)
     params = sig.parameters
 

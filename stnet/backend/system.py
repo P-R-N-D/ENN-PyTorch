@@ -319,6 +319,7 @@ def new_dir(prefix: str) -> str:
 
 
 def get_dpa_backends() -> List[object]:
+
     names = _RUNTIME_CONFIG.sdpa_backends or []
     if not names:
         return []
@@ -414,7 +415,6 @@ def get_device(
     if te_first is not None:
         cfg.te_first = bool(te_first)
     if torch.cuda.is_available():
-        # 1 proc - 1 accelerator (LOCAL_RANK 우선)
         try:
             idx_env = int(os.environ.get("LOCAL_RANK", 0))
         except Exception:
@@ -511,6 +511,7 @@ def is_int8_supported(
 def is_int4_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
+
     dev = torch.device(device) if device is not None else get_device()
     if dev.type != "cuda" or not torch.cuda.is_available():
         return (False, f"INT4 requires CUDA (found {dev.type})")
@@ -542,6 +543,7 @@ def cpu_count() -> int:
 
 
 def num_accelerators() -> int:
+
     try:
         import torch
     except Exception:
@@ -625,6 +627,7 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
+
     threads = optimal_threads()
     try:
         import torch
@@ -1027,14 +1030,9 @@ def worker_init_pin(_: Any) -> None:
 def wrap_with_tlb(fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
     return get_tlb().new_thread(fn)
 class Memory:
-    """Static memory helpers with pinned Page/Pool for H2D and spill control."""
 
     @staticmethod
     def total() -> Optional[int]:
-        """
-        시스템 총 물리 메모리 바이트.
-        psutil / /proc/meminfo / platform API 순으로 조회, 실패 시 None.
-        """
         import sys
         try:
             import psutil
@@ -1071,14 +1069,6 @@ class Memory:
 
     @staticmethod
     def available() -> int:
-        """
-        효과적 '가용 바이트' 추정:
-          - 기본 OS 가용 메모리
-          - (Linux) cgroup v2/v1 한도
-          - (Windows) Job Object 메모리 한도
-          - (macOS/BSD/기타) rlimit (AS/DATA/RSS)
-        중 최솟값을 반환.
-        """
         base = Memory._sys_available()
         cgroup = Memory._linux_limit()
         winjob = Memory._windows_limit()
@@ -1325,7 +1315,6 @@ class Memory:
 
     @staticmethod
     def prefer_local_numa() -> bool:
-        """가능하면 현재 스레드의 NUMA 노드에 메모리 바인딩(실패해도 안전한 no-op)."""
 
         try:
             import numa
@@ -1359,7 +1348,6 @@ class Memory:
         return False
 
     class Page:
-        """Pinned CPU tensor storage; 다양한 shape로 view 제공."""
 
         __slots__ = ("_buf", "_numel", "_dtype")
 
@@ -1394,7 +1382,6 @@ class Memory:
             return self._buf[:needed].view(*shape)
 
     class Pool:
-        """핀드 Page 풀: busy/펜스(Event) 기반 재사용 제어."""
 
         class Token:
             __slots__ = ("i", "g")
@@ -1531,7 +1518,6 @@ class Memory:
                 self._scavenge()
 
     class Cache:
-        """비동기 스필 라이터 캐시: torch.save를 별도 스레드로 넘겨 I/O stall 방지."""
 
         def __init__(self, root: str, max_queue: int = 8):
             import os
