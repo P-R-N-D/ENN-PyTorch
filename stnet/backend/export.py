@@ -292,6 +292,7 @@ class CoreML(Format):
         is_required("coremltools", "pip install coremltools")
         serving_model = _prepare_serving_model(model)
         import coremltools as ct
+        from ..functional.fx import Gradient
 
         sample = _pad_sample(model, kwargs.get("sample_input"))
         wrapper = _CompatLayer(serving_model).eval()
@@ -409,6 +410,7 @@ class TorchScript(Format):
         sample = kwargs.get("sample_input")
         serving_model = _prepare_serving_model(model)
         wrapper = _CompatLayer(serving_model).eval()
+        from ..functional.fx import Gradient
 
         if method == "trace":
             if sample is None:
