@@ -61,7 +61,6 @@ except Exception:
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..data.pipeline import fetch
 from ..data.stats import Metadata
 from ..data.transforms import postprocess, preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
@@ -2070,6 +2069,8 @@ def infer(
 
 
 def main(*args: Any, **kwargs: Any) -> Optional[Root]:
+    from ..data.pipeline import fetch
+
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
     initialize_python_path()
