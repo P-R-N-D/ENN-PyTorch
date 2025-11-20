@@ -9,6 +9,9 @@ import torch
 from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 
+Number = Union[float, int]
+TensorLike = Union[Number, torch.Tensor]
+
 
 def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
@@ -119,21 +122,36 @@ def _nufft_nd(
 ) -> torch.Tensor:
     try:
         import cufinufft
-    except Exception as e:
+    except ImportError as e:
         raise RuntimeError("cuFINUFFT not available") from e
-    B = x_cplx.shape[0]
+
+    if not torch.is_complex(x_cplx):
+        raise TypeError("x_cplx must be a complex-valued tensor")
+
+    B = int(x_cplx.shape[0])
     ndim = len(shape)
-    out_list = []
+    out_list: List[torch.Tensor] = []
+
+    device = x_cplx.device
+    if device.type != "cuda":
+        raise RuntimeError(f"cuFINUFFT requires CUDA tensors, got device={device}")
+
+    dtype_str = "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
+
     if omega.dim() == 2:
         pts = [omega[i].contiguous() for i in range(ndim)]
         plan = cufinufft.Plan(
-            nufft_type, _to_tuple(shape), n_trans=1, eps=eps, dtype="complex64"
+            nufft_type,
+            _to_tuple(shape),
+            n_trans=1,
+            eps=eps,
+            dtype=dtype_str,
         )
         plan.setpts(*pts)
         for b in range(B):
-            fk = plan.execute(x_cplx[b])
-            out_list.append(fk.unsqueeze(0))
-    else:
+            fk = plan.execute(x_cplx[b].contiguous())
+            out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
+    elif omega.dim() == 3:
         for b in range(B):
             pts = [omega[b, i].contiguous() for i in range(ndim)]
             plan = cufinufft.Plan(
@@ -141,21 +159,28 @@ def _nufft_nd(
                 _to_tuple(shape),
                 n_trans=1,
                 eps=eps,
-                dtype="complex64",
+                dtype=dtype_str,
             )
             plan.setpts(*pts)
-            fk = plan.execute(x_cplx[b])
-            out_list.append(fk.unsqueeze(0))
+            fk = plan.execute(x_cplx[b].contiguous())
+            out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
+    else:
+        raise ValueError(
+            f"omega must have shape (ndim, npts) or (B, ndim, npts), got {omega.shape}"
+        )
+
     return torch.cat(out_list, dim=0)
 
 
 def expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:
+    if mask.shape == prediction.shape:
+        return mask
     try:
-        if mask.shape != prediction.shape:
-            mask = mask.expand_as(prediction)
-    except Exception:
-        pass
-    return mask
+        return mask.expand_as(prediction)
+    except RuntimeError as e:
+        raise ValueError(
+            f"Mask shape {mask.shape} cannot be broadcast to prediction shape {prediction.shape}"
+        ) from e
 
 
 class MultipleQuantileLoss(nn.Module):
@@ -213,10 +238,7 @@ class MultipleQuantileLoss(nn.Module):
         return (per_q * self.w).sum()
 
 
-class StandardNormalLoss(nn.Module):
-    _Number = Union[float, int]
-    _TensorLike = Union[_Number, torch.Tensor]
-
+class DistributionLoss(nn.Module):
     def __init__(
         self,
         *args: Any,
@@ -229,9 +251,9 @@ class StandardNormalLoss(nn.Module):
         eps: float = 1e-06,
         reduction: str = "mean",
         mu_mode: str = "target",
-        mu: Optional[_TensorLike] = None,
+        mu: Optional[TensorLike] = None,
         std_mode: str = "target",
-        std: Optional[_TensorLike] = None,
+        std: Optional[TensorLike] = None,
         two_tailed: bool = True,
         ddof: int = 0,
         clamp_max: Optional[float] = None,
@@ -239,19 +261,13 @@ class StandardNormalLoss(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        assert 0.0 < confidence < 1.0
-        assert metric.lower() in {
-            "z",
-            "z_score",
-            "z_value",
-            "zscore",
-            "zvalue",
-            "p",
-            "p_value",
-            "pvalue",
-        }
-        assert penalty.lower() in {"hinge", "tau", "soft", "softplus"}
-        assert reduction.lower() in {"mean", "sum", "none"}
+        if not (0.0 < confidence < 1.0):
+            raise ValueError(f"confidence must be in (0,1), got {confidence}")
+        if penalty.lower() not in {"hinge", "tau", "soft", "softplus"}:
+            raise ValueError(f"invalid penalty={penalty}")
+        if reduction.lower() not in {"mean", "sum", "none"}:
+            raise ValueError(f"invalid reduction={reduction}")
+
         self.confidence = float(confidence)
         self.metric = metric.lower()
         self.penalty = penalty.lower()
@@ -268,10 +284,9 @@ class StandardNormalLoss(nn.Module):
         self.ddof = int(ddof)
         self.clamp_max = clamp_max
         self.detach_stats = bool(detach_stats)
-        self._std_normal = Normal(loc=0.0, scale=1.0)
 
     @staticmethod
-    def _to_tensor_like(x: _TensorLike, ref: torch.Tensor) -> torch.Tensor:
+    def _to_tensor_like(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
         if torch.is_tensor(x):
             t = x.to(device=ref.device, dtype=ref.dtype)
         else:
@@ -279,8 +294,8 @@ class StandardNormalLoss(nn.Module):
         return t
 
     @staticmethod
-    def _expand_params(x: _TensorLike, ref: torch.Tensor) -> torch.Tensor:
-        t = StandardNormalLoss._to_tensor_like(x, ref)
+    def _expand_params(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
+        t = DistributionLoss._to_tensor_like(x, ref)
         if t.ndim < ref.ndim:
             t = t.view(*[1] * (ref.ndim - t.ndim), *t.shape)
         return t
@@ -313,12 +328,17 @@ class StandardNormalLoss(nn.Module):
                 mu = target.mean(dim=dims, keepdim=True)
             case "pred":
                 mu = pred.mean(dim=dims, keepdim=True)
+            case "pooled":
+                mu = 0.5 * (
+                    target.mean(dim=dims, keepdim=True)
+                    + pred.mean(dim=dims, keepdim=True)
+                )
             case "error":
                 mu = (pred - target).mean(dim=dims, keepdim=True)
             case "provided":
                 if self.mu is None:
-                    raise ValueError("mu required")
-                mu = self._expand_params(self.mu, pred)
+                    raise ValueError("mu required when mu_mode='provided'")
+                mu = DistributionLoss._expand_params(self.mu, pred)
             case "none":
                 mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
             case _:
@@ -332,12 +352,20 @@ class StandardNormalLoss(nn.Module):
     ) -> torch.Tensor:
         match self.std_mode:
             case "target":
-                std = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = DistributionLoss._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pred":
-                std = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = DistributionLoss._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
             case "pooled":
-                std_t = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-                std_p = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                std_t = DistributionLoss._safe_std(
+                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                )
+                std_p = DistributionLoss._safe_std(
+                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                )
                 std = torch.sqrt(
                     torch.clamp(
                         0.5 * (std_t**2 + std_p**2),
@@ -346,8 +374,8 @@ class StandardNormalLoss(nn.Module):
                 )
             case "provided":
                 if self.std is None:
-                    raise ValueError("std required")
-                std = self._expand_params(self.std, pred)
+                    raise ValueError("std required when std_mode='provided'")
+                std = DistributionLoss._expand_params(self.std, pred)
                 if self.detach_stats:
                     std = std.detach()
                 return torch.clamp(std, min=self.eps)
@@ -359,9 +387,34 @@ class StandardNormalLoss(nn.Module):
             std = std.detach()
         return torch.clamp(std, min=self.eps)
 
-    def _z_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
-        q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
-        return self._std_normal.icdf(torch.tensor(q, device=device, dtype=dtype))
+    def _statistic_abs(
+        self, pred: torch.Tensor, target: torch.Tensor, mu: torch.Tensor, std: torch.Tensor
+    ) -> torch.Tensor:
+        return ((pred - target - mu) / std).abs()
+
+    def _compute_margin(
+        self,
+        stat_abs: torch.Tensor,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _apply_penalty(self, margin: torch.Tensor) -> torch.Tensor:
+        match self.penalty:
+            case "hinge":
+                pen = torch.clamp(margin, min=0.0).pow(self.hinge_power)
+            case "tau":
+                tau = max(self.tau, self.eps)
+                pen = torch.nn.functional.softplus(margin / tau) * tau
+            case "soft" | "softplus":
+                beta = max(self.tau, self.eps)
+                pen = torch.nn.functional.softplus(beta * margin) / beta
+            case _:
+                raise ValueError("Invalid penalty")
+        return pen
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if pred.shape != target.shape:
@@ -369,12 +422,85 @@ class StandardNormalLoss(nn.Module):
         dims = self._dims(pred)
         mu = self.compute_mu(pred, target, dims)
         std = self.compute_std(pred, target, dims)
-        z_abs = ((pred - target - mu) / std).abs()
+        stat_abs = self._statistic_abs(pred, target, mu, std)
         if self.clamp_max is not None:
-            z_abs = torch.clamp(z_abs, max=float(self.clamp_max))
+            stat_abs = torch.clamp(stat_abs, max=float(self.clamp_max))
+        margin = self._compute_margin(stat_abs, pred, target, mu, std)
+        pen = self._apply_penalty(margin)
+        return self.reduce(pen)
+
+
+class StandardNormalLoss(DistributionLoss):
+    def __init__(
+        self,
+        *args: Any,
+        confidence: float = 0.95,
+        metric: str = "p_value",
+        penalty: str = "soft",
+        tau: float = 2.0,
+        hinge_power: float = 2.0,
+        dim: Optional[Tuple[int, ...]] = None,
+        eps: float = 1e-06,
+        reduction: str = "mean",
+        mu_mode: str = "target",
+        mu: Optional[TensorLike] = None,
+        std_mode: str = "target",
+        std: Optional[TensorLike] = None,
+        two_tailed: bool = True,
+        ddof: int = 0,
+        clamp_max: Optional[float] = None,
+        detach_stats: bool = True,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            confidence=confidence,
+            metric=metric,
+            penalty=penalty,
+            tau=tau,
+            hinge_power=hinge_power,
+            dim=dim,
+            eps=eps,
+            reduction=reduction,
+            mu_mode=mu_mode,
+            mu=mu,
+            std_mode=std_mode,
+            std=std,
+            two_tailed=two_tailed,
+            ddof=ddof,
+            clamp_max=clamp_max,
+            detach_stats=detach_stats,
+            **kwargs,
+        )
+        valid = {
+            "z",
+            "z_score",
+            "z_value",
+            "zscore",
+            "zvalue",
+            "p",
+            "p_value",
+            "pvalue",
+        }
+        if self.metric not in valid:
+            raise ValueError(f"Invalid metric for StandardNormalLoss: {self.metric}")
+        self._std_normal = Normal(loc=0.0, scale=1.0)
+
+    def _z_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
+        q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
+        return self._std_normal.icdf(torch.tensor(q, device=device, dtype=dtype))
+
+    def _compute_margin(
+        self,
+        stat_abs: torch.Tensor,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
+        z_abs = stat_abs
         match self.metric:
             case "z" | "z_score" | "z_value" | "zscore" | "zvalue":
-                margin = z_abs - self._z_threshold(pred.device, pred.dtype)
+                return z_abs - self._z_threshold(pred.device, pred.dtype)
             case "p" | "p_value" | "pvalue":
                 x = z_abs
                 try:
@@ -393,26 +519,14 @@ class StandardNormalLoss(nn.Module):
                     )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
                 alpha = max(1.0 - self.confidence, self.eps)
-                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
+                return -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
             case _:
                 raise ValueError("Invalid metric")
-        match self.penalty:
-            case "hinge":
-                pen = torch.clamp(margin, min=0.0).pow(self.hinge_power)
-            case "tau":
-                tau = max(self.tau, self.eps)
-                pen = torch.nn.functional.softplus(margin / tau) * tau
-            case "soft" | "softplus":
-                beta = max(self.tau, self.eps)
-                pen = torch.nn.functional.softplus(beta * margin) / beta
-            case _:
-                raise ValueError("Invalid penalty")
-        return self.reduce(pen)
 
 
-class StudentsTLoss(nn.Module):
-    _Number = Union[float, int]
-    _TensorLike = Union[_Number, torch.Tensor]
+class StudentsTLoss(DistributionLoss):
+    _Number = Number
+    _TensorLike = TensorLike
 
     def __init__(
         self,
@@ -436,9 +550,27 @@ class StudentsTLoss(nn.Module):
         detach_stats: bool = True,
         **kwargs: Any,
     ) -> None:
-        super().__init__()
-        assert 0.0 < confidence < 1.0
-        assert metric.lower() in {
+        self.df = df
+        super().__init__(
+            confidence=confidence,
+            metric=metric,
+            penalty=penalty,
+            tau=tau,
+            hinge_power=hinge_power,
+            dim=dim,
+            eps=eps,
+            reduction=reduction,
+            mu_mode=mu_mode,
+            mu=mu,
+            std_mode=std_mode,
+            std=std,
+            two_tailed=two_tailed,
+            ddof=ddof,
+            clamp_max=clamp_max,
+            detach_stats=detach_stats,
+            **kwargs,
+        )
+        valid = {
             "t",
             "t_score",
             "t_value",
@@ -448,25 +580,9 @@ class StudentsTLoss(nn.Module):
             "p_value",
             "pvalue",
         }
-        assert penalty.lower() in {"hinge", "tau", "soft", "softplus"}
-        assert reduction.lower() in {"mean", "sum", "none"}
-        self.confidence = float(confidence)
-        self.metric = metric.lower()
-        self.penalty = penalty.lower()
-        self.tau = float(tau)
-        self.hinge_power = float(hinge_power)
-        self.dim = dim
-        self.eps = float(eps)
-        self.reduction = reduction.lower()
-        self.mu_mode = mu_mode.lower()
-        self.mu = mu
-        self.std_mode = std_mode.lower()
-        self.std = std
+        if self.metric not in valid:
+            raise ValueError(f"Invalid metric for StudentsTLoss: {self.metric}")
         self.df = df
-        self.two_tailed = bool(two_tailed)
-        self.ddof = int(ddof)
-        self.clamp_max = clamp_max
-        self.detach_stats = bool(detach_stats)
 
     @staticmethod
     def _to_tensor_like(x: _TensorLike, ref: torch.Tensor) -> torch.Tensor:
@@ -483,88 +599,12 @@ class StudentsTLoss(nn.Module):
             t = t.view(*[1] * (ref.ndim - t.ndim), *t.shape)
         return t
 
-    @staticmethod
-    def _safe_std(
-        x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
-    ) -> torch.Tensor:
-        return _coerce_std(x, dim, ddof, eps)
-
-    def reduce(self, x: torch.Tensor) -> torch.Tensor:
-        match self.reduction:
-            case "mean":
-                return x.mean()
-            case "sum":
-                return x.sum()
-            case "none":
-                return x
-        return x
-
     def _dims(self, pred: torch.Tensor) -> Tuple[int, ...]:
         if self.dim is None:
             if pred.ndim <= 1:
                 return tuple()
             return tuple(range(1, pred.ndim))
         return self.dim
-
-    def compute_mu(
-        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
-    ) -> torch.Tensor:
-        dims = _canonize_dims(pred, dims)
-        match self.mu_mode:
-            case "target":
-                mu = target.mean(dim=dims, keepdim=True)
-            case "pred":
-                mu = pred.mean(dim=dims, keepdim=True)
-            case "pooled":
-                mu = 0.5 * (
-                    target.mean(dim=dims, keepdim=True)
-                    + pred.mean(dim=dims, keepdim=True)
-                )
-            case "provided":
-                if self.mu is None:
-                    raise ValueError("mu required when mu_mode='provided'")
-                mu = self._expand_params(self.mu, pred)
-            case "error":
-                mu = (pred - target).mean(dim=dims, keepdim=True)
-            case "none":
-                mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
-            case _:
-                raise ValueError("invalid mu_mode")
-        if self.detach_stats:
-            mu = mu.detach()
-        return mu
-
-    def compute_std(
-        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
-    ) -> torch.Tensor:
-        match self.std_mode:
-            case "target":
-                std = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-            case "pred":
-                std = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
-            case "pooled":
-                std_t = self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-                std_p = self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
-                std = torch.sqrt(
-                    torch.clamp(
-                        0.5 * (std_t**2 + std_p**2),
-                        min=self.eps * self.eps,
-                    )
-                )
-            case "provided":
-                if self.std is None:
-                    raise ValueError("std required when std_mode='provided'")
-                std = self._expand_params(self.std, pred)
-                if self.detach_stats:
-                    std = std.detach()
-                return torch.clamp(std, min=self.eps)
-            case "none":
-                std = torch.ones(1, device=pred.device, dtype=pred.dtype)
-            case _:
-                raise ValueError("invalid std_mode")
-        if self.detach_stats:
-            std = std.detach()
-        return torch.clamp(std, min=self.eps)
 
     def _t_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
@@ -586,18 +626,18 @@ class StudentsTLoss(nn.Module):
                 hi = torch.where(mask, hi, mid)
             return hi
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        if pred.shape != target.shape:
-            raise ValueError("shape mismatch")
-        dims = self._dims(pred)
-        mu = self.compute_mu(pred, target, dims)
-        std = self.compute_std(pred, target, dims)
-        t_abs = ((pred - target - mu) / std).abs()
-        if self.clamp_max is not None:
-            t_abs = torch.clamp(t_abs, max=float(self.clamp_max))
+    def _compute_margin(
+        self,
+        stat_abs: torch.Tensor,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
+        t_abs = stat_abs
         match self.metric:
             case "t" | "t_score" | "t_value" | "tscore" | "tvalue":
-                margin = t_abs - self._t_threshold(pred.device, pred.dtype)
+                return t_abs - self._t_threshold(pred.device, pred.dtype)
             case "p" | "p_value" | "pvalue":
                 df = self._expand_params(self.df, t_abs)
                 df_safe = torch.clamp(df, min=2.0 + self.eps)
@@ -617,21 +657,9 @@ class StudentsTLoss(nn.Module):
                     )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
                 alpha = max(1.0 - self.confidence, self.eps)
-                margin = -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
+                return -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
             case _:
                 raise ValueError("Invalid metric")
-        match self.penalty:
-            case "hinge":
-                pen = torch.clamp(margin, min=0.0).pow(self.hinge_power)
-            case "tau":
-                tau = max(self.tau, self.eps)
-                pen = torch.nn.functional.softplus(margin / tau) * tau
-            case "soft" | "softplus":
-                beta = max(self.tau, self.eps)
-                pen = torch.nn.functional.softplus(beta * margin) / beta
-            case _:
-                raise ValueError("Invalid penalty")
-        return self.reduce(pen)
 
 
 class DataFidelityLoss(nn.Module):
@@ -719,21 +747,24 @@ class DataFidelityLoss(nn.Module):
                                 nufft_type=2,
                                 eps=self.nufft_eps,
                             )
-                        except Exception:
-                            Xk = _fft_nd(
-                                x.to(torch.complex64),
-                                shape,
-                                real_input=False,
-                                inverse=False,
-                                norm=self.fft_norm,
-                            )
-                            Yk = _fft_nd(
-                                y.to(torch.complex64),
-                                shape,
-                                real_input=False,
-                                inverse=False,
-                                norm=self.fft_norm,
-                            )
+                        except RuntimeError as e:
+                            if "cuFINUFFT not available" in str(e) or "requires CUDA tensors" in str(e):
+                                Xk = _fft_nd(
+                                    x.to(torch.complex64),
+                                    shape,
+                                    real_input=False,
+                                    inverse=False,
+                                    norm=self.fft_norm,
+                                )
+                                Yk = _fft_nd(
+                                    y.to(torch.complex64),
+                                    shape,
+                                    real_input=False,
+                                    inverse=False,
+                                    norm=self.fft_norm,
+                                )
+                            else:
+                                raise
                     case "finufft":
                         raise NotImplementedError(
                             (
@@ -755,28 +786,46 @@ class LinearCombinationLoss(nn.Module):
         loss: Sequence[nn.Module],
         *args: Any,
         offset: float = 0.0,
+        reduce_each: bool = True,
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        if not (
-            isinstance(coefficient, (list, tuple)) and isinstance(loss, (list, tuple))
-        ):
-            raise TypeError("coefficient/loss must be sequences")
-        if len(coefficient) != len(loss) or len(loss) == 0:
-            raise ValueError("invalid coefficient/loss length")
-        self.register_buffer(
-            "coefficient", torch.tensor(list(coefficient), dtype=torch.float32)
-        )
+        if not isinstance(coefficient, Sequence):
+            raise TypeError(f"coefficient must be a Sequence, got {type(coefficient)}")
+        if not isinstance(loss, Sequence):
+            raise TypeError(f"loss must be a Sequence[nn.Module], got {type(loss)}")
+        if len(coefficient) == 0 or len(coefficient) != len(loss):
+            raise ValueError(
+                f"invalid coefficient/loss length: "
+                f"len(coefficient)={len(coefficient)}, len(loss)={len(loss)}"
+            )
+
+        coeff_tensor = torch.as_tensor(coefficient, dtype=torch.float32)
+        if coeff_tensor.ndim != 1 or coeff_tensor.numel() != len(loss):
+            raise ValueError(
+                f"coefficient must be 1D of length {len(loss)}, got shape {coeff_tensor.shape}"
+            )
+
+        self.register_buffer("coefficient", coeff_tensor)
         self.losses = nn.ModuleList(list(loss))
         self.offset = float(offset)
+        self.reduce_each = bool(reduce_each)
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        weights = self.coefficient.to(device=pred.device, dtype=pred.dtype)
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
-        for w, L in zip(self.coefficient, self.losses):
+
+        for w, L in zip(weights, self.losses):
             v = L(pred, target)
-            if v.dim() > 0:
+            if not torch.is_tensor(v):
+                raise TypeError(
+                    f"Loss module {L.__class__.__name__} must return a Tensor, "
+                    f"got {type(v)}"
+                )
+            if self.reduce_each and v.dim() > 0:
                 v = v.mean()
-            total = total + w.to(device=pred.device, dtype=pred.dtype) * v
+            total = total + w * v
+
         return total
 
 
@@ -859,17 +908,22 @@ class TiledLoss(nn.Module):
             mv = mask[tuple(sl)] if mask is not None else None
             elem = self.base(pv, tv)
             if self.reduction == "none":
-                parts.append(elem if mv is None else elem.masked_select(mv))
+                flat = elem.reshape(-1)
+                if mv is not None:
+                    flat_mask = mv.reshape(-1)
+                    flat = flat[flat_mask]
+                parts.append(flat)
             elif mv is not None:
-                total_sum = total_sum + elem.masked_select(mv).sum()
-                total_count = total_count + mv.to(dtype=pred.dtype).sum()
+                selected = elem.masked_select(mv)
+                total_sum = total_sum + selected.sum()
+                total_count = total_count + selected.numel()
             else:
                 total_sum = total_sum + elem.sum()
                 total_count = total_count + elem.numel()
             start = end
         match self.reduction:
             case "none":
-                return torch.cat(parts, dim=td) if parts else pred.new_zeros(())
+                return torch.cat(parts, dim=0) if parts else pred.new_zeros(())
             case "sum":
                 return total_sum
             case "mean":

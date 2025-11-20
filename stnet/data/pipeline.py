@@ -6,6 +6,8 @@ import random
 from functools import partial
 from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
 
+TensorLike = Any
+
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
@@ -24,7 +26,19 @@ from .nodes import (
     Sampler,
     SourceSpec,
 )
-from typing import Mapping as _Mapping
+
+
+def _sync_device(device: torch.device) -> None:
+    dev_t = getattr(device, "type", "cpu")
+    try:
+        if dev_t == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(device=device)
+        elif dev_t == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.synchronize()
+        elif dev_t == "mps" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            torch.mps.synchronize()
+    except Exception:
+        pass
 
 
 def _sample_size(
@@ -44,7 +58,9 @@ def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Seque
     dev_t = getattr(_device, "type", "cpu")
     if dev_t == "cuda":
         try:
-            free, _ = torch.cuda.mem_get_info(_device)
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA not available")
+            free, _ = torch.cuda.mem_get_info(device=_device)
             if _sample_bytes > 0:
                 capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
         except Exception:
@@ -93,14 +109,6 @@ def _h2d_counter(
     N = int(_x_cpu.shape[0])
     bs = max(1, min(int(_bs), N))
 
-    def _sync():
-        if _device.type == "cuda":
-            torch.cuda.synchronize()
-        elif _device.type == "xpu":
-            torch.xpu.synchronize()
-        elif _device.type == "mps":
-            torch.mps.synchronize()
-
     times = []
     for s in range(_steps + _warmup):
         start = 0
@@ -114,17 +122,24 @@ def _h2d_counter(
         ybp = None
         if yb is not None:
             ybp = yb if (hasattr(yb, "is_pinned") and yb.is_pinned()) else (yb.pin_memory() if _device.type in {"cuda", "xpu"} else yb)
-        _sync()
-        t0 = torch.cuda.Event(enable_timing=True) if _device.type == "cuda" else None
+        _sync_device(_device)
+        t0 = None
+        t1 = None
+        if _device.type == "cuda" and torch.cuda.is_available():
+            try:
+                t0 = torch.cuda.Event(enable_timing=True)
+                t1 = torch.cuda.Event(enable_timing=True)
+            except Exception:
+                t0 = None
         if t0 is not None:
-            t1 = torch.cuda.Event(enable_timing=True)
-            t0.record()
-            _ = xbp.to(_device, non_blocking=True)
-            if ybp is not None:
-                _ = ybp.to(_device, non_blocking=True)
-            t1.record()
-            _sync()
-            ms = float(t0.elapsed_time(t1))
+            with torch.cuda.device(_device):
+                t0.record()
+                _ = xbp.to(_device, non_blocking=True)
+                if ybp is not None:
+                    _ = ybp.to(_device, non_blocking=True)
+                t1.record()
+                _sync_device(_device)
+                ms = float(t0.elapsed_time(t1))
         else:
             import time as _t
 
@@ -132,7 +147,7 @@ def _h2d_counter(
             _ = xbp.to(_device, non_blocking=True)
             if ybp is not None:
                 _ = ybp.to(_device, non_blocking=True)
-            _sync()
+            _sync_device(_device)
             tns1 = _t.perf_counter_ns()
             ms = (tns1 - tns0) / 1e6
         if s >= _warmup:
@@ -149,16 +164,24 @@ def _batch_interval(
     _tmin_ms: float = 0.8,
     _tmax_ms: float = 3.0,
 ) -> Tuple[int, float]:
+    if len(_ds) <= 0:
+        return (1, 0.0)
     probe = _ds.get(0, min(8, len(_ds)))
     x_cpu = probe["X"]
     y_cpu = probe.get("Y", None)
+    if not isinstance(x_cpu, torch.Tensor):
+        x_cpu = torch.as_tensor(x_cpu)
+    if y_cpu is not None and not isinstance(y_cpu, torch.Tensor):
+        y_cpu = torch.as_tensor(y_cpu)
     sbytes = _sample_size(x_cpu, y_cpu)
     if sbytes <= 0:
         return (max(1, min(256, len(_ds))), 0.0)
     B_cap = 1 << 16
     if _dev.type == "cuda":
         try:
-            free, _ = torch.cuda.mem_get_info(_dev)
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA not available")
+            free, _ = torch.cuda.mem_get_info(device=_dev)
             cap = int(free * 0.90)
             B_cap = max(1, int(cap // max(1, sbytes * 4)))
         except Exception:
@@ -222,7 +245,7 @@ def _batch_interval(
 
 
 def _is_source_spec(obj: Any) -> bool:
-    if not isinstance(obj, _Mapping):
+    if not isinstance(obj, Mapping):
         return False
     if "kind" not in obj or "path" not in obj:
         return False
@@ -241,6 +264,9 @@ def dataset(
     val_frac: float = 0.0,
     **kwargs: Any,
 ) -> "Dataset":
+    if not isinstance(source, Mapping):
+        raise TypeError(f"dataset expects a SourceSpec mapping, got {type(source)}")
+
     kind = str(source.get("kind"))
     if kind != "memmap":
         raise ValueError(f"Unsupported source kind: {kind!r}")
@@ -395,7 +421,6 @@ def fetch(
     device_obj = (
         torch.device(device) if not isinstance(device, torch.device) else device
     )
-
     hints = optimize_threads()
     io_workers = max(1, int(hints.get("num_workers", 1)))
     prebatch = max(1, int(hints.get("prebatch", max(1, io_workers * 2))))

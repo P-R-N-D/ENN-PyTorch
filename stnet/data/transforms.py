@@ -27,8 +27,14 @@ def _preprocess_x(x_tuple: Any) -> torch.Tensor:
             f"Invalid value={x_tuple!r}"
         ) from exc
     for value in values:
-        if not math.isfinite(value):
-            raise ValueError("preprocess: feature tuples must be finite")
+        try:
+            if not math.isfinite(value):
+                raise ValueError("preprocess: feature tuples must be finite")
+        except TypeError as exc:
+            raise TypeError(
+                "preprocess: feature tuples must contain only numeric finite values. "
+                f"Invalid value={value!r}"
+            ) from exc
     tensor = torch.as_tensor(values, dtype=torch.float64)
     return _assert_finites(tensor, "feature")
 
@@ -45,24 +51,25 @@ def _preprocess_batch(
                 continue
             with suppress(Exception):
                 candidate = getattr(x_value, attr)()
-            if candidate is not None:
+            if isinstance(candidate, torch.Tensor):
                 feature_tensor = candidate
-                if isinstance(feature_tensor, torch.Tensor):
-                    break
                 break
         if not isinstance(feature_tensor, torch.Tensor):
-            try:
+            with suppress(Exception):
                 feature_tensor = torch.as_tensor(x_value)
-            except Exception:
-                feature_tensor = None
     if not isinstance(feature_tensor, torch.Tensor):
         return None
+
     try:
         label_tensor = to_torch_tensor(y_value)
     except Exception:
         return None
     if not isinstance(label_tensor, torch.Tensor):
+        with suppress(Exception):
+            label_tensor = torch.as_tensor(y_value)
+    if not isinstance(label_tensor, torch.Tensor):
         return None
+
     feature_tensor = _assert_finites(
         feature_tensor.detach().to(dtype=torch.float64), "feature"
     )
@@ -74,8 +81,7 @@ def _preprocess_batch(
         batch_dim = int(feature_tensor.shape[0]) if feature_tensor.shape else 1
         feature_tensor = feature_tensor.reshape(batch_dim, -1)
     batch_size = int(feature_tensor.shape[0])
-    label_tensor = label_tensor.detach()
-    label_tensor = _assert_finites(label_tensor, "label")
+    label_tensor = _assert_finites(label_tensor.detach(), "label")
     if label_tensor.dim() == 0:
         label_tensor = label_tensor.unsqueeze(0)
     if label_tensor.dim() == 1 and label_tensor.shape[0] == batch_size:
@@ -88,7 +94,10 @@ def _preprocess_batch(
 
 
 def _preprocess_y(value: Any) -> torch.Tensor:
-    tensor = to_torch_tensor(value)
+    try:
+        tensor = to_torch_tensor(value)
+    except Exception:
+        tensor = None
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(value)
     return tensor.detach()
@@ -113,6 +122,8 @@ def preprocess(
             )
         if labels.ndim == 1:
             labels = labels.unsqueeze(0)
+        if labels.shape[0] != feats.shape[0]:
+            raise ValueError("preprocess(TensorDict): features and labels batch mismatch")
         label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
         keys = [(int(i),) for i in range(int(feats.shape[0]))]
         return (feats, labels, keys, label_shape)

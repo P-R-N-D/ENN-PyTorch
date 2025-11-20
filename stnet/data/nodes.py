@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import random
 import threading
 from contextlib import suppress
@@ -23,6 +22,8 @@ from typing import (
 import torch
 
 from ..backend.system import wrap_with_tlb, get_tlb
+
+TensorLike = Any
 
 try:
     from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
@@ -60,7 +61,7 @@ from .datatype import to_platform_dtype
 from ..functional.fx import Gradient as FxGradient
 
 
-def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> Any:
+def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = True) -> TensorLike:
     if isinstance(batch, torch.Tensor):
         return batch.to(device, non_blocking=non_blocking)
     if isinstance(batch, Mapping):
@@ -74,6 +75,24 @@ def _to_device(batch: Any, device: torch.device, non_blocking: bool = True) -> A
 class Dataset(_Sampler):
     _scale: float = 1.0
     _per_sample_mem_bytes: int = 0
+
+    @staticmethod
+    def _dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
+        try:
+            return getattr(torch, str(name))
+        except Exception:
+            return default
+
+    @classmethod
+    def _load_meta(cls, memmap_dir: str) -> Mapping[str, Any]:
+        meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if not isinstance(meta, Mapping):
+            raise ValueError(f"meta.json under {memmap_dir} must contain a mapping")
+        return meta
 
     @classmethod
     def request_scale_up(cls, factor: float) -> None:
@@ -93,13 +112,12 @@ class Dataset(_Sampler):
     ) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
-        self._meta: Optional[Mapping[str, Any]] = None
-        meta_path = os.path.join(self.dir, "meta.json")
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(f"meta.json not found under: {self.dir}")
-        with open(meta_path, "r", encoding="utf-8") as f:
-            self._meta = json.load(f)
+        self._meta: Mapping[str, Any] = self._load_meta(self.dir)
+
         self._N = int(self._meta.get("N", 0))
+        if self._N <= 0:
+            raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
+
         feat_rel = str(self._meta.get("features_path", "features.mmt"))
         lab_rel = str(self._meta.get("labels_path", "labels.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
@@ -107,16 +125,10 @@ class Dataset(_Sampler):
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
 
-        def _dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
-            try:
-                return getattr(torch, str(name))
-            except Exception:
-                return default
-
-        f_dtype = _dtype_from_name(
+        f_dtype = self._dtype_from_name(
             self._meta.get("features_dtype", "float64"), torch.float64
         )
-        l_dtype = _dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
+        l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
@@ -137,6 +149,7 @@ class Dataset(_Sampler):
         self._shard_id = 0
         self._key = ""
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
+
         self._perm: Optional[torch.Tensor] = None
         self._perm_source: Optional[Literal["runtime", "metadata"]] = None
         perm_fn = (self._meta or {}).get("perm_filename", None)
@@ -208,6 +221,8 @@ class Dataset(_Sampler):
         return dict(self._meta or {})
 
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
+        start = int(start)
+        end = int(end)
         if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
             idx = self._perm[start:end]
             if idx.numel() == 0:
@@ -440,6 +455,8 @@ def preload_memmap(
     seed: int | None = None,
     **kwargs: Any,
 ) -> None:
+    if not isinstance(data, Mapping):
+        raise TypeError("preload_memmap expects a Mapping with 'features' and 'labels'")
     if "features" not in data or "labels" not in data:
         raise ValueError("preload_memmap expects 'features' and 'labels'")
 
@@ -708,7 +725,16 @@ class Connector:
 
 class Loader:
     @staticmethod
-    def compose(source: "BaseNode", *args: Any, device: torch.device, prefetch_factor: int = 2, non_blocking: bool = True, length: Optional[int] = None, pin_memory: Optional[bool] = None, **kwargs: Any) -> "Loader":
+    def compose(
+        source: "BaseNode",
+        *args: Any,
+        device: torch.device,
+        prefetch_factor: int = 2,
+        non_blocking: bool = True,
+        length: Optional[int] = None,
+        pin_memory: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> "Loader":
 
         dev = device if isinstance(device, torch.device) else torch.device(device)
         node = source
@@ -791,8 +817,11 @@ class Loader:
     def __len__(self) -> int:
         if self._length is not None:
             return int(self._length)
+        iterable = getattr(self, "_iterable", None)
+        if iterable is None:
+            return 1
         try:
-            return 1 if self._length is None else int(self._length)
+            return int(len(iterable))
         except Exception:
             return 1
 
