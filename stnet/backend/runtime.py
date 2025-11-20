@@ -76,8 +76,7 @@ from ..functional.optimizers import (
     StochasticWeightAverage,
     stochastic_weight_average,
 )
-from ..model import Root
-from ..model.layers import StudentsT
+from ..model.layers import Root, StudentsT
 from .compat import (
     cudagraph_step_end,
     is_meta_or_fake_tensor,
