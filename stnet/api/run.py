@@ -33,7 +33,7 @@ except ImportError:
 
 from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess
-from ..model import Root
+from ..model.layers import Root
 from .config import (
     ModelConfig,
     OpsMode,
