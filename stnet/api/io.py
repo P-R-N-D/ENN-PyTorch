@@ -30,8 +30,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..functional.fx import Fusion
-from ..model import Root
 from .config import ModelConfig, coerce_model_config
 
 
@@ -92,6 +90,9 @@ def new_model(
     *,
     wrap: bool = True,
 ) -> nn.Module:
+    from ..functional.fx import Fusion
+    from ..model import Root
+    
     cfg = coerce_model_config(config)
     core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     if not wrap:
