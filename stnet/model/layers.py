@@ -379,13 +379,10 @@ class PowerTransform(nn.Module):
         )
 
     def _bc(self, x: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-        v_expanded = v.view(1, -1).to(device=x.device)
-        if torch.is_floating_point(v_expanded):
-            target_dtype = torch.float64 if (
-                x.dtype == torch.float64 or v_expanded.dtype == torch.float64
-            ) else x.dtype
-            v_expanded = v_expanded.to(dtype=target_dtype)
-        return v_expanded.expand_as(x)
+        v = v.to(device=x.device)
+        if v.ndim == 1:
+            v = v.view(1, -1)
+        return v.expand_as(x)
 
     def _yj(self, x: torch.Tensor) -> torch.Tensor:
         lam = self._bc(x, self.lmbda.to(x.dtype))
