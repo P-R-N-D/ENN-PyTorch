@@ -399,7 +399,7 @@ class Dataset(_Sampler):
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
         from ..functional.fx import Gradient as FxGradient
-        
+
         s = int(start)
         e = int(end)
         n = max(0, e - s)

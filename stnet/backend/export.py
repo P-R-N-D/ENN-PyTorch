@@ -15,7 +15,6 @@ import torch
 from torch import nn
 
 from ..api.io import Format
-from ..functional.fx import Gradient
 
 
 def _in_console(cmd: Sequence[str], desc: str) -> None:
@@ -62,6 +61,8 @@ def _get_tensor_shape(
         except (TypeError, ValueError):
             out_shape = None
     if (in_dim is None or out_shape is None) and sample_input is not None:
+        from ..functional.fx import Gradient
+
         dev = next(
             (p.device for p in model.parameters() if p is not None), torch.device("cpu")
         )
@@ -291,6 +292,7 @@ class CoreML(Format):
         is_required("coremltools", "pip install coremltools")
         serving_model = _prepare_serving_model(model)
         import coremltools as ct
+        from ..functional.fx import Gradient
 
         sample = _pad_sample(model, kwargs.get("sample_input"))
         wrapper = _CompatLayer(serving_model).eval()
@@ -408,6 +410,7 @@ class TorchScript(Format):
         sample = kwargs.get("sample_input")
         serving_model = _prepare_serving_model(model)
         wrapper = _CompatLayer(serving_model).eval()
+        from ..functional.fx import Gradient
 
         if method == "trace":
             if sample is None:
@@ -461,6 +464,8 @@ class ExecuTorch(Format):
         sample = kwargs.get("sample_input")
         sample = _pad_sample(serving_model, sample)
         wrapper = _CompatLayer(serving_model).eval()
+
+        from ..functional.fx import Gradient
 
         with Gradient.inference(wrapper):
             exported = torch_export(wrapper, (sample,))
