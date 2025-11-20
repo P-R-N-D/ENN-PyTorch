@@ -58,7 +58,6 @@ except Exception:
     _Sampler = object
 
 from .datatype import to_platform_dtype
-from ..functional.fx import Gradient as FxGradient
 
 
 def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = True) -> TensorLike:
@@ -399,6 +398,8 @@ class Dataset(_Sampler):
             pass
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
+        from ..functional.fx import Gradient as FxGradient
+        
         s = int(start)
         e = int(end)
         n = max(0, e - s)
