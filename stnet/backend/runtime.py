@@ -61,7 +61,6 @@ except Exception:
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..data.nodes import Dataset
 from ..data.pipeline import fetch
 from ..data.stats import Metadata
 from ..data.transforms import postprocess, preprocess
@@ -1124,6 +1123,7 @@ def epochs(
     buffers_dtype: Optional[torch.dtype] = None,
     **kwargs: Any,
 ) -> None:
+    from ..data.nodes import Dataset
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
