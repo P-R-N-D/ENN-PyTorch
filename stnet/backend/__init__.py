@@ -1,186 +1,42 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any
+from importlib import import_module
 
-from ..api.config import (
-    ModelConfig,
-    PatchConfig,
-    RuntimeConfig,
-    coerce_runtime_config,
-    runtime_config,
-)
-from ..functional.losses import (
-    DataFidelityLoss,
-    LinearCombinationLoss,
-    MultipleQuantileLoss,
-    StandardNormalLoss,
-    StudentsTLoss,
-    TiledLoss,
-)
-from .distributed import (
-    Join,
-    JoinableModel,
-    distributed_broadcast,
-    distributed_barrier,
-    distributed_sync,
-    get_available_host,
-    get_preferred_ip,
-    get_world_size,
-    initialize_master_addr,
-    is_distributed,
-    is_port_available,
-    joining,
-    no_sync,
-    resolve_ip_expr,
-    supported_ip_ver,
-    to_ddp,
-    to_fsdp,
-    validate_ip_expr,
-)
-from .system import (
-    cpu_count,
-    cuda_compute_capability,
-    default_temp,
-    get_tlb,
-    get_device,
-    get_runtime_config,
-    initialize_python_path,
-    get_dpa_backends,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int4_supported,
-    is_int8_supported,
-    is_main_loadable,
-    new_dir,
-    optimal_optimizer_params,
-    optimal_procs,
-    optimal_start_method,
-    optimal_threads,
-    optimize_threads,
-    set_multiprocessing_env,
-    worker_init_pin,
-    wrap_with_tlb,
-    Thread,
-)
+from . import compat, distributed, export, profiler, runtime, system
 
 __all__ = [
-    "AdamW",
-    "StochasticWeightAverage",
-    "SWALR",
-    "stochastic_weight_average",
-    "DataFidelityLoss",
-    "Join",
-    "JoinableModel",
-    "LinearCombinationLoss",
-    "ModelConfig",
-    "MultipleQuantileLoss",
-    "PatchConfig",
-    "RuntimeConfig",
-    "StandardNormalLoss",
-    "StudentsTLoss",
-    "TiledLoss",
-    "distributed_broadcast",
-    "coerce_runtime_config",
-    "cpu_count",
-    "cuda_compute_capability",
-    "default_temp",
-    "distributed_barrier",
-    "validate_ip_expr",
-    "get_available_host",
-    "get_device",
-    "get_tlb",
-    "get_preferred_ip",
-    "get_runtime_config",
-    "get_world_size",
-    "infer",
-    "initialize_master_addr",
-    "initialize_python_path",
-    "get_dpa_backends",
-    "is_cpu_bf16_supported",
-    "is_cuda_bf16_supported",
-    "is_distributed",
-    "is_float8_supported",
-    "is_int4_supported",
-    "is_int8_supported",
-    "is_main_loadable",
-    "is_port_available",
-    "joining",
-    "launch",
-    "learn",
-    "load_model",
-    "new_dir",
+    "compat",
+    "distributed",
+    "export",
+    "profiler",
+    "runtime",
+    "system",
     "new_model",
-    "no_sync",
-    "optimal_optimizer_params",
-    "optimal_procs",
-    "optimal_start_method",
-    "optimal_threads",
-    "optimize_threads",
-    "Thread",
-    "predict",
-    "worker_init_pin",
-    "wrap_with_tlb",
-    "supported_ip_ver",
-    "resolve_ip_expr",
-    "runtime_config",
+    "load_model",
     "save_model",
-    "set_multiprocessing_env",
-    "distributed_sync",
     "train",
-    "to_ddp",
-    "to_fsdp",
+    "learn",
+    "predict",
+    "infer",
 ]
 
-
-def __getattr__(name: str) -> Any:
-    if name in {"train", "predict", "launch", "learn", "infer"}:
-        from ..api.run import launch as _launch, predict as _predict, train as _train
-
-        mapping = {
-            "train": _train,
-            "predict": _predict,
-            "launch": _launch,
-            "learn": _train,
-            "infer": _predict,
-        }
-        return mapping[name]
-    if name in {"load_model", "save_model", "new_model"}:
-        from ..api.io import (
-            load_model as _load_model,
-            new_model as _new_model,
-            save_model as _save_model,
-        )
-
-        mapping = {
-            "load_model": _load_model,
-            "new_model": _new_model,
-            "save_model": _save_model,
-        }
-        return mapping[name]
-    if name in {
-        "AdamW",
-        "StochasticWeightAverage",
-        "SWALR",
-        "stochastic_weight_average",
-    }:
-        from ..functional.optimizers import (
-            AdamW as _AdamW,
-            SWALR as _SWALR,
-            StochasticWeightAverage as _StochasticWeightAverage,
-            stochastic_weight_average as _swa_factory,
-        )
-
-        mapping = {
-            "AdamW": _AdamW,
-            "StochasticWeightAverage": _StochasticWeightAverage,
-            "SWALR": _SWALR,
-            "stochastic_weight_average": _swa_factory,
-        }
-        return mapping[name]
-    raise AttributeError(f"module 'stnet.backend' has no attribute '{name}'")
+_EXPORTS = {
+    "new_model": ("stnet.api.io", "new_model"),
+    "load_model": ("stnet.api.io", "load_model"),
+    "save_model": ("stnet.api.io", "save_model"),
+    "train": ("stnet.api.run", "train"),
+    "learn": ("stnet.api.run", "train"),
+    "predict": ("stnet.api.run", "predict"),
+    "infer": ("stnet.api.run", "predict"),
+}
 
 
-def __dir__() -> list[str]:
-    return sorted(set(__all__))
+def __getattr__(name: str):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = _EXPORTS[name]
+    module = import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

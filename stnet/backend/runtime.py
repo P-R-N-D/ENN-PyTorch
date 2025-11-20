@@ -3,16 +3,16 @@ from __future__ import annotations
 
 import contextlib
 from copy import deepcopy
+from dataclasses import replace
+from functools import partial
 import json
 import logging
 import math
 import os
 import sys
+import threading
 import time
 import warnings
-import threading
-from functools import partial
-from dataclasses import replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -26,12 +26,23 @@ from typing import (
     Union,
 )
 
+from tensordict import TensorDictBase
 import torch
 import torch.distributed
 import torch.nn as nn
-
-_LOGGER = logging.getLogger(__name__)
-
+from torch.distributed._tensor import DTensor, Placement, Replicate
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint.api import CheckpointException
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    get_optimizer_state_dict,
+    set_model_state_dict,
+    set_optimizer_state_dict,
+)
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from tqdm.auto import tqdm
 try:
     import pynvml as _nvml
 
@@ -47,25 +58,11 @@ try:
     import psutil as _psutil
 except Exception:
     _psutil = None
-from tensordict import TensorDictBase
-from torch.distributed._tensor import DTensor, Placement, Replicate
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
-from torch.distributed.checkpoint.api import CheckpointException
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-)
-from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.fsdp import MixedPrecisionPolicy
-from tqdm.auto import tqdm
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..data.pipeline import fetch
 from ..data.nodes import Dataset
+from ..data.pipeline import fetch
 from ..data.stats import Metadata
 from ..data.transforms import postprocess, preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
@@ -81,14 +78,6 @@ from ..functional.optimizers import (
     StochasticWeightAverage,
     stochastic_weight_average,
 )
-
-if TYPE_CHECKING:
-    import numpy as _np
-    from numpy.typing import NDArray as _NDArray
-
-    Float64Array = _NDArray[_np.float64]
-else:
-    Float64Array = Any
 from ..model import Root
 from ..model.layers import StudentsT
 from .compat import (
@@ -108,16 +97,18 @@ from .distributed import (
     to_ddp,
     to_fsdp,
 )
-from .system import (
-    get_device,
-    initialize_python_path,
-    is_float8_supported,
-    get_tlb,
-    posix_time,
-    new_dir,
-    Memory,
-)
 from .profiler import FlopCounter
+from .system import Memory, get_device, get_tlb, initialize_python_path, is_float8_supported, new_dir, posix_time
+
+if TYPE_CHECKING:
+    import numpy as _np
+    from numpy.typing import NDArray as _NDArray
+
+    Float64Array = _NDArray[_np.float64]
+else:
+    Float64Array = Any
+
+_LOGGER = logging.getLogger(__name__)
 
 torch_disable_dynamo()
 
@@ -1743,7 +1734,7 @@ def infer(
 
     if not chunk_dir:
         raise RuntimeError(
-            "infer: chunk_dir 경로를 반드시 지정해야 합니다 (스트리밍 저장을 위해 필요)."
+            "infer: chunk_dir must be specified to enable streaming saves."
         )
     os.makedirs(chunk_dir, exist_ok=True)
     try:
