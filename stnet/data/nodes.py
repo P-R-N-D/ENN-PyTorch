@@ -21,8 +21,6 @@ from typing import (
 
 import torch
 
-from ..backend.system import wrap_with_tlb, get_tlb
-
 TensorLike = Any
 
 try:
@@ -72,6 +70,7 @@ def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = Tru
 
 
 class Dataset(_Sampler):
+    
     _scale: float = 1.0
     _per_sample_mem_bytes: int = 0
 
@@ -112,18 +111,15 @@ class Dataset(_Sampler):
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
-
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
             raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
-
         feat_rel = str(self._meta.get("features_path", "features.mmt"))
         lab_rel = str(self._meta.get("labels_path", "labels.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
         lab_path = os.path.join(self.dir, lab_rel)
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
-
         f_dtype = self._dtype_from_name(
             self._meta.get("features_dtype", "float64"), torch.float64
         )
@@ -148,7 +144,6 @@ class Dataset(_Sampler):
         self._shard_id = 0
         self._key = ""
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
-
         self._perm: Optional[torch.Tensor] = None
         self._perm_source: Optional[Literal["runtime", "metadata"]] = None
         perm_fn = (self._meta or {}).get("perm_filename", None)
@@ -685,18 +680,18 @@ class Connector:
         )
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
-
         self.max_concurrancy = max(1, int(self.io_workers))
         try:
+            from ..backend.system import get_tlb
             get_tlb(io_workers=self.io_workers)
         except Exception:
             pass
 
     def compose(self, source: "BaseNode") -> "BaseNode":
-
+        from ..backend.system import wrap_with_tlb
+        
         node: BaseNode = source
         mapper = self.map_fn
-
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             if _Batcher is None or _Unbatcher is None:
                 raise RuntimeError("torchdata.nodes Batcher/Unbatcher are required for prebatch>1")
@@ -718,7 +713,6 @@ class Connector:
             method="thread",
             max_concurrent=int(self.max_concurrancy),
         )
-
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             node = _Unbatcher(node)
         return node
