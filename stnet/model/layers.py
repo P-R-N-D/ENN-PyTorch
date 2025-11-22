@@ -3293,6 +3293,8 @@ class Root(nn.Module):
             )
             target_stats = target_stats.to(device=stats_device, dtype=stats_dtype)
             self.output_denorm._accumulate_batch(target_stats)
+            if self.output_denorm.bn.running_var.mean() == 1.0 and self.output_denorm.bn.running_mean.abs().sum() == 0:
+                self.output_denorm._commit_moments()
 
         norm_dtype = self.input_norm.bn.running_mean.dtype
         features = features.to(device=device, dtype=norm_dtype)
@@ -3436,11 +3438,14 @@ class Root(nn.Module):
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
         y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
-        y_hat_out = y_hat
-        if not is_cls_loss:
-            y_hat_for_loss = self.output_affine(self.output_denorm(y_hat_out))
+
+        if is_cls_loss:
+            pred = y_hat.reshape(b, *self.out_shape)
+            y_hat_for_loss = y_hat
         else:
-            y_hat_for_loss = y_hat_out
+            y_hat_denorm = self.output_affine(self.output_denorm(y_hat))
+            pred = y_hat_denorm.reshape(b, *self.out_shape)
+            y_hat_for_loss = y_hat_denorm
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
@@ -3466,7 +3471,10 @@ class Root(nn.Module):
             y_top = y_hat_for_loss
             y_bot = assembled.to(
                 device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-            )
+                )
+            if not is_cls_loss:
+                y_bot = self.output_affine(self.output_denorm(y_bot))
+
             if global_loss is not None:
                 top_component = global_loss(y_top, tgt)
                 total = total + weights[0] * top_component
@@ -3486,8 +3494,6 @@ class Root(nn.Module):
                 )
                 loss_val = net_loss(y_hat_for_loss, tgt)
 
-        y_hat_out = y_hat_for_loss
-        pred = y_hat_out.reshape(b, *self.out_shape)
         if td_input is not None:
             out_td = td_input.clone()
             out_td.set("pred", pred)
