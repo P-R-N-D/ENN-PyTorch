@@ -65,6 +65,8 @@ from ..data.transforms import postprocess, preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import (
     LossWeightController,
+    LinearCombinationLoss,
+    CRPSLoss,
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
@@ -1996,20 +1998,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         options=StateDictOptions(strict=False),
                     )
                     _initialize_adamw(optimizer)
-        _t = StudentsTLoss(
-            confidence=0.99,
-            metric="t_value",
-            two_tailed=True,
-            df=4,
-            mu_mode="error",
-            std_mode="pooled",
-            ddof=1,
-            clamp_max=8.0,
-            detach_stats=True,
+        global_crps = CRPSLoss(
             dim=-1,
             reduction="none",
+            detach_stats=True,
         )
-        _z = StandardNormalLoss(
+        global_z = StandardNormalLoss(
             confidence=0.99,
             metric="z_value",
             two_tailed=True,
@@ -2024,20 +2018,49 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             reduction="none",
         )
         top_loss = TiledLoss(
-            _t,
+            nn.Sequential(),
             mask_mode=ops.loss_mask_mode,
             mask_value=ops.loss_mask_value,
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
         )
+        top_loss.base = LinearCombinationLoss(
+            coefficient=[0.99, 0.01],
+            loss=[global_crps, global_z],
+            reduce_each=False,
+        )
+
+        local_crps = CRPSLoss(
+            dim=-1,
+            reduction="none",
+            detach_stats=True,
+        )
+        local_t = StudentsTLoss(
+            confidence=0.99,
+            metric="t_value",
+            two_tailed=True,
+            df=4,
+            mu_mode="error",
+            std_mode="pooled",
+            ddof=1,
+            clamp_max=8.0,
+            detach_stats=True,
+            dim=-1,
+            reduction="none",
+        )
         bottom_loss = TiledLoss(
-            _z,
+            nn.Sequential(),
             mask_mode=ops.loss_mask_mode,
             mask_value=ops.loss_mask_value,
             tile_dim=ops.loss_tile_dim,
             tile_size=ops.loss_tile_size,
             reduction="mean",
+        )
+        bottom_loss.base = LinearCombinationLoss(
+            coefficient=[0.97, 0.03],
+            loss=[local_crps, local_t],
+            reduce_each=False,
         )
         loss_controller = LossWeightController()
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")

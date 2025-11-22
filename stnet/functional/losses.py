@@ -238,6 +238,152 @@ class MultipleQuantileLoss(nn.Module):
         return (per_q * self.w).sum()
 
 
+class CRPSLoss(nn.Module):
+
+    def __init__(
+        self,
+        dim: Optional[Tuple[int, ...]] = None,
+        eps: float = 1e-6,
+        reduction: str = "mean",
+        ddof: int = 0,
+        std: Optional[TensorLike] = None,
+        detach_stats: bool = True,
+        mode: str = "normal",
+        sample_dim: Optional[int] = None,
+        max_z: float = 10.0,
+    ) -> None:
+        super().__init__()
+        if reduction.lower() not in {"mean", "sum", "none"}:
+            raise ValueError(f"invalid reduction={reduction}")
+        mode_l = str(mode).lower()
+        if mode_l not in {"normal", "energy"}:
+            raise ValueError(f"CRPSLoss.mode must be 'normal' or 'energy', got {mode}")
+        self.dim = dim
+        self.eps = float(eps)
+        self.reduction = reduction.lower()
+        self.ddof = int(ddof)
+        self.std_param = std
+        self.detach_stats = bool(detach_stats)
+        self.mode = mode_l
+        self.sample_dim = None if sample_dim is None else int(sample_dim)
+        self.max_z = float(max_z)
+
+    @staticmethod
+    def _expand_params(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(x):
+            t = x.to(device=ref.device, dtype=ref.dtype)
+        else:
+            t = torch.tensor(x, device=ref.device, dtype=ref.dtype)
+        if t.ndim < ref.ndim:
+            t = t.view(*[1] * (ref.ndim - t.ndim), *t.shape)
+        return t
+
+    def _dims(self, pred: torch.Tensor) -> Tuple[int, ...]:
+        return _canonize_dims(pred, self.dim, keep_batch=False)
+
+    def _reduce(self, x: torch.Tensor) -> torch.Tensor:
+        match self.reduction:
+            case "mean":
+                return x.mean()
+            case "sum":
+                return x.sum()
+            case "none":
+                return x
+        return x
+
+    def _std_from_error(self, err: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
+        std = _coerce_std(err, dim=dims, ddof=self.ddof, eps=self.eps)
+        if self.detach_stats:
+            std = std.detach()
+        return torch.clamp(std, min=self.eps)
+
+    def _crps_normal(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if pred.shape != target.shape:
+            raise ValueError(f"shape mismatch: pred={pred.shape}, target={target.shape}")
+        dims = self._dims(pred)
+        err = target - pred
+
+        if self.std_param is not None:
+            sigma = self._expand_params(self.std_param, pred)
+            if self.detach_stats:
+                sigma = sigma.detach()
+            sigma = torch.clamp(sigma, min=self.eps)
+        else:
+            sigma = self._std_from_error(err, dims=dims)
+
+        z = err / sigma
+        if self.max_z > 0.0:
+            z = torch.clamp(z, min=-self.max_z, max=self.max_z)
+
+        inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
+        phi = torch.exp(-0.5 * z * z) * inv_sqrt_2pi
+        try:
+            Phi = Normal(loc=0.0, scale=1.0).cdf(z)
+        except NotImplementedError:
+            zero = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+            one = torch.tensor(1.0, device=z.device, dtype=z.dtype)
+            Phi = _normal_cdf(z, zero, one)
+
+        two_Phi_minus_one = 2.0 * Phi - 1.0
+        term = z * two_Phi_minus_one + 2.0 * phi - 1.0 / math.sqrt(math.pi)
+        crps = sigma * term
+        crps = torch.clamp(crps, min=0.0)
+        return self._reduce(crps)
+
+    def _crps_energy(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.sample_dim is None:
+            raise ValueError("CRPSLoss(mode='energy') requires sample_dim to be set")
+        if target.ndim > pred.ndim:
+            raise ValueError(
+                f"target.ndim ({target.ndim}) cannot exceed pred.ndim ({pred.ndim}) in energy mode"
+            )
+
+        nd = pred.ndim
+        sd = self.sample_dim if self.sample_dim >= 0 else self.sample_dim + nd
+        if not (0 <= sd < nd):
+            raise ValueError(f"invalid sample_dim={self.sample_dim} for pred.ndim={nd}")
+
+        if sd != 1:
+            perm = list(range(nd))
+            perm[1], perm[sd] = perm[sd], perm[1]
+            pred = pred.permute(*perm)
+
+        B = int(pred.shape[0])
+        S = int(pred.shape[1])
+        if S <= 1:
+            raise ValueError("energy mode requires at least 2 samples along sample_dim")
+
+        V = int(pred[0, 0].numel())
+        samples = pred.reshape(B, S, V)
+
+        if target.ndim == pred.ndim - 1:
+            target_flat = target.reshape(B, 1, V)
+        else:
+            raise ValueError(
+                "In energy mode, target must be [B, ...] with the same tail shape as pred without sample_dim"
+            )
+
+        diff1 = samples - target_flat
+        dist1 = diff1.norm(dim=-1)
+        term1 = dist1.mean(dim=1)
+
+        diff2 = samples.unsqueeze(2) - samples.unsqueeze(1)
+        dist2 = diff2.norm(dim=-1)
+        eye = torch.eye(S, device=dist2.device, dtype=torch.bool)
+        mask = ~eye
+        dist2 = dist2[:, mask].view(B, S * (S - 1))
+        term2 = dist2.mean(dim=1)
+
+        es = term1 - 0.5 * term2
+        es = torch.clamp(es, min=0.0)
+        return self._reduce(es)
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self.mode == "normal":
+            return self._crps_normal(pred, target)
+        return self._crps_energy(pred, target)
+
+
 class DistributionLoss(nn.Module):
     def __init__(
         self,
