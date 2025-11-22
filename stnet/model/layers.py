@@ -3254,14 +3254,29 @@ class Root(nn.Module):
             td_loss_weights = td_input.get("loss_weights", None)
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
+
         device = self._device
         if features.ndim == 3 and features.shape[1] == 1:
             features = features.reshape(features.shape[0], -1)
 
+        is_cls_loss = (
+            isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
+            if net_loss is not None
+            else False
+        )
+        has_any_loss = (
+            (net_loss is not None)
+            or (global_loss is not None)
+            or (local_loss is not None)
+        )
+        has_supervision = labels_flat is not None and has_any_loss
+        is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
+        infer_mode = not is_train_path
+
         if (
-            self.training
+            is_train_path
             and labels_flat is not None
-            and not isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
+            and not is_cls_loss
             and self.output_denorm.standardize
         ):
             target_stats = labels_flat.reshape(labels_flat.shape[0], -1)
@@ -3287,9 +3302,6 @@ class Root(nn.Module):
         amp_enabled = device.type != "cpu"
         base_param = next(self.local_net.parameters())
         base_dtype = self._base_dtype or base_param.dtype
-        infer_mode = labels_flat is None or (
-            net_loss is None and global_loss is None and (local_loss is None)
-        )
         if self._auto_microbatch_pending:
             try:
                 mb = self._auto_microbatch(features, device)
@@ -3301,7 +3313,7 @@ class Root(nn.Module):
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []
         use_activation_checkpoint = bool(self._activation_checkpoint and not infer_mode)
-        if not infer_mode:
+        if is_train_path:
             self.local_net.train()
             self.global_net.train()
             for idx in range(num_slices):
@@ -3424,11 +3436,6 @@ class Root(nn.Module):
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
         y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
-        is_cls_loss = (
-            isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
-            if net_loss is not None
-            else False
-        )
         y_hat_out = y_hat
         if not is_cls_loss:
             y_hat_for_loss = self.output_affine(self.output_denorm(y_hat_out))
