@@ -3439,13 +3439,13 @@ class Root(nn.Module):
             residual = residual.to(dtype=assembled.dtype)
         y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
 
-        y_hat_denorm = self.output_affine(self.output_denorm(y_hat))
-        pred = y_hat_denorm.reshape(b, *self.out_shape)
-
-        if not is_cls_loss:
-            y_hat_for_loss = y_hat_denorm
-        else:
+        if is_cls_loss:
+            pred = y_hat.reshape(b, *self.out_shape)
             y_hat_for_loss = y_hat
+        else:
+            y_hat_denorm = self.output_affine(self.output_denorm(y_hat))
+            pred = y_hat_denorm.reshape(b, *self.out_shape)
+            y_hat_for_loss = y_hat_denorm
         loss_val: Optional[torch.Tensor] = None
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
