@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-from copy import deepcopy
 from dataclasses import replace
 from functools import partial
 import json
@@ -76,7 +75,7 @@ from ..functional.optimizers import (
     StochasticWeightAverage,
     stochastic_weight_average,
 )
-from ..model.layers import Root, StudentsT
+from ..model.layers import Root
 from .compat import (
     cudagraph_step_end,
     is_meta_or_fake_tensor,
@@ -110,24 +109,6 @@ _LOGGER = logging.getLogger(__name__)
 torch_disable_dynamo()
 
 
-STUDENTS_T_PREFIT_SAMPLE_LIMIT: int = 32768
-STUDENTS_T_PREFIT_IN_KEY: str = "features"
-
-
-def set_students_t_prefit_options(
-    *, limit: int | None = None, in_key: str | None = None
-) -> None:
-    global STUDENTS_T_PREFIT_SAMPLE_LIMIT, STUDENTS_T_PREFIT_IN_KEY
-    if limit is not None:
-        if not isinstance(limit, int) or limit <= 0:
-            raise ValueError("limit must be a positive int")
-        STUDENTS_T_PREFIT_SAMPLE_LIMIT = int(limit)
-    if in_key is not None:
-        if not isinstance(in_key, str) or not in_key:
-            raise ValueError("in_key must be a non-empty str")
-        STUDENTS_T_PREFIT_IN_KEY = in_key
-
-
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 except ImportError:
@@ -146,204 +127,6 @@ ignored_sentences = [
 ]
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 _DL_STATE_FILE = "dataloader.json"
-
-
-@torch.no_grad()
-def _sample_from(
-    loader: Iterable[Any],
-    in_key: str | None = None,
-    limit: int | None = None,
-) -> Float64Array:
-
-    import numpy as _np
-    from tensordict import TensorDictBase
-
-    if in_key is None:
-        in_key = STUDENTS_T_PREFIT_IN_KEY
-    if limit is None:
-        limit = STUDENTS_T_PREFIT_SAMPLE_LIMIT
-    if limit is None or int(limit) <= 0:
-        raise ValueError("limit must be a positive integer")
-
-    xs: list[torch.Tensor] = []
-    n = 0
-    for batch in loader:
-        if isinstance(batch, TensorDictBase):
-            x = batch.get(in_key, None)
-            if x is None:
-                x = batch.get("features", None)
-                if x is None:
-                    continue
-        else:
-            x = batch[0] if isinstance(batch, (list, tuple)) else batch
-        if not torch.is_tensor(x):
-            continue
-        x = x.detach().cpu()
-        if x.ndim == 3 and x.shape[1] == 1:
-            x = x.reshape(x.shape[0], -1)
-        elif x.ndim != 2:
-            x = x.view(x.size(0), -1)
-        xs.append(x)
-        n += x.size(0)
-        if n >= int(limit):
-            break
-    if not xs:
-        return _np.empty((0, 0), dtype=_np.float64)
-    X = torch.cat(xs, dim=0)[: int(limit)].to(dtype=torch.float64).numpy()
-    return X
-
-
-def _reduce_moments(
-    n1: int,
-    m1: torch.Tensor,
-    M2_1: torch.Tensor,
-    M3_1: torch.Tensor,
-    n2: int,
-    m2: torch.Tensor,
-    M2_2: torch.Tensor,
-    M3_2: torch.Tensor,
-) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if n1 == 0:
-        return (int(n2), m2, M2_2, M3_2)
-    if n2 == 0:
-        return (int(n1), m1, M2_1, M3_1)
-    n = n1 + n2
-    delta = m2 - m1
-    n1f = float(n1)
-    n2f = float(n2)
-    nf = float(n)
-    m = m1 + delta * (n2f / nf)
-    M2 = M2_1 + M2_2 + (delta * delta) * (n1f * n2f / nf)
-    M3 = (
-        M3_1
-        + M3_2
-        + (delta * delta * delta) * (n1f * n2f * (n1f - n2f) / (nf * nf))
-        + 3.0 * delta * (n1f * M2_2 - n2f * M2_1) / nf
-    )
-    return (int(n), m, M2, M3)
-
-
-@torch.no_grad()
-@torch_compile_disable(
-    reason="distributed collectives / history sync – run eager", recursive=True
-)
-def _reduce_metrics(layer: nn.Module) -> None:
-    dist = torch.distributed
-    if not (dist.is_available() and dist.is_initialized()):
-        return
-    bn_module = getattr(layer, "bn", None)
-    required = (
-        hasattr(layer, "stg_count")
-        and hasattr(layer, "stg_mean")
-        and hasattr(layer, "stg_M2")
-        and hasattr(layer, "stg_M3")
-        and hasattr(layer, "gs_count")
-        and hasattr(layer, "gs_mean")
-        and hasattr(layer, "gs_M2")
-        and hasattr(layer, "gs_M3")
-        and isinstance(bn_module, nn.BatchNorm1d)
-        and hasattr(bn_module, "running_mean")
-        and hasattr(bn_module, "running_var")
-    )
-    if not required:
-        return
-    world = dist.get_world_size()
-    rank = dist.get_rank()
-
-    backend = str(dist.get_backend()).lower() if hasattr(dist, "get_backend") else ""
-    gather_device = layer.gs_mean.device
-    if "nccl" in backend and gather_device.type != "cuda":
-        gather_device = torch.device("cuda", torch.cuda.current_device())
-
-    D_local = torch.tensor(
-        [int(layer.stg_mean.numel())], dtype=torch.int64, device=gather_device
-    )
-    D_list = [torch.zeros_like(D_local) for _ in range(world)]
-    dist.all_gather(D_list, D_local)
-    if any(int(d.item()) != int(D_list[0].item()) for d in D_list):
-        raise RuntimeError(
-            f"[reduce_metrics] feature dimension mismatch across ranks: {[int(d.item()) for d in D_list]}"
-        )
-
-    n_local = layer.stg_count.to(device=gather_device, dtype=torch.int64)
-    mean_local = layer.stg_mean.to(
-        device=gather_device, dtype=torch.float64
-    ).contiguous()
-    M2_local = layer.stg_M2.to(device=gather_device, dtype=torch.float64).contiguous()
-    M3_local = layer.stg_M3.to(device=gather_device, dtype=torch.float64).contiguous()
-
-    n_list = [torch.zeros_like(n_local) for _ in range(world)]
-    mean_list = [torch.empty_like(mean_local) for _ in range(world)]
-    M2_list = [torch.empty_like(M2_local) for _ in range(world)]
-    M3_list = [torch.empty_like(M3_local) for _ in range(world)]
-
-    dist.all_gather(n_list, n_local)
-    dist.all_gather(mean_list, mean_local)
-    dist.all_gather(M2_list, M2_local)
-    dist.all_gather(M3_list, M3_local)
-    if rank == 0:
-        prev_n = int(layer.gs_count.item())
-        m = layer.gs_mean.to(device=gather_device, dtype=torch.float64).clone()
-        M2 = layer.gs_M2.to(device=gather_device, dtype=torch.float64).clone()
-        M3 = layer.gs_M3.to(device=gather_device, dtype=torch.float64).clone()
-        n_total = int(prev_n)
-        for idx in range(world):
-            n_val = int(n_list[idx].item())
-            if n_val <= 0:
-                continue
-            m_val = mean_list[idx]
-            M2_val = M2_list[idx]
-            M3_val = M3_list[idx]
-            n_total, m, M2, M3 = _reduce_moments(
-                n_total, m, M2, M3, n_val, m_val, M2_val, M3_val
-            )
-        layer.gs_count.fill_(int(n_total))
-
-        layer.gs_mean.copy_(m.to(device=layer.gs_mean.device))
-        layer.gs_M2.copy_(M2.to(device=layer.gs_M2.device))
-        layer.gs_M3.copy_(M3.to(device=layer.gs_M3.device))
-    dist.barrier()
-
-    for tensor in (layer.gs_count, layer.gs_mean, layer.gs_M2, layer.gs_M3):
-        dist.broadcast(tensor, src=0)
-    layer.stg_count.zero_()
-    layer.stg_mean.zero_()
-    layer.stg_M2.zero_()
-    layer.stg_M3.zero_()
-
-
-@torch.no_grad()
-@torch_compile_disable(
-    reason="post-step metric aggregation – run eager", recursive=True
-)
-def push_metrics(model: nn.Module, start_ns: int, end_ns: int) -> None:
-    target = model
-    while hasattr(target, "module"):
-        target = getattr(target, "module")
-    scalers: list[nn.Module] = []
-    for submodule in target.modules():
-        if hasattr(submodule, "commit_training_success") and hasattr(
-            submodule, "stg_count"
-        ):
-            scalers.append(submodule)
-    if not scalers:
-        return
-    for layer in scalers:
-        _reduce_metrics(layer)
-    for layer in scalers:
-        layer.commit_training_success(
-            start_ns=int(start_ns),
-            end_ns=int(end_ns),
-            tz_name="Asia/Seoul",
-        )
-
-    dist = torch.distributed
-    if dist.is_available() and dist.is_initialized():
-        for layer in scalers:
-            bn = getattr(layer, "bn", None)
-            if isinstance(bn, nn.BatchNorm1d):
-                dist.broadcast(bn.running_mean, src=0)
-                dist.broadcast(bn.running_var, src=0)
 
 
 def _num_batches(loader: Any) -> int:
@@ -672,24 +455,6 @@ def _unify_param_dtype(
             )
             setattr(mod, name, new_p)
     return tgt
-
-
-def _x_for_swa(
-    train_loader: Any, device: torch.device, in_dim: int, swa_in_key: str
-) -> Iterator[Dict[str, torch.Tensor]]:
-    for _raw in train_loader:
-        feat, *_ = preprocess(_raw)
-        X = to_torch_tensor(feat)
-        X = torch.atleast_2d(X)
-        if X.dim() != 2:
-            raise RuntimeError(
-                f"features.ndim={X.dim()} (expect 2). got shape={tuple(X.shape)}"
-            )
-        if X.shape[1] != in_dim:
-            raise RuntimeError(
-                f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
-            )
-        yield {swa_in_key: X.to(device, non_blocking=True)}
 
 
 def _first_source_path(obj: Any) -> str:
@@ -1116,8 +881,6 @@ def epochs(
     scheduler_step_per_batch: bool = True,
     swa_helper: Optional[StochasticWeightAverage] = None,
     swa_start_epoch: int = 0,
-    swa_bn_update: bool = False,
-    swa_in_key: str = "features",
     buffers_dtype: Optional[torch.dtype] = None,
     **kwargs: Any,
 ) -> None:
@@ -1172,20 +935,6 @@ def epochs(
                 except Exception:
                     pass
 
-    if (
-        is_distributed()
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_world_size() > 1
-        and not getattr(model, "_syncbn_converted", False)
-    ):
-        _saved = deepcopy(model)
-        try:
-            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-            setattr(model, "_syncbn_converted", True)
-        except Exception as e:
-            model = _saved
-            warnings.warn(f"SyncBatchNorm conversion skipped (fallback): {e}")
-
     if buffers_dtype is not None:
         target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
@@ -1208,8 +957,6 @@ def epochs(
     swa_enabled = swa_helper is not None
     swa_start_epoch = max(0, int(swa_start_epoch))
     swa_has_updated = False
-    bn_update_enabled = bool(swa_bn_update) and swa_enabled
-    swa_in_key = str(swa_in_key or "features")
     prev_io_time = 0.0
     prev_comp_time = 0.0
     prev_io_bytes = 0.0
@@ -1277,36 +1024,6 @@ def epochs(
                     return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
             return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
 
-        try:
-            target_module = model.module if hasattr(model, "module") else model
-            st_layers = [m for m in target_module.modules() if isinstance(m, StudentsT)]
-            if st_layers and train_loader is not None:
-                do_fit = (not is_distributed()) or (
-                    torch.distributed.is_initialized()
-                    and torch.distributed.get_rank() == 0
-                )
-                if do_fit:
-                    X_np = _sample_from(train_loader)
-                    if X_np.size:
-                        for m in st_layers:
-                            with contextlib.suppress(Exception):
-                                m.fit_numpy(X_np, apply_bn=True)
-                if (
-                    torch.distributed.is_available()
-                    and torch.distributed.is_initialized()
-                ):
-                    for m in st_layers:
-                        torch.distributed.broadcast(m.bn.running_mean, src=0)
-                        torch.distributed.broadcast(m.bn.running_var, src=0)
-                        for buf in (
-                            getattr(m, "t_df", None),
-                            getattr(m, "t_loc", None),
-                            getattr(m, "t_scale", None),
-                        ):
-                            if isinstance(buf, torch.Tensor):
-                                torch.distributed.broadcast(buf, src=0)
-        except Exception as _e:
-            warnings.warn(f"StudentsT.fit_numpy pre-fit skipped: {_e}")
         for epoch_idx in range(int(total_epochs)):
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
@@ -1599,32 +1316,12 @@ def epochs(
             if not scheduler_step_per_batch:
                 with contextlib.suppress(Exception):
                     sched.step()
-            if bn_update_enabled and (swa_has_updated or updated_this_epoch):
-                with contextlib.suppress(Exception):
-                    swa_helper.update_batch_norm(
-                        _x_for_swa(train_loader, device, in_dim, swa_in_key),
-                        device=device,
-                        in_key=swa_in_key,
-                    )
-                if buffers_dtype is not None:
-                    target_for_buffers = model.module if hasattr(model, "module") else model
-                    _cast_fp_buffers(target_for_buffers, buffers_dtype)
             if updated_this_epoch:
                 swa_has_updated = True
             prev_comp_time += float(comp_time)
             prev_io_time += float(io_time)
             prev_flops += float(flops)
             prev_io_bytes += float(io_bytes)
-    if bn_update_enabled and swa_has_updated:
-        with contextlib.suppress(Exception):
-            swa_helper.update_batch_norm(
-                _x_for_swa(train_loader, device, in_dim, swa_in_key),
-                device=device,
-                in_key=swa_in_key,
-            )
-        if buffers_dtype is not None:
-            target_for_buffers = model.module if hasattr(model, "module") else model
-            _cast_fp_buffers(target_for_buffers, buffers_dtype)
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
@@ -1633,7 +1330,6 @@ def epochs(
         )
         status_bar.close()
     end_kst_ns = posix_time("Asia/Seoul")
-    push_metrics(model, start_kst_ns, end_kst_ns)
     try:
         dev_t = getattr(device, "type", "")
         total_t = prev_io_time + prev_comp_time
@@ -2419,10 +2115,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             scheduler_step_per_batch = True
             swa_helper: Optional[StochasticWeightAverage] = None
             swa_start_epoch = total_epochs
-            swa_bn_update = False
             enable_swa_cfg = bool(getattr(ops, "swa_enabled", False))
             start_epoch_cfg = getattr(ops, "swa_start_epoch", None)
-            swa_update_bn_cfg = bool(getattr(ops, "swa_update_batch_norm", False))
             enable_swa = (
                 enable_swa_cfg or start_epoch_cfg is not None
             ) and SWALR is not None
@@ -2444,7 +2138,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                             swa_start_epoch = max(1, total_epochs // 2)
                     else:
                         swa_start_epoch = max(1, total_epochs // 2)
-                    swa_bn_update = bool(swa_update_bn_cfg)
                     eta_min = float(getattr(ops, "eta_min", 0.0) or 0.0)
                     base_lr = float(ops.base_lr)
                     default_swa_lr = max(
@@ -2463,7 +2156,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         scheduler_step_per_batch = True
                         swa_helper = None
                         swa_start_epoch = total_epochs
-                        swa_bn_update = False
             scaler = torch.amp.GradScaler(
                 enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
             )
@@ -2493,7 +2185,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 scheduler_step_per_batch=scheduler_step_per_batch,
                 swa_helper=swa_helper,
                 swa_start_epoch=swa_start_epoch,
-                swa_bn_update=swa_bn_update,
                 buffers_dtype=amp_buffers_dtype,
             )
         finally:
