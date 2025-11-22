@@ -3293,8 +3293,6 @@ class Root(nn.Module):
             )
             target_stats = target_stats.to(device=stats_device, dtype=stats_dtype)
             self.output_denorm._accumulate_batch(target_stats)
-            if self.output_denorm.bn.running_var.mean() == 1.0 and self.output_denorm.bn.running_mean.abs().sum() == 0:
-                self.output_denorm._commit_moments()
 
         norm_dtype = self.input_norm.bn.running_mean.dtype
         features = features.to(device=device, dtype=norm_dtype)
