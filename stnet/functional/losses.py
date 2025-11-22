@@ -317,11 +317,11 @@ class CRPSLoss(nn.Module):
 
         inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
         phi = torch.exp(-0.5 * z * z) * inv_sqrt_2pi
+        zero = torch.tensor(0.0, device=z.device, dtype=z.dtype)
+        one = torch.tensor(1.0, device=z.device, dtype=z.dtype)
         try:
-            Phi = Normal(loc=0.0, scale=1.0).cdf(z)
+            Phi = Normal(loc=zero, scale=one).cdf(z)
         except NotImplementedError:
-            zero = torch.tensor(0.0, device=z.device, dtype=z.dtype)
-            one = torch.tensor(1.0, device=z.device, dtype=z.dtype)
             Phi = _normal_cdf(z, zero, one)
 
         two_Phi_minus_one = 2.0 * Phi - 1.0
