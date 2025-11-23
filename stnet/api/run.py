@@ -33,7 +33,7 @@ except ImportError:
 
 from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess
-from ..model.layers import Root
+from ..model.layers import Instance
 from .config import (
     ModelConfig,
     OpsMode,
@@ -96,7 +96,7 @@ def _seed_everything(seed_value: Optional[int]) -> None:
 
 
 def train(
-    model: Root,
+    model: Instance,
     data: (
         Dict[Tuple, torch.Tensor]
         | Sequence[Dict[Tuple, torch.Tensor]]
@@ -120,7 +120,7 @@ def train(
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
-) -> Root:
+) -> Instance:
     try:
         val_frac = float(val_frac)
         val_frac = 0.0 if val_frac < 0.0 else (1.0 if val_frac > 1.0 else val_frac)
@@ -261,7 +261,7 @@ def train(
         master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
         optimize_threads()
         nprocs = optimal_procs()["nproc_per_node"]
-        cfg_obj = getattr(model, "_Root__config", None)
+        cfg_obj = getattr(model, "_Instance__config", None)
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
         else:
@@ -340,7 +340,7 @@ def train(
 
 
 def predict(
-    model: Root,
+    model: Instance,
     data: Dict[Tuple, torch.Tensor],
     *args: Any,
     seed: int = 7,
@@ -370,7 +370,7 @@ def predict(
         {k: v.detach().cpu() for k, v in model.state_dict().items()},
         os.path.join(dcp_dir, "model.pt"),
     )
-    cfg_obj = getattr(model, "_Root__config", None)
+    cfg_obj = getattr(model, "_Instance__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
     else:
@@ -495,7 +495,7 @@ def predict(
                 tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
                 flat = torch.empty((0, *tail), dtype=torch.float32)
 
-            pred_tensor = Root.unflatten_y(flat, out_shape)
+            pred_tensor = Instance.unflatten_y(flat, out_shape)
 
             result: Dict[Tuple, torch.Tensor] = {}
             for i, key in enumerate(keys):
