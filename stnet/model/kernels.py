@@ -50,6 +50,51 @@ def _estimate_flops_msr(
     return 4.0 * attn + gate_cost
 
 
+def _add_mha_flops(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    num_heads: int,
+    embed_dim: int,
+    batch_first: bool,
+    include_projections: bool = True,
+    label: str = "MultiHeadAttention",
+) -> None:
+    try:
+        if batch_first:
+            if query.dim() < 3 or key.dim() < 3:
+                return
+            B = int(query.shape[0])
+            Lq = int(query.shape[1])
+            Sk = int(key.shape[1])
+        else:
+            if query.dim() < 3 or key.dim() < 3:
+                return
+            Lq = int(query.shape[0])
+            B = int(query.shape[1])
+            Sk = int(key.shape[0])
+        H = int(num_heads)
+        E = int(embed_dim)
+        if B <= 0 or Lq <= 0 or Sk <= 0 or H <= 0 or E <= 0:
+            return
+        if E % H != 0:
+            return
+        Dh = E // H
+        core = 2.0 * B * H * Lq * Dh * Sk + 2.0 * B * H * Lq * Sk * Dh
+        proj = 0.0
+        if include_projections:
+            q_tokens = float(B * Lq)
+            k_tokens = float(B * Sk)
+            v_tokens = float(B * Sk)
+            out_tokens = float(B * Lq)
+            proj = 2.0 * q_tokens * E * E
+            proj += 2.0 * k_tokens * E * E
+            proj += 2.0 * v_tokens * E * E
+            proj += 2.0 * out_tokens * E * E
+        FLOP_PROFILER.add(label, float(core + proj))
+    except Exception:
+        pass
+
+
 def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
     if tensor.dim() != 4:
         return False
@@ -699,7 +744,15 @@ class DotProductAttention(nn.Module):
                 self._force_pt = True
                 use_te = False
             else:
-                return out_te.transpose(1, 2).contiguous()
+                out_te = out_te.transpose(1, 2).contiguous()
+                try:
+                    B_, H_, L_, D_ = q_bshd.shape
+                    S_ = k_bshd.shape[2]
+                    flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
+                    FLOP_PROFILER.add("DotProductAttention", float(flops))
+                except Exception:
+                    pass
+                return out_te
         sdpa_bias: torch.Tensor | None = None
         if mask_bool is not None:
             finfo = torch.finfo(q_bshd.dtype)
@@ -762,6 +815,13 @@ class DotProductAttention(nn.Module):
             sdpa_out = torch.nn.functional.scaled_dot_product_attention(
                 q_bhsd, k_bhsd, v_bhsd, **sdpa_kwargs
             )
+        try:
+            B_, H_, L_, D_ = q_bhsd.shape
+            S_ = k_bhsd.shape[2]
+            flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
+            FLOP_PROFILER.add("DotProductAttention", float(flops))
+        except Exception:
+            pass
         return sdpa_out
 
     @staticmethod
@@ -971,6 +1031,12 @@ class MultiScaleRetention(nn.Module):
                 outputs = None
 
             if isinstance(outputs, torch.Tensor):
+                try:
+                    B_ = x.shape[0]
+                    fl = _estimate_flops_msr(B_, seq_len, num_heads=self.nhead, head_dim=self.d_model // self.nhead, use_gate=self.use_gate)
+                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
+                except Exception:
+                    pass
                 return outputs
             if isinstance(outputs, tuple) and outputs:
                 return outputs[0]
@@ -982,7 +1048,7 @@ class MultiScaleRetention(nn.Module):
             and torch.cuda.is_available()
         ):
             try:
-                return self._triton_msr(
+                out_tr = self._triton_msr(
                     x,
                     sin,
                     cos,
@@ -991,6 +1057,13 @@ class MultiScaleRetention(nn.Module):
                     state=state,
                     **kwargs,
                 )
+                try:
+                    B_ = x.shape[0]
+                    fl = _estimate_flops_msr(B_, seq_len, num_heads=self.nhead, head_dim=self.d_model // self.nhead, use_gate=self.use_gate)
+                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
+                except Exception:
+                    pass
+                return out_tr
             except Exception:
                 pass
 
@@ -1190,25 +1263,42 @@ class _MultiHeadAttentionCompat(nn.Module):
         is_causal: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
-        try:
-            if is_causal is not None:
-                return self.mha(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    is_causal=is_causal,
-                    **kwargs,
-                )
-        except TypeError:
-            pass
-        return self.mha(
+
+        def _call_mha(
+            q: torch.Tensor,
+            k: torch.Tensor,
+            v: torch.Tensor,
+        ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            try:
+                if is_causal is not None:
+                    return self.mha(
+                        q,
+                        k,
+                        v,
+                        attn_mask=attn_mask,
+                        is_causal=is_causal,
+                        **kwargs,
+                    )
+            except TypeError:
+                pass
+            return self.mha(
+                q,
+                k,
+                v,
+                attn_mask=attn_mask,
+                **kwargs,
+            )
+
+        out, w = _call_mha(query, key, value)
+        _add_mha_flops(
             query,
             key,
-            value,
-            attn_mask=attn_mask,
-            **kwargs,
+            num_heads=self.mha.num_heads,
+            embed_dim=self.mha.embed_dim,
+            batch_first=self.batch_first,
+            include_projections=True,
         )
+        return out, w
 
 
 class _MultiHeadAttentionNvidia(nn.Module):
@@ -1286,6 +1376,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        embed_dim = int(query.shape[-1])
         if self._force_pt or (self._te_mha is None):
             return self._fallback(
                 query,
@@ -1351,6 +1442,14 @@ class _MultiHeadAttentionNvidia(nn.Module):
                     y, w = out, None
                 if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
                     y = y.transpose(0, 1)
+                _add_mha_flops(
+                    query,
+                    key,
+                    num_heads=self.num_heads,
+                    embed_dim=embed_dim,
+                    batch_first=self.batch_first,
+                    include_projections=True,
+                )
                 return y, w
             except TypeError:
                 continue

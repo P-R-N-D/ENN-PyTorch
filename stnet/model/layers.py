@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from collections import deque
 from importlib import import_module
 from typing import (
-    TYPE_CHECKING,
     Any,
     Dict,
     List,
@@ -25,20 +24,47 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tensordict import TensorDictBase
 try:
-    from torch.nn.functional import scaled_dot_product_attention as _sdpa
-    _HAS_SDPA = True
-                                                          
-except Exception:
-    _HAS_SDPA = False
+    from torch.nn import StochasticDepth as _TorchStochasticDepth  # type: ignore
+except Exception:  # pragma: no cover - fallback for older torch
 
-                                                                
+    class StochasticDepth(nn.Module):
+        def __init__(self, p: float = 0.0, mode: str = "row") -> None:
+            super().__init__()
+            self.p = float(p)
+            self.mode = str(mode)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
+            if (not self.training) or self.p <= 0.0:
+                return x
+            keep = 1.0 - self.p
+            if keep <= 0.0:
+                return torch.zeros_like(x)
+            if self.mode == "row" and x.dim() >= 2:
+                noise_shape = (x.shape[0], *([1] * (x.dim() - 1)))
+                noise = x.new_empty(noise_shape).bernoulli_(keep).div_(keep)
+            else:
+                noise = x.new_empty(x.shape).bernoulli_(keep).div_(keep)
+            return x * noise
+
+else:
+    StochasticDepth = _TorchStochasticDepth  # type: ignore
+
+_Norm = nn.LayerNorm
+
 try:
-    import triton
-    import triton.language as tl
-    _HAS_TRITON = True
+    from torch.nn.attention.flex_attention import (
+        flex_attention,
+        create_block_mask,
+    )
+    _HAS_FLEX_ATTENTION = True
 except Exception:
-    _HAS_TRITON = False
+    _HAS_FLEX_ATTENTION = False
+
+from ..backend.profiler import FLOP_PROFILER
+from ..functional.fx import Autocast, Gradient
+from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 @torch.no_grad()
 def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
@@ -96,483 +122,6 @@ def _block_ranges(N: int, patch: int):
                                 
                            
                                 
-if _HAS_TRITON:
-                                                                                                                                                           
-    _RV_CONFIGS = [
-        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=2,  num_stages=1),
-        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=4,  num_stages=1),
-        triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  32}, num_warps=2,  num_stages=2),
-        triton.Config({'BLOCK_J':  32, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J':  64, 'BLOCK_DH':  64}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  32}, num_warps=4,  num_stages=2),
-        triton.Config({'BLOCK_J': 128, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 128, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 256, 'BLOCK_DH':  64}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 256, 'BLOCK_DH': 128}, num_warps=8,  num_stages=2),
-        triton.Config({'BLOCK_J': 512, 'BLOCK_DH':  64}, num_warps=16, num_stages=3),
-        triton.Config({'BLOCK_J': 512, 'BLOCK_DH': 128}, num_warps=16, num_stages=3),
-    ]
-
-                                          
-    @triton.autotune(configs=_RV_CONFIGS, key=['J', 'DH', 'K'])
-    @triton.jit
-    def _reduce_weighted_sum(
-        W, RV, O,
-        B: tl.constexpr, H: tl.constexpr, K: tl.constexpr, J: tl.constexpr, DH: tl.constexpr,
-                                                               
-        SWB, SWH, SWK, SWJ,
-        SRVB, SRVH, SRVK, SRVJ, SRVDH,
-        SOB, SOH, SOK, SODH,
-        BLOCK_J: tl.constexpr, BLOCK_DH: tl.constexpr,
-    ):
-        pid_bh = tl.program_id(0)                 
-        pid_k  = tl.program_id(1)               
-        pid_d  = tl.program_id(2)                       
-
-        b = pid_bh // H
-        h = pid_bh %  H
-        k = pid_k
-
-        dh_off = pid_d * BLOCK_DH + tl.arange(0, BLOCK_DH)
-        acc = tl.zeros([BLOCK_DH], dtype=tl.float32)
-
-        j0 = 0
-        while j0 < J:
-            j_off = j0 + tl.arange(0, BLOCK_J)
-            mask_j = j_off < J
-                                          
-            w_ptr = W + b*SWB + h*SWH + k*SWK + j_off*SWJ
-            w_val = tl.load(w_ptr, mask=mask_j, other=0.0).to(tl.float32)        
-                                                        
-            rv_ptr = RV + b*SRVB + h*SRVH + k*SRVK + j_off[:, None]*SRVJ + dh_off[None, :]*SRVDH
-            mask_rv = (mask_j[:, None]) & (dh_off[None, :] < DH)
-            rv_val = tl.load(rv_ptr, mask=mask_rv, other=0.0).to(tl.float32)
-                                
-            acc += tl.sum(rv_val * w_val[:, None], axis=0)
-            j0 += BLOCK_J
-
-                                                                                            
-        o_ptr = O + b*SOB + h*SOH + k*SOK + dh_off*SODH
-        mask_o = dh_off < DH
-        old = tl.load(o_ptr, mask=mask_o, other=0.0)
-        tl.store(o_ptr, old + acc, mask=mask_o)
-from tensordict import TensorDictBase
-try:
-    from torch.utils.checkpoint import checkpoint as activation_checkpoint
-except Exception:
-    activation_checkpoint = None
-
-from ..backend.compat import patch_torch, is_meta_or_fake_tensor
-from ..backend.distributed import get_world_size
-from ..backend.system import cpu_info, system_info, posix_time
-from ..functional.fx import Autocast, Gradient, reshape_for_mha
-from .activations import SwiGLU
-from .kernels import (
-    DotProductAttention,
-    MultiHeadAttention,
-    MultiScaleRetention,
-    to_additive_mask,
-)
-
-try:
-    from torch._inductor import config as _inductor_config
-except Exception:
-    _inductor_config = None
-else:
-    try:
-        triton_cfg = getattr(_inductor_config, "triton")
-        if hasattr(triton_cfg, "cudagraph_skip_dynamic_graphs"):
-            triton_cfg.cudagraph_skip_dynamic_graphs = True
-    except Exception:
-        pass
-
-try:
-    from ..backend.compat import RMSNorm as _Norm
-except Exception:
-    _Norm = nn.LayerNorm
-
-
-patch_torch()
-
-
-if TYPE_CHECKING:
-    import numpy as np
-
-    from ..api.config import ModelConfig
-
-
-LayerNorm = nn.LayerNorm
-
-
-_NORM_MODES = {"norm", "normalize", "normalization"}
-_DENORM_MODES = {"denorm", "denormalize", "denormalization"}
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, axes: Tuple[str, ...]) -> None:
-        super().__init__()
-        self.axes = axes
-        if len(axes) < 1 or any(a not in ("l", "t", "t_score", "h", "w") for a in axes):
-            raise ValueError("axes must be drawn from {'l','t','t_score','h','w'}")
-        if d_model % len(axes) != 0:
-            raise ValueError("d_model must be divisible by number of axes")
-        self.d_axis = d_model // len(axes)
-        if self.d_axis % 2 != 0:
-            raise ValueError("per-axis dimension must be even")
-        self.register_buffer(
-            "_cache_meta",
-            torch.tensor([-1, -1, -1], dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer("_cache_pe", torch.empty(0, 0), persistent=False)
-        self._cache_device: torch.device | None = None
-        self._cache_dtype: torch.dtype | None = None
-
-    @staticmethod
-    def _flatten(n: int, dim: int, device: torch.device) -> torch.Tensor:
-        pos = torch.arange(n, device=device, dtype=torch.float32).unsqueeze(1)
-        div = torch.exp(
-            torch.arange(0, dim, 2, device=device, dtype=torch.float32)
-            * (-math.log(10000.0) / dim)
-        )
-        pe = torch.zeros(n, dim, device=device)
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        return pe
-
-    def forward(
-        self,
-        meta: Tuple[int, int, int],
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-    ) -> torch.Tensor:
-        t, h, w = meta
-        if (
-            self._cache_device == device
-            and self._cache_dtype == dtype
-            and self._cache_meta.numel() == 3
-            and tuple(int(x) for x in self._cache_meta.tolist()) == (t, h, w)
-        ):
-            return self._cache_pe
-        chunks: List[torch.Tensor] = []
-        if "t" in self.axes:
-            pt = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
-            chunks.append(pt.expand(t, h, w, self.d_axis))
-        if "h" in self.axes:
-            ph = self._flatten(h, self.d_axis, device).view(1, h, 1, self.d_axis)
-            chunks.append(ph.expand(t, h, w, self.d_axis))
-        if "w" in self.axes:
-            pw = self._flatten(w, self.d_axis, device).view(1, 1, w, self.d_axis)
-            chunks.append(pw.expand(t, h, w, self.d_axis))
-        if "l" in self.axes:
-            pl = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
-            chunks.append(pl.expand(t, 1, 1, self.d_axis))
-        if "t_score" in self.axes:
-            pt_score = self._flatten(t, self.d_axis, device).view(t, 1, 1, self.d_axis)
-            chunks.append(pt_score.expand(t, h, w, self.d_axis))
-        pe = torch.cat(chunks, dim=-1).view(-1, self.d_axis * len(self.axes))
-        pe = pe.to(dtype=dtype)
-        self._cache_meta = torch.tensor([t, h, w], dtype=torch.int64)
-        self._cache_pe = pe
-        self._cache_device = device
-        self._cache_dtype = dtype
-        return pe
-
-
-class StochasticDepth(nn.Module):
-    def __init__(self, p: float = 0.0, mode: str = "row") -> None:
-        super().__init__()
-        if not 0.0 <= p <= 1.0:
-            raise ValueError(f"p must be in [0, 1], got {p}")
-        self.p = float(p)
-        self.mode = str(mode)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not self.training or self.p == 0.0:
-            return x
-        keep_prob = 1.0 - self.p
-        if keep_prob <= 0.0:
-            return torch.zeros_like(x)
-        if self.mode == "row":
-            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        else:
-            shape = (1,) * x.ndim
-        noise = x.new_empty(shape).bernoulli_(keep_prob).div_(keep_prob)
-        return x * noise
-
-
-def norm_layer(norm_type: str, d_model: int) -> nn.Module:
-    kind = str(norm_type).lower()
-    if kind in {"layernorm", "layer_norm", "ln"}:
-        return LayerNorm(d_model)
-    if kind in {"rmsnorm", "rms_norm", "rms"} and hasattr(nn, "RMSNorm"):
-        return nn.RMSNorm(d_model)
-    return LayerNorm(d_model)
-
-
-def stochastic_depth_schedule(max_rate: float, depth: int) -> list[float]:
-    if depth <= 0:
-        return []
-    if max_rate <= 0.0:
-        return [0.0 for _ in range(depth)]
-    step = float(max_rate) / max(1, depth)
-    return [step * float(index + 1) for index in range(depth)]
-
-
-class PatchEmbedding(nn.Module):
-    def __init__(
-        self,
-        *args: Any,
-        in_channels: int = 1,
-        d_model: int = 128,
-        ndim: int = 2,
-        patch: Tuple[int, ...] = (4, 4, 4),
-        stride: Optional[Tuple[int, ...]] = None,
-        grid: Optional[Tuple[int, ...]] = None,
-        grid_3d: Optional[Tuple[int, int, int]] = None,
-        dropout: float = 0.0,
-        pad_to_multiple: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        if ndim not in (1, 2, 3):
-            raise ValueError(f"ndim must be 1, 2, or 3, got {ndim!r}")
-        self.ndim = int(ndim)
-        self.grid = grid
-        self.grid_3d = grid_3d
-        if any((p <= 0 for p in patch)):
-            raise ValueError(f"patch sizes must be positive, got {patch}")
-        if stride is not None and (
-            len(stride) < self.ndim or any((s <= 0 for s in stride[: self.ndim]))
-        ):
-            raise ValueError(
-                (
-                    "stride must have length >= "
-                    f"{self.ndim} with positive values, got {stride}"
-                )
-            )
-        self.dropout = nn.Dropout(dropout)
-        self.d_model = int(d_model)
-        self.patch = patch
-        self.pad_to_multiple = bool(pad_to_multiple)
-        self.static_spatial: Optional[Tuple[int, ...]] = getattr(
-            self, "static_spatial", None
-        )
-        if self.static_spatial is None:
-            hw = getattr(self, "static_hw", None)
-            if hw is not None and self.ndim == 2:
-                self.static_spatial = (int(hw[0]), int(hw[1]))
-        stride = patch if stride is None else stride
-        match self.ndim:
-            case 1:
-                self.proj = nn.Conv1d(
-                    in_channels,
-                    d_model,
-                    kernel_size=(patch[0],),
-                    stride=(stride[0],),
-                )
-            case 2:
-                self.proj = nn.Conv2d(
-                    in_channels,
-                    d_model,
-                    kernel_size=(patch[0], patch[1]),
-                    stride=(stride[0], stride[1]),
-                )
-            case 3:
-                self.proj = nn.Conv3d(
-                    in_channels,
-                    d_model,
-                    kernel_size=(patch[0], patch[1], patch[2]),
-                    stride=(stride[0], stride[1], stride[2]),
-                )
-
-    def _normalize_shape(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 2:
-            b, fdim = x.shape
-            match self.ndim:
-                case 1:
-                    if self.grid is None:
-                        length = fdim
-                        kernel = self.patch[0]
-                        need = (length + kernel - 1) // kernel * kernel
-                        if fdim < need:
-                            x = torch.nn.functional.pad(x, (0, need - fdim))
-                        return x.view(b, 1, -1)
-                    (grid_length,) = self.grid
-                    if fdim < grid_length:
-                        x = torch.nn.functional.pad(x, (0, grid_length - fdim))
-                    elif fdim > grid_length:
-                        raise ValueError(
-                            f"[B,F] grid(L={grid_length}) but F={fdim} > L."
-                        )
-                    return x.view(b, 1, grid_length)
-                case 2:
-                    if self.grid is None:
-                        side = int(math.ceil(math.sqrt(fdim)))
-                        h = w = side
-                    else:
-                        h, w = self.grid
-                    need = h * w
-                    if fdim < need:
-                        x = torch.nn.functional.pad(x, (0, need - fdim))
-                    elif fdim > need:
-                        raise ValueError(f"[B,F] grid(H={h},W={w}) but F={fdim} > H*W.")
-                    return x.view(b, h, w)
-                case 3:
-                    if self.grid_3d is None:
-                        side = int(round(fdim ** (1.0 / 3.0)))
-                        t = h = w = max(1, side)
-                    else:
-                        t, h, w = self.grid_3d
-                    need = t * h * w
-                    if fdim < need:
-                        x = torch.nn.functional.pad(x, (0, need - fdim))
-                    elif fdim > need:
-                        raise ValueError(
-                            f"[B,F] grid(T={t},H={h},W={w}) but F={fdim} > T*H*W."
-                        )
-                    return x.view(b, t, h, w)
-        return x
-
-    def _pad(self, x: torch.Tensor) -> torch.Tensor:
-        match self.ndim:
-            case 1:
-                length = x.shape[-1]
-                kernel = self.patch[0]
-                need = (length + kernel - 1) // kernel * kernel
-                if length < need:
-                    x = F.pad(x, (0, need - length))
-            case 2:
-                h, w = x.shape[-2:]
-                kh, kw = self.patch[:2]
-                need_h = (h + kh - 1) // kh * kh
-                need_w = (w + kw - 1) // kw * kw
-                if h < need_h or w < need_w:
-                    x = F.pad(x, (0, need_w - w, 0, need_h - h))
-            case 3:
-                t, h, w = x.shape[-3:]
-                kt, kh, kw = self.patch
-                need_t = (t + kt - 1) // kt * kt
-                need_h = (h + kh - 1) // kh * kh
-                need_w = (w + kw - 1) // kw * kw
-                if t < need_t or h < need_h or w < need_w:
-                    x = F.pad(
-                        x,
-                        (0, need_w - w, 0, need_h - h, 0, need_t - t),
-                    )
-        return x
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-        x = self._normalize_shape(x)
-        x = torch.atleast_3d(x)
-        if self.static_spatial is not None:
-            x = self._pad_or_crop_to_nd(x, self.static_spatial)
-        elif x.shape[1] != self.patch[0] and self.pad_to_multiple:
-            x = self._dynamic_pad(x)
-        y = self.proj(x)
-        match self.ndim:
-            case 1:
-                b, d, length = y.shape
-                tokens = y.transpose(1, 2).contiguous().view(b, length, d)
-                meta = (length, 1, 1)
-            case 2:
-                b, d, h, w = y.shape
-                tokens = y.permute(0, 2, 3, 1).contiguous().view(b, h * w, d)
-                meta = (1, h, w)
-            case 3:
-                b, d, t, h, w = y.shape
-                tokens = y.permute(0, 2, 3, 4, 1).contiguous().view(b, t * h * w, d)
-                meta = (t, h, w)
-            case _:
-                raise RuntimeError("Unsupported ndim for PatchEmbedding")
-        return (self.dropout(tokens), meta)
-
-    def _pad_or_crop_to_nd(
-        self, x: torch.Tensor, target: Tuple[int, ...]
-    ) -> torch.Tensor:
-        if len(target) != self.ndim:
-            raise ValueError(
-                f"static_spatial must have length {self.ndim}, got {len(target)}"
-            )
-        tgt = [int(v) for v in target]
-        if any(v <= 0 for v in tgt):
-            raise ValueError("static_spatial values must be positive")
-        spatial = list(x.shape[-self.ndim :])
-        pads: list[int] = []
-        for cur, want in reversed(list(zip(spatial, tgt))):
-            pad_right = max(want - cur, 0)
-            pads.extend([0, pad_right])
-        if any(pads):
-            x = F.pad(x, tuple(pads))
-        slices = [slice(None)] * x.ndim
-        base = x.ndim - self.ndim
-        for offset, want in enumerate(tgt):
-            slices[base + offset] = slice(0, want)
-        return x[tuple(slices)]
-
-    def _dynamic_pad(self, x: torch.Tensor) -> torch.Tensor:
-        return self._pad(x)
-
-
-class CrossAttention(nn.Module):
-
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        dropout: float = 0.0,
-        norm_type: str = "layernorm",
-        bias: bool = True,
-        *args: Any,
-        use_gate: bool = True,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        if d_model % nhead != 0:
-            raise ValueError("d_model must be divisible by nhead for attention")
-
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.head_dim = int(self.d_model // self.nhead)
-        self.norm_q = norm_layer(norm_type, self.d_model)
-        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
-        self.kv_proj = nn.Linear(self.d_model, 2 * self.d_model, bias=bias)
-        self.out_proj = nn.Linear(self.d_model, self.d_model, bias=bias)
-        self.dropout = nn.Dropout(float(dropout))
-        self.use_gate = bool(use_gate)
-        if self.use_gate:
-            self.gate = nn.Parameter(torch.zeros(1))
-        else:
-            self.register_parameter("gate", None)
-        self.sdpa = DotProductAttention(
-            num_heads=self.nhead,
-            head_dim=self.head_dim,
-        )
-
-    def forward(
-        self,
-        q: torch.Tensor,
-        kv: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        B, Nq, D = q.shape
-        if D != self.d_model:
-            raise ValueError(f"q.shape[-1]={D} must match d_model={self.d_model}")
-        q_norm = self.norm_q(q)
-        q_proj = self.q_proj(q_norm)
-        kv_proj = self.kv_proj(kv)
-        k_proj, v_proj = kv_proj.chunk(2, dim=-1)
-        qh = reshape_for_mha(q_proj, B, self.nhead, self.head_dim)
-        kh = reshape_for_mha(k_proj, B, self.nhead, self.head_dim)
-        vh = reshape_for_mha(v_proj, B, self.nhead, self.head_dim)
-        yh = self.sdpa(qh, kh, vh, attn_mask=attn_mask)
-        y = yh.transpose(1, 2).contiguous().view(B, Nq, D)
-        y = self.out_proj(self.dropout(y))
-        if self.use_gate and self.gate is not None:
-            y = torch.sigmoid(self.gate) * y
-        return q + y
-
-
 class PatchAttention(nn.Module):
     def __init__(
         self,
@@ -590,17 +139,7 @@ class PatchAttention(nn.Module):
         self.head_dim = self.d_model // self.nhead
         self.coord_dim = int(coord_dim)
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
-        self.rel_bias = nn.Sequential(
-            nn.Linear(self.coord_dim, self.d_model),
-            nn.SiLU(),
-            nn.Linear(self.d_model, self.nhead),
-        )
-        self.rel_value = nn.Sequential(
-            nn.Linear(self.coord_dim, self.d_model),
-            nn.SiLU(),
-            nn.Linear(self.d_model, self.d_model),
-        )
-        self.attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
 
     def forward(
         self,
@@ -618,160 +157,91 @@ class PatchAttention(nn.Module):
             reshape_for_mha(k, B, self.nhead, self.head_dim),
             reshape_for_mha(v, B, self.nhead, self.head_dim),
         )
-        P = N           
-                                               
-                                                                 
-        coords = coords.contiguous()
-        coords_f32 = coords if coords.dtype == torch.float32 else coords.float()
-        attn_bias = None
-        try:
-                                    
-            rel = (coords_f32.unsqueeze(2) - coords_f32.unsqueeze(1))                    
-                                                  
-            attn_bias = self.rel_bias(rel.to(x.dtype)).permute(0, 3, 1, 2).contiguous()
-        except Exception:
-            attn_bias = None
+        if not _HAS_FLEX_ATTENTION:
+            attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+            yh = attn(qh, kh, vh, attn_mask=attn_mask, training=self.training)
+            return yh.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
-                                                      
-        additive = None
-        if attn_mask is not None:
-            if attn_mask.dtype == torch.bool:
-                                                                   
-                _mask = ~attn_mask
-                additive = to_additive_mask(
-                    _mask,
-                    batch=B,
-                    heads=self.nhead,
-                    seq_q=P,
-                    seq_k=P,
-                    dtype=(attn_bias.dtype if attn_bias is not None else qh.dtype),
-                    device=qh.device,
+        coords_f32 = coords.to(dtype=torch.float32, device=x.device).contiguous()
+        W = self.rel_weight.to(dtype=coords_f32.dtype, device=coords_f32.device)
+
+        block = None
+        mask_bias: torch.Tensor | None = None
+        if isinstance(attn_mask, torch.Tensor):
+            m = attn_mask
+            if m.dtype == torch.bool:
+                if m.dim() == 2:
+                    m = m.view(1, 1, N, N).expand(B, self.nhead, N, N)
+                elif m.dim() == 3:
+                    if m.shape != (B, N, N):
+                        raise ValueError(f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})")
+                    m = m.view(B, 1, N, N).expand(B, self.nhead, N, N)
+                elif m.dim() == 4:
+                    b, h, s1, s2 = m.shape
+                    if (b != B) or (s1 != N) or (s2 != N):
+                        raise ValueError(f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})")
+                    if h == 1:
+                        m = m.expand(B, self.nhead, N, N)
+                    elif h != self.nhead:
+                        raise ValueError(
+                            f"bool attn_mask head dim {h} incompatible with nhead={self.nhead}"
+                        )
+                else:
+                    raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
+                allowed = (~m).to(device=qh.device)
+
+                def mask_mod(b, h, qi, kj):
+                    return allowed[b, h, qi, kj]
+
+                block = create_block_mask(
+                    mask_mod,
+                    B,
+                    self.nhead,
+                    N,
+                    N,
+                    device=str(qh.device),
                 )
             else:
-                                                                          
-                additive = attn_mask
-                if additive.dim() == 3:
-                    additive = additive.unsqueeze(1)                     
-                if additive.size(1) == 1 and self.nhead > 1:
-                    additive = additive.expand(B, self.nhead, P, P)
-                additive = additive.to(
-                    dtype=(attn_bias.dtype if attn_bias is not None else qh.dtype),
-                    device=qh.device,
-                )
-        if attn_bias is not None and additive is not None:
-            attn_bias = attn_bias + additive
-        elif additive is not None:
-            attn_bias = additive
-                                                          
-
-                                                           
-                                                        
-        use_shared_weights = bool(getattr(self, "reuse_weights_for_base", False))
-        if use_shared_weights:
-            base = torch.zeros((B, self.nhead, P, self.head_dim), dtype=vh.dtype, device=vh.device)
-        else:
-            base = self.attn(
-                qh,
-                kh,
-                vh,
-                attn_mask=(attn_bias.to(dtype=qh.dtype) if attn_bias is not None else None),
-                training=self.training,
-            )
-                                                                      
-                                                                 
-        H, Dh = self.nhead, self.head_dim
-        scale = 1.0 / math.sqrt(float(self.head_dim))
-                                      
-        rtile = min(P, int(getattr(self, "rel_rtile", getattr(self, "rel_tile", 64))))
-        ctile = min(P, int(getattr(self, "rel_ctile", getattr(self, "rel_tile", 64))))
-        use_triton = (_HAS_TRITON and qh.is_cuda and (not torch.is_grad_enabled()))
-
-                        
-        rel_ctx = torch.zeros((B, H, P, Dh), dtype=qh.dtype, device=qh.device)
-
-                                                                                          
-        for s in range(0, P, rtile):
-            e = min(s + rtile, P)
-            q_blk = qh[:, :, s:e, :]              
-
-                                                                              
-            m = torch.full((B, H, e - s, 1), -float("inf"), dtype=torch.float32, device=qh.device)
-            sum_exp = torch.zeros_like(m)             
-            for t in range(0, P, ctile):
-                u = min(t + ctile, P)
-                k_blk = kh[:, :, t:u, :]              
-                                         
-                sc = torch.einsum("bhid,bhjd->bhij", q_blk, k_blk) * scale
-                if attn_bias is not None:
-                    sc = sc + attn_bias[:, :, s:e, t:u].to(dtype=sc.dtype)
-                sc = sc.float()
-                                        
-                tile_max = sc.amax(dim=-1, keepdim=True)             
-                m_new = torch.maximum(m, tile_max)
-                                                                             
-                sum_exp = sum_exp * torch.exp(m - m_new) + torch.exp(sc - m_new).sum(dim=-1, keepdim=True)
-                m = m_new
-
-                                                                             
-            all_masked = torch.isneginf(m) | (~torch.isfinite(sum_exp)) | (sum_exp <= 0)
-            if all_masked.any():
-                                                                            
-                m = torch.where(all_masked, torch.zeros_like(m), m)
-                sum_exp = torch.where(all_masked, torch.ones_like(sum_exp), sum_exp)
-
-                                                                   
-                                                           
-            if use_triton:
-                o_slice = torch.zeros_like(rel_ctx[:, :, s:e, :], dtype=torch.float32)
-
-            for t in range(0, P, ctile):
-                u = min(t + ctile, P)
-                k_blk = kh[:, :, t:u, :]              
-                sc = torch.einsum("bhid,bhjd->bhij", q_blk, k_blk) * scale             
-                if attn_bias is not None:
-                    sc = sc + attn_bias[:, :, s:e, t:u].to(dtype=sc.dtype)
-                sc = sc.float()
-                w_t = torch.exp(sc - m) / (sum_exp + 1e-12)
-                drop_p = 0.0
-                _attn_p = getattr(self.attn, "dropout_p", None)
-                if _attn_p is None:
-                    _attn_p = getattr(self.attn, "dropout", 0.0)
-                try:
-                    drop_p = float(_attn_p or 0.0)
-                except Exception:
-                    drop_p = 0.0
-                if self.training and drop_p > 0.0:
-                    w_t = F.dropout(w_t, p=drop_p, training=True)
-                rel_chunk = (coords_f32[:, s:e, :].unsqueeze(2) - coords_f32[:, t:u, :].unsqueeze(1))
-                rv = self.rel_value(rel_chunk.to(x.dtype))             
-                rv = rv.view(B, (e - s), (u - t), H, Dh).permute(0, 3, 1, 2, 4).contiguous()
-                if use_shared_weights:
-                    v_blk = vh[:, :, t:u, :]              
-                    _base_acc32 = (w_t.unsqueeze(-1) * v_blk.to(torch.float32).unsqueeze(2)).sum(dim=-2)
-                    base[:, :, s:e, :] += _base_acc32.to(base.dtype)
-                if use_triton:
-                    w_ctg = w_t.contiguous()                                  
-                    B_, H_, K_, J_, DH_ = B, H, (e - s), (u - t), Dh
-                    SWB, SWH, SWK, SWJ = w_ctg.stride()
-                    SRVB, SRVH, SRVK, SRVJ, SRVDH = rv.stride()
-                    SOB, SOH, SOK, SODH = o_slice.stride()
-                    _reduce_weighted_sum[lambda META: (B_*H_, K_, triton.cdiv(DH_, META['BLOCK_DH']))](
-                        w_ctg, rv, o_slice,
-                        B_, H_, K_, J_, DH_,
-                        SWB, SWH, SWK, SWJ,
-                        SRVB, SRVH, SRVK, SRVJ, SRVDH,
-                        SOB, SOH, SOK, SODH,
-                    )
+                bias = m.to(device=qh.device, dtype=qh.dtype)
+                if bias.dim() == 2:
+                    if bias.shape != (N, N):
+                        raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (N,N)=(~,{N})")
+                    bias = bias.view(1, 1, N, N).expand(B, self.nhead, N, N)
+                elif bias.dim() == 3:
+                    if bias.shape != (B, N, N):
+                        raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (B,N,N)=({B},{N},{N})")
+                    bias = bias.view(B, 1, N, N).expand(B, self.nhead, N, N)
+                elif bias.dim() == 4:
+                    b, h, s1, s2 = bias.shape
+                    if (b != B) or (s1 != N) or (s2 != N):
+                        raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (B={B},N={N})")
+                    if h == 1:
+                        bias = bias.expand(B, self.nhead, N, N)
+                    elif h != self.nhead:
+                        raise ValueError(
+                            f"attn_mask head dim {h} incompatible with nhead={self.nhead}"
+                        )
                 else:
-                    _acc32 = (w_t.unsqueeze(-1) * rv.to(torch.float32)).sum(dim=-2)           
-                    rel_ctx[:, :, s:e, :] += _acc32.to(qh.dtype)
+                    raise ValueError(f"attn_mask rank {bias.dim()} not supported")
+                mask_bias = bias.contiguous()
 
-            if use_triton:
-                                                          
-                rel_ctx[:, :, s:e, :] += o_slice.to(dtype=qh.dtype)
+        def score_mod(score, b, h, qi, kj):
+            delta = coords_f32[b, qi] - coords_f32[b, kj]
+            coord_bias = (delta * W[h]).sum().to(dtype=score.dtype)
+            total = score + coord_bias
+            if mask_bias is not None:
+                total = total + mask_bias[b, h, qi, kj].to(dtype=score.dtype)
+            return total
 
-        context = base + rel_ctx
-        return context.transpose(1, 2).contiguous().view(B, N, self.d_model)
+        scale = 1.0 / math.sqrt(float(self.head_dim))
+        out = flex_attention(qh, kh, vh, score_mod=score_mod, block_mask=block, scale=scale)
+        H, Dh = self.nhead, self.head_dim
+        flops = 2.0 * B * H * N * Dh * N + 2.0 * B * H * N * N * Dh + (B * H * N * N * self.coord_dim)
+        try:
+            FLOP_PROFILER.add("PatchAttention", float(flops))
+        except Exception:
+            pass
+        return out.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
 
 class Retention(nn.Module):
@@ -865,13 +335,8 @@ class DilatedAttention(nn.Module):
             "include_softmax_scale_dropout": True,
         }
         self.norm1 = _Norm(self.embed_dim)
-        self.attn = MultiHeadAttention(
-            embed_dim=self.embed_dim,
-            num_heads=self.num_heads,
-            dropout=dropout,
-            bias=bias,
-            batch_first=self.batch_first,
-        )
+        self.qkv = nn.Linear(self.embed_dim, 3 * self.embed_dim, bias=bias)
+        self.out_proj = nn.Linear(self.embed_dim, self.embed_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.norm2 = _Norm(self.embed_dim)
         hidden = int(mlp_ratio * self.embed_dim)
@@ -926,16 +391,74 @@ class DilatedAttention(nn.Module):
 
         residual = x
         x = self.norm1(x)
-        mask = self._get_mask(L, x.device)
-        attn_out, attn_w = self.attn(
-            x,
-            x,
-            x,
-            attn_mask=mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            is_causal=self.causal,
-        )
+        if not _HAS_FLEX_ATTENTION:
+            mha = MultiHeadAttention(
+                self.embed_dim,
+                self.num_heads,
+                dropout=self.dropout_p,
+                batch_first=True,
+                bias=True,
+            )
+            mask = self._get_mask(L, x.device)
+            attn_out, attn_w = mha(
+                x,
+                x,
+                x,
+                attn_mask=mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                is_causal=self.causal,
+            )
+        else:
+            qkv = self.qkv(x)
+            q, k, v = qkv.chunk(3, dim=-1)
+            Dh = self.head_dim
+            H = self.nhead
+            qh = q.view(B, L, H, Dh).transpose(1, 2).contiguous()
+            kh = k.view(B, L, H, Dh).transpose(1, 2).contiguous()
+            vh = v.view(B, L, H, Dh).transpose(1, 2).contiguous()
+
+            dil = int(self.dilation)
+            win = None if self.window_size is None else int(self.window_size)
+            causal = self.causal
+            kpm: torch.Tensor | None = None
+            if isinstance(key_padding_mask, torch.Tensor):
+                if key_padding_mask.dim() != 2 or key_padding_mask.shape != (B, L):
+                    raise ValueError(
+                        f"key_padding_mask must be (B,L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
+                    )
+                kpm = key_padding_mask.to(dtype=torch.bool, device=x.device)
+
+            def mask_mod(b, h, qi, kj):
+                dq = qi - kj
+                ok = (dq.remainder(dil) == 0)
+                if win is not None:
+                    ok = ok & (dq.abs() <= win)
+                if causal:
+                    ok = ok & (kj <= qi)
+                if kpm is not None:
+                    ok = ok & (~kpm[b, kj])
+                return ok
+
+            block = create_block_mask(
+                mask_mod,
+                B,
+                H,
+                L,
+                L,
+                device=str(x.device),
+            )
+            scale = 1.0 / math.sqrt(float(Dh))
+            y = flex_attention(qh, kh, vh, block_mask=block, scale=scale)
+            attn_out = self.out_proj(
+                y.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+            )
+            flops = 2.0 * B * H * L * Dh * L + 2.0 * B * H * L * L * Dh
+            try:
+                FLOP_PROFILER.add("DilatedAttention", float(flops))
+            except Exception:
+                pass
+            attn_w = None
         x = residual + self.dropout(attn_out)
         residual = x
         x = self.norm2(x)
@@ -945,6 +468,32 @@ class DilatedAttention(nn.Module):
             x = x.transpose(0, 1)
 
         return x, (attn_w if need_weights else None)
+
+
+class SwiGLU(nn.Module):
+
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        *,
+        out_dim: Optional[int] = None,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.out_dim = int(out_dim) if out_dim is not None else int(in_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.proj_in = nn.Linear(self.in_dim, 2 * self.hidden_dim)
+        self.proj_out = nn.Linear(self.hidden_dim, self.out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
+        x = self.proj_in(x)
+        u, v = x.chunk(2, dim=-1)
+        activated = F.silu(u) * v
+        activated = self.dropout(activated)
+        return self.proj_out(activated)
 
 
 class PointTransformer(nn.Module):
@@ -1107,6 +656,57 @@ def _coerce_modeling_types(value: Any) -> str:
     if normalized is None:
         raise ValueError(f"Unsupported modeling type '{value}'")
     return normalized
+
+
+def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
+    if depth <= 0:
+        return []
+    if drop_path <= 0.0:
+        return [0.0 for _ in range(depth)]
+    if depth == 1:
+        return [float(drop_path)]
+    step = float(drop_path) / float(depth - 1)
+    return [float(i * step) for i in range(depth)]
+
+
+def norm_layer(norm_type: str, dim: int) -> nn.Module:
+    norm = str(norm_type).strip().lower()
+    if norm in {"ln", "layernorm", "layer_norm", "layer-norm"}:
+        return nn.LayerNorm(dim)
+    if norm in {"bn", "batchnorm", "batch_norm", "batch-norm"}:
+        return nn.BatchNorm1d(dim)
+    if norm in {"rms", "rmsnorm", "rms_norm", "rms-norm"}:
+        try:
+            from torch.nn import RMSNorm  # type: ignore
+
+            return RMSNorm(dim)
+        except Exception:
+            return nn.LayerNorm(dim)
+    return nn.LayerNorm(dim)
+
+
+def is_meta_or_fake_tensor(x: Any) -> bool:
+    if not isinstance(x, torch.Tensor):
+        return False
+    if x.is_meta:
+        return True
+    try:
+        from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
+
+        if isinstance(x, FakeTensor):
+            return True
+    except Exception:
+        pass
+    try:
+        return bool(getattr(x, "fake_mode", None))
+    except Exception:
+        return False
+
+
+def reshape_for_mha(x: torch.Tensor, batch: int, heads: int, head_dim: int) -> torch.Tensor:
+    if x.dim() != 3:
+        raise ValueError(f"Expected (B, N, D) tensor for MHA reshape, got shape {tuple(x.shape)}")
+    return x.view(batch, -1, heads, head_dim).transpose(1, 2).contiguous()
 
 
 class SpatialNet(nn.Module):
@@ -1365,6 +965,41 @@ class TemporalNet(nn.Module):
         if return_state:
             return x, next_state
         return x
+
+
+class CrossAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        dropout: float = 0.0,
+        norm_type: str = "layernorm",
+        drop_path: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__()
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.norm_q = norm_layer(norm_type, self.d_model)
+        self.norm_kv = norm_layer(norm_type, self.d_model)
+        self.attn = MultiHeadAttention(
+            embed_dim=self.d_model,
+            num_heads=self.nhead,
+            dropout=dropout,
+            batch_first=True,
+            bias=True,
+        )
+        self.out_proj = nn.Linear(self.d_model, self.d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.drop_path = StochasticDepth(p=drop_path, mode="row")
+
+    def forward(self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor) -> torch.Tensor:
+        qn = self.norm_q(q_tokens)
+        kvn = self.norm_kv(kv_tokens)
+        ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
+        ctx = self.out_proj(ctx)
+        return q_tokens + self.drop_path(self.dropout(ctx))
 
 
 class CrossTransformer(nn.Module):
@@ -1922,15 +1557,43 @@ class Scaler(nn.Module):
         self.y_std.copy_(std)
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        if self.x_mean.dim() == 1 and x.dim() >= 2 and self.x_mean.shape[-1] != x.shape[-1]:
+            with torch.no_grad():
+                new_c = x.shape[-1]
+                self.x_mean.resize_(new_c)
+                self.x_std.resize_(new_c)
+                self.x_mean.zero_()
+                self.x_std.fill_(1.0)
         return (x - self.x_mean) / (self.x_std + self.eps)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
+        if self.x_mean.dim() == 1 and x_scaled.dim() >= 2 and self.x_mean.shape[-1] != x_scaled.shape[-1]:
+            with torch.no_grad():
+                new_c = x_scaled.shape[-1]
+                self.x_mean.resize_(new_c)
+                self.x_std.resize_(new_c)
+                self.x_mean.zero_()
+                self.x_std.fill_(1.0)
         return x_scaled * (self.x_std + self.eps) + self.x_mean
 
     def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        if self.y_mean.dim() == 1 and y.dim() >= 2 and self.y_mean.shape[-1] != y.shape[-1]:
+            with torch.no_grad():
+                new_c = y.shape[-1]
+                self.y_mean.resize_(new_c)
+                self.y_std.resize_(new_c)
+                self.y_mean.zero_()
+                self.y_std.fill_(1.0)
         return (y - self.y_mean) / (self.y_std + self.eps)
 
     def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
+        if self.y_mean.dim() == 1 and z.dim() >= 2 and self.y_mean.shape[-1] != z.shape[-1]:
+            with torch.no_grad():
+                new_c = z.shape[-1]
+                self.y_mean.resize_(new_c)
+                self.y_std.resize_(new_c)
+                self.y_mean.zero_()
+                self.y_std.fill_(1.0)
         return z * self.y_std + self.y_mean
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from functools import partial
 from types import TracebackType
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -170,6 +171,17 @@ class _FlopProfiler:
         total, _ = self.pop()
         return total
 
+    def sum(self, *, sort: bool = True) -> Tuple[float, Dict[str, float]]:
+        total = float(self._manual_total)
+        if not sort:
+            return total, dict(self._manual_by_type)
+        ordered: Dict[str, float] = {}
+        for name, value in sorted(
+            self._manual_by_type.items(), key=lambda kv: kv[1], reverse=True
+        ):
+            ordered[name] = float(value)
+        return total, ordered
+
     def add(self, typ: str, value: float) -> None:
         if self.is_active():
             try:
@@ -193,7 +205,7 @@ class _FlopProfiler:
     def coerce_flops_ntvx(self) -> None:
         if self._nvtx_getter is not None:
             return
-        hook = ""
+        hook = os.getenv("STNET_NVTX_GETTER", "")
         if not hook:
             self._nvtx_getter = self._get_ntvx
             return
@@ -381,17 +393,12 @@ class _FlopProfiler:
                 pass
 
     def monitoring(
-        self,
-        device: Optional[torch.device],
-        *args: Any,
-        display: bool = False,
-        **kwargs: Any,
+        self, device: Optional[torch.device], *args: Any, display: bool = False, **kwargs: Any
     ) -> Any:
         instrumentation = self
-        self.activate()
-
 
         class _Flops:
+
             def __init__(self) -> None:
                 self.manual_total = 0.0
                 self.manual_breakdown: Dict[str, float] = {}
@@ -402,6 +409,7 @@ class _FlopProfiler:
                 self._nvtx_scope: Any = None
 
             def __enter__(self) -> "_Flops":
+                instrumentation.activate()
                 instrumentation.reset()
                 self._torch_scope = instrumentation._capture_torch(display)
                 self._nvtx_scope = instrumentation.new_flops_ntvx(device)
@@ -413,9 +421,7 @@ class _FlopProfiler:
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
                 manual, breakdown = instrumentation.pop()
-                if manual > 0.0:
-                    instrumentation.capture_ntvx(manual)
-                self.manual_total = manual
+                self.manual_total = float(manual)
                 self.manual_breakdown = breakdown
                 if self._torch_scope is not None:
                     self._torch_scope.__exit__(exc_type, exc, tb)
@@ -429,7 +435,10 @@ class _FlopProfiler:
                         self.nvtx_total = float(self._nvtx_scope.get_total_flops())
                     except Exception:
                         self.nvtx_total = 0.0
-                self.total = max(self.manual_total, self.torch_total, self.nvtx_total)
+                if self.manual_total > 0.0:
+                    self.total = float(self.manual_total)
+                else:
+                    self.total = max(float(self.torch_total), float(self.nvtx_total))
                 instrumentation.deactivate()
                 return False
 
@@ -438,6 +447,31 @@ class _FlopProfiler:
 
             def get_manual_breakdown(self) -> Dict[str, float]:
                 return dict(self.manual_breakdown)
+
+            def to_dict(self) -> Dict[str, float]:
+                return {
+                    "manual_total": float(self.manual_total),
+                    "torch_total": float(self.torch_total),
+                    "nvtx_total": float(self.nvtx_total),
+                    "total": float(self.total),
+                }
+
+            def verbose(self, top_k: int = 8) -> str:
+                lines: list[str] = []
+                lines.append(
+                    f"total FLOPs: manual={self.manual_total:.3e}, "
+                    f"torch={self.torch_total:.3e}, nvtx={self.nvtx_total:.3e}"
+                )
+                if self.manual_breakdown:
+                    lines.append(f"manual breakdown (top {top_k}):")
+                    items = sorted(
+                        self.manual_breakdown.items(),
+                        key=lambda kv: kv[1],
+                        reverse=True,
+                    )
+                    for name, value in items[:top_k]:
+                        lines.append(f"  - {name}: {value:.3e}")
+                return "\n".join(lines)
 
         return _Flops()
 
@@ -536,7 +570,7 @@ class FlopCounter:
 def capture(
     q: torch.Tensor,
     *args: Any,
-    bwd_factor: float = 2.0,
+    bwd_factor: float = 1.0,
     dropout_p: float = 0.0,
     training: bool = False,
     include_softmax_scale_dropout: bool = True,
@@ -551,3 +585,62 @@ def capture(
         include_softmax_scale_dropout=include_softmax_scale_dropout,
         **kwargs,
     )
+
+
+
+def capture_flops(
+    *, sort: bool = True, reset: bool = False
+) -> Tuple[float, Dict[str, float]]:
+    total, breakdown = FLOP_PROFILER.sum(sort=sort)
+    if reset:
+        FLOP_PROFILER.reset()
+    return total, breakdown
+
+
+@contextlib.contextmanager
+def interval_flops(
+    label: str = "",
+    *,
+    sort: bool = True,
+    top_k: int = 8,
+) -> Any:
+
+    class _IntervalFlops:
+        def __init__(self, label: str) -> None:
+            self.label = label
+            self.total = 0.0
+            self.breakdown: Dict[str, float] = {}
+
+        def verbose(self) -> str:
+            lines: list[str] = []
+            title = f"[FLOPs] region='{self.label}'" if self.label else "[FLOPs] region"
+            lines.append(title)
+            lines.append(f"  total: {self.total:.3e}")
+            if self.breakdown:
+                items = self.breakdown.items()
+                if sort:
+                    items = sorted(
+                        items, key=lambda kv: kv[1], reverse=True
+                    )
+                lines.append(f"  breakdown (top {top_k}):")
+                for name, value in list(items)[:top_k]:
+                    lines.append(f"    - {name}: {value:.3e}")
+            return "\n".join(lines)
+
+    before_total, before_map = FLOP_PROFILER.sum(sort=False)
+    region = _IntervalFlops(label=label)
+    try:
+        yield region
+    finally:
+        after_total, after_map = FLOP_PROFILER.sum(sort=False)
+        delta_total = float(after_total - before_total)
+        delta_map: Dict[str, float] = {}
+        keys = set(before_map.keys()) | set(after_map.keys())
+        for name in keys:
+            v0 = float(before_map.get(name, 0.0))
+            v1 = float(after_map.get(name, 0.0))
+            dv = v1 - v0
+            if dv > 0.0:
+                delta_map[name] = dv
+        region.total = delta_total
+        region.breakdown = delta_map
