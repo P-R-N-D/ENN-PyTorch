@@ -24,6 +24,7 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from tensordict import TensorDictBase
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth  # type: ignore
