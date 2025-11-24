@@ -2127,7 +2127,6 @@ class Instance(nn.Module):
     ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
-        self.scaler = Scaler()
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
         if config.device is not None:
@@ -2150,6 +2149,7 @@ class Instance(nn.Module):
             else:
                 device_name = "cpu"
             self._device = torch.device(device_name)
+        self.scaler = Scaler().to(self._device)
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
