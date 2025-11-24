@@ -12,6 +12,7 @@ from typing import (
     Any,
     Dict,
     List,
+    Mapping,
     Deque,
     Optional,
     Protocol,
@@ -1881,7 +1882,6 @@ class LossWeightPolicy(Protocol):
 
 
 class Scaler(nn.Module):
-
     def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = float(eps)
@@ -1951,8 +1951,8 @@ class Scaler(nn.Module):
             self.affine_a.resize_(a.shape)
         if self.affine_b.shape != b.shape:
             self.affine_b.resize_(b.shape)
-        self.affine_a.copy_(a)
-        self.affine_b.copy_(b)
+        self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
+        self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
         self.pw_x.resize_(0)
         self.pw_y.resize_(0)
         self.calib_mode = "affine"
@@ -2085,6 +2085,24 @@ class Scaler(nn.Module):
     def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
         if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
             return z_raw
+        with torch.no_grad():
+            if self.pw_x.dim() == 2 and self.pw_y.dim() == 2:
+                C_saved, Kx = self.pw_x.shape
+                _, Ky = self.pw_y.shape
+                K = min(Kx, Ky)
+                if Kx != K:
+                    self.pw_x = self.pw_x[:, :K]
+                if Ky != K:
+                    self.pw_y = self.pw_y[:, :K]
+                C_target = int(z_raw.shape[-1]) if z_raw.ndim > 0 else C_saved
+                if C_saved < C_target:
+                    extra_x = self.pw_x[-1:].expand(C_target - C_saved, -1)
+                    extra_y = self.pw_y[-1:].expand(C_target - C_saved, -1)
+                    self.pw_x = torch.cat([self.pw_x, extra_x], dim=0)
+                    self.pw_y = torch.cat([self.pw_y, extra_y], dim=0)
+                elif C_saved > C_target:
+                    self.pw_x = self.pw_x[:C_target]
+                    self.pw_y = self.pw_y[:C_target]
 
         orig_shape = z_raw.shape
         if z_raw.ndim == 1:
@@ -2116,6 +2134,191 @@ class Scaler(nn.Module):
 
         out = out.reshape(orig_shape)
         return out
+
+
+class History(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.timezone: str = "UTC"
+        self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.os: str = ""
+        self.kernel: str = ""
+        self.cpu: List[str] = []
+        self.arch: List[str] = []
+        self.ram_gb: int = 0
+        self.python: str = ""
+        self.backends: List[str] = []
+
+        self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_x_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_x_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_y_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_y_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_x_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_x_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_y_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_y_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+
+    @torch.no_grad()
+    def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
+        self.start.fill_(round(float(start_posix), 6))
+
+        if timezone is None or not str(timezone).strip():
+            try:
+                import datetime
+                import time as _time
+
+                now = datetime.datetime.now().astimezone()
+                tzinfo = now.tzinfo
+                tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
+                tz_name = tzinfo.tzname(now) if tzinfo is not None else None
+                tz_env = None
+                with contextlib.suppress(Exception):
+                    tz_env = _time.tzname[0]
+                tz = tz_key or tz_name or tz_env or "UTC"
+                self.timezone = str(tz)
+            except Exception:
+                self.timezone = "UTC"
+        else:
+            self.timezone = str(timezone)
+
+    @torch.no_grad()
+    def end_session(self, end_posix: float, peers: int) -> None:
+        self.end.fill_(round(float(end_posix), 6))
+        self.peers.fill_(int(peers))
+    @torch.no_grad()
+    def set_system_info(
+        self,
+        os_name: str,
+        kernel: str,
+        cpu_list: List[str],
+        arch_list: List[str],
+        ram_gb: int,
+        python_version: str,
+        backends: List[str],
+    ) -> None:
+        self.os = str(os_name)
+        self.kernel = str(kernel)
+        self.cpu = list(cpu_list)
+        self.arch = list(arch_list)
+        self.ram_gb = int(ram_gb)
+        self.python = str(python_version)
+        self.backends = list(backends)
+    @torch.no_grad()
+    def record_batch(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *,
+        use_for_sample: bool = True,
+        use_for_reduced: bool = True,
+    ) -> None:
+        if x.numel() == 0 or y.numel() == 0:
+            return
+        x_cpu = x.detach().to(device="cpu", dtype=torch.float64)
+        y_cpu = y.detach().to(device="cpu", dtype=torch.float64)
+
+        xm = x_cpu.mean()
+        xsq = (x_cpu * x_cpu).mean()
+        xvar = xsq - xm * xm
+        xmin = x_cpu.min()
+        xmax = x_cpu.max()
+
+        ym = y_cpu.mean()
+        ysq = (y_cpu * y_cpu).mean()
+        yvar = ysq - ym * ym
+        ymin = y_cpu.min()
+        ymax = y_cpu.max()
+
+        if use_for_sample:
+            n = int(self.sampled_n.item())
+            n_new = n + 1
+            w_old = n / n_new if n_new > 0 else 0.0
+            w_new = 1.0 / n_new
+
+            self.sampled_n.fill_(n_new)
+            self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
+            self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
+            self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
+            self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
+
+            self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
+            self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
+            self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
+            self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
+
+        if use_for_reduced:
+            n = int(self.reduced_n.item())
+            n_new = n + 1
+            w_old = n / n_new if n_new > 0 else 0.0
+            w_new = 1.0 / n_new
+
+            self.reduced_n.fill_(n_new)
+            self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
+            self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
+            self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
+            self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
+
+            self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
+            self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
+            self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
+            self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+
+def resize_scaler_buffer(
+    model: nn.Module,
+    state: Mapping[str, Any],
+) -> None:
+    from .layers import Scaler
+
+    scaler: Optional[Scaler] = None
+    for module in model.modules():
+        if isinstance(module, Scaler):
+            scaler = module
+            break
+    if scaler is None:
+        return
+
+    view: Mapping[str, Any]
+    if "scaler.x_mean" in state or "module.scaler.x_mean" in state:
+        view = state
+    elif "model" in state and isinstance(state["model"], Mapping):
+        view = state["model"]
+    else:
+        view = state
+
+    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
+    prefixes = ("scaler.", "module.scaler.")
+
+    for prefix in prefixes:
+        for name in buf_names:
+            key = prefix + name
+            if key not in view:
+                continue
+            src = view[key]
+            if not isinstance(src, torch.Tensor):
+                continue
+            buf = getattr(scaler, name, None)
+            if not isinstance(buf, torch.Tensor):
+                continue
+            if tuple(buf.shape) == tuple(src.shape):
+                continue
+            try:
+                buf.resize_(src.shape)
+            except Exception:
+                new_buf = buf.new_zeros(src.shape)
+                buf.resize_(new_buf.shape)
+                buf.copy_(new_buf)
 
 
 class Instance(nn.Module):
@@ -2150,6 +2353,7 @@ class Instance(nn.Module):
                 device_name = "cpu"
             self._device = torch.device(device_name)
         self.scaler = Scaler().to(self._device)
+        self.history = History()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
