@@ -72,6 +72,41 @@ def _preload_state(value: Any) -> Any:
     return value
 
 
+def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
+    """
+    Ensure scaler buffers match the shapes stored in a state_dict before loading.
+    This avoids shape-mismatch errors when scaler statistics were updated during
+    training (e.g., x_mean/x_std with feature dim > 1).
+    """
+
+    scaler = getattr(model, "scaler", None)
+    if scaler is None:
+        return
+
+    tensor_keys = (
+        "x_mean",
+        "x_std",
+        "y_mean",
+        "y_std",
+        "affine_a",
+        "affine_b",
+        "pw_x",
+        "pw_y",
+    )
+    for name in tensor_keys:
+        key = f"scaler.{name}"
+        if key not in state:
+            continue
+        buf = getattr(scaler, name, None)
+        tensor = state[key]
+        if not isinstance(buf, torch.Tensor) or not isinstance(tensor, torch.Tensor):
+            continue
+        if buf.shape == tensor.shape:
+            continue
+        with contextlib.suppress(Exception):
+            buf.resize_(tensor.shape)
+
+
 def _ensure_seed(seed: Optional[int]) -> Optional[int]:
     if seed is None:
         return None
@@ -316,6 +351,7 @@ def train(
         if os.path.isfile(fallback):
             cpu_state = torch.load(fallback, map_location="cpu")
             cpu_state = _preload_state(cpu_state)
+            _resize_scaler_buffers(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
             with warnings.catch_warnings():
@@ -327,6 +363,7 @@ def train(
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ckpt_dir),
                 )
+                _resize_scaler_buffers(model, m_sd)
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )

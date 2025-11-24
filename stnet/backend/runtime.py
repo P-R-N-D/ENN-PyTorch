@@ -373,6 +373,35 @@ def _trim_dcp_keys(state: Any) -> Any:
     return state
 
 
+def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
+    scaler = getattr(model, "scaler", None)
+    if scaler is None:
+        return
+
+    tensor_keys = (
+        "x_mean",
+        "x_std",
+        "y_mean",
+        "y_std",
+        "affine_a",
+        "affine_b",
+        "pw_x",
+        "pw_y",
+    )
+    for name in tensor_keys:
+        key = f"scaler.{name}"
+        if key not in state:
+            continue
+        buf = getattr(scaler, name, None)
+        tensor = state[key]
+        if not isinstance(buf, torch.Tensor) or not isinstance(tensor, torch.Tensor):
+            continue
+        if buf.shape == tensor.shape:
+            continue
+        with contextlib.suppress(Exception):
+            buf.resize_(tensor.shape)
+
+
 def _backend_type(device: torch.device) -> str:
     if device.type == "cuda":
         return "nccl"
@@ -941,6 +970,92 @@ def epochs(
         target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
+    model_for_scaler = model.module if hasattr(model, "module") else model
+    scaler_x_device = model_for_scaler.scaler.x_mean.device
+    scaler_y_device = model_for_scaler.scaler.y_mean.device
+    with torch.no_grad():
+        x_count: int = 0
+        x_sum: Optional[torch.Tensor] = None
+        x_sum_sq: Optional[torch.Tensor] = None
+        y_count: int = 0
+        y_sum: Optional[torch.Tensor] = None
+        y_sum_sq: Optional[torch.Tensor] = None
+
+        for batch in train_loader:
+            feats = batch["features"]
+            labs = batch["labels"]
+            if feats.ndim == 3 and feats.shape[1] == 1:
+                feats = feats.reshape(feats.shape[0], -1)
+
+            xf = feats.to(device=scaler_x_device, dtype=torch.float32)
+            n_x = xf.shape[0]
+            if n_x > 0:
+                x_count += n_x
+                sx = xf.sum(dim=0)
+                sx2 = (xf * xf).sum(dim=0)
+                if x_sum is None:
+                    x_sum = sx
+                    x_sum_sq = sx2
+                else:
+                    x_sum += sx
+                    x_sum_sq += sx2
+
+            yf = labs.to(device=scaler_y_device, dtype=torch.float32)
+            n_y = yf.shape[0]
+            if n_y > 0:
+                y_count += n_y
+                sy = yf.sum(dim=0)
+                sy2 = (yf * yf).sum(dim=0)
+                if y_sum is None:
+                    y_sum = sy
+                    y_sum_sq = sy2
+                else:
+                    y_sum += sy
+                    y_sum_sq += sy2
+        if is_distributed():
+            x_count_t = torch.tensor(
+                float(x_count), device=scaler_x_device, dtype=torch.float64
+            )
+            torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
+            x_count = int(x_count_t.item())
+            if x_sum is not None:
+                torch.distributed.all_reduce(x_sum, op=torch.distributed.ReduceOp.SUM)
+            if x_sum_sq is not None:
+                torch.distributed.all_reduce(x_sum_sq, op=torch.distributed.ReduceOp.SUM)
+
+            y_count_t = torch.tensor(
+                float(y_count), device=scaler_y_device, dtype=torch.float64
+            )
+            torch.distributed.all_reduce(y_count_t, op=torch.distributed.ReduceOp.SUM)
+            y_count = int(y_count_t.item())
+            if y_sum is not None:
+                torch.distributed.all_reduce(y_sum, op=torch.distributed.ReduceOp.SUM)
+            if y_sum_sq is not None:
+                torch.distributed.all_reduce(y_sum_sq, op=torch.distributed.ReduceOp.SUM)
+
+        eps = float(model_for_scaler.scaler.eps)
+        if x_count > 0 and x_sum is not None and x_sum_sq is not None:
+            mean_x = x_sum / float(x_count)
+            var_x = (x_sum_sq / float(x_count)) - mean_x * mean_x
+            std_x = torch.sqrt(var_x.clamp_min(eps))
+            if model_for_scaler.scaler.x_mean.shape != mean_x.shape:
+                model_for_scaler.scaler.x_mean.resize_(mean_x.shape)
+            if model_for_scaler.scaler.x_std.shape != std_x.shape:
+                model_for_scaler.scaler.x_std.resize_(std_x.shape)
+            model_for_scaler.scaler.x_mean.copy_(mean_x)
+            model_for_scaler.scaler.x_std.copy_(std_x)
+
+        if y_count > 0 and y_sum is not None and y_sum_sq is not None:
+            mean_y = y_sum / float(y_count)
+            var_y = (y_sum_sq / float(y_count)) - mean_y * mean_y
+            std_y = torch.sqrt(var_y.clamp_min(eps))
+            if model_for_scaler.scaler.y_mean.shape != mean_y.shape:
+                model_for_scaler.scaler.y_mean.resize_(mean_y.shape)
+            if model_for_scaler.scaler.y_std.shape != std_y.shape:
+                model_for_scaler.scaler.y_std.resize_(std_y.shape)
+            model_for_scaler.scaler.y_mean.copy_(mean_y)
+            model_for_scaler.scaler.y_std.copy_(std_y)
+
     start_kst_ns = posix_time("Asia/Seoul")
     in_dim = int(ops.in_dim)
     use_timer = (
@@ -1324,6 +1439,100 @@ def epochs(
             prev_io_time += float(io_time)
             prev_flops += float(flops)
             prev_io_bytes += float(io_bytes)
+    model_for_scaler = model.module if hasattr(model, "module") else model
+    scaler_y_device = model_for_scaler.scaler.y_mean.device
+    with torch.no_grad():
+        sum_x: Optional[torch.Tensor] = None
+        sum_y: Optional[torch.Tensor] = None
+        sum_x2: Optional[torch.Tensor] = None
+        sum_xy: Optional[torch.Tensor] = None
+        total_n: int = 0
+
+        for batch in train_loader:
+            x_raw = batch["features"].to(device)
+            y_raw = batch["labels"].to(scaler_y_device)
+            out = model(
+                x_raw,
+                labels_flat=None,
+                net_loss=None,
+                global_loss=None,
+                local_loss=None,
+                calibrate_output=False,
+            )
+            if isinstance(out, tuple):
+                z_pred_raw, _ = out
+            else:
+                z_pred_raw = out
+
+            z_pred = z_pred_raw.detach().to(device=scaler_y_device, dtype=torch.float64)
+            z_true = model_for_scaler.scaler.normalize_y(
+                y_raw.detach()
+            ).to(dtype=torch.float64)
+
+            if z_pred.ndim == 1:
+                z_pred = z_pred.unsqueeze(-1)
+            if z_true.ndim == 1:
+                z_true = z_true.unsqueeze(-1)
+            z_pred = z_pred.reshape(-1, z_pred.shape[-1])
+            z_true = z_true.reshape(-1, z_true.shape[-1])
+
+            n_batch = z_pred.shape[0]
+            if n_batch == 0:
+                continue
+            total_n += n_batch
+
+            sx = z_pred.sum(dim=0)
+            sy = z_true.sum(dim=0)
+            sx2 = (z_pred * z_pred).sum(dim=0)
+            sxy = (z_pred * z_true).sum(dim=0)
+
+            if sum_x is None:
+                sum_x = sx
+                sum_y = sy
+                sum_x2 = sx2
+                sum_xy = sxy
+            else:
+                sum_x += sx
+                sum_y += sy
+                sum_x2 += sx2
+                sum_xy += sxy
+        if is_distributed():
+            n_t = torch.tensor(
+                float(total_n), device=scaler_y_device, dtype=torch.float64
+            )
+            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+            total_n = int(n_t.item())
+
+            if sum_x is not None:
+                torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+            if sum_y is not None:
+                torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+            if sum_x2 is not None:
+                torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+            if sum_xy is not None:
+                torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+
+        if total_n > 0 and sum_x is not None and sum_y is not None and sum_x2 is not None and sum_xy is not None:
+            N = float(total_n)
+            mean_x = sum_x / N
+            mean_y = sum_y / N
+            Ex2 = sum_x2 / N
+            Exy = sum_xy / N
+            var_x = Ex2 - mean_x * mean_x
+            cov_xy = Exy - mean_x * mean_y
+
+            eps = float(model_for_scaler.scaler.eps)
+            denom = var_x.clone()
+            tiny_mask = denom.abs() < eps
+            denom[tiny_mask] = 1.0
+
+            a = (cov_xy / denom).to(dtype=torch.float32)
+            b = (mean_y - a.to(dtype=torch.float64) * mean_x).to(dtype=torch.float32)
+            a[tiny_mask] = 1.0
+            b[tiny_mask] = 0.0
+
+            model_for_scaler.scaler.set_affine(a, b)
+
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
@@ -1806,6 +2015,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
                 cpu_state = torch.load(fallback_init, map_location="cpu")
+                _resize_scaler_buffers(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 with warnings.catch_warnings():
@@ -1817,6 +2027,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                         state_dict={"model": m_sd},
                         storage_reader=FileSystemReader(ops.init_ckpt_dir),
                     )
+                    _resize_scaler_buffers(model, m_sd)
                     set_model_state_dict(
                         model, m_sd, options=StateDictOptions(strict=False)
                     )
@@ -2273,6 +2484,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
                 cpu_state = torch.load(fallback_model, map_location="cpu")
+                _resize_scaler_buffers(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 with warnings.catch_warnings():
@@ -2284,6 +2496,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                         state_dict={"model": m_sd},
                         storage_reader=FileSystemReader(ops.model_ckpt_dir),
                     )
+                    _resize_scaler_buffers(model, m_sd)
                     set_model_state_dict(
                         model, m_sd, options=StateDictOptions(strict=False)
                     )

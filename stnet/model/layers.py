@@ -1880,6 +1880,244 @@ class LossWeightPolicy(Protocol):
         raise NotImplementedError
 
 
+class Scaler(nn.Module):
+
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = float(eps)
+        self.calib_mode: str = "none"
+        self.register_buffer("x_mean", torch.zeros(1))
+        self.register_buffer("x_std", torch.ones(1))
+        self.register_buffer("y_mean", torch.zeros(1))
+        self.register_buffer("y_std", torch.ones(1))
+        self.register_buffer("affine_a", torch.ones(1))
+        self.register_buffer("affine_b", torch.zeros(1))
+        self.register_buffer("pw_x", torch.empty(0))
+        self.register_buffer("pw_y", torch.empty(0))
+
+    @torch.no_grad()
+    def update_x(self, x: torch.Tensor) -> None:
+        if x.numel() == 0:
+            return
+        mean = x.mean(dim=0)
+        std = x.std(dim=0, unbiased=False).clamp_min(self.eps)
+        if self.x_mean.shape != mean.shape:
+            self.x_mean.resize_(mean.shape)
+        if self.x_std.shape != std.shape:
+            self.x_std.resize_(std.shape)
+        self.x_mean.copy_(mean)
+        self.x_std.copy_(std)
+
+    @torch.no_grad()
+    def update_y(self, y: torch.Tensor) -> None:
+        if y.numel() == 0:
+            return
+        mean = y.mean(dim=0)
+        std = y.std(dim=0, unbiased=False).clamp_min(self.eps)
+        if self.y_mean.shape != mean.shape:
+            self.y_mean.resize_(mean.shape)
+        if self.y_std.shape != std.shape:
+            self.y_std.resize_(std.shape)
+        self.y_mean.copy_(mean)
+        self.y_std.copy_(std)
+
+    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        return (x - self.x_mean) / (self.x_std + self.eps)
+
+    def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
+        return x_scaled * (self.x_std + self.eps) + self.x_mean
+
+    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        return (y - self.y_mean) / (self.y_std + self.eps)
+
+    def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
+        return z * self.y_std + self.y_mean
+
+    def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
+        if self.calib_mode == "piecewise" and self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
+            return self._piecewise(z_raw)
+        if self.calib_mode in ("affine", "none") and self.affine_a.numel() > 0:
+            return self.affine(z_raw)
+        return z_raw
+
+    def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
+        if self.affine_a.numel() == 0:
+            return z_raw
+        return z_raw * self.affine_a + self.affine_b
+
+    @torch.no_grad()
+    def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
+        if self.affine_a.shape != a.shape:
+            self.affine_a.resize_(a.shape)
+        if self.affine_b.shape != b.shape:
+            self.affine_b.resize_(b.shape)
+        self.affine_a.copy_(a)
+        self.affine_b.copy_(b)
+        self.pw_x.resize_(0)
+        self.pw_y.resize_(0)
+        self.calib_mode = "affine"
+
+    @torch.no_grad()
+    def fit(
+        self,
+        z_raw: torch.Tensor,
+        z_true: torch.Tensor,
+        mode: str = "affine",
+        num_bins: int = 8,
+    ) -> None:
+        if mode == "affine":
+            self._fit_affine(z_raw, z_true)
+            self.calib_mode = "affine"
+        elif mode == "piecewise":
+            self._fit_piecewise(z_raw, z_true, num_bins=num_bins)
+            self.calib_mode = "piecewise"
+        else:
+            raise ValueError(f"Unsupported calibration mode: {mode}")
+
+    @torch.no_grad()
+    def _fit_affine(self, z_raw: torch.Tensor, z_true: torch.Tensor) -> None:
+        if z_raw.numel() == 0 or z_true.numel() == 0:
+            return
+
+        x = z_raw.detach()
+        y = z_true.detach()
+        if x.ndim == 1:
+            x = x.unsqueeze(-1)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+
+        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+
+        x_mean = x.mean(dim=0)
+        y_mean = y.mean(dim=0)
+        x_centered = x - x_mean
+        y_centered = y - y_mean
+
+        denom = (x_centered * x_centered).sum(dim=0)
+        num = (x_centered * y_centered).sum(dim=0)
+
+        denom_safe = denom.clone()
+        tiny_mask = denom_safe.abs() < self.eps
+        denom_safe[tiny_mask] = 1.0
+
+        a64 = num / denom_safe
+        b64 = y_mean - a64 * x_mean
+
+        a64[tiny_mask] = 1.0
+        b64[tiny_mask] = 0.0
+
+        a = a64.to(dtype=torch.float32)
+        b = b64.to(dtype=torch.float32)
+
+        if self.affine_a.shape != a.shape:
+            self.affine_a.resize_(a.shape)
+        if self.affine_b.shape != b.shape:
+            self.affine_b.resize_(b.shape)
+        self.affine_a.copy_(a)
+        self.affine_b.copy_(b)
+
+        self.pw_x.resize_(0)
+        self.pw_y.resize_(0)
+
+    @torch.no_grad()
+    def _fit_piecewise(
+        self,
+        z_raw: torch.Tensor,
+        z_true: torch.Tensor,
+        num_bins: int = 8,
+    ) -> None:
+        if z_raw.numel() == 0 or z_true.numel() == 0:
+            return
+        if num_bins < 2:
+            self._fit_affine(z_raw, z_true)
+            self.calib_mode = "affine"
+            return
+
+        x = z_raw.detach()
+        y = z_true.detach()
+        if x.ndim == 1:
+            x = x.unsqueeze(-1)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+
+        _, C = x.shape
+        device = self.affine_a.device
+        knots_x = torch.empty(C, num_bins, dtype=torch.float32, device=device)
+        knots_y = torch.empty(C, num_bins, dtype=torch.float32, device=device)
+
+        for j in range(C):
+            xj = x[:, j]
+            yj = y[:, j]
+            if xj.numel() == 0:
+                knots_x[j] = torch.linspace(-1.0, 1.0, num_bins, device=device)
+                knots_y[j] = knots_x[j]
+                continue
+            xj_sorted, idx = torch.sort(xj)
+            yj_sorted = yj[idx]
+            idx_q = torch.linspace(
+                0,
+                max(0, xj_sorted.numel() - 1),
+                num_bins,
+                dtype=torch.long,
+                device=xj_sorted.device,
+            )
+            qx = xj_sorted[idx_q]
+            qy = yj_sorted[idx_q]
+            knots_x[j] = qx.to(dtype=torch.float32, device=device)
+            knots_y[j] = qy.to(dtype=torch.float32, device=device)
+
+        if self.pw_x.shape != knots_x.shape:
+            self.pw_x.resize_(knots_x.shape)
+        if self.pw_y.shape != knots_y.shape:
+            self.pw_y.resize_(knots_y.shape)
+        self.pw_x.copy_(knots_x)
+        self.pw_y.copy_(knots_y)
+
+        if self.affine_a.numel() != C:
+            self.affine_a.resize_(C)
+            self.affine_b.resize_(C)
+        self.affine_a.fill_(1.0)
+        self.affine_b.zero_()
+
+    def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
+        if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
+            return z_raw
+
+        orig_shape = z_raw.shape
+        if z_raw.ndim == 1:
+            z = z_raw.unsqueeze(-1)
+        else:
+            z = z_raw
+        z = z.reshape(-1, z.shape[-1])
+
+        _, C = z.shape
+        device = z.device
+        dtype = z.dtype
+
+        out = torch.empty_like(z)
+        for j in range(C):
+            xj = z[:, j]
+            knots_x = self.pw_x[j].to(device=device, dtype=dtype)
+            knots_y = self.pw_y[j].to(device=device, dtype=dtype)
+            if knots_x.numel() < 2:
+                out[:, j] = xj
+                continue
+            idx = torch.bucketize(xj, knots_x)
+            idx = idx.clamp(1, knots_x.numel() - 1)
+            x0 = knots_x[idx - 1]
+            x1 = knots_x[idx]
+            y0 = knots_y[idx - 1]
+            y1 = knots_y[idx]
+            t = (xj - x0) / (x1 - x0 + self.eps)
+            out[:, j] = y0 + t * (y1 - y0)
+
+        out = out.reshape(orig_shape)
+        return out
+
+
 class Instance(nn.Module):
     def __init__(
         self,
@@ -1911,6 +2149,7 @@ class Instance(nn.Module):
             else:
                 device_name = "cpu"
             self._device = torch.device(device_name)
+        self.scaler = Scaler().to(self._device)
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
@@ -2032,6 +2271,7 @@ class Instance(nn.Module):
         loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
+        calibrate_output: bool = bool(kwargs.pop("calibrate_output", True))
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
             td_input = features
@@ -2055,9 +2295,12 @@ class Instance(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
 
+        x_raw = features
+        if x_raw.ndim == 3 and x_raw.shape[1] == 1:
+            x_raw = x_raw.reshape(x_raw.shape[0], -1)
+        x_scaled = self.scaler.normalize_x(x_raw)
+
         device = self._device
-        if features.ndim == 3 and features.shape[1] == 1:
-            features = features.reshape(features.shape[0], -1)
 
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
@@ -2074,7 +2317,7 @@ class Instance(nn.Module):
         infer_mode = not is_train_path
         base_param = next(self.processor.parameters())
         base_dtype = self._base_dtype or base_param.dtype
-        features = features.to(device=device, dtype=base_dtype)
+        features = x_scaled.to(device=device, dtype=base_dtype)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]
         amp_enabled = device.type != "cpu"
@@ -2207,12 +2450,19 @@ class Instance(nn.Module):
             residual = residual.to(dtype=assembled.dtype)
         y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
 
+        z_pred_raw = y_hat
         pred = y_hat.reshape(b, *self.out_shape)
         y_hat_for_loss = y_hat
         loss_val: Optional[torch.Tensor] = None
+        z_true: Optional[torch.Tensor] = None
+        if labels_flat is not None:
+            y_true_raw = labels_flat.to(device=y_hat_for_loss.device)
+            z_true = self.scaler.normalize_y(y_true_raw)
+
         if labels_flat is not None and (
             global_loss is not None or local_loss is not None
         ):
+
             controller: Optional[LossWeightPolicy] = None
             weights: Tuple[float, float]
             if loss_weights is None:
@@ -2225,19 +2475,18 @@ class Instance(nn.Module):
             else:
                 controller = cast(LossWeightPolicy, loss_weights)
                 weights = controller.weights()
-            tgt = labels_flat.to(
+            tgt = z_true.to(
                 device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
             )
             total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            y_top = y_hat_for_loss
             y_bot = assembled.to(
                 device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
             )
 
             if global_loss is not None:
-                top_component = global_loss(y_top, tgt)
+                top_component = global_loss(z_pred_raw, z_true)
                 total = total + weights[0] * top_component
             if local_loss is not None:
                 bottom_component = local_loss(y_bot, tgt)
@@ -2250,10 +2499,20 @@ class Instance(nn.Module):
                 tgt = labels_flat.to(device=y_hat_for_loss.device).long()
                 loss_val = net_loss(y_hat_for_loss, tgt)
             else:
-                tgt = labels_flat.to(
-                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                )
+                if z_true is None:
+                    tgt = self.scaler.normalize_y(
+                        labels_flat.to(device=y_hat_for_loss.device)
+                    )
+                else:
+                    tgt = z_true.to(
+                        device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+                    )
+                tgt = tgt.to(dtype=y_hat_for_loss.dtype)
                 loss_val = net_loss(y_hat_for_loss, tgt)
+
+        if infer_mode and calibrate_output:
+            z_cal = self.scaler.calibrate(z_pred_raw)
+            pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
 
         self.output.clear()
         if processed_ranges:
