@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import platform
 import sys
 import threading
 import time
@@ -77,13 +78,13 @@ from ..functional.optimizers import (
     StochasticWeightAverage,
     stochastic_weight_average,
 )
-from ..model.layers import Instance
+from ..model.layers import History, Instance, resize_scaler_buffer
 from .compat import (
     cudagraph_step_end,
     is_meta_or_fake_tensor,
-    torch_compile_disable,
+    torch_no_compile,
     torch_compile_safe,
-    torch_disable_dynamo,
+    torch_safe_distributed,
 )
 from .distributed import (
     distributed_barrier,
@@ -108,7 +109,7 @@ else:
 
 _LOGGER = logging.getLogger(__name__)
 
-torch_disable_dynamo()
+torch_safe_distributed()
 
 
 try:
@@ -373,35 +374,6 @@ def _trim_dcp_keys(state: Any) -> Any:
     return state
 
 
-def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
-    scaler = getattr(model, "scaler", None)
-    if scaler is None:
-        return
-
-    tensor_keys = (
-        "x_mean",
-        "x_std",
-        "y_mean",
-        "y_std",
-        "affine_a",
-        "affine_b",
-        "pw_x",
-        "pw_y",
-    )
-    for name in tensor_keys:
-        key = f"scaler.{name}"
-        if key not in state:
-            continue
-        buf = getattr(scaler, name, None)
-        tensor = state[key]
-        if not isinstance(buf, torch.Tensor) or not isinstance(tensor, torch.Tensor):
-            continue
-        if buf.shape == tensor.shape:
-            continue
-        with contextlib.suppress(Exception):
-            buf.resize_(tensor.shape)
-
-
 def _backend_type(device: torch.device) -> str:
     if device.type == "cuda":
         return "nccl"
@@ -413,18 +385,11 @@ def _backend_type(device: torch.device) -> str:
 def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
         with contextlib.suppress(Exception):
-            if hasattr(torch.backends, "cuda") and hasattr(
-                torch.backends.cuda, "matmul"
-            ):
-                try:
-                    torch.backends.cuda.matmul.allow_tf32 = True
-                except Exception:
-                    with contextlib.suppress(Exception):
-                        torch.backends.cuda.matmul.fp32_precision = "high"
+            torch.set_float32_matmul_precision("high")
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.fp32_precision = "high"
             if hasattr(torch.backends, "cudnn"):
-                torch.backends.cudnn.allow_tf32 = True
                 torch.backends.cudnn.benchmark = True
-        torch.set_float32_matmul_precision("high")
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
@@ -970,6 +935,68 @@ def epochs(
         target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
+    model_for_hist = model.module if hasattr(model, "module") else model
+    hist = getattr(model_for_hist, "history", None)
+    if isinstance(hist, History):
+        start_ns = posix_time("Asia/Seoul")
+        start_sec = round(float(start_ns) / 1e9, 6)
+        hist.start_session(start_sec)
+
+        os_name = platform.system()
+        if os_name == "Linux":
+            pretty = None
+            with contextlib.suppress(Exception):
+                if os.path.exists("/etc/os-release"):
+                    with open("/etc/os-release", "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.startswith("PRETTY_NAME="):
+                                pretty = line.strip().split("=", 1)[1].strip().strip('"')
+                                break
+            os_full = pretty or f"{os_name} {platform.release()}"
+        elif os_name == "Darwin":
+            ver, _, _ = platform.mac_ver()
+            os_full = f"macOS {ver or platform.release()}"
+        elif os_name == "Windows":
+            ver = platform.version()
+            rel = platform.release()
+            os_full = f"Windows {rel} {ver}"
+        else:
+            os_full = f"{os_name} {platform.release()}"
+
+        kernel = platform.release()
+        arch_list = [platform.machine(), platform.processor() or ""]
+        cpu_list: List[str] = []
+        proc = platform.processor()
+        if proc:
+            cpu_list.append(proc)
+
+        try:
+            ram_bytes = Memory.total()
+            ram_gb = int(round(float(ram_bytes) / (1024 ** 3)))
+        except Exception:
+            ram_gb = 0
+
+        py_ver = platform.python_version()
+
+        backend_list: List[str] = []
+        if torch.cuda.is_available():
+            backend_list.append("cuda")
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            backend_list.append("xpu")
+        if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            backend_list.append("mps")
+        backend_list.append("cpu")
+
+        hist.set_system_info(
+            os_name=os_full,
+            kernel=kernel,
+            cpu_list=cpu_list,
+            arch_list=arch_list,
+            ram_gb=ram_gb,
+            python_version=py_ver,
+            backends=backend_list,
+        )
+
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_x_device = model_for_scaler.scaler.x_mean.device
     scaler_y_device = model_for_scaler.scaler.y_mean.device
@@ -1284,6 +1311,12 @@ def epochs(
                                 tflops=tflops_cur,
                             )
                             train_accum_since_last = 0
+                        if isinstance(hist, History):
+                            try:
+                                if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
+                                    hist.record_batch(X, Y)
+                            except Exception:
+                                pass
                         t_fetch_start = time.perf_counter_ns()
                         if cpu_pool is not None and ((step_idx + 1) & 255) == 0:
                             with contextlib.suppress(Exception):
@@ -1568,6 +1601,13 @@ def epochs(
                     util_fallback = prev_comp_time / total_t
                     if util_fallback > 0.80:
                         time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
+        if isinstance(hist, History):
+            try:
+                end_sec = round(float(end_kst_ns) / 1e9, 6)
+                world = max(1, get_world_size(device)) if is_distributed() else 1
+                hist.end_session(end_sec, peers=world)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -2015,7 +2055,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
                 cpu_state = torch.load(fallback_init, map_location="cpu")
-                _resize_scaler_buffers(model, cpu_state)
+                resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 with warnings.catch_warnings():
@@ -2027,7 +2067,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                         state_dict={"model": m_sd},
                         storage_reader=FileSystemReader(ops.init_ckpt_dir),
                     )
-                    _resize_scaler_buffers(model, m_sd)
+                    resize_scaler_buffer(model, m_sd)
                     set_model_state_dict(
                         model, m_sd, options=StateDictOptions(strict=False)
                     )
@@ -2484,7 +2524,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
                 cpu_state = torch.load(fallback_model, map_location="cpu")
-                _resize_scaler_buffers(model, cpu_state)
+                resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 with warnings.catch_warnings():
@@ -2496,7 +2536,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                         state_dict={"model": m_sd},
                         storage_reader=FileSystemReader(ops.model_ckpt_dir),
                     )
-                    _resize_scaler_buffers(model, m_sd)
+                    resize_scaler_buffer(model, m_sd)
                     set_model_state_dict(
                         model, m_sd, options=StateDictOptions(strict=False)
                     )

@@ -430,11 +430,11 @@ def get_device(
         torch.backends.cudnn.deterministic = cfg.deterministic
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:
-            torch.backends.cuda.matmul.allow_tf32 = bool(cfg.allow_tf32)
-        except Exception:
-            pass
-        try:
             torch.set_float32_matmul_precision(str(cfg.matmul_precision))
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.fp32_precision = (
+                    "high" if bool(cfg.allow_tf32) else "highest"
+                )
         except Exception:
             pass
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

@@ -168,14 +168,14 @@ class TorchCompat:
         )
 
     def apply(self) -> None:
-        self._coerce_rmsnorm()
-        self._coerce_fmin()
-        self._coerce_nanmin()
-        self._coerce_nanmax()
-        self._coerce_nansum()
-        torch_disable_dynamo()
+        self._patch_rmsnorm()
+        self._patch_fmin()
+        self._patch_nanmin()
+        self._patch_nanmax()
+        self._patch_nansum()
+        torch_safe_distributed()
 
-    def _coerce_rmsnorm(self) -> None:
+    def _patch_rmsnorm(self) -> None:
         global RMSNorm
         if hasattr(self.nn_module, "RMSNorm"):
             RMSNorm = self.nn_module.RMSNorm
@@ -196,22 +196,22 @@ class TorchCompat:
         setattr(self.nn_module, "RMSNorm", _RMSNorm)
         RMSNorm = self.nn_module.RMSNorm
 
-    def _coerce_fmin(self) -> None:
+    def _patch_fmin(self) -> None:
         if hasattr(self.module, "fmin"):
             return
         setattr(self.module, "fmin", partial(_fmin_impl, self.module))
 
-    def _coerce_nanmin(self) -> None:
+    def _patch_nanmin(self) -> None:
         if hasattr(self.module, "nanmin"):
             return
         setattr(self.module, "nanmin", partial(_nanmin_impl, self.module))
 
-    def _coerce_nanmax(self) -> None:
+    def _patch_nanmax(self) -> None:
         if hasattr(self.module, "nanmax"):
             return
         setattr(self.module, "nanmax", partial(_nanmax_impl, self.module))
 
-    def _coerce_nansum(self) -> None:
+    def _patch_nansum(self) -> None:
         if hasattr(self.module, "nansum"):
             return
         setattr(self.module, "nansum", partial(_nansum_impl, self.module))
@@ -259,7 +259,7 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
 
 
-def torch_compile_disable(
+def torch_no_compile(
     *,
     reason: str | None = None,
     recursive: bool = True,
@@ -296,7 +296,9 @@ def torch_compile_disable(
     return _identity
 
 
-def torch_disable_dynamo(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
+def torch_safe_distributed(
+    *, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
+) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -329,7 +331,7 @@ def torch_disable_compile(
     if target is None or not hasattr(target, attr):
         return False
     fn = getattr(target, attr)
-    decorator = torch_compile_disable(reason=reason, recursive=recursive)
+    decorator = torch_no_compile(reason=reason, recursive=recursive)
     try:
         wrapped = decorator(fn)
     except Exception:

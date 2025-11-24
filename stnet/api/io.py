@@ -31,6 +31,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from .config import ModelConfig, coerce_model_config
+from ..model.layers import Instance, resize_scaler_buffer
 
 
 class Format(Protocol):
@@ -91,8 +92,7 @@ def new_model(
     wrap: bool = True,
 ) -> nn.Module:
     from ..functional.fx import Fusion
-    from ..model.layers import Instance
-    
+
     cfg = coerce_model_config(config)
     core = Instance(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     if not wrap:
@@ -121,7 +121,10 @@ def load_model(
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
+        resize_scaler_buffer(model, m_sd)
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        # 스케일러 buffer 복원은 register_buffer 덕분에 자동으로 되지만,
+        # 위에서 shape 을 먼저 맞춰놨기 때문에 shape mismatch 에러 없이 안전하다.
         return model
 
     if not p.exists():
@@ -153,6 +156,7 @@ def load_model(
         from safetensors.torch import load_file as load_tensors
 
         sd = load_tensors(str(p), device=map_location or "cpu")
+        resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
 

@@ -15,6 +15,7 @@ import torch
 from torch import nn
 
 from ..api.io import Format
+from ..model.layers import History
 
 
 def _in_console(cmd: Sequence[str], desc: str) -> None:
@@ -40,6 +41,10 @@ def _prepare_serving_model(model: nn.Module) -> nn.Module:
         if hasattr(model, name):
             with contextlib.suppress(Exception):
                 delattr(model, name)
+    with contextlib.suppress(Exception):
+        for module in model.modules():
+            if hasattr(module, "history") and isinstance(getattr(module, "history"), History):
+                delattr(module, "history")
     return model
 
 
