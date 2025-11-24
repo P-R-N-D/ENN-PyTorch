@@ -1,73 +1,68 @@
 # STNet-PyTorch
 
-## Overview
-This repository provides a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling, exposing a high-level backend API for model construction, training, inference, and export utilities. The backend manages dataset materialization, adaptive loss balancing, FLOP accounting, and throughput reporting so you can focus on configuration and feature preparation.
+STNet-PyTorch is a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling. The package ships a high-level backend that takes care of configuration management, training, inference, export utilities, and runtime diagnostics so you can focus on preparing tensors and tuning hyperparameters.
 
-## Key components
-- **Configurable architecture** – `stnet.api.config.ModelConfig` defines depth, attention heads, patching strategy, and compiler hints through a single `compile_mode` string (default: `"disabled"`) instead of a boolean flag. Helper schemas such as `PatchConfig` and the `build_config`/`coerce_build_config` aliases keep patch extraction and compilation options organized. Backend helpers re-export these dataclasses so existing imports from `stnet.backend` continue to function.
-- **Precision-aware scalers** – Normal and StudentsT modules now execute BatchNorm and moment updates in their native dtype while casting inputs/outputs back to the caller, keeping AMP, BF16, and FP8 pipelines numerically stable on every device.
-- **Modeling type aliases** – `_coerce_modeling_types` interprets spatial (`ss`, `spatial`), temporal (`tt`, `temporal`), and spatio-temporal (`st`, `ts`, `spatiotemporal`, etc.) shorthands so configuration files and user input remain ergonomic.
-- **Backend facade** – `stnet.backend` provides lifecycle helpers such as `new_model`, `save_model`, `load_model`, `train`/`learn`, `predict`/`infer`, and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT). The backend consumes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` from the unified `stnet.api.config` module for consistent configuration management, while orchestration internals now live under `stnet.api.run` for direct use when needed. The runtime helpers that previously lived under `stnet.run` now reside in `stnet.api`, so update legacy imports to `stnet.api.*` entry points.
-- **Architecture utilities** – `stnet.model` contains the `Root` model, encoder blocks, and building blocks such as `norm_layer`, `CrossAttention`, and `PatchAttention`, while lower-level primitives now live together in `stnet.model.layers` for reuse across modules.
-- **Data transforms** – reusable preprocessing helpers are located under `stnet.data.transforms`, consolidating the former utilities in a single data namespace.
-- **Thread load balancer** – dataloader workers automatically pin to allowed CPUs, request OpenMP `proc_bind(spread)` when available, and dynamically retune PyTorch intra/inter-op thread counts to avoid oversubscription.
+## Features
+- **Unified configuration layer**: `stnet.api.config` exposes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` along with helpers such as `build_config`/`coerce_build_config` and modeling aliases that normalize spatial (`ss`), temporal (`tt`), and spatio-temporal (`st`) shorthands.
+- **Backend facade**: `stnet.backend` re-exports lifecycle helpers (`new_model`, `save_model`, `load_model`, `learn`/`train`, `infer`/`predict`) and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT) while using the same configuration dataclasses.
+- **Precision-aware modules**: normalization layers and Student’s t components preserve native dtypes for statistics while casting inputs/outputs for safe AMP, BF16, and FP8 execution.
+- **Architecture utilities**: `stnet.model` contains the `Root` model, encoder blocks, `CrossAttention`, `PatchAttention`, and shared primitives under `stnet.model.layers`.
+- **Data transforms**: reusable preprocessing lives under `stnet.data.transforms` for consistent feature handling.
+- **Thread load balancer**: dataloader workers pin to allowed CPUs, request OpenMP `proc_bind(spread)` when available, and tune intra/inter-op threads to avoid oversubscription.
+
+## Requirements and dependencies
+- Python 3.10+
+- PyTorch built for your hardware (CUDA, ROCm, XPU, or CPU-only) installed prior to the editable install.
+
+Core runtime dependencies:
+- `netifaces>=0.11.0`
+- `numpy>=2.2.5`
+- `psutil>=7.0.0`
+- `py-cpuinfo>=9.0.0`
+- `scipy>=1.14.1`
+- `tensordict>=0.10.0`
+- `torch>=2.7.0`
+- `torchdata>=0.11.0`
+- `torchrl>=0.8.1`
+- `tqdm>=4.67.1`
+- `triton>=3.2.0`
+
+Optional extras (install with `pip install -e .[extra]`):
+- `pandas`: pandas dataframe integration.
+- `polars`: Polars dataframe integration.
+- `excel`: spreadsheet helpers via `pandas`, `openpyxl`, and `fastexcel`.
+- `spark`: Spark pipelines (`pyspark[pandas_on_spark]`).
+- `thread`: explicit installation of `psutil` for thread affinity helpers.
+- `torchao`: advanced optimization toolchain.
+- `nvidia_te_cu12` / `nvidia_te_cu13`: NVIDIA Transformer Engine builds for CUDA 12/13.
+- `intel_ai`: Intel Extension for PyTorch.
+- `service`: exporter stack (ONNX, ONNX-TF, ONNX2TF, Core ML, TensorRT, ExecuTorch).
+- `torchscale`: research modules for retention.
+- `telemetry`: GPU telemetry (`pynvml`).
 
 ## Installation
 1. Create and activate a Python 3.10+ environment.
-2. Install PyTorch that matches your hardware (CUDA, ROCm, XPU, or CPU) by following the official [PyTorch instructions](https://pytorch.org/get-started/locally/).
-3. Install STNet-PyTorch and its dependencies:
+2. Install PyTorch that matches your hardware by following the official [PyTorch instructions](https://pytorch.org/get-started/locally/).
+3. Install STNet-PyTorch in editable mode:
    ```bash
    pip install -e .
    ```
-   Optional exporter extras are available via:
+4. Add extras as needed, for example the exporter stack:
    ```bash
    pip install -e .[service]
    ```
--   Additional extras include `pandas`, `polars`, `excel`, `spark`, `torchao`, `nvidia_te_cu12`, `nvidia_te_cu13`, `intel_ai`, `torchscale`, and `telemetry` as defined in `pyproject.toml`.
 
-## Dependencies
-The core backend depends on:
-
-- `torch>=2.7.0`
-- `torchdata>=0.11.0`
-- `tensordict>=0.10.0`
-- `triton>=3.2.0`
-- `torchrl>=0.8.1`
-- `numpy>=2.2.5`
-- `scipy>=1.14.1`
-- `netifaces>=0.11.0`
-- `py-cpuinfo>=9.0.0`
-- `psutil>=7.0.0`
-- `tqdm>=4.67.1`
-
-Optional extras listed in `pyproject.toml` include:
-- dataframe integrations (`pandas`, `polars`)
-- spreadsheet tooling (`excel` – installs `pandas`, `openpyxl`, and `fastexcel`)
-- Spark pipelines (`spark`)
-- advanced optimization toolchains (`torchao`)
-- vendor accelerators (`intel_ai`, `nvidia_te_cu12`, `nvidia_te_cu13`)
-- retention-focused research modules (`torchscale`)
-- telemetry hooks (`telemetry`) – installs `pynvml>=11.5.0` for GPU utilization reporting when available
-
-Install the `service` extra to enable the exporter stack (ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT).
-
-### Compiler configuration
-
-`ModelConfig.compile_mode` accepts the same modes as `torch.compile` (for example `"default"`, `"reduce-overhead"`, or `"max-autotune"`).
-The backend treats `"disabled"`, `"none"`, or an empty string as an explicit request to skip compilation. The helper in `stnet.functional.fx.compile` normalizes the value, trims whitespace, and avoids
-calling `torch.compile` when compilation is disabled or unsupported.
-
-## Quick start
+## Quickstart
 ```python
 import torch
 from stnet import (
     PatchConfig,
     build_config,
-    new_model,
-    load_model,
-    save_model,
-    learn,
     infer,
+    learn,
+    load_model,
+    new_model,
+    save_model,
 )
 
 patch = PatchConfig(is_cube=True, grid_size_3d=(10, 10, 1), patch_size_3d=(1, 1, 1))
@@ -78,13 +73,13 @@ config = build_config(
     patch=patch,
     compile_mode="default",
 )
-model = new_model(in_dim=1024, out_shape=(10,), config=config)
 
+model = new_model(in_dim=1024, out_shape=(10,), config=config)
 features = torch.randn(32, model.in_dim)
 labels = torch.randn(32, *model.out_shape)
 
-dataset = {"X": features, "Y": labels}
-trained = learn(model, dataset, epochs=1, batch_size=8)
+train_ds = {"X": features, "Y": labels}
+trained = learn(model, train_ds, epochs=1, batch_size=8)
 
 infer_batch = {"X": features, "Y": torch.zeros_like(labels)}
 predictions = infer(trained, infer_batch)
@@ -96,22 +91,22 @@ restored.eval()
 with torch.inference_mode():
     scripted_output, _ = restored(features)
 ```
-During training and inference the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized through the join context. FLOP counters and adaptive loss weights update automatically, and the pipeline keeps dataset schemas and scaling statistics in sync with the provided tensors.
 
-The backend helpers manage distributed checkpoints, mixed precision, exporter requirements, and memory-mapped datasets internally, letting you focus on preparing feature tensors and configuration hyperparameters.
+During training the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized. FLOP counters and adaptive loss weights update automatically, and dataset schemas remain aligned with provided tensors.
 
-## Debugging backend tensor issues
-- Enable meta/fake tensor diagnostics by setting `STNET_META_HOOK=1` to raise immediately when a module receives a meta/FakeTensor input. Use `STNET_META_HOOK=warn` during inference services to log a warning instead of aborting execution.
-- Toggle the oneDNN (MKLDNN) backend with `STNET_DISABLE_MKLDNN=1`. When set, the backend will call `torch.backends.mkldnn.enabled = False` before model construction so you can confirm whether a backend-specific kernel is responsible for anomalous behavior.
+## Configuration and compilation
+`ModelConfig.compile_mode` accepts the same modes as `torch.compile` (e.g., `"default"`, `"reduce-overhead"`, `"max-autotune"`). The helper in `stnet.functional.fx.compile` trims whitespace, normalizes disabled options (`"disabled"`, `"none"`, empty string), and skips compilation when unsupported.
+
+## Diagnostics and troubleshooting
+- Set `STNET_META_HOOK=1` to raise immediately when a module receives a meta/FakeTensor. Use `STNET_META_HOOK=warn` during inference services to log without aborting.
+- Set `STNET_DISABLE_MKLDNN=1` to disable the oneDNN (MKLDNN) backend before model construction.
 
 ## Exporting for inference
-Exporter helpers automatically check for optional dependencies and raise informative errors if a backend such as ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch is unavailable. Install the `service` extra to enable the full conversion toolkit.
+Exporter helpers automatically check for optional dependencies and raise informative errors if ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch backends are missing. Install the `service` extra to enable the full conversion toolkit.
 
 ## License
-**Code** is licensed under **PolyForm Noncommercial 1.0.0**
-(SPDX: `PolyForm-Noncommercial-1.0.0`). See `LICENSE`.
+**Code** is licensed under **PolyForm Noncommercial 1.0.0** (SPDX: `PolyForm-Noncommercial-1.0.0`). See `LICENSE`.
 
-**Model weights / datasets** (and other non-code artifacts) are provided
-under **CC BY-NC 4.0**. See the "Creative Commons Attribution-NonCommercial 4.0 International" section in `LICENSE`.
+**Model weights / datasets** (and other non-code artifacts) are provided under **CC BY-NC 4.0**. See the "Creative Commons Attribution-NonCommercial 4.0 International" section in `LICENSE`.
 
 Commercial use requires a separate license. Please contact the author.
