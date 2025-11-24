@@ -64,12 +64,12 @@ def _to_cpu(value: Any) -> Any:
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "_Root__config", None)
+    cfg_obj = getattr(model, "_Instance__config", None)
     if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_root_config__", None)
+        cfg_obj = getattr(model, "__stnet_instance_config__", None)
     if cfg_obj is None:
         for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Root__config", None)
+            cfg_obj = getattr(submodule, "_Instance__config", None)
             if cfg_obj is not None:
                 break
     candidate: ModelConfig | Dict[str, Any] | None
@@ -91,10 +91,10 @@ def new_model(
     wrap: bool = True,
 ) -> nn.Module:
     from ..functional.fx import Fusion
-    from ..model.layers import Root
+    from ..model.layers import Instance
     
     cfg = coerce_model_config(config)
-    core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    core = Instance(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     if not wrap:
         return core
     return Fusion.use_tensordict_layers(

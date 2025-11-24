@@ -1803,7 +1803,7 @@ class Fusion:
                 ),
             )
 
-        root_config = getattr(module, "_Root__config", None)
+        instance_config = getattr(module, "_Instance__config", None)
         derived_attrs: Dict[str, Any] = {}
         for attr in ("in_dim", "out_shape"):
             if hasattr(module, attr):
@@ -1830,7 +1830,7 @@ class Fusion:
                     self.m = m
                     self._in_key = in_key
                     self._out_key = out_key
-                    object.__setattr__(self, "__stnet_root_config__", cfg)
+                    object.__setattr__(self, "__stnet_instance_config__", cfg)
 
                 def forward(
                     self,
@@ -1866,12 +1866,12 @@ class Fusion:
                     loss_val = out_td.get("loss_total", None)
                     return (pred, loss_val)
 
-            wrapper = TensorDictLayer(pipeline, root_config, in_key, out_key)
+            wrapper = TensorDictLayer(pipeline, instance_config, in_key, out_key)
             for name, value in derived_attrs.items():
                 object.__setattr__(wrapper, name, value)
             return wrapper
 
-        setattr(pipeline, "__stnet_root_config__", root_config)
+        setattr(pipeline, "__stnet_instance_config__", instance_config)
         for name, value in derived_attrs.items():
             setattr(pipeline, name, value)
         return pipeline

@@ -5,12 +5,14 @@ import contextlib
 import math
 import warnings
 from dataclasses import dataclass
+from collections import deque
 from importlib import import_module
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
     List,
+    Deque,
     Optional,
     Protocol,
     Sequence,
@@ -1106,7 +1108,7 @@ def _coerce_modeling_types(value: Any) -> str:
     return normalized
 
 
-class SpatialEncoder(nn.Module):
+class SpatialNet(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1145,16 +1147,16 @@ class SpatialEncoder(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_meta_or_fake_tensor(x):
-            raise RuntimeError("x is meta/fake before SpatialEncoder.forward")
+            raise RuntimeError("x is meta/fake before SpatialNet.forward")
         if is_meta_or_fake_tensor(coords):
-            raise RuntimeError("coords is meta/fake before SpatialEncoder.forward")
+            raise RuntimeError("coords is meta/fake before SpatialNet.forward")
         if x.dim() != 3:
             raise ValueError(
-                f"SpatialEncoder expects (B, N, C) tokens, got shape {tuple(x.shape)}"
+                f"SpatialNet expects (B, N, C) tokens, got shape {tuple(x.shape)}"
             )
         if coords.dim() != 3:
             raise ValueError(
-                f"SpatialEncoder expects (B, N, D) coords, got shape {tuple(coords.shape)}"
+                f"SpatialNet expects (B, N, D) coords, got shape {tuple(coords.shape)}"
             )
         if x.shape[:2] != coords.shape[:2]:
             raise ValueError(
@@ -1168,7 +1170,7 @@ class SpatialEncoder(nn.Module):
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError(
-                    "attn_mask is meta/fake before SpatialEncoder.forward"
+                    "attn_mask is meta/fake before SpatialNet.forward"
                 )
             attn_mask = attn_mask.contiguous()
         for i, blk in enumerate(self.blocks):
@@ -1210,7 +1212,7 @@ class SpatialEncoder(nn.Module):
             x = out_s.gather(1, invperm.unsqueeze(-1).expand(B, N, D))
         out = self.norm(x)
         if is_meta_or_fake_tensor(out):
-            raise RuntimeError("SpatialEncoder produced meta/fake tensor")
+            raise RuntimeError("SpatialNet produced meta/fake tensor")
         return out.contiguous()
 
 
@@ -1316,7 +1318,7 @@ class RetNet(nn.Module):
         return x, new_state
 
 
-class TemporalEncoder(nn.Module):
+class TemporalNet(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1484,12 +1486,22 @@ class CrossTransformer(nn.Module):
 
 
 @dataclass
-class Payload:
-    tokens: torch.Tensor
-    context: torch.Tensor
-    flat: torch.Tensor
-    offset: torch.Tensor
-    context_shape: Tuple[int, ...]
+class Request:
+    features: torch.Tensor
+    labels_flat: Optional[torch.Tensor] = None
+    net_loss: Optional[nn.Module] = None
+    global_loss: Optional[nn.Module] = None
+    local_loss: Optional[nn.Module] = None
+    loss_weights: Optional[Union[Tuple[float, float], "LossWeightPolicy"]] = None
+    slice_range: Optional[Tuple[int, int]] = None
+
+@dataclass
+class Response:
+    pred: torch.Tensor
+    loss: Optional[torch.Tensor] = None
+    refined_tokens: Optional[torch.Tensor] = None
+    residual_context: Optional[torch.Tensor] = None
+    slice_range: Optional[Tuple[int, int]] = None
 
 
 class LongNet(nn.Module):
@@ -1629,7 +1641,7 @@ class LongNet(nn.Module):
         return out, attn_w
 
 
-class GlobalEncoder(nn.Module):
+class Controller(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -1677,7 +1689,7 @@ class GlobalEncoder(nn.Module):
         )
 
 
-class LocalProcessor(nn.Module):
+class Processor(nn.Module):
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -1705,7 +1717,7 @@ class LocalProcessor(nn.Module):
             self._get_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
             persistent=False,
         )
-        self.spatial_encoder = SpatialEncoder(
+        self.spatial_net = SpatialNet(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.spatial_depth)),
@@ -1715,7 +1727,7 @@ class LocalProcessor(nn.Module):
             drop_path=self.drop_path,
             norm_type=self.norm_type,
         )
-        self.temporal_encoder = TemporalEncoder(
+        self.temporal_net = TemporalNet(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.temporal_depth)),
@@ -1770,7 +1782,7 @@ class LocalProcessor(nn.Module):
         coords = self.spatial_coords_template.to(device=device, dtype=dtype)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
-    def forward(self, x: torch.Tensor) -> Payload:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
         expected_spatial = B * self.spatial_tokens * self.d_model
@@ -1793,8 +1805,8 @@ class LocalProcessor(nn.Module):
             B, self.temporal_tokens, self.d_model
         ).contiguous()
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
-        spatial_out = self.spatial_encoder(spatial_tokens, coords)
-        temporal_out = self.temporal_encoder(temporal_tokens)
+        spatial_out = self.spatial_net(spatial_tokens, coords)
+        temporal_out = self.temporal_net(temporal_tokens)
         mode = self._fixed_mode
         if mode is not None:
             mode_l = _coerce_modeling_types(mode)
@@ -1828,13 +1840,7 @@ class LocalProcessor(nn.Module):
         context = flat.reshape(B, *self.out_shape).contiguous()
         dims = tuple(range(1, context.ndim))
         offset = context.mean(dim=dims, keepdim=True).contiguous()
-        return Payload(
-            tokens=tokens,
-            context=context,
-            flat=flat,
-            offset=offset,
-            context_shape=self.out_shape,
-        )
+        return (tokens, context)
 
     def _forward_dynamically(
         self, spatial_out: torch.Tensor, temporal_out: torch.Tensor
@@ -1874,7 +1880,7 @@ class LossWeightPolicy(Protocol):
         raise NotImplementedError
 
 
-class Root(nn.Module):
+class Instance(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -1911,10 +1917,8 @@ class Root(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.local_net = LocalProcessor(self.in_dim, self.out_shape, config=config).to(
-            self._device
-        )
-        global_net = GlobalEncoder(
+        self.processor = Processor(self.in_dim, self.out_shape, config=config).to(self._device)
+        controller = Controller(
             int(config.depth),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -1922,7 +1926,13 @@ class Root(nn.Module):
             dropout=float(getattr(config, "dropout", 0.0)),
             batch_first=True,
         ).to(self._device)
-        self.global_net = global_net
+        self.controller = controller
+        try:
+            self.max_queue = int(getattr(config, "queue_size", 2))
+        except Exception:
+            self.max_queue = 2
+        self.input: Deque[Request] = deque()
+        self.output: Deque[Response] = deque()
         try:
             self.microbatch = int(getattr(config, "microbatch", 0))
         except Exception:
@@ -1946,16 +1956,16 @@ class Root(nn.Module):
         normalized_mode = mode.lower()
         disable_compile = normalized_mode in {"", "disabled", "none"}
         compile_mode_arg = normalized_mode if not disable_compile else None
-        self.local_net = Gradient.compile(
-            self.local_net,
+        self.processor = Gradient.compile(
+            self.processor,
             mode=compile_mode_arg,
             fullgraph=False,
             dynamic=False,
             backend="inductor",
             disable=disable_compile,
         )
-        self.global_net = Gradient.compile(
-            self.global_net,
+        self.controller = Gradient.compile(
+            self.controller,
             mode=compile_mode_arg,
             fullgraph=False,
             dynamic=False,
@@ -2062,7 +2072,7 @@ class Root(nn.Module):
         has_supervision = labels_flat is not None and has_any_loss
         is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
         infer_mode = not is_train_path
-        base_param = next(self.local_net.parameters())
+        base_param = next(self.processor.parameters())
         base_dtype = self._base_dtype or base_param.dtype
         features = features.to(device=device, dtype=base_dtype)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
@@ -2078,50 +2088,44 @@ class Root(nn.Module):
         num_slices = (b + self.microbatch - 1) // self.microbatch
         token_chunks: List[torch.Tensor] = []
         context_chunks: List[torch.Tensor] = []
+        processed_ranges: List[Tuple[int, int]] = []
         use_activation_checkpoint = bool(self._activation_checkpoint and not infer_mode)
+        self.input.clear()
+        self.output.clear()
         if is_train_path:
-            self.local_net.train()
-            self.global_net.train()
-            for idx in range(num_slices):
-                s = idx * self.microbatch
-                e = min(b, (idx + 1) * self.microbatch)
-                x_slice = self._cast_graph_safe(features[s:e], device, base_dtype)
-                ctx = (
-                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
-                )
-                with ctx:
-                    out: Payload = self.local_net(x_slice)
-                out_tokens = torch.nan_to_num(
-                    out.tokens, nan=0.0, posinf=0.0, neginf=0.0
-                ).to(dtype=base_dtype)
-                out_context = torch.nan_to_num(
-                    out.context, nan=0.0, posinf=0.0, neginf=0.0
-                ).to(dtype=base_dtype)
-                token_chunks.append(out_tokens)
-                context_chunks.append(out_context)
+            self.processor.train()
+            self.controller.train()
         else:
-            self.local_net.eval()
-            self.global_net.eval()
-            for idx in range(num_slices):
-                s = idx * self.microbatch
-                e = min(b, (idx + 1) * self.microbatch)
-                x_slice = self._cast_graph_safe(features[s:e], device, base_dtype)
+            self.processor.eval()
+            self.controller.eval()
+
+        def _process_one(req: Request) -> None:
+            x_slice = req.features
+            if req.slice_range is not None:
+                processed_ranges.append(req.slice_range)
+            if is_train_path:
+                ctx = Autocast.float(device) if amp_enabled else Autocast.suspend(device)
+                with ctx:
+                    tok, ctx_out = self.processor(x_slice)
+            else:
                 with contextlib.ExitStack() as stack:
-                    stack.enter_context(Gradient.inference(self.local_net))
-                    stack.enter_context(
-                        Autocast.float(device)
-                        if amp_enabled
-                        else Autocast.suspend(device)
-                    )
-                    out = self.local_net(x_slice)
-                out_tokens = torch.nan_to_num(
-                    out.tokens, nan=0.0, posinf=0.0, neginf=0.0
-                ).to(dtype=base_dtype)
-                out_context = torch.nan_to_num(
-                    out.context, nan=0.0, posinf=0.0, neginf=0.0
-                ).to(dtype=base_dtype)
-                token_chunks.append(out_tokens)
-                context_chunks.append(out_context)
+                    stack.enter_context(Gradient.inference(self.processor))
+                    stack.enter_context(Autocast.float(device) if amp_enabled else Autocast.suspend(device))
+                    tok, ctx_out = self.processor(x_slice)
+            out_tokens = torch.nan_to_num(tok, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
+            out_context = torch.nan_to_num(ctx_out, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
+            token_chunks.append(out_tokens)
+            context_chunks.append(out_context)
+
+        for idx in range(num_slices):
+            s = idx * self.microbatch
+            e = min(b, (idx + 1) * self.microbatch)
+            shard = self._cast_graph_safe(features[s:e], device, base_dtype)
+            self.input.append(Request(features=shard, slice_range=(s, e)))
+            if len(self.input) >= max(1, int(self.max_queue)):
+                _process_one(self.input.popleft())
+        while self.input:
+            _process_one(self.input.popleft())
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
@@ -2138,20 +2142,20 @@ class Root(nn.Module):
         t32 = tokens.to(torch.float32)
         tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=tokens.dtype)
         if infer_mode:
-            with Gradient.inference(self.global_net):
+            with Gradient.inference(self.controller):
                 with (
                     Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 ):
-                    refined_tokens, _ = self.global_net(tokens_centered)
+                    refined_tokens, _ = self.controller(tokens_centered)
             refined_tokens = torch.nan_to_num(
                 refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
             )
             decode_tokens = refined_tokens.detach().clone()
-            with Gradient.inference(self.local_net):
+            with Gradient.inference(self.processor):
                 with (
                     Autocast.float(device) if amp_enabled else Autocast.suspend(device)
                 ):
-                    residual_context = self.local_net.decode(
+                    residual_context = self.processor.decode(
                         decode_tokens, apply_norm=True
                     )
             residual_context = torch.nan_to_num(
@@ -2166,7 +2170,7 @@ class Root(nn.Module):
                         if amp_enabled
                         else Autocast.suspend(device)
                     ):
-                        out, _ = self.global_net(inp)
+                        out, _ = self.controller(inp)
                     return out
 
                 if use_activation_checkpoint and activation_checkpoint is not None:
@@ -2185,7 +2189,7 @@ class Root(nn.Module):
                         if amp_enabled
                         else Autocast.suspend(device)
                     ):
-                        return self.local_net.decode(inp, apply_norm=True)
+                        return self.processor.decode(inp, apply_norm=True)
 
                 if use_activation_checkpoint and activation_checkpoint is not None:
                     residual_context = activation_checkpoint(
@@ -2250,6 +2254,36 @@ class Root(nn.Module):
                     device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
                 )
                 loss_val = net_loss(y_hat_for_loss, tgt)
+
+        self.output.clear()
+        if processed_ranges:
+            offset = 0
+            for (s, e) in processed_ranges:
+                length = int(e - s)
+                if length <= 0:
+                    continue
+                start = offset
+                end = offset + length
+                self.output.append(
+                    Response(
+                        pred=pred[start:end],
+                        loss=loss_val,
+                        refined_tokens=refined_tokens[start:end],
+                        residual_context=residual_context[start:end],
+                        slice_range=(s, e),
+                    )
+                )
+                offset = end
+        else:
+            self.output.append(
+                Response(
+                    pred=pred,
+                    loss=loss_val,
+                    refined_tokens=refined_tokens,
+                    residual_context=residual_context,
+                    slice_range=(0, b),
+                )
+            )
 
         if td_input is not None:
             out_td = td_input.clone()

@@ -77,7 +77,7 @@ from ..functional.optimizers import (
     StochasticWeightAverage,
     stochastic_weight_average,
 )
-from ..model.layers import Root
+from ..model.layers import Instance
 from .compat import (
     cudagraph_step_end,
     is_meta_or_fake_tensor,
@@ -506,7 +506,7 @@ def _expand(sources: Any) -> Any:
 
 @torch.no_grad()
 def _calibrate_per_sample_mem(
-    model: Root,
+    model: Instance,
     device: torch.device,
     ops: RuntimeConfig,
     max_probe_batch: int = 32,
@@ -865,7 +865,7 @@ def update_tqdm(
 
 
 def epochs(
-    model: Root,
+    model: Instance,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -1364,7 +1364,7 @@ def epochs(
 
 
 def infer(
-    model: Root,
+    model: Instance,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -1765,7 +1765,7 @@ def infer(
     return None
 
 
-def main(*args: Any, **kwargs: Any) -> Optional[Root]:
+def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
     from ..data.pipeline import fetch
 
     if not args:
@@ -1801,7 +1801,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = Root(ops.in_dim, ops.out_shape, config=cfg)
+        model = Instance(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
@@ -1923,8 +1923,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         wrapped = set()
         try:
             for submodule in _get_layers(
-                getattr(model, "local_net", None)
-            ) + _get_layers(getattr(model, "global_net", None)):
+                getattr(model, "processor", None)
+            ) + _get_layers(getattr(model, "controller", None)):
                 _wrap_fsdp(
                     submodule,
                     mesh,
@@ -2268,7 +2268,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
-        model = Root(ops.in_dim, ops.out_shape, config=cfg)
+        model = Instance(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
