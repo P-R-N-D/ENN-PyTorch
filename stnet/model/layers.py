@@ -64,6 +64,7 @@ except Exception:
     _HAS_FLEX_ATTENTION = False
 
 from ..backend.profiler import FLOP_PROFILER
+from ..backend.compat import torch_safe_distributed
 from ..functional.fx import Autocast, Gradient
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
@@ -142,6 +143,7 @@ class PatchAttention(nn.Module):
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
 
+    @torch_safe_distributed
     def forward(
         self,
         x: torch.Tensor,
