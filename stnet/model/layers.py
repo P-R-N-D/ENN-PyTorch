@@ -762,7 +762,7 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile
+    @torch_no_compile(reason='CUDAGraph error')
     def forward(
         self,
         x: torch.Tensor,
