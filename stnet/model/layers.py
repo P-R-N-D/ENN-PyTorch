@@ -144,7 +144,7 @@ class PatchAttention(nn.Module):
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -756,6 +756,7 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(
         self,
         x: torch.Tensor,
