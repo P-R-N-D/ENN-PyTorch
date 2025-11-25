@@ -149,7 +149,6 @@ class PatchAttention(nn.Module):
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
 
-    @no_compile_with_flex_attention
     def forward(
         self,
         x: torch.Tensor,
@@ -762,7 +761,6 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile(reason='CUDAGraph error')
     def forward(
         self,
         x: torch.Tensor,
@@ -970,7 +968,6 @@ class TemporalNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile(reason='CUDAGraph error')
     def forward(
         self,
         x: torch.Tensor,
@@ -1440,6 +1437,7 @@ class Processor(nn.Module):
         coords = self.spatial_coords_template.to(device=device, dtype=dtype)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error')
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
