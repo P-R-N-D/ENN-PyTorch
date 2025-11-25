@@ -12,7 +12,6 @@ import torch._dynamo
 from torch import nn
 
 from ..backend.profiler import FLOP_PROFILER, capture
-from ..backend.compat import torch_no_compile
 from ..backend.system import (
     cuda_compute_capability,
     get_device,
@@ -1135,7 +1134,6 @@ class MultiScaleRetentionTriton(nn.Module):
         if not (_HAS_TRITON_MSR and torch.cuda.is_available()):
             raise RuntimeError("Triton MSR backend is not available (Triton+CUDA required).")
 
-    @torch_no_compile(reason="Triton alignment bug")
     def forward(
         self,
         x: torch.Tensor,
