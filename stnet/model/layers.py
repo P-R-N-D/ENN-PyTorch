@@ -963,7 +963,6 @@ class TemporalNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -1009,6 +1008,7 @@ class CrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor) -> torch.Tensor:
         qn = self.norm_q(q_tokens)
         kvn = self.norm_kv(kv_tokens)
@@ -1433,7 +1433,6 @@ class Processor(nn.Module):
         coords = self.spatial_coords_template.to(device=device, dtype=dtype)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
