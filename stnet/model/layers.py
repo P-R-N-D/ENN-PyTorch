@@ -756,7 +756,6 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -1434,6 +1433,7 @@ class Processor(nn.Module):
         coords = self.spatial_coords_template.to(device=device, dtype=dtype)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
