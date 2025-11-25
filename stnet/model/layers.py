@@ -69,11 +69,6 @@ from ..functional.fx import Autocast, Gradient
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 
-no_compile_with_flex_attention = (
-    torch_no_compile(reason="FlexAttention backward alignment bug in Inductor")
-    if _HAS_FLEX_ATTENTION else (lambda f: f)
-)
-
 @torch.no_grad()
 def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
     B, N, C = coords.shape
@@ -393,7 +388,6 @@ class DilatedAttention(nn.Module):
         self._mask_cache_gpu[key] = mask_gpu
         return mask_gpu
 
-    @no_compile_with_flex_attention
     def forward(
         self,
         x: torch.Tensor,
