@@ -1478,15 +1478,11 @@ def epochs(
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
     with torch.no_grad():
-        if is_distributed():
-            try:
-                if torch.distributed.get_rank() != 0:
-                    return
-            except Exception:
-                pass
-
-        all_pred: List[torch.Tensor] = []
-        all_true: List[torch.Tensor] = []
+        sum_x: Optional[torch.Tensor] = None
+        sum_y: Optional[torch.Tensor] = None
+        sum_x2: Optional[torch.Tensor] = None
+        sum_xy: Optional[torch.Tensor] = None
+        total_n: int = 0
 
         for batch in train_loader:
             x_raw = batch["features"].to(device)
@@ -1495,7 +1491,6 @@ def epochs(
                 y_flat = y_raw.reshape(y_raw.shape[0], -1)
             else:
                 y_flat = y_raw
-
             out = model(
                 x_raw,
                 labels_flat=None,
@@ -1509,9 +1504,7 @@ def epochs(
             else:
                 z_pred_raw = out
 
-            z_pred = z_pred_raw.detach().to(
-                device=scaler_y_device, dtype=torch.float64
-            )
+            z_pred = z_pred_raw.detach().to(device=scaler_y_device, dtype=torch.float64)
             z_true = model_for_scaler.scaler.normalize_y(
                 y_flat.detach()
             ).to(dtype=torch.float64)
@@ -1522,6 +1515,7 @@ def epochs(
                 z_true = z_true.unsqueeze(-1)
             z_pred = z_pred.reshape(-1, z_pred.shape[-1])
             z_true = z_true.reshape(-1, z_true.shape[-1])
+
             if z_pred.shape[-1] != z_true.shape[-1]:
                 f_pred = z_pred.shape[-1]
                 f_true = z_true.shape[-1]
@@ -1547,13 +1541,60 @@ def epochs(
             if z_pred.numel() == 0 or z_true.numel() == 0:
                 continue
 
-            all_pred.append(z_pred)
-            all_true.append(z_true)
+            n_batch = z_pred.shape[0]
+            total_n += n_batch
 
-        if all_pred and all_true:
-            z_pred_all = torch.cat(all_pred, dim=0)
-            z_true_all = torch.cat(all_true, dim=0)
-            model_for_scaler.scaler.fit(z_pred_all, z_true_all, mode="affine")
+            sx = z_pred.sum(dim=0)
+            sy = z_true.sum(dim=0)
+            sx2 = (z_pred * z_pred).sum(dim=0)
+            sxy = (z_pred * z_true).sum(dim=0)
+
+            if sum_x is None:
+                sum_x = sx
+                sum_y = sy
+                sum_x2 = sx2
+                sum_xy = sxy
+            else:
+                sum_x += sx
+                sum_y += sy
+                sum_x2 += sx2
+                sum_xy += sxy
+        if is_distributed():
+            n_t = torch.tensor(
+                float(total_n), device=scaler_y_device, dtype=torch.float64
+            )
+            torch.distributed.all_reduce(n_t, op=torch.distributed.ReduceOp.SUM)
+            total_n = int(n_t.item())
+
+            if sum_x is not None:
+                torch.distributed.all_reduce(sum_x, op=torch.distributed.ReduceOp.SUM)
+            if sum_y is not None:
+                torch.distributed.all_reduce(sum_y, op=torch.distributed.ReduceOp.SUM)
+            if sum_x2 is not None:
+                torch.distributed.all_reduce(sum_x2, op=torch.distributed.ReduceOp.SUM)
+            if sum_xy is not None:
+                torch.distributed.all_reduce(sum_xy, op=torch.distributed.ReduceOp.SUM)
+
+        if total_n > 0 and sum_x is not None and sum_y is not None and sum_x2 is not None and sum_xy is not None:
+            N = float(total_n)
+            mean_x = sum_x / N
+            mean_y = sum_y / N
+            Ex2 = sum_x2 / N
+            Exy = sum_xy / N
+            var_x = Ex2 - mean_x * mean_x
+            cov_xy = Exy - mean_x * mean_y
+
+            eps = float(model_for_scaler.scaler.eps)
+            denom = var_x.clone()
+            tiny_mask = denom.abs() < eps
+            denom[tiny_mask] = 1.0
+
+            a = (cov_xy / denom).to(dtype=torch.float32)
+            b = (mean_y - a.to(dtype=torch.float64) * mean_x).to(dtype=torch.float32)
+            a[tiny_mask] = 1.0
+            b[tiny_mask] = 0.0
+
+            model_for_scaler.scaler.set_affine(a, b)
 
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
