@@ -36,7 +36,7 @@ except Exception:
             self.p = float(p)
             self.mode = str(mode)
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
             if (not self.training) or self.p <= 0.0:
                 return x
             keep = 1.0 - self.p
@@ -50,7 +50,7 @@ except Exception:
             return x * noise
 
 else:
-    StochasticDepth = _TorchStochasticDepth  # type: ignore
+    StochasticDepth = _TorchStochasticDepth
 
 _Norm = nn.LayerNorm
 
@@ -755,7 +755,6 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -1042,7 +1041,7 @@ class CrossTransformer(nn.Module):
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(
         self,
         spatial_tokens: torch.Tensor,
