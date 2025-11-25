@@ -1577,25 +1577,80 @@ class Scaler(nn.Module):
                 self.x_std.fill_(1.0)
         return x_scaled * (self.x_std + self.eps) + self.x_mean
 
-    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        if self.y_mean.dim() == 1 and y.dim() >= 2 and self.y_mean.shape[-1] != y.shape[-1]:
+    def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean = self.y_mean
+        std = self.y_std
+        if mean.ndim > 1:
+            mean_flat = mean.reshape(-1)
+            std_flat = std.reshape(-1)
             with torch.no_grad():
-                new_c = y.shape[-1]
-                self.y_mean.resize_(new_c)
-                self.y_std.resize_(new_c)
-                self.y_mean.zero_()
-                self.y_std.fill_(1.0)
-        return (y - self.y_mean) / (self.y_std + self.eps)
+                if self.y_mean.shape != mean_flat.shape:
+                    self.y_mean.resize_(mean_flat.shape)
+                if self.y_std.shape != std_flat.shape:
+                    self.y_std.resize_(std_flat.shape)
+                self.y_mean.copy_(mean_flat)
+                self.y_std.copy_(std_flat)
+            mean = self.y_mean
+            std = self.y_std
+        return mean, std
+
+    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        if y.numel() == 0:
+            return y
+
+        orig_shape = y.shape
+        if y.dim() == 1:
+            y_flat = y.view(1, -1)
+            batch_first = False
+        else:
+            y_flat = y.view(y.shape[0], -1)
+            batch_first = True
+
+        mean, std = self._y_stats_vector()
+
+        if mean.numel() == 1 and std.numel() == 1:
+            z_flat = (y_flat - mean) / (std + self.eps)
+        else:
+            if y_flat.shape[1] != mean.numel():
+                raise RuntimeError(
+                    "Scaler.normalize_y: feature dimension mismatch: "
+                    f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
+                )
+            z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
+
+        if batch_first:
+            return z_flat.view(orig_shape)
+        else:
+            return z_flat.view(-1)
 
     def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
-        if self.y_mean.dim() == 1 and z.dim() >= 2 and self.y_mean.shape[-1] != z.shape[-1]:
-            with torch.no_grad():
-                new_c = z.shape[-1]
-                self.y_mean.resize_(new_c)
-                self.y_std.resize_(new_c)
-                self.y_mean.zero_()
-                self.y_std.fill_(1.0)
-        return z * self.y_std + self.y_mean
+        if z.numel() == 0:
+            return z
+
+        orig_shape = z.shape
+        if z.dim() == 1:
+            z_flat = z.view(1, -1)
+            batch_first = False
+        else:
+            z_flat = z.view(z.shape[0], -1)
+            batch_first = True
+
+        mean, std = self._y_stats_vector()
+
+        if mean.numel() == 1 and std.numel() == 1:
+            y_flat = z_flat * std + mean
+        else:
+            if z_flat.shape[1] != mean.numel():
+                raise RuntimeError(
+                    "Scaler.denormalize_y: feature dimension mismatch: "
+                    f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
+                )
+            y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
+
+        if batch_first:
+            return y_flat.view(orig_shape)
+        else:
+            return y_flat.view(-1)
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
         if self.calib_mode == "piecewise" and self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
