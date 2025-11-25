@@ -27,8 +27,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from tensordict import TensorDictBase
 try:
-    from torch.nn import StochasticDepth as _TorchStochasticDepth  # type: ignore
-except Exception:  # pragma: no cover - fallback for older torch
+    from torch.nn import StochasticDepth as _TorchStochasticDepth
+except Exception:
 
     class StochasticDepth(nn.Module):
         def __init__(self, p: float = 0.0, mode: str = "row") -> None:
@@ -970,6 +970,7 @@ class TemporalNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+    @torch_no_compile(reason='CUDAGraph error')
     def forward(
         self,
         x: torch.Tensor,
