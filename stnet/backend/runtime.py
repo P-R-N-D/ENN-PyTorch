@@ -1516,6 +1516,22 @@ def epochs(
             z_pred = z_pred.reshape(-1, z_pred.shape[-1])
             z_true = z_true.reshape(-1, z_true.shape[-1])
 
+            if z_pred.shape[-1] != z_true.shape[-1]:
+                f_pred = z_pred.shape[-1]
+                f_true = z_true.shape[-1]
+                if f_true % f_pred == 0:
+                    group = f_true // f_pred
+                    z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
+                elif f_pred % f_true == 0:
+                    group = f_pred // f_true
+                    z_true = z_true.repeat_interleave(group, dim=1)
+                else:
+                    raise RuntimeError(
+                        "Calibration: feature dimension mismatch between prediction and target "
+                        f"that cannot be reconciled generically. "
+                        f"z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
+                    )
+
             n_batch = z_pred.shape[0]
             if n_batch == 0:
                 continue
