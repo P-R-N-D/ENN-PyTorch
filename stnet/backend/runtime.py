@@ -1504,17 +1504,21 @@ def epochs(
             else:
                 z_pred_raw = out
 
-            z_pred = z_pred_raw.detach().to(device=scaler_y_device, dtype=torch.float64)
+            z_pred = z_pred_raw.detach().to(
+                device=scaler_y_device, dtype=torch.float64
+            )
+            if z_pred.ndim >= 2:
+                z_pred = z_pred.reshape(z_pred.shape[0], -1)
+            else:
+                z_pred = z_pred.view(-1, 1)
+
             z_true = model_for_scaler.scaler.normalize_y(
                 y_flat.detach()
             ).to(dtype=torch.float64)
-
-            if z_pred.ndim == 1:
-                z_pred = z_pred.unsqueeze(-1)
-            if z_true.ndim == 1:
-                z_true = z_true.unsqueeze(-1)
-            z_pred = z_pred.reshape(-1, z_pred.shape[-1])
-            z_true = z_true.reshape(-1, z_true.shape[-1])
+            if z_true.ndim >= 2:
+                z_true = z_true.reshape(z_true.shape[0], -1)
+            else:
+                z_true = z_true.view(-1, 1)
 
             if z_pred.shape[-1] != z_true.shape[-1]:
                 f_pred = z_pred.shape[-1]
