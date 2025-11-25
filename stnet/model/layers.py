@@ -755,6 +755,7 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -962,6 +963,7 @@ class TemporalNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(
         self,
         x: torch.Tensor,
