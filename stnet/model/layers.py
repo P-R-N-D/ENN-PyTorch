@@ -762,6 +762,7 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+    @torch_no_compile
     def forward(
         self,
         x: torch.Tensor,
@@ -795,8 +796,6 @@ class SpatialNet(nn.Module):
                     "attn_mask is meta/fake before SpatialNet.forward"
                 )
             attn_mask = attn_mask.contiguous()
-        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
-            torch.compiler.cudagraph_mark_step_begin()
         for i, blk in enumerate(self.blocks):                                                       
             B, N, D = x.shape
             _patch = getattr(self, "patch_size", 512)
