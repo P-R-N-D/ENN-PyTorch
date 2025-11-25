@@ -1524,7 +1524,7 @@ def epochs(
                     z_true = z_true.view(z_true.shape[0], group, f_pred).mean(dim=1)
                 elif f_pred % f_true == 0:
                     group = f_pred // f_true
-                    z_pred = z_pred.view(z_pred.shape[0], group, f_true).mean(dim=1)
+                    z_true = z_true.repeat_interleave(group, dim=1)
                 else:
                     raise RuntimeError(
                         "Calibration: feature dimension mismatch between prediction and target "
