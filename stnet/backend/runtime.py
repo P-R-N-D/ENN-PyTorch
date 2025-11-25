@@ -941,6 +941,7 @@ def epochs(
         start_ns = posix_time("Asia/Seoul")
         start_sec = round(float(start_ns) / 1e9, 6)
         hist.start_session(start_sec)
+        hist.set_epochs(total_epochs)
 
         os_name = platform.system()
         if os_name == "Linux":

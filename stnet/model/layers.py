@@ -1807,6 +1807,7 @@ class History(nn.Module):
         self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.timezone: str = "UTC"
         self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("epochs", torch.zeros(1, dtype=torch.int64), persistent=True)
         self.os: str = ""
         self.kernel: str = ""
         self.cpu: List[str] = []
@@ -1861,6 +1862,10 @@ class History(nn.Module):
     def end_session(self, end_posix: float, peers: int) -> None:
         self.end.fill_(round(float(end_posix), 6))
         self.peers.fill_(int(peers))
+
+    @torch.no_grad()
+    def set_epochs(self, epochs: int) -> None:
+        self.epochs.fill_(max(0, int(epochs)))
     @torch.no_grad()
     def set_system_info(
         self,
