@@ -1029,6 +1029,8 @@ def epochs(
                     x_sum_sq += sx2
 
             yf = labs.to(device=scaler_y_device, dtype=torch.float32)
+            if yf.ndim >= 2:
+                yf = yf.reshape(yf.shape[0], -1)
             n_y = yf.shape[0]
             if n_y > 0:
                 y_count += n_y
@@ -1485,6 +1487,10 @@ def epochs(
         for batch in train_loader:
             x_raw = batch["features"].to(device)
             y_raw = batch["labels"].to(scaler_y_device)
+            if y_raw.ndim >= 2:
+                y_flat = y_raw.reshape(y_raw.shape[0], -1)
+            else:
+                y_flat = y_raw
             out = model(
                 x_raw,
                 labels_flat=None,
@@ -1500,7 +1506,7 @@ def epochs(
 
             z_pred = z_pred_raw.detach().to(device=scaler_y_device, dtype=torch.float64)
             z_true = model_for_scaler.scaler.normalize_y(
-                y_raw.detach()
+                y_flat.detach()
             ).to(dtype=torch.float64)
 
             if z_pred.ndim == 1:
