@@ -200,7 +200,7 @@ class PatchAttention(nn.Module):
                     self.nhead,
                     N,
                     N,
-                    device=str(qh.device),
+                    device=qh.device,
                 )
             else:
                 bias = m.to(device=qh.device, dtype=qh.dtype)
@@ -447,7 +447,7 @@ class DilatedAttention(nn.Module):
                 H,
                 L,
                 L,
-                device=str(x.device),
+                device=x.device,
             )
             scale = 1.0 / math.sqrt(float(Dh))
             y = flex_attention(qh, kh, vh, block_mask=block, scale=scale)
