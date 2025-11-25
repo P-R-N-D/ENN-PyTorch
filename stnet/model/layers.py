@@ -1008,7 +1008,6 @@ class CrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor) -> torch.Tensor:
         qn = self.norm_q(q_tokens)
         kvn = self.norm_kv(kv_tokens)
@@ -1043,6 +1042,7 @@ class CrossTransformer(nn.Module):
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
 
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=False)
     def forward(
         self,
         spatial_tokens: torch.Tensor,
