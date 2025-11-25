@@ -168,6 +168,7 @@ class PatchAttention(nn.Module):
 
         block = None
         mask_bias: torch.Tensor | None = None
+        coord_bias: torch.Tensor | None = None
         if isinstance(attn_mask, torch.Tensor):
             m = attn_mask
             if m.dtype == torch.bool:
@@ -226,10 +227,20 @@ class PatchAttention(nn.Module):
                     raise ValueError(f"attn_mask rank {bias.dim()} not supported")
                 mask_bias = bias.contiguous()
 
+        Bc, Nc, Cc = coords_f32.shape
+        if (Bc != B) or (Nc != N) or (Cc != self.coord_dim):
+            raise ValueError(
+                f"coords_f32 shape {coords_f32.shape} incompatible with (B,N,C)=({B},{N},{self.coord_dim})"
+            )
+        H = self.nhead
+        delta = coords_f32[:, None, :, None, :] - coords_f32[:, None, None, :, :]
+        W_exp = W.view(1, H, 1, 1, Cc)
+        coord_bias = (delta * W_exp).sum(dim=-1).to(dtype=qh.dtype, device=qh.device)
+
         def score_mod(score, b, h, qi, kj):
-            delta = coords_f32[b, qi] - coords_f32[b, kj]
-            coord_bias = (delta * W[h]).sum().to(dtype=score.dtype)
-            total = score + coord_bias
+            total = score
+            if coord_bias is not None:
+                total = total + coord_bias[b, h, qi, kj]
             if mask_bias is not None:
                 total = total + mask_bias[b, h, qi, kj].to(dtype=score.dtype)
             return total
