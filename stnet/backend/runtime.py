@@ -1532,9 +1532,16 @@ def epochs(
                         f"z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
                     )
 
-            n_batch = z_pred.shape[0]
-            if n_batch == 0:
+            if z_pred.shape[0] != z_true.shape[0]:
+                raise RuntimeError(
+                    "Calibration: batch dimension mismatch between prediction and target. "
+                    f"z_pred.shape={tuple(z_pred.shape)}, z_true.shape={tuple(z_true.shape)}"
+                )
+
+            if z_pred.numel() == 0 or z_true.numel() == 0:
                 continue
+
+            n_batch = z_pred.shape[0]
             total_n += n_batch
 
             sx = z_pred.sum(dim=0)
