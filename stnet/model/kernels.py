@@ -977,9 +977,12 @@ class MultiScaleRetention(nn.Module):
             else self.d_model // self.nhead
         )
         half = key_dim // 2
-        positions = torch.arange(seq_len, device=device, dtype=dtype)
+        coord_dtype = (
+            torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
+        )
+        positions = torch.arange(seq_len, device=device, dtype=coord_dtype)
         inv_freq = 1.0 / self._rope_theta ** torch.linspace(
-            0, 1, half, device=device, dtype=dtype
+            0, 1, half, device=device, dtype=coord_dtype
         )
         freqs = torch.einsum("n,d->nd", positions, inv_freq)
         sin = _clone_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
