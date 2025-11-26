@@ -21,7 +21,7 @@ Core runtime dependencies:
 - `py-cpuinfo>=9.0.0`
 - `scipy>=1.14.1`
 - `tensordict>=0.10.0`
-- `torch>=2.7.0`
+- `torch>=2.8.0`
 - `torchdata>=0.11.0`
 - `torchrl>=0.8.1`
 - `tqdm>=4.67.1`

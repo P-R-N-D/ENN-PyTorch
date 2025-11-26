@@ -392,10 +392,30 @@ def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
         with contextlib.suppress(Exception):
             torch.set_float32_matmul_precision("high")
-            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            if torch.cuda.is_available():
                 with contextlib.suppress(Exception):
-                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-                        torch.backends.cuda.matmul.allow_tf32 = True
+                    torch.backends.fp32_precision = "tf32"
+                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                    torch.backends.cuda.matmul.fp32_precision = "tf32"
+                if hasattr(torch.backends, "cudnn"):
+                    with contextlib.suppress(Exception):
+                        torch.backends.cudnn.fp32_precision = "tf32"
+                    if hasattr(torch.backends.cudnn, "conv"):
+                        torch.backends.cudnn.conv.fp32_precision = "tf32"
+                    if hasattr(torch.backends.cudnn, "rnn"):
+                        torch.backends.cudnn.rnn.fp32_precision = "tf32"
+            else:
+                with contextlib.suppress(Exception):
+                    torch.backends.fp32_precision = "ieee"
+                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                    torch.backends.cuda.matmul.fp32_precision = "ieee"
+                if hasattr(torch.backends, "cudnn"):
+                    with contextlib.suppress(Exception):
+                        torch.backends.cudnn.fp32_precision = "ieee"
+                    if hasattr(torch.backends.cudnn, "conv"):
+                        torch.backends.cudnn.conv.fp32_precision = "ieee"
+                    if hasattr(torch.backends.cudnn, "rnn"):
+                        torch.backends.cudnn.rnn.fp32_precision = "ieee"
             if hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.benchmark = True
     rank = int(os.environ.get("LOCAL_RANK", 0))
