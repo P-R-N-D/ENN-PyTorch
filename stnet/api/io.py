@@ -88,18 +88,10 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
-    *,
-    wrap: bool = True,
 ) -> nn.Module:
-    from ..functional.fx import Fusion
-
     cfg = coerce_model_config(config)
     core = Instance(in_dim, tuple(int(x) for x in out_shape), config=cfg)
-    if not wrap:
-        return core
-    return Fusion.use_tensordict_layers(
-        core, in_key="features", out_key="pred", add_loss=True
-    )
+    return core
 
 
 def load_model(
@@ -108,8 +100,6 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[torch.device | str] = None,
-    *,
-    wrap: bool = True,
 ) -> nn.Module:
     p = Path(checkpoint_path)
     if p.is_dir():
@@ -117,7 +107,7 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape."
             )
-        model = new_model(int(in_dim), tuple(out_shape), config, wrap=wrap)
+        model = new_model(int(in_dim), tuple(out_shape), config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
@@ -151,7 +141,7 @@ def load_model(
                 f"in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
 
-        model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
+        model = new_model(use_in_dim, use_out_shape, use_config)
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
@@ -183,7 +173,7 @@ def load_model(
             f"in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
 
-    model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
+    model = new_model(use_in_dim, use_out_shape, use_config)
     model.load_state_dict(sd, strict=False)
     return model
 
