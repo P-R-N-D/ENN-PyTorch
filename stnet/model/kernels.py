@@ -977,9 +977,14 @@ class MultiScaleRetention(nn.Module):
             else self.d_model // self.nhead
         )
         half = key_dim // 2
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        coord_dtype = dtype if dtype in (
+            torch.float64,
+            torch.float32,
+            torch.bfloat32,
+        ) else torch.float64
+        positions = torch.arange(seq_len, device=device, dtype=coord_dtype)
         inv_freq = 1.0 / self._rope_theta ** torch.linspace(
-            0, 1, half, device=device, dtype=torch.float32
+            0, 1, half, device=device, dtype=coord_dtype
         )
         freqs = torch.einsum("n,d->nd", positions, inv_freq)
         sin = _clone_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
@@ -1192,7 +1197,7 @@ class MultiScaleRetentionTriton(nn.Module):
                 )
 
         v_blhc = v.contiguous()
-        out_state = torch.empty_like(v_blhc, dtype=torch.float32)
+        out_state = torch.empty_like(v_blhc, dtype=v_blhc.dtype)
 
         SVB, SVL, SVH, SVD = v_blhc.stride()
         SOB, SOL, SOH, SOD = out_state.stride()
