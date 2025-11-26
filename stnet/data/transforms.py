@@ -100,7 +100,12 @@ def _preprocess_y(value: Any) -> torch.Tensor:
         tensor = None
     if not isinstance(tensor, torch.Tensor):
         tensor = torch.as_tensor(value)
-    return tensor.detach()
+    t = tensor.detach()
+    if t.is_floating_point() or t.is_complex():
+        t = t.to(dtype=torch.float64)
+    else:
+        t = t.to(dtype=torch.int64)
+    return t
 
 
 def preprocess(

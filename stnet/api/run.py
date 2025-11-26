@@ -529,7 +529,7 @@ def predict(
                 flat = torch.cat(chunks, dim=0)
             else:
                 tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
-                flat = torch.empty((0, *tail), dtype=torch.float32)
+                flat = torch.empty((0, *tail), dtype=torch.float64)
 
             pred_tensor = Instance.unflatten_y(flat, out_shape)
 
@@ -537,7 +537,7 @@ def predict(
             for i, key in enumerate(keys):
                 if i >= pred_tensor.shape[0]:
                     break
-                result[key] = pred_tensor[i].detach().cpu()
+                result[key] = pred_tensor[i].detach().cpu().to(dtype=torch.float64)
 
             return result
         return {}
