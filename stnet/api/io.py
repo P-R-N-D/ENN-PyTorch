@@ -64,6 +64,30 @@ def _to_cpu(value: Any) -> Any:
     return value
 
 
+def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
+    def _is_wrapped_key(key: str) -> bool:
+        parts = key.split(".")
+        return len(parts) >= 3 and parts[0] == "m" and parts[1].isdigit() and parts[2] == "module"
+
+    if not any(_is_wrapped_key(k) for k in sd.keys()):
+        return sd
+
+    new_sd = sd.__class__() if hasattr(sd, "__class__") else {}
+    for k, v in sd.items():
+        if _is_wrapped_key(k):
+            parts = k.split(".")
+            try:
+                module_idx = parts.index("module")
+                new_key = ".".join(parts[module_idx + 1 :])
+            except ValueError:
+                new_key = k
+        else:
+            new_key = k
+        new_sd[new_key] = v
+
+    return new_sd
+
+
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     cfg_obj = getattr(model, "_Instance__config", None)
     if cfg_obj is None:
@@ -146,6 +170,7 @@ def load_model(
         from safetensors.torch import load_file as load_tensors
 
         sd = load_tensors(str(p), device=map_location or "cpu")
+        sd = _strip_legacy_wrapped_keys(sd)
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
@@ -174,6 +199,7 @@ def load_model(
         )
 
     model = new_model(use_in_dim, use_out_shape, use_config)
+    sd = _strip_legacy_wrapped_keys(sd)
     model.load_state_dict(sd, strict=False)
     return model
 
