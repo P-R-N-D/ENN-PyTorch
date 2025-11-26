@@ -64,6 +64,30 @@ def _to_cpu(value: Any) -> Any:
     return value
 
 
+def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
+    def _is_wrapped_key(key: str) -> bool:
+        parts = key.split(".")
+        return len(parts) >= 3 and parts[0] == "m" and parts[1].isdigit() and parts[2] == "module"
+
+    if not any(_is_wrapped_key(k) for k in sd.keys()):
+        return sd
+
+    new_sd = sd.__class__() if hasattr(sd, "__class__") else {}
+    for k, v in sd.items():
+        if _is_wrapped_key(k):
+            parts = k.split(".")
+            try:
+                module_idx = parts.index("module")
+                new_key = ".".join(parts[module_idx + 1 :])
+            except ValueError:
+                new_key = k
+        else:
+            new_key = k
+        new_sd[new_key] = v
+
+    return new_sd
+
+
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     cfg_obj = getattr(model, "_Instance__config", None)
     if cfg_obj is None:
@@ -88,18 +112,10 @@ def new_model(
     in_dim: int,
     out_shape: Sequence[int],
     config: ModelConfig | Dict[str, Any] | None,
-    *,
-    wrap: bool = True,
 ) -> nn.Module:
-    from ..functional.fx import Fusion
-
     cfg = coerce_model_config(config)
     core = Instance(in_dim, tuple(int(x) for x in out_shape), config=cfg)
-    if not wrap:
-        return core
-    return Fusion.use_tensordict_layers(
-        core, in_key="features", out_key="pred", add_loss=True
-    )
+    return core
 
 
 def load_model(
@@ -108,8 +124,6 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[torch.device | str] = None,
-    *,
-    wrap: bool = True,
 ) -> nn.Module:
     p = Path(checkpoint_path)
     if p.is_dir():
@@ -117,7 +131,7 @@ def load_model(
             raise ValueError(
                 "Loading from a checkpoint directory requires in_dim and out_shape."
             )
-        model = new_model(int(in_dim), tuple(out_shape), config, wrap=wrap)
+        model = new_model(int(in_dim), tuple(out_shape), config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
@@ -151,11 +165,12 @@ def load_model(
                 f"in_dim={use_in_dim}, out_shape={use_out_shape}"
             )
 
-        model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
+        model = new_model(use_in_dim, use_out_shape, use_config)
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
         sd = load_tensors(str(p), device=map_location or "cpu")
+        sd = _strip_legacy_wrapped_keys(sd)
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
@@ -183,7 +198,8 @@ def load_model(
             f"in_dim={use_in_dim}, out_shape={use_out_shape}"
         )
 
-    model = new_model(use_in_dim, use_out_shape, use_config, wrap=wrap)
+    model = new_model(use_in_dim, use_out_shape, use_config)
+    sd = _strip_legacy_wrapped_keys(sd)
     model.load_state_dict(sd, strict=False)
     return model
 
