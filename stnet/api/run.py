@@ -172,7 +172,6 @@ def train(
         torch.backends.cudnn.benchmark = True
     with contextlib.suppress(Exception):
         torch.set_float32_matmul_precision("high")
-        torch.backends.cuda.matmul.fp32_precision = "high"
 
     def _check_shapes(
         first_feats: Optional[torch.Tensor],

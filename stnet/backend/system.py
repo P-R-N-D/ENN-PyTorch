@@ -432,9 +432,9 @@ def get_device(
         try:
             torch.set_float32_matmul_precision(str(cfg.matmul_precision))
             if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                torch.backends.cuda.matmul.fp32_precision = (
-                    "high" if bool(cfg.allow_tf32) else "highest"
-                )
+                with contextlib.suppress(Exception):
+                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.allow_tf32)
         except Exception:
             pass
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

@@ -2451,6 +2451,11 @@ class Instance(nn.Module):
                 tgt = tgt.to(dtype=y_hat_for_loss.dtype)
                 loss_val = net_loss(y_hat_for_loss, tgt)
 
+        if loss_val is not None and not isinstance(loss_val, torch.Tensor):
+            loss_val = torch.as_tensor(
+                loss_val, device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+            )
+
         if infer_mode and calibrate_output:
             z_cal = self.scaler.calibrate(z_pred_raw)
             pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)

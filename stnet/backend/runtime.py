@@ -393,7 +393,9 @@ def _set_backend(device: torch.device) -> None:
         with contextlib.suppress(Exception):
             torch.set_float32_matmul_precision("high")
             if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                torch.backends.cuda.matmul.fp32_precision = "high"
+                with contextlib.suppress(Exception):
+                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                        torch.backends.cuda.matmul.allow_tf32 = True
             if hasattr(torch.backends, "cudnn"):
                 torch.backends.cudnn.benchmark = True
     rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -1273,6 +1275,19 @@ def epochs(
                                             loss_val = loss_val.mean()
                                     else:
                                         y_hat, loss_val = model_out
+                                if loss_val is None:
+                                    raise RuntimeError(
+                                        "Model returned no loss value during training. "
+                                        "Ensure loss functions are provided and returning valid outputs."
+                                    )
+                                if not isinstance(loss_val, torch.Tensor):
+                                    loss_val = torch.as_tensor(
+                                        loss_val, device=device, dtype=param_dtype
+                                    )
+                                else:
+                                    loss_val = loss_val.to(
+                                        device=device, dtype=param_dtype
+                                    )
                                 accum_scale = max(1, grad_accum_steps)
                                 loss_for_backprop = loss_val / float(accum_scale)
                                 scaler.scale(loss_for_backprop).backward()
@@ -1409,6 +1424,19 @@ def epochs(
                                             _loss_val = _loss_val.mean()
                                     else:
                                         _y, _loss_val = model_out_val
+                                if _loss_val is None:
+                                    raise RuntimeError(
+                                        "Model returned no loss value during validation. "
+                                        "Ensure loss functions are configured correctly."
+                                    )
+                                if not isinstance(_loss_val, torch.Tensor):
+                                    _loss_val = torch.as_tensor(
+                                        _loss_val, device=device, dtype=param_dtype
+                                    )
+                                else:
+                                    _loss_val = _loss_val.to(
+                                        device=device, dtype=param_dtype
+                                    )
                                 if use_timer:
                                     ev_e.record()
                                     ev_e.synchronize()
@@ -2100,8 +2128,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             else:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message=ignored_pattern)
-                    opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=False)
-                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    m_sd = get_model_state_dict(
+                        model,
+                        options=StateDictOptions(
+                            full_state_dict=True, cpu_offload=False
+                        ),
+                    )
                     m_sd = _trim_dcp_keys(m_sd)
                     load(
                         state_dict={"model": m_sd},
@@ -2507,8 +2539,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         if local_rank == 0:
             with warnings.catch_warnings():
                 warnings.filterwarnings("ignore", message=ignored_pattern)
-                opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                model_sd = get_model_state_dict(model, options=opts_sd)
+                model_sd = get_model_state_dict(
+                    model,
+                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+                )
                 optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
                 writer = FileSystemWriter(
                     ops.ckpt_dir or "", sync_files=True, overwrite=True
@@ -2569,8 +2603,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             else:
                 with warnings.catch_warnings():
                     warnings.filterwarnings("ignore", message=ignored_pattern)
-                    opts_sd = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                    m_sd = get_model_state_dict(model, options=opts_sd)
+                    m_sd = get_model_state_dict(
+                        model,
+                        options=StateDictOptions(
+                            full_state_dict=True, cpu_offload=True
+                        ),
+                    )
                     m_sd = _trim_dcp_keys(m_sd)
                     load(
                         state_dict={"model": m_sd},
