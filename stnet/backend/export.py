@@ -13,6 +13,7 @@ from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
+from tensordict import TensorDictBase
 
 from ..api.io import Format
 from ..model.layers import History
@@ -76,7 +77,26 @@ def _get_tensor_shape(
         with Gradient.inference(model):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            y_flat, _ = model(sample, labels_flat=None, net_loss=None)
+            model_out = model(sample, labels_flat=None, net_loss=None)
+            if isinstance(model_out, TensorDictBase):
+                y_flat = model_out.get("pred", None)
+                if not isinstance(y_flat, torch.Tensor):
+                    y_flat = next(
+                        (
+                            v
+                            for v in model_out.values()
+                            if isinstance(v, torch.Tensor)
+                        ),
+                        None,
+                    )
+            elif isinstance(model_out, (tuple, list)):
+                y_flat = model_out[0]
+            else:
+                y_flat = model_out
+        if not isinstance(y_flat, torch.Tensor):
+            raise RuntimeError(
+                "Failed to infer output shape: model did not return a tensor output"
+            )
         if in_dim is None:
             in_dim = int(sample.numel() // int(sample.shape[0]))
         if out_shape is None:
@@ -132,7 +152,21 @@ class _CompatLayer(nn.Module):
         self.net = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y_flat, _ = self.net(x, labels_flat=None, net_loss=None)
+        out = self.net(x, labels_flat=None, net_loss=None)
+        if isinstance(out, TensorDictBase):
+            y_flat = out.get("pred", None)
+            if not isinstance(y_flat, torch.Tensor):
+                y_flat = next(
+                    (v for v in out.values() if isinstance(v, torch.Tensor)), None
+                )
+        elif isinstance(out, (tuple, list)):
+            y_flat = out[0]
+        else:
+            y_flat = out
+        if not isinstance(y_flat, torch.Tensor):
+            raise RuntimeError(
+                "Compat layer expected tensor output from model forward pass"
+            )
         return y_flat
 
 

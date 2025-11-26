@@ -359,6 +359,10 @@ def torch_compile_safe(
             "commit_training_success",
             reason="history – eager",
         )
+        torch_disable_compile(
+            getattr(layers_module, "History", None),
+            "forward",
+        )
 
     if runtime_module is None:
         with suppress(Exception):
