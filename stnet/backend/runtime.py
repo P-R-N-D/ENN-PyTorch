@@ -2364,6 +2364,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             detach_stats=True,
             dim=-1,
             reduction="none",
+            skew=ops.loss_skew,
         )
         top_loss = TiledLoss(
             nn.Sequential(),
@@ -2396,6 +2397,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             detach_stats=True,
             dim=-1,
             reduction="none",
+            skew=ops.loss_skew,
         )
         bottom_loss = TiledLoss(
             nn.Sequential(),
