@@ -121,12 +121,18 @@ except ImportError:
 
 
 ignored_sentences = [
-    ".*External init callback must run in same thread as registerClient.*",
-    ".*Initializing zero-element tensors is a no-op.*",
-    ".*gpuGetDeviceCount failed with code.*",
-    ".*torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.*",
-    ".*torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.*",
-    ".*TypedStorage is deprecated.*",
+        "External init callback must run in same thread as registerClient",
+    "Initializing zero-element tensors is a no-op",
+    "gpuGetDeviceCount failed with code",
+    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to load in a single process.",
+    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
+    "TypedStorage is deprecated",
+    "flex_attention called without torch.compile() - this will use an unfused implementation that materializes the full scores matrix instead of generating a fused kernel.",
+    "SOLUTION: Use torch.compile(flex_attention)",
+    "If you want to debug your score_mod/mask_mod, you can set:",
+    "torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True",
+    "This will allow you to use print statements or breakpoints. Note: This doesn't work with the backwards pass and may produce incorrect results.",
+    "Not enough SMs to use max_autotune_gemm mode",
 ]
 ignored_pattern = "|".join((f"({sentence})" for sentence in ignored_sentences))
 _DL_STATE_FILE = "dataloader.json"
