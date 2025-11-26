@@ -11,11 +11,10 @@ import platform
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import Lock
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
@@ -27,17 +26,14 @@ except Exception:
     ZoneInfo = None
 
 
-@dataclass
-class _RuntimeConfig:
-    deterministic: bool = False
-    allow_tf32: Optional[bool] = None
-    cudnn_benchmark: Optional[bool] = None
-    matmul_precision: Optional[str] = None
-    sdpa_backends: Optional[List[str]] = None
-    te_first: bool = True
-
-
-_RUNTIME_CONFIG = _RuntimeConfig()
+_RUNTIME_CFG = SimpleNamespace(
+    deterministic=False,
+    allow_tf32=None,
+    cudnn_benchmark=None,
+    matmul_precision=None,
+    sdpa_backends=None,
+    te_first=True,
+)
 
 
 _TZ_ALIASES = {
@@ -171,8 +167,8 @@ def _num_cuda_devices() -> int:
         return 0
 
 
-def get_runtime_config() -> _RuntimeConfig:
-    return _RUNTIME_CONFIG
+def get_runtime_config() -> SimpleNamespace:
+    return _RUNTIME_CFG
 
 
 def is_main_loadable() -> bool:
@@ -320,7 +316,7 @@ def new_dir(prefix: str) -> str:
 
 def get_dpa_backends() -> List[object]:
 
-    names = _RUNTIME_CONFIG.sdpa_backends or []
+    names = _RUNTIME_CFG.sdpa_backends or []
     if not names:
         return []
     try:
@@ -376,7 +372,7 @@ def get_device(
     te_first: Optional[bool] = None,
     **kwargs: Any,
 ) -> torch.device:
-    cfg = _RUNTIME_CONFIG
+    cfg = _RUNTIME_CFG
     if deterministic is not None:
         cfg.deterministic = bool(deterministic)
     det_flag = cfg.deterministic
@@ -431,10 +427,18 @@ def get_device(
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:
             torch.set_float32_matmul_precision(str(cfg.matmul_precision))
+            fp32_precision = "tf32" if allow_val else "ieee"
+            with contextlib.suppress(Exception):
+                torch.backends.fp32_precision = fp32_precision
             if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.fp32_precision = fp32_precision
+            if hasattr(torch.backends, "cudnn"):
                 with contextlib.suppress(Exception):
-                    if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-                        torch.backends.cuda.matmul.allow_tf32 = bool(cfg.allow_tf32)
+                    torch.backends.cudnn.fp32_precision = fp32_precision
+                if hasattr(torch.backends.cudnn, "conv"):
+                    torch.backends.cudnn.conv.fp32_precision = fp32_precision
+                if hasattr(torch.backends.cudnn, "rnn"):
+                    torch.backends.cudnn.rnn.fp32_precision = fp32_precision
         except Exception:
             pass
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
