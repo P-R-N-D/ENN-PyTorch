@@ -977,9 +977,11 @@ class MultiScaleRetention(nn.Module):
             else self.d_model // self.nhead
         )
         half = key_dim // 2
-        coord_dtype = (
-            torch.float64 if dtype in (torch.float16, torch.bfloat16) else dtype
-        )
+        coord_dtype = dtype if dtype in (
+            torch.float64,
+            torch.float32,
+            torch.bfloat32,
+        ) else torch.float64
         positions = torch.arange(seq_len, device=device, dtype=coord_dtype)
         inv_freq = 1.0 / self._rope_theta ** torch.linspace(
             0, 1, half, device=device, dtype=coord_dtype
