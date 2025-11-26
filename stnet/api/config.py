@@ -388,6 +388,7 @@ class RuntimeConfig:
     swa_update_batch_norm: bool = False
     model_ckpt_dir: Optional[str] = None
     keys: Optional[List[Tuple[Any, ...]]] = None
+    loss_skew: bool = True
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "epochs",
         "val_frac",
@@ -403,6 +404,7 @@ class RuntimeConfig:
         "swa_enabled",
         "swa_start_epoch",
         "swa_update_batch_norm",
+        "loss_skew",
     )
     PRED_POS_ORDER: ClassVar[Tuple[str, ...]] = ("seed",)
 
@@ -444,6 +446,7 @@ class RuntimeConfig:
                 "swa_enabled",
                 "swa_start_epoch",
                 "swa_update_batch_norm",
+                "loss_skew",
             }
             unsupported = set(kwargs) - allowed
             if unsupported:
@@ -482,6 +485,7 @@ class RuntimeConfig:
                 swa_enabled=bool(kwargs.get("swa_enabled", False)),
                 swa_start_epoch=kwargs.get("swa_start_epoch"),
                 swa_update_batch_norm=bool(kwargs.get("swa_update_batch_norm", False)),
+                loss_skew=bool(kwargs.get("loss_skew", True)),
             )
         for k in ("sources", "keys"):
             if k not in kwargs or kwargs[k] is None:
@@ -492,6 +496,7 @@ class RuntimeConfig:
             "model_ckpt_dir",
             "seed",
             "ckpt_dir",
+            "loss_skew",
         }
         unsupported = set(kwargs) - allowed
         if unsupported:
@@ -508,6 +513,7 @@ class RuntimeConfig:
             model_ckpt_dir=kwargs.get("model_ckpt_dir"),
             keys=list(kwargs["keys"]),
             seed=int(kwargs.get("seed", 7)),
+            loss_skew=bool(kwargs.get("loss_skew", True)),
         )
 
 

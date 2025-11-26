@@ -32,6 +32,27 @@ def _canonize_dims(
     return out
 
 
+def _median_over_dims(x: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
+    dims = _canonize_dims(x, dims)
+    m = x
+    for d in dims:
+        m, _ = m.median(dim=d, keepdim=True)
+    return m
+
+
+def _mad_std(
+    x: torch.Tensor,
+    dims: Tuple[int, ...],
+    eps: float,
+) -> torch.Tensor:
+    mu = _median_over_dims(x, dims)
+    dev = (x - mu).abs()
+    mad = _median_over_dims(dev, dims)
+    c = 1.482602218505602
+    std = torch.clamp(mad * c, min=eps)
+    return std
+
+
 def _coerce_std(
     x: torch.Tensor, dim: Tuple[int, ...] | int | None, ddof: int, eps: float
 ) -> torch.Tensor:
@@ -267,6 +288,8 @@ class CRPSLoss(nn.Module):
         self.mode = mode_l
         self.sample_dim = None if sample_dim is None else int(sample_dim)
         self.max_z = float(max_z)
+        self._skew_samples: int = 32
+        self._skew_pair_samples: int = 8
 
     @staticmethod
     def _expand_params(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
@@ -311,22 +334,46 @@ class CRPSLoss(nn.Module):
         else:
             sigma = self._std_from_error(err, dims=dims)
 
-        z = err / sigma
+        z_obs = err / sigma
         if self.max_z > 0.0:
-            z = torch.clamp(z, min=-self.max_z, max=self.max_z)
+            z_obs = torch.clamp(z_obs, min=-self.max_z, max=self.max_z)
 
-        inv_sqrt_2pi = 1.0 / math.sqrt(2.0 * math.pi)
-        phi = torch.exp(-0.5 * z * z) * inv_sqrt_2pi
-        zero = torch.tensor(0.0, device=z.device, dtype=z.dtype)
-        one = torch.tensor(1.0, device=z.device, dtype=z.dtype)
-        try:
-            Phi = Normal(loc=zero, scale=one).cdf(z)
-        except NotImplementedError:
-            Phi = _normal_cdf(z, zero, one)
+        z_mean = z_obs.mean(dim=dims, keepdim=True)
+        z_centered = z_obs - z_mean
+        m2 = (z_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
+        m3 = (z_centered**3).mean(dim=dims, keepdim=True)
+        skew_emp = (m3 / (m2.sqrt() ** 3 + self.eps))
 
-        two_Phi_minus_one = 2.0 * Phi - 1.0
-        term = z * two_Phi_minus_one + 2.0 * phi - 1.0 / math.sqrt(math.pi)
-        crps = sigma * term
+        alpha = torch.clamp(skew_emp, min=-5.0, max=5.0)
+        if self.detach_stats:
+            alpha = alpha.detach()
+
+        device, dtype = z_obs.device, z_obs.dtype
+        n_samples = self._skew_samples
+
+        delta = alpha / torch.sqrt(1.0 + alpha * alpha)
+        z0 = torch.randn((n_samples, *z_obs.shape), device=device, dtype=dtype)
+        z1 = torch.randn((n_samples, *z_obs.shape), device=device, dtype=dtype)
+        while delta.ndim < z_obs.ndim:
+            delta = delta.unsqueeze(0)
+        base = delta * z0.abs()
+        tail = torch.sqrt(torch.clamp(1.0 - delta * delta, min=0.0)) * z1
+        z_samp = base + tail
+
+        z_obs_exp = z_obs.unsqueeze(0)
+        e1 = (z_samp - z_obs_exp).abs().mean(dim=0)
+
+        pair_k = min(self._skew_pair_samples, n_samples)
+        if pair_k >= 2:
+            z_pair = z_samp[:pair_k]
+            z1_s = z_pair.unsqueeze(1)
+            z2_s = z_pair.unsqueeze(0)
+            diff_pair = (z1_s - z2_s).abs()
+            e2 = 0.5 * diff_pair.mean(dim=(0, 1))
+        else:
+            e2 = torch.zeros_like(e1)
+
+        crps = sigma * (e1 - e2)
         crps = torch.clamp(crps, min=0.0)
         return self._reduce(crps)
 
@@ -404,6 +451,7 @@ class DistributionLoss(nn.Module):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
+        skew: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -430,6 +478,7 @@ class DistributionLoss(nn.Module):
         self.ddof = int(ddof)
         self.clamp_max = clamp_max
         self.detach_stats = bool(detach_stats)
+        self.skew = bool(skew)
 
     @staticmethod
     def _to_tensor_like(x: TensorLike, ref: torch.Tensor) -> torch.Tensor:
@@ -471,24 +520,49 @@ class DistributionLoss(nn.Module):
         dims = _canonize_dims(pred, dims)
         match self.mu_mode:
             case "target":
-                mu = target.mean(dim=dims, keepdim=True)
+                x = target
+                reducer = torch.median if self.skew else torch.mean
             case "pred":
-                mu = pred.mean(dim=dims, keepdim=True)
+                x = pred
+                reducer = torch.median if self.skew else torch.mean
             case "pooled":
-                mu = 0.5 * (
-                    target.mean(dim=dims, keepdim=True)
-                    + pred.mean(dim=dims, keepdim=True)
-                )
+                if self.skew:
+                    mu_t = _median_over_dims(target, dims)
+                    mu_p = _median_over_dims(pred, dims)
+                    mu = 0.5 * (mu_t + mu_p)
+                    if self.detach_stats:
+                        mu = mu.detach()
+                    return mu
+                else:
+                    mu = 0.5 * (
+                        target.mean(dim=dims, keepdim=True)
+                        + pred.mean(dim=dims, keepdim=True)
+                    )
+                    if self.detach_stats:
+                        mu = mu.detach()
+                    return mu
             case "error":
-                mu = (pred - target).mean(dim=dims, keepdim=True)
+                x = pred - target
+                reducer = torch.median if self.skew else torch.mean
             case "provided":
                 if self.mu is None:
                     raise ValueError("mu required when mu_mode='provided'")
-                mu = DistributionLoss._expand_params(self.mu, pred)
+                mu = self._expand_params(self.mu, pred)
+                if self.detach_stats:
+                    mu = mu.detach()
+                return mu
             case "none":
                 mu = torch.zeros(1, device=pred.device, dtype=pred.dtype)
+                if self.detach_stats:
+                    mu = mu.detach()
+                return mu
             case _:
                 raise ValueError("invalid mu_mode")
+
+        if self.skew:
+            mu = _median_over_dims(x, dims)
+        else:
+            mu = reducer(x, dim=dims, keepdim=True)
         if self.detach_stats:
             mu = mu.detach()
         return mu
@@ -496,21 +570,38 @@ class DistributionLoss(nn.Module):
     def compute_std(
         self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
+        dims = _canonize_dims(pred, dims)
         match self.std_mode:
             case "target":
-                std = DistributionLoss._safe_std(
-                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                std = (
+                    _mad_std(target, dims=dims, eps=self.eps)
+                    if self.skew
+                    else DistributionLoss._safe_std(
+                        target, dim=dims, ddof=self.ddof, eps=self.eps
+                    )
                 )
             case "pred":
-                std = DistributionLoss._safe_std(
-                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                std = (
+                    _mad_std(pred, dims=dims, eps=self.eps)
+                    if self.skew
+                    else DistributionLoss._safe_std(
+                        pred, dim=dims, ddof=self.ddof, eps=self.eps
+                    )
                 )
             case "pooled":
-                std_t = DistributionLoss._safe_std(
-                    target, dim=dims, ddof=self.ddof, eps=self.eps
+                std_t = (
+                    _mad_std(target, dims=dims, eps=self.eps)
+                    if self.skew
+                    else DistributionLoss._safe_std(
+                        target, dim=dims, ddof=self.ddof, eps=self.eps
+                    )
                 )
-                std_p = DistributionLoss._safe_std(
-                    pred, dim=dims, ddof=self.ddof, eps=self.eps
+                std_p = (
+                    _mad_std(pred, dims=dims, eps=self.eps)
+                    if self.skew
+                    else DistributionLoss._safe_std(
+                        pred, dim=dims, ddof=self.ddof, eps=self.eps
+                    )
                 )
                 std = torch.sqrt(
                     torch.clamp(
@@ -521,10 +612,11 @@ class DistributionLoss(nn.Module):
             case "provided":
                 if self.std is None:
                     raise ValueError("std required when std_mode='provided'")
-                std = DistributionLoss._expand_params(self.std, pred)
+                std = self._expand_params(self.std, pred)
                 if self.detach_stats:
                     std = std.detach()
-                return torch.clamp(std, min=self.eps)
+                std = torch.clamp(std, min=self.eps)
+                return std
             case "none":
                 std = torch.ones(1, device=pred.device, dtype=pred.dtype)
             case _:
@@ -596,6 +688,7 @@ class StandardNormalLoss(DistributionLoss):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
+        skew: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -615,6 +708,7 @@ class StandardNormalLoss(DistributionLoss):
             ddof=ddof,
             clamp_max=clamp_max,
             detach_stats=detach_stats,
+            skew=skew,
             **kwargs,
         )
         valid = {
@@ -643,7 +737,23 @@ class StandardNormalLoss(DistributionLoss):
         mu: torch.Tensor,
         std: torch.Tensor,
     ) -> torch.Tensor:
-        z_abs = stat_abs
+        if self.skew:
+            z = (pred - target - mu) / std
+            if self.clamp_max is not None:
+                c = float(self.clamp_max)
+                z = torch.clamp(z, min=-c, max=c)
+            dims = self._dims(pred)
+            z_mean = z.mean(dim=dims, keepdim=True)
+            z_centered = z - z_mean
+            m2 = (z_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
+            m3 = (z_centered**3).mean(dim=dims, keepdim=True)
+            gamma = m3 / (m2.sqrt() ** 3 + self.eps)
+            if self.detach_stats:
+                gamma = gamma.detach()
+            z_eff = z + (gamma / 6.0) * (z * z - 1.0)
+            z_abs = z_eff.abs()
+        else:
+            z_abs = stat_abs
         match self.metric:
             case "z" | "z_score" | "z_value" | "zscore" | "zvalue":
                 return z_abs - self._z_threshold(pred.device, pred.dtype)
@@ -694,6 +804,7 @@ class StudentsTLoss(DistributionLoss):
         ddof: int = 0,
         clamp_max: Optional[float] = None,
         detach_stats: bool = True,
+        skew: bool = False,
         **kwargs: Any,
     ) -> None:
         self.df = df
@@ -714,6 +825,7 @@ class StudentsTLoss(DistributionLoss):
             ddof=ddof,
             clamp_max=clamp_max,
             detach_stats=detach_stats,
+            skew=skew,
             **kwargs,
         )
         valid = {
@@ -780,7 +892,23 @@ class StudentsTLoss(DistributionLoss):
         mu: torch.Tensor,
         std: torch.Tensor,
     ) -> torch.Tensor:
-        t_abs = stat_abs
+        if self.skew:
+            t = (pred - target - mu) / std
+            if self.clamp_max is not None:
+                c = float(self.clamp_max)
+                t = torch.clamp(t, min=-c, max=c)
+            dims = self._dims(pred)
+            t_mean = t.mean(dim=dims, keepdim=True)
+            t_centered = t - t_mean
+            m2 = (t_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
+            m3 = (t_centered**3).mean(dim=dims, keepdim=True)
+            gamma = m3 / (m2.sqrt() ** 3 + self.eps)
+            if self.detach_stats:
+                gamma = gamma.detach()
+            t_eff = t + (gamma / 6.0) * (t * t - 1.0)
+            t_abs = t_eff.abs()
+        else:
+            t_abs = stat_abs
         match self.metric:
             case "t" | "t_score" | "t_value" | "tscore" | "tvalue":
                 return t_abs - self._t_threshold(pred.device, pred.dtype)
