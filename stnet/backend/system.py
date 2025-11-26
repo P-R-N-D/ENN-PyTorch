@@ -427,30 +427,18 @@ def get_device(
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:
             torch.set_float32_matmul_precision(str(cfg.matmul_precision))
-            if torch.cuda.is_available():
+            fp32_precision = "tf32" if allow_val else "ieee"
+            with contextlib.suppress(Exception):
+                torch.backends.fp32_precision = fp32_precision
+            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+                torch.backends.cuda.matmul.fp32_precision = fp32_precision
+            if hasattr(torch.backends, "cudnn"):
                 with contextlib.suppress(Exception):
-                    torch.backends.fp32_precision = "tf32"
-                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                    torch.backends.cuda.matmul.fp32_precision = "tf32"
-                if hasattr(torch.backends, "cudnn"):
-                    with contextlib.suppress(Exception):
-                        torch.backends.cudnn.fp32_precision = "tf32"
-                    if hasattr(torch.backends.cudnn, "conv"):
-                        torch.backends.cudnn.conv.fp32_precision = "tf32"
-                    if hasattr(torch.backends.cudnn, "rnn"):
-                        torch.backends.cudnn.rnn.fp32_precision = "tf32"
-            else:
-                with contextlib.suppress(Exception):
-                    torch.backends.fp32_precision = "ieee"
-                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                    torch.backends.cuda.matmul.fp32_precision = "ieee"
-                if hasattr(torch.backends, "cudnn"):
-                    with contextlib.suppress(Exception):
-                        torch.backends.cudnn.fp32_precision = "ieee"
-                    if hasattr(torch.backends.cudnn, "conv"):
-                        torch.backends.cudnn.conv.fp32_precision = "ieee"
-                    if hasattr(torch.backends.cudnn, "rnn"):
-                        torch.backends.cudnn.rnn.fp32_precision = "ieee"
+                    torch.backends.cudnn.fp32_precision = fp32_precision
+                if hasattr(torch.backends.cudnn, "conv"):
+                    torch.backends.cudnn.conv.fp32_precision = fp32_precision
+                if hasattr(torch.backends.cudnn, "rnn"):
+                    torch.backends.cudnn.rnn.fp32_precision = fp32_precision
         except Exception:
             pass
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
