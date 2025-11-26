@@ -25,7 +25,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
-from tensordict import TensorDictBase
+from tensordict import TensorDict, TensorDictBase
+
+try:
+    from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
+except Exception:
+    LazyTensorStorage = None
+    TensorDictReplayBuffer = None
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
 except Exception:
@@ -1887,21 +1893,63 @@ class History(nn.Module):
         self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
         self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_x_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_x_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_x_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "sampled_x_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
         self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_y_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_y_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_y_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "sampled_y_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+
         self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
         self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_x_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_x_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_x_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "reduced_x_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
         self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_y_min", torch.full((1,), float("inf"), dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_y_max", torch.full((1,), float("-inf"), dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_y_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "reduced_y_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+
+        self._global_step: int = 0
+        self._records: List[Dict[str, Any]] = []
+        self.max_history_steps: int = 0
+        self._replay_buffer: Any = None
+        if LazyTensorStorage is not None and TensorDictReplayBuffer is not None:
+            with contextlib.suppress(Exception):
+                storage = LazyTensorStorage(1024)  # type: ignore[call-arg]
+                self._replay_buffer = TensorDictReplayBuffer(storage=storage)  # type: ignore[call-arg]
 
     @torch.no_grad()
     def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
@@ -1934,6 +1982,7 @@ class History(nn.Module):
     @torch.no_grad()
     def set_epochs(self, epochs: int) -> None:
         self.epochs.fill_(max(0, int(epochs)))
+
     @torch.no_grad()
     def set_system_info(
         self,
@@ -1952,6 +2001,7 @@ class History(nn.Module):
         self.ram_gb = int(ram_gb)
         self.python = str(python_version)
         self.backends = list(backends)
+
     @torch.no_grad()
     def record_batch(
         self,
@@ -1960,6 +2010,8 @@ class History(nn.Module):
         *,
         use_for_sample: bool = True,
         use_for_reduced: bool = True,
+        step: Optional[int] = None,
+        extra: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if x.numel() == 0 or y.numel() == 0:
             return
@@ -2011,6 +2063,112 @@ class History(nn.Module):
             self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
             self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
             self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+
+        self._append(
+            xm=xm,
+            xvar=xvar,
+            xmin=xmin,
+            xmax=xmax,
+            ym=ym,
+            yvar=yvar,
+            ymin=ymin,
+            ymax=ymax,
+            batch_size=int(x_cpu.shape[0]),
+            step=step,
+            extra=extra,
+        )
+
+    def _append(
+        self,
+        *,
+        xm: torch.Tensor,
+        xvar: torch.Tensor,
+        xmin: torch.Tensor,
+        xmax: torch.Tensor,
+        ym: torch.Tensor,
+        yvar: torch.Tensor,
+        ymin: torch.Tensor,
+        ymax: torch.Tensor,
+        batch_size: int,
+        step: Optional[int],
+        extra: Optional[Mapping[str, Any]],
+    ) -> None:
+        t = int(step) if step is not None else int(self._global_step)
+        self._global_step = t + 1
+
+        def _f(val: torch.Tensor) -> float:
+            return float(val.item())
+
+        rec: Dict[str, Any] = {
+            "timestep": t,
+            "batch_size": int(batch_size),
+            "batch_x_mean": _f(xm),
+            "batch_x_var": _f(xvar),
+            "batch_x_min": _f(xmin),
+            "batch_x_max": _f(xmax),
+            "batch_y_mean": _f(ym),
+            "batch_y_var": _f(yvar),
+            "batch_y_min": _f(ymin),
+            "batch_y_max": _f(ymax),
+            "sampled_n": int(self.sampled_n.item()),
+            "sampled_x_mean": _f(self.sampled_x_mean),
+            "sampled_x_var": _f(self.sampled_x_var),
+            "sampled_x_min": _f(self.sampled_x_min),
+            "sampled_x_max": _f(self.sampled_x_max),
+            "sampled_y_mean": _f(self.sampled_y_mean),
+            "sampled_y_var": _f(self.sampled_y_var),
+            "sampled_y_min": _f(self.sampled_y_min),
+            "sampled_y_max": _f(self.sampled_y_max),
+            "reduced_n": int(self.reduced_n.item()),
+            "reduced_x_mean": _f(self.reduced_x_mean),
+            "reduced_x_var": _f(self.reduced_x_var),
+            "reduced_x_min": _f(self.reduced_x_min),
+            "reduced_x_max": _f(self.reduced_x_max),
+            "reduced_y_mean": _f(self.reduced_y_mean),
+            "reduced_y_var": _f(self.reduced_y_var),
+            "reduced_y_min": _f(self.reduced_y_min),
+            "reduced_y_max": _f(self.reduced_y_max),
+        }
+        if extra is not None:
+            rec["extra"] = dict(extra)
+        self._records.append(rec)
+        max_steps = int(self.max_history_steps or 0)
+        if max_steps > 0 and len(self._records) > max_steps:
+            overflow = len(self._records) - max_steps
+            if overflow > 0:
+                del self._records[:overflow]
+        if self._replay_buffer is not None and "TensorDict" in globals():
+            with contextlib.suppress(Exception):
+                td = TensorDict(
+                    {
+                        "timestep": torch.tensor([t], dtype=torch.int64),
+                        "batch_size": torch.tensor([batch_size], dtype=torch.int64),
+                        "batch_x_mean": xm.view(1),
+                        "batch_x_var": xvar.view(1),
+                        "batch_x_min": xmin.view(1),
+                        "batch_x_max": xmax.view(1),
+                        "batch_y_mean": ym.view(1),
+                        "batch_y_var": yvar.view(1),
+                        "batch_y_min": ymin.view(1),
+                        "batch_y_max": ymax.view(1),
+                    },
+                    batch_size=[1],
+                )
+                if hasattr(self._replay_buffer, "extend"):
+                    self._replay_buffer.extend(td)
+                elif hasattr(self._replay_buffer, "add"):
+                    self._replay_buffer.add(td)
+
+    def save(self) -> Sequence[Mapping[str, Any]]:
+        return list(self._records)
+
+    def clear(self) -> None:
+        self._records.clear()
+        self._global_step = 0
+        if self._replay_buffer is not None:
+            with contextlib.suppress(Exception):
+                if hasattr(self._replay_buffer, "empty"):
+                    self._replay_buffer.empty()  # type: ignore[call-arg]
 
 def resize_scaler_buffer(
     model: nn.Module,
@@ -2090,7 +2248,7 @@ class Instance(nn.Module):
                 device_name = "cpu"
             self._device = torch.device(device_name)
         self.scaler = Scaler().to(self._device)
-        self.history = History()
+        self.logger = History()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
             nn.Linear(self.in_dim, self.out_dim).to(self._device)
@@ -2507,6 +2665,12 @@ class Instance(nn.Module):
                     out_td.del_("loss_total")
             return out_td
         return (pred, loss_val)
+
+    def history(self) -> Sequence[Mapping[str, Any]]:
+        hist = getattr(self, "logger", None)
+        if isinstance(hist, History):
+            return hist.save()
+        return []
 
     @staticmethod
     def flatten_y(

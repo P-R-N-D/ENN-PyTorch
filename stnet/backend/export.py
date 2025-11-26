@@ -35,6 +35,7 @@ def _prepare_serving_model(model: nn.Module) -> nn.Module:
         "optim",
         "training_history",
         "history",
+        "logger",
         "metrics",
         "_training_history",
     )
@@ -44,7 +45,11 @@ def _prepare_serving_model(model: nn.Module) -> nn.Module:
                 delattr(model, name)
     with contextlib.suppress(Exception):
         for module in model.modules():
-            if hasattr(module, "history") and isinstance(getattr(module, "history"), History):
+            if hasattr(module, "logger") and isinstance(getattr(module, "logger"), History):
+                delattr(module, "logger")
+            elif hasattr(module, "history") and isinstance(
+                getattr(module, "history"), History
+            ):
                 delattr(module, "history")
     return model
 

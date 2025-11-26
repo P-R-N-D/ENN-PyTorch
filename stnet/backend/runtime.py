@@ -944,7 +944,15 @@ def epochs(
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
     model_for_hist = model.module if hasattr(model, "module") else model
-    hist = getattr(model_for_hist, "history", None)
+    hist = None
+    maybe_hist = getattr(model_for_hist, "logger", None)
+    if isinstance(maybe_hist, History):
+        hist = maybe_hist
+    if hist is None:
+        maybe_hist = getattr(model_for_hist, "history", None)
+        if isinstance(maybe_hist, History):
+            hist = maybe_hist
+
     if isinstance(hist, History):
         start_ns = posix_time("Asia/Seoul")
         start_sec = round(float(start_ns) / 1e9, 6)
