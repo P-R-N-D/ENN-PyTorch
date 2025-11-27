@@ -30,10 +30,6 @@ except Exception:
 _HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
 
 
-def _clone_last_dim(x: torch.Tensor) -> torch.Tensor:
-    return torch.stack((x, x), dim=-1).reshape(*x.shape[:-1], -1)
-
-
 def _estimate_flops_msr(
     batch: int,
     seq_len: int,
@@ -175,67 +171,6 @@ def _expand_for_mha(
     else:
         raise ValueError(f"unsupported mask rank {mask.dim()}")
     return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
-
-
-def to_additive_mask(
-    attn_mask: torch.Tensor | None,
-    *args: Any,
-    batch: int,
-    heads: int,
-    seq_q: int,
-    seq_k: int,
-    dtype: torch.dtype,
-    device: torch.device,
-    **kwargs: Any,
-) -> torch.Tensor:
-
-    if attn_mask is None:
-        return torch.zeros((batch, heads, seq_q, seq_k), dtype=dtype, device=device)
-    elif attn_mask.dtype is torch.bool:
-        expanded = _expand_for_mha(
-            attn_mask, batch=batch, heads=heads, seq_q=seq_q, seq_k=seq_k, device=device
-        )
-        neg_inf = _negative_inf(dtype, device)
-        zero = torch.zeros((), dtype=neg_inf.dtype, device=device)
-        return torch.where(expanded, neg_inf, zero).to(dtype)
-
-    am = attn_mask.to(device=device, dtype=dtype, non_blocking=True)
-    match am.dim():
-        case 2:
-            if am.shape != (seq_q, seq_k):
-                raise ValueError(
-                    f"mask shape {tuple(am.shape)} incompatible with ({seq_q}, {seq_k})"
-                )
-            return (
-                am.view(1, 1, seq_q, seq_k)
-                .expand(batch, heads, seq_q, seq_k)
-                .contiguous()
-            )
-        case 3:
-            if am.shape != (batch, seq_q, seq_k):
-                raise ValueError(
-                    f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
-                )
-            return (
-                am.view(batch, 1, seq_q, seq_k)
-                .expand(batch, heads, seq_q, seq_k)
-                .contiguous()
-            )
-        case 4:
-            b, h, sq, sk = am.shape
-            if b != batch or sq != seq_q or sk != seq_k:
-                raise ValueError(
-                    f"mask shape {tuple(am.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
-                )
-            if h == 1:
-                return am.expand(batch, heads, seq_q, seq_k).contiguous()
-            if h == heads:
-                return am.contiguous()
-            raise ValueError(
-                f"mask head dimension {h} does not match expected heads {heads}"
-            )
-        case _:
-            raise ValueError(f"unsupported mask rank {am.dim()}")
 
 
 def _negative_inf(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
@@ -986,8 +921,18 @@ class MultiScaleRetention(nn.Module):
             0, 1, half, device=device, dtype=coord_dtype
         )
         freqs = torch.einsum("n,d->nd", positions, inv_freq)
-        sin = _clone_last_dim(torch.sin(freqs)).to(dtype)[None, None, :, :]
-        cos = _clone_last_dim(torch.cos(freqs)).to(dtype)[None, None, :, :]
+        sin_base = torch.sin(freqs)
+        cos_base = torch.cos(freqs)
+        sin = (
+            torch.stack((sin_base, sin_base), dim=-1)
+            .reshape(*sin_base.shape[:-1], -1)
+            .to(dtype)[None, None, :, :]
+        )
+        cos = (
+            torch.stack((cos_base, cos_base), dim=-1)
+            .reshape(*cos_base.shape[:-1], -1)
+            .to(dtype)[None, None, :, :]
+        )
         length = seq_len
         idx_i = torch.arange(length, device=device)
         idx_j = torch.arange(length, device=device)

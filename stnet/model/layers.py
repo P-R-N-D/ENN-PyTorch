@@ -87,15 +87,15 @@ def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
     x = (coords - mins) / rng
     return x.clamp_(0.0, 1.0 - 1e-7)
 
-def _expand_bits(v: torch.Tensor):
-    v = (v | (v << 16)) & 0x030000FF
-    v = (v | (v << 8))  & 0x0300F00F
-    v = (v | (v << 4))  & 0x030C30C3
-    v = (v | (v << 2))  & 0x09249249
-    return v
-
 @torch.no_grad()
 def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
+    def _expand_bits(v: torch.Tensor) -> torch.Tensor:
+        v = (v | (v << 16)) & 0x030000FF
+        v = (v | (v << 8))  & 0x0300F00F
+        v = (v | (v << 4))  & 0x030C30C3
+        v = (v | (v << 2))  & 0x09249249
+        return v
+
     B, N, _ = coords01.shape
     maxv = (1 << bits) - 1
     xyz = (coords01 * maxv).to(torch.int32)
