@@ -575,8 +575,13 @@ def _calibrate_per_sample_mem(
 
     with Gradient.inference(model), Autocast.float(device):
         td = to_tensordict({"features": X})
-        _ = model(td, global_loss=None, local_loss=None, loss_weights=None)
-
+        _ = model(
+            td,
+            global_loss=None,
+            local_loss=None,
+            loss_weights=None,
+            calibrate_output=True,
+        )
     try:
         torch.cuda.synchronize(device)
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
@@ -1962,7 +1967,11 @@ def infer(
                                     mark_step()
                             tdp = to_tensordict({"features": Xi})
                             pred_out = run_model(
-                                tdp, global_loss=None, local_loss=None, loss_weights=None
+                                tdp,
+                                global_loss=None,
+                                local_loss=None,
+                                loss_weights=None,
+                                calibrate_output=True,
                             )
                             if isinstance(pred_out, TensorDictBase):
                                 tdp = pred_out

@@ -73,12 +73,6 @@ def _preload_state(value: Any) -> Any:
 
 
 def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
-    """
-    Ensure scaler buffers match the shapes stored in a state_dict before loading.
-    This avoids shape-mismatch errors when scaler statistics were updated during
-    training (e.g., x_mean/x_std with feature dim > 1).
-    """
-
     scaler = getattr(model, "scaler", None)
     if scaler is None:
         return

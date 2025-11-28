@@ -1554,8 +1554,13 @@ class Scaler(nn.Module):
     def update_x(self, x: torch.Tensor) -> None:
         if x.numel() == 0:
             return
-        mean = x.mean(dim=0)
-        std = x.std(dim=0, unbiased=False).clamp_min(self.eps)
+        x_work = x.detach()
+        if x_work.dim() == 1:
+            x_flat = x_work.view(-1, 1)
+        else:
+            x_flat = x_work.reshape(-1, x_work.shape[-1])
+        mean = x_flat.mean(dim=0)
+        std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
         if self.x_mean.shape != mean.shape:
             self.x_mean.resize_(mean.shape)
         if self.x_std.shape != std.shape:
@@ -1567,8 +1572,13 @@ class Scaler(nn.Module):
     def update_y(self, y: torch.Tensor) -> None:
         if y.numel() == 0:
             return
-        mean = y.mean(dim=0)
-        std = y.std(dim=0, unbiased=False).clamp_min(self.eps)
+        y_work = y.detach()
+        if y_work.dim() == 1:
+            y_flat = y_work.view(-1, 1)
+        else:
+            y_flat = y_work.reshape(-1, y_work.shape[-1])
+        mean = y_flat.mean(dim=0)
+        std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
         if self.y_mean.shape != mean.shape:
             self.y_mean.resize_(mean.shape)
         if self.y_std.shape != std.shape:
@@ -1577,24 +1587,48 @@ class Scaler(nn.Module):
         self.y_std.copy_(std)
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
-        if self.x_mean.dim() == 1 and x.dim() >= 2 and self.x_mean.shape[-1] != x.shape[-1]:
-            with torch.no_grad():
-                new_c = x.shape[-1]
-                self.x_mean.resize_(new_c)
-                self.x_std.resize_(new_c)
+        if x.numel() == 0:
+            return x
+        if x.dim() == 1:
+            feat_dim = x.shape[0]
+        else:
+            feat_dim = x.shape[-1]
+        with torch.no_grad():
+            if self.x_mean.numel() == 1 and feat_dim != 1:
+                self.x_mean.resize_(feat_dim)
+                self.x_std.resize_(feat_dim)
                 self.x_mean.zero_()
                 self.x_std.fill_(1.0)
-        return (x - self.x_mean) / (self.x_std + self.eps)
+            elif self.x_mean.numel() != feat_dim:
+                raise RuntimeError(
+                    "Scaler.normalize_x: feature dimension mismatch: "
+                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+                )
+        if x.dim() == 1:
+            return (x - self.x_mean) / (self.x_std + self.eps)
+        view_shape = [1] * (x.dim() - 1) + [-1]
+        mean = self.x_mean.view(*view_shape)
+        std = self.x_std.view(*view_shape)
+        return (x - mean) / (std + self.eps)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
-        if self.x_mean.dim() == 1 and x_scaled.dim() >= 2 and self.x_mean.shape[-1] != x_scaled.shape[-1]:
-            with torch.no_grad():
-                new_c = x_scaled.shape[-1]
-                self.x_mean.resize_(new_c)
-                self.x_std.resize_(new_c)
-                self.x_mean.zero_()
-                self.x_std.fill_(1.0)
-        return x_scaled * (self.x_std + self.eps) + self.x_mean
+        if x_scaled.numel() == 0:
+            return x_scaled
+        if x_scaled.dim() == 1:
+            feat_dim = x_scaled.shape[0]
+        else:
+            feat_dim = x_scaled.shape[-1]
+        if self.x_mean.numel() not in (feat_dim, 1):
+            raise RuntimeError(
+                "Scaler.denormalize_x: feature dimension mismatch: "
+                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+            )
+        if x_scaled.dim() == 1:
+            return x_scaled * (self.x_std + self.eps) + self.x_mean
+        view_shape = [1] * (x_scaled.dim() - 1) + [-1]
+        std = self.x_std.view(*view_shape)
+        mean = self.x_mean.view(*view_shape)
+        return x_scaled * (std + self.eps) + mean
 
     def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
         mean = self.y_mean
