@@ -1061,6 +1061,11 @@ class LinearCombinationLoss(nn.Module):
         *args: Any,
         offset: float = 0.0,
         reduce_each: bool = True,
+        auto_schedule: bool = False,
+        schedule_momentum: float = 0.9,
+        min_coeff: float = 0.05,
+        max_coeff: float = 0.95,
+        eps: float = 1e-06,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -1085,9 +1090,65 @@ class LinearCombinationLoss(nn.Module):
         self.offset = float(offset)
         self.reduce_each = bool(reduce_each)
 
+        self.auto_schedule = bool(auto_schedule)
+        self.schedule_momentum = float(schedule_momentum)
+        self.min_coeff = float(min_coeff)
+        self.max_coeff = float(max_coeff)
+        self.eps = float(eps)
+
+        loss_avg_init = torch.full_like(coeff_tensor, fill_value=1.0)
+        self.register_buffer("loss_avg", loss_avg_init)
+
+    def _update_coefficients(self, per_loss_vals: List[torch.Tensor]) -> None:
+        if not self.auto_schedule or not per_loss_vals:
+            return
+
+        with torch.no_grad():
+            vals: List[float] = []
+            for v in per_loss_vals:
+                try:
+                    val = float(v.detach().abs().mean().item())
+                except Exception:
+                    val = float(self.eps)
+                vals.append(max(val, self.eps))
+
+            avg = self.loss_avg
+            device = avg.device
+            dtype = avg.dtype
+            vals_t = torch.tensor(vals, device=device, dtype=dtype)
+
+            m = max(0.0, min(1.0, float(self.schedule_momentum)))
+            avg.mul_(m).add_(vals_t * (1.0 - m))
+
+            base = self.coefficient.detach().to(device=device, dtype=dtype)
+            base_sum = float(base.sum().item())
+            if not math.isfinite(base_sum) or base_sum <= 0.0:
+                base = torch.ones_like(base)
+                base_sum = float(base.numel())
+            base = base / base_sum
+
+            inv = base / torch.clamp(avg, min=self.eps)
+            inv_sum = float(inv.sum().item())
+            if not math.isfinite(inv_sum) or inv_sum <= 0.0:
+                new_w = torch.full_like(inv, fill_value=1.0 / float(inv.numel()))
+            else:
+                new_w = inv / inv_sum
+
+            if self.min_coeff > 0.0 or self.max_coeff < 1.0:
+                lo = float(self.min_coeff)
+                hi = float(self.max_coeff)
+                new_w = torch.clamp(new_w, min=lo, max=hi)
+                denom = float(new_w.sum().item())
+                if denom > 0.0 and math.isfinite(denom):
+                    new_w = new_w / denom
+
+            self.coefficient.copy_(new_w.to(self.coefficient.device))
+
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         weights = self.coefficient.to(device=pred.device, dtype=pred.dtype)
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
+
+        per_loss_vals: List[torch.Tensor] = []
 
         for w, L in zip(weights, self.losses):
             v = L(pred, target)
@@ -1096,9 +1157,13 @@ class LinearCombinationLoss(nn.Module):
                     f"Loss module {L.__class__.__name__} must return a Tensor, "
                     f"got {type(v)}"
                 )
-            if self.reduce_each and v.dim() > 0:
-                v = v.mean()
-            total = total + w * v
+            v_eff = v
+            if self.reduce_each and v_eff.dim() > 0:
+                v_eff = v_eff.mean()
+            per_loss_vals.append(v_eff)
+            total = total + w * v_eff
+
+        self._update_coefficients(per_loss_vals)
 
         return total
 
