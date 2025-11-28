@@ -69,6 +69,7 @@ from ..functional.losses import (
     LossWeightController,
     LinearCombinationLoss,
     CRPSLoss,
+    DataFidelityLoss,
     StandardNormalLoss,
     StudentsTLoss,
     TiledLoss,
@@ -899,7 +900,7 @@ def epochs(
     scaler: torch.amp.GradScaler,
     sched: torch.optim.lr_scheduler.LRScheduler,
     loss_controller: LossWeightController,
-    top_loss: TiledLoss,
+    top_loss: nn.Module,
     bottom_loss: TiledLoss,
     train_loader: Any,
     val_loader: Any,
@@ -2355,12 +2356,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                         options=StateDictOptions(strict=False),
                     )
                     _initialize_adamw(optimizer)
-        global_crps = CRPSLoss(
+        top_loss = DataFidelityLoss(
+            out_shape=ops.out_shape,
+            reduction="mean",
+        )
+
+        local_crps = CRPSLoss(
             dim=-1,
             reduction="none",
             detach_stats=True,
         )
-        global_z = StandardNormalLoss(
+        local_z = StandardNormalLoss(
             confidence=0.99,
             metric="z_value",
             two_tailed=True,
@@ -2374,25 +2380,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             dim=-1,
             reduction="none",
             skew=ops.loss_skew,
-        )
-        top_loss = TiledLoss(
-            nn.Sequential(),
-            mask_mode=ops.loss_mask_mode,
-            mask_value=ops.loss_mask_value,
-            tile_dim=ops.loss_tile_dim,
-            tile_size=ops.loss_tile_size,
-            reduction="mean",
-        )
-        top_loss.base = LinearCombinationLoss(
-            coefficient=[0.99, 0.01],
-            loss=[global_crps, global_z],
-            reduce_each=False,
-        )
-
-        local_crps = CRPSLoss(
-            dim=-1,
-            reduction="none",
-            detach_stats=True,
         )
         local_t = StudentsTLoss(
             confidence=0.99,
@@ -2408,6 +2395,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="none",
             skew=ops.loss_skew,
         )
+
         bottom_loss = TiledLoss(
             nn.Sequential(),
             mask_mode=ops.loss_mask_mode,
@@ -2417,9 +2405,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.97, 0.03],
-            loss=[local_crps, local_t],
+            coefficient=[0.5, 0.25, 0.25],
+            loss=[local_crps, local_z, local_t],
             reduce_each=False,
+            auto_schedule=True,
+            schedule_momentum=0.9,
+            min_coeff=0.05,
+            max_coeff=0.90,
+            eps=1e-6,
         )
         loss_controller = LossWeightController()
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
