@@ -361,6 +361,7 @@ def train(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
 
+        # --- NEW: epochs()에서 저장한 training history를 model.logger로 가져오기 ---
         try:
             if ckpt_dir is not None:
                 history_path = os.path.join(ckpt_dir, "history.json")
@@ -368,9 +369,22 @@ def train(
                     with open(history_path, "r", encoding="utf-8") as f:
                         history_payload = json.load(f)
                     logger = getattr(model, "logger", None)
+                    print(
+                        f"[HIST-LOAD] path={history_path}, "
+                        f"loaded={len(history_payload) if isinstance(history_payload, list) else 'N/A'}, "
+                        f"logger_type={type(logger)}",
+                        flush=True,
+                    )
                     if isinstance(logger, History) and isinstance(history_payload, list):
                         logger._records = list(history_payload)
-        except Exception:
+                        print(
+                            f"[HIST-LOGGER] records_now={len(logger._records)}",
+                            flush=True,
+                        )
+                else:
+                    print(f"[HIST-LOAD] history.json not found at {history_path}", flush=True)
+        except Exception as e:
+            print(f"[HIST-LOAD-ERROR] {type(e).__name__}: {e}", flush=True)
             pass
 
         return model
