@@ -1707,6 +1707,7 @@ def epochs(
                 hist.end_session(end_sec, peers=world)
                 if ops.ckpt_dir and int(local_rank) == 0:
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
+                    print(f"[HIST-DUMP] rank={local_rank}, path={history_path}, records={len(recs)}", flush=True)
                     with open(history_path, "w", encoding="utf-8") as f:
                         json.dump(hist.save(), f)
             except Exception:
@@ -2409,7 +2410,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.5, 0.25, 0.25],
+            coefficient=[0.8, 0.1, 0.1],
             loss=[local_crps, local_z, local_t],
             reduce_each=False,
             auto_schedule=True,
