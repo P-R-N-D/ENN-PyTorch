@@ -2030,63 +2030,56 @@ class History(nn.Module):
         self,
         x: torch.Tensor,
         y: torch.Tensor,
-        *,
+        *args: Any,
         use_for_sample: bool = True,
         use_for_reduced: bool = True,
         step: Optional[int] = None,
         extra: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
         if x.numel() == 0 or y.numel() == 0:
             return
-        x_cpu = x.detach().to(device="cpu", dtype=torch.float64)
-        y_cpu = y.detach().to(device="cpu", dtype=torch.float64)
-
-        xm = x_cpu.mean()
-        xsq = (x_cpu * x_cpu).mean()
+        stats_device = self.sampled_x_mean.device
+        x_work = x.detach().to(device=stats_device, dtype=torch.float64)
+        y_work = y.detach().to(device=stats_device, dtype=torch.float64)
+        xm = x_work.mean()
+        xsq = (x_work * x_work).mean()
         xvar = xsq - xm * xm
-        xmin = x_cpu.min()
-        xmax = x_cpu.max()
-
-        ym = y_cpu.mean()
-        ysq = (y_cpu * y_cpu).mean()
+        xmin = x_work.min()
+        xmax = x_work.max()
+        ym = y_work.mean()
+        ysq = (y_work * y_work).mean()
         yvar = ysq - ym * ym
-        ymin = y_cpu.min()
-        ymax = y_cpu.max()
-
+        ymin = y_work.min()
+        ymax = y_work.max()
         if use_for_sample:
             n = int(self.sampled_n.item())
             n_new = n + 1
             w_old = n / n_new if n_new > 0 else 0.0
             w_new = 1.0 / n_new
-
             self.sampled_n.fill_(n_new)
             self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
             self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
             self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
             self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
-
             self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
             self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
             self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
             self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
-
         if use_for_reduced:
             n = int(self.reduced_n.item())
             n_new = n + 1
             w_old = n / n_new if n_new > 0 else 0.0
             w_new = 1.0 / n_new
-
             self.reduced_n.fill_(n_new)
             self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
             self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
             self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
             self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
-
             self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
             self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
             self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
             self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
-
         self._append(
             xm=xm,
             xvar=xvar,
@@ -2096,14 +2089,14 @@ class History(nn.Module):
             yvar=yvar,
             ymin=ymin,
             ymax=ymax,
-            batch_size=int(x_cpu.shape[0]),
+            batch_size=int(x.shape[0]),
             step=step,
             extra=extra,
         )
 
     def _append(
         self,
-        *,
+        *args: Any,
         xm: torch.Tensor,
         xvar: torch.Tensor,
         xmin: torch.Tensor,
@@ -2115,6 +2108,7 @@ class History(nn.Module):
         batch_size: int,
         step: Optional[int],
         extra: Optional[Mapping[str, Any]],
+        **kwargs: Any,
     ) -> None:
         t = int(step) if step is not None else int(self._global_step)
         self._global_step = t + 1
