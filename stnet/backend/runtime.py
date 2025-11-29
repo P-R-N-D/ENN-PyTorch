@@ -1378,17 +1378,7 @@ def epochs(
                                     x_hist = X.detach().to("cpu")
                                     y_hist = Y.detach().to("cpu")
                                     hist.record_batch(X, Y)
-                                    print(
-                                        f"[HIST-REC] step={step_idx}, "
-                                        f"x_shape={tuple(X.shape)}, y_shape={tuple(Y.shape)}",
-                                        flush=True,
-                                    )
-                            except Exception as e:
-                                print(
-                                    f"[HIST-REC-ERROR] step={step_idx}, "
-                                    f"{type(e).__name__}: {e}",
-                                    flush=True,
-                                )
+                            except Exception:
                                 pass
                         t_fetch_start = time.perf_counter_ns()
                         if cpu_pool is not None and ((step_idx + 1) & 255) == 0:
@@ -1749,11 +1739,6 @@ def epochs(
                         "records": records,
                     }
 
-                    print(
-                        f"[HIST-DUMP] rank={local_rank}, path={history_path}, "
-                        f"records={len(records)}",
-                        flush=True,
-                    )
                     with open(history_path, "w", encoding="utf-8") as f:
                         json.dump(payload, f)
             except Exception:

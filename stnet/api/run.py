@@ -335,9 +335,6 @@ def train(
         }
 
         num_samples = int(num_samples)
-        base_params = {"epochs": epochs, "base_lr": base_lr, "weight_decay": weight_decay}
-        print(f"num_samples: {num_samples}")
-        print(f"base_params: {base_params}")
         this_run_samples = int(num_samples)
         positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
         for key in list(default_kwargs):
@@ -387,12 +384,6 @@ def train(
                         meta = {}
 
                     logger = getattr(model, "logger", None)
-                    print(
-                        f"[HIST-LOAD] path={history_path}, "
-                        f"loaded={len(records) if isinstance(records, list) else 'N/A'}, "
-                        f"logger_type={type(logger)}",
-                        flush=True,
-                    )
 
                     if isinstance(meta, dict):
                         setattr(model, "_train_history_meta", dict(meta))
@@ -551,15 +542,7 @@ def train(
 
                     if isinstance(logger, History):
                         logger._records = new_run_hist
-
-                    print(
-                        f"[HIST-LOGGER] records_now={len(new_run_hist)}",
-                        flush=True,
-                    )
-                else:
-                    print(f"[HIST-LOAD] history.json not found at {history_path}", flush=True)
-        except Exception as e:
-            print(f"[HIST-LOAD-ERROR] {type(e).__name__}: {e}", flush=True)
+        except Exception:
             pass
 
         return model
