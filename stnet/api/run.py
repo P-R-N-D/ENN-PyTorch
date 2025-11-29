@@ -6,7 +6,6 @@ import json
 import os
 import random
 import shutil
-import warnings
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
@@ -274,16 +273,14 @@ def train(
                 json.dump(payload, f)
         ckpt_dir = new_dir("ckpt_dcp")
         init_dir = new_dir("init_dcp")
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=ignored_pattern)
-            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            m_sd = get_model_state_dict(model, options=opts)
-            save(
-                state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(
-                    init_dir, sync_files=True, overwrite=True
-                ),
-            )
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        m_sd = get_model_state_dict(model, options=opts)
+        save(
+            state_dict={"model": m_sd},
+            storage_writer=FileSystemWriter(
+                init_dir, sync_files=True, overwrite=True
+            ),
+        )
         torch.save(
             {k: v.detach().cpu() for k, v in model.state_dict().items()},
             os.path.join(init_dir, "model.pt"),
@@ -355,19 +352,17 @@ def train(
             _resize_scaler_buffers(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
-                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                m_sd = get_model_state_dict(model, options=opts)
-                m_sd = _trim_dcp_keys(m_sd)
-                load(
-                    state_dict={"model": m_sd},
-                    storage_reader=FileSystemReader(ckpt_dir),
-                )
-                _resize_scaler_buffers(model, m_sd)
-                set_model_state_dict(
-                    model, m_sd, options=StateDictOptions(strict=False)
-                )
+            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            m_sd = get_model_state_dict(model, options=opts)
+            m_sd = _trim_dcp_keys(m_sd)
+            load(
+                state_dict={"model": m_sd},
+                storage_reader=FileSystemReader(ckpt_dir),
+            )
+            _resize_scaler_buffers(model, m_sd)
+            set_model_state_dict(
+                model, m_sd, options=StateDictOptions(strict=False)
+            )
 
         try:
             if ckpt_dir is not None:
@@ -573,14 +568,12 @@ def predict(
     ckpt_dir = os.path.join(tmp_dir, "pred_ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
     mp.allow_connection_pickling()
-    with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", message=ignored_pattern)
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        m_sd = get_model_state_dict(model, options=opts)
-        save(
-            state_dict={"model": m_sd},
-            storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
-        )
+    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+    m_sd = get_model_state_dict(model, options=opts)
+    save(
+        state_dict={"model": m_sd},
+        storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
+    )
     torch.save(
         {k: v.detach().cpu() for k, v in model.state_dict().items()},
         os.path.join(dcp_dir, "model.pt"),

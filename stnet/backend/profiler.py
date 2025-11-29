@@ -171,7 +171,7 @@ class _FlopProfiler:
         total, _ = self.pop()
         return total
 
-    def sum(self, *, sort: bool = True) -> Tuple[float, Dict[str, float]]:
+    def sum(self, *args: Any, sort: bool = True) -> Tuple[float, Dict[str, float]]:
         total = float(self._manual_total)
         if not sort:
             return total, dict(self._manual_by_type)

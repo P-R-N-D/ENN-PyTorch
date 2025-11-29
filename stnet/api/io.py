@@ -137,8 +137,8 @@ def load_model(
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         resize_scaler_buffer(model, m_sd)
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-        # 스케일러 buffer 복원은 register_buffer 덕분에 자동으로 되지만,
-        # 위에서 shape 을 먼저 맞춰놨기 때문에 shape mismatch 에러 없이 안전하다.
+                                                       
+                                                            
         return model
 
     if not p.exists():

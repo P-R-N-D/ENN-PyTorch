@@ -1490,7 +1490,7 @@ class Memory:
                     return view, None
                 return view
 
-        def get_like(self, t: "torch.Tensor", *, return_handle: bool = False):
+        def get_like(self, t: "torch.Tensor", *args: Any, return_handle: bool = False):
             return self.get(tuple(t.shape), t.dtype, return_handle=return_handle)
 
         def release_after(self, token: "Memory.Pool.Token", wait_event: object | None) -> None:

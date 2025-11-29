@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import replace
-from functools import partial
 import json
 import logging
 import math
@@ -13,6 +11,8 @@ import sys
 import threading
 import time
 import warnings
+from dataclasses import replace
+from functools import partial
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -43,6 +43,7 @@ from torch.distributed.checkpoint.state_dict import (
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
+
 try:
     import pynvml as _nvml
 
@@ -231,7 +232,11 @@ def _assert_no_fake_dtensor(
 
 
 def _reset_layernorm_parameter(
-    module: nn.LayerNorm, name: str, data: torch.Tensor, *, requires_grad: bool
+    module: nn.LayerNorm,
+    name: str,
+    data: torch.Tensor,
+    *args: Any,
+    requires_grad: bool,
 ) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
@@ -2586,8 +2591,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 swa_start_epoch=swa_start_epoch,
                 buffers_dtype=amp_buffers_dtype,
             )
-        if keep is not None:
-            keep.cleanup()
+        finally:
+            if keep is not None:
+                keep.cleanup()
         if local_rank == 0:
             model_sd = get_model_state_dict(
                 model,

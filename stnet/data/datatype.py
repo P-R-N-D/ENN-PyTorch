@@ -170,7 +170,7 @@ def to_tensordict(
     **kwargs: Any,
 ) -> TensorDict:
     if isinstance(batch, TensorDictBase):
-        return batch.to(device) if device is not None else batch  # type: ignore[return-value]
+        return batch.to(device) if device is not None else batch                              
     if not isinstance(batch, Mapping):
         raise TypeError(f"Unexpected batch type: {type(batch)}")
 

@@ -452,16 +452,7 @@ class DotProductAttention(nn.Module):
     @staticmethod
     def _is_nvidia_te_available() -> Any:
         try:
-            with contextlib.ExitStack() as stack:
-                import warnings as _warnings
-
-                stack.enter_context(_warnings.catch_warnings())
-                _warnings.filterwarnings(
-                    "ignore",
-                    message="Detected a Jax installation.*",
-                    category=RuntimeWarning,
-                )
-                import transformer_engine.pytorch as te_mod
+            import transformer_engine.pytorch as te_mod
 
             return (True, te_mod)
         except Exception:
@@ -601,7 +592,7 @@ class DotProductAttention(nn.Module):
                 return mask.contiguous(), int(batch_dim), int(head_count)
 
             def _to_bhls(
-                x: torch.Tensor | None, *, dtype: torch.dtype | None = None
+                x: torch.Tensor | None, *args: Any, dtype: torch.dtype | None = None
             ) -> torch.Tensor | None:
                 if x is None:
                     return None
@@ -889,7 +880,7 @@ class MultiScaleRetention(nn.Module):
             self._ts_ok = True
         except Exception:
             self._ts_ok = False
-            self._ts_msr = None  # type: ignore[assignment]
+            self._ts_msr = None                            
 
         self._triton_msr: Optional[MultiScaleRetentionTriton]
         self._triton_msr = None
@@ -965,7 +956,7 @@ class MultiScaleRetention(nn.Module):
 
         if self._ts_ok:
             try:
-                outputs = self._ts_msr(  # type: ignore[call-arg]
+                outputs = self._ts_msr(                          
                     x,
                     sin=sin,
                     cos=cos,
@@ -975,7 +966,7 @@ class MultiScaleRetention(nn.Module):
                     **kwargs,
                 )
             except TypeError:
-                outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)  # type: ignore[call-arg]
+                outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)                          
             except Exception:
                 outputs = None
 

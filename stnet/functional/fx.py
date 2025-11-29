@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import logging
 import math
+import os
 from contextlib import AbstractContextManager
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -263,6 +264,32 @@ class Gradient:
         canonical_mode = normalized_alias or normalized_mode
         if canonical_mode == "max-autotune" and not _is_for_cuda(module):
             canonical_mode = "max-autotune-no-cudagraphs"
+        if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
+            try:
+                from torch._inductor import config as _inductor_config                              
+            except Exception:
+                _inductor_config = None
+
+            if _inductor_config is not None:
+                try:
+                    _inductor_config.autotune_in_subproc = False
+                except Exception:
+                    pass
+
+                try:
+                    _inductor_config.autotune_local_cache = False
+                except Exception:
+                    pass
+                try:
+                    _inductor_config.autotune_remote_cache = None
+                except Exception:
+                    pass
+
+                try:
+                    if getattr(_inductor_config, "max_autotune_gemm_search_space", None):
+                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
+                except Exception:
+                    pass
 
         backend_value = backend
         mode_value: Optional[str] = None
