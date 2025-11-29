@@ -1729,8 +1729,9 @@ def epochs(
                     records = hist.save()
 
                     meta = {
-                        "start": float(hist.start.item()),
-                        "end": float(hist.end.item()),
+                        "start_posix": float(round(float(hist.start.item()), 6)),
+                        "end_posix": float(round(float(hist.end.item()), 6)),
+
                         "timezone": hist.timezone,
                         "peers": int(hist.peers.item()),
                         "epochs": int(hist.epochs.item()),
@@ -1738,7 +1739,7 @@ def epochs(
                         "kernel": hist.kernel,
                         "cpu": list(hist.cpu),
                         "arch": list(hist.arch),
-                        "ram_gb": int(hist.ram_gb),
+                        "ram_gb": float(round(float(hist.ram_gb), 2)),
                         "python": hist.python,
                         "backends": list(hist.backends),
                     }
