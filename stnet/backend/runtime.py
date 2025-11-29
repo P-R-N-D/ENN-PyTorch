@@ -114,6 +114,9 @@ _LOGGER = logging.getLogger(__name__)
 torch_safe_distributed()
 
 
+MB_DIV = 1024.0 * 1024.0
+
+
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
 except ImportError:
@@ -576,13 +579,15 @@ def _calibrate_per_sample_mem(
 
     with Gradient.inference(model), Autocast.float(device):
         td = to_tensordict({"features": X})
-        _ = model(
-            td,
-            global_loss=None,
-            local_loss=None,
-            loss_weights=None,
-            calibrate_output=True,
-        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=ignored_pattern)
+            _ = model(
+                td,
+                global_loss=None,
+                local_loss=None,
+                loss_weights=None,
+                calibrate_output=True,
+            )
     try:
         torch.cuda.synchronize(device)
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
@@ -1295,23 +1300,27 @@ def epochs(
                                     td = to_tensordict(
                                         {"features": X, "labels_flat": Y_flat}
                                     )
-                                    model_out = model(
-                                        td,
-                                        global_loss=top_loss,
-                                        local_loss=bottom_loss,
-                                        loss_weights=loss_controller.weights(),
-                                    )
-                                    if isinstance(model_out, TensorDictBase):
-                                        td = model_out
-                                        y_hat = td.get("pred")
-                                        loss_val = td.get("loss_total", None)
-                                        if (
-                                            isinstance(loss_val, torch.Tensor)
-                                            and loss_val.ndim > 0
-                                        ):
-                                            loss_val = loss_val.mean()
-                                    else:
-                                        y_hat, loss_val = model_out
+                                    with warnings.catch_warnings():
+                                        warnings.filterwarnings(
+                                            "ignore", message=ignored_pattern
+                                        )
+                                        model_out = model(
+                                            td,
+                                            global_loss=top_loss,
+                                            local_loss=bottom_loss,
+                                            loss_weights=loss_controller.weights(),
+                                        )
+                                if isinstance(model_out, TensorDictBase):
+                                    td = model_out
+                                    y_hat = td.get("pred")
+                                    loss_val = td.get("loss_total", None)
+                                    if (
+                                        isinstance(loss_val, torch.Tensor)
+                                        and loss_val.ndim > 0
+                                    ):
+                                        loss_val = loss_val.mean()
+                                else:
+                                    y_hat, loss_val = model_out
                                 if loss_val is None:
                                     raise RuntimeError(
                                         "Model returned no loss value during training. "
@@ -1327,6 +1336,7 @@ def epochs(
                                     )
                                 accum_scale = max(1, grad_accum_steps)
                                 loss_for_backprop = loss_val / float(accum_scale)
+                                loss_for_backprop = loss_for_backprop.clone()
                                 scaler.scale(loss_for_backprop).backward()
                                 if should_sync:
                                     scaler.unscale_(optimizer)
@@ -1361,7 +1371,7 @@ def epochs(
                             io_transferred = prev_io_bytes + float(io_bytes)
                             comp_elapsed = prev_comp_time + float(comp_time)
                             flop_total = prev_flops + float(flops)
-                            mbps_cur = io_transferred / max(io_elapsed, 1e-06) / 1_000_000.0
+                            mbps_cur = io_transferred / max(io_elapsed, 1e-06) / MB_DIV
                             tflops_cur = (
                                 flop_total / max(comp_elapsed, 1e-06) / 1_000_000_000_000.0
                             )
@@ -1446,12 +1456,16 @@ def epochs(
                                     tdv = to_tensordict(
                                         {"features": X, "labels_flat": Yv_flat}
                                     )
-                                    model_out_val = model(
-                                        tdv,
-                                        global_loss=top_loss,
-                                        local_loss=bottom_loss,
-                                        loss_weights=loss_controller.weights(),
-                                    )
+                                    with warnings.catch_warnings():
+                                        warnings.filterwarnings(
+                                            "ignore", message=ignored_pattern
+                                        )
+                                        model_out_val = model(
+                                            tdv,
+                                            global_loss=top_loss,
+                                            local_loss=bottom_loss,
+                                            loss_weights=loss_controller.weights(),
+                                        )
                                     if isinstance(model_out_val, TensorDictBase):
                                         tdv = model_out_val
                                         _y = tdv.get("pred")
@@ -1504,7 +1518,7 @@ def epochs(
                                     mbps_cur = (
                                         io_transferred
                                         / max(io_elapsed, 1e-06)
-                                        / 1_000_000.0
+                                        / MB_DIV
                                     )
                                     tflops_cur = (
                                         flop_total
@@ -1564,14 +1578,16 @@ def epochs(
                 y_flat = y_raw.reshape(y_raw.shape[0], -1)
             else:
                 y_flat = y_raw
-            out = model(
-                x_raw,
-                labels_flat=None,
-                net_loss=None,
-                global_loss=None,
-                local_loss=None,
-                calibrate_output=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=ignored_pattern)
+                out = model(
+                    x_raw,
+                    labels_flat=None,
+                    net_loss=None,
+                    global_loss=None,
+                    local_loss=None,
+                    calibrate_output=False,
+                )
             if isinstance(out, tuple):
                 z_pred_raw, _ = out
             else:
@@ -1674,7 +1690,7 @@ def epochs(
             model_for_scaler.scaler.set_affine(a, b)
 
     if local_rank == 0 and status_bar is not None:
-        mbps = prev_io_bytes / max(prev_io_time, 1e-06) / 1_000_000.0
+        mbps = prev_io_bytes / max(prev_io_time, 1e-06) / MB_DIV
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
         status_bar.set_postfix_str(
             f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
@@ -2003,13 +2019,15 @@ def infer(
                                 if callable(mark_step):
                                     mark_step()
                             tdp = to_tensordict({"features": Xi})
-                            pred_out = run_model(
-                                tdp,
-                                global_loss=None,
-                                local_loss=None,
-                                loss_weights=None,
-                                calibrate_output=True,
-                            )
+                            with warnings.catch_warnings():
+                                warnings.filterwarnings("ignore", message=ignored_pattern)
+                                pred_out = run_model(
+                                    tdp,
+                                    global_loss=None,
+                                    local_loss=None,
+                                    loss_weights=None,
+                                    calibrate_output=True,
+                                )
                             if isinstance(pred_out, TensorDictBase):
                                 tdp = pred_out
                                 y_hat = tdp.get("pred")
@@ -2095,7 +2113,7 @@ def infer(
                 mb_util = (min(B, mb + max(1, mb // 4)) if grew else max(1, int(math.ceil(mb * 0.9))))
                 state["mb"] = max(1, min(mb_mem, mb_util))
                 if local_rank == 0:
-                    mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
+                    mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
                     tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
                     update_tqdm(status_bar, finish=1, mbps=mbps, tflops=tflops)
                 t_fetch_start = time.perf_counter_ns()
@@ -2122,7 +2140,7 @@ def infer(
         else:
             logging.info("Writer thread terminated cleanly.")
         if local_rank == 0 and status_bar is not None:
-            mbps = io_bytes / max(io_time, 1e-06) / 1_000_000.0
+            mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
             tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
             status_bar.set_postfix_str(
                 f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
