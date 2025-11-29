@@ -37,6 +37,7 @@ class IgnoreTorchCompileMsg(logging.Filter):
 os.environ.setdefault("TORCH_LOGS", "-all")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+warnings.filterwarnings("ignore", message="Please use the new API settings to control TF32 behavior.*")
 ignored_sentences = [
     "External init callback must run in same thread as registerClient",
     "Initializing zero-element tensors is a no-op",
@@ -49,6 +50,7 @@ ignored_sentences = [
     "allowTF32CuDNN",
     "allowTF32CuBLAS",
     "torch._dynamo hit config.recompile_limit",
+    "Detected a Jax installation",
 ]
 ignored_pattern = "|".join([f".*{re.escape(s)}.*" for s in ignored_sentences])
 warnings.filterwarnings("ignore", message=ignored_pattern)
@@ -61,6 +63,5 @@ for logger_name in (
 ):
     logger = logging.getLogger(logger_name)
     logger.addFilter(IgnoreTorchCompileMsg())
-    logger.setLevel(logging.ERROR) 
-
+    logger.setLevel(logging.ERROR)
 set_list_to_stack(True).set()

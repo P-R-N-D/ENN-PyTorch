@@ -101,7 +101,14 @@ def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     return (xx | yy | zz)
 
 @torch.no_grad()
-def _serialize_z_index(coords: torch.Tensor, *, bits: int, patch: int, shift_order: bool, block_index: int):
+def _serialize_z_index(
+    coords: torch.Tensor,
+    *args: Any,
+    bits: int,
+    patch: int,
+    shift_order: bool,
+    block_index: int,
+):
     coords01 = _norm_vector(coords)
     keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)                               
@@ -542,12 +549,24 @@ class SwiGLU(nn.Module):
         self.proj_in = nn.Linear(self.in_dim, 2 * self.hidden_dim)
         self.proj_out = nn.Linear(self.hidden_dim, self.out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:  # type: ignore
-        x = self.proj_in(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:                
+        x_in = x
+        x = self.proj_in(x_in)
         u, v = x.chunk(2, dim=-1)
         activated = F.silu(u) * v
         activated = self.dropout(activated)
-        return self.proj_out(activated)
+        out = self.proj_out(activated)
+
+        try:
+            if x_in.numel() > 0 and x_in.size(-1) == self.in_dim:
+                tokens = int(x_in.numel() // self.in_dim)
+                fl_in = 2.0 * tokens * self.in_dim * (2 * self.hidden_dim)
+                fl_out = 2.0 * tokens * self.hidden_dim * self.out_dim
+                FLOP_PROFILER.add("SwiGLU", float(fl_in + fl_out))
+        except Exception:
+            pass
+
+        return out
 
 
 class PointTransformer(nn.Module):
@@ -731,7 +750,7 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
         return nn.BatchNorm1d(dim)
     if norm in {"rms", "rmsnorm", "rms_norm", "rms-norm"}:
         try:
-            from torch.nn import RMSNorm  # type: ignore
+            from torch.nn import RMSNorm                
 
             return RMSNorm(dim)
         except Exception:
@@ -745,7 +764,7 @@ def is_meta_or_fake_tensor(x: Any) -> bool:
     if x.is_meta:
         return True
     try:
-        from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
+        from torch._subclasses.fake_tensor import FakeTensor                
 
         if isinstance(x, FakeTensor):
             return True
@@ -1436,6 +1455,7 @@ class Processor(nn.Module):
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
         self.norm = norm_layer(self.norm_type, self.d_model)
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
+        self.head_hidden_dim = hid
         self.head = nn.Sequential(
             norm_layer(self.norm_type, self.d_model),
             nn.Linear(self.d_model, hid),
@@ -1494,6 +1514,14 @@ class Processor(nn.Module):
         temporal_tokens = temporal_raw.reshape(
             B, self.temporal_tokens, self.d_model
         ).contiguous()
+        try:
+            total_tokens = self.spatial_tokens + self.temporal_tokens
+            fl_tok = (
+                2.0 * float(B) * float(self.in_dim) * float(total_tokens * self.d_model)
+            )
+            FLOP_PROFILER.add("Tokenizer", float(fl_tok))
+        except Exception:
+            pass
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_net(spatial_tokens, coords)
         temporal_out = self.temporal_net(temporal_tokens)
@@ -1526,6 +1554,16 @@ class Processor(nn.Module):
         tokens = tokens.contiguous()
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
+        try:
+            hid = int(self.head_hidden_dim)
+            fl_head = (
+                2.0 * float(B) * float(self.d_model) * float(hid)
+                + 2.0 * float(B) * float(hid) * float(self.out_dim)
+            )
+            FLOP_PROFILER.add("Head", float(fl_head))
+        except Exception:
+            pass
+
         flat = flat.contiguous()
         context = flat.reshape(B, *self.out_shape).contiguous()
         dims = tuple(range(1, context.ndim))
@@ -2066,9 +2104,9 @@ class History(nn.Module):
         arch_norm: List[str] = []
         try:
             try:
-                import psutil  # type: ignore
+                import psutil                
             except Exception:
-                psutil = None  # type: ignore[assignment]
+                psutil = None                            
 
             if psutil is not None:
                 n_cores = psutil.cpu_count(logical=True) or 1
@@ -2103,9 +2141,9 @@ class History(nn.Module):
 
         try:
             try:
-                import psutil  # type: ignore
+                import psutil                
             except Exception:
-                psutil = None  # type: ignore[assignment]
+                psutil = None                            
 
             if psutil is not None:
                 total_bytes = psutil.virtual_memory().total
@@ -2127,7 +2165,7 @@ class History(nn.Module):
                     backend_devices.append(f"cuda:{idx}, {name}")
 
             mps = getattr(torch.backends, "mps", None)
-            if mps is not None and getattr(mps, "is_available", None) and torch.backends.mps.is_available():  # type: ignore[attr-defined]
+            if mps is not None and getattr(mps, "is_available", None) and torch.backends.mps.is_available():                              
                 chip_name = platform.processor() or "Apple Silicon"
                 backend_devices.append(f"mps:0, {chip_name}")
 
