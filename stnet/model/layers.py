@@ -28,11 +28,6 @@ from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from tensordict import TensorDict, TensorDictBase
 
 try:
-    from torchrl.data import LazyTensorStorage, TensorDictReplayBuffer
-except Exception:
-    LazyTensorStorage = None
-    TensorDictReplayBuffer = None
-try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
 except Exception:
 
@@ -1975,16 +1970,10 @@ class History(nn.Module):
             torch.full((1,), float("-inf"), dtype=torch.float64),
             persistent=True,
         )
-
         self._global_step: int = 0
         self._records: List[Dict[str, Any]] = []
         self.max_history_steps: int = 0
-        self._replay_buffer: Any = None
-        if LazyTensorStorage is not None and TensorDictReplayBuffer is not None:
-            with contextlib.suppress(Exception):
-                storage = LazyTensorStorage(1024)  # type: ignore[call-arg]
-                self._replay_buffer = TensorDictReplayBuffer(storage=storage)  # type: ignore[call-arg]
-
+        
     @torch.no_grad()
     def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
         self.start.fill_(round(float(start_posix), 6))
@@ -2171,27 +2160,6 @@ class History(nn.Module):
             overflow = len(self._records) - max_steps
             if overflow > 0:
                 del self._records[:overflow]
-        if self._replay_buffer is not None and "TensorDict" in globals():
-            with contextlib.suppress(Exception):
-                td = TensorDict(
-                    {
-                        "timestep": torch.tensor([t], dtype=torch.int64),
-                        "batch_size": torch.tensor([batch_size], dtype=torch.int64),
-                        "batch_x_mean": xm.view(1),
-                        "batch_x_var": xvar.view(1),
-                        "batch_x_min": xmin.view(1),
-                        "batch_x_max": xmax.view(1),
-                        "batch_y_mean": ym.view(1),
-                        "batch_y_var": yvar.view(1),
-                        "batch_y_min": ymin.view(1),
-                        "batch_y_max": ymax.view(1),
-                    },
-                    batch_size=[1],
-                )
-                if hasattr(self._replay_buffer, "extend"):
-                    self._replay_buffer.extend(td)
-                elif hasattr(self._replay_buffer, "add"):
-                    self._replay_buffer.add(td)
 
     def save(self) -> Sequence[Mapping[str, Any]]:
         return list(self._records)
@@ -2199,10 +2167,6 @@ class History(nn.Module):
     def clear(self) -> None:
         self._records.clear()
         self._global_step = 0
-        if self._replay_buffer is not None:
-            with contextlib.suppress(Exception):
-                if hasattr(self._replay_buffer, "empty"):
-                    self._replay_buffer.empty()  # type: ignore[call-arg]
 
 def resize_scaler_buffer(
     model: nn.Module,
