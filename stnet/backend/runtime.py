@@ -2441,13 +2441,13 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.8, 0.1, 0.1],
+            coefficient=[0.6, 0.25, 0.15],
             loss=[local_crps, local_z, local_t],
             reduce_each=False,
             auto_schedule=True,
             schedule_momentum=0.9,
             min_coeff=0.05,
-            max_coeff=0.90,
+            max_coeff=0.95,
             eps=1e-6,
         )
         loss_controller = LossWeightController()
