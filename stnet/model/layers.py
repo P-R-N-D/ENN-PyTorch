@@ -2017,13 +2017,88 @@ class History(nn.Module):
         python_version: str,
         backends: List[str],
     ) -> None:
+        import platform
+
         self.os = str(os_name)
         self.kernel = str(kernel)
-        self.cpu = list(cpu_list)
-        self.arch = list(arch_list)
-        self.ram_gb = int(ram_gb)
         self.python = str(python_version)
-        self.backends = list(backends)
+
+        cpu_models: List[str] = []
+        arch_norm: List[str] = []
+        try:
+            try:
+                import psutil  # type: ignore
+            except Exception:
+                psutil = None  # type: ignore[assignment]
+
+            if psutil is not None:
+                n_cores = psutil.cpu_count(logical=True) or 1
+            else:
+                n_cores = 1
+
+            model_name: Optional[str] = None
+            try:
+                with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if "model name" in line or "Hardware" in line:
+                            parts = line.split(":", 1)
+                            if len(parts) == 2:
+                                model_name = parts[1].strip()
+                            break
+            except Exception:
+                pass
+
+            if not model_name:
+                model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
+
+            arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
+
+            cpu_models = [str(model_name) for _ in range(int(n_cores))]
+            arch_norm = [str(arch_name) for _ in range(int(n_cores))]
+        except Exception:
+            cpu_models = list(cpu_list)
+            arch_norm = list(arch_list)
+
+        self.cpu = cpu_models
+        self.arch = arch_norm
+
+        try:
+            try:
+                import psutil  # type: ignore
+            except Exception:
+                psutil = None  # type: ignore[assignment]
+
+            if psutil is not None:
+                total_bytes = psutil.virtual_memory().total
+                self.ram_gb = float(round(total_bytes / (1024.0 ** 3), 2))
+            else:
+                self.ram_gb = float(ram_gb)
+        except Exception:
+            self.ram_gb = float(ram_gb)
+
+        backend_devices: List[str] = []
+        try:
+            if torch.cuda.is_available():
+                num_cuda = torch.cuda.device_count()
+                for idx in range(num_cuda):
+                    try:
+                        name = torch.cuda.get_device_name(idx)
+                    except Exception:
+                        name = "CUDA Device"
+                    backend_devices.append(f"cuda:{idx}, {name}")
+
+            mps = getattr(torch.backends, "mps", None)
+            if mps is not None and getattr(mps, "is_available", None) and torch.backends.mps.is_available():  # type: ignore[attr-defined]
+                chip_name = platform.processor() or "Apple Silicon"
+                backend_devices.append(f"mps:0, {chip_name}")
+
+            for idx, model_name in enumerate(cpu_models):
+                backend_devices.append(f"cpu:{idx}, {model_name}")
+
+        except Exception:
+            backend_devices = list(backends)
+
+        self.backends = backend_devices
 
     @torch.no_grad()
     def record_batch(
