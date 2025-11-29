@@ -198,6 +198,14 @@ class PatchAttention(nn.Module):
                 def mask_mod(b, h, qi, kj):
                     return allowed[b, h, qi, kj]
 
+                _block_size: int
+                if N <= 2048:
+                    _block_size = 128
+                elif N <= 16384:
+                    _block_size = 256
+                else:
+                    _block_size = 512
+
                 block = create_block_mask(
                     mask_mod,
                     B,
@@ -205,6 +213,7 @@ class PatchAttention(nn.Module):
                     N,
                     N,
                     device=qh.device,
+                    BLOCK_SIZE=_block_size,
                 )
             else:
                 bias = m.to(device=qh.device, dtype=qh.dtype)
@@ -249,7 +258,18 @@ class PatchAttention(nn.Module):
             return total
 
         scale = 1.0 / math.sqrt(float(self.head_dim))
-        out = flex_attention(qh, kh, vh, score_mod=score_mod, block_mask=block, scale=scale)
+        out = flex_attention(
+            qh,
+            kh,
+            vh,
+            score_mod=score_mod,
+            block_mask=block,
+            scale=scale,
+            enable_gqa=False,
+            return_lse=False,
+            kernel_options=None,
+            return_aux=None,
+        )
         H, Dh = self.nhead, self.head_dim
         flops = 2.0 * B * H * N * Dh * N + 2.0 * B * H * N * N * Dh + (B * H * N * N * self.coord_dim)
         try:
@@ -455,6 +475,14 @@ class DilatedAttention(nn.Module):
                     ok = ok & (~kpm[b, kj])
                 return ok
 
+            _block_size: int
+            if L <= 2048:
+                _block_size = 128
+            elif L <= 16384:
+                _block_size = 256
+            else:
+                _block_size = 512
+
             block = create_block_mask(
                 mask_mod,
                 B,
@@ -462,9 +490,20 @@ class DilatedAttention(nn.Module):
                 L,
                 L,
                 device=x.device,
+                BLOCK_SIZE=_block_size,
             )
             scale = 1.0 / math.sqrt(float(Dh))
-            y = flex_attention(qh, kh, vh, block_mask=block, scale=scale)
+            y = flex_attention(
+                qh,
+                kh,
+                vh,
+                block_mask=block,
+                scale=scale,
+                enable_gqa=False,
+                return_lse=False,
+                kernel_options=None,
+                return_aux=None,
+            )
             attn_out = self.out_proj(
                 y.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
             )
