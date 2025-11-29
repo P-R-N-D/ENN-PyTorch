@@ -1375,6 +1375,8 @@ def epochs(
                         if isinstance(hist, History):
                             try:
                                 if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
+                                    x_hist = X.detach().to("cpu")
+                                    y_hist = Y.detach().to("cpu")
                                     hist.record_batch(X, Y)
                                     print(
                                         f"[HIST-REC] step={step_idx}, "
