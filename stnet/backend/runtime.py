@@ -1376,7 +1376,17 @@ def epochs(
                             try:
                                 if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
                                     hist.record_batch(X, Y)
+                                    print(
+                                        f"[HIST-REC] step={step_idx}, "
+                                        f"x_shape={tuple(X.shape)}, y_shape={tuple(Y.shape)}",
+                                        flush=True,
+                                    )
                             except Exception:
+                                print(
+                                    f"[HIST-REC-ERROR] step={step_idx}, "
+                                    f"{type(e).__name__}: {e}",
+                                    flush=True,
+                                )
                                 pass
                         t_fetch_start = time.perf_counter_ns()
                         if cpu_pool is not None and ((step_idx + 1) & 255) == 0:
