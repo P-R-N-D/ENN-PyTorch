@@ -443,9 +443,29 @@ class _FlopProfiler:
                 return False
 
             def get_total_flops(self) -> float:
-                return float(self.total)
+                if not instrumentation.is_active():
+                    return float(self.total)
+
+                try:
+                    cur_total, _ = instrumentation.sum(sort=False)
+                except Exception:
+                    cur_total = 0.0
+
+                if cur_total > 0.0:
+                    return float(cur_total)
+
+                if self.torch_total > 0.0 or self.nvtx_total > 0.0:
+                    return float(max(self.torch_total, self.nvtx_total))
+
+                return 0.0
 
             def get_manual_breakdown(self) -> Dict[str, float]:
+                if instrumentation.is_active():
+                    try:
+                        _, breakdown = instrumentation.sum(sort=False)
+                        return dict(breakdown)
+                    except Exception:
+                        pass
                 return dict(self.manual_breakdown)
 
             def to_dict(self) -> Dict[str, float]:
