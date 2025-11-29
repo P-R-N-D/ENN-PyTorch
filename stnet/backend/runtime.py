@@ -2434,7 +2434,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.7, 0.2, 0.1],
+            coefficient=[0.75, 0.1, 0.15],
             loss=[local_crps, local_z, local_t],
             reduce_each=False,
             auto_schedule=True,
