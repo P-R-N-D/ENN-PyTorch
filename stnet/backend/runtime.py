@@ -1381,7 +1381,7 @@ def epochs(
                                         f"x_shape={tuple(X.shape)}, y_shape={tuple(Y.shape)}",
                                         flush=True,
                                     )
-                            except Exception:
+                            except Exception as e:
                                 print(
                                     f"[HIST-REC-ERROR] step={step_idx}, "
                                     f"{type(e).__name__}: {e}",
