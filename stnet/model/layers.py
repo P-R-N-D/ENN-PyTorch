@@ -2659,6 +2659,10 @@ class Instance(nn.Module):
         return (pred, loss_val)
 
     def history(self) -> Sequence[Mapping[str, Any]]:
+        run_hist = getattr(self, "_train_history", None)
+        if isinstance(run_hist, list):
+            return run_hist
+
         hist = getattr(self, "logger", None)
         if isinstance(hist, History):
             return hist.save()
