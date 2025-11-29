@@ -218,6 +218,8 @@ def train(
 
     memmap_dir = new_dir("memmap_ds")
 
+    num_samples = 0
+
     first_feats: Optional[torch.Tensor] = None
     label_shape: Tuple[int, ...] = ()
     manifest: Optional[Dict[str, str] | Sequence[str]] = None
@@ -238,6 +240,7 @@ def train(
                 first_feats, label_shape = _check_shapes(
                     first_feats, label_shape, fx, lshape
                 )
+                num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
                 manifest[str(k)] = str(k)
         elif (
             isinstance(data, Sequence)
@@ -253,10 +256,12 @@ def train(
                 first_feats, label_shape = _check_shapes(
                     first_feats, label_shape, fx, lshape
                 )
+                num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
                 manifest.append(key)
         else:
             fx, lshape = _mat_one(data, memmap_dir)
             first_feats, label_shape = fx, tuple(lshape)
+            num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
 
         if first_feats is None or not label_shape:
             raise RuntimeError("no training data provided to train()")
@@ -328,6 +333,12 @@ def train(
             "loss_mask_mode": loss_mask_mode,
             "loss_mask_value": loss_mask_value,
         }
+
+        num_samples = int(num_samples)
+        base_params = {"epochs": epochs, "base_lr": base_lr, "weight_decay": weight_decay}
+        print(f"num_samples: {num_samples}")
+        print(f"base_params: {base_params}")
+        this_run_samples = int(num_samples)
         positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
         for key in list(default_kwargs):
             if key in positional_names or key in kwargs:
@@ -366,24 +377,185 @@ def train(
                 history_path = os.path.join(ckpt_dir, "history.json")
                 if os.path.isfile(history_path):
                     with open(history_path, "r", encoding="utf-8") as f:
-                        history_payload = json.load(f)
+                        raw = json.load(f)
+
+                    if isinstance(raw, dict):
+                        records = raw.get("records", []) or []
+                        meta = raw.get("meta", {}) or {}
+                    else:
+                        records = raw if isinstance(raw, list) else []
+                        meta = {}
+
                     logger = getattr(model, "logger", None)
                     print(
                         f"[HIST-LOAD] path={history_path}, "
-                        f"loaded={len(history_payload) if isinstance(history_payload, list) else 'N/A'}, "
+                        f"loaded={len(records) if isinstance(records, list) else 'N/A'}, "
                         f"logger_type={type(logger)}",
                         flush=True,
                     )
-                    if isinstance(logger, History) and isinstance(history_payload, list):
-                        prev = getattr(logger, "_records", None)
-                        if isinstance(prev, list) and len(prev) > 0:
-                            logger._records = list(prev) + list(history_payload)
-                        else:
-                            logger._records = list(history_payload)
-                        print(
-                            f"[HIST-LOGGER] records_now={len(logger._records)}",
-                            flush=True,
-                        )
+
+                    if isinstance(meta, dict):
+                        setattr(model, "_train_history_meta", dict(meta))
+
+                    def _aggregate_run_stats(
+                        recs: List[Mapping[str, Any]],
+                    ) -> Optional[Dict[str, float]]:
+                        if not isinstance(recs, list) or len(recs) == 0:
+                            return None
+                        total_bs = 0
+                        sum_x = 0.0
+                        sum_x2 = 0.0
+                        sum_y = 0.0
+                        sum_y2 = 0.0
+                        x_min = float("inf")
+                        x_max = float("-inf")
+                        y_min = float("inf")
+                        y_max = float("-inf")
+                        for r in recs:
+                            if not isinstance(r, Mapping):
+                                continue
+                            bs = int(r.get("batch_size", 0))
+                            if bs <= 0:
+                                continue
+                            bxm = float(r.get("batch_x_mean", 0.0))
+                            bxv = float(r.get("batch_x_var", 0.0))
+                            bym = float(r.get("batch_y_mean", 0.0))
+                            byv = float(r.get("batch_y_var", 0.0))
+                            bxmin = float(r.get("batch_x_min", float("inf")))
+                            bxmax = float(r.get("batch_x_max", float("-inf")))
+                            bymin = float(r.get("batch_y_min", float("inf")))
+                            bymax = float(r.get("batch_y_max", float("-inf")))
+
+                            total_bs += bs
+                            sum_x += bxm * bs
+                            sum_x2 += (bxv + bxm * bxm) * bs
+                            sum_y += bym * bs
+                            sum_y2 += (byv + bym * bym) * bs
+
+                            x_min = min(x_min, bxmin)
+                            x_max = max(x_max, bxmax)
+                            y_min = min(y_min, bymin)
+                            y_max = max(y_max, bymax)
+
+                        if total_bs <= 0:
+                            return None
+
+                        mean_x = sum_x / total_bs
+                        mean_y = sum_y / total_bs
+                        var_x = max(sum_x2 / total_bs - mean_x * mean_x, 0.0)
+                        var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
+
+                        return {
+                            "sampled_x_mean": mean_x,
+                            "sampled_x_var": var_x,
+                            "sampled_x_min": x_min,
+                            "sampled_x_max": x_max,
+                            "sampled_y_mean": mean_y,
+                            "sampled_y_var": var_y,
+                            "sampled_y_min": y_min,
+                            "sampled_y_max": y_max,
+                        }
+
+                    if isinstance(records, list) and len(records) > 0:
+                        run_stats = _aggregate_run_stats(records)
+                    else:
+                        run_stats = None
+
+                    prev_total = int(getattr(model, "_history_total_samples", 0))
+                    inc_samples = this_run_samples
+                    new_total = prev_total + inc_samples
+
+                    prev_cum = getattr(model, "_history_cum_stats", None)
+
+                    def _update_cum_stats(
+                        prev: Optional[Dict[str, float]],
+                        n_prev: int,
+                        inc: Optional[Dict[str, float]],
+                        n_inc: int,
+                    ) -> Optional[Dict[str, float]]:
+                        if inc is None or n_inc <= 0:
+                            return prev
+                        if prev is None or n_prev <= 0:
+                            out = {}
+                            for key, val in inc.items():
+                                if key.startswith("sampled_"):
+                                    out["reduced_" + key[len("sampled_") :]] = float(val)
+                            return out
+
+                        out: Dict[str, float] = {}
+                        for axis in ("x", "y"):
+                            m_key = f"{axis}_mean"
+                            v_key = f"{axis}_var"
+                            lo_key = f"{axis}_min"
+                            hi_key = f"{axis}_max"
+
+                            m_prev = float(prev.get("reduced_" + m_key, 0.0))
+                            v_prev = float(prev.get("reduced_" + v_key, 0.0))
+                            lo_prev = float(prev.get("reduced_" + lo_key, float("inf")))
+                            hi_prev = float(prev.get("reduced_" + hi_key, float("-inf")))
+
+                            m_inc = float(inc.get(f"sampled_{m_key}", 0.0))
+                            v_inc = float(inc.get(f"sampled_{v_key}", 0.0))
+                            lo_inc = float(inc.get(f"sampled_{lo_key}", float("inf")))
+                            hi_inc = float(inc.get(f"sampled_{hi_key}", float("-inf")))
+
+                            sum_prev = m_prev * n_prev
+                            sum2_prev = (v_prev + m_prev * m_prev) * n_prev
+                            sum_inc = m_inc * n_inc
+                            sum2_inc = (v_inc + m_inc * m_inc) * n_inc
+
+                            n_new = n_prev + n_inc
+                            sum_new = sum_prev + sum_inc
+                            sum2_new = sum2_prev + sum2_inc
+
+                            m_new = sum_new / n_new
+                            v_new = max(sum2_new / n_new - m_new * m_new, 0.0)
+
+                            lo_new = min(lo_prev, lo_inc)
+                            hi_new = max(hi_prev, hi_inc)
+
+                            out["reduced_" + m_key] = m_new
+                            out["reduced_" + v_key] = v_new
+                            out["reduced_" + lo_key] = lo_new
+                            out["reduced_" + hi_key] = hi_new
+
+                        return out
+
+                    cum_stats = _update_cum_stats(prev_cum, prev_total, run_stats, inc_samples)
+
+                    setattr(model, "_history_total_samples", new_total)
+                    if cum_stats is not None:
+                        setattr(model, "_history_cum_stats", cum_stats)
+
+                    run_hist_prev = getattr(model, "_train_history", None)
+                    run_index = len(run_hist_prev) if isinstance(run_hist_prev, list) else 0
+
+                    run_record: Dict[str, Any] = {
+                        "run_index": run_index,
+                        "sampled_n": inc_samples,
+                        "reduced_n": new_total,
+                    }
+                    if run_stats is not None:
+                        run_record.update(run_stats)
+                    if cum_stats is not None:
+                        run_record.update(cum_stats)
+                    if isinstance(meta, dict) and meta:
+                        run_record["env"] = dict(meta)
+
+                    if isinstance(run_hist_prev, list):
+                        new_run_hist = run_hist_prev + [run_record]
+                    else:
+                        new_run_hist = [run_record]
+
+                    setattr(model, "_train_history", new_run_hist)
+
+                    if isinstance(logger, History):
+                        logger._records = new_run_hist
+
+                    print(
+                        f"[HIST-LOGGER] records_now={len(new_run_hist)}",
+                        flush=True,
+                    )
                 else:
                     print(f"[HIST-LOAD] history.json not found at {history_path}", flush=True)
         except Exception as e:

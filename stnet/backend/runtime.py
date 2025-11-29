@@ -1723,17 +1723,40 @@ def epochs(
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
                 world = max(1, get_world_size(device)) if is_distributed() else 1
                 hist.end_session(end_sec, peers=world)
+
                 if ops.ckpt_dir and int(local_rank) == 0:
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
-                    recs = hist.save()
+                    records = hist.save()
+
+                    meta = {
+                        "start": float(hist.start.item()),
+                        "end": float(hist.end.item()),
+                        "timezone": hist.timezone,
+                        "peers": int(hist.peers.item()),
+                        "epochs": int(hist.epochs.item()),
+                        "os": hist.os,
+                        "kernel": hist.kernel,
+                        "cpu": list(hist.cpu),
+                        "arch": list(hist.arch),
+                        "ram_gb": int(hist.ram_gb),
+                        "python": hist.python,
+                        "backends": list(hist.backends),
+                    }
+
+                    payload = {
+                        "meta": meta,
+                        "records": records,
+                    }
+
                     print(
-                        f"[HIST-DUMP] rank={local_rank}, path={history_path}, records={len(recs)}",
+                        f"[HIST-DUMP] rank={local_rank}, path={history_path}, "
+                        f"records={len(records)}",
                         flush=True,
                     )
                     with open(history_path, "w", encoding="utf-8") as f:
-                        json.dump(recs, f)
-            except Exception as e:
-                print(f"[HIST-DUMP-ERROR] {type(e).__name__}: {e}", flush=True)
+                        json.dump(payload, f)
+            except Exception:
+                pass
     except Exception:
         pass
 
