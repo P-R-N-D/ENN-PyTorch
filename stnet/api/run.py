@@ -53,7 +53,7 @@ from ..backend.system import (
     optimal_start_method,
     set_multiprocessing_env,
 )
-from ..backend.runtime import _trim_dcp_keys, ignored_pattern, main
+from ..backend.runtime import _trim_dcp_keys, main
 
 
 _DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
