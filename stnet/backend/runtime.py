@@ -2586,7 +2586,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 swa_start_epoch=swa_start_epoch,
                 buffers_dtype=amp_buffers_dtype,
             )
-        finally:
         if keep is not None:
             keep.cleanup()
         if local_rank == 0:
