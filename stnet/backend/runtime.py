@@ -8,7 +8,6 @@ import json
 import logging
 import math
 import os
-import re
 import platform
 import sys
 import threading
@@ -125,17 +124,6 @@ except ImportError:
         return None
 
 
-ignored_sentences = [
-    "External init callback must run in same thread as registerClient",
-    "Initializing zero-element tensors is a no-op",
-    "gpuGetDeviceCount failed with code",
-    "torch.distributed is disabled",
-    "TypedStorage is deprecated",
-    "flex_attention called without torch.compile",
-    "SOLUTION: Use torch.compile",
-    "Not enough SMs to use max_autotune_gemm mode",
-]
-ignored_pattern = "|".join([re.escape(s) for s in ignored_sentences])
 _DL_STATE_FILE = "dataloader.json"
 
 
@@ -579,15 +567,13 @@ def _calibrate_per_sample_mem(
 
     with Gradient.inference(model), Autocast.float(device):
         td = to_tensordict({"features": X})
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", message=ignored_pattern)
-            _ = model(
-                td,
-                global_loss=None,
-                local_loss=None,
-                loss_weights=None,
-                calibrate_output=True,
-            )
+        _ = model(
+            td,
+            global_loss=None,
+            local_loss=None,
+            loss_weights=None,
+            calibrate_output=True,
+        )
     try:
         torch.cuda.synchronize(device)
         peak_bytes = int(torch.cuda.max_memory_allocated(device))
@@ -1300,16 +1286,12 @@ def epochs(
                                     td = to_tensordict(
                                         {"features": X, "labels_flat": Y_flat}
                                     )
-                                    with warnings.catch_warnings():
-                                        warnings.filterwarnings(
-                                            "ignore", message=ignored_pattern
-                                        )
-                                        model_out = model(
-                                            td,
-                                            global_loss=top_loss,
-                                            local_loss=bottom_loss,
-                                            loss_weights=loss_controller.weights(),
-                                        )
+                                    model_out = model(
+                                        td,
+                                        global_loss=top_loss,
+                                        local_loss=bottom_loss,
+                                        loss_weights=loss_controller.weights(),
+                                    )
                                 if isinstance(model_out, TensorDictBase):
                                     td = model_out
                                     y_hat = td.get("pred")
@@ -1456,16 +1438,12 @@ def epochs(
                                     tdv = to_tensordict(
                                         {"features": X, "labels_flat": Yv_flat}
                                     )
-                                    with warnings.catch_warnings():
-                                        warnings.filterwarnings(
-                                            "ignore", message=ignored_pattern
-                                        )
-                                        model_out_val = model(
-                                            tdv,
-                                            global_loss=top_loss,
-                                            local_loss=bottom_loss,
-                                            loss_weights=loss_controller.weights(),
-                                        )
+                                    model_out_val = model(
+                                        tdv,
+                                        global_loss=top_loss,
+                                        local_loss=bottom_loss,
+                                        loss_weights=loss_controller.weights(),
+                                    )
                                     if isinstance(model_out_val, TensorDictBase):
                                         tdv = model_out_val
                                         _y = tdv.get("pred")
@@ -1578,16 +1556,14 @@ def epochs(
                 y_flat = y_raw.reshape(y_raw.shape[0], -1)
             else:
                 y_flat = y_raw
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
-                out = model(
-                    x_raw,
-                    labels_flat=None,
-                    net_loss=None,
-                    global_loss=None,
-                    local_loss=None,
-                    calibrate_output=False,
-                )
+            out = model(
+                x_raw,
+                labels_flat=None,
+                net_loss=None,
+                global_loss=None,
+                local_loss=None,
+                calibrate_output=False,
+            )
             if isinstance(out, tuple):
                 z_pred_raw, _ = out
             else:
@@ -2019,15 +1995,13 @@ def infer(
                                 if callable(mark_step):
                                     mark_step()
                             tdp = to_tensordict({"features": Xi})
-                            with warnings.catch_warnings():
-                                warnings.filterwarnings("ignore", message=ignored_pattern)
-                                pred_out = run_model(
-                                    tdp,
-                                    global_loss=None,
-                                    local_loss=None,
-                                    loss_weights=None,
-                                    calibrate_output=True,
-                                )
+                            pred_out = run_model(
+                                tdp,
+                                global_loss=None,
+                                local_loss=None,
+                                loss_weights=None,
+                                calibrate_output=True,
+                            )
                             if isinstance(pred_out, TensorDictBase):
                                 tdp = pred_out
                                 y_hat = tdp.get("pred")
@@ -2215,23 +2189,21 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message=ignored_pattern)
-                    m_sd = get_model_state_dict(
-                        model,
-                        options=StateDictOptions(
-                            full_state_dict=True, cpu_offload=False
-                        ),
-                    )
-                    m_sd = _trim_dcp_keys(m_sd)
-                    load(
-                        state_dict={"model": m_sd},
-                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
-                    )
-                    resize_scaler_buffer(model, m_sd)
-                    set_model_state_dict(
-                        model, m_sd, options=StateDictOptions(strict=False)
-                    )
+                m_sd = get_model_state_dict(
+                    model,
+                    options=StateDictOptions(
+                        full_state_dict=True, cpu_offload=False
+                    ),
+                )
+                m_sd = _trim_dcp_keys(m_sd)
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=FileSystemReader(ops.init_ckpt_dir),
+                )
+                resize_scaler_buffer(model, m_sd)
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Metadata.for_device(device)
@@ -2384,32 +2356,30 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             logger=None,
         )
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
+            _initialize_adamw(optimizer)
+            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+            try:
+                load(
+                    state_dict={"optimizer": optim_sd},
+                    storage_reader=FileSystemReader(ops.init_ckpt_dir),
+                )
+            except (
+                FileNotFoundError,
+                ValueError,
+                KeyError,
+                RuntimeError,
+                CheckpointException,
+            ) as exc:
+                if "optimizer" not in str(exc).lower():
+                    raise
+            else:
+                set_optimizer_state_dict(
+                    model,
+                    optimizer,
+                    optim_sd,
+                    options=StateDictOptions(strict=False),
+                )
                 _initialize_adamw(optimizer)
-                optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-                try:
-                    load(
-                        state_dict={"optimizer": optim_sd},
-                        storage_reader=FileSystemReader(ops.init_ckpt_dir),
-                    )
-                except (
-                    FileNotFoundError,
-                    ValueError,
-                    KeyError,
-                    RuntimeError,
-                    CheckpointException,
-                ) as exc:
-                    if "optimizer" not in str(exc).lower():
-                        raise
-                else:
-                    set_optimizer_state_dict(
-                        model,
-                        optimizer,
-                        optim_sd,
-                        options=StateDictOptions(strict=False),
-                    )
-                    _initialize_adamw(optimizer)
         top_loss = DataFidelityLoss(
             out_shape=ops.out_shape,
             reduction="mean",
@@ -2617,23 +2587,21 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 buffers_dtype=amp_buffers_dtype,
             )
         finally:
-            if keep is not None:
-                keep.cleanup()
+        if keep is not None:
+            keep.cleanup()
         if local_rank == 0:
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore", message=ignored_pattern)
-                model_sd = get_model_state_dict(
-                    model,
-                    options=StateDictOptions(full_state_dict=True, cpu_offload=True),
-                )
-                optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-                writer = FileSystemWriter(
-                    ops.ckpt_dir or "", sync_files=True, overwrite=True
-                )
-                save(
-                    state_dict={"model": model_sd, "optimizer": optim_sd},
-                    storage_writer=writer,
-                )
+            model_sd = get_model_state_dict(
+                model,
+                options=StateDictOptions(full_state_dict=True, cpu_offload=True),
+            )
+            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+            writer = FileSystemWriter(
+                ops.ckpt_dir or "", sync_files=True, overwrite=True
+            )
+            save(
+                state_dict={"model": model_sd, "optimizer": optim_sd},
+                storage_writer=writer,
+            )
             if ops.ckpt_dir:
                 fallback_path = os.path.join(ops.ckpt_dir, "model.pt")
                 _state: Dict[str, Any] = {}
@@ -2684,23 +2652,21 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore", message=ignored_pattern)
-                    m_sd = get_model_state_dict(
-                        model,
-                        options=StateDictOptions(
-                            full_state_dict=True, cpu_offload=True
-                        ),
-                    )
-                    m_sd = _trim_dcp_keys(m_sd)
-                    load(
-                        state_dict={"model": m_sd},
-                        storage_reader=FileSystemReader(ops.model_ckpt_dir),
-                    )
-                    resize_scaler_buffer(model, m_sd)
-                    set_model_state_dict(
-                        model, m_sd, options=StateDictOptions(strict=False)
-                    )
+                m_sd = get_model_state_dict(
+                    model,
+                    options=StateDictOptions(
+                        full_state_dict=True, cpu_offload=True
+                    ),
+                )
+                m_sd = _trim_dcp_keys(m_sd)
+                load(
+                    state_dict={"model": m_sd},
+                    storage_reader=FileSystemReader(ops.model_ckpt_dir),
+                )
+                resize_scaler_buffer(model, m_sd)
+                set_model_state_dict(
+                    model, m_sd, options=StateDictOptions(strict=False)
+                )
         model.to(device, non_blocking=True).eval()
         metadata = Metadata.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
