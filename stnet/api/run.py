@@ -361,7 +361,6 @@ def train(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
 
-        # --- NEW: epochs()에서 저장한 training history를 model.logger로 가져오기 ---
         try:
             if ckpt_dir is not None:
                 history_path = os.path.join(ckpt_dir, "history.json")
@@ -376,7 +375,11 @@ def train(
                         flush=True,
                     )
                     if isinstance(logger, History) and isinstance(history_payload, list):
-                        logger._records = list(history_payload)
+                        prev = getattr(logger, "_records", None)
+                        if isinstance(prev, list) and len(prev) > 0:
+                            logger._records = list(prev) + list(history_payload)
+                        else:
+                            logger._records = list(history_payload)
                         print(
                             f"[HIST-LOGGER] records_now={len(logger._records)}",
                             flush=True,
