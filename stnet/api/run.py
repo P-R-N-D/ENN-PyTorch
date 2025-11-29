@@ -33,7 +33,7 @@ except ImportError:
 
 from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess
-from ..model.layers import Instance
+from ..model.layers import History, Instance
 from .config import (
     ModelConfig,
     OpsMode,
@@ -360,6 +360,19 @@ def train(
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
+
+        try:
+            if ckpt_dir is not None:
+                history_path = os.path.join(ckpt_dir, "history.json")
+                if os.path.isfile(history_path):
+                    with open(history_path, "r", encoding="utf-8") as f:
+                        history_payload = json.load(f)
+                    logger = getattr(model, "logger", None)
+                    if isinstance(logger, History) and isinstance(history_payload, list):
+                        logger._records = list(history_payload)
+        except Exception:
+            pass
+
         return model
     finally:
         shutil.rmtree(memmap_dir, ignore_errors=True)

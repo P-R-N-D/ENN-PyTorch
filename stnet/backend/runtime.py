@@ -1705,6 +1705,10 @@ def epochs(
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
                 world = max(1, get_world_size(device)) if is_distributed() else 1
                 hist.end_session(end_sec, peers=world)
+                if ops.ckpt_dir and int(local_rank) == 0:
+                    history_path = os.path.join(ops.ckpt_dir, "history.json")
+                    with open(history_path, "w", encoding="utf-8") as f:
+                        json.dump(hist.save(), f)
             except Exception:
                 pass
     except Exception:
