@@ -967,7 +967,7 @@ def epochs(
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
     model_for_hist = model.module if hasattr(model, "module") else model
-    hist = None
+    hist: Optional[History] = None
     maybe_hist = getattr(model_for_hist, "logger", None)
     if isinstance(maybe_hist, History):
         hist = maybe_hist
@@ -975,6 +975,12 @@ def epochs(
         maybe_hist = getattr(model_for_hist, "history", None)
         if isinstance(maybe_hist, History):
             hist = maybe_hist
+    if hist is None:
+        hist = History().to(device)
+        try:
+            setattr(model_for_hist, "logger", hist)
+        except Exception:
+            pass
 
     if isinstance(hist, History):
         start_ns = posix_time("Asia/Seoul")
@@ -1707,11 +1713,15 @@ def epochs(
                 hist.end_session(end_sec, peers=world)
                 if ops.ckpt_dir and int(local_rank) == 0:
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
-                    print(f"[HIST-DUMP] rank={local_rank}, path={history_path}, records={len(recs)}", flush=True)
+                    recs = hist.save()
+                    print(
+                        f"[HIST-DUMP] rank={local_rank}, path={history_path}, records={len(recs)}",
+                        flush=True,
+                    )
                     with open(history_path, "w", encoding="utf-8") as f:
-                        json.dump(hist.save(), f)
-            except Exception:
-                pass
+                        json.dump(recs, f)
+            except Exception as e:
+                print(f"[HIST-DUMP-ERROR] {type(e).__name__}: {e}", flush=True)
     except Exception:
         pass
 
