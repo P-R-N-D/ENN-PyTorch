@@ -797,7 +797,7 @@ class Loader:
             self._iterable = Prefetcher(
                 base,
                 device=self._device,
-                depth=self._prefetch_factor,
+                depth=4,
                 non_blocking=True,
                 memory_backpressure=True,
                 gpu_guard_bytes=gpu_guard_mb * (1 << 20),
