@@ -617,8 +617,8 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         num_workers = max(4, min(16, ncpu // 2))
 
     max_concurrancy = int(max(1, num_workers))
-    prebatch = 1
-    prefetch_factor = 3 if has_cuda else 1
+    prebatch = 2 if has_cuda else 1
+    prefetch_factor = 4 if has_cuda else 1
 
     return {
         "intra_ops": int(max(1, intra_ops)),
