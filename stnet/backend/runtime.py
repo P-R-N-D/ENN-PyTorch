@@ -2385,17 +2385,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     options=StateDictOptions(strict=False),
                 )
                 _initialize_adamw(optimizer)
-        top_loss = DataFidelityLoss(
+        top_df = DataFidelityLoss(
             out_shape=ops.out_shape,
             reduction="mean",
         )
 
-        local_crps = CRPSLoss(
-            dim=-1,
-            reduction="none",
-            detach_stats=True,
-        )
-        local_z = StandardNormalLoss(
+        top_z = StandardNormalLoss(
             confidence=0.99,
             metric="z_value",
             two_tailed=True,
@@ -2407,8 +2402,20 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             clamp_max=8.0,
             detach_stats=True,
             dim=-1,
-            reduction="none",
+            reduction="mean",
             skew=ops.loss_skew,
+        )
+        top_loss = LinearCombinationLoss(
+            coefficient=[1.0, 0.0],
+            loss=[top_df, top_z],
+            reduce_each=False,
+            auto_schedule=False,
+        )
+
+        local_crps = CRPSLoss(
+            dim=-1,
+            reduction="none",
+            detach_stats=True,
         )
         local_t = StudentsTLoss(
             confidence=0.99,
@@ -2434,14 +2441,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.8, 0.1, 0.1],
-            loss=[local_crps, local_z, local_t],
+            coefficient=[1.0, 0.0],
+            loss=[local_crps, local_t],
             reduce_each=False,
-            auto_schedule=True,
-            schedule_momentum=0.9,
-            min_coeff=0.05,
-            max_coeff=0.95,
-            eps=1e-6,
+            auto_schedule=False,
         )
         loss_controller = LossWeightController()
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
