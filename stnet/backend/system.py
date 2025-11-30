@@ -597,12 +597,9 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
     ncpu = cpu_count()
     try:
         import torch
-
-        has_cuda = (
-            getattr(torch, "cuda", None) is not None and torch.cuda.is_available()
-        )
+        is_accelerated = torch.accelerator.is_available()
     except Exception:
-        has_cuda = False
+        is_accelerated = False
     if ncpu <= 2:
         inter_ops = 1
         intra_ops = max(1, ncpu - inter_ops)
@@ -617,8 +614,8 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         num_workers = max(4, min(16, ncpu // 2))
 
     max_concurrancy = int(max(1, num_workers))
-    prebatch = 4 if has_cuda else 1
-    prefetch_factor = 4 if has_cuda else 1
+    prebatch = 8 if is_accelerated else 1
+    prefetch_factor = 4 if is_accelerated else 1
 
     return {
         "intra_ops": int(max(1, intra_ops)),
