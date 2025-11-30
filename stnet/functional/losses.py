@@ -1277,8 +1277,8 @@ class LossWeightController:
     min_weight: float = 0.05
     max_weight: float = 0.95
     eps: float = 1e-06
-    top_avg: float = 1.0
-    bottom_avg: float = 1.0
+    top_avg: float = 0.25
+    bottom_avg: float = 0.75
 
     def weights(self) -> Tuple[float, float]:
         top = max(self.eps, self.top_avg)
