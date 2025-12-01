@@ -2427,7 +2427,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         top_loss = LinearCombinationLoss(
             coefficient=[1.0, 0.0],
             loss=[top_df, top_z],
-            reduce_each=False,
+            reduce_each=True,
             auto_schedule=True,
         )
         bottom_loss = TiledLoss(
