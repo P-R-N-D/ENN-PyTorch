@@ -2425,7 +2425,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             skew=ops.loss_skew,
         )
         top_loss = LinearCombinationLoss(
-            coefficient=[0.975, 0.025],
+            coefficient=[1.0, 0.0],
             loss=[top_df, top_z],
             reduce_each=False,
             auto_schedule=True,
@@ -2442,7 +2442,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             coefficient=[1.0, 0.0],
             loss=[local_crps, local_t],
             reduce_each=False,
-            auto_schedule=False,
+            auto_schedule=True,
         )
         loss_controller = LossWeightController(top_avg=0.75, bottom_avg=0.25)
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
