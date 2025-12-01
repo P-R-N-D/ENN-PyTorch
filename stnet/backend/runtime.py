@@ -2425,7 +2425,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             skew=ops.loss_skew,
         )
         top_loss = LinearCombinationLoss(
-            coefficient=[0.9, 0.1],
+            coefficient=[0.95, 0.05],
             loss=[top_df, top_z],
             reduce_each=False,
             auto_schedule=False,
