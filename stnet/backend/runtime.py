@@ -2405,13 +2405,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
             skew=ops.loss_skew,
         )
-        top_loss = LinearCombinationLoss(
-            coefficient=[1.0, 0.0],
-            loss=[top_df, top_z],
-            reduce_each=False,
-            auto_schedule=False,
-        )
-
         local_crps = CRPSLoss(
             dim=-1,
             reduction="none",
@@ -2431,7 +2424,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="none",
             skew=ops.loss_skew,
         )
-
+        top_loss = LinearCombinationLoss(
+            coefficient=[0.75, 0.25],
+            loss=[top_df, top_z],
+            reduce_each=False,
+            auto_schedule=False,
+        )
         bottom_loss = TiledLoss(
             nn.Sequential(),
             mask_mode=ops.loss_mask_mode,
@@ -2446,7 +2444,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduce_each=False,
             auto_schedule=False,
         )
-        loss_controller = LossWeightController(top_avg=0.775, bottom_avg=0.225)
+        loss_controller = LossWeightController(top_avg=0.75, bottom_avg=0.25)
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
         init_state_path = (
             loader_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
