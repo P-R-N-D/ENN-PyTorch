@@ -2446,7 +2446,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduce_each=False,
             auto_schedule=False,
         )
-        loss_controller = LossWeightController(top_avg=0.725, bottom_avg=0.275)
+        loss_controller = LossWeightController(top_avg=0.775, bottom_avg=0.225)
         ckpt_state_path = loader_state_path(ops.ckpt_dir or "")
         init_state_path = (
             loader_state_path(ops.init_ckpt_dir) if ops.init_ckpt_dir else None
