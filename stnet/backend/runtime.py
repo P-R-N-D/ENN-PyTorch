@@ -1149,6 +1149,7 @@ def epochs(
     prev_comp_time = 0.0
     prev_io_bytes = 0.0
     prev_flops = 0.0
+    prev_samples = 0.0
 
     join_context = joining(model=model, optimizer=optimizer)
     with join_context:
@@ -1221,6 +1222,7 @@ def epochs(
             comp_time: float = 0.0
             io_bytes: float = 0.0
             flops: float = 0.0
+            train_samples_epoch: float = 0.0
             flop_counter_train = FlopCounter(model, mode="train", device=device)
             with flop_counter_train:
                 model.train()
@@ -1243,6 +1245,7 @@ def epochs(
                                 f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                             )
                         Y = to_torch_tensor(label)
+                        train_samples_epoch += float(X.shape[0])
                         t_ready = time.perf_counter_ns()
                         X, Y = _pin_tensor(X, Y)
                         if use_timer:
@@ -1522,14 +1525,14 @@ def epochs(
                                 pool_handles.clear()
             if is_distributed():
                 stats = torch.tensor(
-                    [comp_time, io_time, flops, io_bytes],
+                    [comp_time, io_time, flops, io_bytes, train_samples_epoch],
                     device=device,
                     dtype=torch.float64,
                 )
                 torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
                 world = max(1, get_world_size(device))
                 stats /= world
-                comp_time, io_time, flops, io_bytes = [float(x) for x in stats.tolist()]
+                comp_time, io_time, flops, io_bytes, train_samples_epoch = [float(x) for x in stats.tolist()]
                 distributed_barrier(device)
             updated_this_epoch = False
             if swa_enabled and epoch_idx >= swa_start_epoch:
@@ -1545,6 +1548,7 @@ def epochs(
             prev_io_time += float(io_time)
             prev_flops += float(flops)
             prev_io_bytes += float(io_bytes)
+            prev_samples += float(train_samples_epoch)
     model_for_scaler = model.module if hasattr(model, "module") else model
     scaler_y_device = model_for_scaler.scaler.y_mean.device
     with torch.no_grad():
@@ -1681,30 +1685,30 @@ def epochs(
     try:
         dev_t = getattr(device, "type", "")
         total_t = prev_io_time + prev_comp_time
+        samples_per_sec = 0.0
+        util_from_sps = 0.0
+        if total_t > 0.0 and prev_samples > 0.0 and prev_comp_time > 0.0:
+            samples_per_sec = prev_samples / total_t
+            max_samples_per_sec = prev_samples / prev_comp_time
+            if max_samples_per_sec > 0.0:
+                util_from_sps = samples_per_sec / max_samples_per_sec
+        util_fallback = util_from_sps if util_from_sps > 0.0 else (
+            (prev_comp_time / total_t) if total_t > 0.0 else 0.0
+        )
+
         if dev_t != "cpu":
-            gpu_util, mem_util = _gpu_nvml_utils(device)
-            if gpu_util is not None:
-                if gpu_util < 95.0:
-                    Dataset.request_scale_up(1.25)
-                elif gpu_util > 98.0 or (mem_util is not None and mem_util >= 90.0):
-                    Dataset.request_scale_down(0.90)
-            else:
-                if total_t > 0:
-                    util_fallback = prev_comp_time / total_t
-                    if util_fallback < 0.95:
-                        Dataset.request_scale_up(1.25)
-                    elif util_fallback > 0.99:
-                        Dataset.request_scale_down(0.90)
+            if util_fallback < 0.95:
+                Dataset.request_scale_up(1.25)
+            elif util_fallback > 0.99:
+                Dataset.request_scale_down(0.90)
         else:
             cpu_pct = _cpu_percent_now()
             if cpu_pct is not None:
                 if cpu_pct > 80.0:
                     time.sleep(min(0.005, 0.001 * (cpu_pct - 80.0)))
             else:
-                if total_t > 0:
-                    util_fallback = prev_comp_time / total_t
-                    if util_fallback > 0.80:
-                        time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
+                if util_fallback > 0.80:
+                    time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
         if isinstance(hist, History):
             try:
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
