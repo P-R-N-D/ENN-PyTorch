@@ -2426,8 +2426,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         )
         top_loss = LinearCombinationLoss(
             coefficient=[0.99, 0.01],
-            min_coeff: float = 0.00,
-            max_coeff: float = 1.00,
+            min_coeff=0.00,
+            max_coeff=1.00,
             loss=[top_df, top_z],
             reduce_each=True,
             auto_schedule=True,
@@ -2442,8 +2442,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         )
         bottom_loss.base = LinearCombinationLoss(
             coefficient=[0.99, 0.01],
-            min_coeff: float = 0.00,
-            max_coeff: float = 1.00,
+            min_coeff=0.00,
+            max_coeff=1.00,
             loss=[local_crps, local_t],
             reduce_each=False,
             auto_schedule=True,
