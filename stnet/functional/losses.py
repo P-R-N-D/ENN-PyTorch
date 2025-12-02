@@ -1063,8 +1063,8 @@ class LinearCombinationLoss(nn.Module):
         reduce_each: bool = True,
         auto_schedule: bool = False,
         schedule_momentum: float = 0.9,
-        min_coeff: float = 0.05,
-        max_coeff: float = 0.95,
+        min_coeff: float = 0.01,
+        max_coeff: float = 0.99,
         eps: float = 1e-06,
         **kwargs: Any,
     ) -> None:
