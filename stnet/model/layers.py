@@ -2415,13 +2415,8 @@ class Instance(nn.Module):
             self.max_queue = 2
         self.input: Deque[Request] = deque()
         self.output: Deque[Response] = deque()
-        try:
-            self.microbatch = int(getattr(config, "microbatch", 0))
-        except Exception:
-            self.microbatch = 0
-        if self.microbatch < 0:
-            raise ValueError(f"config.microbatch must be >= 0, got {self.microbatch}")
-        self._auto_microbatch_pending = self.microbatch == 0
+        self.microbatch = 0
+        self._auto_microbatch_pending = True
         self._activation_checkpoint = bool(
             getattr(config, "activation_checkpoint", False)
         )
