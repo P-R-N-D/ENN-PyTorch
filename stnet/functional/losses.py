@@ -1063,8 +1063,8 @@ class LinearCombinationLoss(nn.Module):
         reduce_each: bool = True,
         auto_schedule: bool = False,
         schedule_momentum: float = 0.9,
-        min_coeff: float = 0.01,
-        max_coeff: float = 0.99,
+        min_coeff: float = 0.05,
+        max_coeff: float = 0.95,
         eps: float = 1e-06,
         **kwargs: Any,
     ) -> None:
@@ -1274,8 +1274,8 @@ class TiledLoss(nn.Module):
 @dataclass
 class LossWeightController:
     momentum: float = 0.9
-    min_weight: float = 0.01
-    max_weight: float = 0.99
+    min_weight: float = 0.05
+    max_weight: float = 0.95
     eps: float = 1e-06
     top_avg: float = 0.75
     bottom_avg: float = 0.25
