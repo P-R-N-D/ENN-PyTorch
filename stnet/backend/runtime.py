@@ -2429,7 +2429,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             skew=ops.loss_skew,
         )
         top_loss = LinearCombinationLoss(
-            coefficient=[0.95, 0.05],
+            coefficient=[1.00, 0.00],
             loss=[top_df, top_z],
             reduce_each=True,
             auto_schedule=True,
@@ -2443,7 +2443,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             reduction="mean",
         )
         bottom_loss.base = LinearCombinationLoss(
-            coefficient=[0.95, 0.05],
+            coefficient=[1.00, 0.00],
             loss=[local_crps, local_t],
             reduce_each=False,
             auto_schedule=True,
