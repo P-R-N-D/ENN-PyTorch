@@ -5,7 +5,6 @@ import contextlib
 import importlib
 import logging
 import math
-import os
 from contextlib import AbstractContextManager
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -14,13 +13,9 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..backend.system import (
-    get_device,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int8_supported,
-)
+from ..backend.system import (get_device, is_cpu_bf16_supported,
+                              is_cuda_bf16_supported, is_float8_supported,
+                              is_int8_supported)
 from ..data.stats import Metadata
 
 patch_torch()
@@ -850,11 +845,12 @@ _ptq_impl: Callable[..., tuple[nn.Module, bool, str]] | None
 QAT: Any | None
 
 try:
-    from torchao.quantization import (
-        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
-        Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
-        quantize_ as _quantize,
-    )
+    from torchao.quantization import \
+        Int8DynamicActivationInt8WeightConfig as \
+        _Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization import \
+        Int8WeightOnlyConfig as _Int8WeightOnlyConfig
+    from torchao.quantization import quantize_ as _quantize
 
     _ptq_impl = getattr(_quantize, "ptq", None)
 except ImportError:
@@ -873,8 +869,7 @@ except Exception:
         try:
             from torchao.quantization.qat import (
                 FromIntXQuantizationAwareTrainingConfig,
-                IntXQuantizationAwareTrainingConfig,
-            )
+                IntXQuantizationAwareTrainingConfig)
 
             class _ShimQATStep:
                 PREPARE = "prepare"
@@ -1439,9 +1434,7 @@ class Fusion:
         try:
             from torchao.quantization import (
                 Float8DynamicActivationFloat8WeightConfig,
-                Float8WeightOnlyConfig,
-                quantize_,
-            )
+                Float8WeightOnlyConfig, quantize_)
 
             cfg = (
                 Float8DynamicActivationFloat8WeightConfig()

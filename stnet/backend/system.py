@@ -1195,8 +1195,9 @@ class Memory:
             return None
         try:
             import ctypes
-            import psutil
             from ctypes import wintypes as wt
+
+            import psutil
 
             kernel32 = ctypes.windll.kernel32
             IsProcessInJob = kernel32.IsProcessInJob
@@ -1298,6 +1299,7 @@ class Memory:
     def _bsd_limit() -> Optional[int]:
         try:
             import resource
+
             import psutil
 
             rss = psutil.Process(os.getpid()).memory_info().rss
@@ -1352,7 +1354,7 @@ class Memory:
 
         __slots__ = ("_buf", "_numel", "_dtype")
 
-        def __init__(self, numel: int, dtype: "torch.dtype"):
+        def __init__(self, numel: int, dtype: "torch.dtype") -> None:
             import torch
 
             self._numel = int(max(1, numel))
@@ -1366,10 +1368,10 @@ class Memory:
             return self._numel
 
         @property
-        def dtype(self):
+        def dtype(self) -> "torch.dtype":
             return self._dtype
 
-        def view(self, *shape: int):
+        def view(self, *shape: int) -> "torch.Tensor":
             import torch
 
             needed = 1
@@ -1387,20 +1389,20 @@ class Memory:
         class Token:
             __slots__ = ("i", "g")
 
-            def __init__(self, i: int, g: int):
+            def __init__(self, i: int, g: int) -> None:
                 self.i = i
                 self.g = g
 
         class _Entry:
             __slots__ = ("page", "busy", "fence", "gen")
 
-            def __init__(self, page: "Memory.Page"):
+            def __init__(self, page: "Memory.Page") -> None:
                 self.page = page
                 self.busy = False
                 self.fence = None
                 self.gen = 0
 
-        def __init__(self, capacity: int = 4):
+        def __init__(self, capacity: int = 4) -> None:
             import threading
 
             self._cap = max(1, int(capacity))
@@ -1427,7 +1429,7 @@ class Memory:
 
         def _ensure_view(
             self, e: "Memory.Pool._Entry", shape: "Tuple[int, ...]", dtype: "torch.dtype"
-        ):
+        ) -> "torch.Tensor":
             need = 1
             for s in shape:
                 need *= int(s)
@@ -1442,7 +1444,7 @@ class Memory:
             dtype: "torch.dtype",
             *,
             return_handle: bool = False,
-        ):
+        ) -> "torch.Tensor" | "tuple[torch.Tensor, Memory.Pool.Token | None]":
             with self._lock:
                 self._scavenge()
                 n = len(self._pages)
@@ -1487,7 +1489,7 @@ class Memory:
                     return view, None
                 return view
 
-        def get_like(self, t: "torch.Tensor", *args: Any, return_handle: bool = False):
+        def get_like(self, t: "torch.Tensor", *args: Any, return_handle: bool = False) -> "torch.Tensor" | "tuple[torch.Tensor, Memory.Pool.Token | None]":
             return self.get(tuple(t.shape), t.dtype, return_handle=return_handle)
 
         def release_after(self, token: "Memory.Pool.Token", wait_event: object | None) -> None:
@@ -1520,7 +1522,7 @@ class Memory:
 
     class Cache:
 
-        def __init__(self, root: str, max_queue: int = 8):
+        def __init__(self, root: str, max_queue: int = 8) -> None:
             import os
             import queue
             import threading
@@ -1562,8 +1564,10 @@ class Memory:
                         release_cb()
 
         def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
+            import json
+            import os
+
             import torch
-            import json, os
 
             try:
                 if path.endswith(".mmt"):
@@ -1590,7 +1594,7 @@ class Memory:
             self._q.put((None, None, None, None))
             self._t.join()
 
-        def _run(self):
+        def _run(self) -> None:
             import contextlib
 
             while True:
@@ -1620,7 +1624,7 @@ class Memory:
             return bool(self._err_event.is_set())
 
     class Buffer:
-        def __init__(self, max_batches: int):
+        def __init__(self, max_batches: int) -> None:
             import queue
             import threading
             self.max_batches = max(1, int(max_batches))
@@ -1628,7 +1632,8 @@ class Memory:
             self._stop = threading.Event()
 
         def put(self, tensor: "torch.Tensor") -> None:
-            import time, logging
+            import logging
+            import time
 
             start = time.monotonic()
             try:

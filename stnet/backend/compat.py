@@ -50,7 +50,7 @@ else:
     RMSNorm = None
 
 try:
-    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.attention import SDPBackend
 except Exception:
 
     class _SDPEnum:

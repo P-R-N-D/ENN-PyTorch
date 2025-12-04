@@ -3,28 +3,16 @@ from __future__ import annotations
 
 import contextlib
 import math
-import warnings
-from dataclasses import dataclass
 from collections import deque
-from typing import (
-    Any,
-    Dict,
-    List,
-    Mapping,
-    Deque,
-    Optional,
-    Protocol,
-    Sequence,
-    Tuple,
-    Union,
-    cast,
-)
+from dataclasses import dataclass
+from typing import (Any, Deque, Dict, Iterator, List, Mapping, Optional,
+                    Protocol, Sequence, Tuple, Union, cast)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tensordict import TensorDictBase
 from torch.utils.checkpoint import checkpoint as activation_checkpoint
-from tensordict import TensorDict, TensorDictBase
 
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
@@ -55,22 +43,21 @@ else:
 _Norm = nn.LayerNorm
 
 try:
-    from torch.nn.attention.flex_attention import (
-        flex_attention,
-        create_block_mask,
-    )
+    from torch.nn.attention.flex_attention import (create_block_mask,
+                                                   flex_attention)
     _HAS_FLEX_ATTENTION = True
 except Exception:
     _HAS_FLEX_ATTENTION = False
 
-from ..backend.profiler import FLOP_PROFILER
 from ..backend.compat import torch_no_compile
+from ..backend.profiler import FLOP_PROFILER
 from ..functional.fx import Autocast, Gradient
-from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
+from .kernels import (DotProductAttention, MultiHeadAttention,
+                      MultiScaleRetention)
 
 
 @torch.no_grad()
-def _norm_vector(coords: torch.Tensor, eps: float = 1e-6):
+def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     B, N, C = coords.shape
     if C == 2:
         z = torch.zeros(B, N, 1, dtype=coords.dtype, device=coords.device)
@@ -107,7 +94,7 @@ def _serialize_z_index(
     patch: int,
     shift_order: bool,
     block_index: int,
-):
+) -> tuple[torch.Tensor, torch.Tensor]:
     coords01 = _norm_vector(coords)
     keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)                               
@@ -124,7 +111,7 @@ def _serialize_z_index(
     invperm.scatter_(1, perm, scatter_src)
     return perm, invperm
 
-def _block_ranges(N: int, patch: int):
+def _block_ranges(N: int, patch: int) -> "Iterator[tuple[int, int]]":
     for s in range(0, N, patch):
         e = min(s + patch, N)
         yield s, e
@@ -201,7 +188,7 @@ class PatchAttention(nn.Module):
                     raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
                 allowed = (~m).to(device=qh.device)
 
-                def mask_mod(b, h, qi, kj):
+                def mask_mod(b: int, h: int, qi: int, kj: int) -> bool:
                     return allowed[b, h, qi, kj]
 
                 _block_size: int
@@ -255,7 +242,9 @@ class PatchAttention(nn.Module):
         W_exp = W.view(1, H, 1, 1, Cc)
         coord_bias = (delta * W_exp).sum(dim=-1).to(dtype=qh.dtype, device=qh.device)
 
-        def score_mod(score, b, h, qi, kj):
+        def score_mod(
+            score: torch.Tensor, b: int, h: int, qi: int, kj: int
+        ) -> torch.Tensor:
             total = score
             if coord_bias is not None:
                 total = total + coord_bias[b, h, qi, kj]
@@ -470,7 +459,7 @@ class DilatedAttention(nn.Module):
                     )
                 kpm = key_padding_mask.to(dtype=torch.bool, device=x.device)
 
-            def mask_mod(b, h, qi, kj):
+            def mask_mod(b: int, h: int, qi: int, kj: int) -> bool:
                 dq = qi - kj
                 ok = (dq.remainder(dil) == 0)
                 if win is not None:
@@ -1422,26 +1411,27 @@ class Processor(nn.Module):
         mode = self._fixed_mode
         if mode is not None:
             mode_l = _coerce_modeling_types(mode)
-            if mode_l == "ss":
-                tokens = spatial_out
-            elif mode_l == "tt":
-                tokens = temporal_out
-            elif mode_l == "ts":
-                if hasattr(self.perception, "_forward_dynamically"):
-                    tokens = self.perception._forward_dynamically(
-                        temporal_out, spatial_out, "ts"
-                    )
-                else:
-                    tokens = self.perception(temporal_out, spatial_out, mode="ts")
-            elif mode_l == "st":
-                if hasattr(self.perception, "_forward_dynamically"):
-                    tokens = self.perception._forward_dynamically(
-                        spatial_out, temporal_out, "st"
-                    )
-                else:
-                    tokens = self.perception(spatial_out, temporal_out, mode="st")
-            else:
-                raise RuntimeError(f"Unhandled modeling type '{mode}'")
+            match mode_l:
+                case 'ss':
+                    tokens = spatial_out
+                case 'tt':
+                    tokens = temporal_out
+                case 'ts':
+                    if hasattr(self.perception, "_forward_dynamically"):
+                        tokens = self.perception._forward_dynamically(
+                            temporal_out, spatial_out, "ts"
+                        )
+                    else:
+                        tokens = self.perception(temporal_out, spatial_out, mode="ts")
+                case 'st':
+                    if hasattr(self.perception, "_forward_dynamically"):
+                        tokens = self.perception._forward_dynamically(
+                            spatial_out, temporal_out, "st"
+                        )
+                    else:
+                        tokens = self.perception(spatial_out, temporal_out, mode="st")
+                case _:
+                    raise RuntimeError(f"Unhandled modeling type '{mode}'")
         else:
             tokens = self._forward_dynamically(spatial_out, temporal_out)
         tokens = self.norm(tokens)
@@ -2370,21 +2360,22 @@ class Instance(nn.Module):
         fudge = 8
         max_batch = 1 << 14
         free_bytes = None
-        if dev_t == "cuda":
-            with contextlib.suppress(Exception):
-                free, _ = torch.cuda.mem_get_info(device)
-                free_bytes = int(free)
-        elif dev_t == "xpu":
-            with contextlib.suppress(Exception):
-                props = getattr(torch.xpu, "get_device_properties", None)
-                mem_alloc = getattr(torch.xpu, "memory_allocated", None)
-                if callable(props) and callable(mem_alloc):
-                    total = int(props(device).total_memory); used = int(mem_alloc(device))
-                    free_bytes = max(0, total - used)
-        elif dev_t == "mps":
-            with contextlib.suppress(Exception):
-                from ..backend.system import Memory
-                free_bytes = int(Memory.available() * 0.25)
+        match dev_t:
+            case 'cuda':
+                with contextlib.suppress(Exception):
+                    free, _ = torch.cuda.mem_get_info(device)
+                    free_bytes = int(free)
+            case 'xpu':
+                with contextlib.suppress(Exception):
+                    props = getattr(torch.xpu, "get_device_properties", None)
+                    mem_alloc = getattr(torch.xpu, "memory_allocated", None)
+                    if callable(props) and callable(mem_alloc):
+                        total = int(props(device).total_memory); used = int(mem_alloc(device))
+                        free_bytes = max(0, total - used)
+            case 'mps':
+                with contextlib.suppress(Exception):
+                    from ..backend.system import Memory
+                    free_bytes = int(Memory.available() * 0.25)
         if not free_bytes or free_bytes <= 0:
             return 64
         budget = int(free_bytes * 0.90)

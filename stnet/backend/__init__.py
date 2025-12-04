@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from importlib import import_module
+from types import ModuleType
 
 from . import compat, distributed, profiler, system
 
@@ -15,7 +15,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> "ModuleType":
     if name in {"export", "runtime"}:
         import importlib
 

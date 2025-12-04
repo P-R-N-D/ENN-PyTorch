@@ -2,16 +2,15 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass, field
+import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar
 
-import math
 import torch
 from tensordict import tensorclass
 
 from ..backend.system import cuda_compute_capability
-
 
 TExtra = TypeVar("TExtra")
 

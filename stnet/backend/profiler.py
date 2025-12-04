@@ -6,11 +6,11 @@ import logging
 import os
 from functools import partial
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
+                    Tuple)
 
 import torch
 from torch import nn
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -314,7 +314,8 @@ class _FlopProfiler:
         class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
             def __init__(self, show: bool) -> None:
                 try:
-                    from torch.utils.flop_counter import FlopCounterMode as _TorchMode
+                    from torch.utils.flop_counter import \
+                        FlopCounterMode as _TorchMode
 
                     self._impl = _TorchMode(display=show)
                 except Exception:

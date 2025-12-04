@@ -10,51 +10,30 @@ from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
-
 import torch
 import torch.multiprocessing as mp
-from torch.distributed.checkpoint import (
-    FileSystemReader,
-    FileSystemWriter,
-    load,
-    save,
-)
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    set_model_state_dict,
-)
+from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
+                                          load, save)
+from torch.distributed.checkpoint.state_dict import (StateDictOptions,
+                                                     get_model_state_dict,
+                                                     set_model_state_dict)
 
 try:
     from torch.distributed.run import LaunchConfig, elastic_launch
 except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
+from ..backend.distributed import (get_available_host, get_preferred_ip,
+                                   initialize_master_addr)
+from ..backend.runtime import _trim_dcp_keys, main
+from ..backend.system import (initialize_python_path, new_dir, optimal_procs,
+                              optimal_start_method, optimize_threads,
+                              set_multiprocessing_env)
 from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess
 from ..model.layers import History, Instance
-from .config import (
-    ModelConfig,
-    OpsMode,
-    RuntimeConfig,
-    coerce_model_config,
-    runtime_config,
-)
-from ..backend.distributed import (
-    get_available_host,
-    get_preferred_ip,
-    initialize_master_addr,
-)
-from ..backend.system import (
-    initialize_python_path,
-    new_dir,
-    optimize_threads,
-    optimal_procs,
-    optimal_start_method,
-    set_multiprocessing_env,
-)
-from ..backend.runtime import _trim_dcp_keys, main
-
+from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
+                     runtime_config)
 
 _DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
 

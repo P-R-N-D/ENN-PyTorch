@@ -3,10 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from dataclasses import asdict
 from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
 
 import torch
@@ -23,15 +23,14 @@ if _add_safe_globals is not None:
 
         _add_safe_globals([_torch_version.TorchVersion])
 
-from torch.distributed.checkpoint import FileSystemReader, load as dcp_load
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    set_model_state_dict,
-)
+from torch.distributed.checkpoint import FileSystemReader
+from torch.distributed.checkpoint import load as dcp_load
+from torch.distributed.checkpoint.state_dict import (StateDictOptions,
+                                                     get_model_state_dict,
+                                                     set_model_state_dict)
 
-from .config import ModelConfig, coerce_model_config
 from ..model.layers import Instance, resize_scaler_buffer
+from .config import ModelConfig, coerce_model_config
 
 
 class Format(Protocol):
@@ -263,10 +262,8 @@ class Model:
         suffix = p.suffix.lower()
 
         if not suffix and p.exists() and p.is_dir():
-            from torch.distributed.checkpoint import (
-                FileSystemWriter,
-                save as dcp_save,
-            )
+            from torch.distributed.checkpoint import FileSystemWriter
+            from torch.distributed.checkpoint import save as dcp_save
 
             opts_sd = StateDictOptions(full_state_dict=True)
             m_sd = get_model_state_dict(model, options=opts_sd)
