@@ -193,9 +193,6 @@ def _is_nvidia_te_supported() -> bool:
             return False
     except Exception:
         pass
-    major, minor = cuda_compute_capability(device)
-    if major < 8:
-        return False
     return True
 
 
