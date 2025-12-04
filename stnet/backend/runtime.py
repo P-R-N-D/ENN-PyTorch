@@ -829,20 +829,68 @@ def get_tqdm(
 
 
 def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[float]]:
-    if not _NVML_READY or getattr(device, "type", "") != "cuda":
+    if getattr(device, "type", "") != "cuda":
         return None, None
+
+    gpu_util: Optional[float] = None
+    mem_util: Optional[float] = None
+
+    if _NVML_READY:
+        try:
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            h = _nvml.nvmlDeviceGetHandleByIndex(int(idx))
+            u = _nvml.nvmlDeviceGetUtilizationRates(h)
+            mi = _nvml.nvmlDeviceGetMemoryInfo(h)
+            gpu_util = float(getattr(u, "gpu", 0.0))
+            if getattr(mi, "total", 0):
+                mem_util = 100.0 * float(mi.used) / float(mi.total)
+        except Exception:
+            pass
+
+    if mem_util is None:
+        with contextlib.suppress(Exception):
+            idx = device.index if device.index is not None else torch.cuda.current_device()
+            free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+            if total_bytes:
+                used_bytes = float(total_bytes - free_bytes)
+                mem_util = 100.0 * used_bytes / float(total_bytes)
+
+    return gpu_util, mem_util
+
+
+def _xpu_mem_util(device: torch.device) -> Optional[float]:
+    if getattr(device, "type", "") != "xpu":
+        return None
+    if not hasattr(torch, "xpu"):
+        return None
     try:
-        idx = device.index if device.index is not None else torch.cuda.current_device()
-        h = _nvml.nvmlDeviceGetHandleByIndex(int(idx))
-        u = _nvml.nvmlDeviceGetUtilizationRates(h)
-        mi = _nvml.nvmlDeviceGetMemoryInfo(h)
-        gpu_util = float(getattr(u, "gpu", 0.0))
-        mem_util = (
-            (100.0 * float(mi.used) / float(mi.total)) if getattr(mi, "total", 0) else None
-        )
-        return gpu_util, mem_util
+        idx = device.index if device.index is not None else torch.xpu.current_device()
+        props = torch.xpu.get_device_properties(idx)
+        total = getattr(props, "total_memory", None)
+        if not total:
+            return None
+        used = float(torch.xpu.memory_allocated(idx))
+        return 100.0 * used / float(total) if total > 0 else None
     except Exception:
-        return None, None
+        return None
+
+
+def _mps_mem_util(device: torch.device) -> Optional[float]:
+    if getattr(device, "type", "") != "mps":
+        return None
+    if not hasattr(torch, "mps"):
+        return None
+    if _psutil is None:
+        return None
+    try:
+        vm = _psutil.virtual_memory()
+        total = float(getattr(vm, "total", 0.0))
+        if total <= 0.0:
+            return None
+        used = float(torch.mps.current_allocated_memory())
+        return 100.0 * used / total
+    except Exception:
+        return None
 
 
 def _sync_int_across_ranks(value: int, device: torch.device, src: int = 0) -> int:
@@ -967,6 +1015,7 @@ def epochs(
     util_alpha: float = 0.2
     global_step: int = 0
     util_adjust_interval: int = 0
+    util_warmup_steps: int = 0
 
     def _cast_fp_buffers(module: torch.nn.Module, dtype: torch.dtype) -> None:
         for buf in module.buffers(recurse=True):
@@ -1158,6 +1207,12 @@ def epochs(
 
     if train_steps > 0:
         util_adjust_interval = max(10, int(train_steps * 0.05))
+        # Enable auto-tuning after at least 10% of an epoch has passed,
+        # but no earlier than 50 steps. Also do not exceed train_steps.
+        util_warmup_steps = max(
+            util_adjust_interval,
+            min(int(train_steps), max(50, int(train_steps * 0.1))),
+        )
 
     status_bar = (
         get_tqdm(title="Training", total=total_updates, device=device)
@@ -1378,20 +1433,31 @@ def epochs(
 
                             if device.type == "cuda":
                                 util_now, mem_now = _gpu_nvml_utils(device)
-                                if util_now is not None:
-                                    util_now = float(util_now)
-                                    if gpu_util_ema is None:
-                                        gpu_util_ema = util_now
-                                    else:
-                                        gpu_util_ema = (1.0 - util_alpha) * gpu_util_ema + util_alpha * util_now
-                                if mem_now is not None:
-                                    mem_now = float(mem_now)
-                                    if mem_util_ema is None:
-                                        mem_util_ema = mem_now
-                                    else:
-                                        mem_util_ema = (1.0 - util_alpha) * mem_util_ema + util_alpha * mem_now
+                            elif device.type == "xpu":
+                                util_now, mem_now = None, _xpu_mem_util(device)
+                            elif device.type == "mps":
+                                util_now, mem_now = None, _mps_mem_util(device)
+                            else:
+                                util_now, mem_now = None, None
 
-                            if util_adjust_interval > 0 and (global_step % util_adjust_interval == 0):
+                            if util_now is not None:
+                                util_now = float(util_now)
+                                if gpu_util_ema is None:
+                                    gpu_util_ema = util_now
+                                else:
+                                    gpu_util_ema = (1.0 - util_alpha) * gpu_util_ema + util_alpha * util_now
+                            if mem_now is not None:
+                                mem_now = float(mem_now)
+                                if mem_util_ema is None:
+                                    mem_util_ema = mem_now
+                                else:
+                                    mem_util_ema = (1.0 - util_alpha) * mem_util_ema + util_alpha * mem_now
+
+                            if (
+                                util_adjust_interval > 0
+                                and global_step >= util_warmup_steps
+                                and (global_step % util_adjust_interval == 0)
+                            ):
                                 new_grad_accum = grad_accum_steps
 
                                 util_frac: Optional[float] = None
