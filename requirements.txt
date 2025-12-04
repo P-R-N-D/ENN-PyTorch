@@ -1,21 +1,25 @@
+# Notes:
+# - Do NOT add `triton` here; PyTorch will install a matching version automatically.
+# - Install the correct PyTorch build for your accelerator (CUDA/ROCm/XPU/CPU) BEFORE installing extras.
+
+# Base runtime (mirrors pyproject [project.dependencies])
 netifaces>=0.11.0
 numpy>=2.2.5
 psutil>=7.0.0
 py-cpuinfo>=9.0.0
 scipy>=1.14.1
 tensordict>=0.10.0
-torch>=2.8.0
+torch>=2.2
 torchdata>=0.11.0
 torchrl>=0.8.1
+tensordict>=0.10.0
 tqdm>=4.67.1
-triton>=3.2.0
+safetensors>=0.4.0
 
 # Optional extras (install via `pip install -e .[extra]`):
-# pandas: pandas>=2.2.0
-# polars: polars>=1.30.0
-# excel: pandas>=2.2.0, openpyxl>=3.1.5, fastexcel>=0.14.0
-# spark: pyspark[pandas_on_spark]>=4.0.0
-# thread: psutil>=7.0.0
+# pandas: pandas>=2.2.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
+# pandas_spark: pyspark[pandas_on_spark]>=4.0.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
+# polars: polars>=1.30.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
 # torchao: torchao>=0.11.0
 # nvidia_te_cu12: transformer-engine-cu12>=2.2.0, transformer-engine-torch>=2.2.0
 # nvidia_te_cu13: transformer-engine-cu13>=2.9.0, transformer-engine-torch>=2.2.0
