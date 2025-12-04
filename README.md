@@ -21,7 +21,7 @@ Spatio‑temporal neural network building blocks for PyTorch with pragmatic util
    ```bash
    pip install --upgrade pip
    # Example (CUDA users should pick the right index-url/wheel for their CUDA version)
-   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.2'
+   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.8.0'
    pip install -e .
    ```
 
