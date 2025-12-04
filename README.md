@@ -1,111 +1,153 @@
 # STNet-PyTorch
 
-STNet-PyTorch is a PyTorch implementation of the STNet architecture for joint spatial and temporal modeling. The package ships a high-level backend that takes care of configuration management, training, inference, export utilities, and runtime diagnostics so you can focus on preparing tensors and tuning hyperparameters.
+Spatio‑temporal neural network building blocks for PyTorch with pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
+
+> **Python**: 3.10+ · **License**: PolyForm Noncommercial 1.0.0
 
 ## Features
-- **Unified configuration layer**: `stnet.api.config` exposes `ModelConfig`, `PatchConfig`, and `RuntimeConfig` along with helpers such as `build_config`/`coerce_build_config` and modeling aliases that normalize spatial (`ss`), temporal (`tt`), and spatio-temporal (`st`) shorthands.
-- **Backend facade**: `stnet.backend` re-exports lifecycle helpers (`new_model`, `save_model`, `load_model`, `learn`/`train`, `infer`/`predict`) and exporter shims (TorchScript, ONNX, TensorRT, Core ML, ExecuTorch, TensorFlow, LiteRT) while using the same configuration dataclasses.
-- **Precision-aware modules**: normalization layers and Student’s t components preserve native dtypes for statistics while casting inputs/outputs for safe AMP, BF16, and FP8 execution.
-- **Architecture utilities**: `stnet.model` contains the `Root` model, encoder blocks, `CrossAttention`, `PatchAttention`, and shared primitives under `stnet.model.layers`.
-- **Data transforms**: reusable preprocessing lives under `stnet.data.transforms` for consistent feature handling.
-- **Thread load balancer**: dataloader workers pin to allowed CPUs, request OpenMP `proc_bind(spread)` when available, and tune intra/inter-op threads to avoid oversubscription.
-
-## Requirements and dependencies
-- Python 3.10+
-- PyTorch built for your hardware (CUDA, ROCm, XPU, or CPU-only) installed prior to the editable install.
-
-Core runtime dependencies:
-- `netifaces>=0.11.0`
-- `numpy>=2.2.5`
-- `psutil>=7.0.0`
-- `py-cpuinfo>=9.0.0`
-- `scipy>=1.14.1`
-- `tensordict>=0.10.0`
-- `torch>=2.8.0`
-- `torchdata>=0.11.0`
-- `torchrl>=0.8.1`
-- `tqdm>=4.67.1`
-- `triton>=3.2.0`
-
-Optional extras (install with `pip install -e .[extra]`):
-- `pandas`: pandas dataframe integration.
-- `polars`: Polars dataframe integration.
-- `excel`: spreadsheet helpers via `pandas`, `openpyxl`, and `fastexcel`.
-- `spark`: Spark pipelines (`pyspark[pandas_on_spark]`).
-- `thread`: explicit installation of `psutil` for thread affinity helpers.
-- `torchao`: advanced optimization toolchain.
-- `nvidia_te_cu12` / `nvidia_te_cu13`: NVIDIA Transformer Engine builds for CUDA 12/13.
-- `intel_ai`: Intel Extension for PyTorch.
-- `service`: exporter stack (ONNX, ONNX-TF, ONNX2TF, Core ML, TensorRT, ExecuTorch).
-- `telemetry`: GPU telemetry (`pynvml`).
+- **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation.
+- **I/O helpers** (`stnet.api.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
+- **Runtime utilities** (`stnet.backend.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
+- **Distributed** (`stnet.backend.distributed`): utilities to bootstrap and coordinate multi‑process training.
+- **Export** (`stnet.backend.export`): ONNX and serving-oriented conversion helpers (optional `service` extra).
+- **Data pipeline** (`stnet.data`): transforms, simple stats, and `torchdata`-driven nodes for scalable input pipelines.
+- **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), FX utils, and optimizers/SWA.
+- **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `History`, `Instance`).
 
 ## Installation
-1. Create and activate a Python 3.10+ environment.
-2. Install PyTorch that matches your hardware by following the official [PyTorch instructions](https://pytorch.org/get-started/locally/).
-3. Install STNet-PyTorch in editable mode:
+
+1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).
+2. Install STNet-PyTorch (editable for development is recommended):
    ```bash
+   pip install --upgrade pip
+   # Example (CUDA users should pick the right index-url/wheel for their CUDA version)
+   # pip install --index-url https://download.pytorch.org/whl/cu121 'torch>=2.2'
    pip install -e .
    ```
-4. Add extras as needed, for example the exporter stack:
-   ```bash
-   pip install -e .[service]
-   ```
 
-## Quickstart
-```python
-import torch
-from stnet import (
-    PatchConfig,
-    build_config,
-    infer,
-    learn,
-    load_model,
-    new_model,
-    save_model,
-)
+Optional extras:
+```bash
+# ONNX/CoreML/TensorRT/ExecuTorch export helpers
+pip install -e .[deployment]
 
-patch = PatchConfig(is_cube=True, grid_size_3d=(10, 10, 1), patch_size_3d=(1, 1, 1))
-config = build_config(
-    modeling_type="spatiotemporal",
-    depth=64,
-    heads=4,
-    patch=patch,
-    compile_mode="default",
-)
+# Dataframe integrations
+pip install -e .[pandas]      # or: .[polars]
 
-model = new_model(in_dim=1024, out_shape=(10,), config=config)
-features = torch.randn(32, model.in_dim)
-labels = torch.randn(32, *model.out_shape)
+# Pandas on Spark (with pandas-on-Spark)
+pip install -e .[pandas_on_spark]
 
-train_ds = {"X": features, "Y": labels}
-trained = learn(model, train_ds, epochs=1, batch_size=8)
+# NVIDIA TE / Intel IPEX / TorchAO (hardware-specific)
+pip install -e .[nvidia_te_cu12]   # or .[nvidia_te_cu13]
+pip install -e .[intel_ai]
+pip install -e .[torchao]
 
-infer_batch = {"X": features, "Y": torch.zeros_like(labels)}
-predictions = infer(trained, infer_batch)
-
-save_path = save_model(trained, "checkpoints/stnet.pt")
-restored = load_model(save_path)
-
-restored.eval()
-with torch.inference_mode():
-    scripted_output, _ = restored(features)
+# Telemetry (NVIDIA GPU info)
+pip install -e .[telemetry]
 ```
 
-During training the progress bar reports MB/s, TFLOPS, elapsed time, and completion percentage while distributed workers stay synchronized. FLOP counters and adaptive loss weights update automatically, and dataset schemas remain aligned with provided tensors.
+> **Note**: Do **not** install `triton` manually; the correct Triton build is pulled automatically by PyTorch.
 
-## Configuration and compilation
-`ModelConfig.compile_mode` accepts the same modes as `torch.compile` (e.g., `"default"`, `"reduce-overhead"`, `"max-autotune"`). The helper in `stnet.functional.fx.compile` trims whitespace, normalizes disabled options (`"disabled"`, `"none"`, empty string), and skips compilation when unsupported.
+## Quickstart
 
-## Diagnostics and troubleshooting
-- Set `STNET_META_HOOK=1` to raise immediately when a module receives a meta/FakeTensor. Use `STNET_META_HOOK=warn` during inference services to log without aborting.
-- Set `STNET_DISABLE_MKLDNN=1` to disable the oneDNN (MKLDNN) backend before model construction.
+Minimal forward/backward loop:
 
-## Exporting for inference
-Exporter helpers automatically check for optional dependencies and raise informative errors if ONNX, TensorFlow, Core ML, TensorRT, LiteRT, or ExecuTorch backends are missing. Install the `service` extra to enable the full conversion toolkit.
+```python
+import torch
+from stnet.api.config import ModelConfig
+from stnet.model.layers import Instance
+from stnet.functional.losses import StudentsTLoss
+from stnet.backend.system import optimize_threads
+
+# 1) Build a config and model
+cfg = ModelConfig(
+    in_dim=16,
+    out_shape=(1,),
+    depth=4,
+    heads=4,
+    device="cuda" if torch.cuda.is_available() else "cpu",
+)
+model = Instance(cfg.in_dim, cfg.out_shape, cfg)
+
+# 2) Synthetic batch (B x T x C_in) -> (B x T x *out_shape)
+x = torch.randn(32, 12, cfg.in_dim, device=next(model.parameters()).device)
+y = torch.randn(32, 12, *cfg.out_shape, device=x.device)
+
+# 3) Loss & optimizer
+loss_fn = StudentsTLoss()
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+# 4) Optional: autotune thread settings for this machine
+optimize_threads()
+
+model.train()
+for step in range(200):
+    pred = model(x)                 # forward
+    loss = loss_fn(pred, y)         # compute loss
+    loss.backward()                 # backward
+    opt.step(); opt.zero_grad()     # update
+```
+
+Checkpointing:
+```python
+from stnet.api.io import save_model, load_model
+
+save_model(model, "ckpt.pth")
+model2 = load_model("ckpt.pth", device="cuda")
+```
+
+> API names above reflect the current package layout. If you have local changes, adjust imports accordingly.
+
+## Project layout
+
+```
+stnet/
+  __init__.py
+  api/
+    __init__.py
+    config.py
+    io.py
+    run.py
+  backend/
+    __init__.py
+    compat.py
+    distributed.py
+    export.py
+    profiler.py
+    runtime.py
+    system.py
+  data/
+    __init__.py
+    datatype.py
+    nodes.py
+    pipeline.py
+    stats.py
+    transforms.py
+  functional/
+    __init__.py
+    fx.py
+    losses.py
+    optimizers.py
+  model/
+    __init__.py
+    activations.py
+    kernels.py
+    layers.py
+
+```
+
+## Environment variables
+
+- `STNET_META_HOOK`: set to `1` to fail fast on metadata shape/type mismatches during module wiring; set to `warn` to log only.
+- `STNET_DISABLE_MKLDNN`: set to `1` to disable oneDNN (MKLDNN) before model construction if it causes issues for your CPU build.
+
+## Version & compatibility notes
+
+- Python ≥ 3.10 is required.
+- PyTorch is expected to be **≥ 2.8.0**. If you rely on features that landed later (e.g., advanced Inductor options), bump the constraint accordingly.
+- `torchdata` is used by the data pipeline nodes; it is listed as a dependency to avoid runtime import errors.
+- `triton` is intentionally **not** pinned here; the correct binary is installed as a transitive dependency of PyTorch.
 
 ## License
-**Code** is licensed under **PolyForm Noncommercial 1.0.0** (SPDX: `PolyForm-Noncommercial-1.0.0`). See `LICENSE`.
 
-**Model weights / datasets** (and other non-code artifacts) are provided under **CC BY-NC 4.0**. See the "Creative Commons Attribution-NonCommercial 4.0 International" section in `LICENSE`.
-
-Commercial use requires a separate license. Please contact the author.
+**Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
+**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license.
