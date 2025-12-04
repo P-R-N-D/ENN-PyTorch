@@ -189,28 +189,13 @@ def _is_nvidia_te_supported() -> bool:
     if device.type != "cuda":
         return False
     try:
-        index = (
-            device.index if device.index is not None else torch.cuda.current_device()
-        )
-    except Exception:
-        index = 0
-    try:
-        props = torch.cuda.get_device_properties(index)
-        maj = int(getattr(props, "major", 0))
-        minr = int(getattr(props, "minor", 0))
-    except Exception:
-        try:
-            maj, minr = torch.cuda.get_device_capability(index)
-        except Exception:
-            return False
-    min_major, min_minor = 8, 0
-    if maj < min_major or (maj == min_major and minr < min_minor):
-        return False
-    try:
         if torch._dynamo.is_compiling():
             return False
     except Exception:
         pass
+    major, minor = cuda_compute_capability(device)
+    if major < 8:
+        return False
     return True
 
 
@@ -319,28 +304,6 @@ else:
         device = torch.device("cuda", 0)
     if getattr(device, "type", "cpu") != "cuda":
         _should_import_te = False
-    else:
-        try:
-            index = (
-                device.index
-                if device.index is not None
-                else torch.cuda.current_device()
-            )
-        except Exception:
-            index = 0
-        try:
-            props = torch.cuda.get_device_properties(index)
-            major = int(getattr(props, "major", 0))
-        except Exception:
-            try:
-                major, _ = torch.cuda.get_device_capability(index)
-            except Exception:
-                major = 0
-        min_major = 8
-        if min_major >= 10:
-            min_major //= 10
-        if major < min_major:
-            _should_import_te = False
 if _should_import_te:
     try:
         import transformer_engine.pytorch as te
@@ -353,16 +316,18 @@ else:
     _HAS_TE = False
 
 
-def _is_nvidia_mha_preferred(min_cc: Tuple[int, int] = (8, 0)) -> bool:
+def _is_nvidia_mha_preferred() -> bool:
     if not _HAS_TE:
         return False
     if not _is_nvidia_te_supported():
         return False
-    device = get_device()
+    try:
+        device = get_device()
+    except Exception:
+        device = torch.device("cuda", 0)
     if device.type != "cuda" or not torch.cuda.is_available():
         return False
-    cc = cuda_compute_capability(device)
-    return cc >= min_cc
+    return True
 
 
 class DotProductAttention(nn.Module):
@@ -863,24 +828,8 @@ class MultiScaleRetention(nn.Module):
         self._fallback = MultiScaleRetentionCompat(
             self.d_model, self.nhead, use_gate=self.use_gate
         )
-        self._ts_ok = False
         self._triton_ok = False
-        try:
-            from torchscale.component.multiscale_retention import (
-                MultiScaleRetention as _TorchScaleMSR,
-            )
 
-            self._ts_msr = _TorchScaleMSR(self.d_model, self.nhead)
-            self._msr_dev_tag: Optional[str] = None
-            self._msr_compiled: bool = False
-            self._msr_ipex_infer: bool = False
-            self._ts_key_dim = int(
-                getattr(self._ts_msr, "key_dim", self.d_model // self.nhead)
-            )
-            self._ts_ok = True
-        except Exception:
-            self._ts_ok = False
-            self._ts_msr = None                            
 
         self._triton_msr: Optional[MultiScaleRetentionTriton]
         self._triton_msr = None
@@ -897,11 +846,7 @@ class MultiScaleRetention(nn.Module):
         self._decay_range = 1.0
 
     def _get_coords(self, seq_len: Any, device: Any, dtype: Any) -> Any:
-        key_dim = int(
-            self._ts_key_dim
-            if getattr(self, "_ts_key_dim", None) is not None
-            else self.d_model // self.nhead
-        )
+        key_dim = int(self.d_model // self.nhead)
         half = key_dim // 2
         coord_dtype = dtype if dtype in (
             torch.float64,
@@ -953,33 +898,6 @@ class MultiScaleRetention(nn.Module):
         dtype = x.dtype
         device = x.device
         sin, cos, rel = self._get_coords(seq_len, device, dtype)
-
-        if self._ts_ok:
-            try:
-                outputs = self._ts_msr(                          
-                    x,
-                    sin=sin,
-                    cos=cos,
-                    decay=rel,
-                    attn_mask=attn_mask,
-                    state=state,
-                    **kwargs,
-                )
-            except TypeError:
-                outputs = self._ts_msr(x, sin=sin, cos=cos, decay=rel)                          
-            except Exception:
-                outputs = None
-
-            if isinstance(outputs, torch.Tensor):
-                try:
-                    B_ = x.shape[0]
-                    fl = _estimate_flops_msr(B_, seq_len, num_heads=self.nhead, head_dim=self.d_model // self.nhead, use_gate=self.use_gate)
-                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
-                except Exception:
-                    pass
-                return outputs
-            if isinstance(outputs, tuple) and outputs:
-                return outputs[0]
 
         if (
             self._triton_ok
@@ -1416,11 +1334,10 @@ class MultiHeadAttention(nn.Module):
         bias: bool = True,
         dropout: float = 0.0,
         batch_first: bool = True,
-        prefer_te_min_cc: Tuple[int, int] = (8, 0),
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        if _is_nvidia_mha_preferred(prefer_te_min_cc):
+        if _is_nvidia_mha_preferred():
             try:
                 impl = _MultiHeadAttentionNvidia(
                     embed_dim,

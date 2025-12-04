@@ -6,7 +6,6 @@ import math
 import warnings
 from dataclasses import dataclass
 from collections import deque
-from importlib import import_module
 from typing import (
     Any,
     Dict,
@@ -908,38 +907,6 @@ class RetNet(nn.Module):
 
         self.norm1 = norm_layer(norm_type, self.d_model)
 
-        self._ts_impl: Optional[nn.Module] = None
-        try:
-            ts_retnet_mod = import_module("torchscale.architecture.retnet")
-        except Exception:
-            ts_retnet_mod = None
-
-        if ts_retnet_mod is not None:
-            candidates: list[Any] = []
-            for name in ("RetNetDecoderLayer", "RetNetLayer", "RetNetBlock"):
-                if hasattr(ts_retnet_mod, name):
-                    candidates.append(getattr(ts_retnet_mod, name))
-            for cls in candidates:
-                if not callable(cls):
-                    continue
-                ctor_variants = (
-                    dict(embed_dim=self.d_model, retention_heads=self.nhead),
-                    dict(
-                        decoder_embed_dim=self.d_model,
-                        decoder_retention_heads=self.nhead,
-                    ),
-                )
-                for ck in ctor_variants:
-                    try:
-                        self._ts_impl = cls(**ck)
-                        break
-                    except TypeError:
-                        continue
-                    except Exception:
-                        continue
-                if self._ts_impl is not None:
-                    break
-
         self.retention = Retention(self.d_model, self.nhead)
 
         self.dropout = nn.Dropout(dropout)
@@ -960,31 +927,11 @@ class RetNet(nn.Module):
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
 
-        h: torch.Tensor
-        new_state: Optional[dict] = state
-        used_ts = False
-        if self._ts_impl is not None:
-            try:
-                out_ts = self._ts_impl(
-                    x,
-                    attn_mask=causal_mask,
-                )
-                if isinstance(out_ts, tuple):
-                    h = out_ts[0]
-                else:
-                    h = out_ts
-                used_ts = True
-            except Exception:
-                used_ts = False
-
-        if not used_ts:
-            h, new_state = self.retention(
-                self.norm1(x),
-                attn_mask=causal_mask,
-                state=state,
-            )
-        else:
-            h = self.norm1(h)
+        h, new_state = self.retention(
+            self.norm1(x),
+            attn_mask=causal_mask,
+            state=state,
+        )
 
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
@@ -1241,61 +1188,28 @@ class LongNet(nn.Module):
             "include_softmax_scale_dropout": True,
         }
         self.batch_first = bool(batch_first)
-        self._impl: Optional[nn.Module] = None
-        try:
-            ts_longnet = import_module("torchscale.net.longnet")
-        except Exception:
-            self._impl = None
-        else:
-            ctor_variants = (
-                {
-                    "embed_dim": embed_dim,
-                    "num_heads": num_heads,
-                    "depth": depth,
-                    "dropout": dropout,
-                },
-                {
-                    "d_model": embed_dim,
-                    "nhead": num_heads,
-                    "num_layers": depth,
-                    "dropout": dropout,
-                },
-            )
-            longnet_ctor = getattr(ts_longnet, "LongNet", None)
-            impl = None
-            if callable(longnet_ctor):
-                for kw in ctor_variants:
-                    try:
-                        impl = longnet_ctor(**kw)
-                        break
-                    except Exception:
-                        continue
-            self._impl = impl
-
-        if self._impl is not None:
-            self._using = "torchscale"
-            self._impl_batch_first = getattr(self._impl, "batch_first", True)
-        else:
-            self._using = "fallback"
-            self._impl_batch_first = self.batch_first
-            layers: List[nn.Module] = []
-            dilation = base_dilation
-            for _ in range(depth):
-                layers.append(
-                    DilatedAttention(
-                        embed_dim=embed_dim,
-                        num_heads=num_heads,
-                        dilation=dilation,
-                        window_size=window_size,
-                        dropout=dropout,
-                        mlp_ratio=mlp_ratio,
-                        causal=causal,
-                        batch_first=self.batch_first,
-                    )
+        # TorchScale LongNet is deliberately disabled to keep semantics stable.
+        self._impl = None
+        self._using = "fallback"
+        self._impl_batch_first = self.batch_first
+        layers: List[nn.Module] = []
+        dilation = base_dilation
+        for _ in range(depth):
+            layers.append(
+                DilatedAttention(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    dilation=dilation,
+                    window_size=window_size,
+                    dropout=dropout,
+                    mlp_ratio=mlp_ratio,
+                    causal=causal,
+                    batch_first=self.batch_first,
                 )
-                dilation = max(1, dilation * max(1, int(dilation_growth)))
-            self.layers = nn.ModuleList(layers)
-            self.norm = nn.LayerNorm(embed_dim)
+            )
+            dilation = max(1, dilation * max(1, int(dilation_growth)))
+        self.layers = nn.ModuleList(layers)
+        self.norm = nn.LayerNorm(embed_dim)
 
     @property
     def using(self) -> str:
@@ -1308,26 +1222,6 @@ class LongNet(nn.Module):
         need_weights: bool = False,
         **_: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        if self._impl is not None:
-            out = x
-            need_transpose = (
-                out.dim() == 3
-                and (self.batch_first != bool(self._impl_batch_first))
-                and (out.shape[0] != out.shape[1])
-            )
-            if need_transpose:
-                out = out.transpose(0, 1)
-            try:
-                out = self._impl(out)
-            except Exception as exc:
-                warnings.warn(
-                    f"torchscale LongNet call failed: {exc}. Returning the input tensor.",
-                    RuntimeWarning,
-                )
-            if need_transpose and out.dim() == 3 and out.shape[0] != out.shape[1]:
-                out = out.transpose(0, 1)
-            return out, None
-
         attn_w: Optional[torch.Tensor] = None
         out = x
         need_transpose_fallback = (

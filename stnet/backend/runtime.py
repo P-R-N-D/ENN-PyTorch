@@ -845,6 +845,17 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
         return None, None
 
 
+def _sync_int_across_ranks(value: int, device: torch.device, src: int = 0) -> int:
+    if not is_distributed():
+        return int(value)
+    try:
+        tensor = torch.tensor([int(value)], device=device, dtype=torch.int32)
+        torch.distributed.broadcast(tensor, src=src)
+        return int(tensor.item())
+    except Exception:
+        return int(value)
+
+
 def _cpu_percent_now() -> Optional[float]:
     if _psutil is None:
         return None
@@ -944,10 +955,18 @@ def epochs(
     auto_steps = min(auto_steps, 64)
 
     grad_accum_steps: int = int(auto_steps)
+    grad_accum_steps = _sync_int_across_ranks(grad_accum_steps, device=device, src=0)
+
     logging.info(
         f"[epochs] auto grad_accum_steps={grad_accum_steps} "
         f"(per_batch={per_batch}, target_global_batch={target_global_batch}, factor={factor})"
     )
+
+    gpu_util_ema: Optional[float] = None
+    mem_util_ema: Optional[float] = None
+    util_alpha: float = 0.2
+    global_step: int = 0
+    util_adjust_interval: int = 0
 
     def _cast_fp_buffers(module: torch.nn.Module, dtype: torch.dtype) -> None:
         for buf in module.buffers(recurse=True):
@@ -1127,8 +1146,8 @@ def epochs(
             model_for_scaler.scaler.y_mean.copy_(mean_y)
             model_for_scaler.scaler.y_std.copy_(std_y)
 
-    start_kst_ns = posix_time("Asia/Seoul")
     in_dim = int(ops.in_dim)
+
     use_timer = (
         (device.type == "cuda" and hasattr(torch.cuda, "Event")) or
         (device.type == "xpu" and hasattr(torch, "xpu") and hasattr(torch.xpu, "Event"))
@@ -1136,6 +1155,10 @@ def epochs(
     train_steps = _num_batches(train_loader)
     val_steps = _num_batches(val_loader)
     total_updates = int(total_epochs) * (int(train_steps) + int(val_steps))
+
+    if train_steps > 0:
+        util_adjust_interval = max(10, int(train_steps * 0.05))
+
     status_bar = (
         get_tqdm(title="Training", total=total_updates, device=device)
         if local_rank == 0
@@ -1226,6 +1249,7 @@ def epochs(
             flop_counter_train = FlopCounter(model, mode="train", device=device)
             with flop_counter_train:
                 model.train()
+                global_step = 0
                 optimizer.zero_grad(set_to_none=True)
                 t_fetch_start = time.perf_counter_ns()
                 total_batches = len(train_loader)
@@ -1348,6 +1372,67 @@ def epochs(
                                                 flop_breakdown_epoch.get(name, 0.0)
                                                 + float(value)
                                             )
+
+                        if should_sync:
+                            global_step += 1
+
+                            if device.type == "cuda":
+                                util_now, mem_now = _gpu_nvml_utils(device)
+                                if util_now is not None:
+                                    util_now = float(util_now)
+                                    if gpu_util_ema is None:
+                                        gpu_util_ema = util_now
+                                    else:
+                                        gpu_util_ema = (1.0 - util_alpha) * gpu_util_ema + util_alpha * util_now
+                                if mem_now is not None:
+                                    mem_now = float(mem_now)
+                                    if mem_util_ema is None:
+                                        mem_util_ema = mem_now
+                                    else:
+                                        mem_util_ema = (1.0 - util_alpha) * mem_util_ema + util_alpha * mem_now
+
+                            if util_adjust_interval > 0 and (global_step % util_adjust_interval == 0):
+                                new_grad_accum = grad_accum_steps
+
+                                util_frac: Optional[float] = None
+                                mem_frac: Optional[float] = None
+
+                                if gpu_util_ema is not None:
+                                    util_frac = max(0.0, min(1.0, gpu_util_ema / 100.0))
+                                if mem_util_ema is not None:
+                                    mem_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
+
+                                if util_frac is None:
+                                    total_t_local = float(io_time + comp_time)
+                                    if total_t_local > 0.0:
+                                        util_frac = max(
+                                            0.0,
+                                            min(1.0, float(comp_time) / total_t_local),
+                                        )
+                                    else:
+                                        util_frac = 0.0
+
+                                if util_frac is not None:
+                                    if mem_frac is not None:
+                                        if util_frac < 0.88 and mem_frac < 0.90:
+                                            new_grad_accum = min(64, grad_accum_steps + 1)
+                                        elif util_frac > 0.97 or mem_frac > 0.92:
+                                            new_grad_accum = max(1, grad_accum_steps - 1)
+                                    else:
+                                        if util_frac < 0.88:
+                                            new_grad_accum = min(64, grad_accum_steps + 1)
+                                        elif util_frac > 0.97:
+                                            new_grad_accum = max(1, grad_accum_steps - 1)
+
+                                if new_grad_accum != grad_accum_steps:
+                                    new_grad_accum = _sync_int_across_ranks(
+                                        new_grad_accum, device=device, src=0
+                                    )
+                                    logging.info(
+                                        f"[epochs] adjusted grad_accum_steps={new_grad_accum} "
+                                        f"(gpu_util_ema={gpu_util_ema}, mem_util_ema={mem_util_ema})"
+                                    )
+                                    grad_accum_steps = new_grad_accum
                         if use_timer:
                             ev_e.record()
                             ev_e.synchronize()
@@ -1696,11 +1781,20 @@ def epochs(
             (prev_comp_time / total_t) if total_t > 0.0 else 0.0
         )
 
+        gpu_util_frac = None
+        mem_util_frac = None
+        if gpu_util_ema is not None:
+            gpu_util_frac = max(0.0, min(1.0, gpu_util_ema / 100.0))
+        if mem_util_ema is not None:
+            mem_util_frac = max(0.0, min(1.0, mem_util_ema / 100.0))
+
         if dev_t != "cpu":
-            if util_fallback < 0.95:
-                Dataset.request_scale_up(1.25)
-            elif util_fallback > 0.99:
-                Dataset.request_scale_down(0.90)
+            util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
+            util_for_cap = max(0.0, min(1.0, util_for_cap))
+            if mem_util_frac is not None and mem_util_frac > 0.92:
+                Dataset.request_scale_down(0.95)
+            elif util_for_cap < 0.90 and (mem_util_frac is None or mem_util_frac < 0.88):
+                Dataset.request_scale_up(1.10)
         else:
             cpu_pct = _cpu_percent_now()
             if cpu_pct is not None:
@@ -1837,7 +1931,6 @@ def infer(
 
     ref_tail_shape: Optional[Tuple[int, ...]] = None
     ref_dtype: Optional[torch.dtype] = None
-    bad_tail: Optional[Tuple[int, ...]] = None
     shape_inconsistent: bool = False
 
     dtype_size = (
@@ -1979,7 +2072,7 @@ def infer(
                 t0 = time.perf_counter_ns()
                 state = getattr(run_model, "_autobs_infer", None)
                 if state is None:
-                    state = {"mb": 0, "util_prev": None, "bps_est": None}
+                    state = {"mb": 0, "util_prev": None, "bps_est": None, "util_ema": None}
                     setattr(run_model, "_autobs_infer", state)
                 B = int(X.shape[0])
                 mb = int(state["mb"] or max(1, B // 2))
@@ -1989,6 +2082,9 @@ def infer(
                 pre_alloc = (
                     torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
                 )
+
+                comp_time_batch = 0.0
+                io_time_batch = float(wait_s + h2d_s)
                 for _micro in range(chunks):
                     sl = slice(s_idx, min(B, s_idx + mb))
                     s_idx += mb
@@ -2051,8 +2147,7 @@ def infer(
                         else:
                             if tail != ref_tail_shape or y_hat_cpu.dtype != ref_dtype:
                                 if not shape_inconsistent:
-                                    bad_tail = tail
-                                shape_inconsistent = True
+                                    shape_inconsistent = True
                     except Exception:
                         pass
                     if rank != 0:
@@ -2076,25 +2171,50 @@ def infer(
                         step_flops = float(step_counter.get_total_flops())
                     total_flops += max(0.0, step_flops)
 
-                comp_time += (time.perf_counter_ns() - t0) / 1_000_000_000.0
-                util_cur = float((time.perf_counter_ns() - t0) / 1_000_000_000.0) / max(
-                    float(wait_s + h2d_s) + float((time.perf_counter_ns() - t0) / 1_000_000_000.0), 1e-6
-                )
-                grew = (state.get("util_prev") is None) or (util_cur >= state["util_prev"] - 0.02)
-                state["util_prev"] = util_cur
+                dt = (time.perf_counter_ns() - t0) / 1_000_000_000.0
+                comp_time_batch += float(dt)
+                comp_time += float(dt)
+
+                total_t_batch = max(comp_time_batch + io_time_batch, 1e-6)
+                util_cur = comp_time_batch / total_t_batch
+
+                alpha = 0.2
+                if state.get("util_ema") is None:
+                    state["util_ema"] = float(util_cur)
+                else:
+                    state["util_ema"] = (1.0 - alpha) * float(state["util_ema"]) + alpha * float(util_cur)
+
                 if state.get("bps_est") is None and device.type == "cuda":
                     delta = max(0, torch.cuda.memory_allocated(device) - pre_alloc)
                     if delta > 0:
                         state["bps_est"] = delta / float(mb)
+
+                u = float(state["util_ema"])
+                target_hi = 0.98
+                target_lo = 0.90
+
+                new_mb = mb
+                if u < target_lo:
+                    new_mb = min(B, mb + max(1, mb // 4))
+                elif u > target_hi:
+                    new_mb = max(1, mb - max(1, mb // 4))
+
                 mb_mem = B
                 if device.type == "cuda" and state.get("bps_est"):
-                    free, total = torch.cuda.mem_get_info(device)
-                    alloc_now = torch.cuda.memory_allocated(device)
-                    target = int(total * 0.90)
-                    headroom = max(0, target - alloc_now)
-                    mb_mem = max(1, min(B, int(headroom / max(1, int(state["bps_est"])))))
-                mb_util = (min(B, mb + max(1, mb // 4)) if grew else max(1, int(math.ceil(mb * 0.9))))
-                state["mb"] = max(1, min(mb_mem, mb_util))
+                    try:
+                        _, total = torch.cuda.mem_get_info(device)
+                        alloc_now = torch.cuda.memory_allocated(device)
+                        target = int(total * 0.90)
+                        headroom = max(0, target - alloc_now)
+                        mb_mem = max(
+                            1,
+                            min(B, int(headroom / max(1, int(state["bps_est"])))),
+                        )
+                    except Exception:
+                        mb_mem = B
+
+                new_mb = max(1, min(new_mb, mb_mem))
+                state["mb"] = new_mb
                 if local_rank == 0:
                     mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
                     tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
