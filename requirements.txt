@@ -9,7 +9,7 @@ psutil>=7.0.0
 py-cpuinfo>=9.0.0
 scipy>=1.14.1
 tensordict>=0.10.0
-torch>=2.2
+torch>=2.8.0
 torchdata>=0.11.0
 torchrl>=0.8.1
 tensordict>=0.10.0
@@ -18,11 +18,11 @@ safetensors>=0.4.0
 
 # Optional extras (install via `pip install -e .[extra]`):
 # pandas: pandas>=2.2.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
-# pandas_spark: pyspark[pandas_on_spark]>=4.0.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
+# pandas_on_spark: pyspark[pandas_on_spark]>=4.0.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
 # polars: polars>=1.30.0, openpyxl>=3.1.5, fastexcel>=0.14.0, xlsxwriter>=3.2.0
 # torchao: torchao>=0.11.0
 # nvidia_te_cu12: transformer-engine-cu12>=2.2.0, transformer-engine-torch>=2.2.0
 # nvidia_te_cu13: transformer-engine-cu13>=2.9.0, transformer-engine-torch>=2.2.0
 # intel_ai: intel-extension-for-pytorch>=2.7.0
-# service: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
+# deployment: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
 # telemetry: pynvml>=11.5.0
