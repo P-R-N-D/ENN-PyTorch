@@ -4,38 +4,22 @@ from __future__ import annotations
 import contextlib
 import copy
 import logging
-import math
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Sequence, Tuple, Union)
 
 import torch
-from torch import nn, optim
 from tensordict import TensorDict, TensorDictBase
+from torch import nn, optim
 
-from ..backend.system import (
-    get_device,
-    is_float8_supported,
-    is_int4_supported,
-    is_int8_supported,
-    optimal_optimizer_params,
-)
+from ..backend.system import (get_device, is_float8_supported,
+                              is_int4_supported, is_int8_supported,
+                              optimal_optimizer_params)
 from ..data.stats import Metadata
 from .fx import Autocast, Fusion, is_scale_safe
 
-
 try:
-    from torch.optim.swa_utils import AveragedModel as _SWA
     from torch.optim.swa_utils import SWALR
+    from torch.optim.swa_utils import AveragedModel as _SWA
     from torch.optim.swa_utils import update_bn as _update_bn
 except Exception:
     _SWA = None
@@ -58,7 +42,7 @@ def _log_debug(logger: Optional[Callable[[str], None]], msg: str) -> None:
 
 
 class ExponentialMovingAverage:
-    def __init__(self, model: nn.Module, decay: float = 0.9999):
+    def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         if not 0.0 < decay < 1.0:
             raise ValueError("EMA decay must be in (0, 1)")
         self.decay = decay
@@ -208,9 +192,8 @@ class AdamW:
         dev, meta = AdamW._from_metadata(model_or_params, metadata)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import (
-                    FusedAdam as TEFusedAdam,
-                )
+                from transformer_engine.pytorch.optimizers import \
+                    FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
                 if logger:
@@ -236,7 +219,8 @@ class AdamW:
             if fp8_allowed and ok:
                 if "TE" in str(reason):
                     try:
-                        from transformer_engine.pytorch.optimizers import FusedAdam
+                        from transformer_engine.pytorch.optimizers import \
+                            FusedAdam
 
                         opt = FusedAdam(params, lr=lr, weight_decay=weight_decay)
                         if logger:
@@ -290,9 +274,8 @@ class AdamW:
         dev, meta = AdamW._from_metadata(model_or_params, metadata)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import (
-                    FusedAdam as TEFusedAdam,
-                )
+                from transformer_engine.pytorch.optimizers import \
+                    FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
                 if logger:
@@ -338,10 +321,8 @@ class AdamW:
                 try:
                     from torchao.optim import AdamW4bit, AdamW8bit
                 except ImportError:
-                    from torchao.prototype.low_bit_optim import (
-                        AdamW4bit,
-                        AdamW8bit,
-                    )
+                    from torchao.prototype.low_bit_optim import (AdamW4bit,
+                                                                 AdamW8bit)
                 if quant_choice == "int8":
                     opt = AdamW8bit(params, lr=lr, weight_decay=weight_decay)
                     if logger:

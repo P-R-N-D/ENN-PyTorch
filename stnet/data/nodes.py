@@ -6,44 +6,34 @@ import os
 import random
 import threading
 from contextlib import suppress
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterator,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-    TypedDict,
-    Literal,
-)
+from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
+                    Sequence, Tuple, TypedDict)
 
 import torch
 
 TensorLike = Any
 
 try:
-    from torchdata.nodes import BaseNode, Loader as _Loader, ParallelMapper
+    from torchdata.nodes import BaseNode
+    from torchdata.nodes import Loader as _Loader
+    from torchdata.nodes import ParallelMapper
 except Exception:
-    from torchdata.nodes import BaseNode, Loader as _Loader
+    from torchdata.nodes import BaseNode
+    from torchdata.nodes import Loader as _Loader
 
     ParallelMapper = None
 
 from tensordict import MemoryMappedTensor
 
-
 try:
-    from torchdata.nodes import (
-        MultiNodeWeightedSampler,
-        PinMemory,
-        Prefetcher as _Prefetcher,
-        SamplerWrapper,
-        Batcher as _Batcher,
-        Unbatcher as _Unbatcher,
-    )
+    from torchdata.nodes import Batcher as _Batcher
+    from torchdata.nodes import MultiNodeWeightedSampler, PinMemory
+    from torchdata.nodes import Prefetcher as _Prefetcher
+    from torchdata.nodes import SamplerWrapper
+    from torchdata.nodes import Unbatcher as _Unbatcher
 except Exception:
-    from torchdata.nodes import PinMemory, Prefetcher as _Prefetcher
+    from torchdata.nodes import PinMemory
+    from torchdata.nodes import Prefetcher as _Prefetcher
 
     MultiNodeWeightedSampler = None
     SamplerWrapper = None
@@ -82,7 +72,7 @@ class Dataset(_Sampler):
             return default
 
     @classmethod
-    def _load_meta(cls, memmap_dir: str) -> Mapping[str, Any]:
+    def _load_meta(cls: type["Dataset"], memmap_dir: str) -> Mapping[str, Any]:
         meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
         if not os.path.isfile(meta_path):
             raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
@@ -93,11 +83,11 @@ class Dataset(_Sampler):
         return meta
 
     @classmethod
-    def request_scale_up(cls, factor: float) -> None:
+    def request_scale_up(cls: type["Dataset"], factor: float) -> None:
         cls._scale = min(2.0, cls._scale * float(factor))
 
     @classmethod
-    def request_scale_down(cls, factor: float) -> None:
+    def request_scale_down(cls: type["Dataset"], factor: float) -> None:
         cls._scale = max(0.5, cls._scale * float(factor))
 
     def __init__(
@@ -353,7 +343,7 @@ class Dataset(_Sampler):
             raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
         return SamplerWrapper(self)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[str, tuple[int, int]]]:
         cuts = getattr(self, "_S_cuts", None)
         if not cuts:
             self._shard()
@@ -889,7 +879,7 @@ class Prefetcher:
         self._pin   = bool(kwargs.get("pin_host", use_accel))                             
         self._gpu_stream = None
 
-    def _to_device(self, x, device):
+    def _to_device(self, x: Any, device: torch.device) -> Any:
         if torch.is_tensor(x):
             return x.to(device, non_blocking=True)
         if isinstance(x, (list, tuple)):
@@ -898,7 +888,7 @@ class Prefetcher:
             return {k: self._to_device(v, device) for k, v in x.items()}
         return x
 
-    def _pin_memory(self, x):
+    def _pin_memory(self, x: Any) -> Any:
         if not self._pin:
             return x
         if torch.is_tensor(x) and x.device.type == "cpu":
@@ -910,8 +900,9 @@ class Prefetcher:
         return x
 
     def __iter__(self) -> Iterator[Any]:
-        from torch.utils.data import get_worker_info
         import time
+
+        from torch.utils.data import get_worker_info
 
         info = get_worker_info()
         device = getattr(self, "_device", torch.device("cpu"))
@@ -956,7 +947,7 @@ class Prefetcher:
             preloaded = None
             it = iter(iterable)
 
-            def _preload():
+            def _preload() -> Any | None:
                 try:
                     b = next(it)
                 except StopIteration:
@@ -986,7 +977,7 @@ class Prefetcher:
                     )
                     cs.wait_stream(self._gpu_stream)
                                                          
-                    def _record(x):
+                    def _record(x: Any) -> None:
                         if torch.is_tensor(x):
                             x.record_stream(cs)
                             return

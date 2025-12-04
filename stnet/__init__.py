@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import os
 import logging
+import os
 import re
 import warnings
 
@@ -20,7 +20,7 @@ __all__ = [
 ]
 
 class IgnoreTorchCompileMsg(logging.Filter):
-    def filter(self, record):
+    def filter(self, record: logging.LogRecord) -> bool:
         msg = record.getMessage()
         if "No valid triton configs" in msg: return False
         elif "Runtime error during autotuning" in msg: return False

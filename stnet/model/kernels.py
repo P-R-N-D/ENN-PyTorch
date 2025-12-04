@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
 import inspect
 import math
 import warnings
@@ -12,12 +11,8 @@ import torch._dynamo
 from torch import nn
 
 from ..backend.profiler import FLOP_PROFILER, capture
-from ..backend.system import (
-    cuda_compute_capability,
-    get_device,
-    get_runtime_config,
-    get_dpa_backends,
-)
+from ..backend.system import (cuda_compute_capability, get_device,
+                              get_dpa_backends, get_runtime_config)
 
 try:
     import triton
@@ -935,17 +930,23 @@ class MultiScaleRetention(nn.Module):
 
 @triton.jit
 def _triton_retention(
-    V,
-    LAMBDA,
-    OUT,
+    V: Any,
+    LAMBDA: Any,
+    OUT: Any,
     B: tl.constexpr,
     L: tl.constexpr,
     H: tl.constexpr,
     DH: tl.constexpr,
-    SVB, SVL, SVH, SVD,
-    SOB, SOL, SOH, SOD,
+    SVB: Any,
+    SVL: Any,
+    SVH: Any,
+    SVD: Any,
+    SOB: Any,
+    SOL: Any,
+    SOH: Any,
+    SOD: Any,
     BLOCK_DH: tl.constexpr,
-):
+) -> None:
     pid_bh = tl.program_id(0)
     pid_d  = tl.program_id(1)
 

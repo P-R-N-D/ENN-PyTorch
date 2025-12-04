@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Sequence, Tuple, Union
 import torch
 from tensordict import TensorDictBase
 
-from .datatype import to_tuple, to_torch_tensor
+from .datatype import to_torch_tensor, to_tuple
 
 
 def _assert_finites(tensor: torch.Tensor, name: str) -> torch.Tensor:

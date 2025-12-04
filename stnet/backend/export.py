@@ -12,8 +12,8 @@ from tempfile import TemporaryDirectory
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
-from torch import nn
 from tensordict import TensorDictBase
+from torch import nn
 
 from ..api.io import Format
 from ..model.layers import History
@@ -336,6 +336,7 @@ class CoreML(Format):
         is_required("coremltools", "pip install coremltools")
         serving_model = _prepare_serving_model(model)
         import coremltools as ct
+
         from ..functional.fx import Gradient
 
         sample = _pad_sample(model, kwargs.get("sample_input"))
@@ -407,8 +408,8 @@ class LiteRT(Format):
         is_required("onnx", "pip install onnx")
         is_required("onnx-tf", "pip install onnx-tf")
         import onnx
-        from onnx_tf.backend import prepare
         import tensorflow as tf
+        from onnx_tf.backend import prepare
 
         model_onnx = onnx.load(str(onnx_path))
 

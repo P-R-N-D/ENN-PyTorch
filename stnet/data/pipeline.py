@@ -4,28 +4,22 @@ from __future__ import annotations
 import os
 import random
 from functools import partial
-from typing import Any, Callable, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple,
+                    Union)
 
 TensorLike = Any
 
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
-from ..backend.system import get_tlb, optimize_threads, Memory
+from ..backend.system import Memory, get_tlb, optimize_threads
 
 try:
     from torchdata.nodes import BaseNode
 except Exception:
     from torchdata.nodes import BaseNode
 
-from .nodes import (
-    Dataset,
-    Disposable,
-    Connector,
-    Loader,
-    Sampler,
-    SourceSpec,
-)
+from .nodes import Connector, Dataset, Disposable, Loader, Sampler, SourceSpec
 
 
 def _sync_device(device: torch.device) -> None:
@@ -56,34 +50,35 @@ def _sample_size(
 def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Sequence[int]:
     capB = 1024
     dev_t = getattr(_device, "type", "cpu")
-    if dev_t == "cuda":
-        try:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA not available")
-            free, _ = torch.cuda.mem_get_info(device=_device)
-            if _sample_bytes > 0:
-                capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
-        except Exception:
-            pass
-    elif dev_t == "xpu":
-        try:
-            props = getattr(torch.xpu, "get_device_properties", None)
-            mem_alloc = getattr(torch.xpu, "memory_allocated", None)
-            if callable(props) and callable(mem_alloc):
-                total = int(props(_device).total_memory)
-                used = int(mem_alloc(_device))
-                free = max(0, total - used)
+    match dev_t:
+        case 'cuda':
+            try:
+                if not torch.cuda.is_available():
+                    raise RuntimeError("CUDA not available")
+                free, _ = torch.cuda.mem_get_info(device=_device)
                 if _sample_bytes > 0:
                     capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
-        except Exception:
-            pass
-    elif dev_t == "mps":
-        try:
-            free_host = int(Memory.available())
-            if _sample_bytes > 0:
-                capB = max(1, int((free_host * 0.25) // max(1, _sample_bytes * 4)))
-        except Exception:
-            pass
+            except Exception:
+                pass
+        case 'xpu':
+            try:
+                props = getattr(torch.xpu, "get_device_properties", None)
+                mem_alloc = getattr(torch.xpu, "memory_allocated", None)
+                if callable(props) and callable(mem_alloc):
+                    total = int(props(_device).total_memory)
+                    used = int(mem_alloc(_device))
+                    free = max(0, total - used)
+                    if _sample_bytes > 0:
+                        capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
+            except Exception:
+                pass
+        case 'mps':
+            try:
+                free_host = int(Memory.available())
+                if _sample_bytes > 0:
+                    capB = max(1, int((free_host * 0.25) // max(1, _sample_bytes * 4)))
+            except Exception:
+                pass
     capB = max(1, min(capB, int(_N)))
     base = [
         capB // 8,
@@ -494,8 +489,8 @@ def fetch(
         if not sampler_nodes:
             raise RuntimeError("No non-empty training sources provided")
 
-        def iterate(sample):
-            def _one(smpl):
+        def iterate(sample: Any) -> Any:
+            def _one(smpl: Any) -> Any:
                 if (
                     isinstance(smpl, (list, tuple))
                     and len(smpl) == 2
@@ -570,8 +565,8 @@ def fetch(
         if not sampler_list:
             raise RuntimeError("No non-empty training sources provided")
 
-        def iterate(sample):
-            def _one(smpl):
+        def iterate(sample: Any) -> Any:
+            def _one(smpl: Any) -> Any:
                 if (
                     isinstance(smpl, (list, tuple))
                     and len(smpl) == 2
@@ -623,8 +618,8 @@ def fetch(
         )
         datasets: Dict[str, Any] = {"0": ds}
 
-        def iterate(sample):
-            def _one(smpl):
+        def iterate(sample: Any) -> Any:
+            def _one(smpl: Any) -> Any:
                 if (
                     isinstance(smpl, (list, tuple))
                     and len(smpl) == 2
@@ -712,8 +707,8 @@ def fetch(
             if not sampler_nodes:
                 raise RuntimeError("No non-empty validation sources provided")
 
-            def iterate(sample):
-                def _one(smpl):
+            def iterate(sample: Any) -> Any:
+                def _one(smpl: Any) -> Any:
                     if (
                         isinstance(smpl, (list, tuple))
                         and len(smpl) == 2
@@ -793,8 +788,8 @@ def fetch(
             if not sampler_list:
                 raise RuntimeError("No non-empty validation sources provided")
 
-            def iterate(sample):
-                def _one(smpl):
+            def iterate(sample: Any) -> Any:
+                def _one(smpl: Any) -> Any:
                     if (
                         isinstance(smpl, (list, tuple))
                         and len(smpl) == 2
@@ -852,8 +847,8 @@ def fetch(
             )
             datasets: Dict[str, Any] = {"0": ds}
 
-            def iterate(sample):
-                def _one(smpl):
+            def iterate(sample: Any) -> Any:
+                def _one(smpl: Any) -> Any:
                     if (
                         isinstance(smpl, (list, tuple))
                         and len(smpl) == 2

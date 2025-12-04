@@ -8,38 +8,26 @@ import math
 import os
 import platform
 import sys
-import threading
 import time
 import warnings
 from dataclasses import replace
 from functools import partial
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Dict,
-    Iterable,
-    Iterator,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import (TYPE_CHECKING, Any, Dict, Iterable, Iterator, List,
+                    Optional, Sequence, Tuple, Union)
 
-from tensordict import TensorDictBase
 import torch
 import torch.distributed
 import torch.nn as nn
+from tensordict import TensorDictBase
 from torch.distributed._tensor import DTensor, Placement, Replicate
-from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
+                                          load, save)
 from torch.distributed.checkpoint.api import CheckpointException
-from torch.distributed.checkpoint.state_dict import (
-    StateDictOptions,
-    get_model_state_dict,
-    get_optimizer_state_dict,
-    set_model_state_dict,
-    set_optimizer_state_dict,
-)
+from torch.distributed.checkpoint.state_dict import (StateDictOptions,
+                                                     get_model_state_dict,
+                                                     get_optimizer_state_dict,
+                                                     set_model_state_dict,
+                                                     set_optimizer_state_dict)
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
@@ -63,43 +51,23 @@ except Exception:
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.stats import Metadata
-from ..data.transforms import postprocess, preprocess
+from ..data.transforms import preprocess
 from ..functional.fx import Autocast, Fusion, Gradient
-from ..functional.losses import (
-    LossWeightController,
-    LinearCombinationLoss,
-    CRPSLoss,
-    DataFidelityLoss,
-    StandardNormalLoss,
-    StudentsTLoss,
-    TiledLoss,
-)
-from ..functional.optimizers import (
-    AdamW,
-    SWALR,
-    StochasticWeightAverage,
-    stochastic_weight_average,
-)
+from ..functional.losses import (CRPSLoss, DataFidelityLoss,
+                                 LinearCombinationLoss, LossWeightController,
+                                 StandardNormalLoss, StudentsTLoss, TiledLoss)
+from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
+                                     stochastic_weight_average)
 from ..model.layers import History, Instance, resize_scaler_buffer
-from .compat import (
-    cudagraph_step_end,
-    is_meta_or_fake_tensor,
-    torch_no_compile,
-    torch_compile_safe,
-    torch_safe_distributed,
-)
-from .distributed import (
-    distributed_barrier,
-    distributed_sync,
-    get_world_size,
-    is_distributed,
-    joining,
-    no_sync,
-    to_ddp,
-    to_fsdp,
-)
+from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
+                     torch_compile_safe, torch_no_compile,
+                     torch_safe_distributed)
+from .distributed import (distributed_barrier, distributed_sync,
+                          get_world_size, is_distributed, joining, no_sync,
+                          to_ddp, to_fsdp)
 from .profiler import FlopCounter
-from .system import Memory, get_device, get_tlb, initialize_python_path, is_float8_supported, new_dir, posix_time
+from .system import (Memory, get_device, get_tlb, initialize_python_path,
+                     is_float8_supported, new_dir, posix_time)
 
 if TYPE_CHECKING:
     import numpy as _np
@@ -1053,25 +1021,26 @@ def epochs(
         hist.set_epochs(total_epochs)
 
         os_name = platform.system()
-        if os_name == "Linux":
-            pretty = None
-            with contextlib.suppress(Exception):
-                if os.path.exists("/etc/os-release"):
-                    with open("/etc/os-release", "r", encoding="utf-8") as f:
-                        for line in f:
-                            if line.startswith("PRETTY_NAME="):
-                                pretty = line.strip().split("=", 1)[1].strip().strip('"')
-                                break
-            os_full = pretty or f"{os_name} {platform.release()}"
-        elif os_name == "Darwin":
-            ver, _, _ = platform.mac_ver()
-            os_full = f"macOS {ver or platform.release()}"
-        elif os_name == "Windows":
-            ver = platform.version()
-            rel = platform.release()
-            os_full = f"Windows {rel} {ver}"
-        else:
-            os_full = f"{os_name} {platform.release()}"
+        match os_name:
+            case 'Linux':
+                pretty = None
+                with contextlib.suppress(Exception):
+                    if os.path.exists("/etc/os-release"):
+                        with open("/etc/os-release", "r", encoding="utf-8") as f:
+                            for line in f:
+                                if line.startswith("PRETTY_NAME="):
+                                    pretty = line.strip().split("=", 1)[1].strip().strip('"')
+                                    break
+                os_full = pretty or f"{os_name} {platform.release()}"
+            case 'Darwin':
+                ver, _, _ = platform.mac_ver()
+                os_full = f"macOS {ver or platform.release()}"
+            case 'Windows':
+                ver = platform.version()
+                rel = platform.release()
+                os_full = f"Windows {rel} {ver}"
+            case _:
+                os_full = f"{os_name} {platform.release()}"
 
         kernel = platform.release()
         arch_list = [platform.machine(), platform.processor() or ""]

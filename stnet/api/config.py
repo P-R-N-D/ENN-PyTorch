@@ -3,20 +3,8 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import asdict, dataclass, field
-from typing import (
-    Any,
-    ClassVar,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    TypeAlias,
-    Union,
-)
-
-from typing import TYPE_CHECKING
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal,
+                    Optional, Sequence, Tuple, TypeAlias, Union)
 
 if TYPE_CHECKING:
     from ..data.nodes import SourceSpec
