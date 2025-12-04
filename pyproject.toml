@@ -44,7 +44,6 @@ service = [
   "tensorrt>=10.10.0.31",
   "executorch>=0.6.0"
 ]
-torchscale = ["torchscale>=0.3.0"]
 telemetry = ["pynvml>=11.5.0"]
 
 [tool.setuptools]

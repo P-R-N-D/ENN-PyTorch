@@ -37,7 +37,6 @@ Optional extras (install with `pip install -e .[extra]`):
 - `nvidia_te_cu12` / `nvidia_te_cu13`: NVIDIA Transformer Engine builds for CUDA 12/13.
 - `intel_ai`: Intel Extension for PyTorch.
 - `service`: exporter stack (ONNX, ONNX-TF, ONNX2TF, Core ML, TensorRT, ExecuTorch).
-- `torchscale`: research modules for retention.
 - `telemetry`: GPU telemetry (`pynvml`).
 
 ## Installation

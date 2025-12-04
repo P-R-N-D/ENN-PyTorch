@@ -21,5 +21,4 @@ triton>=3.2.0
 # nvidia_te_cu13: transformer-engine-cu13>=2.9.0, transformer-engine-torch>=2.2.0
 # intel_ai: intel-extension-for-pytorch>=2.7.0
 # service: onnx>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2, coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
-# torchscale: torchscale>=0.3.0
 # telemetry: pynvml>=11.5.0
