@@ -4,14 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stnet-pytorch"
-version = "1.0"
-description = "PyTorch implementation of STNet with distributed training and inference workflows"
+version = "1.0.0"
+description = "Spatio-temporal neural network building blocks for PyTorch (training, data pipelines, export)"
 readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
-license = "PolyForm-Noncommercial-1.0.0"
-license-files = ["LICENSE*"]
+license = { file = "LICENSE" }
 authors = [{ name = "Kim Jeseok" }]
 keywords = ["transformer", "spatio-temporal", "pytorch", "fp8", "training"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "License :: Other/Proprietary License",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
 dependencies = [
   "netifaces>=0.11.0",
   "numpy>=2.2.5",
@@ -19,11 +28,9 @@ dependencies = [
   "py-cpuinfo>=9.0.0",
   "scipy>=1.14.1",
   "tensordict>=0.10.0",
-  "torch>=2.8.0",
+  "torch>=2.2",
   "torchdata>=0.11.0",
-  "torchrl>=0.8.1",
   "tqdm>=4.67.1",
-  "triton>=3.2.0"
 ]
 
 [project.optional-dependencies]
@@ -36,21 +43,18 @@ torchao = ["torchao>=0.11.0"]
 nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
 nvidia_te_cu13 = ["transformer-engine-cu13>=2.9.0", "transformer-engine-torch>=2.2.0"]
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
-service = [
-  "onnx>=1.18.0",
-  "onnx-tf>=1.10.0",
-  "onnx2tf>=1.27.2",
-  "coremltools>=8.3.0",
-  "tensorrt>=10.10.0.31",
-  "executorch>=0.6.0"
-]
+service = ["onnx>=1.18.0", "onnx-tf>=1.10.0", "onnx2tf>=1.27.2", "coremltools>=8.3.0", "tensorrt>=10.10.0.31", "executorch>=0.6.0"]
 telemetry = ["pynvml>=11.5.0"]
+# rl = ["torchrl>=0.8.1"]  # enable if you start using torchrl
 
 [tool.setuptools]
 include-package-data = true
+license-files = ["LICENSE*"]
 
 [tool.setuptools.packages.find]
+where = [""]
 include = ["stnet*"]
+exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 "stnet" = [
@@ -64,5 +68,5 @@ include = ["stnet*"]
   "**/*.pt",
   "**/*.pth",
   "**/*.onnx",
-  "**/*.bin"
+  "**/*.bin",
 ]
