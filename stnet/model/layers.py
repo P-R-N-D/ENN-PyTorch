@@ -164,32 +164,41 @@ class PatchAttention(nn.Module):
 
         block = None
         mask_bias: torch.Tensor | None = None
-        coord_bias: torch.Tensor | None = None
+        mask_bias_kind: str | None = None
         if isinstance(attn_mask, torch.Tensor):
             m = attn_mask
             if m.dtype == torch.bool:
+                m = m.to(device=qh.device)
                 if m.dim() == 2:
-                    m = m.view(1, 1, N, N).expand(B, self.nhead, N, N)
+                    if m.shape != (N, N):
+                        raise ValueError(f"bool attn_mask shape {tuple(m.shape)} incompatible with (N,N)=({N},{N})")
+
+                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                        return ~m[qi, kj]
                 elif m.dim() == 3:
                     if m.shape != (B, N, N):
                         raise ValueError(f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})")
-                    m = m.view(B, 1, N, N).expand(B, self.nhead, N, N)
+
+                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                        return ~m[b, qi, kj]
                 elif m.dim() == 4:
-                    b, h, s1, s2 = m.shape
-                    if (b != B) or (s1 != N) or (s2 != N):
+                    b0, hm, s1, s2 = m.shape
+                    if (b0 != B) or (s1 != N) or (s2 != N):
                         raise ValueError(f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})")
-                    if h == 1:
-                        m = m.expand(B, self.nhead, N, N)
-                    elif h != self.nhead:
+                    if hm == 1:
+
+                        def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                            return ~m[b, 0, qi, kj]
+                    elif hm != self.nhead:
                         raise ValueError(
-                            f"bool attn_mask head dim {h} incompatible with nhead={self.nhead}"
+                            f"bool attn_mask head dim {hm} incompatible with nhead={self.nhead}"
                         )
+                    else:
+
+                        def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                            return ~m[b, h, qi, kj]
                 else:
                     raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
-                allowed = (~m).to(device=qh.device)
-
-                def mask_mod(b: int, h: int, qi: int, kj: int) -> bool:
-                    return allowed[b, h, qi, kj]
 
                 _block_size: int
                 if N <= 2048:
@@ -213,21 +222,23 @@ class PatchAttention(nn.Module):
                 if bias.dim() == 2:
                     if bias.shape != (N, N):
                         raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (N,N)=(~,{N})")
-                    bias = bias.view(1, 1, N, N).expand(B, self.nhead, N, N)
+                    mask_bias_kind = "2d"
                 elif bias.dim() == 3:
                     if bias.shape != (B, N, N):
                         raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (B,N,N)=({B},{N},{N})")
-                    bias = bias.view(B, 1, N, N).expand(B, self.nhead, N, N)
+                    mask_bias_kind = "3d"
                 elif bias.dim() == 4:
-                    b, h, s1, s2 = bias.shape
-                    if (b != B) or (s1 != N) or (s2 != N):
+                    b0, hm, s1, s2 = bias.shape
+                    if (b0 != B) or (s1 != N) or (s2 != N):
                         raise ValueError(f"attn_mask shape {tuple(bias.shape)} incompatible with (B={B},N={N})")
-                    if h == 1:
-                        bias = bias.expand(B, self.nhead, N, N)
-                    elif h != self.nhead:
+                    if hm == 1:
+                        mask_bias_kind = "4d1"
+                    elif hm != self.nhead:
                         raise ValueError(
-                            f"attn_mask head dim {h} incompatible with nhead={self.nhead}"
+                            f"attn_mask head dim {hm} incompatible with nhead={self.nhead}"
                         )
+                    else:
+                        mask_bias_kind = "4d"
                 else:
                     raise ValueError(f"attn_mask rank {bias.dim()} not supported")
                 mask_bias = bias.contiguous()
@@ -237,19 +248,23 @@ class PatchAttention(nn.Module):
             raise ValueError(
                 f"coords_f32 shape {coords_f32.shape} incompatible with (B,N,C)=({B},{N},{self.coord_dim})"
             )
-        H = self.nhead
-        delta = coords_f32[:, None, :, None, :] - coords_f32[:, None, None, :, :]
-        W_exp = W.view(1, H, 1, 1, Cc)
-        coord_bias = (delta * W_exp).sum(dim=-1).to(dtype=qh.dtype, device=qh.device)
+        coord_proj = torch.matmul(coords_f32, W.t()).transpose(1, 2).contiguous()
 
         def score_mod(
             score: torch.Tensor, b: int, h: int, qi: int, kj: int
         ) -> torch.Tensor:
             total = score
-            if coord_bias is not None:
-                total = total + coord_bias[b, h, qi, kj]
+            coord_term = coord_proj[b, h, qi] - coord_proj[b, h, kj]
+            total = total + coord_term.to(dtype=score.dtype)
             if mask_bias is not None:
-                total = total + mask_bias[b, h, qi, kj].to(dtype=score.dtype)
+                if mask_bias_kind == "2d":
+                    total = total + mask_bias[qi, kj].to(dtype=score.dtype)
+                elif mask_bias_kind == "3d":
+                    total = total + mask_bias[b, qi, kj].to(dtype=score.dtype)
+                elif mask_bias_kind == "4d1":
+                    total = total + mask_bias[b, 0, qi, kj].to(dtype=score.dtype)
+                else:
+                    total = total + mask_bias[b, h, qi, kj].to(dtype=score.dtype)
             return total
 
         scale = 1.0 / math.sqrt(float(self.head_dim))
