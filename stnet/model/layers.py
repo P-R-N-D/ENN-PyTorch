@@ -2520,25 +2520,68 @@ class Instance(nn.Module):
             )
             assembled = assembled + bl
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
-        t32 = tokens.to(torch.float32)
-        tokens_centered = (t32 - t32.mean(dim=1, keepdim=True)).to(dtype=tokens.dtype)
+        mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
+        tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
+
+        # controller / decode 공통 microbatch 크기 결정
+        ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
+        if ctrl_mb <= 0:
+            ctrl_mb = int(self.microbatch or 0)
+        if ctrl_mb <= 0:
+            ctrl_mb = 64
+        ctrl_mb = max(1, min(int(b), int(ctrl_mb)))
+
         if infer_mode:
+            # ---------- Inference: controller ----------
             with Gradient.inference(self.controller):
-                with (
-                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
-                ):
-                    refined_tokens, _ = self.controller(tokens_centered)
+
+                def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
+                    with (
+                        Autocast.float(device)
+                        if amp_enabled
+                        else Autocast.suspend(device)
+                    ):
+                        out, _ = self.controller(chunk)
+                    return out
+
+                if ctrl_mb < int(b):
+                    refined_tokens = torch.cat(
+                        [
+                            _infer_controller(tokens_centered[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    refined_tokens = _infer_controller(tokens_centered)
+
             refined_tokens = torch.nan_to_num(
                 refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
             )
             decode_tokens = refined_tokens.detach().clone()
+
+            # ---------- Inference: decode ----------
             with Gradient.inference(self.processor):
-                with (
-                    Autocast.float(device) if amp_enabled else Autocast.suspend(device)
-                ):
-                    residual_context = self.processor.decode(
-                        decode_tokens, apply_norm=True
+
+                def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
+                    with (
+                        Autocast.float(device)
+                        if amp_enabled
+                        else Autocast.suspend(device)
+                    ):
+                        return self.processor.decode(chunk, apply_norm=True)
+
+                if ctrl_mb < int(b):
+                    residual_context = torch.cat(
+                        [
+                            _infer_decode(decode_tokens[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
                     )
+                else:
+                    residual_context = _infer_decode(decode_tokens)
+
             residual_context = torch.nan_to_num(
                 residual_context, nan=0.0, posinf=0.0, neginf=0.0
             )
@@ -2554,12 +2597,18 @@ class Instance(nn.Module):
                         out, _ = self.controller(inp)
                     return out
 
-                if use_activation_checkpoint and activation_checkpoint is not None:
-                    refined_tokens = activation_checkpoint(
-                        _global_tokens, tokens_centered
+                def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
+                    if use_activation_checkpoint and activation_checkpoint is not None:
+                        return activation_checkpoint(_global_tokens, chunk)
+                    return _global_tokens(chunk)
+
+                if ctrl_mb < int(b):
+                    refined_tokens = torch.cat(
+                        [_run_controller(tokens_centered[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        dim=0,
                     )
                 else:
-                    refined_tokens = _global_tokens(tokens_centered)
+                    refined_tokens = _run_controller(tokens_centered)
                 refined_tokens = torch.nan_to_num(
                     refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
                 )
@@ -2572,12 +2621,18 @@ class Instance(nn.Module):
                     ):
                         return self.processor.decode(inp, apply_norm=True)
 
-                if use_activation_checkpoint and activation_checkpoint is not None:
-                    residual_context = activation_checkpoint(
-                        _decode_tokens, refined_tokens
+                def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
+                    if use_activation_checkpoint and activation_checkpoint is not None:
+                        return activation_checkpoint(_decode_tokens, chunk)
+                    return _decode_tokens(chunk)
+
+                if ctrl_mb < int(b):
+                    residual_context = torch.cat(
+                        [_run_decode(refined_tokens[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        dim=0,
                     )
                 else:
-                    residual_context = _decode_tokens(refined_tokens)
+                    residual_context = _run_decode(refined_tokens)
                 residual_context = torch.nan_to_num(
                     residual_context, nan=0.0, posinf=0.0, neginf=0.0
                 )

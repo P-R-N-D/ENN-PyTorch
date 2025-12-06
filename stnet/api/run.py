@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import json
 import os
 import random
@@ -323,6 +324,27 @@ def train(
             **default_kwargs,
             **kwargs,
         )
+        with contextlib.suppress(Exception):
+            model.to("cpu")
+        with contextlib.suppress(Exception):
+            gc.collect()
+        with contextlib.suppress(Exception):
+            accelerator = getattr(torch, "accelerator", None)
+            memory = getattr(accelerator, "memory", None) if accelerator is not None else None
+            if memory is not None and hasattr(memory, "empty_cache"):
+                memory.empty_cache()
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        with contextlib.suppress(Exception):
+            empty_mps = getattr(torch, "mps", None)
+            if empty_mps is not None and hasattr(empty_mps, "empty_cache"):
+                empty_mps.empty_cache()
+        with contextlib.suppress(Exception):
+            empty_xpu = getattr(torch, "xpu", None)
+            memory = getattr(empty_xpu, "memory", None) if empty_xpu is not None else None
+            if memory is not None and hasattr(memory, "empty_cache"):
+                memory.empty_cache()
         elastic_launch(lc, main)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
@@ -606,6 +628,27 @@ def predict(
         **default_kwargs,
         **kwargs,
     )
+    with contextlib.suppress(Exception):
+        model.to("cpu")
+    with contextlib.suppress(Exception):
+        gc.collect()
+    with contextlib.suppress(Exception):
+        accelerator = getattr(torch, "accelerator", None)
+        memory = getattr(accelerator, "memory", None) if accelerator is not None else None
+        if memory is not None and hasattr(memory, "empty_cache"):
+            memory.empty_cache()
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    with contextlib.suppress(Exception):
+        empty_mps = getattr(torch, "mps", None)
+        if empty_mps is not None and hasattr(empty_mps, "empty_cache"):
+            empty_mps.empty_cache()
+    with contextlib.suppress(Exception):
+        empty_xpu = getattr(torch, "xpu", None)
+        memory = getattr(empty_xpu, "memory", None) if empty_xpu is not None else None
+        if memory is not None and hasattr(memory, "empty_cache"):
+            memory.empty_cache()
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     rdzv_endpoint = get_available_host(default_rdzv_host)
     master_addr, _ = initialize_master_addr(rdzv_endpoint)
