@@ -2606,13 +2606,29 @@ class Instance(nn.Module):
 
         mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
         tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
-        DEFAULT_MAX_CTRL_MB = 64
-        SAFETY_DIV = 4
-        aggressive_mb = int(getattr(self, "controller_microbatch", 0) or DEFAULT_MAX_CTRL_MB)
-        aggressive_mb = max(1, aggressive_mb)
-        base_mb = int(self.microbatch or aggressive_mb)
-        conservative_mb = max(1, base_mb // SAFETY_DIV)
-        ctrl_mb = min(int(b), conservative_mb, aggressive_mb)
+        ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
+        if device.type == "cuda":
+            try:
+                one = tokens_centered[:1]
+                elem_size = int(one.element_size())
+                numel = int(one.nelement())
+                bytes_per_sample = max(1, elem_size * numel)
+                FUDGE = 16
+                bytes_per_sample *= FUDGE
+                free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+                SAFETY = 0.7
+                usable = int(free_bytes * SAFETY)
+                max_by_mem = max(1, usable // bytes_per_sample)
+
+                if ctrl_mb <= 0:
+                    ctrl_mb = 64
+                ctrl_mb = int(max(1, min(int(b), int(ctrl_mb), int(max_by_mem))))
+            except Exception:
+                if ctrl_mb <= 0:
+                    ctrl_mb = min(int(b), 8)
+        else:
+            if ctrl_mb <= 0:
+                ctrl_mb = min(int(b), 8)
 
         if infer_mode:
             with contextlib.suppress(Exception):
