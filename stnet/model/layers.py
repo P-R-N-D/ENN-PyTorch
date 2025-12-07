@@ -507,6 +507,14 @@ class DilatedAttention(nn.Module):
                         return False
                 return True
 
+            mask_fn = dilated_mask
+            try:
+                import torch._dynamo as _dynamo
+
+                mask_fn = _dynamo.disable(dilated_mask)
+            except Exception:
+                pass
+
             if L_k <= 2048:
                 _block_size = 128
             elif L_k <= 16384:
@@ -515,7 +523,7 @@ class DilatedAttention(nn.Module):
                 _block_size = 512
 
             block_mask = create_block_mask(
-                dilated_mask,
+                mask_fn,
                 B,
                 H,
                 L_q,
