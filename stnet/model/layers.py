@@ -490,29 +490,7 @@ class DilatedAttention(nn.Module):
             kh = k.view(B, L_k, H, Dh).transpose(1, 2)
             vh = v.view(B, L_k, H, Dh).transpose(1, 2)
 
-            kpm_bool = kpm_k
             win = int(self.window_size) if self.window_size is not None else None
-
-            def dilated_mask(b, h, q_idx, kv_idx):
-                keep = torch.ones_like(q_idx, dtype=torch.bool)
-
-                if self.causal:
-                    keep = keep & (kv_idx <= q_idx)
-
-                if win is not None:
-                    keep = keep & ((q_idx - kv_idx).abs() <= win)
-
-                if self.dilation > 1:
-                    keep = keep & (((q_idx - kv_idx) % self.dilation) == 0)
-
-                if kpm_bool is not None:
-                    is_pad_q = kpm_bool[b, q_idx]
-                    is_pad_k = kpm_bool[b, kv_idx]
-                    keep = keep & (~(is_pad_q | is_pad_k))
-
-                return keep
-
-            mask_fn = dilated_mask
 
             if L_k <= 2048:
                 _block_size = 128
@@ -521,20 +499,81 @@ class DilatedAttention(nn.Module):
             else:
                 _block_size = 512
 
-            block_mask = create_block_mask(
-                mask_fn,
-                B,
-                H,
-                L_q,
-                L_k,
-                device=x_k.device,
-                BLOCK_SIZE=_block_size,
-            )
+            max_group = int(getattr(self, "flex_batch_microbatch", 0) or B)
+            max_group = max(1, min(B, max_group))
 
-            y = flex_attention(qh, kh, vh, block_mask=block_mask)
-            attn_out = self.out_proj(
-                y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
-            )
+            def _run_flex_for_group(group_size: int) -> torch.Tensor:
+                outputs: List[torch.Tensor] = []
+                for b0 in range(0, B, group_size):
+                    b1 = min(B, b0 + group_size)
+                    B_g = b1 - b0
+
+                    qh_g = qh[b0:b1]  # (B_g, H, L_q, Dh)
+                    kh_g = kh[b0:b1]  # (B_g, H, L_k, Dh)
+                    vh_g = vh[b0:b1]  # (B_g, H, L_k, Dh)
+
+                    kpm_g: Optional[torch.Tensor] = None
+                    if kpm_k is not None:
+                        kpm_g = kpm_k[b0:b1]
+
+                    def mask_mod_g(b, h, q_idx, kv_idx):
+                        keep = torch.ones_like(q_idx, dtype=torch.bool)
+
+                        if self.causal:
+                            keep &= (kv_idx <= q_idx)
+
+                        if win is not None:
+                            keep &= ((q_idx - kv_idx).abs() <= win)
+
+                        if self.dilation > 1:
+                            keep &= (((q_idx - kv_idx) % self.dilation) == 0)
+
+                        if kpm_g is not None:
+                            is_pad_q = kpm_g[b, q_idx]
+                            is_pad_k = kpm_g[b, kv_idx]
+                            keep &= ~(is_pad_q | is_pad_k)
+
+                        return keep
+
+                    block_mask_g = create_block_mask(
+                        mask_mod_g,
+                        B_g,
+                        H,
+                        L_q,
+                        L_k,
+                        device=x_k.device,
+                        BLOCK_SIZE=_block_size,
+                    )
+
+                    y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g)
+                    out_g = self.out_proj(
+                        y_g.transpose(1, 2).contiguous().view(B_g, L_q, self.embed_dim)
+                    )
+                    outputs.append(out_g)
+
+                if len(outputs) == 1:
+                    return outputs[0]
+                return torch.cat(outputs, dim=0)  # type: ignore[return-value]
+
+            group = max_group
+            last_oom: Optional[RuntimeError] = None
+            while group >= 1:
+                try:
+                    attn_out = _run_flex_for_group(group)
+                    last_oom = None
+                    break
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "CUDA out of memory" not in msg and "out of memory" not in msg:
+                        raise
+                    last_oom = e
+                    if x_k.device.type == "cuda":
+                        with contextlib.suppress(Exception):
+                            torch.cuda.empty_cache()
+                    group //= 2
+
+            if last_oom is not None:
+                raise last_oom
 
         else:
             qkv = self.qkv(x_k)
