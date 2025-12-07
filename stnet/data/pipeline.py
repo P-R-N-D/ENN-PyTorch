@@ -203,18 +203,39 @@ def _batch_interval(
     if _dev.type == "cuda":
         try:
             per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
-        except Exception:
-            per_sample = 0
-        if per_sample > 0:
-            try:
+            if per_sample > 0:
                 free_bytes, _ = torch.cuda.mem_get_info(_dev)
                 safe_cap = int(max(0, free_bytes) * 0.80)
                 if safe_cap > 0:
                     cap_from_mem = int(safe_cap // max(1, per_sample))
                     if cap_from_mem > 0:
                         B_cap = max(1, min(B_cap, cap_from_mem))
-            except Exception:
-                pass
+        except Exception:
+            pass
+    elif _dev.type == "xpu":
+        try:
+            per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+            if per_sample > 0 and callable(mem_get_info):
+                free_bytes, _ = mem_get_info(_dev)
+                safe_cap = int(max(0, int(free_bytes)) * 0.80)
+                if safe_cap > 0:
+                    cap_from_mem = int(safe_cap // max(1, per_sample))
+                    if cap_from_mem > 0:
+                        B_cap = max(1, min(B_cap, cap_from_mem))
+        except Exception:
+            pass
+
+    try:
+        host_avail = int(Memory.available())
+        if host_avail > 0:
+            host_cap = int(host_avail * 0.10)
+            if host_cap > 0:
+                host_B_cap = int(host_cap // max(1, sbytes))
+                if host_B_cap > 0:
+                    B_cap = max(1, min(B_cap, host_B_cap))
+    except Exception:
+        pass
 
     candidates = _random_batches(sbytes, _dev, len(_ds))
     if candidates:
@@ -437,6 +458,38 @@ def fetch(
         except Exception:
             return (int(batch_size) if batch_size is not None else 0, 0.0)
 
+    def _cap_pf_depth(_datasets: Mapping[str, Dataset], _pf: int, _bs: int) -> int:
+        try:
+            host_avail = int(Memory.available())
+            if host_avail <= 0:
+                return int(_pf)
+            budget = int(host_avail * 0.15)
+            if budget <= 0 or _bs <= 0:
+                return int(_pf)
+            sbytes_max = 0
+            for _ds in _datasets.values():
+                if len(_ds) <= 0:
+                    continue
+                probe = _ds.get(0, min(1, len(_ds)))
+                x = probe.get("X")
+                y = probe.get("Y") if isinstance(probe, Mapping) else None
+                if x is None:
+                    continue
+                if not isinstance(x, torch.Tensor):
+                    x = torch.as_tensor(x)
+                if y is not None and not isinstance(y, torch.Tensor):
+                    y = torch.as_tensor(y)
+                sbytes_max = max(sbytes_max, _sample_size(x, y))
+            if sbytes_max <= 0:
+                return int(_pf)
+            bytes_per_batch = int(sbytes_max) * int(_bs)
+            if bytes_per_batch <= 0:
+                return int(_pf)
+            pf_cap = max(1, int(budget // max(1, bytes_per_batch)))
+            return int(max(1, min(int(_pf), pf_cap, 8)))
+        except Exception:
+            return int(_pf)
+
     _device_obj = device_obj
     _auto_bs_candidates: list[int] = []
     _auto_ms_candidates: list[float] = []
@@ -466,6 +519,7 @@ def fetch(
                     elif _m < 1.00:
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
+                pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
             else:
                 batch_size = 1
         sampler_nodes: Dict[str, BaseNode] = {}
@@ -547,6 +601,7 @@ def fetch(
                     elif _m < 1.00:
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
+                pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
             else:
                 batch_size = 1
         sampler_list: list[BaseNode] = []
@@ -687,6 +742,7 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
+                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
             sampler_nodes: Dict[str, BaseNode] = {}
             lengths: Dict[str, int] = {}
             for key, ds in datasets.items():
@@ -773,6 +829,7 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
+                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
             sampler_list: list[BaseNode] = []
             lengths: list[int] = []
             for k, ds in datasets.items():

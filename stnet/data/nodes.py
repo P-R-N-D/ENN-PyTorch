@@ -424,10 +424,23 @@ class Dataset(_Sampler):
 
 def _to_high_precision(value: Any) -> torch.Tensor:
     tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
+
+    float_name = os.environ.get("STNET_MEMMAP_FLOAT_DTYPE", "").strip()
+    if float_name.startswith("torch."):
+        float_name = float_name.split(".", 1)[1]
+    memmap_float = getattr(torch, float_name, None) if float_name else None
+    if not isinstance(memmap_float, torch.dtype) or not torch.is_floating_point(
+        torch.empty((), dtype=memmap_float)
+    ):
+        memmap_float = torch.float32
+
+    def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return t.to(dtype=dtype)
+
     if tensor.is_floating_point():
-        return tensor.to(dtype=torch.float64)
+        return _to_dtype(tensor, memmap_float)
     if tensor.dtype in {torch.uint8, torch.int8, torch.int16, torch.int32}:
-        return tensor.to(dtype=torch.int64)
+        return _to_dtype(tensor, torch.int64)
     return tensor
 
 
@@ -448,8 +461,14 @@ def preload_memmap(
 
     os.makedirs(memmap_dir, exist_ok=True)
 
-    features = _to_high_precision(data["features"]).detach().cpu().contiguous()
-    labels = _to_high_precision(data["labels"]).detach().cpu().contiguous()
+    def _as_cpu_contig(x: Any) -> torch.Tensor:
+        t = _to_high_precision(x).detach()
+        if t.device.type != "cpu":
+            t = t.cpu()
+        return t.contiguous() if not t.is_contiguous() else t
+
+    features = _as_cpu_contig(data["features"])
+    labels = _as_cpu_contig(data["labels"])
 
     if features.shape[0] != labels.shape[0]:
         raise ValueError("features and labels must have the same length")
@@ -461,25 +480,37 @@ def preload_memmap(
     feature_flat = features.view(count, -1)
     label_flat = labels.view(count, -1)
     label_shape = tuple(labels.shape[1:])
+    feature_dim = int(feature_flat.shape[1])
+    features_dtype = to_platform_dtype(feature_flat.dtype, "name")
+    labels_dtype = to_platform_dtype(label_flat.dtype, "name")
 
     perm: torch.Tensor | None = None
+    shuffle_mode = "none"
     if shuffle:
         generator = torch.Generator(device="cpu")
         if seed is not None:
             with suppress(Exception):
                 generator.manual_seed(int(seed))
         perm = torch.randperm(count, generator=generator)
-        feature_flat = feature_flat.index_select(0, perm)
-        label_flat = label_flat.index_select(0, perm)
-        if seed is not None:
-            with suppress(Exception):
-                torch.save(perm, os.path.join(memmap_dir, "perm.pt"))
+
+        perm_path = os.path.join(memmap_dir, "perm.pt")
+        with suppress(Exception):
+            torch.save(perm, perm_path)
+        if os.path.isfile(perm_path):
+            shuffle_mode = "perm"
+        else:
+            shuffle_mode = "physical"
+            feature_flat = feature_flat.index_select(0, perm)
+            label_flat = label_flat.index_select(0, perm)
 
     features_path = os.path.join(memmap_dir, "features.mmt")
     labels_path = os.path.join(memmap_dir, "labels.mmt")
 
     MemoryMappedTensor.from_tensor(feature_flat, filename=features_path)
     MemoryMappedTensor.from_tensor(label_flat, filename=labels_path)
+
+    with suppress(Exception):
+        del features, labels, feature_flat, label_flat
 
     val_count = max(0, min(count, int(round(count * float(val_frac)))))
     train_count = max(0, min(count, count - val_count))
@@ -488,22 +519,23 @@ def preload_memmap(
 
     meta: Dict[str, Any] = {
         "N": count,
-        "feature_dim": int(feature_flat.shape[1]),
+        "feature_dim": feature_dim,
         "features_path": "features.mmt",
         "labels_path": "labels.mmt",
         "label_shape": list(label_shape),
-        "features_dtype": to_platform_dtype(feature_flat.dtype, "name"),
-        "labels_dtype": to_platform_dtype(label_flat.dtype, "name"),
+        "features_dtype": features_dtype,
+        "labels_dtype": labels_dtype,
         "fractions": [float(train_frac), float(val_frac)],
-        "shuffled": bool(shuffle),
+        "shuffled": bool(shuffle_mode == "physical"),
         "shuffle_seed": int(seed) if seed is not None else None,
+        "shuffle_mode": str(shuffle_mode),
         "train_start": train_start,
         "train_end": train_end,
         "val_start": val_start,
         "val_end": val_end,
     }
 
-    if perm is not None and seed is not None:
+    if shuffle_mode == "perm" and perm is not None:
         meta["perm_filename"] = "perm.pt"
 
     with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
@@ -723,14 +755,15 @@ class Loader:
 
         dev = device if isinstance(device, torch.device) else torch.device(device)
         node = source
+        pf = max(1, int(prefetch_factor))
+        node = _Prefetcher(node, prefetch_factor=pf)
         do_pin = bool(pin_memory) if pin_memory is not None else (getattr(dev, 'type', 'cpu') in {'cuda','xpu','mps'})
         if do_pin:
             node = PinMemory(node, pin_memory_device=dev.type)
-        node = _Prefetcher(node, prefetch_factor=int(prefetch_factor))
         return Loader(
             dev,
             node=node,
-            prefetch_factor=int(prefetch_factor),
+            prefetch_factor=pf,
             non_blocking=bool(non_blocking),
             length=length,
         )

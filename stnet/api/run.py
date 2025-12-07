@@ -145,49 +145,37 @@ def train(
         torch.backends.cudnn.benchmark = True
 
     def _check_shapes(
-        first_feats: Optional[torch.Tensor],
+        first_in_dim: Optional[int],
+        in_dim: int,
         first_label_shape: Tuple[int, ...],
-        fx: torch.Tensor,
         lshape: Tuple[int, ...],
-    ) -> Tuple[torch.Tensor, Tuple[int, ...]]:
-        if first_feats is None:
-            return fx, tuple(lshape)
-        if int(fx.shape[1]) != int(first_feats.shape[1]) or tuple(lshape) != tuple(
-            first_label_shape
-        ):
+    ) -> Tuple[Optional[int], Tuple[int, ...]]:
+        if first_in_dim is None:
+            return int(in_dim), tuple(lshape)
+        if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
             raise RuntimeError(
-                "inconsistent feature/label shapes across datasets: "
-                f"expected in_dim={int(first_feats.shape[1])}, out_shape={tuple(first_label_shape)} "
-                f"but got in_dim={int(fx.shape[1])}, out_shape={tuple(lshape)}"
+                f"Shape mismatch across datasets: expected X_dim={first_in_dim}, y_shape={first_label_shape}, "
+                f"got X_dim={in_dim}, y_shape={lshape}"
             )
-        return first_feats, first_label_shape
+        return first_in_dim, first_label_shape
 
-    def _mat_one(d: Any, out_dir: str) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+    def _mat_one(d: Any, out_dir: str) -> Tuple[int, Tuple[int, ...], int]:
         fx, lb, _, lshape = preprocess(d)
-        fx = fx.detach().cpu().contiguous()
-        lb = lb.detach().cpu().contiguous()
-
-        did_manual_shuffle = False
-        if shuffle:
-            n_total_ps = int(lb.shape[0]) if hasattr(lb, "shape") and lb.ndim > 0 else 0
-            if n_total_ps > 0:
-                g = torch.Generator(device="cpu")
-                if seed_value is not None:
-                    g.manual_seed(seed_value)
-                perm = torch.randperm(n_total_ps, generator=g)
-                fx = fx.index_select(0, perm)
-                lb = lb.index_select(0, perm)
-                did_manual_shuffle = True
-        shuffle_for_preload = bool(shuffle and not did_manual_shuffle)
+        fx = fx.contiguous()
+        count = int(fx.shape[0])
+        if count <= 0:
+            raise ValueError("Empty dataset provided to train().")
+        in_dim = int(fx.reshape(count, -1).shape[1])
         preload_memmap(
             {"features": fx, "labels": lb},
             memmap_dir=out_dir,
             train_frac=1.0 - float(val_frac),
             val_frac=float(val_frac),
-            shuffle=shuffle_for_preload,
+            shuffle=bool(shuffle),
             seed=seed_value,
         )
-        return fx, tuple(lshape)
+        del fx, lb
+        return in_dim, tuple(lshape), count
 
     initialize_python_path()
     mp.allow_connection_pickling()
@@ -197,7 +185,7 @@ def train(
 
     num_samples = 0
 
-    first_feats: Optional[torch.Tensor] = None
+    first_in_dim: Optional[int] = None
     label_shape: Tuple[int, ...] = ()
     manifest: Optional[Dict[str, str] | Sequence[str]] = None
     ckpt_dir: Optional[str] = None
@@ -213,11 +201,11 @@ def train(
             for k, d in data.items():
                 sub = os.path.join(memmap_dir, str(k))
                 os.makedirs(sub, exist_ok=True)
-                fx, lshape = _mat_one(d, sub)
-                first_feats, label_shape = _check_shapes(
-                    first_feats, label_shape, fx, lshape
+                in_dim, lshape, n = _mat_one(d, sub)
+                first_in_dim, label_shape = _check_shapes(
+                    first_in_dim, in_dim, label_shape, lshape
                 )
-                num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
+                num_samples += n
                 manifest[str(k)] = str(k)
         elif (
             isinstance(data, Sequence)
@@ -229,18 +217,18 @@ def train(
                 key = str(i)
                 sub = os.path.join(memmap_dir, key)
                 os.makedirs(sub, exist_ok=True)
-                fx, lshape = _mat_one(d, sub)
-                first_feats, label_shape = _check_shapes(
-                    first_feats, label_shape, fx, lshape
+                in_dim, lshape, n = _mat_one(d, sub)
+                first_in_dim, label_shape = _check_shapes(
+                    first_in_dim, in_dim, label_shape, lshape
                 )
-                num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
+                num_samples += n
                 manifest.append(key)
         else:
-            fx, lshape = _mat_one(data, memmap_dir)
-            first_feats, label_shape = fx, tuple(lshape)
-            num_samples += int(fx.shape[0]) if hasattr(fx, "shape") else 0
+            in_dim, lshape, n = _mat_one(data, memmap_dir)
+            first_in_dim, label_shape = in_dim, tuple(lshape)
+            num_samples += n
 
-        if first_feats is None or not label_shape:
+        if first_in_dim is None or not label_shape:
             raise RuntimeError("no training data provided to train()")
 
         if manifest is not None:
@@ -291,7 +279,7 @@ def train(
             sources={"kind": "memmap", "path": memmap_dir},
             ckpt_dir=ckpt_dir,
             init_ckpt_dir=init_dir,
-            in_dim=int(first_feats.shape[1]),
+            in_dim=int(first_in_dim),
             out_shape=tuple(label_shape),
             cfg_dict=cfg_dict,
         )
