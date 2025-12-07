@@ -2573,13 +2573,13 @@ class Instance(nn.Module):
 
         mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
         tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
-
-        ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
-        if ctrl_mb <= 0:
-            ctrl_mb = int(self.microbatch or 0)
-        if ctrl_mb <= 0:
-            ctrl_mb = 64
-        ctrl_mb = max(1, min(int(b), int(ctrl_mb)))
+        DEFAULT_MAX_CTRL_MB = 64
+        SAFETY_DIV = 4
+        aggressive_mb = int(getattr(self, "controller_microbatch", 0) or DEFAULT_MAX_CTRL_MB)
+        aggressive_mb = max(1, aggressive_mb)
+        base_mb = int(self.microbatch or aggressive_mb)
+        conservative_mb = max(1, base_mb // SAFETY_DIV)
+        ctrl_mb = min(int(b), conservative_mb, aggressive_mb)
 
         if infer_mode:
             with Gradient.inference(self.controller):
