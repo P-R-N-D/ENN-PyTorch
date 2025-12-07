@@ -420,7 +420,6 @@ class DilatedAttention(nn.Module):
             return mask_cpu
         return mask_cpu.to(device=device, non_blocking=True)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -494,6 +493,12 @@ class DilatedAttention(nn.Module):
             kpm_bool = kpm_k
             win = int(self.window_size) if self.window_size is not None else None
 
+            try:
+                import torch._dynamo
+                torch._dynamo.graph_break()
+            except ImportError:
+                pass
+
             def dilated_mask(b, h, q_idx, kv_idx):
                 keep = torch.ones_like(q_idx, dtype=torch.bool)
 
@@ -509,17 +514,11 @@ class DilatedAttention(nn.Module):
                 if kpm_bool is not None:
                     is_pad_q = kpm_bool[b, q_idx]
                     is_pad_k = kpm_bool[b, kv_idx]
-                    keep = keep & ~(is_pad_q | is_pad_k)
+                    keep = keep & (~(is_pad_q | is_pad_k))
 
                 return keep
 
             mask_fn = dilated_mask
-            try:
-                import torch._dynamo as _dynamo
-
-                mask_fn = _dynamo.disable(dilated_mask)
-            except Exception:
-                pass
 
             if L_k <= 2048:
                 _block_size = 128
