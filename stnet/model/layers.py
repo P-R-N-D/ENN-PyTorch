@@ -410,7 +410,12 @@ class DilatedAttention(nn.Module):
         self.length_bucket_multiple: int = 64
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        mask_cpu = _get_dilated_mask(L, dilation=self.dilation, causal=self.causal)
+        mask_cpu = _get_dilated_mask(
+            L,
+            dilation=self.dilation,
+            window_size=self.window_size,
+            causal=self.causal,
+        )
         if device.type == "cpu":
             return mask_cpu
         return mask_cpu.to(device=device, non_blocking=True)
@@ -463,6 +468,9 @@ class DilatedAttention(nn.Module):
             if kpm is not None:
                 pad_mask = torch.ones((B, pad_len), device=kpm.device, dtype=torch.bool)
                 kpm_k = torch.cat((kpm, pad_mask), dim=1)
+            else:
+                kpm_k = torch.zeros((B, L_k), device=x.device, dtype=torch.bool)
+                kpm_k[:, -pad_len:] = True
 
         residual = x_k
         x_k = self.norm1(x_k)
