@@ -493,12 +493,6 @@ class DilatedAttention(nn.Module):
             kpm_bool = kpm_k
             win = int(self.window_size) if self.window_size is not None else None
 
-            try:
-                import torch._dynamo
-                torch._dynamo.graph_break()
-            except ImportError:
-                pass
-
             def dilated_mask(b, h, q_idx, kv_idx):
                 keep = torch.ones_like(q_idx, dtype=torch.bool)
 
@@ -2389,19 +2383,13 @@ class Instance(nn.Module):
             disable=disable_compile,
             **compile_kwargs,
         )
-        controller_compile_kwargs: Dict[str, Any] = dict(compile_kwargs)
-        opts = dict(controller_compile_kwargs.get("options") or {})
-        opts["triton.cudagraphs"] = False
-        controller_compile_kwargs["options"] = opts
-
         self.controller = Gradient.compile(
             self.controller,
-            mode=compile_mode_arg,
+            mode=None,
             fullgraph=False,
-            dynamic=True,
+            dynamic=False,
             backend="inductor",
-            disable=disable_compile,
-            **controller_compile_kwargs,
+            disable=True,
         )
         self.__config = config
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
