@@ -496,12 +496,10 @@ class DilatedAttention(nn.Module):
             def dilated_mask(b: int, h: int, q_idx: int, kv_idx: int) -> bool:
                 qj = int(q_idx)
                 kj = int(kv_idx)
-                # causal
                 if self.causal and kj > qj:
                     return False
                 if win is not None and abs(qj - kj) > win:
                     return False
-                # dilation
                 if self.dilation > 1 and (qj - kj) % self.dilation != 0:
                     return False
                 if kpm_bool is not None:
