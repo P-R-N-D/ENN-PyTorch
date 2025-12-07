@@ -2690,9 +2690,7 @@ class Instance(nn.Module):
                     return out
 
                 def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    if use_activation_checkpoint:
-                        return activation_checkpoint(_global_tokens, chunk)
-                    return _global_tokens(chunk)
+                    return activation_checkpoint(_global_tokens, chunk)
 
                 if ctrl_mb < int(b):
                     refined_tokens = torch.cat(
