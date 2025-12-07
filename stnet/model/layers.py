@@ -517,16 +517,17 @@ class DilatedAttention(nn.Module):
                         kpm_g = kpm_k[b0:b1]
 
                     def mask_mod_g(b, h, q_idx, kv_idx):
-                        keep = torch.ones_like(q_idx, dtype=torch.bool)
+                        dq = q_idx - kv_idx
+                        keep = torch.ones_like(dq, dtype=torch.bool)
 
                         if self.causal:
                             keep &= (kv_idx <= q_idx)
 
                         if win is not None:
-                            keep &= ((q_idx - kv_idx).abs() <= win)
+                            keep &= (dq.abs() <= win)
 
                         if self.dilation > 1:
-                            keep &= (((q_idx - kv_idx) % self.dilation) == 0)
+                            keep &= ((dq % self.dilation) == 0)
 
                         if kpm_g is not None:
                             is_pad_q = kpm_g[b, q_idx]
