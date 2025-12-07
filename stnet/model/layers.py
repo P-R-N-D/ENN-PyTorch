@@ -507,14 +507,12 @@ class DilatedAttention(nn.Module):
                         return False
                 return True
 
-            if L_k >= 8192:
-                block_M, block_N = 64, 64
-            elif L_k >= 4096:
-                block_M, block_N = 64, 32
-            elif L_k >= 2048:
-                block_M, block_N = 32, 64
+            if L_k <= 2048:
+                _block_size = 128
+            elif L_k <= 16384:
+                _block_size = 256
             else:
-                block_M, block_N = 32, 32
+                _block_size = 512
 
             block_mask = create_block_mask(
                 dilated_mask,
@@ -523,8 +521,7 @@ class DilatedAttention(nn.Module):
                 L_q,
                 L_k,
                 device=x_k.device,
-                block_size=(block_M, block_N),
-                mask_mod="and",
+                BLOCK_SIZE=_block_size,
             )
 
             y = flex_attention(qh, kh, vh, block_mask=block_mask)
