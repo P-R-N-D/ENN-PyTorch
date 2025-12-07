@@ -490,29 +490,7 @@ class DilatedAttention(nn.Module):
             kh = k.view(B, L_k, H, Dh).transpose(1, 2)
             vh = v.view(B, L_k, H, Dh).transpose(1, 2)
 
-            kpm_bool = kpm_k
             win = int(self.window_size) if self.window_size is not None else None
-
-            def dilated_mask(b, h, q_idx, kv_idx):
-                keep = torch.ones_like(q_idx, dtype=torch.bool)
-
-                if self.causal:
-                    keep = keep & (kv_idx <= q_idx)
-
-                if win is not None:
-                    keep = keep & ((q_idx - kv_idx).abs() <= win)
-
-                if self.dilation > 1:
-                    keep = keep & (((q_idx - kv_idx) % self.dilation) == 0)
-
-                if kpm_bool is not None:
-                    is_pad_q = kpm_bool[b, q_idx]
-                    is_pad_k = kpm_bool[b, kv_idx]
-                    keep = keep & (~(is_pad_q | is_pad_k))
-
-                return keep
-
-            mask_fn = dilated_mask
 
             if L_k <= 2048:
                 _block_size = 128
@@ -521,20 +499,53 @@ class DilatedAttention(nn.Module):
             else:
                 _block_size = 512
 
-            block_mask = create_block_mask(
-                mask_fn,
-                B,
-                H,
-                L_q,
-                L_k,
-                device=x_k.device,
-                BLOCK_SIZE=_block_size,
-            )
+            attn_out_chunks: List[torch.Tensor] = []
 
-            y = flex_attention(qh, kh, vh, block_mask=block_mask)
-            attn_out = self.out_proj(
-                y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
-            )
+            for b_idx in range(B):
+                qh_b = qh[b_idx : b_idx + 1]
+                kh_b = kh[b_idx : b_idx + 1]
+                vh_b = vh[b_idx : b_idx + 1]
+
+                kpm_b: Optional[torch.Tensor] = None
+                if kpm_k is not None:
+                    kpm_b = kpm_k[b_idx]  # shape: (L_k,)
+
+                def mask_mod_b(h, q_idx, kv_idx):
+                    keep = torch.ones_like(q_idx, dtype=torch.bool)
+
+                    if self.causal:
+                        keep &= (kv_idx <= q_idx)
+
+                    if win is not None:
+                        keep &= ((q_idx - kv_idx).abs() <= win)
+
+                    if self.dilation > 1:
+                        keep &= (((q_idx - kv_idx) % self.dilation) == 0)
+
+                    if kpm_b is not None:
+                        is_pad_q = kpm_b[q_idx]
+                        is_pad_k = kpm_b[kv_idx]
+                        keep &= ~(is_pad_q | is_pad_k)
+
+                    return keep
+
+                block_mask_b = create_block_mask(
+                    lambda _b, h, q_idx, kv_idx: mask_mod_b(h, q_idx, kv_idx),
+                    1,
+                    H,
+                    L_q,
+                    L_k,
+                    device=x_k.device,
+                    BLOCK_SIZE=_block_size,
+                )
+
+                y_b = flex_attention(qh_b, kh_b, vh_b, block_mask=block_mask_b)
+                attn_out_b = self.out_proj(
+                    y_b.transpose(1, 2).contiguous().view(1, L_q, self.embed_dim)
+                )
+                attn_out_chunks.append(attn_out_b)
+
+            attn_out = torch.cat(attn_out_chunks, dim=0)
 
         else:
             qkv = self.qkv(x_k)
