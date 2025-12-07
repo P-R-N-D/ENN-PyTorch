@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import os
 from contextlib import suppress
 from typing import Any, Dict, List, Sequence, Tuple, Union
 
@@ -9,6 +10,40 @@ import torch
 from tensordict import TensorDictBase
 
 from .datatype import to_torch_tensor, to_tuple
+
+
+def _dtype_from_env(var: str, default: torch.dtype) -> torch.dtype:
+    raw = os.environ.get(var)
+    if raw is None:
+        return default
+    name = str(raw).strip()
+    if not name:
+        return default
+    if name.startswith("torch."):
+        name = name.split(".", 1)[1]
+    dt = getattr(torch, name, None)
+    return dt if isinstance(dt, torch.dtype) else default
+
+
+def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    return t.to(dtype=dtype)
+
+
+_FEATURE_DTYPE: torch.dtype = _dtype_from_env("STNET_FEATURE_DTYPE", torch.float32)
+_LABEL_FLOAT_DTYPE: torch.dtype = _dtype_from_env("STNET_LABEL_DTYPE", torch.float32)
+
+
+def _normalize_float_dtype(dtype: torch.dtype) -> torch.dtype:
+    try:
+        if torch.is_floating_point(torch.empty((), dtype=dtype)):
+            return dtype
+    except Exception:
+        pass
+    return torch.float32
+
+
+_FEATURE_DTYPE = _normalize_float_dtype(_FEATURE_DTYPE)
+_LABEL_FLOAT_DTYPE = _normalize_float_dtype(_LABEL_FLOAT_DTYPE)
 
 
 def _assert_finites(tensor: torch.Tensor, name: str) -> torch.Tensor:
@@ -35,7 +70,7 @@ def _preprocess_x(x_tuple: Any) -> torch.Tensor:
                 "preprocess: feature tuples must contain only numeric finite values. "
                 f"Invalid value={value!r}"
             ) from exc
-    tensor = torch.as_tensor(values, dtype=torch.float64)
+    tensor = torch.as_tensor(values, dtype=_FEATURE_DTYPE)
     return _assert_finites(tensor, "feature")
 
 
@@ -71,7 +106,7 @@ def _preprocess_batch(
         return None
 
     feature_tensor = _assert_finites(
-        feature_tensor.detach().to(dtype=torch.float64), "feature"
+        _to_dtype(feature_tensor.detach(), _FEATURE_DTYPE), "feature"
     )
     if feature_tensor.dim() == 0:
         feature_tensor = feature_tensor.reshape(1, 1)
@@ -81,7 +116,12 @@ def _preprocess_batch(
         batch_dim = int(feature_tensor.shape[0]) if feature_tensor.shape else 1
         feature_tensor = feature_tensor.reshape(batch_dim, -1)
     batch_size = int(feature_tensor.shape[0])
-    label_tensor = _assert_finites(label_tensor.detach(), "label")
+    label_tensor = label_tensor.detach()
+    if label_tensor.is_floating_point() or label_tensor.is_complex():
+        label_tensor = _to_dtype(label_tensor, _LABEL_FLOAT_DTYPE)
+    else:
+        label_tensor = _to_dtype(label_tensor, torch.int64)
+    label_tensor = _assert_finites(label_tensor, "label")
     if label_tensor.dim() == 0:
         label_tensor = label_tensor.unsqueeze(0)
     if label_tensor.dim() == 1 and label_tensor.shape[0] == batch_size:
@@ -102,9 +142,9 @@ def _preprocess_y(value: Any) -> torch.Tensor:
         tensor = torch.as_tensor(value)
     t = tensor.detach()
     if t.is_floating_point() or t.is_complex():
-        t = t.to(dtype=torch.float64)
+        t = _to_dtype(t, _LABEL_FLOAT_DTYPE)
     else:
-        t = t.to(dtype=torch.int64)
+        t = _to_dtype(t, torch.int64)
     return t
 
 
@@ -129,7 +169,14 @@ def preprocess(
             labels = labels.unsqueeze(0)
         if labels.shape[0] != feats.shape[0]:
             raise ValueError("preprocess(TensorDict): features and labels batch mismatch")
-        label_shape = tuple(labels.shape[1:]) if labels.dim() > 1 else (1,)
+        feats = _assert_finites(_to_dtype(feats.detach(), _FEATURE_DTYPE), "feature")
+        labels = labels.detach()
+        if labels.is_floating_point() or labels.is_complex():
+            labels = _to_dtype(labels, _LABEL_FLOAT_DTYPE)
+        else:
+            labels = _to_dtype(labels, torch.int64)
+        labels = _assert_finites(labels, "label")
+        label_shape = tuple(labels.shape[1:])
         keys = [(int(i),) for i in range(int(feats.shape[0]))]
         return (feats, labels, keys, label_shape)
     if isinstance(data, dict) and "X" in data and ("Y" in data):
