@@ -2389,14 +2389,19 @@ class Instance(nn.Module):
             disable=disable_compile,
             **compile_kwargs,
         )
+        controller_compile_kwargs: Dict[str, Any] = dict(compile_kwargs)
+        opts = dict(controller_compile_kwargs.get("options") or {})
+        opts["triton.cudagraphs"] = False
+        controller_compile_kwargs["options"] = opts
+
         self.controller = Gradient.compile(
             self.controller,
             mode=compile_mode_arg,
             fullgraph=False,
-            dynamic=compile_dynamic,
+            dynamic=True,
             backend="inductor",
             disable=disable_compile,
-            **compile_kwargs,
+            **controller_compile_kwargs,
         )
         self.__config = config
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
@@ -2582,6 +2587,11 @@ class Instance(nn.Module):
         ctrl_mb = min(int(b), conservative_mb, aggressive_mb)
 
         if infer_mode:
+            with contextlib.suppress(Exception):
+                import torch._dynamo as _dynamo
+
+                _dynamo.graph_break()
+
             with Gradient.inference(self.controller):
 
                 def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
@@ -2635,6 +2645,11 @@ class Instance(nn.Module):
             )
         else:
             with torch.enable_grad():
+
+                with contextlib.suppress(Exception):
+                    import torch._dynamo as _dynamo
+
+                    _dynamo.graph_break()
 
                 def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
                     with (
