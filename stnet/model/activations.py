@@ -31,7 +31,7 @@ class GeGLU(nn.Module):
                 f"GeGLU expected last dimension {self.in_dim}, got {x.size(-1)}"
             )
         a, b = self.in_proj(x).chunk(2, dim=-1)
-        y = a * F.gelu(b)
+        y = F.gelu(a) * b
         y = self.dropout(y)
         return self.out_proj(y)
 
@@ -59,6 +59,6 @@ class SwiGLU(nn.Module):
                 f"SwiGLU expected last dimension {self.in_dim}, got {x.size(-1)}"
             )
         a, b = self.in_proj(x).chunk(2, dim=-1)
-        y = a * F.silu(b)
+        y = F.silu(a) * b
         y = self.dropout(y)
         return self.out_proj(y)

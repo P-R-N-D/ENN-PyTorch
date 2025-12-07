@@ -5,8 +5,21 @@ import contextlib
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import (Any, Deque, Dict, Iterator, List, Mapping, Optional,
-                    Protocol, Sequence, Tuple, Union, cast)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    Union,
+    cast,
+)
 
 import torch
 import torch.nn as nn
@@ -54,6 +67,9 @@ from ..backend.profiler import FLOP_PROFILER
 from ..functional.fx import Autocast, Gradient
 from .kernels import (DotProductAttention, MultiHeadAttention,
                       MultiScaleRetention)
+
+if TYPE_CHECKING:
+    from .activations import SwiGLU as _SwiGLU
 
 
 @torch.no_grad()
@@ -533,45 +549,6 @@ class DilatedAttention(nn.Module):
 
         return x, (attn_w if need_weights else None)
 
-
-class SwiGLU(nn.Module):
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        *,
-        out_dim: Optional[int] = None,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.in_dim = int(in_dim)
-        self.hidden_dim = int(hidden_dim)
-        self.out_dim = int(out_dim) if out_dim is not None else int(in_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.proj_in = nn.Linear(self.in_dim, 2 * self.hidden_dim)
-        self.proj_out = nn.Linear(self.hidden_dim, self.out_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:                
-        x_in = x
-        x = self.proj_in(x_in)
-        u, v = x.chunk(2, dim=-1)
-        activated = F.silu(u) * v
-        activated = self.dropout(activated)
-        out = self.proj_out(activated)
-
-        try:
-            if x_in.numel() > 0 and x_in.size(-1) == self.in_dim:
-                tokens = int(x_in.numel() // self.in_dim)
-                fl_in = 2.0 * tokens * self.in_dim * (2 * self.hidden_dim)
-                fl_out = 2.0 * tokens * self.hidden_dim * self.out_dim
-                FLOP_PROFILER.add("SwiGLU", float(fl_in + fl_out))
-        except Exception:
-            pass
-
-        return out
-
-
 class PointTransformer(nn.Module):
 
     def __init__(
@@ -596,6 +573,8 @@ class PointTransformer(nn.Module):
         self.attn = PatchAttention(self.d_model, self.nhead, coord_dim=self.coord_dim)
         self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
+        from .activations import SwiGLU
+
         self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
         self._ln_materialized = False
 
@@ -917,6 +896,8 @@ class RetNet(nn.Module):
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
+        from .activations import SwiGLU
+
         self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
 
     def forward(
@@ -1046,6 +1027,8 @@ class CrossTransformer(nn.Module):
         )
         self.mix_norm = norm_layer(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
+        from .activations import SwiGLU
+
         self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
