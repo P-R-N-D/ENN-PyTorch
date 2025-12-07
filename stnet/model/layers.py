@@ -2690,7 +2690,7 @@ class Instance(nn.Module):
                     return out
 
                 def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    if activation_checkpoint is not None:
+                    if use_activation_checkpoint:
                         return activation_checkpoint(_global_tokens, chunk)
                     return _global_tokens(chunk)
 
@@ -2714,6 +2714,8 @@ class Instance(nn.Module):
                         return self.processor.decode(inp, apply_norm=True)
 
                 def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
+                    if use_activation_checkpoint:
+                        return activation_checkpoint(_decode_tokens, chunk)
                     return _decode_tokens(chunk)
 
                 if ctrl_mb < int(b):
