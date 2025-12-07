@@ -1335,6 +1335,14 @@ def epochs(
                             model, enable=(grad_accum_steps > 1 and (not should_sync))
                         ):
                             with flop_counter_train.step(display=False) as train_counter:
+                                with contextlib.suppress(Exception):
+                                    mark_step = getattr(
+                                        getattr(torch, "compiler", None),
+                                        "cudagraph_mark_step_begin",
+                                        None,
+                                    )
+                                    if callable(mark_step):
+                                        mark_step()
                                 with Autocast.float(device):
                                     Y_flat = Y.reshape(Y.shape[0], -1).to(
                                         device, dtype=param_dtype, non_blocking=True
@@ -1560,6 +1568,14 @@ def epochs(
                                 else:
                                     t_comp_s = time.perf_counter_ns()
                                 with flop_counter_val.step(display=False) as val_counter:
+                                    with contextlib.suppress(Exception):
+                                        mark_step = getattr(
+                                            getattr(torch, "compiler", None),
+                                            "cudagraph_mark_step_begin",
+                                            None,
+                                        )
+                                        if callable(mark_step):
+                                            mark_step()
                                     Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                         device, dtype=param_dtype, non_blocking=True
                                     )
