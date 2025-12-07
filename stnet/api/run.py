@@ -143,8 +143,6 @@ def train(
     with contextlib.suppress(Exception):
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
-    with contextlib.suppress(Exception):
-        torch.set_float32_matmul_precision("high")
 
     def _check_shapes(
         first_feats: Optional[torch.Tensor],

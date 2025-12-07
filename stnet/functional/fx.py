@@ -304,6 +304,24 @@ class Gradient:
             compile_kwargs["fullgraph"] = bool(fullgraph)
         if dynamic is not None:
             compile_kwargs["dynamic"] = bool(dynamic)
+        if options and mode_value is not None:
+            try:
+                from torch._inductor import config as _inductor_config  # type: ignore
+            except Exception:
+                _inductor_config = None
+            if _inductor_config is not None:
+                for _k, _v in dict(options).items():
+                    if not isinstance(_k, str):
+                        continue
+                    try:
+                        _obj = _inductor_config
+                        _parts = _k.split(".")
+                        for _p in _parts[:-1]:
+                            _obj = getattr(_obj, _p)
+                        setattr(_obj, _parts[-1], _v)
+                    except Exception:
+                        pass
+            options = None
         if options:
             existing = compile_kwargs.get("options", {})
             if isinstance(existing, dict):

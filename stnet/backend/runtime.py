@@ -353,7 +353,6 @@ def _backend_type(device: torch.device) -> str:
 def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
         with contextlib.suppress(Exception):
-            torch.set_float32_matmul_precision("high")
             if torch.cuda.is_available():
                 with contextlib.suppress(Exception):
                     torch.backends.fp32_precision = "tf32"

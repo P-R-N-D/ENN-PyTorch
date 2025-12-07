@@ -407,43 +407,16 @@ class DilatedAttention(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden, self.embed_dim, bias=True),
         )
-        self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
-        self._mask_cache_gpu: Dict[Tuple[int, int], torch.Tensor] = {}
-        self._max_mask_cache_gpu: int = 1
+        self.length_bucket_multiple: int = 64
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        key = (L, device.index if device.type == "cuda" else -1)
-        mask_gpu = self._mask_cache_gpu.get(key)
-        if mask_gpu is not None and mask_gpu.device == device:
-            return mask_gpu
-
-        mask_cpu = self._mask_cache_cpu.get(L)
-        if mask_cpu is None:
-            mask_cpu = (
-                _get_dilated_mask(
-                    L,
-                    dilation=self.dilation,
-                    window_size=self.window_size,
-                    causal=self.causal,
-                )
-                .detach()
-                .contiguous()
-                .cpu()
-            )
-            self._mask_cache_cpu[L] = mask_cpu
-
-        mask_gpu = mask_cpu.to(device=device, non_blocking=True)
-        max_keep = int(getattr(self, "_max_mask_cache_gpu", 1) or 1)
-        if max_keep <= 0:
-            return mask_gpu
-        self._mask_cache_gpu[key] = mask_gpu
-        if len(self._mask_cache_gpu) > max_keep:
-            for old_key in list(self._mask_cache_gpu.keys()):
-                if len(self._mask_cache_gpu) <= max_keep:
-                    break
-                if old_key != key:
-                    self._mask_cache_gpu.pop(old_key, None)
-        return self._mask_cache_gpu[key]
+        mask_cpu = _get_dilated_mask(
+            L,
+            dilation=self.dilation,
+            window_size=self.window_size,
+            causal=self.causal,
+        )
+        return mask_cpu.to(device=device, non_blocking=True)
 
     def forward(
         self,
@@ -460,8 +433,36 @@ class DilatedAttention(nn.Module):
                 f"x.shape[-1]={D} must match embed_dim={self.embed_dim}"
             )
 
-        residual = x
-        x = self.norm1(x)
+        if key_padding_mask is not None:
+            if key_padding_mask.dim() != 2 or key_padding_mask.shape != (B, L):
+                raise ValueError(
+                    f"key_padding_mask must be (B,L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
+                )
+            if key_padding_mask.dtype != torch.bool:
+                key_padding_mask = key_padding_mask.to(dtype=torch.bool)
+
+        bucket = int(getattr(self, "length_bucket_multiple", 64))
+        if bucket <= 0:
+            bucket = 64
+        bucket = max(bucket, 1)
+        L_bucket = ((int(L) + bucket - 1) // bucket) * bucket
+        pad_len = L_bucket - int(L)
+
+        if pad_len > 0:
+            pad = x.new_zeros((B, pad_len, D))
+            x_eff = torch.cat([x, pad], dim=1)
+            if key_padding_mask is not None:
+                pad_mask = torch.ones((B, pad_len), device=key_padding_mask.device, dtype=key_padding_mask.dtype)
+                key_padding_mask_eff = torch.cat([key_padding_mask, pad_mask], dim=1)
+            else:
+                key_padding_mask_eff = key_padding_mask
+        else:
+            x_eff = x
+            key_padding_mask_eff = key_padding_mask
+
+        residual = x_eff
+        x_eff = self.norm1(x_eff)
+
         if not _HAS_FLEX_ATTENTION:
             mha = MultiHeadAttention(
                 self.embed_dim,
@@ -470,35 +471,35 @@ class DilatedAttention(nn.Module):
                 batch_first=True,
                 bias=True,
             )
-            mask = self._get_mask(L, x.device)
+            mask = self._get_mask(L_bucket, x_eff.device)
             attn_out, attn_w = mha(
-                x,
-                x,
-                x,
+                x_eff,
+                x_eff,
+                x_eff,
                 attn_mask=mask,
-                key_padding_mask=key_padding_mask,
+                key_padding_mask=key_padding_mask_eff,
                 need_weights=need_weights,
                 is_causal=self.causal,
             )
         else:
-            qkv = self.qkv(x)
+            qkv = self.qkv(x_eff)
             q, k, v = qkv.chunk(3, dim=-1)
             Dh = self.head_dim
             H = self.nhead
-            qh = q.view(B, L, H, Dh).transpose(1, 2).contiguous()
-            kh = k.view(B, L, H, Dh).transpose(1, 2).contiguous()
-            vh = v.view(B, L, H, Dh).transpose(1, 2).contiguous()
+            qh = q.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
+            kh = k.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
+            vh = v.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
 
             dil = int(self.dilation)
             win = None if self.window_size is None else int(self.window_size)
             causal = self.causal
             kpm: torch.Tensor | None = None
-            if isinstance(key_padding_mask, torch.Tensor):
-                if key_padding_mask.dim() != 2 or key_padding_mask.shape != (B, L):
+            if isinstance(key_padding_mask_eff, torch.Tensor):
+                if key_padding_mask_eff.dim() != 2 or key_padding_mask_eff.shape != (B, L_bucket):
                     raise ValueError(
-                        f"key_padding_mask must be (B,L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
+                        f"key_padding_mask must be (B,L_bucket)=({B},{L_bucket}), got {tuple(key_padding_mask_eff.shape)}"
                     )
-                kpm = key_padding_mask.to(dtype=torch.bool, device=x.device)
+                kpm = key_padding_mask_eff.to(dtype=torch.bool, device=x_eff.device)
 
             def mask_mod(b: int, h: int, qi: int, kj: int) -> bool:
                 dq = qi - kj
@@ -512,9 +513,9 @@ class DilatedAttention(nn.Module):
                 return ok
 
             _block_size: int
-            if L <= 2048:
+            if L_bucket <= 2048:
                 _block_size = 128
-            elif L <= 16384:
+            elif L_bucket <= 16384:
                 _block_size = 256
             else:
                 _block_size = 512
@@ -523,9 +524,9 @@ class DilatedAttention(nn.Module):
                 mask_mod,
                 B,
                 H,
-                L,
-                L,
-                device=x.device,
+                L_bucket,
+                L_bucket,
+                device=x_eff.device,
                 BLOCK_SIZE=_block_size,
             )
             scale = 1.0 / math.sqrt(float(Dh))
@@ -541,18 +542,24 @@ class DilatedAttention(nn.Module):
                 return_aux=None,
             )
             attn_out = self.out_proj(
-                y.transpose(1, 2).contiguous().view(B, L, self.embed_dim)
+                y.transpose(1, 2).contiguous().view(B, L_bucket, self.embed_dim)
             )
-            flops = 2.0 * B * H * L * Dh * L + 2.0 * B * H * L * L * Dh
+            flops = 2.0 * B * H * L_bucket * Dh * L_bucket + 2.0 * B * H * L_bucket * L_bucket * Dh
             try:
                 FLOP_PROFILER.add("DilatedAttention", float(flops))
             except Exception:
                 pass
             attn_w = None
+
         x = residual + self.dropout(attn_out)
         residual = x
         x = self.norm2(x)
         x = residual + self.ffn(x)
+
+        if pad_len > 0:
+            x = x[:, :L, :]
+            if attn_w is not None:
+                attn_w = attn_w[..., :L, :L]
 
         if not self.batch_first:
             x = x.transpose(0, 1)
@@ -1170,6 +1177,7 @@ class LongNet(nn.Module):
         mlp_ratio: float = 4.0,
         causal: bool = False,
         batch_first: bool = True,
+        length_bucket_multiple: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -1192,18 +1200,22 @@ class LongNet(nn.Module):
         layers: List[nn.Module] = []
         dilation = base_dilation
         for _ in range(depth):
-            layers.append(
-                DilatedAttention(
-                    embed_dim=embed_dim,
-                    num_heads=num_heads,
-                    dilation=dilation,
-                    window_size=window_size,
-                    dropout=dropout,
-                    mlp_ratio=mlp_ratio,
-                    causal=causal,
-                    batch_first=self.batch_first,
-                )
+            attn = DilatedAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dilation=dilation,
+                window_size=window_size,
+                dropout=dropout,
+                mlp_ratio=mlp_ratio,
+                causal=causal,
+                batch_first=self.batch_first,
             )
+            if length_bucket_multiple is not None:
+                try:
+                    attn.length_bucket_multiple = int(length_bucket_multiple)
+                except Exception:
+                    pass
+            layers.append(attn)
             dilation = max(1, dilation * max(1, int(dilation_growth)))
         self.layers = nn.ModuleList(layers)
         self.norm = nn.LayerNorm(embed_dim)
@@ -1254,6 +1266,7 @@ class Controller(nn.Module):
         mlp_ratio: float = 4.0,
         causal: bool = False,
         batch_first: bool = True,
+        length_bucket_multiple: Optional[int] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -1268,6 +1281,7 @@ class Controller(nn.Module):
             mlp_ratio=mlp_ratio,
             causal=causal,
             batch_first=batch_first,
+            length_bucket_multiple=length_bucket_multiple,
         )
 
     @property
@@ -2292,6 +2306,10 @@ class Instance(nn.Module):
             else None
         )
         self.processor = Processor(self.in_dim, self.out_shape, config=config).to(self._device)
+        try:
+            bucket = int(getattr(config, "length_bucket_multiple", 64))
+        except Exception:
+            bucket = 64
         controller = Controller(
             int(config.depth),
             int(config.heads),
@@ -2299,6 +2317,7 @@ class Instance(nn.Module):
             mlp_ratio=float(getattr(config, "mlp_ratio", 4.0)),
             dropout=float(getattr(config, "dropout", 0.0)),
             batch_first=True,
+            length_bucket_multiple=bucket,
         ).to(self._device)
         self.controller = controller
         try:

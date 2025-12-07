@@ -426,7 +426,6 @@ def get_device(
         torch.backends.cudnn.deterministic = cfg.deterministic
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
         try:
-            torch.set_float32_matmul_precision(str(cfg.matmul_precision))
             fp32_precision = "tf32" if allow_val else "ieee"
             with contextlib.suppress(Exception):
                 torch.backends.fp32_precision = fp32_precision
