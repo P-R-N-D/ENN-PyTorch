@@ -35,6 +35,44 @@ _RUNTIME_CFG = SimpleNamespace(
     te_first=True,
 )
 
+_FP32_PRECISION_CACHE: Dict[Tuple[str, int], str] = {}
+
+def set_float32_precision(
+    device: torch.device,
+    dtype: Optional[torch.dtype] = None,
+    autocast_dtype: Optional[torch.dtype] = None,
+) -> None:
+    if device.type != "cuda":
+        return
+
+    use_tf32 = False
+    for _dt in (dtype, autocast_dtype):
+        if _dt is None:
+            continue
+        if _dt not in (torch.float32, torch.float64):
+            use_tf32 = True
+            break
+
+    precision = "tf32" if use_tf32 else "ieee"
+    key = (device.type, int(device.index) if device.index is not None else -1)
+    if _FP32_PRECISION_CACHE.get(key) == precision:
+        return
+    _FP32_PRECISION_CACHE[key] = precision
+
+    with contextlib.suppress(Exception):
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
+                torch.backends.cuda.matmul.fp32_precision = precision
+
+    with contextlib.suppress(Exception):
+        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv"):
+            if hasattr(torch.backends.cudnn.conv, "fp32_precision"):
+                torch.backends.cudnn.conv.fp32_precision = precision
+    with contextlib.suppress(Exception):
+        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "rnn"):
+            if hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
+                torch.backends.cudnn.rnn.fp32_precision = precision
+
 
 _TZ_ALIASES = {
     "KST": "Asia/Seoul",
@@ -425,21 +463,6 @@ def get_device(
         device = torch.device(f"cuda:{idx}")
         torch.backends.cudnn.deterministic = cfg.deterministic
         torch.backends.cudnn.benchmark = bool(cfg.cudnn_benchmark)
-        try:
-            fp32_precision = "tf32" if allow_val else "ieee"
-            with contextlib.suppress(Exception):
-                torch.backends.fp32_precision = fp32_precision
-            if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                torch.backends.cuda.matmul.fp32_precision = fp32_precision
-            if hasattr(torch.backends, "cudnn"):
-                with contextlib.suppress(Exception):
-                    torch.backends.cudnn.fp32_precision = fp32_precision
-                if hasattr(torch.backends.cudnn, "conv"):
-                    torch.backends.cudnn.conv.fp32_precision = fp32_precision
-                if hasattr(torch.backends.cudnn, "rnn"):
-                    torch.backends.cudnn.rnn.fp32_precision = fp32_precision
-        except Exception:
-            pass
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
         device = torch.device("mps")
     elif hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():

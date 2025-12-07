@@ -67,7 +67,8 @@ from .distributed import (distributed_barrier, distributed_sync,
                           to_ddp, to_fsdp)
 from .profiler import FlopCounter
 from .system import (Memory, get_device, get_tlb, initialize_python_path,
-                     is_float8_supported, new_dir, posix_time)
+                     is_float8_supported, new_dir, posix_time,
+                     set_float32_precision)
 
 if TYPE_CHECKING:
     import numpy as _np
@@ -352,33 +353,8 @@ def _backend_type(device: torch.device) -> str:
 
 def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
-        with contextlib.suppress(Exception):
-            if torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    torch.backends.fp32_precision = "tf32"
-                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                    torch.backends.cuda.matmul.fp32_precision = "tf32"
-                if hasattr(torch.backends, "cudnn"):
-                    with contextlib.suppress(Exception):
-                        torch.backends.cudnn.fp32_precision = "tf32"
-                    if hasattr(torch.backends.cudnn, "conv"):
-                        torch.backends.cudnn.conv.fp32_precision = "tf32"
-                    if hasattr(torch.backends.cudnn, "rnn"):
-                        torch.backends.cudnn.rnn.fp32_precision = "tf32"
-            else:
-                with contextlib.suppress(Exception):
-                    torch.backends.fp32_precision = "ieee"
-                if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-                    torch.backends.cuda.matmul.fp32_precision = "ieee"
-                if hasattr(torch.backends, "cudnn"):
-                    with contextlib.suppress(Exception):
-                        torch.backends.cudnn.fp32_precision = "ieee"
-                    if hasattr(torch.backends.cudnn, "conv"):
-                        torch.backends.cudnn.conv.fp32_precision = "ieee"
-                    if hasattr(torch.backends.cudnn, "rnn"):
-                        torch.backends.cudnn.rnn.fp32_precision = "ieee"
-            if hasattr(torch.backends, "cudnn"):
-                torch.backends.cudnn.benchmark = True
+        if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.benchmark = True
     rank = int(os.environ.get("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
@@ -938,6 +914,12 @@ def epochs(
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
 
+    autocast_dtype: Optional[torch.dtype] = None
+    with contextlib.suppress(Exception):
+        autocast_dtype = Autocast.resolve_float_dtype(device)
+    with contextlib.suppress(Exception):
+        set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
+
     per_batch = getattr(train_loader, "batch_size", None)
     if per_batch is None or int(per_batch) <= 0:
         try:
@@ -1175,8 +1157,6 @@ def epochs(
 
     if train_steps > 0:
         util_adjust_interval = max(10, int(train_steps * 0.05))
-        # Enable auto-tuning after at least 10% of an epoch has passed,
-        # but no earlier than 50 steps. Also do not exceed train_steps.
         util_warmup_steps = max(
             util_adjust_interval,
             min(int(train_steps), max(50, int(train_steps * 0.1))),
@@ -2428,6 +2408,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         )
         if param_dtype is None:
             param_dtype = torch.float32
+        autocast_dtype: Optional[torch.dtype] = None
+        with contextlib.suppress(Exception):
+            autocast_dtype = Autocast.resolve_float_dtype(device)
+        with contextlib.suppress(Exception):
+            set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
+
         fp8_ok, fp8_reason = is_float8_supported(device)
         fp8_enabled = False
         fp8_backend: Optional[str] = None

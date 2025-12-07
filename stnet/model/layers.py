@@ -410,12 +410,9 @@ class DilatedAttention(nn.Module):
         self.length_bucket_multiple: int = 64
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        mask_cpu = _get_dilated_mask(
-            L,
-            dilation=self.dilation,
-            window_size=self.window_size,
-            causal=self.causal,
-        )
+        mask_cpu = _get_dilated_mask(L, dilation=self.dilation, causal=self.causal)
+        if device.type == "cpu":
+            return mask_cpu
         return mask_cpu.to(device=device, non_blocking=True)
 
     def forward(
@@ -423,159 +420,154 @@ class DilatedAttention(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        average_attn_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        transposed = False
         if not self.batch_first:
             x = x.transpose(0, 1)
+            if key_padding_mask is not None:
+                key_padding_mask = key_padding_mask.transpose(0, 1)
+            transposed = True
 
         B, L, D = x.shape
         if D != self.embed_dim:
-            raise ValueError(
-                f"x.shape[-1]={D} must match embed_dim={self.embed_dim}"
-            )
+            raise ValueError(f"x.shape[-1]={D} must match embed_dim={self.embed_dim}")
 
+        kpm: Optional[torch.Tensor] = None
         if key_padding_mask is not None:
-            if key_padding_mask.dim() != 2 or key_padding_mask.shape != (B, L):
+            if key_padding_mask.shape[0] != B or key_padding_mask.shape[1] != L:
                 raise ValueError(
-                    f"key_padding_mask must be (B,L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
+                    f"key_padding_mask must be (B, L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
                 )
-            if key_padding_mask.dtype != torch.bool:
-                key_padding_mask = key_padding_mask.to(dtype=torch.bool)
+            kpm = key_padding_mask
+            if kpm.dtype is not torch.bool:
+                kpm = kpm.to(torch.bool)
 
-        bucket = int(getattr(self, "length_bucket_multiple", 64))
-        if bucket <= 0:
-            bucket = 64
-        bucket = max(bucket, 1)
-        L_bucket = ((int(L) + bucket - 1) // bucket) * bucket
-        pad_len = L_bucket - int(L)
+        base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
+        if L <= 512:
+            mult = base_mult
+        elif L <= 2048:
+            mult = base_mult * 2
+        else:
+            mult = base_mult * 4
+        mult = max(mult, 1)
 
+        L_k = int(((L + mult - 1) // mult) * mult)
+        pad_len = L_k - L
+
+        x_k = x
+        kpm_k: Optional[torch.Tensor] = kpm
         if pad_len > 0:
             pad = x.new_zeros((B, pad_len, D))
-            x_eff = torch.cat([x, pad], dim=1)
-            pad_mask = torch.ones(
-                (B, pad_len),
-                device=(key_padding_mask.device if key_padding_mask is not None else x.device),
-                dtype=(key_padding_mask.dtype if key_padding_mask is not None else torch.bool),
-            )
+            x_k = torch.cat((x, pad), dim=1)
+            if kpm is not None:
+                pad_mask = torch.ones((B, pad_len), device=kpm.device, dtype=torch.bool)
+                kpm_k = torch.cat((kpm, pad_mask), dim=1)
 
-            if key_padding_mask is not None:
-                key_padding_mask_eff = torch.cat([key_padding_mask, pad_mask], dim=1)
-            else:
-                key_padding_mask_eff = torch.cat(
-                    [
-                        torch.zeros((B, L), device=x.device, dtype=torch.bool),
-                        pad_mask,
-                    ],
-                    dim=1,
-                )
-        else:
-            x_eff = x
-            key_padding_mask_eff = key_padding_mask
+        residual = x_k
+        x_k = self.norm1(x_k)
 
-        residual = x_eff
-        x_eff = self.norm1(x_eff)
+        attn_w: Optional[torch.Tensor] = None
 
-        if not _HAS_FLEX_ATTENTION:
-            mha = MultiHeadAttention(
-                self.embed_dim,
-                self.num_heads,
-                dropout=self.dropout_p,
-                batch_first=True,
-                bias=True,
-            )
-            mask = self._get_mask(L_bucket, x_eff.device)
-            attn_out, attn_w = mha(
-                x_eff,
-                x_eff,
-                x_eff,
-                attn_mask=mask,
-                key_padding_mask=key_padding_mask_eff,
-                need_weights=need_weights,
-                is_causal=self.causal,
-            )
-        else:
-            qkv = self.qkv(x_eff)
+        L_q = L
+
+        if _HAS_FLEX_ATTENTION:
+            qkv = self.qkv(x_k)
             q, k, v = qkv.chunk(3, dim=-1)
+
+            H = self.num_heads
             Dh = self.head_dim
-            H = self.nhead
-            qh = q.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
-            kh = k.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
-            vh = v.view(B, L_bucket, H, Dh).transpose(1, 2).contiguous()
 
-            dil = int(self.dilation)
-            win = None if self.window_size is None else int(self.window_size)
-            causal = self.causal
-            kpm: torch.Tensor | None = None
-            if isinstance(key_padding_mask_eff, torch.Tensor):
-                if key_padding_mask_eff.dim() != 2 or key_padding_mask_eff.shape != (B, L_bucket):
-                    raise ValueError(
-                        f"key_padding_mask must be (B,L_bucket)=({B},{L_bucket}), got {tuple(key_padding_mask_eff.shape)}"
-                    )
-                kpm = key_padding_mask_eff.to(dtype=torch.bool, device=x_eff.device)
+            qh = q[:, :L_q, :].view(B, L_q, H, Dh).transpose(1, 2)
+            kh = k.view(B, L_k, H, Dh).transpose(1, 2)
+            vh = v.view(B, L_k, H, Dh).transpose(1, 2)
 
-            def mask_mod(b: int, h: int, qi: int, kj: int) -> bool:
-                dq = qi - kj
-                ok = (dq.remainder(dil) == 0)
-                if win is not None:
-                    ok = ok & (dq.abs() <= win)
-                if causal:
-                    ok = ok & (kj <= qi)
-                if kpm is not None:
-                    ok = ok & (~kpm[b, kj])
-                return ok
+            kpm_bool = kpm_k
 
-            _block_size: int
-            if L_bucket <= 2048:
-                _block_size = 128
-            elif L_bucket <= 16384:
-                _block_size = 256
+            def dilated_mask(b: int, h: int, q_idx: int, kv_idx: int) -> bool:
+                qj = int(q_idx)
+                kj = int(kv_idx)
+                if self.causal and kj > qj:
+                    return False
+                if self.dilation > 1 and (qj - kj) % self.dilation != 0:
+                    return False
+                if kpm_bool is not None:
+                    if bool(kpm_bool[b, qj]) or bool(kpm_bool[b, kj]):
+                        return False
+                return True
+
+            if L_k >= 8192:
+                block_M, block_N = 64, 64
+            elif L_k >= 4096:
+                block_M, block_N = 64, 32
+            elif L_k >= 2048:
+                block_M, block_N = 32, 64
             else:
-                _block_size = 512
+                block_M, block_N = 32, 32
 
-            block = create_block_mask(
-                mask_mod,
+            block_mask = create_block_mask(
+                dilated_mask,
                 B,
                 H,
-                L_bucket,
-                L_bucket,
-                device=x_eff.device,
-                BLOCK_SIZE=_block_size,
+                L_q,
+                L_k,
+                device=x_k.device,
+                block_size=(block_M, block_N),
+                mask_mod="and",
             )
-            scale = 1.0 / math.sqrt(float(Dh))
-            y = flex_attention(
+
+            y = flex_attention(qh, kh, vh, block_mask=block_mask)
+            attn_out = self.out_proj(
+                y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+            )
+
+        else:
+            qkv = self.qkv(x_k)
+            q, k, v = qkv.chunk(3, dim=-1)
+
+            H = self.num_heads
+            Dh = self.head_dim
+
+            qh = q[:, :L_q, :].view(B, L_q, H, Dh).transpose(1, 2)
+            kh = k.view(B, L_k, H, Dh).transpose(1, 2)
+            vh = v.view(B, L_k, H, Dh).transpose(1, 2)
+
+            base_mask_full = self._get_mask(L_k, x_k.device)
+            base_mask = base_mask_full[:L_q, :]
+
+            attn_mask = base_mask
+            if kpm_k is not None:
+                kpm_b = kpm_k.to(torch.bool)
+                attn_mask = (
+                    base_mask[None, None, :, :]
+                    | kpm_b[:, None, None, :]
+                    | kpm_b[:, None, :L_q, None]
+                )
+
+            y = F.scaled_dot_product_attention(
                 qh,
                 kh,
                 vh,
-                block_mask=block,
-                scale=scale,
-                enable_gqa=False,
-                return_lse=False,
-                kernel_options=None,
-                return_aux=None,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,
             )
             attn_out = self.out_proj(
-                y.transpose(1, 2).contiguous().view(B, L_bucket, self.embed_dim)
+                y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
             )
-            flops = 2.0 * B * H * L_bucket * Dh * L_bucket + 2.0 * B * H * L_bucket * L_bucket * Dh
-            try:
-                FLOP_PROFILER.add("DilatedAttention", float(flops))
-            except Exception:
-                pass
-            attn_w = None
 
-        x = residual + self.dropout(attn_out)
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.ffn(x)
+        x_out = x + self.dropout(attn_out)
+        res2 = x_out
+        x_out = self.norm2(x_out)
+        x_out = self.ffn(x_out)
+        x_out = res2 + self.dropout(x_out)
 
-        if pad_len > 0:
-            x = x[:, :L, :]
-            if attn_w is not None:
-                attn_w = attn_w[..., :L, :L]
+        if transposed:
+            x_out = x_out.transpose(0, 1)
 
-        if not self.batch_first:
-            x = x.transpose(0, 1)
-
-        return x, (attn_w if need_weights else None)
+        if need_weights:
+            return x_out, attn_w
+        return x_out, None
 
 class PointTransformer(nn.Module):
 
@@ -1204,7 +1196,6 @@ class LongNet(nn.Module):
             "include_softmax_scale_dropout": True,
         }
         self.batch_first = bool(batch_first)
-        # TorchScale LongNet is deliberately disabled to keep semantics stable.
         self._impl = None
         self._using = "fallback"
         self._impl_batch_first = self.batch_first
@@ -2559,45 +2550,19 @@ class Instance(nn.Module):
             assembled = assembled + bl
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
-        den = max(1, int(tokens.shape[1]))
-        mean32 = tokens.sum(dim=(1,), keepdim=True, dtype=torch.float32) / den
+        mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
         tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
 
         ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
-        dec_mb = int(getattr(self, "decode_microbatch", 0) or 0)
-
-        def _default_ctrl_mb() -> int:
-            mb = int(self.microbatch or 0)
-            if mb <= 0:
-                return 16
-            return max(1, min(mb, 16))
-
         if ctrl_mb <= 0:
-            ctrl_mb = _default_ctrl_mb()
-        if dec_mb <= 0:
-            dec_mb = ctrl_mb
+            ctrl_mb = int(self.microbatch or 0)
+        if ctrl_mb <= 0:
+            ctrl_mb = 64
         ctrl_mb = max(1, min(int(b), int(ctrl_mb)))
-        dec_mb = max(1, min(int(b), int(dec_mb)))
-
-        pad_mb = bool(getattr(self, "_pad_compiled_microbatch", False))
-
-        def _pad_chunk(x: torch.Tensor, target: int) -> Tuple[torch.Tensor, Optional[int]]:
-            if (not pad_mb) or int(x.shape[0]) == int(target):
-                return x, None
-            orig = int(x.shape[0])
-            pad = int(target) - orig
-            if pad <= 0:
-                return x, None
-            z = x.new_zeros((pad,) + tuple(x.shape[1:]))
-            return torch.cat([x, z], dim=0), orig
-
-        def _unpad(y: torch.Tensor, orig: Optional[int]) -> torch.Tensor:
-            if orig is None:
-                return y
-            return y[:orig]
 
         if infer_mode:
             with Gradient.inference(self.controller):
+
                 def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
                     with (
                         Autocast.float(device)
@@ -2608,26 +2573,23 @@ class Instance(nn.Module):
                     return out
 
                 if ctrl_mb < int(b):
-                    rt_chunks: List[torch.Tensor] = []
-                    for s in range(0, int(b), ctrl_mb):
-                        chunk = tokens_centered[s : s + ctrl_mb]
-                        chunk, orig = _pad_chunk(chunk, ctrl_mb)
-                        rt_chunks.append(_unpad(_infer_controller(chunk), orig))
-                    refined_tokens = (
-                        torch.cat(rt_chunks, dim=0)
-                        if len(rt_chunks) > 1
-                        else rt_chunks[0]
+                    refined_tokens = torch.cat(
+                        [
+                            _infer_controller(tokens_centered[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
                     )
                 else:
-                    chunk, orig = _pad_chunk(tokens_centered, ctrl_mb)
-                    refined_tokens = _unpad(_infer_controller(chunk), orig)
+                    refined_tokens = _infer_controller(tokens_centered)
 
             refined_tokens = torch.nan_to_num(
                 refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
             )
-            decode_tokens = refined_tokens.detach()
+            decode_tokens = refined_tokens.detach().clone()
 
             with Gradient.inference(self.processor):
+
                 def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
                     with (
                         Autocast.float(device)
@@ -2636,20 +2598,16 @@ class Instance(nn.Module):
                     ):
                         return self.processor.decode(chunk, apply_norm=True)
 
-                if dec_mb < int(b):
-                    rc_chunks: List[torch.Tensor] = []
-                    for s in range(0, int(b), dec_mb):
-                        chunk = decode_tokens[s : s + dec_mb]
-                        chunk, orig = _pad_chunk(chunk, dec_mb)
-                        rc_chunks.append(_unpad(_infer_decode(chunk), orig))
-                    residual_context = (
-                        torch.cat(rc_chunks, dim=0)
-                        if len(rc_chunks) > 1
-                        else rc_chunks[0]
+                if ctrl_mb < int(b):
+                    residual_context = torch.cat(
+                        [
+                            _infer_decode(decode_tokens[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
                     )
                 else:
-                    chunk, orig = _pad_chunk(decode_tokens, dec_mb)
-                    residual_context = _unpad(_infer_decode(chunk), orig)
+                    residual_context = _infer_decode(decode_tokens)
 
             residual_context = torch.nan_to_num(
                 residual_context, nan=0.0, posinf=0.0, neginf=0.0
@@ -2672,19 +2630,12 @@ class Instance(nn.Module):
                     return _global_tokens(chunk)
 
                 if ctrl_mb < int(b):
-                    rt_chunks: List[torch.Tensor] = []
-                    for s in range(0, int(b), ctrl_mb):
-                        chunk = tokens_centered[s : s + ctrl_mb]
-                        chunk, orig = _pad_chunk(chunk, ctrl_mb)
-                        rt_chunks.append(_unpad(_run_controller(chunk), orig))
-                    refined_tokens = (
-                        torch.cat(rt_chunks, dim=0)
-                        if len(rt_chunks) > 1
-                        else rt_chunks[0]
+                    refined_tokens = torch.cat(
+                        [_run_controller(tokens_centered[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        dim=0,
                     )
                 else:
-                    chunk, orig = _pad_chunk(tokens_centered, ctrl_mb)
-                    refined_tokens = _unpad(_run_controller(chunk), orig)
+                    refined_tokens = _run_controller(tokens_centered)
                 refined_tokens = torch.nan_to_num(
                     refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
                 )
@@ -2702,20 +2653,13 @@ class Instance(nn.Module):
                         return activation_checkpoint(_decode_tokens, chunk)
                     return _decode_tokens(chunk)
 
-                if dec_mb < int(b):
-                    rc_chunks: List[torch.Tensor] = []
-                    for s in range(0, int(b), dec_mb):
-                        chunk = refined_tokens[s : s + dec_mb]
-                        chunk, orig = _pad_chunk(chunk, dec_mb)
-                        rc_chunks.append(_unpad(_run_decode(chunk), orig))
-                    residual_context = (
-                        torch.cat(rc_chunks, dim=0)
-                        if len(rc_chunks) > 1
-                        else rc_chunks[0]
+                if ctrl_mb < int(b):
+                    residual_context = torch.cat(
+                        [_run_decode(refined_tokens[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        dim=0,
                     )
                 else:
-                    chunk, orig = _pad_chunk(refined_tokens, dec_mb)
-                    residual_context = _unpad(_run_decode(chunk), orig)
+                    residual_context = _run_decode(refined_tokens)
                 residual_context = torch.nan_to_num(
                     residual_context, nan=0.0, posinf=0.0, neginf=0.0
                 )
