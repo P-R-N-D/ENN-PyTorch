@@ -451,11 +451,22 @@ class DilatedAttention(nn.Module):
         if pad_len > 0:
             pad = x.new_zeros((B, pad_len, D))
             x_eff = torch.cat([x, pad], dim=1)
+            pad_mask = torch.ones(
+                (B, pad_len),
+                device=(key_padding_mask.device if key_padding_mask is not None else x.device),
+                dtype=(key_padding_mask.dtype if key_padding_mask is not None else torch.bool),
+            )
+
             if key_padding_mask is not None:
-                pad_mask = torch.ones((B, pad_len), device=key_padding_mask.device, dtype=key_padding_mask.dtype)
                 key_padding_mask_eff = torch.cat([key_padding_mask, pad_mask], dim=1)
             else:
-                key_padding_mask_eff = key_padding_mask
+                key_padding_mask_eff = torch.cat(
+                    [
+                        torch.zeros((B, L), device=x.device, dtype=torch.bool),
+                        pad_mask,
+                    ],
+                    dim=1,
+                )
         else:
             x_eff = x
             key_padding_mask_eff = key_padding_mask
