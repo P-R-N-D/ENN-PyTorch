@@ -2505,10 +2505,9 @@ class Instance(nn.Module):
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
         if tokens.dtype not in (torch.float64, torch.float32):
-            mean = tokens.mean(dim=1, keepdim=True, dtype=torch.float64)
-            mean = mean.to(dtype=tokens.dtype)
+            mean = tokens.mean(dim=(1,), keepdim=True, dtype=torch.float64)
         else:
-            mean = tokens.mean(dim=1, keepdim=1)
+            mean = tokens.mean(dim=(1,), keepdim=True, dtype=tokens.dtype)
         tokens_centered = (tokens - mean).contiguous()
 
         ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
