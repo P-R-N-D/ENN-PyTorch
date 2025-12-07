@@ -409,6 +409,7 @@ class DilatedAttention(nn.Module):
         )
         self._mask_cache_cpu: Dict[int, torch.Tensor] = {}
         self._mask_cache_gpu: Dict[Tuple[int, int], torch.Tensor] = {}
+        self._max_mask_cache_gpu: int = 1
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
         key = (L, device.index if device.type == "cuda" else -1)
@@ -432,8 +433,17 @@ class DilatedAttention(nn.Module):
             self._mask_cache_cpu[L] = mask_cpu
 
         mask_gpu = mask_cpu.to(device=device, non_blocking=True)
+        max_keep = int(getattr(self, "_max_mask_cache_gpu", 1) or 1)
+        if max_keep <= 0:
+            return mask_gpu
         self._mask_cache_gpu[key] = mask_gpu
-        return mask_gpu
+        if len(self._mask_cache_gpu) > max_keep:
+            for old_key in list(self._mask_cache_gpu.keys()):
+                if len(self._mask_cache_gpu) <= max_keep:
+                    break
+                if old_key != key:
+                    self._mask_cache_gpu.pop(old_key, None)
+        return self._mask_cache_gpu[key]
 
     def forward(
         self,
@@ -2315,21 +2325,36 @@ class Instance(nn.Module):
         normalized_mode = mode.lower()
         disable_compile = normalized_mode in {"", "disabled", "none"}
         compile_mode_arg = normalized_mode if not disable_compile else None
+
+        compile_dynamic = bool(
+            getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead")
+        )
+        compile_cudagraphs = bool(
+            getattr(config, "compile_cudagraphs", normalized_mode != "reduce-overhead")
+        )
+        compile_kwargs: Dict[str, Any] = {}
+        if not compile_cudagraphs:
+            compile_kwargs["options"] = {"triton.cudagraphs": False}
+        self._pad_compiled_microbatch = bool(
+            getattr(config, "pad_compiled_microbatch", True)
+        ) and (not disable_compile)
         self.processor = Gradient.compile(
             self.processor,
             mode=compile_mode_arg,
             fullgraph=False,
-            dynamic=False,
+            dynamic=compile_dynamic,
             backend="inductor",
             disable=disable_compile,
+            **compile_kwargs,
         )
         self.controller = Gradient.compile(
             self.controller,
             mode=compile_mode_arg,
             fullgraph=False,
-            dynamic=False,
+            dynamic=compile_dynamic,
             backend="inductor",
             disable=disable_compile,
+            **compile_kwargs,
         )
         self.__config = config
         self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
@@ -2504,11 +2529,9 @@ class Instance(nn.Module):
             assembled = assembled + bl
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
-        if tokens.dtype not in (torch.float64, torch.float32):
-            mean = tokens.mean(dim=(1,), keepdim=True, dtype=torch.float64)
-        else:
-            mean = tokens.mean(dim=(1,), keepdim=True, dtype=tokens.dtype)
-        tokens_centered = (tokens - mean).contiguous()
+        den = max(1, int(tokens.shape[1]))
+        mean32 = tokens.sum(dim=(1,), keepdim=True, dtype=torch.float32) / den
+        tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
 
         ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
         dec_mb = int(getattr(self, "decode_microbatch", 0) or 0)
@@ -2516,8 +2539,8 @@ class Instance(nn.Module):
         def _default_ctrl_mb() -> int:
             mb = int(self.microbatch or 0)
             if mb <= 0:
-                return 32
-            return max(1, min(mb, 32))
+                return 16
+            return max(1, min(mb, 16))
 
         if ctrl_mb <= 0:
             ctrl_mb = _default_ctrl_mb()
@@ -2525,6 +2548,23 @@ class Instance(nn.Module):
             dec_mb = ctrl_mb
         ctrl_mb = max(1, min(int(b), int(ctrl_mb)))
         dec_mb = max(1, min(int(b), int(dec_mb)))
+
+        pad_mb = bool(getattr(self, "_pad_compiled_microbatch", False))
+
+        def _pad_chunk(x: torch.Tensor, target: int) -> Tuple[torch.Tensor, Optional[int]]:
+            if (not pad_mb) or int(x.shape[0]) == int(target):
+                return x, None
+            orig = int(x.shape[0])
+            pad = int(target) - orig
+            if pad <= 0:
+                return x, None
+            z = x.new_zeros((pad,) + tuple(x.shape[1:]))
+            return torch.cat([x, z], dim=0), orig
+
+        def _unpad(y: torch.Tensor, orig: Optional[int]) -> torch.Tensor:
+            if orig is None:
+                return y
+            return y[:orig]
 
         if infer_mode:
             with Gradient.inference(self.controller):
@@ -2540,14 +2580,17 @@ class Instance(nn.Module):
                 if ctrl_mb < int(b):
                     rt_chunks: List[torch.Tensor] = []
                     for s in range(0, int(b), ctrl_mb):
-                        rt_chunks.append(_infer_controller(tokens_centered[s : s + ctrl_mb]))
+                        chunk = tokens_centered[s : s + ctrl_mb]
+                        chunk, orig = _pad_chunk(chunk, ctrl_mb)
+                        rt_chunks.append(_unpad(_infer_controller(chunk), orig))
                     refined_tokens = (
                         torch.cat(rt_chunks, dim=0)
                         if len(rt_chunks) > 1
                         else rt_chunks[0]
                     )
                 else:
-                    refined_tokens = _infer_controller(tokens_centered)
+                    chunk, orig = _pad_chunk(tokens_centered, ctrl_mb)
+                    refined_tokens = _unpad(_infer_controller(chunk), orig)
 
             refined_tokens = torch.nan_to_num(
                 refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
@@ -2566,16 +2609,17 @@ class Instance(nn.Module):
                 if dec_mb < int(b):
                     rc_chunks: List[torch.Tensor] = []
                     for s in range(0, int(b), dec_mb):
-                        rc_chunks.append(
-                            _infer_decode(decode_tokens[s : s + dec_mb])
-                        )
+                        chunk = decode_tokens[s : s + dec_mb]
+                        chunk, orig = _pad_chunk(chunk, dec_mb)
+                        rc_chunks.append(_unpad(_infer_decode(chunk), orig))
                     residual_context = (
                         torch.cat(rc_chunks, dim=0)
                         if len(rc_chunks) > 1
                         else rc_chunks[0]
                     )
                 else:
-                    residual_context = _infer_decode(decode_tokens)
+                    chunk, orig = _pad_chunk(decode_tokens, dec_mb)
+                    residual_context = _unpad(_infer_decode(chunk), orig)
 
             residual_context = torch.nan_to_num(
                 residual_context, nan=0.0, posinf=0.0, neginf=0.0
@@ -2600,14 +2644,17 @@ class Instance(nn.Module):
                 if ctrl_mb < int(b):
                     rt_chunks: List[torch.Tensor] = []
                     for s in range(0, int(b), ctrl_mb):
-                        rt_chunks.append(_run_controller(tokens_centered[s : s + ctrl_mb]))
+                        chunk = tokens_centered[s : s + ctrl_mb]
+                        chunk, orig = _pad_chunk(chunk, ctrl_mb)
+                        rt_chunks.append(_unpad(_run_controller(chunk), orig))
                     refined_tokens = (
                         torch.cat(rt_chunks, dim=0)
                         if len(rt_chunks) > 1
                         else rt_chunks[0]
                     )
                 else:
-                    refined_tokens = _run_controller(tokens_centered)
+                    chunk, orig = _pad_chunk(tokens_centered, ctrl_mb)
+                    refined_tokens = _unpad(_run_controller(chunk), orig)
                 refined_tokens = torch.nan_to_num(
                     refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
                 )
@@ -2628,14 +2675,17 @@ class Instance(nn.Module):
                 if dec_mb < int(b):
                     rc_chunks: List[torch.Tensor] = []
                     for s in range(0, int(b), dec_mb):
-                        rc_chunks.append(_run_decode(refined_tokens[s : s + dec_mb]))
+                        chunk = refined_tokens[s : s + dec_mb]
+                        chunk, orig = _pad_chunk(chunk, dec_mb)
+                        rc_chunks.append(_unpad(_run_decode(chunk), orig))
                     residual_context = (
                         torch.cat(rc_chunks, dim=0)
                         if len(rc_chunks) > 1
                         else rc_chunks[0]
                     )
                 else:
-                    residual_context = _run_decode(refined_tokens)
+                    chunk, orig = _pad_chunk(refined_tokens, dec_mb)
+                    residual_context = _unpad(_run_decode(chunk), orig)
                 residual_context = torch.nan_to_num(
                     residual_context, nan=0.0, posinf=0.0, neginf=0.0
                 )
