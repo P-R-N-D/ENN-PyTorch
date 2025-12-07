@@ -2613,42 +2613,7 @@ class Instance(nn.Module):
 
         mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
         tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
-
-        user_ctrl_mb = int(getattr(self, "controller_microbatch", 0) or 0)
-        if user_ctrl_mb > 0:
-            ctrl_mb = user_ctrl_mb
-        else:
-            ctrl_mb = 64
-
-        dev_type = getattr(device, "type", "cpu")
-        free_bytes: Optional[int] = None
-
-        if _acc_memory is not None and dev_type in ("cuda", "xpu", "mps"):
-            with contextlib.suppress(Exception):
-                stats = _acc_memory.memory_stats(device) 
-                active = int(
-                    stats.get("active_bytes.all.current", stats.get("active_bytes", 0))
-                )
-                total = int(stats.get("device_limit_bytes", 0))
-                if total > 0 and active >= 0:
-                    free_bytes = max(0, total - active)
-        if free_bytes is None and dev_type == "cuda":
-            with contextlib.suppress(Exception):
-                free, total = torch.cuda.mem_get_info(device)
-                free_bytes = int(free)
-        if free_bytes is not None and free_bytes > 0:
-            one = tokens_centered[:1]
-            bytes_per_sample = int(one.nelement()) * int(one.element_size())
-            if bytes_per_sample <= 0:
-                bytes_per_sample = 1
-            FUDGE = 16
-            bytes_per_sample *= FUDGE
-            SAFETY = 0.7
-            usable = int(free_bytes * SAFETY)
-            max_by_mem = max(1, usable // bytes_per_sample)
-            ctrl_mb = int(max(1, min(int(b), int(ctrl_mb), int(max_by_mem))))
-        else:
-            ctrl_mb = max(1, min(int(b), int(ctrl_mb), 8))
+        ctrl_mb = 1
 
         if infer_mode:
             with contextlib.suppress(Exception):
@@ -2725,9 +2690,7 @@ class Instance(nn.Module):
                     return out
 
                 def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    if use_activation_checkpoint and activation_checkpoint is not None:
-                        return activation_checkpoint(_global_tokens, chunk)
-                    return _global_tokens(chunk)
+                    return activation_checkpoint(_global_tokens, chunk)
 
                 if ctrl_mb < int(b):
                     refined_tokens = torch.cat(
@@ -2749,7 +2712,7 @@ class Instance(nn.Module):
                         return self.processor.decode(inp, apply_norm=True)
 
                 def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
-                    if use_activation_checkpoint and activation_checkpoint is not None:
+                    if use_activation_checkpoint:
                         return activation_checkpoint(_decode_tokens, chunk)
                     return _decode_tokens(chunk)
 
