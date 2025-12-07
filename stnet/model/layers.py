@@ -420,7 +420,7 @@ class DilatedAttention(nn.Module):
             return mask_cpu
         return mask_cpu.to(device=device, non_blocking=True)
 
-    @torch_no_compile
+    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
     def forward(
         self,
         x: torch.Tensor,
