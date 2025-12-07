@@ -694,6 +694,51 @@ class Autocast:
         cls._metadata = meta
 
     @classmethod
+    def resolve_float_dtype(
+        cls,
+        device: Optional[Union[torch.device, str]] = None,
+        dtype: Optional[Union[torch.dtype, str]] = None,
+        metadata: Optional[Metadata[Any]] = None,
+    ) -> Optional[torch.dtype]:
+        """Return the float autocast dtype that `Autocast.float(...)` would use.
+
+        Returns None when autocast is disabled by metadata.
+        """
+        dev = cls._device(device)
+        meta = cls.coerce_metadata(metadata, device=dev)
+        disable = bool(meta.is_disabled()) if meta is not None else False
+        if disable:
+            return None
+
+        def _coerce_dt(x: Any, default: torch.dtype) -> torch.dtype:
+            if x is None:
+                return default
+            if isinstance(x, torch.dtype):
+                return x
+            s = str(x).strip()
+            s = s.replace("torch.", "")
+            return getattr(torch, s, default)
+
+        requested_dtype = _coerce_dt(dtype, torch.float16)
+        candidates: Tuple[torch.dtype, ...] = (requested_dtype, cls._last_float_dtype)
+        if meta is not None:
+            extra = getattr(meta, "float_dtypes", None)
+            if extra:
+                try:
+                    candidates = tuple(_coerce_dt(x, requested_dtype) for x in extra)
+                except Exception:
+                    pass
+
+        chosen = cls.negotiate(
+            candidates,
+            fallback=requested_dtype,
+            device=dev,
+            meta=meta,
+            context="autocast-float",
+        )
+        return chosen
+
+    @classmethod
     @contextlib.contextmanager
     def float(
         cls: object,
