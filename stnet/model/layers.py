@@ -493,19 +493,24 @@ class DilatedAttention(nn.Module):
             kpm_bool = kpm_k
             win = int(self.window_size) if self.window_size is not None else None
 
-            def dilated_mask(b: int, h: int, q_idx: int, kv_idx: int) -> bool:
-                qj = int(q_idx)
-                kj = int(kv_idx)
-                if self.causal and kj > qj:
-                    return False
-                if win is not None and abs(qj - kj) > win:
-                    return False
-                if self.dilation > 1 and (qj - kj) % self.dilation != 0:
-                    return False
+            def dilated_mask(b, h, q_idx, kv_idx):
+                keep = torch.ones_like(q_idx, dtype=torch.bool)
+
+                if self.causal:
+                    keep = keep & (kv_idx <= q_idx)
+
+                if win is not None:
+                    keep = keep & ((q_idx - kv_idx).abs() <= win)
+
+                if self.dilation > 1:
+                    keep = keep & (((q_idx - kv_idx) % self.dilation) == 0)
+
                 if kpm_bool is not None:
-                    if bool(kpm_bool[b, qj]) or bool(kpm_bool[b, kj]):
-                        return False
-                return True
+                    is_pad_q = kpm_bool[b, q_idx]
+                    is_pad_k = kpm_bool[b, kv_idx]
+                    keep = keep & ~(is_pad_q | is_pad_k)
+
+                return keep
 
             mask_fn = dilated_mask
             try:
