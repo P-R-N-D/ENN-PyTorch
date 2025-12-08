@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import math
 from collections import deque
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ try:
                                                    flex_attention)
     _HAS_FLEX_ATTENTION = True
 except Exception:
+    _HAS_FLEX_ATTENTION = False
+
+if os.environ.get("STNET_DISABLE_FLEX_ATTENTION") in {"1", "true", "True"}:
     _HAS_FLEX_ATTENTION = False
 
 _acc_memory = None
@@ -539,7 +543,8 @@ class DilatedAttention(nn.Module):
                         if kpm_g is not None:
                             is_pad_q = kpm_g[b, q_idx]
                             is_pad_k = kpm_g[b, kv_idx]
-                            keep &= ~(is_pad_q | is_pad_k)
+                            bad = (is_pad_q | is_pad_k)
+                            keep = keep & (~bad)
 
                         return keep
 
@@ -2451,7 +2456,6 @@ class Instance(nn.Module):
             disable=True,
         )
         self.__config = config
-        self._base_dtype: Optional[torch.dtype] = getattr(self, "base_dtype", None)
 
     @staticmethod
     def _cast_graph_safe(
@@ -2472,32 +2476,46 @@ class Instance(nn.Module):
             X = features
         if not isinstance(X, torch.Tensor):
             return 64
-        one = X[:1]
-        bytes_per_sample = int(one.nelement()) * int(one.element_size())
-        fudge = 8
-        max_batch = 1 << 14
+        b = int(X.shape[0] if X.ndim > 0 else 1)
+        hard_max = 64
+        with contextlib.suppress(Exception):
+            hard_max = int(os.environ.get("STNET_MICROBATCH_MAX", hard_max))
+        hard_max = max(1, min(hard_max, b))
+        per_sample = 0
+        env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
+        with contextlib.suppress(Exception):
+            if env_ps:
+                per_sample = int(env_ps)
+        if per_sample <= 0:
+            one = X[:1]
+            bytes_per_sample = int(one.nelement()) * int(one.element_size())
+            per_sample = int(bytes_per_sample * 8)
+        stage_div = 4
+        with contextlib.suppress(Exception):
+            stage_div = max(1, int(os.environ.get("STNET_MICROBATCH_STAGE_DIV", stage_div)))
+        per_sample = max(1, int(per_sample // stage_div))
+
         free_bytes = None
         match dev_t:
-            case 'cuda':
+            case "cuda":
                 with contextlib.suppress(Exception):
                     free, _ = torch.cuda.mem_get_info(device)
                     free_bytes = int(free)
-            case 'xpu':
+            case "xpu":
                 with contextlib.suppress(Exception):
-                    props = getattr(torch.xpu, "get_device_properties", None)
-                    mem_alloc = getattr(torch.xpu, "memory_allocated", None)
-                    if callable(props) and callable(mem_alloc):
-                        total = int(props(device).total_memory); used = int(mem_alloc(device))
-                        free_bytes = max(0, total - used)
-            case 'mps':
+                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                    if callable(mem_get_info):
+                        free, _ = mem_get_info(device)
+                        free_bytes = int(free)
+            case "mps":
                 with contextlib.suppress(Exception):
                     from ..backend.system import Memory
                     free_bytes = int(Memory.available() * 0.25)
         if not free_bytes or free_bytes <= 0:
-            return 64
-        budget = int(free_bytes * 0.90)
-        denom = max(1, bytes_per_sample * fudge)
-        mb = max(1, min(max_batch, budget // denom))
+            return hard_max
+
+        budget = int(free_bytes * 0.35)
+        mb = max(1, min(hard_max, int(budget // per_sample)))
         return int(mb)
 
     def forward(
@@ -2556,7 +2574,7 @@ class Instance(nn.Module):
         is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
         infer_mode = not is_train_path
         base_param = next(self.processor.parameters())
-        base_dtype = self._base_dtype or base_param.dtype
+        base_dtype = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None) or base_param.dtype
         features = x_scaled.to(device=device, dtype=base_dtype)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = features.shape[0]

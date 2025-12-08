@@ -203,6 +203,13 @@ def _batch_interval(
     if _dev.type == "cuda":
         try:
             per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+            if per_sample <= 0:
+                env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
+                try:
+                    if env_ps:
+                        per_sample = int(env_ps)
+                except Exception:
+                    per_sample = 0
             if per_sample > 0:
                 free_bytes, _ = torch.cuda.mem_get_info(_dev)
                 safe_cap = int(max(0, free_bytes) * 0.80)
@@ -215,6 +222,13 @@ def _batch_interval(
     elif _dev.type == "xpu":
         try:
             per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+            if per_sample <= 0:
+                env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
+                try:
+                    if env_ps:
+                        per_sample = int(env_ps)
+                except Exception:
+                    per_sample = 0
             mem_get_info = getattr(torch.xpu, "mem_get_info", None)
             if per_sample > 0 and callable(mem_get_info):
                 free_bytes, _ = mem_get_info(_dev)
@@ -234,6 +248,13 @@ def _batch_interval(
                 host_B_cap = int(host_cap // max(1, sbytes))
                 if host_B_cap > 0:
                     B_cap = max(1, min(B_cap, host_B_cap))
+    except Exception:
+        pass
+
+    env_max = os.environ.get("STNET_MAX_BATCH_SIZE") or os.environ.get("STNET_MAX_BATCH")
+    try:
+        if env_max:
+            B_cap = max(1, min(B_cap, int(env_max)))
     except Exception:
         pass
 
