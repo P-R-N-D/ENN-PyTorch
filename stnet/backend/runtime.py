@@ -989,7 +989,7 @@ def epochs(
         if isinstance(maybe_hist, History):
             hist = maybe_hist
     if hist is None:
-        hist = History().to(device)
+        hist = History()
         try:
             setattr(model_for_hist, "logger", hist)
         except Exception:
@@ -2759,6 +2759,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 options=StateDictOptions(full_state_dict=True, cpu_offload=True),
             )
             optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+
             writer = FileSystemWriter(
                 ops.ckpt_dir or "", sync_files=True, overwrite=True
             )
@@ -2768,16 +2769,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             )
             if ops.ckpt_dir:
                 fallback_path = os.path.join(ops.ckpt_dir, "model.pt")
-                _state: Dict[str, Any] = {}
-                for k, v in model.state_dict().items():
-                    if isinstance(v, torch.Tensor):
-                        t = v.detach().cpu()
-                        if t.is_floating_point():
-                            t = t.to(dtype=torch.float64)
-                        _state[k] = t
-                    else:
-                        _state[k] = v
-                torch.save(_state, fallback_path)
+                model_fallback = dict(model_sd)
+                _trim_dcp_keys(model_fallback)
+                torch.save(model_fallback, fallback_path)
             with contextlib.suppress(Exception):
                 _dl = {
                     "train": (
