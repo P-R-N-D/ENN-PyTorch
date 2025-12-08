@@ -51,7 +51,7 @@ except Exception:
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.stats import Metadata
-from ..data.transforms import preprocess
+from ..data.transforms import preprocess, batch_to_device
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
                                  LinearCombinationLoss, LossWeightController,
@@ -1260,8 +1260,49 @@ def epochs(
                 for step_idx, _raw in enumerate(train_loader):
                     try:
                         train_accum_since_last += 1
-                        feat, label, *_ = preprocess(_raw)
-                        X = to_torch_tensor(feat)
+                        if device.type in ("cuda", "xpu", "mps"):
+                            t_ready = time.perf_counter_ns()
+                            if use_timer:
+                                h2d_s_ev, h2d_e_ev = (
+                                    torch.Event(device=device, enable_timing=True),
+                                    torch.Event(device=device, enable_timing=True),
+                                )
+                                h2d_s_ev.record()
+                                X, Y = batch_to_device(_raw, device)
+                                h2d_e_ev.record()
+                                h2d_e_ev.synchronize()
+                                h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                            else:
+                                t_h2d_s = time.perf_counter_ns()
+                                X, Y = batch_to_device(_raw, device)
+                                t_h2d_e = time.perf_counter_ns()
+                                h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                        else:
+                            feat, label, *_ = preprocess(_raw)
+                            X = to_torch_tensor(feat)
+                            Y = to_torch_tensor(label)
+
+                            t_ready = time.perf_counter_ns()
+                            X, Y = _pin_tensor(X, Y)
+
+                            if use_timer:
+                                h2d_s_ev, h2d_e_ev = (
+                                    torch.Event(device=device, enable_timing=True),
+                                    torch.Event(device=device, enable_timing=True),
+                                )
+                                h2d_s_ev.record()
+                                X = _to_device_with_stream(X)
+                                Y = _to_device_with_stream(Y)
+                                h2d_e_ev.record()
+                                h2d_e_ev.synchronize()
+                                h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                            else:
+                                t_h2d_s = time.perf_counter_ns()
+                                X = _to_device_with_stream(X)
+                                Y = _to_device_with_stream(Y)
+                                t_h2d_e = time.perf_counter_ns()
+                                h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+
                         X = torch.atleast_2d(X)
                         if X.dim() != 2:
                             raise RuntimeError(
@@ -1271,27 +1312,7 @@ def epochs(
                             raise RuntimeError(
                                 f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                             )
-                        Y = to_torch_tensor(label)
                         train_samples_epoch += float(X.shape[0])
-                        t_ready = time.perf_counter_ns()
-                        X, Y = _pin_tensor(X, Y)
-                        if use_timer:
-                            h2d_s_ev, h2d_e_ev = (
-                                torch.Event(device=device, enable_timing=True),
-                                torch.Event(device=device, enable_timing=True),
-                            )
-                            h2d_s_ev.record()
-                            X = _to_device_with_stream(X)
-                            Y = _to_device_with_stream(Y)
-                            h2d_e_ev.record()
-                            h2d_e_ev.synchronize()
-                            h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                        else:
-                            t_h2d_s = time.perf_counter_ns()
-                            X = _to_device_with_stream(X)
-                            Y = _to_device_with_stream(Y)
-                            t_h2d_e = time.perf_counter_ns()
-                            h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
                         wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
                         io_time += float(wait_s + h2d_s)
                         with contextlib.suppress(Exception):
@@ -1499,8 +1520,49 @@ def epochs(
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             try:
-                                feat, label, *_ = preprocess(_raw)
-                                X = to_torch_tensor(feat)
+                                if device.type in ("cuda", "xpu", "mps"):
+                                    t_ready = time.perf_counter_ns()
+                                    if use_timer:
+                                        h2d_s_ev, h2d_e_ev = (
+                                            torch.Event(device=device, enable_timing=True),
+                                            torch.Event(device=device, enable_timing=True),
+                                        )
+                                        h2d_s_ev.record()
+                                        X, Y = batch_to_device(_raw, device)
+                                        h2d_e_ev.record()
+                                        h2d_e_ev.synchronize()
+                                        h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                                    else:
+                                        t_h2d_s = time.perf_counter_ns()
+                                        X, Y = batch_to_device(_raw, device)
+                                        t_h2d_e = time.perf_counter_ns()
+                                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                                else:
+                                    feat, label, *_ = preprocess(_raw)
+                                    X = to_torch_tensor(feat)
+                                    Y = to_torch_tensor(label)
+
+                                    t_ready = time.perf_counter_ns()
+                                    X, Y = _pin_tensor(X, Y)
+
+                                    if use_timer:
+                                        h2d_s_ev, h2d_e_ev = (
+                                            torch.Event(device=device, enable_timing=True),
+                                            torch.Event(device=device, enable_timing=True),
+                                        )
+                                        h2d_s_ev.record()
+                                        X = _to_device_with_stream(X)
+                                        Y = _to_device_with_stream(Y)
+                                        h2d_e_ev.record()
+                                        h2d_e_ev.synchronize()
+                                        h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                                    else:
+                                        t_h2d_s = time.perf_counter_ns()
+                                        X = _to_device_with_stream(X)
+                                        Y = _to_device_with_stream(Y)
+                                        t_h2d_e = time.perf_counter_ns()
+                                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+
                                 X = torch.atleast_2d(X)
                                 if X.dim() != 2:
                                     raise RuntimeError(
@@ -1510,25 +1572,7 @@ def epochs(
                                     raise RuntimeError(
                                         f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                                     )
-                                Y = to_torch_tensor(label)
-                                t_ready = time.perf_counter_ns()
-                                if use_timer:
-                                    h2d_s_ev, h2d_e_ev = (
-                                        torch.Event(device=device, enable_timing=True),
-                                        torch.Event(device=device, enable_timing=True),
-                                    )
-                                    h2d_s_ev.record()
-                                    X = _to_device_with_stream(X)
-                                    Y = _to_device_with_stream(Y)
-                                    h2d_e_ev.record()
-                                    h2d_e_ev.synchronize()
-                                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                                else:
-                                    t_h2d_s = time.perf_counter_ns()
-                                    X = _to_device_with_stream(X)
-                                    Y = _to_device_with_stream(Y)
-                                    t_h2d_e = time.perf_counter_ns()
-                                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                                val_samples_epoch += float(X.shape[0])
                                 wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
                                 io_time += float(wait_s + h2d_s)
                                 with contextlib.suppress(Exception):
@@ -2048,8 +2092,58 @@ def infer(
     try:
         with flop_counter, Gradient.inference(run_model), Autocast.float(device):
             for _idx, _raw in enumerate(data_loader):
-                feat, _label, *_ = preprocess(_raw)
-                X = to_torch_tensor(feat)
+                if device.type in ("cuda", "xpu", "mps"):
+                    if use_timer:
+                        h2d_s_ev, h2d_e_ev = (
+                            torch.Event(device=device, enable_timing=True),
+                            torch.Event(device=device, enable_timing=True),
+                        )
+                        h2d_s_ev.record()
+                        X, _ = batch_to_device(_raw, device)
+                        h2d_e_ev.record()
+                        h2d_e_ev.synchronize()
+                        h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                    else:
+                        t_h2d_s = time.perf_counter_ns()
+                        X, _ = batch_to_device(_raw, device)
+                        t_h2d_e = time.perf_counter_ns()
+                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                else:
+                    feat, _label, *_ = preprocess(_raw)
+                    X = to_torch_tensor(feat)
+                    h2d_s = 0.0
+                    moved_h2d = False
+                    if device.type in ("cuda", "xpu") and X.device.type == "cpu":
+                        try:
+                            if not (hasattr(X, "is_pinned") and X.is_pinned()):
+                                X_pinned = torch.empty_like(X, device="cpu", pin_memory=True)
+                                X_pinned.copy_(X, non_blocking=False)
+                            else:
+                                X_pinned = X
+                            X = X_pinned.to(device, non_blocking=True)
+                            X_pinned.record_stream(getattr(torch, device.type).current_stream(device))
+                            moved_h2d = True
+                        except Exception:
+                            X = X.to(device, non_blocking=(device.type in ("cuda", "xpu")))
+                            moved_h2d = True
+                    if use_timer:
+                        ev_h2d_s, ev_h2d_e = (
+                            torch.Event(device=device, enable_timing=True),
+                            torch.Event(device=device, enable_timing=True),
+                        )
+                        ev_h2d_s.record()
+                        if not moved_h2d:
+                            X = X.to(device, non_blocking=True)
+                        ev_h2d_e.record()
+                        ev_h2d_e.synchronize()
+                        h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
+                    else:
+                        t_h2d_s = time.perf_counter_ns()
+                        if not moved_h2d:
+                            X = X.to(device, non_blocking=True)
+                        t_h2d_e = time.perf_counter_ns()
+                        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+
                 X = torch.atleast_2d(X)
                 if X.dim() != 2:
                     raise RuntimeError(
@@ -2062,37 +2156,6 @@ def infer(
                     )
                 if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
                     X = X.to(dtype=torch.float32)
-                moved_h2d = False
-                if device.type in ("cuda", "xpu") and X.device.type == "cpu":
-                    try:
-                        if not (hasattr(X, "is_pinned") and X.is_pinned()):
-                            X_pinned = torch.empty_like(X, device="cpu", pin_memory=True)
-                            X_pinned.copy_(X, non_blocking=False)
-                        else:
-                            X_pinned = X
-                        X = X_pinned.to(device, non_blocking=True)
-                        X_pinned.record_stream(getattr(torch, device.type).current_stream(device))
-                        moved_h2d = True
-                    except Exception:
-                        X = X.to(device, non_blocking=(device.type in ("cuda", "xpu")))
-                        moved_h2d = True
-                if use_timer:
-                    ev_h2d_s, ev_h2d_e = (
-                        torch.Event(device=device, enable_timing=True),
-                        torch.Event(device=device, enable_timing=True),
-                    )
-                    ev_h2d_s.record()
-                    if not moved_h2d:
-                        X = X.to(device, non_blocking=True)
-                    ev_h2d_e.record()
-                    ev_h2d_e.synchronize()
-                    h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
-                else:
-                    t_h2d_s = time.perf_counter_ns()
-                    if not moved_h2d:
-                        X = X.to(device, non_blocking=True)
-                    t_h2d_e = time.perf_counter_ns()
-                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
                 wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
                 io_time += wait_s + h2d_s
                 with contextlib.suppress(Exception):

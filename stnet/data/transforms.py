@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import math
+import contextlib
 import os
 from contextlib import suppress
-from typing import Any, Dict, List, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import torch
 from tensordict import TensorDictBase
@@ -260,3 +261,126 @@ def postprocess(
         seen.add(k_out)
         fixed_keys.append(k_out)
     return {k: v for k, v in zip(fixed_keys, rows)}
+
+
+
+def batch_to_device(
+    batch: Any,
+    device: torch.device,
+    *,
+    non_blocking: Optional[bool] = None,
+    pin_memory: Optional[bool] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _extract_xy(sample: Any) -> Tuple[Any, Any]:
+        if isinstance(sample, TensorDictBase):
+            x = sample.get("features", sample.get("X", None))
+            y = sample.get("labels", sample.get("Y", None))
+            return x, y
+        if isinstance(sample, Mapping):
+            x = sample.get("features", sample.get("X", None))
+            y = sample.get("labels", sample.get("Y", None))
+            return x, y
+        return (None, None)
+
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    dev_type = dev.type
+
+    if non_blocking is None:
+        non_blocking = bool(dev_type in {"cuda", "xpu"})
+    if pin_memory is None:
+        pin_memory = bool(dev_type in {"cuda", "xpu"})
+
+    X: Optional[torch.Tensor] = None
+    Y: Optional[torch.Tensor] = None
+
+    if isinstance(batch, TensorDictBase) or isinstance(batch, Mapping):
+        x_raw, y_raw = _extract_xy(batch)
+        if x_raw is None or y_raw is None:
+            feats, labs, *_ = preprocess(batch)
+            x_raw, y_raw = feats, labs
+        X = to_torch_tensor(x_raw)
+        Y = to_torch_tensor(y_raw)
+    elif isinstance(batch, tuple) and len(batch) >= 2 and not isinstance(
+        batch[0], (Mapping, TensorDictBase)
+    ):
+        X = to_torch_tensor(batch[0])
+        Y = to_torch_tensor(batch[1])
+    elif isinstance(batch, (list, tuple)):
+        if len(batch) == 0:
+            X = torch.empty((0,), device="cpu")
+            Y = torch.empty((0,), device="cpu")
+        elif all(isinstance(elem, (Mapping, TensorDictBase)) for elem in batch):
+            xs: List[torch.Tensor] = []
+            ys: List[torch.Tensor] = []
+            for elem in batch:
+                x_raw, y_raw = _extract_xy(elem)
+                if x_raw is None or y_raw is None:
+                    feats, labs, *_ = preprocess(elem)
+                    x_raw, y_raw = feats, labs
+                xs.append(to_torch_tensor(x_raw))
+                ys.append(to_torch_tensor(y_raw))
+
+            def _stack(tensors: List[torch.Tensor]) -> torch.Tensor:
+                if tensors and all(torch.is_tensor(t) and t.device.type != "cpu" for t in tensors):
+                    return torch.stack(tensors, dim=0)
+                if pin_memory and dev_type in {"cuda", "xpu"} and tensors:
+                    t0 = tensors[0]
+                    out = torch.empty(
+                        (len(tensors), *tuple(t0.shape)),
+                        dtype=t0.dtype,
+                        device="cpu",
+                        pin_memory=True,
+                    )
+                    try:
+                        torch.stack(tensors, dim=0, out=out)
+                        return out
+                    except Exception:
+                        return torch.stack(tensors, dim=0).pin_memory()
+                return torch.stack(tensors, dim=0)
+
+            X = _stack(xs)
+            Y = _stack(ys)
+        else:
+            feats, labs, *_ = preprocess(batch)
+            X = to_torch_tensor(feats)
+            Y = to_torch_tensor(labs)
+    else:
+        feats, labs, *_ = preprocess(batch)
+        X = to_torch_tensor(feats)
+        Y = to_torch_tensor(labs)
+
+    if X is None or Y is None:
+        raise ValueError(f"batch_to_device: could not extract (X, Y) from batch type: {type(batch)!r}")
+
+    if dev_type == "cpu":
+        if X.device.type != "cpu":
+            X = X.to("cpu")
+        if Y.device.type != "cpu":
+            Y = Y.to("cpu")
+        return X, Y
+
+    if X.device == dev and Y.device == dev:
+        return X, Y
+
+    if dev_type in {"cuda", "xpu"}:
+        stream = None
+        with contextlib.suppress(Exception):
+            stream = getattr(torch, dev_type).current_stream(dev)
+
+        def _to_dev(t: torch.Tensor) -> torch.Tensor:
+            t_cpu = t
+            if t_cpu.device.type != "cpu":
+                return t_cpu.to(dev, non_blocking=False)
+            if pin_memory and (not (hasattr(t_cpu, "is_pinned") and t_cpu.is_pinned())):
+                pinned = torch.empty_like(t_cpu, device="cpu", pin_memory=True)
+                pinned.copy_(t_cpu, non_blocking=False)
+                t_cpu = pinned
+            out_dev = t_cpu.to(dev, non_blocking=bool(non_blocking))
+            if stream is not None and hasattr(t_cpu, "is_pinned") and t_cpu.is_pinned():
+                with contextlib.suppress(Exception):
+                    t_cpu.record_stream(stream)
+            return out_dev
+
+        return _to_dev(X), _to_dev(Y)
+
+    return X.to(dev, non_blocking=False), Y.to(dev, non_blocking=False)
