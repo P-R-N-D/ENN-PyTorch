@@ -164,6 +164,7 @@ def train(
 
         from collections.abc import Mapping as _Mapping
 
+        # 1) dict[tuple -> tensor] 형태: 기존 스트리밍 경로
         if (
             isinstance(d, _Mapping)
             and not isinstance(d, TensorDictBase)
@@ -268,6 +269,116 @@ def train(
 
             return in_dim, label_shape, count
 
+        # 2) TensorDictBase 입력: 배치 축 기준으로 스트리밍 처리
+        elif isinstance(d, TensorDictBase):
+            td = d
+            if td.batch_size is None or len(td.batch_size) == 0:
+                raise ValueError("TensorDict input to train() must have a batch dimension.")
+
+            count = int(td.batch_size[0])
+            if count <= 0:
+                raise ValueError("Empty TensorDict provided to train().")
+
+            chunk_size = 32
+            chunk_size = min(chunk_size, count)
+
+            # 첫 chunk로 in_dim / label_shape 추론
+            first_td = td[:chunk_size]
+            fx0, lb0, _, _ = preprocess(first_td)
+            fx0 = fx0.contiguous()
+            lb0 = lb0.contiguous()
+
+            if fx0.ndim < 2:
+                fx0 = fx0.reshape(fx0.shape[0], -1)
+
+            n0 = int(fx0.shape[0])
+            in_dim = int(fx0.reshape(n0, -1).shape[1])
+            label_shape = tuple(lb0.shape[1:])
+
+            os.makedirs(out_dir, exist_ok=True)
+            features_path = os.path.join(out_dir, "features.mmt")
+            labels_path = os.path.join(out_dir, "labels.mmt")
+
+            features_mmt = MemoryMappedTensor.empty(
+                (count, in_dim),
+                dtype=fx0.dtype,
+                filename=features_path,
+                existsok=True,
+            )
+            labels_mmt = MemoryMappedTensor.empty(
+                (count, *label_shape),
+                dtype=lb0.dtype,
+                filename=labels_path,
+                existsok=True,
+            )
+
+            # 첫 chunk 기록
+            features_mmt[0:n0].copy_(fx0.view(n0, -1))
+            labels_mmt[0:n0].copy_(lb0.view(n0, *label_shape))
+            written = n0
+
+            # 나머지 chunk들을 스트리밍으로 채움
+            idx = chunk_size
+            while idx < count:
+                end = min(idx + chunk_size, count)
+                td_chunk = td[idx:end]
+
+                fx, lb, _, _ = preprocess(td_chunk)
+                fx = fx.contiguous()
+                lb = lb.contiguous()
+
+                if tuple(lb.shape[1:]) != label_shape:
+                    raise RuntimeError(
+                        f"label shape mismatch: expected {label_shape}, "
+                        f"got {tuple(lb.shape[1:])}"
+                    )
+
+                n = int(fx.shape[0])
+                if int(fx.reshape(n, -1).shape[1]) != in_dim:
+                    raise RuntimeError(
+                        f"feature dim mismatch: expected {in_dim}, "
+                        f"got {int(fx.reshape(n, -1).shape[1])}"
+                    )
+
+                features_mmt[idx : idx + n].copy_(fx.view(n, -1))
+                labels_mmt[idx : idx + n].copy_(lb.view(n, *label_shape))
+
+                written += n
+                idx = end
+
+            if written != count:
+                raise RuntimeError(f"memmap written={written}, expected={count}")
+
+            # train / val split 메타 작성
+            val_count = max(0, min(count, int(round(count * float(val_frac)))))
+            train_count = max(0, count - val_count)
+            train_start, train_end = 0, train_count
+            val_start, val_end = train_end, train_end + val_count
+
+            meta = {
+                "N": int(count),
+                "feature_dim": int(in_dim),
+                "features_path": "features.mmt",
+                "labels_path": "labels.mmt",
+                "label_shape": list(label_shape),
+                "features_dtype": str(fx0.dtype).replace("torch.", ""),
+                "labels_dtype": str(lb0.dtype).replace("torch.", ""),
+                "fractions": [float(1.0 - float(val_frac)), float(val_frac)],
+                "shuffled": False,
+                "shuffle_seed": int(seed_value) if seed_value is not None else None,
+                "shuffle_mode": "none",
+                "train_start": int(train_start),
+                "train_end": int(train_end),
+                "val_start": int(val_start),
+                "val_end": int(val_end),
+            }
+
+            with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+
+            return in_dim, label_shape, count
+
+        # 3) 그 외 입력: 기존 경로 사용 (memmap 로딩 시 셔플 끔)
         fx, lb, _, lshape = preprocess(d)
         fx = fx.contiguous()
         count = int(fx.shape[0])
@@ -683,6 +794,7 @@ def predict(
     seed_value = _ensure_seed(seed)
     _seed_everything(seed_value)
 
+    # None 값이 있으면 dummy label 생성 (기존 로직 유지)
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
@@ -694,79 +806,189 @@ def predict(
             for k, v in data.items()
         }
 
-    items = list(data.items())
-    count = len(items)
-    if count <= 0:
-        return {}
+    from collections.abc import Mapping as _Mapping
 
-    chunk_size = 32
-    chunk_size = min(chunk_size, count)
-    keys = [k for (k, _) in items]
-    first_items = items[:chunk_size]
-    first_batch = {k: v for (k, v) in first_items}
+    # ---- 1) TensorDictBase 입력: 배치 축 기준 스트리밍 ----
+    if isinstance(data, TensorDictBase):
+        td = data
+        if td.batch_size is None or len(td.batch_size) == 0:
+            raise ValueError("TensorDict input to predict() must have a batch dimension.")
 
-    feats0, labels0, _, label_shape = preprocess(first_batch)
-    feats0 = feats0.contiguous()
-    labels0 = labels0.contiguous()
+        count = int(td.batch_size[0])
+        if count <= 0:
+            return {}
 
-    if feats0.ndim < 2:
-        feats0 = feats0.reshape(feats0.shape[0], -1)
+        chunk_size = 32
+        chunk_size = min(chunk_size, count)
 
-    n0 = int(feats0.shape[0])
-    in_dim = int(feats0.reshape(n0, -1).shape[1])
-    label_shape = tuple(labels0.shape[1:])
+        # keys: TensorDict는 보통 별도 key 리스트를 넘겨주지 않으므로
+        # 여기서는 단순히 range 기반 인덱스를 key로 사용한다.
+        keys = list(range(count))
 
-    os.makedirs(memmap_dir, exist_ok=True)
-    features_path = os.path.join(memmap_dir, "features.mmt")
-    labels_path = os.path.join(memmap_dir, "labels.mmt")
+        # 첫 chunk
+        first_td = td[:chunk_size]
+        feats0, labels0, _, label_shape = preprocess(first_td)
+        feats0 = feats0.contiguous()
+        labels0 = labels0.contiguous()
 
-    features_mmt = MemoryMappedTensor.empty(
-        (count, in_dim),
-        dtype=feats0.dtype,
-        filename=features_path,
-        existsok=True,
-    )
-    labels_mmt = MemoryMappedTensor.empty(
-        (count, *label_shape),
-        dtype=labels0.dtype,
-        filename=labels_path,
-        existsok=True,
-    )
+        if feats0.ndim < 2:
+            feats0 = feats0.reshape(feats0.shape[0], -1)
 
-    features_mmt[0:n0].copy_(feats0.view(n0, -1))
-    labels_mmt[0:n0].copy_(labels0.view(n0, *label_shape))
-    written = n0
-    idx = chunk_size
-    while idx < count:
-        end = min(idx + chunk_size, count)
-        batch_items = items[idx:end]
-        batch_dict = {k: v for (k, v) in batch_items}
+        n0 = int(feats0.shape[0])
+        in_dim = int(feats0.reshape(n0, -1).shape[1])
+        label_shape = tuple(labels0.shape[1:])
 
-        fx, lb, _, lshape = preprocess(batch_dict)
-        fx = fx.contiguous()
-        lb = lb.contiguous()
+        os.makedirs(memmap_dir, exist_ok=True)
+        features_path = os.path.join(memmap_dir, "features.mmt")
+        labels_path = os.path.join(memmap_dir, "labels.mmt")
 
-        if tuple(lb.shape[1:]) != label_shape:
-            raise RuntimeError(
-                f"label shape mismatch: expected {label_shape}, "
-                f"got {tuple(lb.shape[1:])}"
-            )
+        features_mmt = MemoryMappedTensor.empty(
+            (count, in_dim),
+            dtype=feats0.dtype,
+            filename=features_path,
+            existsok=True,
+        )
+        labels_mmt = MemoryMappedTensor.empty(
+            (count, *label_shape),
+            dtype=labels0.dtype,
+            filename=labels_path,
+            existsok=True,
+        )
 
-        n = int(fx.shape[0])
-        if int(fx.reshape(n, -1).shape[1]) != in_dim:
-            raise RuntimeError(
-                f"feature dim mismatch: expected {in_dim}, "
-                f"got {int(fx.reshape(n, -1).shape[1])}"
-            )
+        features_mmt[0:n0].copy_(feats0.view(n0, -1))
+        labels_mmt[0:n0].copy_(labels0.view(n0, *label_shape))
+        written = n0
 
-        features_mmt[idx : idx + n].copy_(fx.view(n, -1))
-        labels_mmt[idx : idx + n].copy_(lb.view(n, *label_shape))
+        idx = chunk_size
+        while idx < count:
+            end = min(idx + chunk_size, count)
+            td_chunk = td[idx:end]
 
-        written += n
-        idx = end
+            fx, lb, _, _ = preprocess(td_chunk)
+            fx = fx.contiguous()
+            lb = lb.contiguous()
 
-    if written != count:
-        raise RuntimeError(f"memmap written={written}, expected={count}")
+            if tuple(lb.shape[1:]) != label_shape:
+                raise RuntimeError(
+                    f"label shape mismatch: expected {label_shape}, "
+                    f"got {tuple(lb.shape[1:])}"
+                )
+
+            n = int(fx.shape[0])
+            if int(fx.reshape(n, -1).shape[1]) != in_dim:
+                raise RuntimeError(
+                    f"feature dim mismatch: expected {in_dim}, "
+                    f"got {int(fx.reshape(n, -1).shape[1])}"
+                )
+
+            features_mmt[idx : idx + n].copy_(fx.view(n, -1))
+            labels_mmt[idx : idx + n].copy_(lb.view(n, *label_shape))
+
+            written += n
+            idx = end
+
+        if written != count:
+            raise RuntimeError(f"memmap written={written}, expected={count}")
+
+    # ---- 2) dict[tuple -> tensor] 입력: 기존 스트리밍 경로 ----
+    elif (
+        isinstance(data, _Mapping)
+        and not isinstance(data, TensorDictBase)
+        and data
+        and all(not isinstance(v, _Mapping) for v in data.values())
+    ):
+        items = list(data.items())
+        count = len(items)
+        if count <= 0:
+            return {}
+
+        chunk_size = 32
+        chunk_size = min(chunk_size, count)
+
+        keys = [k for (k, _) in items]
+
+        first_items = items[:chunk_size]
+        first_batch = {k: v for (k, v) in first_items}
+
+        feats0, labels0, _, label_shape = preprocess(first_batch)
+        feats0 = feats0.contiguous()
+        labels0 = labels0.contiguous()
+
+        if feats0.ndim < 2:
+            feats0 = feats0.reshape(feats0.shape[0], -1)
+
+        n0 = int(feats0.shape[0])
+        in_dim = int(feats0.reshape(n0, -1).shape[1])
+        label_shape = tuple(labels0.shape[1:])
+
+        os.makedirs(memmap_dir, exist_ok=True)
+        features_path = os.path.join(memmap_dir, "features.mmt")
+        labels_path = os.path.join(memmap_dir, "labels.mmt")
+
+        features_mmt = MemoryMappedTensor.empty(
+            (count, in_dim),
+            dtype=feats0.dtype,
+            filename=features_path,
+            existsok=True,
+        )
+        labels_mmt = MemoryMappedTensor.empty(
+            (count, *label_shape),
+            dtype=labels0.dtype,
+            filename=labels_path,
+            existsok=True,
+        )
+
+        features_mmt[0:n0].copy_(feats0.view(n0, -1))
+        labels_mmt[0:n0].copy_(labels0.view(n0, *label_shape))
+        written = n0
+
+        idx = chunk_size
+        while idx < count:
+            end = min(idx + chunk_size, count)
+            batch_items = items[idx:end]
+            batch_dict = {k: v for (k, v) in batch_items}
+
+            fx, lb, _, _ = preprocess(batch_dict)
+            fx = fx.contiguous()
+            lb = lb.contiguous()
+
+            if tuple(lb.shape[1:]) != label_shape:
+                raise RuntimeError(
+                    f"label shape mismatch: expected {label_shape}, "
+                    f"got {tuple(lb.shape[1:])}"
+                )
+
+            n = int(fx.shape[0])
+            if int(fx.reshape(n, -1).shape[1]) != in_dim:
+                raise RuntimeError(
+                    f"feature dim mismatch: expected {in_dim}, "
+                    f"got {int(fx.reshape(n, -1).shape[1])}"
+                )
+
+            features_mmt[idx : idx + n].copy_(fx.view(n, -1))
+            labels_mmt[idx : idx + n].copy_(lb.view(n, *label_shape))
+
+            written += n
+            idx = end
+
+        if written != count:
+            raise RuntimeError(f"memmap written={written}, expected={count}")
+
+    # ---- 3) 그 외 입력: 예전 경로 유지 (호환성용) ----
+    else:
+        feats, labels, keys, label_shape = preprocess(data)
+        preload_memmap(
+            {"features": feats, "labels": labels},
+            memmap_dir=memmap_dir,
+            train_frac=1.0,
+            val_frac=0.0,
+            shuffle=False,
+            seed=seed_value,
+        )
+        in_dim = int(feats.shape[1])
+        count = int(feats.shape[0])
+        feats0, labels0 = feats, labels
+
     val_count = 0
     train_count = count
     train_start, train_end = 0, train_count
