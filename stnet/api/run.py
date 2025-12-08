@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from tensordict import MemoryMappedTensor
+from tensordict import MemoryMappedTensor, TensorDictBase
 import torch.multiprocessing as mp
 from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
                                           load, save)
@@ -164,8 +164,11 @@ def train(
 
         from collections.abc import Mapping as _Mapping
 
-        if isinstance(d, _Mapping) and d and all(
-            not isinstance(v, _Mapping) for v in d.values()
+        if (
+            isinstance(d, _Mapping)
+            and not isinstance(d, TensorDictBase)
+            and d
+            and all(not isinstance(v, _Mapping) for v in d.values())
         ):
             items = list(d.items())
             count = len(items)
