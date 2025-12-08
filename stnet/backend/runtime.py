@@ -1344,9 +1344,9 @@ def epochs(
                                     if callable(mark_step):
                                         mark_step()
                                 with Autocast.float(device):
-                                    Y_flat = Y.reshape(Y.shape[0], -1).to(
-                                        device, dtype=param_dtype, non_blocking=True
-                                    )
+                                    Y_flat = Y.reshape(Y.shape[0], -1)
+                                    if Y_flat.device != device or Y_flat.dtype != param_dtype:
+                                        Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=True)
                                     td = to_tensordict(
                                         {"features": X, "labels_flat": Y_flat}
                                     )
@@ -2365,6 +2365,114 @@ def infer(
     return None
 
 
+def _unwrap_for_microbatch(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    m: Any = model
+    for _ in range(8):
+        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
+            return m
+        child = getattr(m, "module", None)
+        if child is None or child is m:
+            break
+        m = child
+    return None
+
+
+def _estimate_per_sample_device_mem(
+    *,
+    model: torch.nn.Module,
+    device: torch.device,
+    in_dim: int,
+    out_shape: Sequence[int],
+    param_dtype: torch.dtype,
+    global_loss: Optional[torch.nn.Module] = None,
+    local_loss: Optional[torch.nn.Module] = None,
+    safety: float = 1.35,
+) -> Optional[int]:
+    if getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
+        return None
+
+    out_dim = int(math.prod(tuple(out_shape))) if out_shape else 1
+
+    def _probe(B: int) -> Optional[int]:
+        inst = _unwrap_for_microbatch(model)
+        saved_microbatch: Any = None
+        saved_pending: Any = None
+
+        try:
+            if inst is not None:
+                saved_microbatch = getattr(inst, "microbatch", None)
+                saved_pending = getattr(inst, "_auto_microbatch_pending", None)
+                inst.microbatch = max(1, int(B))
+                inst._auto_microbatch_pending = False
+
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(device)
+
+            X = torch.randn((B, in_dim), device=device, dtype=param_dtype)
+            Y = torch.randn((B, out_dim), device=device, dtype=param_dtype)
+
+            with Autocast.float(device):
+                out = model(
+                    X,
+                    labels_flat=Y,
+                    global_loss=global_loss,
+                    local_loss=local_loss,
+                    loss_weights=(1.0, 1.0),
+                )
+                loss = None
+                if isinstance(out, tuple) and len(out) == 2:
+                    _, loss = out
+                if loss is None:
+                    pred = out[0] if isinstance(out, tuple) else out
+                    pred = pred.reshape(B, -1)
+                    loss = (pred - Y).pow(2).mean()
+                if loss.ndim != 0:
+                    loss = loss.mean()
+
+            loss.backward()
+            torch.cuda.synchronize(device)
+            peak = int(torch.cuda.max_memory_allocated(device))
+
+            del X, Y, out, loss
+            model.zero_grad(set_to_none=True)
+            torch.cuda.empty_cache()
+            return peak
+        except RuntimeError as e:
+            if "out of memory" in str(e).lower():
+                with contextlib.suppress(Exception):
+                    torch.cuda.empty_cache()
+                return None
+            raise
+        finally:
+            if inst is not None:
+                with contextlib.suppress(Exception):
+                    if saved_microbatch is not None:
+                        inst.microbatch = saved_microbatch
+                    if saved_pending is not None:
+                        inst._auto_microbatch_pending = saved_pending
+
+    p1 = _probe(1)
+    if p1 is None:
+        return None
+    p2 = _probe(2)
+    p4 = _probe(4)
+
+    if p4 is not None:
+        slope = max(1, (p4 - p1) // 3)
+    elif p2 is not None:
+        slope = max(1, (p2 - p1))
+    else:
+        slope = max(1, p1)
+
+    elem = torch.empty((), dtype=param_dtype).element_size()
+    floor = int((in_dim + out_dim) * elem * 16)
+    per_sample = max(int(slope), floor)
+
+    per_sample = int(per_sample * float(safety))
+    return per_sample if per_sample > 0 else None
+
+
 def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
     from ..data.pipeline import fetch
 
@@ -2702,12 +2810,43 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 device_str = str(device)
                 device_type = device_str.split(":", 1)[0]
             non_blocking_copy = device_type in accelerator_types
+            with contextlib.suppress(Exception):
+                from ..data.nodes import Dataset
+
+                per_sample: Optional[int] = _estimate_per_sample_device_mem(
+                    model=model,
+                    device=device,
+                    in_dim=int(ops.in_dim),
+                    out_shape=tuple(ops.out_shape),
+                    param_dtype=param_dtype,
+                    global_loss=top_loss,
+                    local_loss=bottom_loss,
+                )
+                reduced = 0
+                if dist.is_available() and dist.is_initialized() and device.type == "cuda":
+                    t = torch.tensor(
+                        [int(per_sample) if isinstance(per_sample, int) and per_sample > 0 else 0],
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+                    reduced = int(t.item())
+                elif isinstance(per_sample, int) and per_sample > 0:
+                    reduced = int(per_sample)
+
+                if reduced > 0:
+                    Dataset._per_sample_mem_bytes = int(reduced)
+                    os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(reduced))
+
+            os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
+            os.environ.setdefault("STNET_MICROBATCH_STAGE_DIV", "4")
             train_loader, val_loader, keep = fetch(
                 sources=ops.sources,
                 device=device,
                 val_frac=float(ops.val_frac),
                 non_blocking_copy=non_blocking_copy,
                 flatten_features=True,
+                labels_dtype=param_dtype,
             )
             if restore_dl_state:
                 with contextlib.suppress(Exception):

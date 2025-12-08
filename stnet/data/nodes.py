@@ -413,12 +413,11 @@ class Dataset(_Sampler):
             Y = self._Y.narrow(0, s, n)
             if self._label_shape:
                 Y = Y.view(n, *self._label_shape)
-            if _is_accelerator_available():
-                try:
+            pin_in_dataset = os.environ.get("STNET_PIN_IN_DATASET", "0") == "1"
+            if pin_in_dataset and _is_accelerator_available():
+                with suppress(Exception):
                     X = X.pin_memory()
                     Y = Y.pin_memory()
-                except Exception:
-                    pass
             return {"X": X, "Y": Y}
 
 
