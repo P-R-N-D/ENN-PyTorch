@@ -164,7 +164,6 @@ def train(
 
         from collections.abc import Mapping as _Mapping
 
-        # 1) dict[tuple -> tensor] 형태: 기존 스트리밍 경로
         if (
             isinstance(d, _Mapping)
             and not isinstance(d, TensorDictBase)
@@ -269,7 +268,6 @@ def train(
 
             return in_dim, label_shape, count
 
-        # 2) TensorDictBase 입력: 배치 축 기준으로 스트리밍 처리
         elif isinstance(d, TensorDictBase):
             td = d
             if td.batch_size is None or len(td.batch_size) == 0:
@@ -282,7 +280,6 @@ def train(
             chunk_size = 32
             chunk_size = min(chunk_size, count)
 
-            # 첫 chunk로 in_dim / label_shape 추론
             first_td = td[:chunk_size]
             fx0, lb0, _, _ = preprocess(first_td)
             fx0 = fx0.contiguous()
@@ -312,12 +309,10 @@ def train(
                 existsok=True,
             )
 
-            # 첫 chunk 기록
             features_mmt[0:n0].copy_(fx0.view(n0, -1))
             labels_mmt[0:n0].copy_(lb0.view(n0, *label_shape))
             written = n0
 
-            # 나머지 chunk들을 스트리밍으로 채움
             idx = chunk_size
             while idx < count:
                 end = min(idx + chunk_size, count)
@@ -349,7 +344,6 @@ def train(
             if written != count:
                 raise RuntimeError(f"memmap written={written}, expected={count}")
 
-            # train / val split 메타 작성
             val_count = max(0, min(count, int(round(count * float(val_frac)))))
             train_count = max(0, count - val_count)
             train_start, train_end = 0, train_count
@@ -378,7 +372,6 @@ def train(
 
             return in_dim, label_shape, count
 
-        # 3) 그 외 입력: 기존 경로 사용 (memmap 로딩 시 셔플 끔)
         fx, lb, _, lshape = preprocess(d)
         fx = fx.contiguous()
         count = int(fx.shape[0])
@@ -794,7 +787,6 @@ def predict(
     seed_value = _ensure_seed(seed)
     _seed_everything(seed_value)
 
-    # None 값이 있으면 dummy label 생성 (기존 로직 유지)
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
         data = {
@@ -808,7 +800,6 @@ def predict(
 
     from collections.abc import Mapping as _Mapping
 
-    # ---- 1) TensorDictBase 입력: 배치 축 기준 스트리밍 ----
     if isinstance(data, TensorDictBase):
         td = data
         if td.batch_size is None or len(td.batch_size) == 0:
@@ -821,11 +812,8 @@ def predict(
         chunk_size = 32
         chunk_size = min(chunk_size, count)
 
-        # keys: TensorDict는 보통 별도 key 리스트를 넘겨주지 않으므로
-        # 여기서는 단순히 range 기반 인덱스를 key로 사용한다.
         keys = list(range(count))
 
-        # 첫 chunk
         first_td = td[:chunk_size]
         feats0, labels0, _, label_shape = preprocess(first_td)
         feats0 = feats0.contiguous()
@@ -890,7 +878,6 @@ def predict(
         if written != count:
             raise RuntimeError(f"memmap written={written}, expected={count}")
 
-    # ---- 2) dict[tuple -> tensor] 입력: 기존 스트리밍 경로 ----
     elif (
         isinstance(data, _Mapping)
         and not isinstance(data, TensorDictBase)
@@ -974,7 +961,6 @@ def predict(
         if written != count:
             raise RuntimeError(f"memmap written={written}, expected={count}")
 
-    # ---- 3) 그 외 입력: 한 번에 preprocess 후, 직접 memmap 생성 ----
     else:
         feats, labels, keys, label_shape = preprocess(data)
         feats = feats.contiguous()
