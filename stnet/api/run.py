@@ -974,19 +974,41 @@ def predict(
         if written != count:
             raise RuntimeError(f"memmap written={written}, expected={count}")
 
-    # ---- 3) 그 외 입력: 예전 경로 유지 (호환성용) ----
+    # ---- 3) 그 외 입력: 한 번에 preprocess 후, 직접 memmap 생성 ----
     else:
         feats, labels, keys, label_shape = preprocess(data)
-        preload_memmap(
-            {"features": feats, "labels": labels},
-            memmap_dir=memmap_dir,
-            train_frac=1.0,
-            val_frac=0.0,
-            shuffle=False,
-            seed=seed_value,
-        )
-        in_dim = int(feats.shape[1])
+        feats = feats.contiguous()
+        labels = labels.contiguous()
+
+        if feats.ndim < 2:
+            feats = feats.reshape(feats.shape[0], -1)
+
         count = int(feats.shape[0])
+        if count <= 0:
+            return {}
+
+        in_dim = int(feats.reshape(count, -1).shape[1])
+
+        os.makedirs(memmap_dir, exist_ok=True)
+        features_path = os.path.join(memmap_dir, "features.mmt")
+        labels_path = os.path.join(memmap_dir, "labels.mmt")
+
+        features_mmt = MemoryMappedTensor.empty(
+            (count, in_dim),
+            dtype=feats.dtype,
+            filename=features_path,
+            existsok=True,
+        )
+        labels_mmt = MemoryMappedTensor.empty(
+            (count, *label_shape),
+            dtype=labels.dtype,
+            filename=labels_path,
+            existsok=True,
+        )
+
+        features_mmt[0:count].copy_(feats.view(count, -1))
+        labels_mmt[0:count].copy_(labels.view(count, *label_shape))
+
         feats0, labels0 = feats, labels
 
     val_count = 0
