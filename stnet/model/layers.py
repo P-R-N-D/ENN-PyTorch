@@ -2161,19 +2161,31 @@ class History(nn.Module):
     ) -> None:
         if x.numel() == 0 or y.numel() == 0:
             return
+        x_det = x.detach()
+        y_det = y.detach()
+
+        def _stats(t: torch.Tensor):
+            if t.is_floating_point() or t.is_complex():
+                v, m = torch.var_mean(t, correction=0)
+                mn, mx = torch.aminmax(t)
+            else:
+                mn, mx = torch.aminmax(t)
+                m = t.sum(dtype=torch.float64) / float(t.numel())
+                v = torch.zeros((), dtype=torch.float64, device=m.device)
+            return v, m, mn, mx
+
+        xvar_dev, xm_dev, xmin_dev, xmax_dev = _stats(x_det)
+        yvar_dev, ym_dev, ymin_dev, ymax_dev = _stats(y_det)
+
         stats_device = self.sampled_x_mean.device
-        x_work = x.detach().to(device=stats_device, dtype=torch.float64)
-        y_work = y.detach().to(device=stats_device, dtype=torch.float64)
-        xm = x_work.mean()
-        xsq = (x_work * x_work).mean()
-        xvar = xsq - xm * xm
-        xmin = x_work.min()
-        xmax = x_work.max()
-        ym = y_work.mean()
-        ysq = (y_work * y_work).mean()
-        yvar = ysq - ym * ym
-        ymin = y_work.min()
-        ymax = y_work.max()
+        xm   = xm_dev.to(device=stats_device, dtype=torch.float64)
+        xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
+        xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
+        xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
+        ym   = ym_dev.to(device=stats_device, dtype=torch.float64)
+        yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
+        ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
+        ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
         if use_for_sample:
             n = int(self.sampled_n.item())
             n_new = n + 1
