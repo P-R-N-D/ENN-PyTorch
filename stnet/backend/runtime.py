@@ -1004,6 +1004,54 @@ def epochs(
         f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})"
     )
 
+    # >>> DEBUG: 메모리 / 배치 상태 로거 추가 <<<
+    proc = None
+    if _psutil is not None:
+        try:
+            proc = _psutil.Process(os.getpid())
+        except Exception:
+            proc = None
+
+    def _log_step_state(
+        tag: str,
+        step_idx: int,
+        total_batches: int,
+        micro_batch: int,
+        grad_accum: int,
+        should_sync: bool,
+        device: torch.device = device,
+    ) -> None:
+        if not logging.getLogger().isEnabledFor(logging.INFO):
+            return
+
+        rss = None
+        host_avail = None
+        host_total = None
+        if proc is not None:
+            with contextlib.suppress(Exception):
+                rss = proc.memory_info().rss
+        with contextlib.suppress(Exception):
+            host_avail = Memory.available()
+            host_total = Memory.total()
+
+        cuda_alloc = None
+        cuda_reserved = None
+        if device.type == "cuda" and torch.cuda.is_available():
+            with contextlib.suppress(Exception):
+                cuda_alloc = torch.cuda.memory_allocated(device)
+                cuda_reserved = torch.cuda.memory_reserved(device)
+
+        eff_batch = int(micro_batch) * max(1, int(grad_accum))
+
+        logging.info(
+            f"[epochs][{tag}] step={step_idx+1}/{total_batches} "
+            f"micro_batch={micro_batch} grad_accum={grad_accum} "
+            f"eff_batch_per_update={eff_batch} should_sync={should_sync} "
+            f"rss={rss} host_avail={host_avail} host_total={host_total} "
+            f"cuda_alloc={cuda_alloc} cuda_reserved={cuda_reserved}"
+        )
+    # <<< DEBUG 로거 끝 <<<
+
     gpu_util_ema: Optional[float] = None
     mem_util_ema: Optional[float] = None
     util_alpha: float = 0.2
@@ -1347,7 +1395,6 @@ def epochs(
                                 Y = _to_device_with_stream(Y)
                                 t_h2d_e = time.perf_counter_ns()
                                 h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-
                         X = torch.atleast_2d(X)
                         if X.dim() != 2:
                             raise RuntimeError(
@@ -1357,10 +1404,6 @@ def epochs(
                             raise RuntimeError(
                                 f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                             )
-                        #
-                        if local_rank == 0:  # 메인 프로세스에서만 출력
-                            print(f"[DEBUG] Step {step_idx}: Batch Size = {X.shape[0]}, Mem Allocated = {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
-                        #
                         train_samples_epoch += float(X.shape[0])
                         wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
                         io_time += float(wait_s + h2d_s)
@@ -1372,6 +1415,18 @@ def epochs(
                         should_sync = ((step_idx + 1) % max(1, grad_accum_steps) == 0) or (
                             step_idx + 1 == total_batches
                         )
+                        # >>> DEBUG: 스텝별 배치/메모리 상태 찍기 <<<
+                        # 로그가 너무 많으면 조건을 걸어서 줄여도 됨
+                        if step_idx < 50 or ((step_idx + 1) % 100 == 0):
+                            _log_step_state(
+                                tag="train",
+                                step_idx=step_idx,
+                                total_batches=total_batches,
+                                micro_batch=int(X.shape[0]),
+                                grad_accum=int(grad_accum_steps),
+                                should_sync=bool(should_sync),
+                            )
+                        # <<< DEBUG 끝 >>>
                         if use_timer:
                             ev_s, ev_e = (
                                 torch.Event(device=device, enable_timing=True),
