@@ -617,11 +617,34 @@ def num_accelerators() -> int:
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
     ncpu = cpu_count()
+
     try:
         import torch
-        is_accelerated = torch.accelerator.is_available()
+        is_accelerated = False
+        accel = getattr(torch, "accelerator", None)
+        if accel is not None and hasattr(accel, "is_available"):
+            is_accelerated = bool(accel.is_available())
+        else:
+            if torch.cuda.is_available():
+                is_accelerated = True
+            else:
+                xpu = getattr(torch, "xpu", None)
+                if (
+                    xpu is not None
+                    and callable(getattr(xpu, "is_available", None))
+                    and xpu.is_available()
+                ):
+                    is_accelerated = True
+                mps = getattr(getattr(torch, "backends", None), "mps", None)
+                if (
+                    mps is not None
+                    and callable(getattr(mps, "is_available", None))
+                    and mps.is_available()
+                ):
+                    is_accelerated = True
     except Exception:
         is_accelerated = False
+
     if ncpu <= 2:
         inter_ops = 1
         intra_ops = max(1, ncpu - inter_ops)
@@ -636,8 +659,37 @@ def optimal_threads() -> Dict[str, Union[int, bool]]:
         num_workers = max(4, min(16, ncpu // 2))
 
     max_concurrancy = int(max(1, num_workers))
-    prebatch = 16 if is_accelerated else 1
-    prefetch_factor = 4 if is_accelerated else 1
+
+    prebatch = 1
+    prefetch_factor = 1
+
+    if is_accelerated:
+        prebatch = 4
+        prefetch_factor = 2
+
+    try:
+        env_prebatch = os.environ.get("STNET_PREBATCH")
+        if env_prebatch is not None and str(env_prebatch).strip():
+            prebatch = max(1, int(env_prebatch))
+    except Exception:
+        pass
+
+    try:
+        env_prefetch = os.environ.get("STNET_PREFETCH_FACTOR")
+        if env_prefetch is not None and str(env_prefetch).strip():
+            prefetch_factor = max(1, int(env_prefetch))
+    except Exception:
+        pass
+
+    max_total_ahead = 8 if is_accelerated else 4
+    total_ahead = prebatch * prefetch_factor
+    if total_ahead > max_total_ahead:
+        scale = max_total_ahead / float(total_ahead)
+        new_prefetch = max(1, int(prefetch_factor * scale))
+        prefetch_factor = new_prefetch
+        total_ahead = prebatch * prefetch_factor
+        if total_ahead > max_total_ahead:
+            prebatch = max(1, int(max_total_ahead // max(1, prefetch_factor)))
 
     return {
         "intra_ops": int(max(1, intra_ops)),

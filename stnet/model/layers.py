@@ -26,7 +26,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDictBase
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
+from torch.utils.checkpoint import checkpoint as _activation_checkpoint_base
+
+
+def activation_checkpoint(function, *args: Any, **kwargs: Any) -> torch.Tensor:
+    kwargs.pop("use_reentrant", None)
+    return _activation_checkpoint_base(function, *args, use_reentrant=False, **kwargs)
 
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
@@ -2409,9 +2414,13 @@ class Instance(nn.Module):
         self.output: Deque[Response] = deque()
         self.microbatch = 0
         self._auto_microbatch_pending = True
-        self._activation_checkpoint = bool(
-            getattr(config, "activation_checkpoint", False)
-        )
+        self._activation_checkpoint = True
+        with contextlib.suppress(Exception):
+            env_ac = os.environ.get("STNET_ACTIVATION_CHECKPOINT")
+            if env_ac is not None and str(env_ac).strip():
+                flag = str(env_ac).strip().lower()
+                if flag in {"0", "false", "no", "off"}:
+                    self._activation_checkpoint = False
         try:
             self.register_buffer(
                 "output_baked_flag",
