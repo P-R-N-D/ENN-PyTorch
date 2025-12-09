@@ -258,6 +258,117 @@ class Metadata(Generic[TExtra]):
         return value.detach().clone() if isinstance(value, torch.Tensor) else None
 
 
+@dataclass
+class BatchPolicy:
+    sample_bytes: int
+    host_sample_bytes: Optional[int] = None
+
+    prebatch: int = 1
+    prefetch_factor: int = 2
+    num_workers: int = 0
+    num_streams: int = 1
+    max_concurrency: int = 1
+
+    min_batch: int = 1
+    max_batch: Optional[int] = None
+
+    device_margin: float = 0.8
+    host_margin: float = 0.8
+
+    def __post_init__(self) -> None:
+        self.sample_bytes = max(int(self.sample_bytes or 0), 0)
+        if self.host_sample_bytes is None:
+            self.host_sample_bytes = self.sample_bytes
+
+        self.prebatch = max(int(self.prebatch or 0), 0)
+        self.prefetch_factor = max(int(self.prefetch_factor or 0), 0)
+        self.num_workers = max(int(self.num_workers or 0), 0)
+        self.num_streams = max(int(self.num_streams or 0), 0)
+        self.max_concurrency = max(int(self.max_concurrency or 0), 0)
+
+        self.min_batch = max(int(self.min_batch or 1), 1)
+        if self.max_batch is not None:
+            self.max_batch = max(int(self.max_batch), 1)
+
+        self.device_margin = float(self.device_margin)
+        self.host_margin = float(self.host_margin)
+
+    @property
+    def host_concurrency(self) -> int:
+        w = max(self.num_workers, 1)
+        pf = max(self.prefetch_factor, 1)
+        pre = max(self.prebatch, 1)
+        return max(w * pf * pre, 1)
+
+    @property
+    def device_concurrency(self) -> int:
+        mc = max(self.max_concurrency, 1)
+        ns = max(self.num_streams, 1)
+        pre = max(self.prebatch, 1)
+        return max(mc * ns * pre, 1)
+
+    @staticmethod
+    def _cap_from_bytes(
+        free_bytes: int,
+        per_sample_bytes: int,
+        margin: float,
+        concurrency: int,
+    ) -> int:
+        if free_bytes <= 0 or per_sample_bytes <= 0:
+            return 0
+        safe = int(max(0, float(free_bytes)) * float(margin))
+        if safe <= 0:
+            return 0
+        per = max(per_sample_bytes, 1) * max(concurrency, 1)
+        if per <= 0:
+            return 0
+        return max(int(safe // per), 0)
+
+    def cap_from_device(self, free_device_bytes: Optional[int]) -> int:
+        if free_device_bytes is None:
+            return 0
+        return self._cap_from_bytes(
+            int(free_device_bytes),
+            int(self.sample_bytes),
+            self.device_margin,
+            self.device_concurrency,
+        )
+
+    def cap_from_host(self, free_host_bytes: Optional[int]) -> int:
+        if free_host_bytes is None:
+            return 0
+        host_bytes = int(self.host_sample_bytes or 0)
+        return self._cap_from_bytes(
+            int(free_host_bytes),
+            host_bytes,
+            self.host_margin,
+            self.host_concurrency,
+        )
+
+    def suggest_batch(
+        self,
+        free_device_bytes: Optional[int],
+        free_host_bytes: Optional[int] = None,
+    ) -> int:
+        candidates = []
+        dev_cap = self.cap_from_device(free_device_bytes)
+        if dev_cap:
+            candidates.append(dev_cap)
+        host_cap = self.cap_from_host(free_host_bytes)
+        if host_cap:
+            candidates.append(host_cap)
+
+        if not candidates:
+            b = self.max_batch if self.max_batch is not None else self.min_batch
+        else:
+            b = min(candidates)
+            if self.max_batch is not None:
+                b = min(b, int(self.max_batch))
+
+        b = max(int(b), self.min_batch)
+        return max(b, 1)
+
+
 @tensorclass(shadow=True)
 class TensorDictMetadata:
     use_amp: bool = False
