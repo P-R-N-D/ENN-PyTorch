@@ -1002,6 +1002,7 @@ def epochs(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} ",
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, ",
         f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})",
+        flush=True,
     )
     logging.info(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} "
@@ -1053,6 +1054,7 @@ def epochs(
             f"eff_batch_per_update={eff_batch} should_sync={should_sync} ",
             f"rss={rss} host_avail={host_avail} host_total={host_total} ",
             f"cuda_alloc={cuda_alloc} cuda_reserved={cuda_reserved}",
+            flush=True,
         )
         logging.info(
             f"[epochs][{tag}] step={step_idx+1}/{total_batches} "
@@ -1343,9 +1345,9 @@ def epochs(
                     return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
             return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
 
-        print(r"[epochs] BEFORE | for epoch_idx in range(int(total_epochs)):")
+        print(r"[epochs] BEFORE | for epoch_idx in range(int(total_epochs)):", flush=True)
         for epoch_idx in range(int(total_epochs)):
-            print(r"[epochs] AFTER | for epoch_idx in range(int(total_epochs)):")
+            print(r"[epochs] AFTER | for epoch_idx in range(int(total_epochs)):", flush=True)
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -1364,10 +1366,10 @@ def epochs(
                 total_batches = len(train_loader)
                 train_accum_since_last = 0
                 logging.info("[epochs] BEFORE for loop")
-                print(r"[epochs] BEFORE | for step_idx, _raw in enumerate(train_loader):")
-                print("len(train_loader) = ", len(train_loader))
+                print(r"[epochs] BEFORE | for step_idx, _raw in enumerate(train_loader):", flush=True)
+                print("len(train_loader) = ", len(train_loader), flush=True)
                 for step_idx, _raw in enumerate(train_loader):
-                    print(r"[epochs] AFTER | for step_idx, _raw in enumerate(train_loader):")
+                    print(r"[epochs] AFTER | for step_idx, _raw in enumerate(train_loader):", flush=True)
                     try:
                         train_accum_since_last += 1
                         if device.type in ("cuda", "xpu", "mps"):
