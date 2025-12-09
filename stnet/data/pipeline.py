@@ -481,6 +481,18 @@ def fetch(
         except Exception:
             return (int(batch_size) if batch_size is not None else 0, 0.0)
 
+    def _resize_batch_after_pf(_datasets: Mapping[str, Dataset], _bs: int) -> int:
+        _auto_bs_candidates.clear()
+        for _k, _ds in _datasets.items():
+            B_i, _ = _stream_batch(_ds, _device_obj)
+            if B_i > 0:
+                _auto_bs_candidates.append(B_i)
+        if not _auto_bs_candidates:
+            return int(_bs)
+        cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+        cand_max = max(_auto_bs_candidates)
+        return int(max(1, min(cand_max, cand_mean)))
+
     def _cap_pf_depth(_datasets: Mapping[str, Dataset], _pf: int, _bs: int) -> int:
         try:
             host_avail = int(Memory.available())
@@ -533,6 +545,7 @@ def fetch(
                 cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
+                pf_depth_before = int(pf_depth)
                 if _auto_ms_candidates:
                     _m = min(_auto_ms_candidates)
                     if _m < 0.35:
@@ -543,6 +556,8 @@ def fetch(
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
                 pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = _resize_batch_after_pf(datasets, int(batch_size))
             else:
                 batch_size = 1
         sampler_nodes: Dict[str, BaseNode] = {}
@@ -615,6 +630,7 @@ def fetch(
                 cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
+                pf_depth_before = int(pf_depth)
                 if _auto_ms_candidates:
                     _m = min(_auto_ms_candidates)
                     if _m < 0.35:
@@ -625,6 +641,8 @@ def fetch(
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
                 pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = _resize_batch_after_pf(datasets, int(batch_size))
             else:
                 batch_size = 1
         sampler_list: list[BaseNode] = []
@@ -681,6 +699,7 @@ def fetch(
         if batch_size is None or int(batch_size) <= 0:
             B_i, ms_i = _stream_batch(ds, _device_obj)
             batch_size = max(1, int(B_i) if B_i > 0 else 1)
+            pf_depth_before = int(pf_depth)
             if ms_i:
                 if ms_i < 0.35:
                     pf_depth = max(pf_depth, 6)
@@ -688,6 +707,10 @@ def fetch(
                     pf_depth = max(pf_depth, 4)
                 elif ms_i < 1.00:
                     pf_depth = max(pf_depth, 3)
+            if int(pf_depth) != int(pf_depth_before):
+                batch_size = max(
+                    1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
+                )
         sampler_node = ds.compose(
             batch_size=int(batch_size),
             shuffle=True,
@@ -756,6 +779,7 @@ def fetch(
                     cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
+                    pf_depth_before = int(pf_depth)
                     if _auto_ms_candidates:
                         _m = min(_auto_ms_candidates)
                         if _m < 0.35:
@@ -766,6 +790,8 @@ def fetch(
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
                     pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    if int(pf_depth) != int(pf_depth_before):
+                        batch_size = _resize_batch_after_pf(datasets, int(batch_size))
             sampler_nodes: Dict[str, BaseNode] = {}
             lengths: Dict[str, int] = {}
             for key, ds in datasets.items():
@@ -843,6 +869,7 @@ def fetch(
                     cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
+                    pf_depth_before = int(pf_depth)
                     if _auto_ms_candidates:
                         _m = min(_auto_ms_candidates)
                         if _m < 0.35:
@@ -853,6 +880,8 @@ def fetch(
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
                     pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    if int(pf_depth) != int(pf_depth_before):
+                        batch_size = _resize_batch_after_pf(datasets, int(batch_size))
             sampler_list: list[BaseNode] = []
             lengths: list[int] = []
             for k, ds in datasets.items():
@@ -912,6 +941,7 @@ def fetch(
             if batch_size is None or int(batch_size) <= 0:
                 B_i, ms_i = _stream_batch(ds, _device_obj)
                 batch_size = max(1, int(B_i) if B_i > 0 else 1)
+                pf_depth_before = int(pf_depth)
                 if ms_i:
                     if ms_i < 0.35:
                         pf_depth = max(pf_depth, 6)
@@ -919,6 +949,11 @@ def fetch(
                         pf_depth = max(pf_depth, 4)
                     elif ms_i < 1.00:
                         pf_depth = max(pf_depth, 3)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = max(
+                        1,
+                        int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1,
+                    )
             sampler_node = ds.compose(
                 batch_size=int(batch_size),
                 shuffle=False,
