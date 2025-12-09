@@ -788,10 +788,10 @@ def fetch(
                             pf_depth = max(pf_depth, 4)
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
-                        pf_depth = int(max(2, min(8, pf_depth)))
-                        pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
-                        if int(pf_depth) != int(pf_depth_before):
-                            batch_size = _rescale_batch(datasets, int(batch_size))
+                    pf_depth = int(max(2, min(8, pf_depth)))
+                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    if int(pf_depth) != int(pf_depth_before):
+                        batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_nodes: Dict[str, BaseNode] = {}
             lengths: Dict[str, int] = {}
             for key, ds in datasets.items():
@@ -879,9 +879,9 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
-                        pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
-                        if int(pf_depth) != int(pf_depth_before):
-                            batch_size = _rescale_batch(datasets, int(batch_size))
+                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    if int(pf_depth) != int(pf_depth_before):
+                        batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_list: list[BaseNode] = []
             lengths: list[int] = []
             for k, ds in datasets.items():
