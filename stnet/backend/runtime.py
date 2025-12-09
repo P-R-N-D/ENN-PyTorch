@@ -921,7 +921,14 @@ def epochs(
         set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
     per_batch = getattr(train_loader, "batch_size", None)
-    if per_batch is None or int(per_batch) <= 0:
+    est_bytes_per_sample: Optional[int] = None
+
+    with contextlib.suppress(Exception):
+        v = getattr(Dataset, "_per_sample_mem_bytes", 0)
+        if isinstance(v, int) and v > 0:
+            est_bytes_per_sample = int(v)
+
+    if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
         try:
             sample = next(iter(train_loader))
             if isinstance(sample, (list, tuple)) and sample:
@@ -930,33 +937,71 @@ def epochs(
                 feats = next(iter(sample.values()))
             else:
                 feats = sample
-            per_batch = int(getattr(feats, "shape", [len(feats)])[0])
-        except Exception:
-            per_batch = 1
 
-    if per_batch <= 0:
+            if per_batch is None or int(per_batch) <= 0:
+                with contextlib.suppress(Exception):
+                    per_batch = int(getattr(feats, "shape", [len(feats)])[0])
+
+            if est_bytes_per_sample is None:
+                with contextlib.suppress(Exception):
+                    if isinstance(feats, torch.Tensor):
+                        if feats.ndim >= 1 and int(feats.shape[0]) > 0:
+                            one = feats[:1]
+                        else:
+                            one = feats.reshape(1, -1)
+                        est_bytes_per_sample = int(one.nelement()) * int(one.element_size())
+        except Exception:
+            if per_batch is None or int(per_batch) <= 0:
+                per_batch = 1
+
+    if per_batch is None or per_batch <= 0:
         per_batch = 1
 
-    factor = 2
+    min_grad_accum = 1
+    max_grad_accum = 64
+    with contextlib.suppress(Exception):
+        env_min = os.environ.get("STNET_ACCUM_STEPS")
+        if env_min is not None and str(env_min).strip():
+            min_grad_accum = max(1, int(env_min))
+    with contextlib.suppress(Exception):
+        env_max = os.environ.get("STNET_MAX_ACCUM_STEPS")
+        if env_max is not None and str(env_max).strip():
+            max_grad_accum = max(min_grad_accum, int(env_max))
+
+    safe_host_bytes: Optional[int] = None
     with contextlib.suppress(Exception):
         avail_bytes = Memory.available()
+        total_bytes = Memory.total()
         if avail_bytes and avail_bytes > 0:
-            avail_gb = avail_bytes / float(1024 ** 3)
-            est = int(max(1, min(8, avail_gb / 4.0)))
-            factor = max(factor, est)
+            safe_host_bytes = int(avail_bytes * 0.7)
+            if total_bytes and total_bytes > 0:
+                safe_host_bytes = min(safe_host_bytes, int(total_bytes * 0.5))
 
-    target_global_batch = per_batch * factor
-    auto_steps = target_global_batch // per_batch
-    if auto_steps < 1:
-        auto_steps = 1
-    auto_steps = min(auto_steps, 64)
+    if (
+        safe_host_bytes is not None
+        and safe_host_bytes > 0
+        and est_bytes_per_sample is not None
+        and est_bytes_per_sample > 0
+    ):
+        prefetch_depth = 4
+        bytes_per_batch = int(est_bytes_per_sample) * int(per_batch)
+        if bytes_per_batch > 0:
+            max_from_mem = int(
+                max(
+                    1,
+                    safe_host_bytes
+                    // max(1, bytes_per_batch * prefetch_depth),
+                )
+            )
+            max_grad_accum = max(min_grad_accum, min(max_grad_accum, max_from_mem))
 
-    grad_accum_steps: int = int(auto_steps)
+    grad_accum_steps: int = int(min_grad_accum)
     grad_accum_steps = _sync_int_across_ranks(grad_accum_steps, device=device, src=0)
 
     logging.info(
-        f"[epochs] auto grad_accum_steps={grad_accum_steps} "
-        f"(per_batch={per_batch}, target_global_batch={target_global_batch}, factor={factor})"
+        f"[epochs] grad_accum_steps initial={grad_accum_steps} "
+        f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, "
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})"
     )
 
     gpu_util_ema: Optional[float] = None
@@ -1458,14 +1503,32 @@ def epochs(
                                 if util_frac is not None:
                                     if mem_frac is not None:
                                         if util_frac < 0.88 and mem_frac < 0.90:
-                                            new_grad_accum = min(64, grad_accum_steps + 1)
+                                            new_grad_accum = min(max_grad_accum, grad_accum_steps + 1)
                                         elif util_frac > 0.97 or mem_frac > 0.92:
-                                            new_grad_accum = max(1, grad_accum_steps - 1)
+                                            new_grad_accum = max(min_grad_accum, grad_accum_steps - 1)
                                     else:
                                         if util_frac < 0.88:
-                                            new_grad_accum = min(64, grad_accum_steps + 1)
+                                            new_grad_accum = min(max_grad_accum, grad_accum_steps + 1)
                                         elif util_frac > 0.97:
-                                            new_grad_accum = max(1, grad_accum_steps - 1)
+                                            new_grad_accum = max(min_grad_accum, grad_accum_steps - 1)
+
+                                host_avail_now: Optional[int] = None
+                                host_total_now: Optional[int] = None
+                                with contextlib.suppress(Exception):
+                                    host_avail_now = Memory.available()
+                                    host_total_now = Memory.total()
+                                host_low = False
+                                if host_avail_now is not None and host_avail_now > 0:
+                                    host_low_abs = host_avail_now < (512 * 1024 * 1024)
+                                    host_low_rel = False
+                                    if host_total_now is not None and host_total_now > 0:
+                                        host_low_rel = float(host_avail_now) / float(host_total_now) < 0.10
+                                    host_low = host_low_abs or host_low_rel
+                                if host_low:
+                                    if new_grad_accum > grad_accum_steps:
+                                        new_grad_accum = grad_accum_steps
+                                    if grad_accum_steps > min_grad_accum:
+                                        new_grad_accum = min_grad_accum
 
                                 if new_grad_accum != grad_accum_steps:
                                     new_grad_accum = _sync_int_across_ranks(
@@ -2284,6 +2347,17 @@ def infer(
                 target_hi = 0.98
                 target_lo = 0.90
 
+                min_mb_env = 1
+                max_mb_env = B
+                with contextlib.suppress(Exception):
+                    env_min = os.environ.get("STNET_INFER_MICROBATCH")
+                    if env_min is not None and str(env_min).strip():
+                        min_mb_env = max(1, int(env_min))
+                with contextlib.suppress(Exception):
+                    env_max = os.environ.get("STNET_INFER_MICROBATCH_MAX")
+                    if env_max is not None and str(env_max).strip():
+                        max_mb_env = max(min_mb_env, min(B, int(env_max)))
+
                 new_mb = mb
                 if u < target_lo:
                     new_mb = min(B, mb + max(1, mb // 4))
@@ -2304,7 +2378,26 @@ def infer(
                     except Exception:
                         mb_mem = B
 
-                new_mb = max(1, min(new_mb, mb_mem))
+                host_avail_now: Optional[int] = None
+                host_total_now: Optional[int] = None
+                with contextlib.suppress(Exception):
+                    host_avail_now = Memory.available()
+                    host_total_now = Memory.total()
+                host_low = False
+                if host_avail_now is not None and host_avail_now > 0:
+                    host_low_abs = host_avail_now < (512 * 1024 * 1024)
+                    host_low_rel = False
+                    if host_total_now is not None and host_total_now > 0:
+                        host_low_rel = float(host_avail_now) / float(host_total_now) < 0.10
+                    host_low = host_low_abs or host_low_rel
+                if host_low:
+                    if new_mb > mb:
+                        new_mb = mb
+                    if mb > min_mb_env:
+                        new_mb = min_mb_env
+
+                max_allowed = min(mb_mem, max_mb_env)
+                new_mb = max(min_mb_env, min(new_mb, max_allowed))
                 state["mb"] = new_mb
                 if local_rank == 0:
                     mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
