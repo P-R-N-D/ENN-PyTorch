@@ -998,6 +998,11 @@ def epochs(
     grad_accum_steps: int = int(min_grad_accum)
     grad_accum_steps = _sync_int_across_ranks(grad_accum_steps, device=device, src=0)
 
+    print(
+        f"[epochs] grad_accum_steps initial={grad_accum_steps} ",
+        f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, ",
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})",
+    )
     logging.info(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} "
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, "
@@ -1042,7 +1047,13 @@ def epochs(
                 cuda_reserved = torch.cuda.memory_reserved(device)
 
         eff_batch = int(micro_batch) * max(1, int(grad_accum))
-
+        print(
+            f"[epochs][{tag}] step={step_idx+1}/{total_batches} ",
+            f"micro_batch={micro_batch} grad_accum={grad_accum} ",
+            f"eff_batch_per_update={eff_batch} should_sync={should_sync} ",
+            f"rss={rss} host_avail={host_avail} host_total={host_total} ",
+            f"cuda_alloc={cuda_alloc} cuda_reserved={cuda_reserved}",
+        )
         logging.info(
             f"[epochs][{tag}] step={step_idx+1}/{total_batches} "
             f"micro_batch={micro_batch} grad_accum={grad_accum} "
