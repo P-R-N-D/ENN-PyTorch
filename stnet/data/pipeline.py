@@ -13,6 +13,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
 from ..backend.system import Memory, get_tlb, optimize_threads
+from .stats import BatchPolicy
 
 try:
     from torchdata.nodes import BaseNode
@@ -158,6 +159,10 @@ def _batch_interval(
     _dev: torch.device,
     _tmin_ms: float = 0.8,
     _tmax_ms: float = 3.0,
+    *,
+    prefetch_factor: int = 2,
+    num_workers: int = 0,
+    prebatch: int = 1,
 ) -> Tuple[int, float]:
     if len(_ds) <= 0:
         return (1, 0.0)
@@ -172,84 +177,75 @@ def _batch_interval(
     if sbytes <= 0:
         return (max(1, min(256, len(_ds))), 0.0)
     B_cap = 1 << 16
-    if _dev.type == "cuda":
-        try:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA not available")
-            free, _ = torch.cuda.mem_get_info(device=_dev)
-            cap = int(free * 0.90)
-            B_cap = max(1, int(cap // max(1, sbytes * 4)))
-        except Exception:
-            pass
-    elif _dev.type == "xpu":
-        try:
-            props = getattr(torch.xpu, "get_device_properties", None)
-            mem_alloc = getattr(torch.xpu, "memory_allocated", None)
-            if callable(props) and callable(mem_alloc):
-                total = int(props(_dev).total_memory)
-                used = int(mem_alloc(_dev))
-                cap = int(max(0, total - used) * 0.90)
-                B_cap = max(1, int(cap // max(1, sbytes * 4)))
-        except Exception:
-            pass
-    elif _dev.type == "mps":
-        try:
-            cap = int(int(Memory.available()) * 0.25)
-            B_cap = max(1, int(cap // max(1, sbytes * 4)))
-        except Exception:
-            pass
-    B_cap = max(1, min(int(B_cap * Dataset._scale), len(_ds)))
+    _dev_type = _dev.type
 
-    if _dev.type == "cuda":
+    per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+    if per_sample <= 0:
         try:
-            per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
-            if per_sample <= 0:
-                env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
-                try:
-                    if env_ps:
-                        per_sample = int(env_ps)
-                except Exception:
-                    per_sample = 0
-            if per_sample > 0:
-                free_bytes, _ = torch.cuda.mem_get_info(_dev)
-                safe_cap = int(max(0, free_bytes) * 0.80)
-                if safe_cap > 0:
-                    cap_from_mem = int(safe_cap // max(1, per_sample))
-                    if cap_from_mem > 0:
-                        B_cap = max(1, min(B_cap, cap_from_mem))
+            env_v = (
+                os.environ.get("STNET_PER_SAMPLE_MEM_BYTES")
+                or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
+            )
+            if env_v is not None:
+                per_sample = int(env_v)
         except Exception:
-            pass
-    elif _dev.type == "xpu":
+            per_sample = 0
+    if per_sample <= 0:
+        per_sample = sbytes
+
+    tpl = BatchPolicy(
+        sample_bytes=per_sample,
+        host_sample_bytes=sbytes,
+        prefetch_factor=max(int(prefetch_factor or 1), 1),
+        num_workers=max(int(num_workers or 0), 0),
+        prebatch=max(int(prebatch or 1), 1),
+        num_streams=1,
+        max_concurrency=1,
+        min_batch=1,
+        max_batch=B_cap,
+        device_margin=0.90,
+        host_margin=0.10,
+    )
+
+    dev_free: Optional[int] = None
+    host_free: Optional[int] = None
+
+    try:
+        accelerator = getattr(torch, "accelerator", None)
+        mem_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
+        mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
+        if callable(mem_get_info):
+            info = mem_get_info(_dev)
+            if isinstance(info, (list, tuple)) and len(info) >= 1:
+                dev_free = int(info[0])
+            elif isinstance(info, dict):
+                dev_free = int(info.get("free", 0) or 0)
+    except Exception:
+        dev_free = None
+
+    if dev_free is None:
         try:
-            per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
-            if per_sample <= 0:
-                env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
-                try:
-                    if env_ps:
-                        per_sample = int(env_ps)
-                except Exception:
-                    per_sample = 0
-            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-            if per_sample > 0 and callable(mem_get_info):
-                free_bytes, _ = mem_get_info(_dev)
-                safe_cap = int(max(0, int(free_bytes)) * 0.80)
-                if safe_cap > 0:
-                    cap_from_mem = int(safe_cap // max(1, per_sample))
-                    if cap_from_mem > 0:
-                        B_cap = max(1, min(B_cap, cap_from_mem))
+            if _dev_type == "cuda" and torch.cuda.is_available():
+                dev_free, _ = torch.cuda.mem_get_info(device=_dev)
+            elif _dev_type == "xpu":
+                mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                if callable(mem_get_info):
+                    dev_free, _ = mem_get_info(_dev)
         except Exception:
-            pass
+            dev_free = None
 
     try:
         host_avail = int(Memory.available())
         if host_avail > 0:
-            host_cap = int(host_avail * 0.10)
-            if host_cap > 0:
-                host_B_cap = int(host_cap // max(1, sbytes))
-                if host_B_cap > 0:
-                    B_cap = max(1, min(B_cap, host_B_cap))
+            host_free = host_avail
     except Exception:
-        pass
+        host_free = None
+
+    cap_from_mem = tpl.suggest_batch(dev_free, host_free)
+    if cap_from_mem > 0:
+        B_cap = min(B_cap, cap_from_mem)
+
+    B_cap = max(1, min(int(B_cap * Dataset._scale), len(_ds)))
 
     env_max = os.environ.get("STNET_MAX_BATCH_SIZE") or os.environ.get("STNET_MAX_BATCH")
     try:
@@ -475,9 +471,27 @@ def fetch(
 
     def _stream_batch(_ds: Dataset, _dev: torch.device) -> Tuple[int, float]:
         try:
-            return _batch_interval(_ds, _dev)
+            return _batch_interval(
+                _ds,
+                _dev,
+                prefetch_factor=pf_depth,
+                num_workers=io_workers,
+                prebatch=prebatch,
+            )
         except Exception:
             return (int(batch_size) if batch_size is not None else 0, 0.0)
+
+    def _rescale_batch(_datasets: Mapping[str, Dataset], _bs: int) -> int:
+        _auto_bs_candidates.clear()
+        for _k, _ds in _datasets.items():
+            B_i, _ = _stream_batch(_ds, _device_obj)
+            if B_i > 0:
+                _auto_bs_candidates.append(B_i)
+        if not _auto_bs_candidates:
+            return int(_bs)
+        cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
+        cand_max = max(_auto_bs_candidates)
+        return int(max(1, min(cand_max, cand_mean)))
 
     def _cap_pf_depth(_datasets: Mapping[str, Dataset], _pf: int, _bs: int) -> int:
         try:
@@ -531,6 +545,7 @@ def fetch(
                 cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
+                pf_depth_before = int(pf_depth)
                 if _auto_ms_candidates:
                     _m = min(_auto_ms_candidates)
                     if _m < 0.35:
@@ -541,6 +556,8 @@ def fetch(
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
                 pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = _rescale_batch(datasets, int(batch_size))
             else:
                 batch_size = 1
         sampler_nodes: Dict[str, BaseNode] = {}
@@ -613,6 +630,7 @@ def fetch(
                 cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
+                pf_depth_before = int(pf_depth)
                 if _auto_ms_candidates:
                     _m = min(_auto_ms_candidates)
                     if _m < 0.35:
@@ -623,6 +641,8 @@ def fetch(
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
                 pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = _rescale_batch(datasets, int(batch_size))
             else:
                 batch_size = 1
         sampler_list: list[BaseNode] = []
@@ -679,6 +699,7 @@ def fetch(
         if batch_size is None or int(batch_size) <= 0:
             B_i, ms_i = _stream_batch(ds, _device_obj)
             batch_size = max(1, int(B_i) if B_i > 0 else 1)
+            pf_depth_before = int(pf_depth)
             if ms_i:
                 if ms_i < 0.35:
                     pf_depth = max(pf_depth, 6)
@@ -686,6 +707,10 @@ def fetch(
                     pf_depth = max(pf_depth, 4)
                 elif ms_i < 1.00:
                     pf_depth = max(pf_depth, 3)
+            if int(pf_depth) != int(pf_depth_before):
+                batch_size = max(
+                    1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
+                )
         sampler_node = ds.compose(
             batch_size=int(batch_size),
             shuffle=True,
@@ -754,6 +779,7 @@ def fetch(
                     cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
+                    pf_depth_before = int(pf_depth)
                     if _auto_ms_candidates:
                         _m = min(_auto_ms_candidates)
                         if _m < 0.35:
@@ -763,7 +789,9 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
-                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                        pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                        if int(pf_depth) != int(pf_depth_before):
+                            batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_nodes: Dict[str, BaseNode] = {}
             lengths: Dict[str, int] = {}
             for key, ds in datasets.items():
@@ -841,6 +869,7 @@ def fetch(
                     cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
+                    pf_depth_before = int(pf_depth)
                     if _auto_ms_candidates:
                         _m = min(_auto_ms_candidates)
                         if _m < 0.35:
@@ -850,7 +879,9 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
-                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                        pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                        if int(pf_depth) != int(pf_depth_before):
+                            batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_list: list[BaseNode] = []
             lengths: list[int] = []
             for k, ds in datasets.items():
@@ -910,6 +941,7 @@ def fetch(
             if batch_size is None or int(batch_size) <= 0:
                 B_i, ms_i = _stream_batch(ds, _device_obj)
                 batch_size = max(1, int(B_i) if B_i > 0 else 1)
+                pf_depth_before = int(pf_depth)
                 if ms_i:
                     if ms_i < 0.35:
                         pf_depth = max(pf_depth, 6)
@@ -917,6 +949,11 @@ def fetch(
                         pf_depth = max(pf_depth, 4)
                     elif ms_i < 1.00:
                         pf_depth = max(pf_depth, 3)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = max(
+                        1,
+                        int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1,
+                    )
             sampler_node = ds.compose(
                 batch_size=int(batch_size),
                 shuffle=False,

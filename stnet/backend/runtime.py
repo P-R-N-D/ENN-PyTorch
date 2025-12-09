@@ -957,6 +957,8 @@ def epochs(
     if per_batch is None or per_batch <= 0:
         per_batch = 1
 
+    from ..data.stats import BatchPolicy
+
     min_grad_accum = 1
     max_grad_accum = 64
     with contextlib.suppress(Exception):
@@ -968,32 +970,50 @@ def epochs(
         if env_max is not None and str(env_max).strip():
             max_grad_accum = max(min_grad_accum, int(env_max))
 
-    safe_host_bytes: Optional[int] = None
-    with contextlib.suppress(Exception):
-        avail_bytes = Memory.available()
-        total_bytes = Memory.total()
-        if avail_bytes and avail_bytes > 0:
-            safe_host_bytes = int(avail_bytes * 0.7)
-            if total_bytes and total_bytes > 0:
-                safe_host_bytes = min(safe_host_bytes, int(total_bytes * 0.5))
-
-    if (
-        safe_host_bytes is not None
-        and safe_host_bytes > 0
-        and est_bytes_per_sample is not None
-        and est_bytes_per_sample > 0
-    ):
-        prefetch_depth = 4
-        bytes_per_batch = int(est_bytes_per_sample) * int(per_batch)
-        if bytes_per_batch > 0:
-            max_from_mem = int(
-                max(
-                    1,
-                    safe_host_bytes
-                    // max(1, bytes_per_batch * prefetch_depth),
-                )
+    tpl: Optional[BatchPolicy] = None
+    if est_bytes_per_sample is not None:
+        try:
+            tpl = BatchPolicy(
+                sample_bytes=int(est_bytes_per_sample),
+                host_sample_bytes=int(est_bytes_per_sample),
+                prebatch=1,
+                prefetch_factor=int(
+                    os.environ.get("STNET_HOST_PREFETCH_FACTOR") or "4"
+                ),
+                num_workers=getattr(train_loader, "num_workers", 0),
+                num_streams=1,
+                max_concurrency=1,
+                min_batch=1,
+                max_batch=max_grad_accum,
+                host_margin=0.70,
+                device_margin=1.0,
             )
-            max_grad_accum = max(min_grad_accum, min(max_grad_accum, max_from_mem))
+        except Exception:
+            tpl = None
+
+    safe_host_bytes: Optional[int] = None
+    max_from_mem: Optional[int] = None
+    if tpl is not None:
+        try:
+            host_mem = Memory.available()
+            if host_mem is not None and host_mem > 0:
+                safe_host_bytes = int(host_mem)
+                total_samples_cap = tpl.suggest_batch(
+                    free_device_bytes=None,
+                    free_host_bytes=safe_host_bytes,
+                )
+                if total_samples_cap > 0:
+                    max_from_mem = max(
+                        1, int(total_samples_cap) // int(per_batch or 1)
+                    )
+        except Exception:
+            safe_host_bytes = None
+
+    if max_from_mem is not None:
+        max_grad_accum = max(
+            int(min_grad_accum),
+            min(int(max_grad_accum), int(max_from_mem)),
+        )
 
     grad_accum_steps: int = int(min_grad_accum)
     grad_accum_steps = _sync_int_across_ranks(grad_accum_steps, device=device, src=0)

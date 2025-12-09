@@ -40,6 +40,35 @@ from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
 _DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
 
 
+def _clear_device_caches() -> None:
+    with contextlib.suppress(Exception):
+        gc.collect()
+
+    with contextlib.suppress(Exception):
+        accelerator = getattr(torch, "accelerator", None)
+        memory_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
+        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
+        if callable(empty_cache):
+            empty_cache()
+
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    with contextlib.suppress(Exception):
+        mps_mod = getattr(torch, "mps", None)
+        empty_cache = getattr(mps_mod, "empty_cache", None) if mps_mod is not None else None
+        if callable(empty_cache):
+            empty_cache()
+
+    with contextlib.suppress(Exception):
+        xpu_mod = getattr(torch, "xpu", None)
+        memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
+        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
+        if callable(empty_cache):
+            empty_cache()
+
+
 def _preload_state(value: Any) -> Any:
     if _DTENSOR_TYPE is not None and isinstance(value, _DTENSOR_TYPE):
         return value.to_local()
@@ -530,25 +559,7 @@ def train(
         )
         with contextlib.suppress(Exception):
             model.to("cpu")
-        with contextlib.suppress(Exception):
-            gc.collect()
-        with contextlib.suppress(Exception):
-            accelerator = getattr(torch, "accelerator", None)
-            memory = getattr(accelerator, "memory", None) if accelerator is not None else None
-            if memory is not None and hasattr(memory, "empty_cache"):
-                memory.empty_cache()
-        with contextlib.suppress(Exception):
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        with contextlib.suppress(Exception):
-            empty_mps = getattr(torch, "mps", None)
-            if empty_mps is not None and hasattr(empty_mps, "empty_cache"):
-                empty_mps.empty_cache()
-        with contextlib.suppress(Exception):
-            empty_xpu = getattr(torch, "xpu", None)
-            memory = getattr(empty_xpu, "memory", None) if empty_xpu is not None else None
-            if memory is not None and hasattr(memory, "empty_cache"):
-                memory.empty_cache()
+        _clear_device_caches()
         elastic_launch(lc, main)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
@@ -1051,25 +1062,7 @@ def predict(
     )
     with contextlib.suppress(Exception):
         model.to("cpu")
-    with contextlib.suppress(Exception):
-        gc.collect()
-    with contextlib.suppress(Exception):
-        accelerator = getattr(torch, "accelerator", None)
-        memory = getattr(accelerator, "memory", None) if accelerator is not None else None
-        if memory is not None and hasattr(memory, "empty_cache"):
-            memory.empty_cache()
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    with contextlib.suppress(Exception):
-        empty_mps = getattr(torch, "mps", None)
-        if empty_mps is not None and hasattr(empty_mps, "empty_cache"):
-            empty_mps.empty_cache()
-    with contextlib.suppress(Exception):
-        empty_xpu = getattr(torch, "xpu", None)
-        memory = getattr(empty_xpu, "memory", None) if empty_xpu is not None else None
-        if memory is not None and hasattr(memory, "empty_cache"):
-            memory.empty_cache()
+    _clear_device_caches()
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     rdzv_endpoint = get_available_host(default_rdzv_host)
     master_addr, _ = initialize_master_addr(rdzv_endpoint)
