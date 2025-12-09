@@ -1343,7 +1343,9 @@ def epochs(
                     return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
             return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
 
+        print(r"[epochs] BEFORE | for epoch_idx in range(int(total_epochs)):")
         for epoch_idx in range(int(total_epochs)):
+            print(r"[epochs] AFTER | for epoch_idx in range(int(total_epochs)):")
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -1361,7 +1363,11 @@ def epochs(
                 t_fetch_start = time.perf_counter_ns()
                 total_batches = len(train_loader)
                 train_accum_since_last = 0
+                logging.info("[epochs] BEFORE for loop")
+                print(r"[epochs] BEFORE | for step_idx, _raw in enumerate(train_loader):")
+                print("len(train_loader) = ", len(train_loader))
                 for step_idx, _raw in enumerate(train_loader):
+                    print(r"[epochs] AFTER | for step_idx, _raw in enumerate(train_loader):")
                     try:
                         train_accum_since_last += 1
                         if device.type in ("cuda", "xpu", "mps"):
