@@ -1357,6 +1357,10 @@ def epochs(
                             raise RuntimeError(
                                 f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                             )
+                        #
+                        if local_rank == 0:  # 메인 프로세스에서만 출력
+                            print(f"[DEBUG] Step {step_idx}: Batch Size = {X.shape[0]}, Mem Allocated = {torch.cuda.memory_allocated(device) / 1024**2:.2f} MB")
+                        #
                         train_samples_epoch += float(X.shape[0])
                         wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
                         io_time += float(wait_s + h2d_s)
