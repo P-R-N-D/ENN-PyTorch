@@ -69,7 +69,7 @@ def _clear_device_caches() -> None:
             empty_cache()
 
 
-def _reset_default_pg() -> None:
+def _reset_process_group() -> None:
     if not torch.distributed.is_available():
         return
     if torch.distributed.is_initialized():
@@ -167,7 +167,7 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Instance:
-    _reset_default_pg()
+    _reset_process_group()
     try:
         val_frac = float(val_frac)
         val_frac = 0.0 if val_frac < 0.0 else (1.0 if val_frac > 1.0 else val_frac)
@@ -785,7 +785,7 @@ def predict(
     **kwargs: Any,
 ) -> Dict[str, Any]:
 
-    _reset_default_pg()
+    _reset_process_group()
     initialize_python_path()
     set_multiprocessing_env()
     tmp_dir = new_dir("infer")
