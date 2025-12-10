@@ -13,10 +13,14 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..backend.system import (get_device, is_cpu_bf16_supported,
-                              is_cuda_bf16_supported, is_float8_supported,
-                              is_int8_supported)
-from ..data.stats import Metadata
+from ..backend.system import (
+    get_device,
+    is_cpu_bf16_supported,
+    is_cuda_bf16_supported,
+    is_float8_supported,
+    is_int8_supported,
+)
+from ..api.templates import AutocastStats
 
 patch_torch()
 
@@ -152,7 +156,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 def is_scale_safe(
     dtype: torch.dtype,
-    meta: Optional[Metadata[Any]],
+    meta: Optional[AutocastStats[Any]],
     *args: Any,
     safety_margin: float = 8.0,
     **kwargs: Any,
@@ -338,7 +342,7 @@ class Autocast:
     _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _metadata: Optional[Metadata[Any]] = None
+    _metadata: Optional[AutocastStats[Any]] = None
 
     @staticmethod
     def _device(
@@ -450,9 +454,9 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
-    ) -> Metadata[Any]:
+    ) -> AutocastStats[Any]:
         meta = metadata or cls._metadata
         device_hint: Optional[Union[torch.device, str]] = device
         if device_hint is None and meta is not None:
@@ -460,7 +464,7 @@ class Autocast:
                 device_hint = torch.device(meta.device)
         dev = cls._device(device_hint)
         if meta is None:
-            meta = Metadata.for_device(dev)
+            meta = AutocastStats.for_device(dev)
         else:
             current_device = torch.device(getattr(meta, "device", dev))
             if current_device != dev:
@@ -529,7 +533,7 @@ class Autocast:
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
-        meta: Optional[Metadata[Any]] = None,
+        meta: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         for dtype in candidates:
@@ -641,7 +645,7 @@ class Autocast:
         cls: object,
         model: Optional[nn.Module],
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
     ) -> None:
         backend: Optional[str] = None
@@ -698,7 +702,7 @@ class Autocast:
         cls,
         device: Optional[Union[torch.device, str]] = None,
         dtype: Optional[Union[torch.dtype, str]] = None,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
     ) -> Optional[torch.dtype]:
         """Return the float autocast dtype that `Autocast.float(...)` would use.
 
@@ -744,7 +748,7 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
@@ -870,7 +874,7 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
@@ -1134,7 +1138,7 @@ class Fusion:
     def negotiate(
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
@@ -1173,14 +1177,14 @@ class Fusion:
 
     @staticmethod
     def _coerce_metadata(
-        model: nn.Module, metadata: Optional[Metadata[Any]] = None
-    ) -> Metadata[Any]:
+        model: nn.Module, metadata: Optional[AutocastStats[Any]] = None
+    ) -> AutocastStats[Any]:
         Autocast.configure(model, metadata=metadata)
         meta = Autocast._metadata
         if meta is None:
             ref = Fusion._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
-            meta = Metadata.for_device(dev)
+            meta = AutocastStats.for_device(dev)
             Autocast.configure(model, metadata=meta)
         return meta
 
@@ -1360,7 +1364,7 @@ class Fusion:
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> Tuple[nn.Module, bool, str]:
@@ -1514,7 +1518,7 @@ class Fusion:
     @staticmethod
     def enable_float8_training(
         model: nn.Module,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
@@ -1554,7 +1558,7 @@ class Fusion:
     @staticmethod
     def enable_float8_prediction(
         model: nn.Module,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
@@ -1602,7 +1606,7 @@ class Fusion:
     @staticmethod
     def enable_int8_training(
         model: nn.Module,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
@@ -1626,7 +1630,7 @@ class Fusion:
     @staticmethod
     def enable_int8_prediction(
         model: nn.Module,
-        metadata: Optional[Metadata[Any]] = None,
+        metadata: Optional[AutocastStats[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)

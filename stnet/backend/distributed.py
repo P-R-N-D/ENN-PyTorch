@@ -604,8 +604,6 @@ def to_ddp(
     **kwargs: Any,
 ) -> torch.nn.Module:
     module = module.to(device)
-    if not is_distributed():
-        return module
     if isinstance(module, DDP):
         return module
 
@@ -625,9 +623,9 @@ def to_ddp(
     if "bucket_cap_mb" in params:
         ddp_kwargs["bucket_cap_mb"] = bucket_mb
     if "gradient_as_bucket_view" in params:
-        ddp_kwargs["gradient_as_bucket_view"] = _env_flag("STNET_DDP_BUCKET_VIEW", True)
+        ddp_kwargs["gradient_as_bucket_view"] = True
     if "static_graph" in params:
-        ddp_kwargs["static_graph"] = _env_flag("STNET_DDP_STATIC_GRAPH", False)
+        ddp_kwargs["static_graph"] = False
     return DDP(module, **ddp_kwargs)
 
 
