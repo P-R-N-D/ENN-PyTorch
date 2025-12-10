@@ -50,7 +50,7 @@ except Exception:
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..api.templates import AutocastStats
+from ..api.templates import DatasetPolicy
 from ..data.transforms import preprocess, batch_to_device
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
@@ -2927,7 +2927,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 )
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
-        metadata = AutocastStats.for_device(device)
+        metadata = DatasetPolicy.for_device(device)
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
@@ -3421,7 +3421,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
-        metadata = AutocastStats.for_device(device)
+        metadata = DatasetPolicy.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
