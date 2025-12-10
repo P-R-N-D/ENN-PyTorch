@@ -2872,7 +2872,13 @@ class Instance(nn.Module):
             )
 
         if td_input is not None:
-            out_td = td_input.clone()
+            if hasattr(td_input, "copy"):
+                out_td = td_input.copy()
+            else:
+                try:
+                    out_td = td_input.clone(recurse=False)
+                except TypeError:
+                    out_td = td_input.clone(False)
             out_td.set("pred", pred)
             out_td.set("refined_tokens", refined_tokens)
             out_td.set("residual_context", residual_context)
