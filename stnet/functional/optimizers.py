@@ -14,7 +14,7 @@ from torch import nn, optim
 from ..backend.system import (get_device, is_float8_supported,
                               is_int4_supported, is_int8_supported,
                               optimal_optimizer_params)
-from ..api.templates import DatasetPolicy
+from ..api.templates import DataPolicy
 from .fx import Autocast, Fusion, is_scale_safe
 
 try:
@@ -157,8 +157,8 @@ class AdamW:
         model_or_params: Union[
             nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
         ],
-        metadata: Optional["DatasetPolicy[Any]"] = None,
-    ) -> Tuple[torch.device, "DatasetPolicy[Any]"]:
+        metadata: Optional["DataPolicy[Any]"] = None,
+    ) -> Tuple[torch.device, "DataPolicy[Any]"]:
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
             ref_tensor = Fusion._peek_layer(model_or_params)
@@ -180,7 +180,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[DatasetPolicy[Any]] = None,
+        metadata: Optional[DataPolicy[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -262,7 +262,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[DatasetPolicy[Any]] = None,
+        metadata: Optional[DataPolicy[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
