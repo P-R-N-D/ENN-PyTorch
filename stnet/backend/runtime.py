@@ -1667,7 +1667,10 @@ def epochs(
                             if cpu_pool is not None and ((step_idx + 1) & 255) == 0:
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
-    
+
+                            # Successful processing of this batch; exit retry loop
+                            break
+
                         except RuntimeError as e:
                             msg = str(e).lower()
                             if "out of memory" in msg:
