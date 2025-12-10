@@ -1,14 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar
 
 import torch
-from tensordict import tensorclass
 
 from ..backend.system import cuda_compute_capability
 
@@ -18,7 +16,7 @@ _BOOTSTRAP_DEPTH = 0
 
 
 @dataclass
-class AutocastStats(Generic[TExtra]):
+class DatasetPolicy(Generic[TExtra]):
     device: torch.device
     device_type: str = field(init=False, default="cpu")
     cuda_cc: Optional[Tuple[int, int]] = field(init=False, default=None)
@@ -133,7 +131,7 @@ class AutocastStats(Generic[TExtra]):
         scale_is_integral: Optional[bool] = None,
         extra: Optional[Mapping[str, TExtra]] = None,
         **kwargs: Any,
-    ) -> "AutocastStats[TExtra]":
+    ) -> "DatasetPolicy[TExtra]":
         dev = torch.device(device)
         float_candidates = cls._float_amp_candidates(dev)
         int_candidates = cls._integer_candidates(dev)
@@ -369,27 +367,3 @@ class BatchPolicy:
         return max(b, 1)
 
 
-@tensorclass(shadow=True)
-class TensorDictMetadata:
-    use_amp: bool = False
-    amp_dtype: Optional[Any] = None
-    device: Optional[Any] = None
-
-    def autocast(self) -> contextlib.AbstractContextManager[Any]:
-        if not (self.use_amp and isinstance(self.amp_dtype, torch.dtype)):
-            return contextlib.nullcontext()
-
-        if isinstance(self.device, torch.device):
-            dev_type = self.device.type
-        else:
-            dev_type = "cuda" if torch.cuda.is_available() else "cpu"
-
-        autocast_fn = getattr(torch, "autocast", None)
-        amp_mod = getattr(torch, "amp", None)
-        if hasattr(amp_mod, "autocast"):
-            autocast_fn = amp_mod.autocast
-
-        if callable(autocast_fn):
-            return autocast_fn(device_type=dev_type, dtype=self.amp_dtype)
-
-        return contextlib.nullcontext()
