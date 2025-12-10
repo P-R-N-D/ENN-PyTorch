@@ -1771,10 +1771,10 @@ def epochs(
                                         feat, label, *_ = preprocess(_raw)
                                         X = to_torch_tensor(feat)
                                         Y = to_torch_tensor(label)
-    
+
                                         t_ready = time.perf_counter_ns()
                                         X, Y = _pin_tensor(X, Y)
-    
+
                                         if use_timer:
                                             h2d_s_ev, h2d_e_ev = (
                                                 torch.Event(device=device, enable_timing=True),
@@ -1792,7 +1792,7 @@ def epochs(
                                             Y = _to_device_with_stream(Y)
                                             t_h2d_e = time.perf_counter_ns()
                                             h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-    
+
                                     X = torch.atleast_2d(X)
                                     if X.dim() != 2:
                                         raise RuntimeError(
@@ -1802,7 +1802,12 @@ def epochs(
                                         raise RuntimeError(
                                             f"feature dim mismatch: X.shape[1]={X.shape[1]} != in_dim={in_dim}"
                                         )
-                                    val_samples_epoch += float(X.shape[0])
+
+                                    if Y.ndim < 1:
+                                        raise RuntimeError(
+                                            f"labels.ndim={Y.ndim} (expect >= 1). got shape={tuple(Y.shape)}"
+                                        )
+
                                     wait_s = (t_ready - t_fetch_start) / 1_000_000_000.0
                                     io_time += float(wait_s + h2d_s)
                                     with contextlib.suppress(Exception):
@@ -1810,6 +1815,7 @@ def epochs(
                                             X.element_size() * X.nelement()
                                             + Y.element_size() * Y.nelement()
                                         )
+
                                     if use_timer:
                                         ev_s, ev_e = (
                                             torch.Event(device=device, enable_timing=True),
@@ -1818,6 +1824,7 @@ def epochs(
                                         ev_s.record()
                                     else:
                                         t_comp_s = time.perf_counter_ns()
+
                                     with flop_counter_val.step(display=False) as val_counter:
                                         with contextlib.suppress(Exception):
                                             mark_step = getattr(
@@ -1883,81 +1890,82 @@ def epochs(
                                                     flop_breakdown_epoch.get(name, 0.0)
                                                     + float(value)
                                                 )
-                                if local_rank == 0:
-                                    io_elapsed = prev_io_time + float(io_time)
-                                    io_transferred = prev_io_bytes + float(io_bytes)
-                                    comp_elapsed = prev_comp_time + float(comp_time)
-                                    flop_total = prev_flops + float(flops)
-                                    mbps_cur = (
-                                        io_transferred
-                                        / max(io_elapsed, 1e-06)
-                                        / MB_DIV
-                                    )
-                                    tflops_cur = (
-                                        flop_total
-                                        / max(comp_elapsed, 1e-06)
-                                        / 1_000_000_000_000.0
-                                    )
-                                    update_tqdm(
-                                        status_bar,
-                                        finish=1,
-                                        mbps=mbps_cur,
-                                        tflops=tflops_cur,
-                                    )
-                                t_fetch_start = time.perf_counter_ns()
-                                if cpu_pool is not None and ((_vstep + 1) & 255) == 0:
-                                    with contextlib.suppress(Exception):
-                                        cpu_pool.collect()
 
-                                break
-
-                            except RuntimeError as e:
-                                msg = str(e).lower()
-                                if "out of memory" in msg:
-                                    _LOGGER.error(
-                                        "[epochs] OOM during validation step %d. "
-                                        "Trying to reduce microbatch and retry same batch.",
-                                        _vstep,
-                                    )
-                                    with contextlib.suppress(Exception):
-                                        if device.type == "cuda" and torch.cuda.is_available():
-                                            torch.cuda.empty_cache()
-                                        elif device.type == "xpu" and hasattr(torch, "xpu"):
-                                            empty_cache = getattr(torch.xpu, "empty_cache", None)
-                                            if callable(empty_cache):
-                                                empty_cache()
-
-                                    reduced_any = False
-
-                                    inst = _unwrap_for_microbatch(model)
-                                    if inst is not None:
-        
-                                        with contextlib.suppress(Exception):
-                                            cur_mb = int(getattr(inst, "microbatch", 0) or 0)
-                                        if cur_mb > 1:
-                                            new_mb = max(1, cur_mb // 2)
-                                            if new_mb < cur_mb:
-                                                with contextlib.suppress(Exception):
-                                                    inst.microbatch = new_mb
-                                                    inst._auto_microbatch_pending = False
-                                                _LOGGER.info(
-                                                    "[epochs] reduced Instance.microbatch from %d to %d after OOM in validation",
-                                                    cur_mb,
-                                                    new_mb,
-                                                )
-                                                reduced_any = True
-
-                                    if not reduced_any:
-                                        _LOGGER.error(
-                                            "[epochs] OOM in validation and no more knobs to reduce "
-                                            "(microbatch <= 1). Giving up on recovery."
+                                    if local_rank == 0:
+                                        io_elapsed = prev_io_time + float(io_time)
+                                        io_transferred = prev_io_bytes + float(io_bytes)
+                                        comp_elapsed = prev_comp_time + float(comp_time)
+                                        flop_total = prev_flops + float(flops)
+                                        mbps_cur = (
+                                            io_transferred
+                                            / max(io_elapsed, 1e-06)
+                                            / MB_DIV
                                         )
-                                        raise
+                                        tflops_cur = (
+                                            flop_total
+                                            / max(comp_elapsed, 1e-06)
+                                            / 1_000_000_000_000.0
+                                        )
+                                        update_tqdm(
+                                            status_bar,
+                                            finish=1,
+                                            mbps=mbps_cur,
+                                            tflops=tflops_cur,
+                                        )
 
-                                    continue
-                                raise
-                            finally:
-                                pool_handles.clear()
+                                    t_fetch_start = time.perf_counter_ns()
+                                    if cpu_pool is not None and ((_vstep + 1) & 255) == 0:
+                                        with contextlib.suppress(Exception):
+                                            cpu_pool.collect()
+
+                                    break
+
+                                except RuntimeError as e:
+                                    msg = str(e).lower()
+                                    if "out of memory" in msg:
+                                        _LOGGER.error(
+                                            "[epochs] OOM during validation step %d. "
+                                            "Trying to reduce microbatch and retry same batch.",
+                                            _vstep,
+                                        )
+                                        with contextlib.suppress(Exception):
+                                            if device.type == "cuda" and torch.cuda.is_available():
+                                                torch.cuda.empty_cache()
+                                            elif device.type == "xpu" and hasattr(torch, "xpu"):
+                                                empty_cache = getattr(torch.xpu, "empty_cache", None)
+                                                if callable(empty_cache):
+                                                    empty_cache()
+
+                                        reduced_any = False
+
+                                        inst = _unwrap_for_microbatch(model)
+                                        if inst is not None:
+                                            with contextlib.suppress(Exception):
+                                                cur_mb = int(getattr(inst, "microbatch", 0) or 0)
+                                            if cur_mb > 1:
+                                                new_mb = max(1, cur_mb // 2)
+                                                if new_mb < cur_mb:
+                                                    with contextlib.suppress(Exception):
+                                                        inst.microbatch = new_mb
+                                                        inst._auto_microbatch_pending = False
+                                                    _LOGGER.info(
+                                                        "[epochs] reduced Instance.microbatch from %d to %d after OOM in validation",
+                                                        cur_mb,
+                                                        new_mb,
+                                                    )
+                                                    reduced_any = True
+
+                                        if not reduced_any:
+                                            _LOGGER.error(
+                                                "[epochs] OOM in validation and no more knobs to reduce "
+                                                "(microbatch <= 1). Giving up on recovery."
+                                            )
+                                            raise
+
+                                        continue
+                                    raise
+                                finally:
+                                    pool_handles.clear()
             if is_distributed():
                 stats = torch.tensor(
                     [comp_time, io_time, flops, io_bytes, train_samples_epoch],

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+from dataclasses import dataclass
 from functools import partial
 from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple,
                     Union)
@@ -13,7 +14,6 @@ import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
 from ..backend.system import Memory, get_tlb, optimize_threads
-from .stats import BatchPolicy
 
 try:
     from torchdata.nodes import BaseNode
@@ -21,6 +21,36 @@ except Exception:
     from torchdata.nodes import BaseNode
 
 from .nodes import Connector, Dataset, Disposable, Loader, Sampler, SourceSpec
+
+
+@dataclass
+class BatchPolicy:
+    sample_bytes: int
+    host_sample_bytes: int
+    prefetch_factor: int = 1
+    num_workers: int = 0
+    prebatch: int = 1
+    num_streams: int = 1
+    max_concurrency: int = 1
+    min_batch: int = 1
+    max_batch: int = 1
+    device_margin: float = 0.90
+    host_margin: float = 0.10
+
+    def suggest_batch(
+        self, dev_free: Optional[int] = None, host_free: Optional[int] = None
+    ) -> int:
+        caps = []
+        if dev_free is not None and dev_free > 0 and self.sample_bytes > 0:
+            caps.append(int((dev_free * float(self.device_margin)) // max(1, self.sample_bytes)))
+        if host_free is not None and host_free > 0 and self.host_sample_bytes > 0:
+            caps.append(int((host_free * float(self.host_margin)) // max(1, self.host_sample_bytes)))
+        if not caps:
+            return 0
+        cap = max(1, min(caps))
+        cap = min(cap, int(self.max_batch))
+        cap = max(int(self.min_batch), cap)
+        return cap
 
 
 def _sync_device(device: torch.device) -> None:
