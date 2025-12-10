@@ -606,10 +606,6 @@ def to_ddp(
     module = module.to(device)
     if isinstance(module, DDP):
         return module
-
-    if not is_distributed():
-        return module
-
     device_ids = _get_device_id(device)
     ddp_kwargs = {
         "broadcast_buffers": True,
