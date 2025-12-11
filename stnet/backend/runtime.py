@@ -921,9 +921,9 @@ def epochs(
 
     cpu_pool: Optional[Memory.Pool] = None
     pool_capacity: int = 0
-    with contextlib.suppress(Exception):
-        Memory.prefer_local_numa()
     if device.type in {"cuda", "xpu"}:
+        with contextlib.suppress(Exception):
+            Memory.prefer_local_numa()
         try:
             cpu_pool = Memory.Pool(capacity=8)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
@@ -1318,7 +1318,6 @@ def epochs(
 
         with contextlib.suppress(Exception):
             get_tlb().pin_thread()
-            Memory.prefer_local_numa()
         from typing import Dict
 
         pool_handles: Dict[int, object] = {}
