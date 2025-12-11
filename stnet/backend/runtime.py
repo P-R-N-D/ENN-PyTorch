@@ -67,8 +67,7 @@ from .distributed import (distributed_barrier, distributed_sync,
                           to_ddp, to_fsdp)
 from .profiler import FlopCounter
 from .system import (Memory, get_device, get_tlb, initialize_python_path,
-                     is_float8_supported, new_dir, posix_time,
-                     set_float32_precision)
+                     new_dir, posix_time, set_float32_precision)
 
 if TYPE_CHECKING:
     import numpy as _np
@@ -2976,7 +2975,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         with contextlib.suppress(Exception):
             set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
-        fp8_ok, fp8_reason = is_float8_supported(device)
+        fp8_ok, fp8_reason = DataPolicy.is_float8_supported(device)
         fp8_enabled = False
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
@@ -3233,7 +3232,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
 
             os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
             os.environ.setdefault("STNET_MICROBATCH_STAGE_DIV", "4")
-            train_loader, val_loader, keep = fetch(
+            _dl = fetch(
                 sources=ops.sources,
                 device=device,
                 val_frac=float(ops.val_frac),
@@ -3241,6 +3240,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 flatten_features=True,
                 labels_dtype=param_dtype,
             )
+            train_loader = _dl.get("training_loader")
+            val_loader = _dl.get("validation_loader")
+            keep = _dl.get("disposable")
             if restore_dl_state:
                 with contextlib.suppress(Exception):
                     train_loader.load_state_dict(state_train)
@@ -3441,7 +3443,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             ),
         )
         Autocast.configure(model, metadata=metadata)
-        fp8_infer_ok, fp8_infer_reason = is_float8_supported(device)
+        fp8_infer_ok, fp8_infer_reason = DataPolicy.is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = Fusion.enable_float8_prediction(
                 model, metadata=metadata, logger=_float8_log
@@ -3462,12 +3464,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        data_loader, _, keep = fetch(
+        _dl = fetch(
             sources=ops.sources,
             device=device,
             val_frac=0.0,
             non_blocking_copy=True,
         )
+        data_loader = _dl.get("training_loader")
+        keep = _dl.get("disposable")
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):

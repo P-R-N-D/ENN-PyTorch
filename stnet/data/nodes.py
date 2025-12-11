@@ -656,27 +656,20 @@ class Connector:
         **kwargs: Any,
     ) -> None:
         self.map_fn = map_fn
-        try:
-            from ..backend.system import optimal_threads
+        from ..api.templates import WorkerPolicy
 
-            _t = optimal_threads()
-        except Exception:
-            _t = {
-                "num_workers": 1,
-                "max_concurrancy": 1,
-                "prebatch": 2,
-                "prefetch_factor": 1,
-            }
+        wp = WorkerPolicy.autotune()
+        wp.apply_torch_threads()
 
         self.io_workers = (
-            int(io_workers) if io_workers is not None else int(_t.get("num_workers", 1))
+            int(io_workers) if io_workers is not None else int(getattr(wp, "num_workers", 1))
         )
         self.io_workers = max(1, self.io_workers)
 
         self.prebatch = (
             int(prebatch)
             if prebatch is not None
-            else int(_t.get("prebatch", max(1, self.io_workers * 2)))
+            else int(getattr(wp, "prebatch", max(1, self.io_workers * 2)))
         )
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
@@ -684,7 +677,7 @@ class Connector:
         pf = (
             int(prefetch_factor)
             if prefetch_factor is not None
-            else int(_t.get("prefetch_factor", 1))
+            else int(getattr(wp, "prefetch_factor", 1))
         )
         with suppress(Exception):
             pf = max(1, int(pf))

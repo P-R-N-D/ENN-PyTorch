@@ -11,8 +11,8 @@ import torch._dynamo
 from torch import nn
 
 from ..backend.profiler import FLOP_PROFILER, capture
-from ..backend.system import (cuda_compute_capability, get_device,
-                              get_dpa_backends, get_runtime_config)
+from ..api.templates import DataPolicy
+from ..backend.system import get_device, get_dpa_backends, get_runtime_config
 
 try:
     import triton
