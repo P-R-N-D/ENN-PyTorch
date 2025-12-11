@@ -486,8 +486,8 @@ def _calibrate_per_sample_mem(
             out_dim *= int(d)
     except Exception:
         out_dim = 1
-    elem_size = torch.empty((), dtype=torch.float32).element_size()
-    floor_bytes = int((in_dim + out_dim) * elem_size * 256) if (in_dim + out_dim) > 0 else 0
+    elem_size = torch.empty((), dtype=torch.float64).element_size()
+    floor_bytes = int((in_dim + out_dim) * elem_size * 1024) if (in_dim + out_dim) > 0 else 0
 
     dev_type = getattr(device, "type", "")
     if dev_type not in {"cuda", "xpu", "mps"}:
