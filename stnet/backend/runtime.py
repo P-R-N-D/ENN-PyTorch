@@ -487,7 +487,7 @@ def _calibrate_per_sample_mem(
     except Exception:
         out_dim = 1
     elem_size = torch.empty((), dtype=torch.float32).element_size()
-    floor_bytes = int((in_dim + out_dim) * elem_size * 16) if (in_dim + out_dim) > 0 else 0
+    floor_bytes = int((in_dim + out_dim) * elem_size * 64) if (in_dim + out_dim) > 0 else 0
 
     dev_type = getattr(device, "type", "")
     if dev_type not in {"cuda", "xpu", "mps"}:
@@ -692,7 +692,7 @@ def _calibrate_per_sample_mem(
         per_sample = int(delta // max(B0, 1))
         if floor_bytes > 0:
             per_sample = max(per_sample, floor_bytes)
-        margin = 1.25 if with_backward else 1.20
+        margin = 1.5 if with_backward else 1.20
         per_sample = int(per_sample * float(margin))
         if per_sample <= 0:
             return
@@ -1220,8 +1220,8 @@ def epochs(
                 max_concurrency=1,
                 min_batch=1,
                 max_batch=max_grad_accum,
-                host_margin=0.75,
-                device_margin=0.80,
+                host_margin=0.8,
+                device_margin=0.8,
             )
         except Exception:
             tpl = None
