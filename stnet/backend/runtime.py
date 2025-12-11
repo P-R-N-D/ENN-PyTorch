@@ -469,6 +469,9 @@ def _calibrate_per_sample_mem(
     ops: RuntimeConfig,
     max_probe_batch: int = 32,
     with_backward: bool = False,
+    global_loss: Optional[nn.Module] = None,
+    local_loss: Optional[nn.Module] = None,
+    loss_weights: Optional[Any] = None,
 ) -> None:
     from ..data.nodes import Dataset
 
@@ -593,8 +596,7 @@ def _calibrate_per_sample_mem(
                     td = to_tensordict({"features": X})
                     if labels is not None:
                         Y = to_torch_tensor(labels)
-                        Y = torch.atleast_2d(Y)
-                        Y = Y.to(device=device, non_blocking=True)
+                        Y = torch.atleast_2d(Y).to(device=device, non_blocking=True)
                         Y_flat = Y.reshape(Y.shape[0], -1)
                         td["labels_flat"] = Y_flat
 
@@ -602,9 +604,9 @@ def _calibrate_per_sample_mem(
                     with Autocast.float(device):
                         out = model(
                             td,
-                            global_loss=None,
-                            local_loss=None,
-                            loss_weights=None,
+                            global_loss=global_loss,
+                            local_loss=local_loss,
+                            loss_weights=loss_weights,
                             calibrate_output=False,
                         )
 
@@ -3359,6 +3361,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     device=device,
                     ops=ops,
                     with_backward=True,
+                    global_loss=top_loss,
+                    local_loss=bottom_loss,
+                    loss_weights=loss_controller.weights(),
                 )
 
             os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
