@@ -998,8 +998,8 @@ def epochs(
             if host_mem is not None and host_mem > 0:
                 safe_host_bytes = int(host_mem)
                 total_samples_cap = tpl.suggest_batch(
-                    free_device_bytes=None,
-                    free_host_bytes=safe_host_bytes,
+                    dev_free=None,
+                    host_free=safe_host_bytes,
                 )
                 if total_samples_cap > 0:
                     max_from_mem = max(
