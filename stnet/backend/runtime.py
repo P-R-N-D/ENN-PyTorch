@@ -560,28 +560,42 @@ def _calibrate_per_sample_mem(
         if base_alloc is None or peak_api is None:
             return
 
+        # Pull a small probe batch.
         batch = ds.get(0, B0)
         forward_ran = False
+
         try:
-            feat, _label, *_rest = preprocess(batch)
-            feat = torch.as_tensor(feat)
-            if feat.ndim == 1:
-                feat = feat.unsqueeze(0)
-            feat = feat.to(device=device, non_blocking=True)
-            _ = model(feat)
-            forward_ran = True
-            with contextlib.suppress(Exception):
-                if dev_type == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize(device)
-                elif dev_type == "xpu" and hasattr(torch, "xpu"):
-                    sync = getattr(torch.xpu, "synchronize", None)
-                    if callable(sync):
-                        sync(device)
-                elif dev_type == "mps" and hasattr(torch, "mps"):
-                    sync = getattr(torch.mps, "synchronize", None)
-                    if callable(sync):
-                        sync()
+            # Try to run a lightweight forward pass so that activation
+            # allocations are reflected in the peak memory.
+            from ..data.transforms import preprocess
+            from ..data.io import to_torch_tensor, to_tensordict
+            from ..backend.system import Autocast
+            from ..backend.gradient import Gradient
+
+            feats, labels, *_rest = preprocess(batch)
+            X = to_torch_tensor(feats)
+            X = torch.atleast_2d(X)
+
+            # Basic sanity check against the model's expected input dimension.
+            if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
+                X = X.to(device=device, non_blocking=True)
+                td = to_tensordict({"features": X})
+
+                with Gradient.inference(model), Autocast.float(device):
+                    _ = model(
+                        td,
+                        global_loss=None,
+                        local_loss=None,
+                        loss_weights=None,
+                        calibrate_output=True,
+                    )
+                forward_ran = True
         except Exception:
+            forward_ran = False
+
+        if not forward_ran:
+            # Fallback: move the raw batch to device and "touch" tensors to
+            # force allocations, without relying on model-specific inputs.
             batch_dev = _to_device(batch, device)
 
             def _touch(obj: Any) -> None:
@@ -595,18 +609,19 @@ def _calibrate_per_sample_mem(
                         _touch(v)
 
             _touch(batch_dev)
-        if not forward_ran:
-            with contextlib.suppress(Exception):
-                if dev_type == "cuda" and torch.cuda.is_available():
-                    torch.cuda.synchronize(device)
-                elif dev_type == "xpu" and hasattr(torch, "xpu"):
-                    sync = getattr(torch.xpu, "synchronize", None)
-                    if callable(sync):
-                        sync(device)
-                elif dev_type == "mps" and hasattr(torch, "mps"):
-                    sync = getattr(torch.mps, "synchronize", None)
-                    if callable(sync):
-                        sync()
+
+        # Ensure all device work has completed before sampling the peak.
+        with contextlib.suppress(Exception):
+            if dev_type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device)
+            elif dev_type == "xpu" and hasattr(torch, "xpu"):
+                sync = getattr(torch.xpu, "synchronize", None)
+                if callable(sync):
+                    sync()
+            elif dev_type == "mps" and hasattr(torch, "mps"):
+                sync = getattr(torch.mps, "synchronize", None)
+                if callable(sync):
+                    sync()
 
         peak_alloc = peak_api(device)
         delta = max(0, int(peak_alloc) - int(base_alloc))
