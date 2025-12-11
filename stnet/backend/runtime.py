@@ -463,14 +463,28 @@ def _expand(sources: Any) -> Any:
     return sources
 
 
-@torch.no_grad()
 def _calibrate_per_sample_mem(
     model: Instance,
     device: torch.device,
     ops: RuntimeConfig,
     max_probe_batch: int = 32,
+    with_backward: bool = False,
 ) -> None:
     from ..data.nodes import Dataset
+
+    try:
+        in_dim = int(getattr(ops, "in_dim", 0) or 0)
+    except Exception:
+        in_dim = 0
+    try:
+        out_shape = tuple(getattr(ops, "out_shape", []) or [])
+        out_dim = 1
+        for d in out_shape:
+            out_dim *= int(d)
+    except Exception:
+        out_dim = 1
+    elem_size = torch.empty((), dtype=torch.float32).element_size()
+    floor_bytes = int((in_dim + out_dim) * elem_size * 16) if (in_dim + out_dim) > 0 else 0
 
     dev_type = getattr(device, "type", "")
     if dev_type not in {"cuda", "xpu", "mps"}:
@@ -559,11 +573,14 @@ def _calibrate_per_sample_mem(
         batch = ds.get(0, B0)
         forward_ran = False
 
+        training_mode = bool(model.training)
+
         try:
             from ..data.transforms import preprocess
             from ..data.io import to_torch_tensor, to_tensordict
-            from ..backend.system import Autocast
-            from ..backend.gradient import Gradient
+            from ..functional.fx import Autocast
+            from ..functional.fx import Gradient
+            from tensordict import TensorDictBase
 
             feats, labels, *_rest = preprocess(batch)
             X = to_torch_tensor(feats)
@@ -571,19 +588,72 @@ def _calibrate_per_sample_mem(
 
             if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
                 X = X.to(device=device, non_blocking=True)
-                td = to_tensordict({"features": X})
 
-                with Gradient.inference(model), Autocast.float(device):
-                    _ = model(
-                        td,
-                        global_loss=None,
-                        local_loss=None,
-                        loss_weights=None,
-                        calibrate_output=True,
-                    )
-                forward_ran = True
+                if with_backward:
+                    td = to_tensordict({"features": X})
+                    if labels is not None:
+                        Y = to_torch_tensor(labels)
+                        Y = torch.atleast_2d(Y)
+                        Y = Y.to(device=device, non_blocking=True)
+                        Y_flat = Y.reshape(Y.shape[0], -1)
+                        td["labels_flat"] = Y_flat
+
+                    model.train()
+                    with Autocast.float(device):
+                        out = model(
+                            td,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                            calibrate_output=False,
+                        )
+
+                    target: Optional[torch.Tensor] = None
+                    if isinstance(out, TensorDictBase):
+                        target = out.get("loss_total", None)
+                        if target is None:
+                            pred = out.get("pred", None)
+                            if isinstance(pred, torch.Tensor):
+                                target = pred
+                    elif isinstance(out, torch.Tensor):
+                        target = out
+                    elif isinstance(out, (list, tuple)) and len(out) > 0:
+                        for v in out:
+                            if isinstance(v, torch.Tensor):
+                                target = v
+                                break
+                    elif isinstance(out, dict):
+                        for v in out.values():
+                            if isinstance(v, torch.Tensor):
+                                target = v
+                                break
+
+                    if isinstance(target, torch.Tensor):
+                        loss = target
+                        if loss.ndim != 0:
+                            loss = loss.mean()
+                        loss.backward()
+                        forward_ran = True
+                else:
+                    td = to_tensordict({"features": X})
+                    with Gradient.inference(model), Autocast.float(device):
+                        _ = model(
+                            td,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                            calibrate_output=True,
+                        )
+                    forward_ran = True
         except Exception:
             forward_ran = False
+        finally:
+            if with_backward:
+                with contextlib.suppress(Exception):
+                    model.zero_grad(set_to_none=True)
+            if not training_mode:
+                with contextlib.suppress(Exception):
+                    model.eval()
 
         if not forward_ran:
             batch_dev = _to_device(batch, device)
@@ -618,9 +688,23 @@ def _calibrate_per_sample_mem(
             return
 
         per_sample = int(delta // max(B0, 1))
-        per_sample = int(per_sample * 1.20)
+        if floor_bytes > 0:
+            per_sample = max(per_sample, floor_bytes)
+        margin = 1.25 if with_backward else 1.20
+        per_sample = int(per_sample * float(margin))
         if per_sample <= 0:
             return
+        with contextlib.suppress(Exception):
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                t = torch.tensor(
+                    [int(per_sample)],
+                    device=device,
+                    dtype=torch.long,
+                )
+                torch.distributed.all_reduce(
+                    t, op=torch.distributed.ReduceOp.MAX
+                )
+                per_sample = int(t.item())
 
         try:
             Dataset._per_sample_mem_bytes = int(per_sample)
@@ -2932,102 +3016,6 @@ def _unwrap_for_microbatch(model: torch.nn.Module) -> Optional[torch.nn.Module]:
     return None
 
 
-def _estimate_per_sample_device_mem(
-    *,
-    model: torch.nn.Module,
-    device: torch.device,
-    in_dim: int,
-    out_shape: Sequence[int],
-    param_dtype: torch.dtype,
-    global_loss: Optional[torch.nn.Module] = None,
-    local_loss: Optional[torch.nn.Module] = None,
-    safety: float = 1.35,
-) -> Optional[int]:
-    if getattr(device, "type", None) != "cuda" or not torch.cuda.is_available():
-        return None
-
-    out_dim = int(math.prod(tuple(out_shape))) if out_shape else 1
-
-    def _probe(B: int) -> Optional[int]:
-        inst = _unwrap_for_microbatch(model)
-        saved_microbatch: Any = None
-        saved_pending: Any = None
-
-        try:
-            if inst is not None:
-                saved_microbatch = getattr(inst, "microbatch", None)
-                saved_pending = getattr(inst, "_auto_microbatch_pending", None)
-                inst.microbatch = max(1, int(B))
-                inst._auto_microbatch_pending = False
-
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats(device)
-
-            X = torch.randn((B, in_dim), device=device, dtype=param_dtype)
-            Y = torch.randn((B, out_dim), device=device, dtype=param_dtype)
-
-            with Autocast.float(device):
-                out = model(
-                    X,
-                    labels_flat=Y,
-                    global_loss=global_loss,
-                    local_loss=local_loss,
-                    loss_weights=(1.0, 1.0),
-                )
-                loss = None
-                if isinstance(out, tuple) and len(out) == 2:
-                    _, loss = out
-                if loss is None:
-                    pred = out[0] if isinstance(out, tuple) else out
-                    pred = pred.reshape(B, -1)
-                    loss = (pred - Y).pow(2).mean()
-                if loss.ndim != 0:
-                    loss = loss.mean()
-
-            loss.backward()
-            torch.cuda.synchronize(device)
-            peak = int(torch.cuda.max_memory_allocated(device))
-
-            del X, Y, out, loss
-            model.zero_grad(set_to_none=True)
-            torch.cuda.empty_cache()
-            return peak
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                with contextlib.suppress(Exception):
-                    torch.cuda.empty_cache()
-                return None
-            raise
-        finally:
-            if inst is not None:
-                with contextlib.suppress(Exception):
-                    if saved_microbatch is not None:
-                        inst.microbatch = saved_microbatch
-                    if saved_pending is not None:
-                        inst._auto_microbatch_pending = saved_pending
-
-    p1 = _probe(1)
-    if p1 is None:
-        return None
-    p2 = _probe(2)
-    p4 = _probe(4)
-
-    if p4 is not None:
-        slope = max(1, (p4 - p1) // 3)
-    elif p2 is not None:
-        slope = max(1, (p2 - p1))
-    else:
-        slope = max(1, p1)
-
-    elem = torch.empty((), dtype=param_dtype).element_size()
-    floor = int((in_dim + out_dim) * elem * 16)
-    per_sample = max(int(slope), floor)
-
-    per_sample = int(per_sample * float(safety))
-    return per_sample if per_sample > 0 else None
-
-
 def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
     from ..data.pipeline import fetch
 
@@ -3366,32 +3354,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 device_type = device_str.split(":", 1)[0]
             non_blocking_copy = device_type in accelerator_types
             with contextlib.suppress(Exception):
-                from ..data.nodes import Dataset
-
-                per_sample: Optional[int] = _estimate_per_sample_device_mem(
+                _calibrate_per_sample_mem(
                     model=model,
                     device=device,
-                    in_dim=int(ops.in_dim),
-                    out_shape=tuple(ops.out_shape),
-                    param_dtype=param_dtype,
-                    global_loss=top_loss,
-                    local_loss=bottom_loss,
+                    ops=ops,
+                    with_backward=True,
                 )
-                reduced = 0
-                if dist.is_available() and dist.is_initialized() and device.type == "cuda":
-                    t = torch.tensor(
-                        [int(per_sample) if isinstance(per_sample, int) and per_sample > 0 else 0],
-                        device=device,
-                        dtype=torch.long,
-                    )
-                    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-                    reduced = int(t.item())
-                elif isinstance(per_sample, int) and per_sample > 0:
-                    reduced = int(per_sample)
-
-                if reduced > 0:
-                    Dataset._per_sample_mem_bytes = int(reduced)
-                    os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(reduced))
 
             os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
             os.environ.setdefault("STNET_MICROBATCH_STAGE_DIV", "4")
@@ -3622,6 +3590,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 model=model,
                 device=device,
                 ops=ops,
+                with_backward=False,
             )
 
         expanded_sources = _expand(ops.sources)
