@@ -1220,8 +1220,8 @@ def epochs(
                 max_concurrency=1,
                 min_batch=1,
                 max_batch=max_grad_accum,
-                host_margin=0.70,
-                device_margin=0.90,
+                host_margin=0.75,
+                device_margin=0.80,
             )
         except Exception:
             tpl = None
