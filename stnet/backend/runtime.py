@@ -919,6 +919,16 @@ def epochs(
     with contextlib.suppress(Exception):
         set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
+    cpu_pool: Optional[Memory.Pool] = None
+    pool_capacity: int = 0
+    if device.type in {"cuda", "xpu"}:
+        try:
+            cpu_pool = Memory.Pool(capacity=8)
+            pool_capacity = int(getattr(cpu_pool, "capacity", 8))
+        except Exception:
+            cpu_pool = None
+            pool_capacity = 0
+
     per_batch = getattr(train_loader, "batch_size", None)
     est_bytes_per_sample: Optional[int] = None
 
@@ -970,8 +980,10 @@ def epochs(
             max_grad_accum = max(min_grad_accum, int(env_max))
 
     tpl: Optional[BatchPolicy] = None
-    if est_bytes_per_sample is not None:
+    if est_bytes_per_sample is not None and est_bytes_per_sample > 0 and max_grad_accum > 0:
         try:
+            effective_streams = 1 + max(0, pool_capacity)
+
             tpl = BatchPolicy(
                 sample_bytes=int(est_bytes_per_sample),
                 host_sample_bytes=int(est_bytes_per_sample),
@@ -980,7 +992,7 @@ def epochs(
                     os.environ.get("STNET_HOST_PREFETCH_FACTOR") or "4"
                 ),
                 num_workers=getattr(train_loader, "num_workers", 0),
-                num_streams=1,
+                num_streams=int(effective_streams),
                 max_concurrency=1,
                 min_batch=1,
                 max_batch=max_grad_accum,
@@ -1305,7 +1317,6 @@ def epochs(
         with contextlib.suppress(Exception):
             get_tlb().pin_thread()
             Memory.prefer_local_numa()
-        cpu_pool = Memory.Pool(capacity=8) if device.type in {"cuda", "xpu"} else None
         from typing import Dict
 
         pool_handles: Dict[int, object] = {}
