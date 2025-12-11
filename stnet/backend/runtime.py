@@ -560,13 +560,10 @@ def _calibrate_per_sample_mem(
         if base_alloc is None or peak_api is None:
             return
 
-        # Pull a small probe batch.
         batch = ds.get(0, B0)
         forward_ran = False
 
         try:
-            # Try to run a lightweight forward pass so that activation
-            # allocations are reflected in the peak memory.
             from ..data.transforms import preprocess
             from ..data.io import to_torch_tensor, to_tensordict
             from ..backend.system import Autocast
@@ -576,7 +573,6 @@ def _calibrate_per_sample_mem(
             X = to_torch_tensor(feats)
             X = torch.atleast_2d(X)
 
-            # Basic sanity check against the model's expected input dimension.
             if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
                 X = X.to(device=device, non_blocking=True)
                 td = to_tensordict({"features": X})
@@ -594,8 +590,6 @@ def _calibrate_per_sample_mem(
             forward_ran = False
 
         if not forward_ran:
-            # Fallback: move the raw batch to device and "touch" tensors to
-            # force allocations, without relying on model-specific inputs.
             batch_dev = _to_device(batch, device)
 
             def _touch(obj: Any) -> None:
@@ -610,7 +604,6 @@ def _calibrate_per_sample_mem(
 
             _touch(batch_dev)
 
-        # Ensure all device work has completed before sampling the peak.
         with contextlib.suppress(Exception):
             if dev_type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize(device)
