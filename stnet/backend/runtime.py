@@ -561,19 +561,52 @@ def _calibrate_per_sample_mem(
             return
 
         batch = ds.get(0, B0)
-        batch_dev = _to_device(batch, device)
+        forward_ran = False
+        try:
+            feat, _label, *_rest = preprocess(batch)
+            feat = torch.as_tensor(feat)
+            if feat.ndim == 1:
+                feat = feat.unsqueeze(0)
+            feat = feat.to(device=device, non_blocking=True)
+            _ = model(feat)
+            forward_ran = True
+            with contextlib.suppress(Exception):
+                if dev_type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                elif dev_type == "xpu" and hasattr(torch, "xpu"):
+                    sync = getattr(torch.xpu, "synchronize", None)
+                    if callable(sync):
+                        sync(device)
+                elif dev_type == "mps" and hasattr(torch, "mps"):
+                    sync = getattr(torch.mps, "synchronize", None)
+                    if callable(sync):
+                        sync()
+        except Exception:
+            batch_dev = _to_device(batch, device)
 
-        def _touch(obj: Any) -> None:
-            if isinstance(obj, torch.Tensor):
-                _ = obj.sum()
-            elif isinstance(obj, (list, tuple)):
-                for v in obj:
-                    _touch(v)
-            elif isinstance(obj, dict):
-                for v in obj.values():
-                    _touch(v)
+            def _touch(obj: Any) -> None:
+                if isinstance(obj, torch.Tensor):
+                    _ = obj.sum()
+                elif isinstance(obj, (list, tuple)):
+                    for v in obj:
+                        _touch(v)
+                elif isinstance(obj, dict):
+                    for v in obj.values():
+                        _touch(v)
 
-        _touch(batch_dev)
+            _touch(batch_dev)
+        if not forward_ran:
+            with contextlib.suppress(Exception):
+                if dev_type == "cuda" and torch.cuda.is_available():
+                    torch.cuda.synchronize(device)
+                elif dev_type == "xpu" and hasattr(torch, "xpu"):
+                    sync = getattr(torch.xpu, "synchronize", None)
+                    if callable(sync):
+                        sync(device)
+                elif dev_type == "mps" and hasattr(torch, "mps"):
+                    sync = getattr(torch.mps, "synchronize", None)
+                    if callable(sync):
+                        sync()
 
         peak_alloc = peak_api(device)
         delta = max(0, int(peak_alloc) - int(base_alloc))
