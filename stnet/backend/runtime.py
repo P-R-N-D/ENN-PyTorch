@@ -483,6 +483,7 @@ def _calibrate_per_sample_mem(
             split="train",
             val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0),
         )
+        
     except Exception:
         return
 
@@ -625,7 +626,7 @@ def _calibrate_per_sample_mem(
             Dataset._per_sample_mem_bytes = int(per_sample)
         except Exception:
             pass
-
+        print("[calibrate] per_sample =", per_sample, "B0 =", B0, "delta =", delta, flush=True)
         with contextlib.suppress(Exception):
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
 
