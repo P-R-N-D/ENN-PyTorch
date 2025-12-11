@@ -921,6 +921,8 @@ def epochs(
 
     cpu_pool: Optional[Memory.Pool] = None
     pool_capacity: int = 0
+    with contextlib.suppress(Exception):
+        Memory.prefer_local_numa()
     if device.type in {"cuda", "xpu"}:
         try:
             cpu_pool = Memory.Pool(capacity=8)
