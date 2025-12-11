@@ -468,6 +468,7 @@ def _calibrate_per_sample_mem(
     device: torch.device,
     ops: RuntimeConfig,
     max_probe_batch: int = 32,
+    with_backward: bool = False,
 ) -> None:
     from ..data.nodes import Dataset
 
@@ -572,11 +573,14 @@ def _calibrate_per_sample_mem(
         batch = ds.get(0, B0)
         forward_ran = False
 
+        training_mode = bool(model.training)
+
         try:
             from ..data.transforms import preprocess
             from ..data.io import to_torch_tensor, to_tensordict
-            from ..backend.system import Autocast
-            from ..backend.gradient import Gradient
+            from ..functional.fx import Autocast
+            from ..functional.fx import Gradient
+            from tensordict import TensorDictBase
 
             feats, labels, *_rest = preprocess(batch)
             X = to_torch_tensor(feats)
@@ -584,19 +588,73 @@ def _calibrate_per_sample_mem(
 
             if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
                 X = X.to(device=device, non_blocking=True)
-                td = to_tensordict({"features": X})
 
-                with Gradient.inference(model), Autocast.float(device):
-                    _ = model(
-                        td,
-                        global_loss=None,
-                        local_loss=None,
-                        loss_weights=None,
-                        calibrate_output=True,
-                    )
-                forward_ran = True
+                if with_backward:
+                    td = to_tensordict({"features": X})
+                    if labels is not None:
+                        Y = to_torch_tensor(labels)
+                        Y = torch.atleast_2d(Y)
+                        Y = Y.to(device=device, non_blocking=True)
+                        Y_flat = Y.reshape(Y.shape[0], -1)
+                        td["labels_flat"] = Y_flat
+
+                    model.train()
+                    with Autocast.float(device):
+                        out = model(
+                            td,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                            calibrate_output=False,
+                        )
+
+                    target: Optional[torch.Tensor] = None
+                    if isinstance(out, TensorDictBase):
+                        target = out.get("loss_total", None)
+                        if target is None:
+                            pred = out.get("pred", None)
+                            if isinstance(pred, torch.Tensor):
+                                target = pred
+                    elif isinstance(out, torch.Tensor):
+                        target = out
+                    elif isinstance(out, (list, tuple)) and len(out) > 0:
+                        for v in out:
+                            if isinstance(v, torch.Tensor):
+                                target = v
+                                break
+                    elif isinstance(out, dict):
+                        for v in out.values():
+                            if isinstance(v, torch.Tensor):
+                                target = v
+                                break
+
+                    if isinstance(target, torch.Tensor):
+                        loss = target
+                        if loss.ndim != 0:
+                            loss = loss.mean()
+                        loss.backward()
+                        forward_ran = True
+                else:
+                    td = to_tensordict({"features": X})
+                    with Gradient.inference(model), Autocast.float(device):
+                        _ = model(
+                            td,
+                            global_loss=None,
+                            local_loss=None,
+                            loss_weights=None,
+                            calibrate_output=True,
+                        )
+                    forward_ran = True
         except Exception:
             forward_ran = False
+        finally:
+            if with_backward:
+                with contextlib.suppress(Exception):
+                    model.zero_grad(set_to_none=True)
+            # 원래 train/eval 상태로 복구
+            if not training_mode:
+                with contextlib.suppress(Exception):
+                    model.eval()
 
         if not forward_ran:
             batch_dev = _to_device(batch, device)
@@ -633,7 +691,8 @@ def _calibrate_per_sample_mem(
         per_sample = int(delta // max(B0, 1))
         if floor_bytes > 0:
             per_sample = max(per_sample, floor_bytes)
-        per_sample = int(per_sample * 1.20)
+        margin = 1.25 if with_backward else 1.20
+        per_sample = int(per_sample * float(margin))
         if per_sample <= 0:
             return
         with contextlib.suppress(Exception):
@@ -653,236 +712,6 @@ def _calibrate_per_sample_mem(
         except Exception:
             pass
         print("[calibrate] per_sample =", per_sample, "B0 =", B0, "delta =", delta, flush=True)
-        with contextlib.suppress(Exception):
-            os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
-
-    except Exception:
-        return
-
-
-def _estimate_per_sample_train_mem(
-    model: Instance,
-    device: torch.device,
-    ops: RuntimeConfig,
-    max_probe_batch: int = 16,
-) -> None:
-    from ..data.nodes import Dataset
-
-    dev_type = getattr(device, "type", "")
-    if dev_type not in {"cuda", "xpu", "mps"}:
-        return
-
-    try:
-        in_dim = int(getattr(ops, "in_dim", 0) or 0)
-    except Exception:
-        in_dim = 0
-    try:
-        out_shape = tuple(getattr(ops, "out_shape", []) or [])
-        out_dim = 1
-        for d in out_shape:
-            out_dim *= int(d)
-    except Exception:
-        out_dim = 1
-    elem_size = torch.empty((), dtype=torch.float32).element_size()
-    floor_bytes = int((in_dim + out_dim) * elem_size * 24) if (in_dim + out_dim) > 0 else 0
-
-    try:
-        memmap_root = _first_source_path(ops.sources)
-        ds = Dataset(
-            memmap_root,
-            split="train",
-            val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0),
-        )
-    except Exception:
-        return
-
-    try:
-        N = int(len(ds))
-    except Exception:
-        N = 0
-    if N <= 0:
-        return
-
-    B0 = max(1, min(int(max_probe_batch), N))
-
-    def _to_device(obj: Any, dev: torch.device) -> Any:
-        if isinstance(obj, torch.Tensor):
-            return obj.to(device=dev, non_blocking=True)
-        from tensordict import TensorDictBase
-        from collections.abc import Mapping
-
-        if isinstance(obj, TensorDictBase):
-            return obj.to(device=dev)
-        if isinstance(obj, Mapping):
-            return {k: _to_device(v, dev) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            seq = [_to_device(v, dev) for v in obj]
-            return type(obj)(seq)
-        return obj
-
-    try:
-        base_alloc: Optional[int] = None
-        peak_api: Optional[Callable[[torch.device], int]] = None
-
-        accel = getattr(torch, "accelerator", None)
-        if accel is not None and hasattr(accel, "is_available") and accel.is_available():
-            mem_mod = getattr(accel, "memory", None)
-            with contextlib.suppress(Exception):
-                if mem_mod is not None:
-                    alloc_fn = getattr(mem_mod, "allocated", None)
-                    reset_fn = getattr(mem_mod, "reset_peak_memory_stats", None)
-                    peak_fn = getattr(mem_mod, "max_memory_allocated", None)
-                    if callable(alloc_fn) and callable(peak_fn):
-                        base_alloc = int(alloc_fn(device))
-                        if callable(reset_fn):
-                            reset_fn(device)
-                        peak_api = lambda d: int(peak_fn(d))
-
-        if base_alloc is None:
-            if dev_type == "cuda" and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    base_alloc = int(torch.cuda.memory_allocated(device))
-                    torch.cuda.reset_peak_memory_stats(device)
-                    peak_api = lambda d: int(torch.cuda.max_memory_allocated(d))
-            elif dev_type == "xpu" and hasattr(torch, "xpu"):
-                with contextlib.suppress(Exception):
-                    alloc = getattr(torch.xpu, "memory_allocated", None)
-                    reset = getattr(torch.xpu, "reset_peak_memory_stats", None)
-                    peak = getattr(torch.xpu, "max_memory_allocated", None)
-                    if callable(alloc) and callable(peak):
-                        base_alloc = int(alloc(device))
-                        if callable(reset):
-                            reset(device)
-                        peak_api = lambda d: int(peak(d))
-            elif dev_type == "mps" and hasattr(torch, "mps"):
-                with contextlib.suppress(Exception):
-                    mps = torch.mps
-                    alloc = getattr(mps, "current_allocated_memory", None)
-                    peak = getattr(mps, "max_memory_allocated", None)
-                    if callable(alloc) and callable(peak):
-                        base_alloc = int(alloc())
-                        peak_api = lambda d: int(peak())
-
-        if base_alloc is None or peak_api is None:
-            return
-
-        batch = ds.get(0, B0)
-        forward_ran = False
-        training_mode = bool(model.training)
-        model.train()
-
-        try:
-            from ..data.transforms import preprocess
-            from ..data.io import to_torch_tensor, to_tensordict
-            from ..backend.system import Autocast
-
-            feats, labels, *_rest = preprocess(batch)
-            X = to_torch_tensor(feats)
-            X = torch.atleast_2d(X)
-            if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
-                X = X.to(device=device, non_blocking=True)
-                td = to_tensordict({"features": X})
-                if labels is not None:
-                    y = to_torch_tensor(labels)
-                    td["labels"] = y.to(device=device, non_blocking=True)
-
-                with Autocast.float(device):
-                    out = model(
-                        td,
-                        global_loss=None,
-                        local_loss=None,
-                        loss_weights=None,
-                        calibrate_output=False,
-                    )
-
-                target: Optional[torch.Tensor] = None
-                if isinstance(out, torch.Tensor):
-                    target = out
-                elif isinstance(out, (list, tuple)) and len(out) > 0:
-                    if isinstance(out[0], torch.Tensor):
-                        target = out[0]
-                elif isinstance(out, dict):
-                    for v in out.values():
-                        if isinstance(v, torch.Tensor):
-                            target = v
-                            break
-
-                if isinstance(target, torch.Tensor) and target.requires_grad:
-                    loss = target.sum()
-                    loss.backward()
-                    forward_ran = True
-        except Exception:
-            forward_ran = False
-        finally:
-            with contextlib.suppress(Exception):
-                model.zero_grad(set_to_none=True)
-            if not training_mode:
-                model.eval()
-
-        if not forward_ran:
-            batch_dev = _to_device(batch, device)
-
-            def _touch(obj: Any) -> None:
-                if isinstance(obj, torch.Tensor):
-                    _ = obj.sum()
-                elif isinstance(obj, (list, tuple)):
-                    for v in obj:
-                        _touch(v)
-                elif isinstance(obj, dict):
-                    for v in obj.values():
-                        _touch(v)
-
-            _touch(batch_dev)
-
-        with contextlib.suppress(Exception):
-            if dev_type == "cuda" and torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            elif dev_type == "xpu" and hasattr(torch, "xpu"):
-                sync = getattr(torch.xpu, "synchronize", None)
-                if callable(sync):
-                    sync()
-            elif dev_type == "mps" and hasattr(torch, "mps"):
-                sync = getattr(torch.mps, "synchronize", None)
-                if callable(sync):
-                    sync()
-
-        peak_alloc = peak_api(device)
-        delta = max(0, int(peak_alloc) - int(base_alloc))
-        if delta <= 0:
-            return
-
-        per_sample = int(delta // max(B0, 1))
-        if floor_bytes > 0:
-            per_sample = max(per_sample, floor_bytes)
-        per_sample = int(per_sample * 1.25)
-        if per_sample <= 0:
-            return
-
-        with contextlib.suppress(Exception):
-            if torch.distributed.is_available() and torch.distributed.is_initialized():
-                t = torch.tensor(
-                    [int(per_sample)],
-                    device=device,
-                    dtype=torch.long,
-                )
-                torch.distributed.all_reduce(
-                    t, op=torch.distributed.ReduceOp.MAX
-                )
-                per_sample = int(t.item())
-
-        try:
-            Dataset._per_sample_mem_bytes = int(per_sample)
-        except Exception:
-            pass
-        print(
-            "[estimate] train per_sample =",
-            per_sample,
-            "B0 =",
-            B0,
-            "delta =",
-            delta,
-            flush=True,
-        )
         with contextlib.suppress(Exception):
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
 
@@ -3526,10 +3355,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 device_type = device_str.split(":", 1)[0]
             non_blocking_copy = device_type in accelerator_types
             with contextlib.suppress(Exception):
-                _estimate_per_sample_train_mem(
+                _calibrate_per_sample_mem(
                     model=model,
                     device=device,
                     ops=ops,
+                    with_backward=True,
                 )
 
             os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
