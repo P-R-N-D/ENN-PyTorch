@@ -476,11 +476,6 @@ def _calibrate_per_sample_mem(
     if dev_type not in {"cuda", "xpu", "mps"}:
         return
 
-    with contextlib.suppress(Exception):
-        v = getattr(Dataset, "_per_sample_mem_bytes", 0)
-        if isinstance(v, int) and v > 0:
-            return
-
     try:
         memmap_root = _first_source_path(ops.sources)
         ds = Dataset(
