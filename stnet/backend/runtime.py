@@ -999,20 +999,34 @@ def epochs(
                 min_batch=1,
                 max_batch=max_grad_accum,
                 host_margin=0.70,
-                device_margin=1.0,
+                device_margin=0.90,
             )
         except Exception:
             tpl = None
 
     safe_host_bytes: Optional[int] = None
+    safe_dev_bytes: Optional[int] = None
     max_from_mem: Optional[int] = None
     if tpl is not None:
         try:
             host_mem = Memory.available()
             if host_mem is not None and host_mem > 0:
                 safe_host_bytes = int(host_mem)
+
+            if device.type == "cuda" and torch.cuda.is_available():
+                with contextlib.suppress(Exception):
+                    free_dev, _total_dev = torch.cuda.mem_get_info(device=device)
+                    safe_dev_bytes = int(free_dev)
+            elif device.type == "xpu" and hasattr(torch, "xpu"):
+                with contextlib.suppress(Exception):
+                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                    if callable(mem_get_info):
+                        free_dev, _total_dev = mem_get_info(device)
+                        safe_dev_bytes = int(free_dev)
+
+            if safe_host_bytes is not None or safe_dev_bytes is not None:
                 total_samples_cap = tpl.suggest_batch(
-                    dev_free=None,
+                    dev_free=safe_dev_bytes,
                     host_free=safe_host_bytes,
                 )
                 if total_samples_cap > 0:
@@ -1021,6 +1035,7 @@ def epochs(
                     )
         except Exception:
             safe_host_bytes = None
+            safe_dev_bytes = None
 
     if max_from_mem is not None:
         max_grad_accum = max(

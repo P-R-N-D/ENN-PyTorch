@@ -1219,6 +1219,58 @@ class CrossTransformer(nn.Module):
         raise RuntimeError(f"Unhandled mode: {mode_l}")
 
 
+def _auto_microbatch(
+    device: torch.device,
+    hard_max: int,
+    per_sample_bytes: int,
+) -> int:
+    if hard_max <= 0 or per_sample_bytes <= 0:
+        return 1
+
+    dev_t = device.type
+    dev_free: Optional[int] = None
+    host_free: Optional[int] = None
+
+    from ..backend.system import Memory as _Mem
+    try:
+        host_free = int(_Mem.available())
+    except Exception:
+        host_free = None
+
+    if dev_t == "cuda" and torch.cuda.is_available():
+        try:
+            free, _ = torch.cuda.mem_get_info(device)
+            dev_free = int(free)
+        except Exception:
+            dev_free = None
+    elif dev_t == "xpu" and hasattr(torch, "xpu"):
+        try:
+            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+            if callable(mem_get_info):
+                free, _ = mem_get_info(device)
+                dev_free = int(free)
+        except Exception:
+            dev_free = None
+    elif dev_t == "mps":
+        dev_free = None
+
+    effective_free: Optional[int]
+    if dev_t in {"cuda", "xpu", "mps"}:
+        if host_free is not None and dev_free is not None:
+            effective_free = min(host_free, dev_free)
+        else:
+            effective_free = host_free if dev_free is None else dev_free
+    else:
+        effective_free = host_free
+
+    if effective_free is None or effective_free <= 0:
+        return hard_max
+
+    budget = int(effective_free * 0.35)
+    max_mb = max(1, int(budget // max(per_sample_bytes, 1)))
+    return max(1, min(hard_max, max_mb))
+
+
 @dataclass
 class Request:
     features: torch.Tensor
@@ -2478,7 +2530,6 @@ class Instance(nn.Module):
         return x
 
     def _auto_microbatch(self, features: torch.Tensor | TensorDictBase, device: torch.device) -> int:
-        dev_t = getattr(device, "type", "cpu")
         if isinstance(features, TensorDictBase):
             X = features.get("features")
         else:
@@ -2504,28 +2555,13 @@ class Instance(nn.Module):
             stage_div = max(1, int(os.environ.get("STNET_MICROBATCH_STAGE_DIV", stage_div)))
         per_sample = max(1, int(per_sample // stage_div))
 
-        free_bytes = None
-        match dev_t:
-            case "cuda":
-                with contextlib.suppress(Exception):
-                    free, _ = torch.cuda.mem_get_info(device)
-                    free_bytes = int(free)
-            case "xpu":
-                with contextlib.suppress(Exception):
-                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                    if callable(mem_get_info):
-                        free, _ = mem_get_info(device)
-                        free_bytes = int(free)
-            case "mps":
-                with contextlib.suppress(Exception):
-                    from ..backend.system import Memory
-                    free_bytes = int(Memory.available() * 0.25)
-        if not free_bytes or free_bytes <= 0:
-            return hard_max
-
-        budget = int(free_bytes * 0.35)
-        mb = max(1, min(hard_max, int(budget // per_sample)))
-        return int(mb)
+        # Decide microbatch size based on combined host + device free memory.
+        mb_size = _auto_microbatch(
+            device=device,
+            hard_max=hard_max,
+            per_sample_bytes=per_sample,
+        )
+        return int(mb_size)
 
     def forward(
         self,
