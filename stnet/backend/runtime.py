@@ -473,12 +473,21 @@ def _calibrate_per_sample_mem(
     from ..data.nodes import Dataset
 
     dev_type = getattr(device, "type", "")
-    if dev_type != "cuda":
+    if dev_type not in {"cuda", "xpu", "mps"}:
         return
+
+    with contextlib.suppress(Exception):
+        v = getattr(Dataset, "_per_sample_mem_bytes", 0)
+        if isinstance(v, int) and v > 0:
+            return
 
     try:
         memmap_root = _first_source_path(ops.sources)
-        ds = Dataset(memmap_root, split="train", val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0))
+        ds = Dataset(
+            memmap_root,
+            split="train",
+            val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0),
+        )
     except Exception:
         return
 
@@ -490,52 +499,102 @@ def _calibrate_per_sample_mem(
         return
 
     B0 = max(1, min(int(max_probe_batch), N))
+
+    def _to_device(obj: Any, dev: torch.device) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return obj.to(device=dev, non_blocking=True)
+        from tensordict import TensorDictBase
+        from collections.abc import Mapping
+        if isinstance(obj, TensorDictBase):
+            return obj.to(device=dev)
+        if isinstance(obj, Mapping):
+            return {k: _to_device(v, dev) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            seq = [_to_device(v, dev) for v in obj]
+            return type(obj)(seq)
+        return obj
+
     try:
+        base_alloc: Optional[int] = None
+        peak_api: Optional[Callable[[torch.device], int]] = None
+
+        accel = getattr(torch, "accelerator", None)
+        if accel is not None and hasattr(accel, "is_available") and accel.is_available():
+            mem_mod = getattr(accel, "memory", None)
+            with contextlib.suppress(Exception):
+                if mem_mod is not None:
+                    alloc_fn = getattr(mem_mod, "allocated", None)
+                    reset_fn = getattr(mem_mod, "reset_peak_memory_stats", None)
+                    peak_fn = getattr(mem_mod, "max_memory_allocated", None)
+                    if callable(alloc_fn) and callable(peak_fn):
+                        base_alloc = int(alloc_fn(device))
+                        if callable(reset_fn):
+                            reset_fn(device)
+                        peak_api = lambda d: int(peak_fn(d))
+
+        if base_alloc is None:
+            if dev_type == "cuda" and torch.cuda.is_available():
+                with contextlib.suppress(Exception):
+                    base_alloc = int(torch.cuda.memory_allocated(device))
+                    torch.cuda.reset_peak_memory_stats(device)
+                    peak_api = lambda d: int(torch.cuda.max_memory_allocated(d))
+            elif dev_type == "xpu" and hasattr(torch, "xpu"):
+                with contextlib.suppress(Exception):
+                    alloc = getattr(torch.xpu, "memory_allocated", None)
+                    reset = getattr(torch.xpu, "reset_peak_memory_stats", None)
+                    peak = getattr(torch.xpu, "max_memory_allocated", None)
+                    if callable(alloc) and callable(peak):
+                        base_alloc = int(alloc(device))
+                        if callable(reset):
+                            reset(device)
+                        peak_api = lambda d: int(peak(d))
+            elif dev_type == "mps" and hasattr(torch, "mps"):
+                with contextlib.suppress(Exception):
+                    mps = torch.mps
+                    alloc = getattr(mps, "current_allocated_memory", None)
+                    peak = getattr(mps, "max_memory_allocated", None)
+                    if callable(alloc) and callable(peak):
+                        base_alloc = int(alloc())
+                        peak_api = lambda d: int(peak())
+
+        if base_alloc is None or peak_api is None:
+            return
+
         batch = ds.get(0, B0)
+        batch_dev = _to_device(batch, device)
+
+        def _touch(obj: Any) -> None:
+            if isinstance(obj, torch.Tensor):
+                _ = obj.sum()
+            elif isinstance(obj, (list, tuple)):
+                for v in obj:
+                    _touch(v)
+            elif isinstance(obj, dict):
+                for v in obj.values():
+                    _touch(v)
+
+        _touch(batch_dev)
+
+        peak_alloc = peak_api(device)
+        delta = max(0, int(peak_alloc) - int(base_alloc))
+        if delta <= 0:
+            return
+
+        per_sample = int(delta // max(B0, 1))
+        per_sample = int(per_sample * 1.20)
+        if per_sample <= 0:
+            return
+
+        try:
+            Dataset._per_sample_mem_bytes = int(per_sample)
+        except Exception:
+            pass
+
+        with contextlib.suppress(Exception):
+            os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
+
     except Exception:
         return
-
-    try:
-        feats, labels, keys, label_shape = preprocess(batch)
-    except Exception:
-        return
-
-    X = to_torch_tensor(feats)
-    X = torch.atleast_2d(X)
-    if X.dim() != 2 or X.shape[1] != int(ops.in_dim):
-        return
-
-    X = X.to(device, non_blocking=True)
-
-    try:
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats(device)
-    except Exception:
-        pass
-
-    with Gradient.inference(model), Autocast.float(device):
-        td = to_tensordict({"features": X})
-        _ = model(
-            td,
-            global_loss=None,
-            local_loss=None,
-            loss_weights=None,
-            calibrate_output=True,
-        )
-    try:
-        torch.cuda.synchronize(device)
-        peak_bytes = int(torch.cuda.max_memory_allocated(device))
-    except Exception:
-        return
-
-    if peak_bytes <= 0:
-        return
-
-    per_sample = max(1, peak_bytes // B0)
-    try:
-        Dataset._per_sample_mem_bytes = int(per_sample)
-    except Exception:
-        pass
 
 
 def _coerce_dtensor(
