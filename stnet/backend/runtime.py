@@ -10,6 +10,7 @@ import platform
 import sys
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
 from typing import (TYPE_CHECKING, Any, Dict, Iterable, Iterator, List,
@@ -940,28 +941,67 @@ def epochs(
             est_bytes_per_sample = int(v)
 
     if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
+        def _accumulate_sample_bytes(obj: Any) -> Tuple[Optional[int], int]:
+
+            batch_dim: Optional[int] = None
+            bytes_per_sample = 0
+
+            def handle_tensor(t: torch.Tensor) -> None:
+                nonlocal batch_dim, bytes_per_sample
+                if not isinstance(t, torch.Tensor) or t.numel() <= 0:
+                    return
+                # infer batch dimension
+                b = int(t.shape[0]) if t.ndim >= 1 else 1
+                if batch_dim is None:
+                    batch_dim = b
+
+                if t.ndim >= 1 and b > 0:
+                    one = t[:1]
+                else:
+                    one = t.reshape(1, -1)
+                bytes_per_sample += int(one.nelement()) * int(one.element_size())
+
+            def walk(o: Any) -> None:
+                if isinstance(o, torch.Tensor):
+                    handle_tensor(o)
+                elif isinstance(o, TensorDictBase):
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, Mapping):
+
+                    for v in o.values():
+                        walk(v)
+                elif isinstance(o, (list, tuple)):
+                    for v in o:
+                        walk(v)
+
+
+            walk(obj)
+
+            # If we didn't see any tensors, signal failure.
+            if bytes_per_sample <= 0:
+                return None, 0
+            return batch_dim, bytes_per_sample
+
         try:
-            sample = next(iter(train_loader))
-            if isinstance(sample, (list, tuple)) and sample:
-                feats = sample[0]
-            elif isinstance(sample, dict) and sample:
-                feats = next(iter(sample.values()))
-            else:
-                feats = sample
+            it = iter(train_loader)
+            sample = next(it)
+
+            bs, bytes_ps = _accumulate_sample_bytes(sample)
+
+            # Infer per_batch if still unknown
+            if (per_batch is None or int(per_batch) <= 0) and bs is not None and bs > 0:
+                per_batch = int(bs)
+
+
+            if est_bytes_per_sample is None and bytes_ps > 0:
+                est_bytes_per_sample = int(bytes_ps)
+        except StopIteration:
 
             if per_batch is None or int(per_batch) <= 0:
-                with contextlib.suppress(Exception):
-                    per_batch = int(getattr(feats, "shape", [len(feats)])[0])
-
-            if est_bytes_per_sample is None:
-                with contextlib.suppress(Exception):
-                    if isinstance(feats, torch.Tensor):
-                        if feats.ndim >= 1 and int(feats.shape[0]) > 0:
-                            one = feats[:1]
-                        else:
-                            one = feats.reshape(1, -1)
-                        est_bytes_per_sample = int(one.nelement()) * int(one.element_size())
+                per_batch = 1
         except Exception:
+
             if per_batch is None or int(per_batch) <= 0:
                 per_batch = 1
 
