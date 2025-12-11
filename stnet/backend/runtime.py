@@ -651,7 +651,6 @@ def _calibrate_per_sample_mem(
             if with_backward:
                 with contextlib.suppress(Exception):
                     model.zero_grad(set_to_none=True)
-            # 원래 train/eval 상태로 복구
             if not training_mode:
                 with contextlib.suppress(Exception):
                     model.eval()
@@ -3591,6 +3590,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 model=model,
                 device=device,
                 ops=ops,
+                with_backward=False,
             )
 
         expanded_sources = _expand(ops.sources)
