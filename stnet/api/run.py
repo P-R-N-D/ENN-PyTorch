@@ -28,9 +28,9 @@ except ImportError:
 from ..backend.distributed import (get_available_host, get_preferred_ip,
                                    initialize_master_addr)
 from ..backend.runtime import _trim_dcp_keys, main
-from ..backend.system import (initialize_python_path, new_dir, optimal_procs,
-                              optimal_start_method, optimize_threads,
-                              set_multiprocessing_env)
+from ..backend.system import (initialize_python_path, new_dir,
+                              optimal_start_method, set_multiprocessing_env)
+from .templates import WorkerPolicy
 from ..data.nodes import preload_memmap
 from ..data.transforms import preprocess
 from ..model.layers import History, Instance
@@ -511,8 +511,10 @@ def train(
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
         master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
-        optimize_threads()
-        nprocs = optimal_procs()["nproc_per_node"]
+        # Keep local world-size & threads consistent with WorkerPolicy used by loaders.
+        _wp = WorkerPolicy.autotune()
+        _wp.apply_torch_threads()
+        nprocs = int(_wp.nproc_per_node)
         cfg_obj = getattr(model, "_Instance__config", None)
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
@@ -1076,8 +1078,9 @@ def predict(
     default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
     rdzv_endpoint = get_available_host(default_rdzv_host)
     master_addr, _ = initialize_master_addr(rdzv_endpoint)
-    optimize_threads()
-    nprocs = int(optimal_procs()["nproc_per_node"])
+    _wp = WorkerPolicy.autotune()
+    _wp.apply_torch_threads()
+    nprocs = int(_wp.nproc_per_node)
     resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
     resolved_rdzv_backend = rdzv_backend or "c10d"
     lc = LaunchConfig(

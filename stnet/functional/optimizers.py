@@ -11,9 +11,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
-from ..backend.system import (get_device, is_float8_supported,
-                              is_int4_supported, is_int8_supported,
-                              optimal_optimizer_params)
+from ..backend.system import get_device, optimal_optimizer_params
 from ..api.templates import DataPolicy
 from .fx import Autocast, Fusion, is_scale_safe
 
@@ -215,7 +213,7 @@ class AdamW:
                         logger(
                             "[OPT] FP8 optimizers disabled: data scale exceeds float8 range"
                         )
-            ok, reason = is_float8_supported(dev)
+            ok, reason = DataPolicy.is_float8_supported(dev)
             if fp8_allowed and ok:
                 if "TE" in str(reason):
                     try:
@@ -296,9 +294,9 @@ class AdamW:
                     Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]
                 ] = []
                 if max_abs <= 7.0:
-                    candidates.append(("int4", is_int4_supported))
+                    candidates.append(("int4", DataPolicy.is_int4_supported))
                 if max_abs <= 127.0:
-                    candidates.append(("int8", is_int8_supported))
+                    candidates.append(("int8", DataPolicy.is_int8_supported))
                 if not candidates:
                     if logger:
                         logger(

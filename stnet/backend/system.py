@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import importlib
+from dataclasses import replace
 import itertools
 import multiprocessing
 import os
@@ -378,26 +379,15 @@ def get_dpa_backends() -> List[object]:
 
 
 def is_cpu_bf16_supported() -> bool:
-    try:
-        mkldnn_ops = getattr(torch.ops, "mkldnn", None)
-        if mkldnn_ops is not None and hasattr(mkldnn_ops, "_is_mkldnn_bf16_supported"):
-            return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
-    except Exception:
-        pass
-    return False
+    from ..api.templates import DataPolicy
+
+    return DataPolicy.is_cpu_bf16_supported()
 
 
 def is_cuda_bf16_supported() -> bool:
-    try:
-        if not torch.cuda.is_available():
-            return False
-        f = getattr(torch.cuda, "is_bf16_supported", None)
-        if callable(f):
-            return bool(f())
-        major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
-        return major >= 8
-    except Exception:
-        return False
+    from ..api.templates import DataPolicy
+
+    return DataPolicy.is_cuda_bf16_supported()
 
 
 def get_device(
@@ -487,78 +477,39 @@ def optimal_optimizer_params(
 
 
 def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return (0, 0)
-    try:
-        major, minor = torch.cuda.get_device_capability(device)
-    except Exception:
-        return (0, 0)
-    return (int(major), int(minor))
+    from ..api.templates import DataPolicy
+
+    return DataPolicy.cuda_compute_capability(device)
 
 
 def is_float8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    dev = torch.device(device) if device is not None else get_device()
-    if dev.type != "cuda" or not torch.cuda.is_available():
-        return (False, f"FP8 requires CUDA (found {dev.type})")
-    major, minor = cuda_compute_capability(dev)
-    if major <= 0:
-        return (False, "Unable to query CUDA compute capability")
-    if major < 9:
-        return (False, f"FP8 requires sm_90+ (found sm_{major}{minor})")
-    try:
-        import transformer_engine.pytorch as te
+    from ..api.templates import DataPolicy
 
-        backend = getattr(te, "__name__", "transformer_engine.pytorch")
-        return (True, backend)
-    except Exception:
-        return (False, "transformer_engine not found")
+    return DataPolicy.is_float8_supported(device)
 
 
 def is_int8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    dev = torch.device(device) if device is not None else get_device()
-    if dev.type != "cuda" or not torch.cuda.is_available():
-        return (False, f"INT8 requires CUDA (found {dev.type})")
-    major, minor = cuda_compute_capability(dev)
-    if major <= 0:
-        return (False, "Unable to query CUDA compute capability")
-    if major < 7:
-        return (False, f"INT8 requires sm_70+ (found sm_{major}{minor})")
-    try:
-        importlib.import_module("torchao.quantization")
-        return (True, "torchao.quantization")
-    except Exception:
-        return (True, f"sm_{major}{minor}")
+    from ..api.templates import DataPolicy
+
+    return DataPolicy.is_int8_supported(device)
 
 
 def is_int4_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
+    from ..api.templates import DataPolicy
 
-    dev = torch.device(device) if device is not None else get_device()
-    if dev.type != "cuda" or not torch.cuda.is_available():
-        return (False, f"INT4 requires CUDA (found {dev.type})")
-    major, minor = cuda_compute_capability(dev)
-    if major <= 0:
-        return (False, "Unable to query CUDA compute capability")
-    if major < 8:
-        return (False, f"INT4 requires sm_80+ (found sm_{major}{minor})")
-    try:
-        importlib.import_module("torchao.optim")
-        return (True, "torchao.optim")
-    except Exception:
-        with contextlib.suppress(Exception):
-            importlib.import_module("torchao.prototype.low_bit_optim")
-            return (True, f"sm_{major}{minor}")
-    return (False, "torchao low-bit optimizers unavailable")
+    return DataPolicy.is_int4_supported(device)
 
 
 def optimal_procs() -> Dict[str, Union[int, str]]:
-    n_gpu = _num_cuda_devices()
-    return {"nproc_per_node": n_gpu or 1, "device": "cuda" if n_gpu else "cpu"}
+    from ..api.templates import WorkerPolicy
+
+    return WorkerPolicy.autotune().as_procs_dict()
 
 
 def cpu_count() -> int:
@@ -616,108 +567,17 @@ def num_accelerators() -> int:
 
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
-    ncpu = cpu_count()
+    from ..api.templates import WorkerPolicy
 
-    try:
-        import torch
-        is_accelerated = False
-        accel = getattr(torch, "accelerator", None)
-        if accel is not None and hasattr(accel, "is_available"):
-            is_accelerated = bool(accel.is_available())
-        else:
-            if torch.cuda.is_available():
-                is_accelerated = True
-            else:
-                xpu = getattr(torch, "xpu", None)
-                if (
-                    xpu is not None
-                    and callable(getattr(xpu, "is_available", None))
-                    and xpu.is_available()
-                ):
-                    is_accelerated = True
-                mps = getattr(getattr(torch, "backends", None), "mps", None)
-                if (
-                    mps is not None
-                    and callable(getattr(mps, "is_available", None))
-                    and mps.is_available()
-                ):
-                    is_accelerated = True
-    except Exception:
-        is_accelerated = False
-
-    if ncpu <= 2:
-        inter_ops = 1
-        intra_ops = max(1, ncpu - inter_ops)
-        num_workers = max(1, ncpu)
-    elif 2 < ncpu <= 8:
-        inter_ops = max(1, ncpu // 4)
-        intra_ops = max(1, ncpu - inter_ops)
-        num_workers = max(2, min(8, ncpu // 2))
-    else:
-        inter_ops = max(2, min(8, ncpu // 6))
-        intra_ops = max(1, ncpu - inter_ops)
-        num_workers = max(4, min(16, ncpu // 2))
-
-    max_concurrancy = int(max(1, num_workers))
-
-    prebatch = 1
-    prefetch_factor = 1
-
-    if is_accelerated:
-        prebatch = 4
-        prefetch_factor = 2
-
-    try:
-        env_prebatch = os.environ.get("STNET_PREBATCH")
-        if env_prebatch is not None and str(env_prebatch).strip():
-            prebatch = max(1, int(env_prebatch))
-    except Exception:
-        pass
-
-    try:
-        env_prefetch = os.environ.get("STNET_PREFETCH_FACTOR")
-        if env_prefetch is not None and str(env_prefetch).strip():
-            prefetch_factor = max(1, int(env_prefetch))
-    except Exception:
-        pass
-
-    max_total_ahead = 8 if is_accelerated else 4
-    total_ahead = prebatch * prefetch_factor
-    if total_ahead > max_total_ahead:
-        scale = max_total_ahead / float(total_ahead)
-        new_prefetch = max(1, int(prefetch_factor * scale))
-        prefetch_factor = new_prefetch
-        total_ahead = prebatch * prefetch_factor
-        if total_ahead > max_total_ahead:
-            prebatch = max(1, int(max_total_ahead // max(1, prefetch_factor)))
-
-    return {
-        "intra_ops": int(max(1, intra_ops)),
-        "inter_ops": int(max(1, inter_ops)),
-        "num_workers": int(max(1, num_workers)),
-        "max_concurrancy": int(max(1, max_concurrancy)),
-        "prebatch": int(max(1, prebatch)),
-        "prefetch_factor": int(max(1, prefetch_factor)),
-    }
+    return WorkerPolicy.autotune().as_threads_dict()
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
+    from ..api.templates import WorkerPolicy
 
-    threads = optimal_threads()
-    try:
-        import torch
-
-        torch.set_num_threads(int(threads["intra_ops"]))
-    except Exception:
-        pass
-    try:
-        import torch
-
-        if hasattr(torch, "set_num_interop_threads"):
-            torch.set_num_interop_threads(int(threads["inter_ops"]))
-    except Exception:
-        pass
-    return threads
+    wp = WorkerPolicy.autotune()
+    wp.apply_torch_threads()
+    return wp.as_threads_dict()
 
 
 class Thread:
@@ -986,16 +846,14 @@ class Thread:
     def optimize_threads(
         intra: Optional[int] = None, inter: Optional[int] = None
     ) -> None:
+        from ..api.templates import WorkerPolicy
+
+        wp = WorkerPolicy.autotune()
         if intra is not None:
-            try:
-                torch.set_num_threads(max(1, int(intra)))
-            except Exception:
-                pass
-        if inter is not None and hasattr(torch, "set_num_interop_threads"):
-            try:
-                torch.set_num_interop_threads(max(1, int(inter)))
-            except Exception:
-                pass
+            wp = replace(wp, intra_ops=int(intra))
+        if inter is not None:
+            wp = replace(wp, inter_ops=int(inter))
+        wp.apply_torch_threads()
 
     def tune_threads(
         self,

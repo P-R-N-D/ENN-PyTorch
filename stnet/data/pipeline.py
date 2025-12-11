@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import random
-from dataclasses import dataclass
 from functools import partial
 from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple,
                     Union)
@@ -13,7 +12,8 @@ TensorLike = Any
 import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
-from ..backend.system import Memory, get_tlb, optimize_threads
+from ..backend.system import Memory, get_tlb
+from ..api.templates import BatchPolicy, WorkerPolicy
 
 try:
     from torchdata.nodes import BaseNode
@@ -21,36 +21,6 @@ except Exception:
     from torchdata.nodes import BaseNode
 
 from .nodes import Connector, Dataset, Disposable, Loader, Sampler, SourceSpec
-
-
-@dataclass
-class BatchPolicy:
-    sample_bytes: int
-    host_sample_bytes: int
-    prefetch_factor: int = 1
-    num_workers: int = 0
-    prebatch: int = 1
-    num_streams: int = 1
-    max_concurrency: int = 1
-    min_batch: int = 1
-    max_batch: int = 1
-    device_margin: float = 0.90
-    host_margin: float = 0.10
-
-    def suggest_batch(
-        self, dev_free: Optional[int] = None, host_free: Optional[int] = None
-    ) -> int:
-        caps = []
-        if dev_free is not None and dev_free > 0 and self.sample_bytes > 0:
-            caps.append(int((dev_free * float(self.device_margin)) // max(1, self.sample_bytes)))
-        if host_free is not None and host_free > 0 and self.host_sample_bytes > 0:
-            caps.append(int((host_free * float(self.host_margin)) // max(1, self.host_sample_bytes)))
-        if not caps:
-            return 0
-        cap = max(1, min(caps))
-        cap = min(cap, int(self.max_batch))
-        cap = max(int(self.min_batch), cap)
-        return cap
 
 
 def _sync_device(device: torch.device) -> None:
@@ -193,6 +163,7 @@ def _batch_interval(
     prefetch_factor: int = 2,
     num_workers: int = 0,
     prebatch: int = 1,
+    worker_policy: Optional[WorkerPolicy] = None,
 ) -> Tuple[int, float]:
     if len(_ds) <= 0:
         return (1, 0.0)
@@ -223,14 +194,30 @@ def _batch_interval(
     if per_sample <= 0:
         per_sample = sbytes
 
+    if worker_policy is not None:
+        _wp = worker_policy
+        _max_conc = max(1, int(getattr(_wp, "max_concurrency", 1)))
+        _streams = max(1, int(getattr(_wp, "h2d_streams", 1)))
+        _lws = max(1, int(getattr(_wp, "local_world_size", 1)))
+    else:
+        try:
+            _wp = WorkerPolicy.autotune()
+            _max_conc = max(1, int(getattr(_wp, "max_concurrency", 1)))
+            _streams = max(1, int(getattr(_wp, "h2d_streams", 1)))
+            _lws = max(1, int(getattr(_wp, "local_world_size", 1)))
+        except Exception:
+            _wp = None
+            _max_conc, _streams, _lws = (1, 1, 1)
+
     tpl = BatchPolicy(
         sample_bytes=per_sample,
         host_sample_bytes=sbytes,
         prefetch_factor=max(int(prefetch_factor or 1), 1),
         num_workers=max(int(num_workers or 0), 0),
         prebatch=max(int(prebatch or 1), 1),
-        num_streams=1,
-        max_concurrency=1,
+        num_streams=_streams,
+        max_concurrency=_max_conc,
+        local_world_size=_lws,
         min_batch=1,
         max_batch=B_cap,
         device_margin=0.90,
@@ -271,7 +258,11 @@ def _batch_interval(
     except Exception:
         host_free = None
 
-    cap_from_mem = tpl.suggest_batch(dev_free, host_free)
+    cap_from_mem = tpl.suggest_batch(
+        dev_free=dev_free,
+        host_free=host_free,
+        local_world_size=_lws,
+    )
     if cap_from_mem > 0:
         B_cap = min(B_cap, cap_from_mem)
 
@@ -480,14 +471,15 @@ def fetch(
     flatten_features: bool = True,
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
-) -> Tuple[Any, Optional[Any], Disposable]:
+) -> Dict[str, Any]:
     device_obj = (
         torch.device(device) if not isinstance(device, torch.device) else device
     )
-    hints = optimize_threads()
-    io_workers = max(1, int(hints.get("num_workers", 1)))
-    prebatch = max(1, int(hints.get("prebatch", max(1, io_workers * 2))))
-    pf_depth = max(1, int(hints.get("prefetch_factor", 1)))
+    _wp = WorkerPolicy.autotune()
+    _wp.apply_torch_threads()
+    io_workers = int(_wp.num_workers)
+    prebatch = int(_wp.prebatch)
+    pf_depth = int(_wp.prefetch_factor)
 
     map_fn = partial(
         collate,
@@ -507,6 +499,7 @@ def fetch(
                 prefetch_factor=pf_depth,
                 num_workers=io_workers,
                 prebatch=prebatch,
+                worker_policy=_wp,
             )
         except Exception:
             return (int(batch_size) if batch_size is not None else 0, 0.0)
@@ -1030,5 +1023,9 @@ def fetch(
                 length=len(ds),
             )
 
-    return train_loader, val_loader, allocated
+    return {
+        "training_loader": train_loader,
+        "validation_loader": val_loader,
+        "disposable": allocated,
+    }
 

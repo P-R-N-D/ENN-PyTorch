@@ -13,13 +13,7 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..backend.system import (
-    get_device,
-    is_cpu_bf16_supported,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int8_supported,
-)
+from ..backend.system import get_device
 from ..api.templates import DataPolicy
 
 patch_torch()
@@ -372,7 +366,7 @@ class Autocast:
             order = ("te", "ao")
         for backend in order:
             if backend == "te":
-                ok, reason = is_float8_supported(dev)
+                ok, reason = DataPolicy.is_float8_supported(dev)
                 if not ok:
                     _LOGGER.debug("Autocast FP8 TE unavailable: %s", reason)
                     continue
@@ -418,7 +412,7 @@ class Autocast:
             order = ("te", "ao")
         for backend in order:
             if backend == "te":
-                ok, reason = is_int8_supported(dev)
+                ok, reason = DataPolicy.is_int8_supported(dev)
                 if not ok:
                     _LOGGER.debug("Autocast INT8 TE unavailable: %s", reason)
                     continue
@@ -1145,13 +1139,13 @@ class Fusion:
         candidates: List[torch.dtype] = []
         if dev.type == "cuda":
             try:
-                if is_cuda_bf16_supported(dev):
+                if DataPolicy.is_cuda_bf16_supported(dev):
                     candidates.append(torch.bfloat16)
             except Exception:
                 pass
             candidates.extend((torch.float16, torch.float32))
         elif dev.type == "cpu":
-            if is_cpu_bf16_supported():
+            if DataPolicy.is_cpu_bf16_supported():
                 candidates.append(torch.bfloat16)
             candidates.extend((torch.float32, torch.float64))
         elif dev.type == "xpu":
@@ -1376,7 +1370,7 @@ class Fusion:
         except Exception:
             return (model, False, "transformer_engine not installed")
         te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
-        fp8_ok, why = is_float8_supported(dev)
+        fp8_ok, why = DataPolicy.is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
         params_dtype = Fusion.negotiate(dev, metadata=metadata)
@@ -1523,7 +1517,7 @@ class Fusion:
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
-        ok, reason = is_float8_supported(device)
+        ok, reason = DataPolicy.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
@@ -1563,7 +1557,7 @@ class Fusion:
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
-        ok, reason = is_float8_supported(device)
+        ok, reason = DataPolicy.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)

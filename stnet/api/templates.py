@@ -2,17 +2,172 @@
 from __future__ import annotations
 
 import math
+import os
+import contextlib
+import importlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, Generic, MutableMapping, Optional, Tuple, TypeVar, Union
 
 import torch
-
-from ..backend.system import cuda_compute_capability
 
 TExtra = TypeVar("TExtra")
 
 _BOOTSTRAP_DEPTH = 0
+@dataclass(slots=True)
+class WorkerPolicy:
+    nproc_per_node: int = 1
+    device: str = "cpu"
+    local_world_size: int = 1
+
+    intra_ops: int = 1
+    inter_ops: int = 1
+
+    num_workers: int = 1
+    prebatch: int = 1
+    prefetch_factor: int = 2
+    max_concurrency: int = 1
+    h2d_streams: int = 1
+
+    @staticmethod
+    def _cpu_count() -> int:
+        try:
+            return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        except Exception:
+            return os.cpu_count() or 1
+
+    @staticmethod
+    def _detect_accelerator() -> Tuple[str, int]:
+        dev_type = "cpu"
+        n = 0
+
+        try:
+            accel = getattr(torch, "accelerator", None)
+            if accel is not None and hasattr(accel, "is_available") and accel.is_available():
+                current = getattr(accel, "current_accelerator", None)
+                if callable(current):
+                    dev = current(False)
+                    if isinstance(dev, torch.device):
+                        dev_type = dev.type
+                dc = getattr(accel, "device_count", None)
+                if callable(dc):
+                    n = int(dc())
+        except Exception:
+            dev_type, n = "cpu", 0
+
+        try:
+            if n <= 0:
+                if torch.cuda.is_available():
+                    dev_type = "cuda"
+                    n = int(torch.cuda.device_count())
+                else:
+                    xpu = getattr(torch, "xpu", None)
+                    if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+                        dev_type = "xpu"
+                        n = int(getattr(xpu, "device_count", lambda: 1)())
+                    else:
+                        mps_backend = getattr(torch.backends, "mps", None)
+                        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
+                            dev_type = "mps"
+                            n = 1
+        except Exception:
+            pass
+
+        if n <= 0:
+            dev_type, n = "cpu", 0
+        return dev_type, max(0, n)
+
+    @classmethod
+    def autotune(cls) -> "WorkerPolicy":
+        ncpu = cls._cpu_count()
+        dev_type, nacc = cls._detect_accelerator()
+        is_accel = nacc > 0
+
+        if ncpu <= 2:
+            inter_ops = 1
+            intra_ops = max(1, ncpu - inter_ops)
+            num_workers = max(1, ncpu)
+        elif 2 < ncpu <= 8:
+            inter_ops = max(1, ncpu // 4)
+            intra_ops = max(1, ncpu - inter_ops)
+            num_workers = max(2, min(8, ncpu // 2))
+        else:
+            inter_ops = max(2, min(8, ncpu // 6))
+            intra_ops = max(1, ncpu - inter_ops)
+            num_workers = max(4, min(16, ncpu // 2))
+
+        max_concurrency = max(1, num_workers)
+
+        if is_accel:
+            prebatch = 4
+            prefetch_factor = 2
+        else:
+            prebatch = 1
+            prefetch_factor = 1
+
+        env_pre = os.environ.get("STNET_PREBATCH")
+        if env_pre:
+            try:
+                prebatch = max(1, int(env_pre))
+            except Exception:
+                pass
+        env_pf = os.environ.get("STNET_PREFETCH_FACTOR")
+        if env_pf:
+            try:
+                prefetch_factor = max(1, int(env_pf))
+            except Exception:
+                pass
+
+        max_total_ahead = 8 if is_accel else 4
+        total = prebatch * prefetch_factor
+        if total > max_total_ahead:
+            scale = max_total_ahead / float(total)
+            prefetch_factor = max(1, int(prefetch_factor * scale))
+            total = prebatch * prefetch_factor
+            if total > max_total_ahead:
+                prebatch = max(1, int(max_total_ahead // max(1, prefetch_factor)))
+
+        local_world = max(1, nacc or 1) if is_accel else 1
+
+        return cls(
+            nproc_per_node=local_world,
+            device=dev_type,
+            local_world_size=local_world,
+            intra_ops=int(intra_ops),
+            inter_ops=int(inter_ops),
+            num_workers=int(num_workers),
+            prebatch=int(prebatch),
+            prefetch_factor=int(prefetch_factor),
+            max_concurrency=int(max_concurrency),
+            h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
+        )
+
+    def as_threads_dict(self) -> Dict[str, int]:
+        return {
+            "intra_ops": int(self.intra_ops),
+            "inter_ops": int(self.inter_ops),
+            "num_workers": int(self.num_workers),
+            "max_concurrancy": int(self.max_concurrency),
+            "prebatch": int(self.prebatch),
+            "prefetch_factor": int(self.prefetch_factor),
+        }
+
+    def as_procs_dict(self) -> Dict[str, Union[int, str]]:
+        return {
+            "nproc_per_node": int(self.nproc_per_node),
+            "device": str(self.device),
+        }
+
+    def apply_torch_threads(self) -> None:
+        try:
+            torch.set_num_threads(max(1, int(self.intra_ops)))
+        except Exception:
+            pass
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(max(1, int(self.inter_ops)))
+            except Exception:
+                pass
 
 
 @dataclass
@@ -36,17 +191,114 @@ class DataPolicy(Generic[TExtra]):
         dev = torch.device(self.device)
         self.device = dev
         self.device_type = dev.type
-        if dev.type == "cuda":
-            try:
-                major, minor = cuda_compute_capability(dev)
-            except Exception:
-                major, minor = (0, 0)
+        if dev.type == "cuda" and torch.cuda.is_available():
+            major, minor = self.cuda_compute_capability(dev)
             if major > 0 or minor > 0:
                 self.cuda_cc = (int(major), int(minor))
             else:
                 self.cuda_cc = None
         else:
             self.cuda_cc = None
+
+    @staticmethod
+    def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]:
+        dev = torch.device(device)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return (0, 0)
+        try:
+            major, minor = torch.cuda.get_device_capability(dev)
+        except Exception:
+            return (0, 0)
+        return (int(major), int(minor))
+
+    @staticmethod
+    def is_cpu_bf16_supported() -> bool:
+        try:
+            mkldnn_ops = getattr(torch.ops, "mkldnn", None)
+            if mkldnn_ops is not None and hasattr(mkldnn_ops, "_is_mkldnn_bf16_supported"):
+                return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def is_cuda_bf16_supported() -> bool:
+        try:
+            if not torch.cuda.is_available():
+                return False
+            f = getattr(torch.cuda, "is_bf16_supported", None)
+            if callable(f):
+                return bool(f())
+            major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
+            return major >= 8
+        except Exception:
+            return False
+
+    @staticmethod
+    def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
+        if device is not None:
+            return torch.device(device)
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        return torch.device("cpu")
+
+    @classmethod
+    def is_float8_supported(
+        cls, device: Optional[Union[torch.device, str]] = None
+    ) -> Tuple[bool, str]:
+        dev = cls._resolve_device(device)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return (False, f"FP8 requires CUDA (found {dev.type})")
+        major, minor = cls.cuda_compute_capability(dev)
+        if major <= 0:
+            return (False, "Unable to query CUDA compute capability")
+        if major < 9:
+            return (False, f"FP8 requires sm_90+ (found sm_{major}{minor})")
+        try:
+            import transformer_engine.pytorch as te  # type: ignore
+            backend = getattr(te, "__name__", "transformer_engine.pytorch")
+            return (True, backend)
+        except Exception:
+            return (False, "transformer_engine.pytorch not found")
+
+    @classmethod
+    def is_int8_supported(
+        cls, device: Optional[Union[torch.device, str]] = None
+    ) -> Tuple[bool, str]:
+        dev = cls._resolve_device(device)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return (False, f"INT8 requires CUDA (found {dev.type})")
+        major, minor = cls.cuda_compute_capability(dev)
+        if major <= 0:
+            return (False, "Unable to query CUDA compute capability")
+        if major < 7:
+            return (False, f"INT8 requires sm_70+ (found sm_{major}{minor})")
+        try:
+            importlib.import_module("torchao.quantization")
+            return (True, "torchao.quantization")
+        except Exception:
+            return (True, f"sm_{major}{minor}")
+
+    @classmethod
+    def is_int4_supported(
+        cls, device: Optional[Union[torch.device, str]] = None
+    ) -> Tuple[bool, str]:
+        dev = cls._resolve_device(device)
+        if dev.type != "cuda" or not torch.cuda.is_available():
+            return (False, f"INT4 requires CUDA (found {dev.type})")
+        major, minor = cls.cuda_compute_capability(dev)
+        if major <= 0:
+            return (False, "Unable to query CUDA compute capability")
+        if major < 8:
+            return (False, f"INT4 requires sm_80+ (found sm_{major}{minor})")
+        try:
+            importlib.import_module("torchao.optim")
+            return (True, "torchao.optim")
+        except Exception:
+            with contextlib.suppress(Exception):
+                importlib.import_module("torchao.prototype.low_bit_optim")
+                return (True, f"sm_{major}{minor}")
+        return (False, "torchao low-bit optimizers unavailable")
 
     @property
     def cuda_cc_str(self) -> Optional[str]:
@@ -266,6 +518,7 @@ class BatchPolicy:
     num_workers: int = 0
     num_streams: int = 1
     max_concurrency: int = 1
+    local_world_size: int = 1
 
     min_batch: int = 1
     max_batch: Optional[int] = None
@@ -291,71 +544,45 @@ class BatchPolicy:
         self.device_margin = float(self.device_margin)
         self.host_margin = float(self.host_margin)
 
-    @property
-    def host_concurrency(self) -> int:
-        w = max(self.num_workers, 1)
-        pf = max(self.prefetch_factor, 1)
-        pre = max(self.prebatch, 1)
-        return max(w * pf * pre, 1)
-
-    @property
-    def device_concurrency(self) -> int:
-        mc = max(self.max_concurrency, 1)
-        ns = max(self.num_streams, 1)
-        pre = max(self.prebatch, 1)
-        return max(mc * ns * pre, 1)
-
-    @staticmethod
-    def _cap_from_bytes(
-        free_bytes: int,
-        per_sample_bytes: int,
-        margin: float,
-        concurrency: int,
-    ) -> int:
-        if free_bytes <= 0 or per_sample_bytes <= 0:
-            return 0
-        safe = int(max(0, float(free_bytes)) * float(margin))
-        if safe <= 0:
-            return 0
-        per = max(per_sample_bytes, 1) * max(concurrency, 1)
-        if per <= 0:
-            return 0
-        return max(int(safe // per), 0)
-
-    def cap_from_device(self, free_device_bytes: Optional[int]) -> int:
-        if free_device_bytes is None:
-            return 0
-        return self._cap_from_bytes(
-            int(free_device_bytes),
-            int(self.sample_bytes),
-            self.device_margin,
-            self.device_concurrency,
-        )
-
-    def cap_from_host(self, free_host_bytes: Optional[int]) -> int:
-        if free_host_bytes is None:
-            return 0
-        host_bytes = int(self.host_sample_bytes or 0)
-        return self._cap_from_bytes(
-            int(free_host_bytes),
-            host_bytes,
-            self.host_margin,
-            self.host_concurrency,
+    def host_inflight_batches_per_proc(self) -> int:
+        return (
+            max(1, self.max_concurrency) * max(1, self.prebatch)
+            + max(1, self.prefetch_factor)
+            + max(1, self.num_streams)
+            + 1
         )
 
     def suggest_batch(
         self,
-        free_device_bytes: Optional[int],
-        free_host_bytes: Optional[int] = None,
+        *,
+        dev_free: Optional[int] = None,
+        host_free: Optional[int] = None,
+        local_world_size: Optional[int] = None,
     ) -> int:
-        candidates = []
-        dev_cap = self.cap_from_device(free_device_bytes)
-        if dev_cap:
-            candidates.append(dev_cap)
-        host_cap = self.cap_from_host(free_host_bytes)
-        if host_cap:
-            candidates.append(host_cap)
+        lw = int(local_world_size) if local_world_size is not None else int(self.local_world_size or 1)
+        if lw <= 0:
+            lw = 1
 
+        dev_cap: Optional[int] = None
+        if dev_free is not None and dev_free > 0 and self.sample_bytes > 0:
+            dev_cap = int(
+                (float(dev_free) * float(self.device_margin))
+                // max(1, int(self.sample_bytes))
+            )
+
+        host_cap: Optional[int] = None
+        if host_free is not None and host_free > 0 and (self.host_sample_bytes or 0) > 0:
+            inflight = self.host_inflight_batches_per_proc()
+            denom = (
+                max(1, int(self.host_sample_bytes or 0))
+                * max(1, inflight)
+                * max(1, lw)
+            )
+            host_cap = int(
+                (float(host_free) * float(self.host_margin)) // denom
+            )
+
+        candidates = [c for c in (dev_cap, host_cap) if isinstance(c, int) and c > 0]
         if not candidates:
             b = self.max_batch if self.max_batch is not None else self.min_batch
         else:
@@ -363,7 +590,7 @@ class BatchPolicy:
             if self.max_batch is not None:
                 b = min(b, int(self.max_batch))
 
-        b = max(int(b), self.min_batch)
-        return max(b, 1)
+        b = max(int(b), int(self.min_batch))
+        return max(1, b)
 
 
