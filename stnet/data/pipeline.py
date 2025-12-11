@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import random
+import contextlib
 from functools import partial
 from typing import (Any, Callable, Dict, Mapping, Optional, Sequence, Tuple,
                     Union)
@@ -49,37 +50,44 @@ def _sample_size(
 
 
 def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Sequence[int]:
+    if _sample_bytes <= 0 or _N <= 0:
+        return [1]
+
     capB = 1024
     dev_t = getattr(_device, "type", "cpu")
-    match dev_t:
-        case 'cuda':
-            try:
-                if not torch.cuda.is_available():
-                    raise RuntimeError("CUDA not available")
-                free, _ = torch.cuda.mem_get_info(device=_device)
-                if _sample_bytes > 0:
-                    capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
-            except Exception:
-                pass
-        case 'xpu':
-            try:
-                props = getattr(torch.xpu, "get_device_properties", None)
-                mem_alloc = getattr(torch.xpu, "memory_allocated", None)
-                if callable(props) and callable(mem_alloc):
-                    total = int(props(_device).total_memory)
-                    used = int(mem_alloc(_device))
-                    free = max(0, total - used)
-                    if _sample_bytes > 0:
-                        capB = max(1, int((free * 0.90) // max(1, _sample_bytes * 4)))
-            except Exception:
-                pass
-        case 'mps':
-            try:
-                free_host = int(Memory.available())
-                if _sample_bytes > 0:
-                    capB = max(1, int((free_host * 0.25) // max(1, _sample_bytes * 4)))
-            except Exception:
-                pass
+
+    host_free: Optional[int] = None
+    with contextlib.suppress(Exception):
+        host_free = int(Memory.available())
+
+    dev_free: Optional[int] = None
+    if dev_t == "cuda" and torch.cuda.is_available():
+        with contextlib.suppress(Exception):
+            free, _ = torch.cuda.mem_get_info(device=_device)
+            dev_free = int(free)
+    elif dev_t == "xpu" and hasattr(torch, "xpu"):
+        with contextlib.suppress(Exception):
+            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+            if callable(mem_get_info):
+                free, _ = mem_get_info(_device)
+                dev_free = int(free)
+    elif dev_t == "mps":
+        dev_free = None
+
+    effective_free: Optional[int]
+    if dev_t in {"cuda", "xpu", "mps"}:
+        if host_free is not None and dev_free is not None:
+            effective_free = min(host_free, dev_free)
+        else:
+            effective_free = host_free if dev_free is None else dev_free
+    else:
+        effective_free = host_free
+
+    if effective_free is not None and effective_free > 0:
+        capB = max(
+            1,
+            int((effective_free * 0.80) // max(_sample_bytes * 4, 1)),
+        )
     capB = max(1, min(capB, int(_N)))
     base = [
         capB // 8,
@@ -516,19 +524,40 @@ def fetch(
         cand_max = max(_auto_bs_candidates)
         return int(max(1, min(cand_max, cand_mean)))
 
-    def _cap_pf_depth(_datasets: Mapping[str, Dataset], _pf: int, _bs: int) -> int:
+    def _cap_pf_depth(
+        _device_obj: torch.device, _datasets: Mapping[str, Dataset], _pf: int, _bs: int
+    ) -> int:
         try:
             host_avail = int(Memory.available())
             if host_avail <= 0:
                 return int(_pf)
-            budget = int(host_avail * 0.15)
+
+            dev_free: Optional[int] = None
+            dev_t = getattr(_device_obj, "type", "cpu")
+            if dev_t == "cuda" and torch.cuda.is_available():
+                with contextlib.suppress(Exception):
+                    free_dev, _ = torch.cuda.mem_get_info(device=_device_obj)
+                    dev_free = int(free_dev)
+            elif dev_t == "xpu" and hasattr(torch, "xpu"):
+                with contextlib.suppress(Exception):
+                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                    if callable(mem_get_info):
+                        free_dev, _ = mem_get_info(_device_obj)
+                        dev_free = int(free_dev)
+
+            if dev_free is not None:
+                effective_avail = min(host_avail, dev_free)
+            else:
+                effective_avail = host_avail
+
+            budget = int(effective_avail * 0.15)
             if budget <= 0 or _bs <= 0:
                 return int(_pf)
             sbytes_max = 0
-            for _ds in _datasets.values():
+            for _k, _ds in _datasets.items():
                 if len(_ds) <= 0:
                     continue
-                probe = _ds.get(0, min(1, len(_ds)))
+                probe = _ds.get(0, min(8, len(_ds)))
                 x = probe.get("X")
                 y = probe.get("Y") if isinstance(probe, Mapping) else None
                 if x is None:
@@ -578,7 +607,7 @@ def fetch(
                     elif _m < 1.00:
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
-                pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
                 if int(pf_depth) != int(pf_depth_before):
                     batch_size = _rescale_batch(datasets, int(batch_size))
             else:
@@ -663,7 +692,7 @@ def fetch(
                     elif _m < 1.00:
                         pf_depth = max(pf_depth, 3)
                 pf_depth = int(max(2, min(8, pf_depth)))
-                pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
                 if int(pf_depth) != int(pf_depth_before):
                     batch_size = _rescale_batch(datasets, int(batch_size))
             else:
@@ -812,7 +841,7 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
-                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
                     if int(pf_depth) != int(pf_depth_before):
                         batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_nodes: Dict[str, BaseNode] = {}
@@ -902,7 +931,7 @@ def fetch(
                         elif _m < 1.00:
                             pf_depth = max(pf_depth, 3)
                     pf_depth = int(max(2, min(8, pf_depth)))
-                    pf_depth = _cap_pf_depth(datasets, pf_depth, batch_size)
+                    pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
                     if int(pf_depth) != int(pf_depth_before):
                         batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_list: list[BaseNode] = []
