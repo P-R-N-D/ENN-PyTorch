@@ -59,7 +59,7 @@ def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = Tru
     return batch
 
 
-class Dataset(_Sampler):
+class Sampler(_Sampler):
     
     _scale: float = 1.0
     _per_sample_mem_bytes: int = 0
@@ -72,7 +72,7 @@ class Dataset(_Sampler):
             return default
 
     @classmethod
-    def _load_meta(cls: type["Dataset"], memmap_dir: str) -> Mapping[str, Any]:
+    def _load_meta(cls: type["Sampler"], memmap_dir: str) -> Mapping[str, Any]:
         meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
         if not os.path.isfile(meta_path):
             raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
@@ -83,11 +83,11 @@ class Dataset(_Sampler):
         return meta
 
     @classmethod
-    def request_scale_up(cls: type["Dataset"], factor: float) -> None:
+    def request_scale_up(cls: type["Sampler"], factor: float) -> None:
         cls._scale = min(2.0, cls._scale * float(factor))
 
     @classmethod
-    def request_scale_down(cls: type["Dataset"], factor: float) -> None:
+    def request_scale_down(cls: type["Sampler"], factor: float) -> None:
         cls._scale = max(0.5, cls._scale * float(factor))
 
     def __init__(
@@ -541,11 +541,11 @@ def preload_memmap(
         json.dump(meta, handle)
 
 
-SourceKind = Literal["memmap"]
+SourceType = Literal["memmap"]
 
 
-class SourceSpec(TypedDict):
-    kind: SourceKind
+class Source(TypedDict):
+    format: SourceType
     path: str
 
 
@@ -601,7 +601,7 @@ class Disposable:
         return iter(self._keep)
 
 
-class Sampler:
+class Wrapper:
     def __init__(
         self,
         *args: Any,

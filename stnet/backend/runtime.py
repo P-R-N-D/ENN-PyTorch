@@ -52,7 +52,7 @@ except Exception:
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..api.templates import DataPolicy
+from ..api.templates import Dataset
 from ..data.transforms import preprocess, batch_to_device
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
@@ -476,7 +476,7 @@ def _calibrate_per_sample_mem(
     local_loss: Optional[nn.Module] = None,
     loss_weights: Optional[Any] = None,
 ) -> None:
-    from ..data.nodes import Dataset
+    from ..data.nodes import Sampler
 
     try:
         in_dim = int(getattr(ops, "in_dim", 0) or 0)
@@ -498,7 +498,7 @@ def _calibrate_per_sample_mem(
 
     try:
         memmap_root = _first_source_path(ops.sources)
-        ds = Dataset(
+        ds = Sampler(
             memmap_root,
             split="train",
             val_frac=float(getattr(ops, "val_frac", 0.0) or 0.0),
@@ -712,7 +712,7 @@ def _calibrate_per_sample_mem(
                 per_sample = int(t.item())
 
         try:
-            Dataset._per_sample_mem_bytes = int(per_sample)
+            Sampler._per_sample_mem_bytes = int(per_sample)
         except Exception:
             pass
         print("[calibrate] per_sample =", per_sample, "B0 =", B0, "delta =", delta, flush=True)
@@ -1094,7 +1094,7 @@ def epochs(
     buffers_dtype: Optional[torch.dtype] = None,
     **kwargs: Any,
 ) -> None:
-    from ..data.nodes import Dataset
+    from ..data.nodes import Sampler
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
@@ -1121,7 +1121,7 @@ def epochs(
     est_bytes_per_sample: Optional[int] = None
 
     with contextlib.suppress(Exception):
-        v = getattr(Dataset, "_per_sample_mem_bytes", 0)
+        v = getattr(Sampler, "_per_sample_mem_bytes", 0)
         if isinstance(v, int) and v > 0:
             est_bytes_per_sample = int(v)
 
@@ -2561,9 +2561,9 @@ def epochs(
             util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
             util_for_cap = max(0.0, min(1.0, util_for_cap))
             if mem_util_frac is not None and mem_util_frac > 0.92:
-                Dataset.request_scale_down(0.95)
+                Sampler.request_scale_down(0.95)
             elif util_for_cap < 0.90 and (mem_util_frac is None or mem_util_frac < 0.88):
-                Dataset.request_scale_up(1.10)
+                Sampler.request_scale_up(1.10)
         else:
             cpu_pct = _cpu_percent_now()
             if cpu_pct is not None:
@@ -3242,7 +3242,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 )
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
-        metadata = DataPolicy.for_device(device)
+        metadata = Dataset.for_device(device)
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
@@ -3291,7 +3291,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         with contextlib.suppress(Exception):
             set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
-        fp8_ok, fp8_reason = DataPolicy.is_float8_supported(device)
+        fp8_ok, fp8_reason = Dataset.is_float8_supported(device)
         fp8_enabled = False
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
@@ -3722,7 +3722,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
-        metadata = DataPolicy.for_device(device)
+        metadata = Dataset.for_device(device)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
@@ -3742,7 +3742,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             ),
         )
         Autocast.configure(model, metadata=metadata)
-        fp8_infer_ok, fp8_infer_reason = DataPolicy.is_float8_supported(device)
+        fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = Fusion.enable_float8_prediction(
                 model, metadata=metadata, logger=_float8_log

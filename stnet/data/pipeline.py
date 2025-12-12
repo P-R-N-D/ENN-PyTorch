@@ -23,7 +23,7 @@ try:
 except Exception:
     from torchdata.nodes import BaseNode
 
-from .nodes import Connector, Dataset, Disposable, Loader, Sampler, SourceSpec
+from .nodes import Connector, Disposable, Loader, Sampler, Source, Wrapper
 
 
 def _sync_device(device: torch.device) -> None:
@@ -151,7 +151,7 @@ def _h2d_counter(
 
 
 def _batch_interval(
-    _ds: "Dataset",
+    _ds: "Sampler",
     _dev: torch.device,
     _tmin_ms: float = 0.8,
     _tmax_ms: float = 3.0,
@@ -176,7 +176,7 @@ def _batch_interval(
     B_cap = 1 << 16
     _dev_type = _dev.type
 
-    per_sample = int(getattr(Dataset, "_per_sample_mem_bytes", 0) or 0)
+    per_sample = int(getattr(Sampler, "_per_sample_mem_bytes", 0) or 0)
     if per_sample <= 0:
         try:
             env_v = (
@@ -417,7 +417,7 @@ def _batch_interval(
     if cap_from_mem > 0:
         B_cap = min(B_cap, cap_from_mem)
 
-    B_cap = max(1, min(int(B_cap * Dataset._scale), len(_ds)))
+    B_cap = max(1, min(int(B_cap * Sampler._scale), len(_ds)))
 
     env_max = os.environ.get("STNET_MAX_BATCH_SIZE") or os.environ.get("STNET_MAX_BATCH")
     try:
@@ -487,7 +487,9 @@ def _batch_interval(
 def _is_source_spec(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
-    if "kind" not in obj or "path" not in obj:
+    if "path" not in obj:
+        return False
+    if "format" not in obj and "kind" not in obj:
         return False
     p = obj.get("path")
     try:
@@ -498,21 +500,26 @@ def _is_source_spec(obj: Any) -> bool:
 
 
 def dataset(
-    source: SourceSpec,
+    source: Source,
     *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
     **kwargs: Any,
-) -> "Dataset":
+) -> "Sampler":
     if not isinstance(source, Mapping):
-        raise TypeError(f"dataset expects a SourceSpec mapping, got {type(source)}")
+        raise TypeError(f"dataset expects a Source mapping, got {type(source)}")
 
-    kind = str(source.get("kind"))
-    if kind != "memmap":
-        raise ValueError(f"Unsupported source kind: {kind!r}")
+    format = source.get("format")
+    if format is None:
+        format = source.get("kind")
+    if format is None:
+        raise ValueError("Source['format'] or Source['kind'] must be provided")
+    format = str(format)
+    if format != "memmap":
+        raise ValueError(f"Unsupported source format: {format!r}")
     path = os.fspath(source.get("path", ""))
     if not path:
-        raise ValueError("SourceSpec['path'] must be provided")
+        raise ValueError("Source['path'] must be provided")
     if not os.path.isdir(path):
         raise FileNotFoundError(f"memmap directory not found: {path!r}")
     sp = str(split or "train")
@@ -521,7 +528,7 @@ def dataset(
     vf = float(val_frac)
     if not (0.0 <= vf <= 1.0):
         raise ValueError(f"val_frac must be in [0,1], got: {vf}")
-    return Dataset(path, split=sp, val_frac=vf)
+    return Sampler(path, split=sp, val_frac=vf)
 
 
 def _process(
@@ -629,7 +636,7 @@ def compose(
     mx_weights = None
     if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping):
         mx_weights = weights
-    sampler = Sampler(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=0, weights=mx_weights)
+    sampler = Wrapper(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=0, weights=mx_weights)
     source = sampler.compose(node_or_nodes)
     mapper = Connector(
         map_fn=map_fn,
@@ -645,9 +652,9 @@ def compose(
 
 def fetch(
     sources: Union[
-        SourceSpec,
-        Sequence[SourceSpec],
-        Mapping[str, SourceSpec],
+        Source,
+        Sequence[Source],
+        Mapping[str, Source],
     ],
     device: Union[str, torch.device],
     val_frac: float = 0.0,
@@ -677,7 +684,7 @@ def fetch(
     allocated = Disposable()
     batch_size: Optional[int] = None
 
-    def _stream_batch(_ds: Dataset, _dev: torch.device) -> Tuple[int, float]:
+    def _stream_batch(_ds: Sampler, _dev: torch.device) -> Tuple[int, float]:
         try:
             return _batch_interval(
                 _ds,
@@ -690,7 +697,7 @@ def fetch(
         except Exception:
             return (int(batch_size) if batch_size is not None else 0, 0.0)
 
-    def _rescale_batch(_datasets: Mapping[str, Dataset], _bs: int) -> int:
+    def _rescale_batch(_datasets: Mapping[str, Sampler], _bs: int) -> int:
         _auto_bs_candidates.clear()
         for _k, _ds in _datasets.items():
             B_i, _ = _stream_batch(_ds, _device_obj)
@@ -703,7 +710,7 @@ def fetch(
         return int(max(1, min(cand_max, cand_mean)))
 
     def _cap_pf_depth(
-        _device_obj: torch.device, _datasets: Mapping[str, Dataset], _pf: int, _bs: int
+        _device_obj: torch.device, _datasets: Mapping[str, Sampler], _pf: int, _bs: int
     ) -> int:
         try:
             host_avail = int(Memory.available())
