@@ -434,10 +434,31 @@ def _batch_interval(
 
     # Pull the initial B toward the H2D-derived hint when available to reduce
     # the number of doubling/halving iterations below.
+    # Compromise: instead of hard-overriding B, snap toward the hint using the
+    # candidate set (which encodes coarse memory/heuristic constraints).
     if b_init_hint is not None:
         try:
             B_hint = max(1, min(int(B_cap), int(b_init_hint)))
-            B = int(B_hint)
+            if candidates:
+                # Keep only usable candidates under current cap.
+                cands = [
+                    int(c)
+                    for c in candidates
+                    if isinstance(c, int) and c > 0 and int(c) <= int(B_cap)
+                ]
+                if cands:
+                    # Prefer the largest candidate <= hint (avoids starting above
+                    # the H2D target and immediately halving).
+                    le = [c for c in cands if int(c) <= int(B_hint)]
+                    if le:
+                        B = int(max(le))
+                    else:
+                        # All candidates are above hint; choose the smallest candidate.
+                        B = int(min(cands))
+                else:
+                    B = int(B_hint)
+            else:
+                B = int(B_hint)
         except Exception:
             pass
 
