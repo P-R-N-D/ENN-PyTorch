@@ -206,6 +206,18 @@ def _batch_interval(
     dev_margin = 0.90
     host_margin = 0.10
 
+    # When budgets are not explicitly set, we derive a conservative cap from:
+    #   - per-sample bytes (data size)
+    #   - estimated pipeline inflight (prefetch/streams/workers)
+    # This avoids hard-coding fixed caps like 8/16GB while still guarding against
+    # pathological "auto-batch uses everything" behavior on large systems.
+    budget_slack = 1.25
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_BUDGET_SLACK")
+        if v is not None and str(v).strip():
+            budget_slack = float(v)
+    budget_slack = max(1.0, min(4.0, float(budget_slack)))
+
     dev_budget_ratio = 1.0
     dev_budget_min_bytes = 0
     dev_budget_max_bytes: Optional[int] = None
@@ -303,6 +315,37 @@ def _batch_interval(
                 host_total = int(_ht)
     except Exception:
         host_free = None
+
+    # If budgets were not explicitly configured, derive a conservative cap.
+    # We cap the *batch size* in samples by estimating how many samples are needed
+    # to keep the pipeline fed (inflight batches), then converting to bytes.
+    if (
+        tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None
+    ) and int(tpl.sample_bytes or 0) > 0:
+        try:
+            inflight = int(tpl.host_inflight_batches_per_proc())
+            lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
+            # A small sample target that scales with inflight, but still bounded by B_cap.
+            # This is meant to prevent huge auto-batches on large-memory machines.
+            target_batch_samples = max(1, min(int(B_cap), max(64, inflight * 32)))
+
+            if tpl.device_budget_max_bytes is None:
+                base_dev = int(tpl.sample_bytes) * int(target_batch_samples)
+                cap_dev = int(float(base_dev) * float(budget_slack))
+                if dev_total is not None and int(dev_total) > 0:
+                    cap_dev = min(int(cap_dev), int(dev_total))
+                tpl.device_budget_max_bytes = max(0, int(cap_dev))
+
+            if tpl.host_budget_max_bytes is None and int(tpl.host_sample_bytes or 0) > 0:
+                base_host = int(tpl.host_sample_bytes) * max(1, inflight) * max(
+                    1, lw
+                ) * int(target_batch_samples)
+                cap_host = int(float(base_host) * float(budget_slack))
+                if host_total is not None and int(host_total) > 0:
+                    cap_host = min(int(cap_host), int(host_total))
+                tpl.host_budget_max_bytes = max(0, int(cap_host))
+        except Exception:
+            pass
 
     cap_from_mem = tpl.suggest_batch(
         dev_free=dev_free,

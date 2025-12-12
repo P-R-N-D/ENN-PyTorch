@@ -1209,6 +1209,17 @@ def epochs(
     dev_margin = 0.8
     host_margin = 0.8
 
+    # When budgets are not explicitly set, we derive a conservative per-run budget
+    # from the observed per-sample bytes and the minimum accumulation requirement.
+    # This avoids hard-coding fixed caps like 8/16GB while still preventing
+    # "data eats all RAM/VRAM" behaviors on very large systems.
+    budget_slack = 1.25
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_BUDGET_SLACK")
+        if v is not None and str(v).strip():
+            budget_slack = float(v)
+    budget_slack = max(1.0, min(4.0, float(budget_slack)))
+
     dev_budget_ratio = 1.0
     dev_budget_min_bytes = 0
     dev_budget_max_bytes: Optional[int] = None
@@ -1316,6 +1327,43 @@ def epochs(
                     safe_host_total = int(host_total)
 
             safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
+
+            # If budgets were not explicitly configured, derive a conservative cap
+            # based on "data bytes we need to not starve" (per-batch * min-accum),
+            # scaled by a small slack factor to tolerate variability.
+            #
+            # NOTE: In this codebase, est_bytes_per_sample is derived from input
+            # tensors (data size), not model/optimizer state.
+            if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
+                try:
+                    # Minimum total samples we must support to satisfy min_grad_accum.
+                    target_total_samples = max(1, int(per_batch or 1)) * max(
+                        1, int(min_grad_accum)
+                    )
+
+                    # Device budget: cap data bytes on device.
+                    if tpl.device_budget_max_bytes is None and int(tpl.sample_bytes or 0) > 0:
+                        base_dev = int(tpl.sample_bytes) * int(target_total_samples)
+                        cap_dev = int(float(base_dev) * float(budget_slack))
+                        # Never exceed known total if available.
+                        if safe_dev_total is not None and int(safe_dev_total) > 0:
+                            cap_dev = min(int(cap_dev), int(safe_dev_total))
+                        tpl.device_budget_max_bytes = max(0, int(cap_dev))
+
+                    # Host budget: cap data bytes staged in host inflight queues.
+                    if tpl.host_budget_max_bytes is None and int(tpl.host_sample_bytes or 0) > 0:
+                        inflight = int(tpl.host_inflight_batches_per_proc())
+                        lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
+                        base_host = int(tpl.host_sample_bytes) * max(1, inflight) * max(
+                            1, lw
+                        ) * int(target_total_samples)
+                        cap_host = int(float(base_host) * float(budget_slack))
+                        if safe_host_total is not None and int(safe_host_total) > 0:
+                            cap_host = min(int(cap_host), int(safe_host_total))
+                        tpl.host_budget_max_bytes = max(0, int(cap_host))
+                except Exception:
+                    # If derivation fails, keep budgets unset (margin-only behavior).
+                    pass
 
             if safe_host_bytes is not None or safe_dev_bytes is not None:
                 total_samples_cap = tpl.suggest_batch(
