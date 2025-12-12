@@ -12,7 +12,7 @@ from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
 from ..backend.system import get_device, optimal_optimizer_params
-from ..api.templates import DataPolicy
+from ..api.templates import Dataset
 from .fx import Autocast, Fusion, is_scale_safe
 
 try:
@@ -155,8 +155,8 @@ class AdamW:
         model_or_params: Union[
             nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
         ],
-        metadata: Optional["DataPolicy[Any]"] = None,
-    ) -> Tuple[torch.device, "DataPolicy[Any]"]:
+        metadata: Optional["Dataset[Any]"] = None,
+    ) -> Tuple[torch.device, "Dataset[Any]"]:
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
             ref_tensor = Fusion._peek_layer(model_or_params)
@@ -178,7 +178,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -213,7 +213,7 @@ class AdamW:
                         logger(
                             "[OPT] FP8 optimizers disabled: data scale exceeds float8 range"
                         )
-            ok, reason = DataPolicy.is_float8_supported(dev)
+            ok, reason = Dataset.is_float8_supported(dev)
             if fp8_allowed and ok:
                 if "TE" in str(reason):
                     try:
@@ -260,7 +260,7 @@ class AdamW:
         lr: float,
         *args: Any,
         weight_decay: float = 0.0,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
@@ -294,9 +294,9 @@ class AdamW:
                     Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]
                 ] = []
                 if max_abs <= 7.0:
-                    candidates.append(("int4", DataPolicy.is_int4_supported))
+                    candidates.append(("int4", Dataset.is_int4_supported))
                 if max_abs <= 127.0:
-                    candidates.append(("int8", DataPolicy.is_int8_supported))
+                    candidates.append(("int8", Dataset.is_int8_supported))
                 if not candidates:
                     if logger:
                         logger(

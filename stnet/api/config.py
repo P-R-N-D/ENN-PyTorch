@@ -7,9 +7,9 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal,
                     Optional, Sequence, Tuple, TypeAlias, Union)
 
 if TYPE_CHECKING:
-    from ..data.nodes import SourceSpec
+    from ..data.nodes import Source
 else:
-    SourceSpec = Dict[str, Any]
+    Source = Dict[str, Any]
 
 import torch
 
@@ -348,9 +348,7 @@ class RuntimeConfig:
     in_dim: int
     out_shape: Tuple[int, ...]
     cfg_dict: Dict[str, Any]
-    sources: Optional[
-        Union[SourceSpec, Sequence[SourceSpec], Dict[str, SourceSpec]]
-    ] = None
+    sources: Optional[Union[Source, Sequence[Source], Dict[str, Source]]] = None
     ckpt_dir: Optional[str] = None
     init_ckpt_dir: Optional[str] = None
     epochs: int = 5

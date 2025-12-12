@@ -171,7 +171,7 @@ class WorkerPolicy:
 
 
 @dataclass
-class DataPolicy(Generic[TExtra]):
+class Dataset(Generic[TExtra]):
     device: torch.device
     device_type: str = field(init=False, default="cpu")
     cuda_cc: Optional[Tuple[int, int]] = field(init=False, default=None)
@@ -383,7 +383,7 @@ class DataPolicy(Generic[TExtra]):
         scale_is_integral: Optional[bool] = None,
         extra: Optional[Mapping[str, TExtra]] = None,
         **kwargs: Any,
-    ) -> "DataPolicy[TExtra]":
+    ) -> "Dataset[TExtra]":
         dev = torch.device(device)
         float_candidates = cls._float_amp_candidates(dev)
         int_candidates = cls._integer_candidates(dev)

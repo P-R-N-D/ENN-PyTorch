@@ -379,15 +379,15 @@ def get_dpa_backends() -> List[object]:
 
 
 def is_cpu_bf16_supported() -> bool:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.is_cpu_bf16_supported()
+    return Dataset.is_cpu_bf16_supported()
 
 
 def is_cuda_bf16_supported() -> bool:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.is_cuda_bf16_supported()
+    return Dataset.is_cuda_bf16_supported()
 
 
 def get_device(
@@ -477,33 +477,33 @@ def optimal_optimizer_params(
 
 
 def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.cuda_compute_capability(device)
+    return Dataset.cuda_compute_capability(device)
 
 
 def is_float8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.is_float8_supported(device)
+    return Dataset.is_float8_supported(device)
 
 
 def is_int8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.is_int8_supported(device)
+    return Dataset.is_int8_supported(device)
 
 
 def is_int4_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import DataPolicy
+    from ..api.templates import Dataset
 
-    return DataPolicy.is_int4_supported(device)
+    return Dataset.is_int4_supported(device)
 
 
 def optimal_procs() -> Dict[str, Union[int, str]]:

@@ -14,7 +14,7 @@ from torch import nn
 
 from ..backend.compat import patch_torch
 from ..backend.system import get_device
-from ..api.templates import DataPolicy
+from ..api.templates import Dataset
 
 patch_torch()
 
@@ -150,7 +150,7 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 def is_scale_safe(
     dtype: torch.dtype,
-    meta: Optional[DataPolicy[Any]],
+    meta: Optional[Dataset[Any]],
     *args: Any,
     safety_margin: float = 8.0,
     **kwargs: Any,
@@ -336,7 +336,7 @@ class Autocast:
     _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _metadata: Optional[DataPolicy[Any]] = None
+    _metadata: Optional[Dataset[Any]] = None
 
     @staticmethod
     def _device(
@@ -366,7 +366,7 @@ class Autocast:
             order = ("te", "ao")
         for backend in order:
             if backend == "te":
-                ok, reason = DataPolicy.is_float8_supported(dev)
+                ok, reason = Dataset.is_float8_supported(dev)
                 if not ok:
                     _LOGGER.debug("Autocast FP8 TE unavailable: %s", reason)
                     continue
@@ -412,7 +412,7 @@ class Autocast:
             order = ("te", "ao")
         for backend in order:
             if backend == "te":
-                ok, reason = DataPolicy.is_int8_supported(dev)
+                ok, reason = Dataset.is_int8_supported(dev)
                 if not ok:
                     _LOGGER.debug("Autocast INT8 TE unavailable: %s", reason)
                     continue
@@ -448,9 +448,9 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
-    ) -> DataPolicy[Any]:
+    ) -> Dataset[Any]:
         meta = metadata or cls._metadata
         device_hint: Optional[Union[torch.device, str]] = device
         if device_hint is None and meta is not None:
@@ -458,7 +458,7 @@ class Autocast:
                 device_hint = torch.device(meta.device)
         dev = cls._device(device_hint)
         if meta is None:
-            meta = DataPolicy.for_device(dev)
+            meta = Dataset.for_device(dev)
         else:
             current_device = torch.device(getattr(meta, "device", dev))
             if current_device != dev:
@@ -527,7 +527,7 @@ class Autocast:
         logger: Optional[logging.Logger] = None,
         context: str = "autocast",
         device: Optional[torch.device] = None,
-        meta: Optional[DataPolicy[Any]] = None,
+        meta: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         for dtype in candidates:
@@ -639,7 +639,7 @@ class Autocast:
         cls: object,
         model: Optional[nn.Module],
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> None:
         backend: Optional[str] = None
@@ -696,7 +696,7 @@ class Autocast:
         cls,
         device: Optional[Union[torch.device, str]] = None,
         dtype: Optional[Union[torch.dtype, str]] = None,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
     ) -> Optional[torch.dtype]:
         """Return the float autocast dtype that `Autocast.float(...)` would use.
 
@@ -742,7 +742,7 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
@@ -868,7 +868,7 @@ class Autocast:
         cls: object,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> contextlib.AbstractContextManager[None]:
         dev = cls._device(device)
@@ -1132,20 +1132,20 @@ class Fusion:
     def negotiate(
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
         candidates: List[torch.dtype] = []
         if dev.type == "cuda":
             try:
-                if DataPolicy.is_cuda_bf16_supported(dev):
+                if Dataset.is_cuda_bf16_supported(dev):
                     candidates.append(torch.bfloat16)
             except Exception:
                 pass
             candidates.extend((torch.float16, torch.float32))
         elif dev.type == "cpu":
-            if DataPolicy.is_cpu_bf16_supported():
+            if Dataset.is_cpu_bf16_supported():
                 candidates.append(torch.bfloat16)
             candidates.extend((torch.float32, torch.float64))
         elif dev.type == "xpu":
@@ -1171,14 +1171,14 @@ class Fusion:
 
     @staticmethod
     def _coerce_metadata(
-        model: nn.Module, metadata: Optional[DataPolicy[Any]] = None
-    ) -> DataPolicy[Any]:
+        model: nn.Module, metadata: Optional[Dataset[Any]] = None
+    ) -> Dataset[Any]:
         Autocast.configure(model, metadata=metadata)
         meta = Autocast._metadata
         if meta is None:
             ref = Fusion._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
-            meta = DataPolicy.for_device(dev)
+            meta = Dataset.for_device(dev)
             Autocast.configure(model, metadata=meta)
         return meta
 
@@ -1358,7 +1358,7 @@ class Fusion:
         model: nn.Module,
         device: Optional[Union[torch.device, str]] = None,
         *args: Any,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> Tuple[nn.Module, bool, str]:
@@ -1370,7 +1370,7 @@ class Fusion:
         except Exception:
             return (model, False, "transformer_engine not installed")
         te_backend = getattr(te, "__name__", "transformer_engine.pytorch")
-        fp8_ok, why = DataPolicy.is_float8_supported(dev)
+        fp8_ok, why = Dataset.is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
         params_dtype = Fusion.negotiate(dev, metadata=metadata)
@@ -1512,12 +1512,12 @@ class Fusion:
     @staticmethod
     def enable_float8_training(
         model: nn.Module,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
-        ok, reason = DataPolicy.is_float8_supported(device)
+        ok, reason = Dataset.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
@@ -1552,12 +1552,12 @@ class Fusion:
     @staticmethod
     def enable_float8_prediction(
         model: nn.Module,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
-        ok, reason = DataPolicy.is_float8_supported(device)
+        ok, reason = Dataset.is_float8_supported(device)
         if not ok:
             Autocast.configure(model, metadata=meta)
             return (model, False, reason)
@@ -1600,7 +1600,7 @@ class Fusion:
     @staticmethod
     def enable_int8_training(
         model: nn.Module,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
@@ -1624,7 +1624,7 @@ class Fusion:
     @staticmethod
     def enable_int8_prediction(
         model: nn.Module,
-        metadata: Optional[DataPolicy[Any]] = None,
+        metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
         meta = Fusion._coerce_metadata(model, metadata)
