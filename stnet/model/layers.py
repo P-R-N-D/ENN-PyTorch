@@ -349,6 +349,7 @@ class Retention(nn.Module):
 def _get_dilated_mask(
     seq_len: int,
     *args: Any,
+    device: Optional[torch.device] = None,
     dilation: int = 1,
     window_size: Optional[int] = None,
     causal: bool = False,
@@ -358,7 +359,7 @@ def _get_dilated_mask(
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
     L = int(seq_len)
-    device = torch.device("cpu")
+    device = torch.device("cpu") if device is None else torch.device(device)
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
     j = torch.arange(L, device=device).unsqueeze(0).expand(L, L)
     dist = (i - j).abs()
