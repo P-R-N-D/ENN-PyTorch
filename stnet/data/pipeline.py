@@ -327,6 +327,8 @@ def _batch_interval(
     # Cache probe results to optionally reuse later for initial H2D med estimate.
     probe_bs_cache: Optional[int] = None
     med_probe_cache: Optional[float] = None
+    # Hint for choosing the initial B in the subsequent auto-batch loop.
+    b_init_hint: Optional[int] = None
 
     # If budgets were not explicitly configured, derive a conservative cap.
     # We cap the *batch size* in samples by estimating how many samples are needed
@@ -365,6 +367,7 @@ def _batch_interval(
                 target_batch_samples = max(1, min(int(B_cap), bs_est))
                 probe_bs_cache = int(probe_bs)
                 med_probe_cache = float(med_probe)
+                b_init_hint = int(target_batch_samples)
             else:
                 # Fallback to a byte-based target (aim for ~64MiB per transfer).
                 target_bytes = 64 * 1024 * 1024
@@ -372,6 +375,7 @@ def _batch_interval(
                     1,
                     min(int(B_cap), int(target_bytes // max(1, int(tpl.sample_bytes)))),
                 )
+                b_init_hint = int(target_batch_samples)
 
             new_dev_cap: Optional[int] = tpl.device_budget_max_bytes
             new_host_cap: Optional[int] = tpl.host_budget_max_bytes
@@ -427,6 +431,16 @@ def _batch_interval(
         B = min(candidates[-1], B_cap)
     else:
         B = min(64, B_cap)
+
+    # Pull the initial B toward the H2D-derived hint when available to reduce
+    # the number of doubling/halving iterations below.
+    if b_init_hint is not None:
+        try:
+            B_hint = max(1, min(int(B_cap), int(b_init_hint)))
+            B = int(B_hint)
+        except Exception:
+            pass
+
     # Reuse probe result when possible to avoid redundant H2D measurement.
     if probe_bs_cache is not None and med_probe_cache is not None and int(B) == int(probe_bs_cache):
         med = float(med_probe_cache)
