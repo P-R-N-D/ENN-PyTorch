@@ -208,11 +208,11 @@ def _batch_interval(
 
     dev_budget_ratio = 1.0
     dev_budget_min_bytes = 0
-    dev_budget_max_bytes = 8 * 1024 * 1024 * 1024
+    dev_budget_max_bytes: Optional[int] = None
 
     host_budget_ratio = 1.0
     host_budget_min_bytes = 0
-    host_budget_max_bytes = 16 * 1024 * 1024 * 1024
+    host_budget_max_bytes: Optional[int] = None
 
     with contextlib.suppress(Exception):
         v = os.environ.get("STNET_DEVICE_MARGIN")
@@ -257,8 +257,12 @@ def _batch_interval(
 
     dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
     host_budget_min_bytes = max(0, int(host_budget_min_bytes))
-    dev_budget_max_bytes = max(0, int(dev_budget_max_bytes))
-    host_budget_max_bytes = max(0, int(host_budget_max_bytes))
+    dev_budget_max_bytes = (
+        None if dev_budget_max_bytes is None else max(0, int(dev_budget_max_bytes))
+    )
+    host_budget_max_bytes = (
+        None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
+    )
 
     tpl = BatchPolicy(
         sample_bytes=per_sample,
@@ -275,10 +279,14 @@ def _batch_interval(
         host_margin=float(host_margin),
         device_budget_ratio=float(dev_budget_ratio),
         device_budget_min_bytes=int(dev_budget_min_bytes),
-        device_budget_max_bytes=int(dev_budget_max_bytes),
+        device_budget_max_bytes=(
+            None if dev_budget_max_bytes is None else int(dev_budget_max_bytes)
+        ),
         host_budget_ratio=float(host_budget_ratio),
         host_budget_min_bytes=int(host_budget_min_bytes),
-        host_budget_max_bytes=int(host_budget_max_bytes),
+        host_budget_max_bytes=(
+            None if host_budget_max_bytes is None else int(host_budget_max_bytes)
+        ),
     )
 
     dev_free, dev_total = _device_mem_get_info(_dev)
