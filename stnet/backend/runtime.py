@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -84,6 +85,8 @@ torch_safe_distributed()
 
 
 MB_DIV = 1024.0 * 1024.0
+
+_device_mem_get_info = Memory.device_mem_get_info
 
 
 try:
@@ -1203,6 +1206,85 @@ def epochs(
         if env_max is not None and str(env_max).strip():
             max_grad_accum = max(min_grad_accum, int(env_max))
 
+
+    dev_margin = 0.8
+    host_margin = 0.8
+
+    # When budgets are not explicitly set, we derive a conservative per-run budget
+    # from the observed per-sample bytes and the minimum accumulation requirement.
+    # This avoids hard-coding fixed caps like 8/16GB while still preventing
+    # "data eats all RAM/VRAM" behaviors on very large systems.
+    # Soft slack for auto-derived budgets (only used when budgets are unset).
+    budget_slack = 1.25
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_BUDGET_SLACK")
+        if v is not None and str(v).strip():
+            budget_slack = float(v)
+    budget_slack = max(1.0, min(4.0, float(budget_slack)))
+
+    dev_budget_ratio = 1.0
+    dev_budget_min_bytes = 0
+    dev_budget_max_bytes: Optional[int] = None
+
+    host_budget_ratio = 1.0
+    host_budget_min_bytes = 0
+    host_budget_max_bytes: Optional[int] = None
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_MARGIN")
+        if v is not None and str(v).strip():
+            dev_margin = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_MARGIN")
+        if v is not None and str(v).strip():
+            host_margin = float(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            dev_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_max_bytes = int(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            host_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_max_bytes = int(v)
+
+    dev_margin = max(0.0, min(1.0, float(dev_margin)))
+    host_margin = max(0.0, min(1.0, float(host_margin)))
+
+    dev_budget_ratio = max(0.0, min(1.0, float(dev_budget_ratio)))
+    host_budget_ratio = max(0.0, min(1.0, float(host_budget_ratio)))
+
+    dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
+    host_budget_min_bytes = max(0, int(host_budget_min_bytes))
+    dev_budget_max_bytes = (
+        None if dev_budget_max_bytes is None else max(0, int(dev_budget_max_bytes))
+    )
+    host_budget_max_bytes = (
+        None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
+    )
+    # Treat 0 (or less) as "unset/disabled" for max-bytes, to avoid confusing states.
+    if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
+        dev_budget_max_bytes = None
+    if host_budget_max_bytes is not None and int(host_budget_max_bytes) <= 0:
+        host_budget_max_bytes = None
+
     tpl: Optional[BatchPolicy] = None
     if est_bytes_per_sample is not None and est_bytes_per_sample > 0 and max_grad_accum > 0:
         try:
@@ -1220,36 +1302,109 @@ def epochs(
                 max_concurrency=1,
                 min_batch=1,
                 max_batch=max_grad_accum,
-                host_margin=0.8,
-                device_margin=0.8,
+                host_margin=float(host_margin),
+                device_margin=float(dev_margin),
+                host_budget_ratio=float(host_budget_ratio),
+                host_budget_min_bytes=int(host_budget_min_bytes),
+                host_budget_max_bytes=(
+                    None if host_budget_max_bytes is None else int(host_budget_max_bytes)
+                ),
+                device_budget_ratio=float(dev_budget_ratio),
+                device_budget_min_bytes=int(dev_budget_min_bytes),
+                device_budget_max_bytes=(
+                    None if dev_budget_max_bytes is None else int(dev_budget_max_bytes)
+                ),
             )
         except Exception:
             tpl = None
 
     safe_host_bytes: Optional[int] = None
+    safe_host_total: Optional[int] = None
     safe_dev_bytes: Optional[int] = None
+    safe_dev_total: Optional[int] = None
     max_from_mem: Optional[int] = None
     if tpl is not None:
         try:
             host_mem = Memory.available()
-            if host_mem is not None and host_mem > 0:
+            if host_mem is not None and host_mem >= 0:
                 safe_host_bytes = int(host_mem)
+            with contextlib.suppress(Exception):
+                host_total = Memory.total()
+                if host_total is not None and host_total > 0:
+                    safe_host_total = int(host_total)
 
-            if device.type == "cuda" and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    free_dev, _total_dev = torch.cuda.mem_get_info(device=device)
-                    safe_dev_bytes = int(free_dev)
-            elif device.type == "xpu" and hasattr(torch, "xpu"):
-                with contextlib.suppress(Exception):
-                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                    if callable(mem_get_info):
-                        free_dev, _total_dev = mem_get_info(device)
-                        safe_dev_bytes = int(free_dev)
+            safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
+
+            # If budgets were not explicitly configured, derive a conservative cap
+            # based on "data bytes we need to not starve" (per-batch * min-accum),
+            # scaled by a small slack factor to tolerate variability.
+            #
+            # NOTE: In this codebase, est_bytes_per_sample is derived from input
+            # tensors (data size), not model/optimizer state.
+            if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
+                try:
+                    # Minimum total samples we must support to satisfy min_grad_accum.
+                    target_total_samples = max(1, int(per_batch or 1)) * max(
+                        1, int(min_grad_accum)
+                    )
+
+                    new_dev_cap: Optional[int] = tpl.device_budget_max_bytes
+                    new_host_cap: Optional[int] = tpl.host_budget_max_bytes
+
+                    # Device budget: cap data bytes on device.
+                    if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
+                        base_dev = int(tpl.sample_bytes) * int(target_total_samples)
+                        cap_dev = int(float(base_dev) * float(budget_slack))
+                        # Never exceed known total if available.
+                        if safe_dev_total is not None and int(safe_dev_total) > 0:
+                            cap_dev = min(int(cap_dev), int(safe_dev_total))
+                        cap_dev = max(0, int(cap_dev))
+                        new_dev_cap = None if cap_dev <= 0 else cap_dev
+
+                    # Host budget: cap data bytes staged in host inflight queues.
+                    if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
+                        inflight = int(tpl.host_inflight_batches_per_proc())
+                        lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
+                        base_host = int(tpl.host_sample_bytes) * max(1, inflight) * max(
+                            1, lw
+                        ) * int(target_total_samples)
+                        cap_host = int(float(base_host) * float(budget_slack))
+                        if safe_host_total is not None and int(safe_host_total) > 0:
+                            cap_host = min(int(cap_host), int(safe_host_total))
+                        cap_host = max(0, int(cap_host))
+                        new_host_cap = None if cap_host <= 0 else cap_host
+
+                    # Rebuild tpl via dataclasses.replace to avoid bypassing dataclass invariants.
+                    if (new_dev_cap != tpl.device_budget_max_bytes) or (new_host_cap != tpl.host_budget_max_bytes):
+                        tpl = dataclasses.replace(
+                            tpl,
+                            device_budget_max_bytes=new_dev_cap,
+                            host_budget_max_bytes=new_host_cap,
+                        )
+                        with contextlib.suppress(Exception):
+                            _LOGGER.info(
+                                "[epochs] auto-derived budgets: dev_max=%s host_max=%s slack=%.3f "
+                                "(sample=%s host_sample=%s per_batch=%s min_accum=%s inflight=%s lws=%s)",
+                                str(new_dev_cap),
+                                str(new_host_cap),
+                                float(budget_slack),
+                                str(getattr(tpl, "sample_bytes", None)),
+                                str(getattr(tpl, "host_sample_bytes", None)),
+                                str(per_batch),
+                                str(min_grad_accum),
+                                str(getattr(tpl, "host_inflight_batches_per_proc", lambda: None)()),
+                                str(getattr(tpl, "local_world_size", None)),
+                            )
+                except Exception:
+                    # If derivation fails, keep budgets unset (margin-only behavior).
+                    pass
 
             if safe_host_bytes is not None or safe_dev_bytes is not None:
                 total_samples_cap = tpl.suggest_batch(
                     dev_free=safe_dev_bytes,
                     host_free=safe_host_bytes,
+                    dev_total=safe_dev_total,
+                    host_total=safe_host_total,
                 )
                 if total_samples_cap > 0:
                     max_from_mem = max(
@@ -1257,7 +1412,9 @@ def epochs(
                     )
         except Exception:
             safe_host_bytes = None
+            safe_host_total = None
             safe_dev_bytes = None
+            safe_dev_total = None
 
     if max_from_mem is not None:
         max_grad_accum = max(
@@ -1271,13 +1428,19 @@ def epochs(
     print(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} ",
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, ",
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})",
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
+        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
+        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
+        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})",
         flush=True,
     )
     logging.info(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} "
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, "
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})"
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
+        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
+        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
+        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})"
     )
 
     proc = None

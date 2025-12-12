@@ -1010,6 +1010,128 @@ class Memory:
         return max(0, min(candidates)) if candidates else 0
 
     @staticmethod
+    def _parse_free_total(info: Any) -> Tuple[Optional[int], Optional[int]]:
+        free: Optional[int] = None
+        total: Optional[int] = None
+
+        if isinstance(info, (list, tuple)):
+            if len(info) >= 1:
+                with contextlib.suppress(Exception):
+                    free = int(info[0])
+            if len(info) >= 2:
+                with contextlib.suppress(Exception):
+                    total = int(info[1])
+
+        elif isinstance(info, dict):
+            free_v = (
+                info.get("free", None)
+                or info.get("free_memory", None)
+                or info.get("free_bytes", None)
+            )
+            total_v = (
+                info.get("total", None)
+                or info.get("total_memory", None)
+                or info.get("total_bytes", None)
+            )
+
+            if total_v is None and info.get("bytes_limit", None) is not None:
+                total_v = info.get("bytes_limit", None)
+            if free_v is None and total_v is not None:
+                used_v = (
+                    info.get("bytes_used", None)
+                    or info.get("bytes_in_use", None)
+                    or info.get("bytes_used_current", None)
+                )
+                if used_v is not None:
+                    with contextlib.suppress(Exception):
+                        free_v = int(total_v) - int(used_v)
+
+            with contextlib.suppress(Exception):
+                if free_v is not None:
+                    free = int(free_v)
+            with contextlib.suppress(Exception):
+                if total_v is not None:
+                    total = int(total_v)
+
+        if free is not None:
+            free = max(0, int(free))
+        if total is not None:
+            total = max(0, int(total))
+        return free, total
+
+    @staticmethod
+    def device_mem_get_info(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
+
+        free: Optional[int] = None
+        total: Optional[int] = None
+        with contextlib.suppress(Exception):
+            acc = getattr(torch, "accelerator", None)
+            if acc is not None:
+                get_memory_info = getattr(acc, "get_memory_info", None)
+                if callable(get_memory_info):
+                    info = get_memory_info(device)
+                    free, total = Memory._parse_free_total(info)
+
+                if free is None or total is None:
+                    mem_mod = getattr(acc, "memory", None)
+                    mem_get_info = (
+                        getattr(mem_mod, "mem_get_info", None)
+                        if mem_mod is not None
+                        else None
+                    )
+                    if callable(mem_get_info):
+                        info = mem_get_info(device)
+                        f2, t2 = Memory._parse_free_total(info)
+                        if free is None:
+                            free = f2
+                        if total is None:
+                            total = t2
+
+        dev_t = getattr(device, "type", "cpu")
+
+        if free is None or total is None:
+            if dev_t == "cuda" and torch.cuda.is_available():
+                with contextlib.suppress(Exception):
+                    f2, t2 = torch.cuda.mem_get_info(device=device)
+                    if free is None:
+                        free = int(f2)
+                    if total is None:
+                        total = int(t2)
+
+            elif dev_t == "xpu" and hasattr(torch, "xpu"):
+                with contextlib.suppress(Exception):
+                    mem_mod = getattr(torch.xpu, "memory", None)
+                    mem_get_info = (
+                        getattr(mem_mod, "mem_get_info", None)
+                        if mem_mod is not None
+                        else None
+                    )
+                    if not callable(mem_get_info):
+                        mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                    if callable(mem_get_info):
+                        f2, t2 = mem_get_info(device)
+                        if free is None:
+                            free = int(f2)
+                        if total is None:
+                            total = int(t2)
+
+            elif dev_t == "mps" and hasattr(torch, "mps"):
+                with contextlib.suppress(Exception):
+                    total_v = int(torch.mps.recommended_max_memory())
+                    used_v = int(torch.mps.driver_allocated_memory())
+                    if total_v > 0:
+                        if total is None:
+                            total = total_v
+                        if free is None:
+                            free = max(0, total_v - used_v)
+
+        if free is not None:
+            free = max(0, int(free))
+        if total is not None:
+            total = max(0, int(total))
+        return free, total
+
+    @staticmethod
     def _sys_available() -> Optional[int]:
         try:
             import psutil
