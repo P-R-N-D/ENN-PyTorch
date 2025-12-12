@@ -4,12 +4,10 @@ from __future__ import annotations
 import contextlib
 import os
 import math
-from collections import deque
-from dataclasses import dataclass
+import weakref
 from typing import (
     TYPE_CHECKING,
     Any,
-    Deque,
     Dict,
     Iterator,
     List,
@@ -28,8 +26,11 @@ import torch.nn.functional as F
 from tensordict import TensorDictBase
 from torch.utils.checkpoint import checkpoint as _activation_checkpoint_base
 
+_DILATED_MASK_CACHE_MAX = 32
+_FLEX_BLOCK_MASK_CACHE_MAX = 16
 
-def activation_checkpoint(function, *args: Any, **kwargs: Any) -> torch.Tensor:
+
+def activation_checkpoint(function, *args: Any, **kwargs: Any) -> Any:
     kwargs.pop("use_reentrant", None)
     return _activation_checkpoint_base(function, *args, use_reentrant=False, **kwargs)
 
@@ -425,16 +426,97 @@ class DilatedAttention(nn.Module):
         )
         self.length_bucket_multiple: int = 64
 
+    @staticmethod
+    def _device_key(device: torch.device) -> Tuple[str, int]:
+        idx = -1
+        with contextlib.suppress(Exception):
+            if device.index is not None:
+                idx = int(device.index)
+        return (str(device.type), idx)
+
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        mask_cpu = _get_dilated_mask(
+        win_key = int(self.window_size) if self.window_size is not None else -1
+        key = (
+            int(L),
+            int(self.dilation),
+            win_key,
+            int(self.causal),
+            self._device_key(device),
+        )
+        cache = getattr(self, "_mask_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_mask_cache", cache)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+        mask = _get_dilated_mask(
             L,
             dilation=self.dilation,
             window_size=self.window_size,
             causal=self.causal,
+            device=device,
         )
-        if device.type == "cpu":
-            return mask_cpu
-        return mask_cpu.to(device=device, non_blocking=True)
+        if key not in cache and len(cache) >= _DILATED_MASK_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        cache[key] = mask
+        return mask
+
+    def _get_flex_block_mask(
+        self,
+        B: int,
+        H: int,
+        L_q: int,
+        L_k: int,
+        *,
+        device: torch.device,
+        block_size: int,
+        win: Optional[int],
+    ) -> Any:
+        win_key = int(win) if win is not None else -1
+        key = (
+            self._device_key(device),
+            int(B),
+            int(H),
+            int(L_q),
+            int(L_k),
+            int(block_size),
+            int(self.dilation),
+            win_key,
+            int(self.causal),
+        )
+        cache = getattr(self, "_flex_block_mask_cache", None)
+        if cache is None:
+            cache = {}
+            setattr(self, "_flex_block_mask_cache", cache)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
+        def _mask_mod(b, h, q_idx, kv_idx):
+            dq = q_idx - kv_idx
+            keep = torch.ones_like(dq, dtype=torch.bool)
+            if self.causal:
+                keep &= (kv_idx <= q_idx)
+            if win is not None:
+                keep &= (dq.abs() <= win)
+            if self.dilation > 1:
+                keep &= ((dq % self.dilation) == 0)
+            return keep
+
+        block_mask = create_block_mask(
+            _mask_mod,
+            B,
+            H,
+            L_q,
+            L_k,
+            device=device,
+            BLOCK_SIZE=int(block_size),
+        )
+        if key not in cache and len(cache) >= _FLEX_BLOCK_MASK_CACHE_MAX:
+            cache.pop(next(iter(cache)))
+        cache[key] = block_mask
+        return block_mask
 
     def forward(
         self,
@@ -532,36 +614,49 @@ class DilatedAttention(nn.Module):
                     if kpm_k is not None:
                         kpm_g = kpm_k[b0:b1]
 
-                    def mask_mod_g(b, h, q_idx, kv_idx):
-                        dq = q_idx - kv_idx
-                        keep = torch.ones_like(dq, dtype=torch.bool)
+                    if kpm_g is None:
+                        # Fast path: no padding mask => reuse a cached block mask.
+                        block_mask_g = self._get_flex_block_mask(
+                            B_g,
+                            H,
+                            L_q,
+                            L_k,
+                            device=x_k.device,
+                            block_size=_block_size,
+                            win=win,
+                        )
+                    else:
 
-                        if self.causal:
-                            keep &= (kv_idx <= q_idx)
+                        def mask_mod_g(b, h, q_idx, kv_idx):
+                            dq = q_idx - kv_idx
+                            keep = torch.ones_like(dq, dtype=torch.bool)
 
-                        if win is not None:
-                            keep &= (dq.abs() <= win)
+                            if self.causal:
+                                keep &= (kv_idx <= q_idx)
 
-                        if self.dilation > 1:
-                            keep &= ((dq % self.dilation) == 0)
+                            if win is not None:
+                                keep &= (dq.abs() <= win)
 
-                        if kpm_g is not None:
-                            is_pad_q = kpm_g[b, q_idx]
-                            is_pad_k = kpm_g[b, kv_idx]
-                            bad = (is_pad_q | is_pad_k)
-                            keep = keep & (~bad)
+                            if self.dilation > 1:
+                                keep &= ((dq % self.dilation) == 0)
 
-                        return keep
+                            if kpm_g is not None:
+                                is_pad_q = kpm_g[b, q_idx]
+                                is_pad_k = kpm_g[b, kv_idx]
+                                bad = (is_pad_q | is_pad_k)
+                                keep = keep & (~bad)
 
-                    block_mask_g = create_block_mask(
-                        mask_mod_g,
-                        B_g,
-                        H,
-                        L_q,
-                        L_k,
-                        device=x_k.device,
-                        BLOCK_SIZE=_block_size,
-                    )
+                            return keep
+
+                        block_mask_g = create_block_mask(
+                            mask_mod_g,
+                            B_g,
+                            H,
+                            L_q,
+                            L_k,
+                            device=x_k.device,
+                            BLOCK_SIZE=_block_size,
+                        )
 
                     y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g)
                     out_g = self.out_proj(
@@ -705,7 +800,15 @@ class PointTransformer(nn.Module):
             if not isinstance(ln, nn.LayerNorm):
                 return
             dev = ref.device
-            target_dtype = torch.float32 if dev.type == "cpu" else ref.dtype
+            target_dtype = (
+                torch.float32
+                if (
+                    dev.type == "cpu"
+                    and ref.is_floating_point()
+                    and ref.dtype in (torch.float16, torch.bfloat16)
+                )
+                else ref.dtype
+            )
             w = getattr(ln, "weight", None)
             b = getattr(ln, "bias", None)
             try:
@@ -742,7 +845,7 @@ class PointTransformer(nn.Module):
         if (
             _x.device.type == "cpu"
             and _x.is_floating_point()
-            and _x.dtype != torch.float32
+            and _x.dtype in (torch.float16, torch.bfloat16)
         ):
             _x = _x.float()
         _x = self.norm1(_x)
@@ -751,7 +854,7 @@ class PointTransformer(nn.Module):
         if (
             _x.device.type == "cpu"
             and x.is_floating_point()
-            and x.dtype != torch.float32
+            and x.dtype in (torch.float16, torch.bfloat16)
         ):
             _x = _x.to(x.dtype)
         y = self.attn(_x, coords, attn_mask=attn_mask)
@@ -762,7 +865,7 @@ class PointTransformer(nn.Module):
         if (
             _x2.device.type == "cpu"
             and _x2.is_floating_point()
-            and _x2.dtype != torch.float32
+            and _x2.dtype in (torch.float16, torch.bfloat16)
         ):
             _x2 = _x2.float()
         _x2 = self.norm2(_x2)
@@ -771,7 +874,7 @@ class PointTransformer(nn.Module):
         if (
             _x2.device.type == "cpu"
             and x.is_floating_point()
-            and x.dtype != torch.float32
+            and x.dtype in (torch.float16, torch.bfloat16)
         ):
             _x2 = _x2.to(x.dtype)
         x = x + self.drop_path(self.dropout(self.ffn(_x2)))
@@ -888,6 +991,69 @@ class SpatialNet(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+        self.register_buffer(
+            "_perm_cache",
+            torch.empty(0, dtype=torch.int64),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_invperm_cache",
+            torch.empty(0, dtype=torch.int64),
+            persistent=False,
+        )
+        self._perm_cache_meta: Optional[Tuple[int, int, int, int, int]] = None
+
+    def _ensure_permutation_cache(
+        self, coords: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        depth = len(self.blocks)
+        if coords.dim() != 3:
+            raise ValueError(
+                f"SpatialNet coords must be (B,N,C), got shape {tuple(coords.shape)}"
+            )
+        _, N, _ = coords.shape
+        patch = int(getattr(self, "patch_size", 512))
+        shift = bool(getattr(self, "shift_order", True))
+        bits = int(getattr(self, "morton_bits", 10))
+        meta = (int(N), int(patch), int(bits), int(shift), int(depth))
+
+        perm_cache = getattr(self, "_perm_cache", None)
+        inv_cache = getattr(self, "_invperm_cache", None)
+        if (
+            isinstance(perm_cache, torch.Tensor)
+            and isinstance(inv_cache, torch.Tensor)
+            and self._perm_cache_meta == meta
+            and perm_cache.numel() == depth * N
+            and inv_cache.numel() == depth * N
+            and perm_cache.shape == (depth, N)
+            and inv_cache.shape == (depth, N)
+            and perm_cache.device == coords.device
+            and inv_cache.device == coords.device
+        ):
+            return perm_cache, inv_cache
+
+        coords_one = coords[:1].contiguous()
+        perms: List[torch.Tensor] = []
+        invperms: List[torch.Tensor] = []
+        for i in range(depth):
+            perm_i, inv_i = _serialize_z_index(
+                coords_one,
+                bits=bits,
+                patch=patch,
+                shift_order=shift,
+                block_index=i,
+            )
+            perms.append(perm_i[0].to(dtype=torch.int64))
+            invperms.append(inv_i[0].to(dtype=torch.int64))
+
+        perm_new = torch.stack(perms, dim=0).to(device=coords.device)
+        inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
+        self._perm_cache = perm_new
+        self._invperm_cache = inv_new
+        self._perm_cache_meta = meta
+        return perm_new, inv_new
+
+    @torch_no_compile(reason="SpatialNet uses dynamic gather/scatter", recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -921,20 +1087,21 @@ class SpatialNet(nn.Module):
                     "attn_mask is meta/fake before SpatialNet.forward"
                 )
             attn_mask = attn_mask.contiguous()
-        for i, blk in enumerate(self.blocks):                                                       
+        perm_cache, inv_cache = self._ensure_permutation_cache(coords)
+        _patch = int(getattr(self, "patch_size", 512))
+
+        for i, blk in enumerate(self.blocks):
             B, N, D = x.shape
-            _patch = getattr(self, "patch_size", 512)
-            _shift = getattr(self, "shift_order", True)
-            _bits  = getattr(self, "morton_bits", 10)
-            perm, invperm = _serialize_z_index(coords, bits=_bits, patch=_patch,
-                                                   shift_order=_shift, block_index=i)
+            perm = perm_cache[i].unsqueeze(0).expand(B, N)
+            invperm = inv_cache[i].unsqueeze(0).expand(B, N)
+
             x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
             c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
             out_s = torch.empty_like(x_s)
-                                                
+
             m_s = None
             if attn_mask is not None:
-                                                          
+
                 if attn_mask.dim() == 3:
                     m_s = attn_mask.gather(
                         1, perm.unsqueeze(-1).expand(B, N, N)
@@ -1271,25 +1438,6 @@ def _auto_microbatch(
     return max(1, min(hard_max, max_mb))
 
 
-@dataclass
-class Request:
-    features: torch.Tensor
-    labels_flat: Optional[torch.Tensor] = None
-    net_loss: Optional[nn.Module] = None
-    global_loss: Optional[nn.Module] = None
-    local_loss: Optional[nn.Module] = None
-    loss_weights: Optional[Union[Tuple[float, float], "LossWeightPolicy"]] = None
-    slice_range: Optional[Tuple[int, int]] = None
-
-@dataclass
-class Response:
-    pred: torch.Tensor
-    loss: Optional[torch.Tensor] = None
-    refined_tokens: Optional[torch.Tensor] = None
-    residual_context: Optional[torch.Tensor] = None
-    slice_range: Optional[Tuple[int, int]] = None
-
-
 class LongNet(nn.Module):
     def __init__(
         self,
@@ -1519,10 +1667,19 @@ class Processor(nn.Module):
     def _spatial_coords(
         self, batch: int, device: torch.device, dtype: torch.dtype
     ) -> torch.Tensor:
-        coords = self.spatial_coords_template.to(device=device, dtype=dtype)
+        _ = dtype
+        # Spatial coords are constants; keep float32 to avoid autocast-induced
+        # dtype churn and repeated allocations.
+        coords = self.spatial_coords_template
+        if coords.device != device or coords.dtype is not torch.float32:
+            coords = coords.to(device=device, dtype=torch.float32)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
-    @torch_no_compile(reason='Safe from CUDAGraph error', recursive=True)
+    # Processor.forward is intentionally kept eager. We selectively torch.compile()
+    # only stable, hot submodules (TemporalNet / CrossTransformer / head) and keep
+    # orchestration + SpatialNet calls outside the compiled graph to reduce graph
+    # breaks and compilation fragility.
+    @torch_no_compile(reason="Processor orchestrates eager + compiled submodules", recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
@@ -1545,12 +1702,19 @@ class Processor(nn.Module):
         temporal_tokens = temporal_raw.reshape(
             B, self.temporal_tokens, self.d_model
         ).contiguous()
+        # Avoid side-effectful bookkeeping inside torch.compile graphs.
         try:
-            total_tokens = self.spatial_tokens + self.temporal_tokens
-            fl_tok = (
-                2.0 * float(B) * float(self.in_dim) * float(total_tokens * self.d_model)
-            )
-            FLOP_PROFILER.add("Tokenizer", float(fl_tok))
+            import torch._dynamo as _dynamo
+
+            if not _dynamo.is_compiling():
+                total_tokens = self.spatial_tokens + self.temporal_tokens
+                fl_tok = (
+                    2.0
+                    * float(B)
+                    * float(self.in_dim)
+                    * float(total_tokens * self.d_model)
+                )
+                FLOP_PROFILER.add("Tokenizer", float(fl_tok))
         except Exception:
             pass
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
@@ -1587,12 +1751,15 @@ class Processor(nn.Module):
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         try:
-            hid = int(self.head_hidden_dim)
-            fl_head = (
-                2.0 * float(B) * float(self.d_model) * float(hid)
-                + 2.0 * float(B) * float(hid) * float(self.out_dim)
-            )
-            FLOP_PROFILER.add("Head", float(fl_head))
+            import torch._dynamo as _dynamo
+
+            if not _dynamo.is_compiling():
+                hid = int(self.head_hidden_dim)
+                fl_head = (
+                    2.0 * float(B) * float(self.d_model) * float(hid)
+                    + 2.0 * float(B) * float(hid) * float(self.out_dim)
+                )
+                FLOP_PROFILER.add("Head", float(fl_head))
         except Exception:
             pass
 
@@ -1627,6 +1794,21 @@ class Processor(nn.Module):
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         return flat.reshape(tokens.shape[0], *self.out_shape)
+
+
+class _CompiledDecode(nn.Module):
+
+    def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
+        super().__init__()
+        self._norm = weakref.proxy(norm)
+        self._head = weakref.proxy(head)
+        self._out_shape = tuple(int(x) for x in out_shape)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        tokens = self._norm(tokens)
+        pooled = tokens.mean(dim=1)
+        flat = self._head(pooled)
+        return flat.reshape(tokens.shape[0], *self._out_shape)
 
 
 class LossWeightPolicy(Protocol):
@@ -2458,14 +2640,12 @@ class Instance(nn.Module):
             length_bucket_multiple=bucket,
         ).to(self._device)
         self.controller = controller
-        try:
-            self.max_queue = int(getattr(config, "queue_size", 2))
-        except Exception:
-            self.max_queue = 2
-        self.input: Deque[Request] = deque()
-        self.output: Deque[Response] = deque()
         self.microbatch = 0
+        self.ctrl_microbatch = 0
         self._auto_microbatch_pending = True
+        self._auto_ctrl_microbatch_pending = True
+        self._decode_compiled: Optional[nn.Module] = None
+
         self._activation_checkpoint = True
         with contextlib.suppress(Exception):
             env_ac = os.environ.get("STNET_ACTIVATION_CHECKPOINT")
@@ -2481,6 +2661,17 @@ class Instance(nn.Module):
             )
         except Exception:
             pass
+
+        if self._device.type == "cpu":
+            with contextlib.suppress(Exception):
+                self.scaler = self.scaler.double()
+            with contextlib.suppress(Exception):
+                if self.linear_branch is not None:
+                    self.linear_branch = self.linear_branch.double()
+            with contextlib.suppress(Exception):
+                self.processor = self.processor.double()
+            with contextlib.suppress(Exception):
+                self.controller = self.controller.double()
         raw_mode = getattr(config, "compile_mode", "disabled")
         mode = str(raw_mode or "").strip()
         normalized_mode = mode.lower()
@@ -2499,23 +2690,40 @@ class Instance(nn.Module):
         self._pad_compiled_microbatch = bool(
             getattr(config, "pad_compiled_microbatch", True)
         ) and (not disable_compile)
-        self.processor = Gradient.compile(
-            self.processor,
-            mode=compile_mode_arg,
-            fullgraph=False,
-            dynamic=compile_dynamic,
-            backend="inductor",
-            disable=disable_compile,
-            **compile_kwargs,
-        )
-        self.controller = Gradient.compile(
-            self.controller,
-            mode=None,
-            fullgraph=False,
-            dynamic=False,
-            backend="inductor",
-            disable=True,
-        )
+        if not disable_compile:
+            with contextlib.suppress(Exception):
+                _raw_head = self.processor.head
+                _decode_mod = _CompiledDecode(self.processor.norm, _raw_head, self.out_shape).to(self._device)
+                self._decode_compiled = Gradient.compile(
+                    _decode_mod,
+                    mode=compile_mode_arg,
+                    fullgraph=False,
+                    dynamic=True,
+                    backend="inductor",
+                    disable=disable_compile,
+                    **compile_kwargs,
+                )
+
+            with contextlib.suppress(Exception):
+                self.processor.temporal_net = Gradient.compile(
+                    self.processor.temporal_net,
+                    mode=compile_mode_arg,
+                    fullgraph=False,
+                    dynamic=compile_dynamic,
+                    backend="inductor",
+                    disable=disable_compile,
+                    **compile_kwargs,
+                )
+            with contextlib.suppress(Exception):
+                self.processor.perception = Gradient.compile(
+                    self.processor.perception,
+                    mode=compile_mode_arg,
+                    fullgraph=False,
+                    dynamic=compile_dynamic,
+                    backend="inductor",
+                    disable=disable_compile,
+                    **compile_kwargs,
+                )
         self.__config = config
 
     @staticmethod
@@ -2602,8 +2810,14 @@ class Instance(nn.Module):
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
         x_scaled = self.scaler.normalize_x(x_raw)
+        # Only break graphs when we're actually compiling.
+        with contextlib.suppress(Exception):
+            import torch._dynamo as _dynamo
+            if _dynamo.is_compiling():
+                _dynamo.graph_break()
 
         device = self._device
+        amp_enabled = device.type != "cpu"
 
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
@@ -2618,12 +2832,16 @@ class Instance(nn.Module):
         has_supervision = labels_flat is not None and has_any_loss
         is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
         infer_mode = not is_train_path
+
         base_param = next(self.processor.parameters())
-        base_dtype = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None) or base_param.dtype
+        param_dtype = base_param.dtype
+        # A안: CPU(AMP 비사용)면 float64 고정. GPU는 파라미터 dtype(또는 사용자 지정 base_dtype) 사용.
+        base_dtype = (torch.float64 if not amp_enabled
+                      else (getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None) or param_dtype))
         features = x_scaled.to(device=device, dtype=base_dtype)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
-        b = features.shape[0]
-        amp_enabled = device.type != "cpu"
+        b = int(features.shape[0])
+
         if self._auto_microbatch_pending:
             try:
                 mb = self._auto_microbatch(features, device)
@@ -2631,13 +2849,8 @@ class Instance(nn.Module):
             except Exception:
                 self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
             self._auto_microbatch_pending = False
-        num_slices = (b + self.microbatch - 1) // self.microbatch
-        token_chunks: List[torch.Tensor] = []
-        context_chunks: List[torch.Tensor] = []
-        processed_ranges: List[Tuple[int, int]] = []
-        use_activation_checkpoint = bool(self._activation_checkpoint and not infer_mode)
-        self.input.clear()
-        self.output.clear()
+        mb = max(1, min(int(b), int(self.microbatch) or int(b)))
+
         if is_train_path:
             self.processor.train()
             self.controller.train()
@@ -2645,37 +2858,52 @@ class Instance(nn.Module):
             self.processor.eval()
             self.controller.eval()
 
-        def _process_one(req: Request) -> None:
-            x_slice = req.features
-            if req.slice_range is not None:
-                processed_ranges.append(req.slice_range)
-            if is_train_path:
-                ctx = Autocast.float(device) if amp_enabled else Autocast.suspend(device)
-                with ctx:
-                    tok, ctx_out = self.processor(x_slice)
+        use_activation_checkpoint = bool(self._activation_checkpoint and is_train_path)
+
+        def _graph_break() -> None:
+            with contextlib.suppress(Exception):
+                try:
+                    import torch._inductor as _inductor
+
+                    gb = getattr(_inductor, "graph_break", None)
+                    if callable(gb):
+                        gb()
+                        return
+                except Exception:
+                    pass
+                try:
+                    import torch._dynamo as _dynamo
+
+                    _dynamo.graph_break()
+                except Exception:
+                    pass
+
+        def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                return self.processor(inp)
+
+        token_chunks: List[torch.Tensor] = []
+        context_chunks: List[torch.Tensor] = []
+        for s in range(0, int(b), mb):
+            x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
+            if is_train_path and use_activation_checkpoint:
+                tok, ctx_out = activation_checkpoint(_encode, x_slice)
             else:
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(Gradient.inference(self.processor))
-                    stack.enter_context(Autocast.float(device) if amp_enabled else Autocast.suspend(device))
-                    tok, ctx_out = self.processor(x_slice)
+                if infer_mode:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(Gradient.inference(self.processor))
+                        tok, ctx_out = _encode(x_slice)
+                else:
+                    tok, ctx_out = _encode(x_slice)
             out_tokens = torch.nan_to_num(tok, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
             out_context = torch.nan_to_num(ctx_out, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
             token_chunks.append(out_tokens)
             context_chunks.append(out_context)
-
-        for idx in range(num_slices):
-            s = idx * self.microbatch
-            e = min(b, (idx + 1) * self.microbatch)
-            shard = self._cast_graph_safe(features[s:e], device, base_dtype)
-            self.input.append(Request(features=shard, slice_range=(s, e)))
-            if len(self.input) >= max(1, int(self.max_queue)):
-                _process_one(self.input.popleft())
-        while self.input:
-            _process_one(self.input.popleft())
         tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
         context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
         tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
         context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
+
         assembled = torch.nan_to_num(
             context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -2684,107 +2912,106 @@ class Instance(nn.Module):
                 self._cast_graph_safe(features, self._device, assembled.dtype)
             )
             assembled = assembled + bl
-        tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
 
-        mean32 = tokens.mean(dim=1, keepdim=True, dtype=torch.float32)
-        tokens_centered = (tokens - mean32.to(dtype=tokens.dtype)).contiguous()
-        ctrl_mb = 1
+        mean_dtype = torch.float32 if amp_enabled else tokens.dtype
+        mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
+        tokens_centered = (tokens - mean.to(dtype=tokens.dtype)).contiguous()
+
+        if self._auto_ctrl_microbatch_pending:
+            try:
+                mb2 = self._auto_microbatch(tokens_centered, device)
+                self.ctrl_microbatch = max(1, int(mb2))
+            except Exception:
+                self.ctrl_microbatch = 1
+            self._auto_ctrl_microbatch_pending = False
+        ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
+
+        refined_tokens: torch.Tensor
+        residual_context: torch.Tensor
 
         if infer_mode:
-            with contextlib.suppress(Exception):
-                import torch._dynamo as _dynamo
-
-                _dynamo.graph_break()
+            _graph_break()
 
             with Gradient.inference(self.controller):
 
                 def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device)
-                        if amp_enabled
-                        else Autocast.suspend(device)
-                    ):
+                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
                         out, _ = self.controller(chunk)
                     return out
 
                 if ctrl_mb < int(b):
                     refined_tokens = torch.cat(
-                        [
-                            _infer_controller(tokens_centered[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
+                        [_infer_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
                         dim=0,
                     )
                 else:
                     refined_tokens = _infer_controller(tokens_centered)
 
-            refined_tokens = torch.nan_to_num(
-                refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
-            )
-            decode_tokens = refined_tokens.detach().clone()
+            refined_tokens = torch.nan_to_num(refined_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+            decode_tokens = refined_tokens.detach()
+
+            _graph_break()
 
             with Gradient.inference(self.processor):
 
                 def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device)
-                        if amp_enabled
-                        else Autocast.suspend(device)
-                    ):
+                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                        dc = getattr(self, "_decode_compiled", None)
+                        if dc is not None:
+                            if (
+                                self._pad_compiled_microbatch
+                                and chunk.dim() == 3
+                                and chunk.shape[0] != ctrl_mb
+                                and chunk.shape[0] < ctrl_mb
+                            ):
+                                pad_n = int(ctrl_mb - chunk.shape[0])
+                                pad = torch.zeros(
+                                    (pad_n, chunk.shape[1], chunk.shape[2]),
+                                    device=chunk.device,
+                                    dtype=chunk.dtype,
+                                )
+                                out = dc(torch.cat([chunk, pad], dim=0))
+                                return out[: chunk.shape[0]]
+                            return dc(chunk)
                         return self.processor.decode(chunk, apply_norm=True)
 
                 if ctrl_mb < int(b):
                     residual_context = torch.cat(
-                        [
-                            _infer_decode(decode_tokens[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
+                        [_infer_decode(decode_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
                         dim=0,
                     )
                 else:
                     residual_context = _infer_decode(decode_tokens)
 
-            residual_context = torch.nan_to_num(
-                residual_context, nan=0.0, posinf=0.0, neginf=0.0
-            )
+            residual_context = torch.nan_to_num(residual_context, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             with torch.enable_grad():
-
-                with contextlib.suppress(Exception):
-                    import torch._dynamo as _dynamo
-
-                    _dynamo.graph_break()
+                _graph_break()
 
                 def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device)
-                        if amp_enabled
-                        else Autocast.suspend(device)
-                    ):
+                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
                         out, _ = self.controller(inp)
                     return out
 
                 def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    return activation_checkpoint(_global_tokens, chunk)
+                    return _global_tokens(chunk)
 
                 if ctrl_mb < int(b):
                     refined_tokens = torch.cat(
-                        [_run_controller(tokens_centered[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        [_run_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
                         dim=0,
                     )
                 else:
                     refined_tokens = _run_controller(tokens_centered)
-                refined_tokens = torch.nan_to_num(
-                    refined_tokens, nan=0.0, posinf=0.0, neginf=0.0
-                )
+
+                refined_tokens = torch.nan_to_num(refined_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+
+                _graph_break()
 
                 def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device)
-                        if amp_enabled
-                        else Autocast.suspend(device)
-                    ):
-                        return self.processor.decode(inp, apply_norm=True)
+                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                        dc = getattr(self, "_decode_compiled", None)
+                        return dc(inp) if dc is not None else self.processor.decode(inp, apply_norm=True)
 
                 def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
                     if use_activation_checkpoint:
@@ -2793,14 +3020,14 @@ class Instance(nn.Module):
 
                 if ctrl_mb < int(b):
                     residual_context = torch.cat(
-                        [_run_decode(refined_tokens[s:s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                        [_run_decode(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
                         dim=0,
                     )
                 else:
                     residual_context = _run_decode(refined_tokens)
-                residual_context = torch.nan_to_num(
-                    residual_context, nan=0.0, posinf=0.0, neginf=0.0
-                )
+
+                residual_context = torch.nan_to_num(residual_context, nan=0.0, posinf=0.0, neginf=0.0)
+
         residual = torch.nan_to_num(
             residual_context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -2876,36 +3103,6 @@ class Instance(nn.Module):
         if infer_mode and calibrate_output:
             z_cal = self.scaler.calibrate(z_pred_raw)
             pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
-
-        self.output.clear()
-        if processed_ranges:
-            offset = 0
-            for (s, e) in processed_ranges:
-                length = int(e - s)
-                if length <= 0:
-                    continue
-                start = offset
-                end = offset + length
-                self.output.append(
-                    Response(
-                        pred=pred[start:end],
-                        loss=loss_val,
-                        refined_tokens=refined_tokens[start:end],
-                        residual_context=residual_context[start:end],
-                        slice_range=(s, e),
-                    )
-                )
-                offset = end
-        else:
-            self.output.append(
-                Response(
-                    pred=pred,
-                    loss=loss_val,
-                    refined_tokens=refined_tokens,
-                    residual_context=residual_context,
-                    slice_range=(0, b),
-                )
-            )
 
         if td_input is not None:
             if hasattr(td_input, "copy"):
