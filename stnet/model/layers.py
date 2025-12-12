@@ -29,8 +29,6 @@ from torch.utils.checkpoint import checkpoint as _activation_checkpoint_base
 _DILATED_MASK_CACHE_MAX = 32
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 
-# Defensive cache guards (tunable via env).
-# NOTE: dilated masks are dense (L x L) bool tensors; caching large ones can eat GPU memory fast.
 _DILATED_MASK_CACHE_MAX_L = int(os.environ.get("STNET_DILATED_MASK_CACHE_MAX_L", "4096"))
 _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = int(
     os.environ.get("STNET_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", str(64 * 1024 * 1024))
@@ -446,8 +444,6 @@ class DilatedAttention(nn.Module):
         return (str(device.type), idx)
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        # Defensive: never cache extremely large dense masks.
-        # (They are O(L^2) and can quickly blow up GPU memory.)
         if int(L) > _DILATED_MASK_CACHE_MAX_L:
             return _get_dilated_mask(
                 int(L),
@@ -480,8 +476,6 @@ class DilatedAttention(nn.Module):
             device=device,
         )
 
-        # Defensive: skip caching large entries even if L is under the max-L cap.
-        # (element_size for bool is typically 1 byte, but we use tensor metadata anyway)
         with contextlib.suppress(Exception):
             mask_bytes = int(mask.numel()) * int(mask.element_size())
             if mask_bytes > _DILATED_MASK_CACHE_ENTRY_MAX_BYTES:
@@ -523,11 +517,8 @@ class DilatedAttention(nn.Module):
         if cached is not None:
             return cached
 
-        # Defensive: estimate the worst-case boolean mask size and avoid caching
-        # if it is too large (block_mask representation may still be heavy).
-        # This protects against pathological B/H/L growth across requests.
         try:
-            est_bool_bytes = int(B) * int(H) * int(L_q) * int(L_k)  # bool ~ 1 byte
+            est_bool_bytes = int(B) * int(H) * int(L_q) * int(L_k)
         except Exception:
             est_bool_bytes = _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES + 1
         skip_cache = est_bool_bytes > _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES
