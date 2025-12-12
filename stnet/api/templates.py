@@ -525,6 +525,13 @@ class BatchPolicy:
 
     device_margin: float = 0.8
     host_margin: float = 0.8
+    device_budget_ratio: float = 0.0
+    device_budget_min_bytes: int = 0
+    device_budget_max_bytes: Optional[int] = None
+
+    host_budget_ratio: float = 0.0
+    host_budget_min_bytes: int = 0
+    host_budget_max_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.sample_bytes = max(int(self.sample_bytes or 0), 0)
@@ -541,8 +548,19 @@ class BatchPolicy:
         if self.max_batch is not None:
             self.max_batch = max(int(self.max_batch), 1)
 
-        self.device_margin = float(self.device_margin)
-        self.host_margin = float(self.host_margin)
+        self.device_margin = max(0.0, min(1.0, float(self.device_margin)))
+        self.host_margin = max(0.0, min(1.0, float(self.host_margin)))
+
+        self.device_budget_ratio = max(0.0, min(1.0, float(self.device_budget_ratio or 0.0)))
+        self.host_budget_ratio = max(0.0, min(1.0, float(self.host_budget_ratio or 0.0)))
+
+        self.device_budget_min_bytes = max(int(self.device_budget_min_bytes or 0), 0)
+        self.host_budget_min_bytes = max(int(self.host_budget_min_bytes or 0), 0)
+
+        if self.device_budget_max_bytes is not None:
+            self.device_budget_max_bytes = max(int(self.device_budget_max_bytes), 0)
+        if self.host_budget_max_bytes is not None:
+            self.host_budget_max_bytes = max(int(self.host_budget_max_bytes), 0)
 
     def host_inflight_batches_per_proc(self) -> int:
         return (
@@ -552,37 +570,88 @@ class BatchPolicy:
             + 1
         )
 
+    @staticmethod
+    def _budget_bytes(
+        total_bytes: Optional[int],
+        *,
+        budget_ratio: float,
+        budget_min_bytes: int,
+        budget_max_bytes: Optional[int],
+    ) -> int:
+        total = int(total_bytes) if total_bytes is not None else 0
+        ratio = float(budget_ratio or 0.0)
+        base = int(float(total) * ratio) if total > 0 and ratio > 0.0 else 0
+        budget = max(int(budget_min_bytes or 0), base)
+        if (budget <= 0) and (total <= 0) and (budget_max_bytes is not None):
+            budget = int(budget_max_bytes)
+        elif budget_max_bytes is not None:
+            budget = min(budget, int(budget_max_bytes))
+        return max(0, int(budget))
+
     def suggest_batch(
         self,
         *,
         dev_free: Optional[int] = None,
         host_free: Optional[int] = None,
+        dev_total: Optional[int] = None,
+        host_total: Optional[int] = None,
         local_world_size: Optional[int] = None,
     ) -> int:
-        lw = int(local_world_size) if local_world_size is not None else int(self.local_world_size or 1)
+        lw = (
+            int(local_world_size)
+            if local_world_size is not None
+            else int(self.local_world_size or 1)
+        )
         if lw <= 0:
             lw = 1
 
+        use_dev_budget = (
+            self.device_budget_ratio > 0.0
+            or self.device_budget_min_bytes > 0
+            or self.device_budget_max_bytes is not None
+        )
+        use_host_budget = (
+            self.host_budget_ratio > 0.0
+            or self.host_budget_min_bytes > 0
+            or self.host_budget_max_bytes is not None
+        )
+
         dev_cap: Optional[int] = None
-        if dev_free is not None and dev_free > 0 and self.sample_bytes > 0:
-            dev_cap = int(
-                (float(dev_free) * float(self.device_margin))
-                // max(1, int(self.sample_bytes))
-            )
+        if dev_free is not None and dev_free >= 0 and self.sample_bytes > 0:
+            denom = max(1, int(self.sample_bytes))
+            usable = int(float(dev_free) * float(self.device_margin))
+            if use_dev_budget:
+                budget = self._budget_bytes(
+                    dev_total,
+                    budget_ratio=self.device_budget_ratio,
+                    budget_min_bytes=self.device_budget_min_bytes,
+                    budget_max_bytes=self.device_budget_max_bytes,
+                )
+                if budget > 0:
+                    usable = min(int(usable), int(budget))
+            dev_cap = int(max(0, usable) // denom)
 
         host_cap: Optional[int] = None
-        if host_free is not None and host_free > 0 and (self.host_sample_bytes or 0) > 0:
+        if host_free is not None and host_free >= 0 and (self.host_sample_bytes or 0) > 0:
             inflight = self.host_inflight_batches_per_proc()
             denom = (
                 max(1, int(self.host_sample_bytes or 0))
                 * max(1, inflight)
                 * max(1, lw)
             )
-            host_cap = int(
-                (float(host_free) * float(self.host_margin)) // denom
-            )
+            usable = int(float(host_free) * float(self.host_margin))
+            if use_host_budget:
+                budget = self._budget_bytes(
+                    host_total,
+                    budget_ratio=self.host_budget_ratio,
+                    budget_min_bytes=self.host_budget_min_bytes,
+                    budget_max_bytes=self.host_budget_max_bytes,
+                )
+                if budget > 0:
+                    usable = min(int(usable), int(budget))
+            host_cap = int(max(0, usable) // denom)
 
-        candidates = [c for c in (dev_cap, host_cap) if isinstance(c, int) and c > 0]
+        candidates = [c for c in (dev_cap, host_cap) if isinstance(c, int) and c >= 0]
         if not candidates:
             b = self.max_batch if self.max_batch is not None else self.min_batch
         else:

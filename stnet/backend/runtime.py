@@ -85,6 +85,8 @@ torch_safe_distributed()
 
 MB_DIV = 1024.0 * 1024.0
 
+_device_mem_get_info = Memory.device_mem_get_info
+
 
 try:
     from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
@@ -1203,6 +1205,64 @@ def epochs(
         if env_max is not None and str(env_max).strip():
             max_grad_accum = max(min_grad_accum, int(env_max))
 
+
+    dev_margin = 0.8
+    host_margin = 0.8
+
+    dev_budget_ratio = 1.0
+    dev_budget_min_bytes = 0
+    dev_budget_max_bytes = 8 * 1024 * 1024 * 1024
+
+    host_budget_ratio = 1.0
+    host_budget_min_bytes = 0
+    host_budget_max_bytes = 16 * 1024 * 1024 * 1024
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_MARGIN")
+        if v is not None and str(v).strip():
+            dev_margin = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_MARGIN")
+        if v is not None and str(v).strip():
+            host_margin = float(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            dev_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_max_bytes = int(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            host_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_max_bytes = int(v)
+
+    dev_margin = max(0.0, min(1.0, float(dev_margin)))
+    host_margin = max(0.0, min(1.0, float(host_margin)))
+
+    dev_budget_ratio = max(0.0, min(1.0, float(dev_budget_ratio)))
+    host_budget_ratio = max(0.0, min(1.0, float(host_budget_ratio)))
+
+    dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
+    host_budget_min_bytes = max(0, int(host_budget_min_bytes))
+    dev_budget_max_bytes = max(0, int(dev_budget_max_bytes))
+    host_budget_max_bytes = max(0, int(host_budget_max_bytes))
+
     tpl: Optional[BatchPolicy] = None
     if est_bytes_per_sample is not None and est_bytes_per_sample > 0 and max_grad_accum > 0:
         try:
@@ -1220,36 +1280,41 @@ def epochs(
                 max_concurrency=1,
                 min_batch=1,
                 max_batch=max_grad_accum,
-                host_margin=0.8,
-                device_margin=0.8,
+                host_margin=float(host_margin),
+                device_margin=float(dev_margin),
+                host_budget_ratio=float(host_budget_ratio),
+                host_budget_min_bytes=int(host_budget_min_bytes),
+                host_budget_max_bytes=int(host_budget_max_bytes),
+                device_budget_ratio=float(dev_budget_ratio),
+                device_budget_min_bytes=int(dev_budget_min_bytes),
+                device_budget_max_bytes=int(dev_budget_max_bytes),
             )
         except Exception:
             tpl = None
 
     safe_host_bytes: Optional[int] = None
+    safe_host_total: Optional[int] = None
     safe_dev_bytes: Optional[int] = None
+    safe_dev_total: Optional[int] = None
     max_from_mem: Optional[int] = None
     if tpl is not None:
         try:
             host_mem = Memory.available()
-            if host_mem is not None and host_mem > 0:
+            if host_mem is not None and host_mem >= 0:
                 safe_host_bytes = int(host_mem)
+            with contextlib.suppress(Exception):
+                host_total = Memory.total()
+                if host_total is not None and host_total > 0:
+                    safe_host_total = int(host_total)
 
-            if device.type == "cuda" and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    free_dev, _total_dev = torch.cuda.mem_get_info(device=device)
-                    safe_dev_bytes = int(free_dev)
-            elif device.type == "xpu" and hasattr(torch, "xpu"):
-                with contextlib.suppress(Exception):
-                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                    if callable(mem_get_info):
-                        free_dev, _total_dev = mem_get_info(device)
-                        safe_dev_bytes = int(free_dev)
+            safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
 
             if safe_host_bytes is not None or safe_dev_bytes is not None:
                 total_samples_cap = tpl.suggest_batch(
                     dev_free=safe_dev_bytes,
                     host_free=safe_host_bytes,
+                    dev_total=safe_dev_total,
+                    host_total=safe_host_total,
                 )
                 if total_samples_cap > 0:
                     max_from_mem = max(
@@ -1257,7 +1322,9 @@ def epochs(
                     )
         except Exception:
             safe_host_bytes = None
+            safe_host_total = None
             safe_dev_bytes = None
+            safe_dev_total = None
 
     if max_from_mem is not None:
         max_grad_accum = max(
@@ -1271,13 +1338,19 @@ def epochs(
     print(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} ",
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, ",
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})",
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
+        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
+        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
+        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})",
         flush=True,
     )
     logging.info(
         f"[epochs] grad_accum_steps initial={grad_accum_steps} "
         f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, "
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes})"
+        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
+        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
+        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
+        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})"
     )
 
     proc = None

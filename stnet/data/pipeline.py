@@ -37,6 +37,9 @@ def _sync_device(device: torch.device) -> None:
         pass
 
 
+_device_mem_get_info = Memory.device_mem_get_info
+
+
 def _sample_size(
     _x_cpu: torch.Tensor, _y_cpu: Optional[torch.Tensor]
 ) -> int:
@@ -60,34 +63,17 @@ def _random_batches(_sample_bytes: int, _device: torch.device, _N: int) -> Seque
     with contextlib.suppress(Exception):
         host_free = int(Memory.available())
 
-    dev_free: Optional[int] = None
-    if dev_t == "cuda" and torch.cuda.is_available():
-        with contextlib.suppress(Exception):
-            free, _ = torch.cuda.mem_get_info(device=_device)
-            dev_free = int(free)
-    elif dev_t == "xpu" and hasattr(torch, "xpu"):
-        with contextlib.suppress(Exception):
-            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-            if callable(mem_get_info):
-                free, _ = mem_get_info(_device)
-                dev_free = int(free)
-    elif dev_t == "mps":
-        dev_free = None
+    dev_free, _ = _device_mem_get_info(_device)
 
-    effective_free: Optional[int]
-    if dev_t in {"cuda", "xpu", "mps"}:
-        if host_free is not None and dev_free is not None:
-            effective_free = min(host_free, dev_free)
-        else:
-            effective_free = host_free if dev_free is None else dev_free
-    else:
+    effective_free: Optional[int] = None
+    if host_free is not None:
         effective_free = host_free
+    if dev_free is not None:
+        effective_free = dev_free if effective_free is None else min(effective_free, dev_free)
 
-    if effective_free is not None and effective_free > 0:
-        capB = max(
-            1,
-            int((effective_free * 0.80) // max(_sample_bytes * 4, 1)),
-        )
+    if effective_free is not None:
+        effective_free = max(0, int(effective_free))
+        capB = max(1, int((effective_free * 0.80) // max(_sample_bytes * 4, 1)))
     capB = max(1, min(capB, int(_N)))
     base = [
         capB // 8,
@@ -217,6 +203,63 @@ def _batch_interval(
             _wp = None
             _max_conc, _streams, _lws = (1, 1, 1)
 
+    dev_margin = 0.90
+    host_margin = 0.10
+
+    dev_budget_ratio = 1.0
+    dev_budget_min_bytes = 0
+    dev_budget_max_bytes = 8 * 1024 * 1024 * 1024
+
+    host_budget_ratio = 1.0
+    host_budget_min_bytes = 0
+    host_budget_max_bytes = 16 * 1024 * 1024 * 1024
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_MARGIN")
+        if v is not None and str(v).strip():
+            dev_margin = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_MARGIN")
+        if v is not None and str(v).strip():
+            host_margin = float(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            dev_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_DEVICE_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            dev_budget_max_bytes = int(v)
+
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_RATIO")
+        if v is not None and str(v).strip():
+            host_budget_ratio = float(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MIN_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_min_bytes = int(v)
+    with contextlib.suppress(Exception):
+        v = os.environ.get("STNET_HOST_BUDGET_MAX_BYTES")
+        if v is not None and str(v).strip():
+            host_budget_max_bytes = int(v)
+
+    dev_margin = max(0.0, min(1.0, float(dev_margin)))
+    host_margin = max(0.0, min(1.0, float(host_margin)))
+
+    dev_budget_ratio = max(0.0, min(1.0, float(dev_budget_ratio)))
+    host_budget_ratio = max(0.0, min(1.0, float(host_budget_ratio)))
+
+    dev_budget_min_bytes = max(0, int(dev_budget_min_bytes))
+    host_budget_min_bytes = max(0, int(host_budget_min_bytes))
+    dev_budget_max_bytes = max(0, int(dev_budget_max_bytes))
+    host_budget_max_bytes = max(0, int(host_budget_max_bytes))
+
     tpl = BatchPolicy(
         sample_bytes=per_sample,
         host_sample_bytes=sbytes,
@@ -228,47 +271,36 @@ def _batch_interval(
         local_world_size=_lws,
         min_batch=1,
         max_batch=B_cap,
-        device_margin=0.90,
-        host_margin=0.10,
+        device_margin=float(dev_margin),
+        host_margin=float(host_margin),
+        device_budget_ratio=float(dev_budget_ratio),
+        device_budget_min_bytes=int(dev_budget_min_bytes),
+        device_budget_max_bytes=int(dev_budget_max_bytes),
+        host_budget_ratio=float(host_budget_ratio),
+        host_budget_min_bytes=int(host_budget_min_bytes),
+        host_budget_max_bytes=int(host_budget_max_bytes),
     )
 
-    dev_free: Optional[int] = None
+    dev_free, dev_total = _device_mem_get_info(_dev)
     host_free: Optional[int] = None
-
-    try:
-        accelerator = getattr(torch, "accelerator", None)
-        mem_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
-        mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
-        if callable(mem_get_info):
-            info = mem_get_info(_dev)
-            if isinstance(info, (list, tuple)) and len(info) >= 1:
-                dev_free = int(info[0])
-            elif isinstance(info, dict):
-                dev_free = int(info.get("free", 0) or 0)
-    except Exception:
-        dev_free = None
-
-    if dev_free is None:
-        try:
-            if _dev_type == "cuda" and torch.cuda.is_available():
-                dev_free, _ = torch.cuda.mem_get_info(device=_dev)
-            elif _dev_type == "xpu":
-                mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                if callable(mem_get_info):
-                    dev_free, _ = mem_get_info(_dev)
-        except Exception:
-            dev_free = None
+    host_total: Optional[int] = None
 
     try:
         host_avail = int(Memory.available())
         if host_avail > 0:
             host_free = host_avail
+        with contextlib.suppress(Exception):
+            _ht = Memory.total()
+            if _ht is not None and _ht > 0:
+                host_total = int(_ht)
     except Exception:
         host_free = None
 
     cap_from_mem = tpl.suggest_batch(
         dev_free=dev_free,
         host_free=host_free,
+        dev_total=dev_total,
+        host_total=host_total,
         local_world_size=_lws,
     )
     if cap_from_mem > 0:
@@ -532,18 +564,7 @@ def fetch(
             if host_avail <= 0:
                 return int(_pf)
 
-            dev_free: Optional[int] = None
-            dev_t = getattr(_device_obj, "type", "cpu")
-            if dev_t == "cuda" and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    free_dev, _ = torch.cuda.mem_get_info(device=_device_obj)
-                    dev_free = int(free_dev)
-            elif dev_t == "xpu" and hasattr(torch, "xpu"):
-                with contextlib.suppress(Exception):
-                    mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                    if callable(mem_get_info):
-                        free_dev, _ = mem_get_info(_device_obj)
-                        dev_free = int(free_dev)
+            dev_free, _ = _device_mem_get_info(_device_obj)
 
             if dev_free is not None:
                 effective_avail = min(host_avail, dev_free)
