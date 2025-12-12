@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import logging
 import math
@@ -1213,6 +1214,7 @@ def epochs(
     # from the observed per-sample bytes and the minimum accumulation requirement.
     # This avoids hard-coding fixed caps like 8/16GB while still preventing
     # "data eats all RAM/VRAM" behaviors on very large systems.
+    # Soft slack for auto-derived budgets (only used when budgets are unset).
     budget_slack = 1.25
     with contextlib.suppress(Exception):
         v = os.environ.get("STNET_BUDGET_SLACK")
@@ -1277,6 +1279,11 @@ def epochs(
     host_budget_max_bytes = (
         None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
     )
+    # Treat 0 (or less) as "unset/disabled" for max-bytes, to avoid confusing states.
+    if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
+        dev_budget_max_bytes = None
+    if host_budget_max_bytes is not None and int(host_budget_max_bytes) <= 0:
+        host_budget_max_bytes = None
 
     tpl: Optional[BatchPolicy] = None
     if est_bytes_per_sample is not None and est_bytes_per_sample > 0 and max_grad_accum > 0:
@@ -1341,17 +1348,21 @@ def epochs(
                         1, int(min_grad_accum)
                     )
 
+                    new_dev_cap: Optional[int] = tpl.device_budget_max_bytes
+                    new_host_cap: Optional[int] = tpl.host_budget_max_bytes
+
                     # Device budget: cap data bytes on device.
-                    if tpl.device_budget_max_bytes is None and int(tpl.sample_bytes or 0) > 0:
+                    if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
                         base_dev = int(tpl.sample_bytes) * int(target_total_samples)
                         cap_dev = int(float(base_dev) * float(budget_slack))
                         # Never exceed known total if available.
                         if safe_dev_total is not None and int(safe_dev_total) > 0:
                             cap_dev = min(int(cap_dev), int(safe_dev_total))
-                        tpl.device_budget_max_bytes = max(0, int(cap_dev))
+                        cap_dev = max(0, int(cap_dev))
+                        new_dev_cap = None if cap_dev <= 0 else cap_dev
 
                     # Host budget: cap data bytes staged in host inflight queues.
-                    if tpl.host_budget_max_bytes is None and int(tpl.host_sample_bytes or 0) > 0:
+                    if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
                         inflight = int(tpl.host_inflight_batches_per_proc())
                         lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
                         base_host = int(tpl.host_sample_bytes) * max(1, inflight) * max(
@@ -1360,7 +1371,30 @@ def epochs(
                         cap_host = int(float(base_host) * float(budget_slack))
                         if safe_host_total is not None and int(safe_host_total) > 0:
                             cap_host = min(int(cap_host), int(safe_host_total))
-                        tpl.host_budget_max_bytes = max(0, int(cap_host))
+                        cap_host = max(0, int(cap_host))
+                        new_host_cap = None if cap_host <= 0 else cap_host
+
+                    # Rebuild tpl via dataclasses.replace to avoid bypassing dataclass invariants.
+                    if (new_dev_cap != tpl.device_budget_max_bytes) or (new_host_cap != tpl.host_budget_max_bytes):
+                        tpl = dataclasses.replace(
+                            tpl,
+                            device_budget_max_bytes=new_dev_cap,
+                            host_budget_max_bytes=new_host_cap,
+                        )
+                        with contextlib.suppress(Exception):
+                            _LOGGER.info(
+                                "[epochs] auto-derived budgets: dev_max=%s host_max=%s slack=%.3f "
+                                "(sample=%s host_sample=%s per_batch=%s min_accum=%s inflight=%s lws=%s)",
+                                str(new_dev_cap),
+                                str(new_host_cap),
+                                float(budget_slack),
+                                str(getattr(tpl, "sample_bytes", None)),
+                                str(getattr(tpl, "host_sample_bytes", None)),
+                                str(per_batch),
+                                str(min_grad_accum),
+                                str(getattr(tpl, "host_inflight_batches_per_proc", lambda: None)()),
+                                str(getattr(tpl, "local_world_size", None)),
+                            )
                 except Exception:
                     # If derivation fails, keep budgets unset (margin-only behavior).
                     pass

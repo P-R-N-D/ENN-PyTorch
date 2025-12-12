@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import dataclasses
 import math
 import os
 import random
@@ -212,6 +213,7 @@ def _batch_interval(
     #   - estimated pipeline inflight (prefetch/streams/workers)
     # This avoids hard-coding fixed caps like 8/16GB while still guarding against
     # pathological "auto-batch uses everything" behavior on large systems.
+    # Soft slack for auto-derived budgets (only used when budgets are unset).
     budget_slack = 1.25
     with contextlib.suppress(Exception):
         v = os.environ.get("STNET_BUDGET_SLACK")
@@ -276,6 +278,11 @@ def _batch_interval(
     host_budget_max_bytes = (
         None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
     )
+    # Treat 0 (or less) as "unset/disabled" for max-bytes.
+    if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
+        dev_budget_max_bytes = None
+    if host_budget_max_bytes is not None and int(host_budget_max_bytes) <= 0:
+        host_budget_max_bytes = None
 
     tpl = BatchPolicy(
         sample_bytes=per_sample,
@@ -317,6 +324,10 @@ def _batch_interval(
     except Exception:
         host_free = None
 
+    # Cache probe results to optionally reuse later for initial H2D med estimate.
+    probe_bs_cache: Optional[int] = None
+    med_probe_cache: Optional[float] = None
+
     # If budgets were not explicitly configured, derive a conservative cap.
     # We cap the *batch size* in samples by estimating how many samples are needed
     # to keep the pipeline fed (inflight batches), then converting to bytes.
@@ -346,11 +357,14 @@ def _batch_interval(
                     _h2d_counter(x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1)
                 )
 
-            if med_probe > 0.0:
+            # Validate probe result (avoid NaN/inf/<=0).
+            if (med_probe is not None) and (isinstance(med_probe, (float, int))) and math.isfinite(float(med_probe)) and float(med_probe) > 0.0:
                 # Assume near-linear scaling: ms ~ bs. Choose bs so ms ~= target_ms.
                 # bs_est = ceil(target_ms * probe_bs / med_probe)
                 bs_est = int(math.ceil((target_ms * float(probe_bs)) / float(med_probe)))
                 target_batch_samples = max(1, min(int(B_cap), bs_est))
+                probe_bs_cache = int(probe_bs)
+                med_probe_cache = float(med_probe)
             else:
                 # Fallback to a byte-based target (aim for ~64MiB per transfer).
                 target_bytes = 64 * 1024 * 1024
@@ -359,21 +373,33 @@ def _batch_interval(
                     min(int(B_cap), int(target_bytes // max(1, int(tpl.sample_bytes)))),
                 )
 
-            if tpl.device_budget_max_bytes is None:
+            new_dev_cap: Optional[int] = tpl.device_budget_max_bytes
+            new_host_cap: Optional[int] = tpl.host_budget_max_bytes
+
+            if new_dev_cap is None:
                 base_dev = int(tpl.sample_bytes) * int(target_batch_samples)
                 cap_dev = int(float(base_dev) * float(budget_slack))
                 if dev_total is not None and int(dev_total) > 0:
                     cap_dev = min(int(cap_dev), int(dev_total))
-                tpl.device_budget_max_bytes = max(0, int(cap_dev))
+                cap_dev = max(0, int(cap_dev))
+                new_dev_cap = None if cap_dev <= 0 else cap_dev
 
-            if tpl.host_budget_max_bytes is None and int(tpl.host_sample_bytes or 0) > 0:
+            if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
                 base_host = int(tpl.host_sample_bytes) * max(1, inflight) * max(
                     1, lw
                 ) * int(target_batch_samples)
                 cap_host = int(float(base_host) * float(budget_slack))
                 if host_total is not None and int(host_total) > 0:
                     cap_host = min(int(cap_host), int(host_total))
-                tpl.host_budget_max_bytes = max(0, int(cap_host))
+                cap_host = max(0, int(cap_host))
+                new_host_cap = None if cap_host <= 0 else cap_host
+
+            if (new_dev_cap != tpl.device_budget_max_bytes) or (new_host_cap != tpl.host_budget_max_bytes):
+                tpl = dataclasses.replace(
+                    tpl,
+                    device_budget_max_bytes=new_dev_cap,
+                    host_budget_max_bytes=new_host_cap,
+                )
         except Exception:
             pass
 
@@ -401,7 +427,11 @@ def _batch_interval(
         B = min(candidates[-1], B_cap)
     else:
         B = min(64, B_cap)
-    med = _h2d_counter(x_cpu, y_cpu, _dev, B)
+    # Reuse probe result when possible to avoid redundant H2D measurement.
+    if probe_bs_cache is not None and med_probe_cache is not None and int(B) == int(probe_bs_cache):
+        med = float(med_probe_cache)
+    else:
+        med = _h2d_counter(x_cpu, y_cpu, _dev, B)
     while med > 0.0 and med < _tmin_ms and B < B_cap:
         B_next = min(B * 2, B_cap)
         med_next = _h2d_counter(x_cpu, y_cpu, _dev, B_next)
