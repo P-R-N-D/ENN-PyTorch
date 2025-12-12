@@ -487,7 +487,9 @@ def _batch_interval(
 def _is_source_spec(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
-    if "format" not in obj or "path" not in obj:
+    if "path" not in obj:
+        return False
+    if "format" not in obj and "kind" not in obj:
         return False
     p = obj.get("path")
     try:
@@ -507,7 +509,12 @@ def dataset(
     if not isinstance(source, Mapping):
         raise TypeError(f"dataset expects a Source mapping, got {type(source)}")
 
-    format = str(source.get("format"))
+    format = source.get("format")
+    if format is None:
+        format = source.get("kind")
+    if format is None:
+        raise ValueError("Source['format'] or Source['kind'] must be provided")
+    format = str(format)
     if format != "memmap":
         raise ValueError(f"Unsupported source format: {format!r}")
     path = os.fspath(source.get("path", ""))
