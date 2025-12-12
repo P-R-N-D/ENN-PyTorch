@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import math
 import os
 import random
 import contextlib
@@ -325,9 +326,38 @@ def _batch_interval(
         try:
             inflight = int(tpl.host_inflight_batches_per_proc())
             lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
-            # A small sample target that scales with inflight, but still bounded by B_cap.
-            # This is meant to prevent huge auto-batches on large-memory machines.
-            target_batch_samples = max(1, min(int(B_cap), max(64, inflight * 32)))
+            # Derive a per-batch sample target using a quick H2D profile.
+            #
+            # Goal: keep per-batch H2D transfer time within a reasonable range
+            # (same objective as the later auto-batch loop that targets [_tmin_ms, _tmax_ms]),
+            # without hard-coding caps like 8/16GB or magic sample counts.
+            #
+            # We keep the probe cheap: few steps, minimal warmup.
+            target_ms = float(
+                max(
+                    float(_tmin_ms),
+                    min(float(_tmax_ms), 0.5 * (float(_tmin_ms) + float(_tmax_ms))),
+                )
+            )
+            probe_bs = max(1, min(int(B_cap), 64))
+            med_probe = 0.0
+            with contextlib.suppress(Exception):
+                med_probe = float(
+                    _h2d_counter(x_cpu, y_cpu, _dev, probe_bs, _steps=4, _warmup=1)
+                )
+
+            if med_probe > 0.0:
+                # Assume near-linear scaling: ms ~ bs. Choose bs so ms ~= target_ms.
+                # bs_est = ceil(target_ms * probe_bs / med_probe)
+                bs_est = int(math.ceil((target_ms * float(probe_bs)) / float(med_probe)))
+                target_batch_samples = max(1, min(int(B_cap), bs_est))
+            else:
+                # Fallback to a byte-based target (aim for ~64MiB per transfer).
+                target_bytes = 64 * 1024 * 1024
+                target_batch_samples = max(
+                    1,
+                    min(int(B_cap), int(target_bytes // max(1, int(tpl.sample_bytes)))),
+                )
 
             if tpl.device_budget_max_bytes is None:
                 base_dev = int(tpl.sample_bytes) * int(target_batch_samples)
