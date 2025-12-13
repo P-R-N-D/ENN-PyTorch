@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import collections.abc as _abc
 import math
 import os
 import contextlib
@@ -32,7 +33,7 @@ class WorkerPolicy:
     @staticmethod
     def _cpu_count() -> int:
         try:
-            return len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+            return len(os.sched_getaffinity(0))
         except Exception:
             return os.cpu_count() or 1
 
@@ -170,6 +171,206 @@ class WorkerPolicy:
                 pass
 
 
+@dataclass(slots=True)
+class LoaderPolicy:
+    max_batches_accel: int = 4
+    max_batches_cpu: int = 2
+    soft_cap_multiplier: int = 2
+
+    def hard_inflight_batches(self, device: torch.device | str) -> int:
+        dev = torch.device(device) if not isinstance(device, torch.device) else device
+        if dev.type in ("cuda", "xpu", "mps"):
+            return max(1, int(self.max_batches_accel))
+        return max(1, int(self.max_batches_cpu))
+
+    def apply_soft_limits(self, wp: WorkerPolicy, device: torch.device | str) -> WorkerPolicy:
+        hard = int(self.hard_inflight_batches(device))
+        soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
+
+        num_workers = max(0, int(getattr(wp, "num_workers", 0) or 0))
+        if num_workers > soft_cap:
+            wp.num_workers = max(1, int(soft_cap))
+            num_workers = int(wp.num_workers)
+        prefetch_factor = max(1, int(getattr(wp, "prefetch_factor", 1) or 1))
+        prebatch = max(0, int(getattr(wp, "prebatch", 0) or 0))
+
+        inflight = num_workers * prefetch_factor + prebatch
+        if inflight > soft_cap:
+            budget = max(1, soft_cap - prebatch)
+            if num_workers > 0:
+                prefetch_factor = max(1, min(prefetch_factor, budget // max(1, num_workers)))
+            else:
+                prefetch_factor = 1
+            wp.prefetch_factor = int(prefetch_factor)
+
+            inflight = num_workers * int(wp.prefetch_factor) + prebatch
+            if inflight > soft_cap:
+                wp.prebatch = max(0, int(soft_cap - num_workers * int(wp.prefetch_factor)))
+
+        with contextlib.suppress(Exception):
+            wp.max_concurrency = max(1, min(int(getattr(wp, "max_concurrency", 1) or 1), soft_cap))
+        return wp
+
+    def wrap_input(self, loader: Any, device: torch.device | str, *, name: str) -> Any:
+        from ..data.nodes import BufferedLoader
+
+        max_batches = self.hard_inflight_batches(device)
+        return BufferedLoader(loader, max_batches=max_batches, name=name)
+
+
+@dataclass
+class Session:
+    sources: Any
+    device: torch.device | str
+
+    val_frac: float = 0.0
+    non_blocking_copy: bool = True
+    labels_dtype: Optional[torch.dtype] = None
+    sanitize: bool = True
+    flatten_features: bool = True
+
+    train_weights: Optional[Mapping[str, float]] = None
+    val_weights: Optional[Mapping[str, float]] = None
+
+    worker_policy: Optional[WorkerPolicy] = None
+    loader_policy: LoaderPolicy = field(default_factory=LoaderPolicy)
+
+    raw_training_loader: Any = None
+    raw_validation_loader: Any = None
+
+    training_loader: Any = None
+    validation_loader: Any = None
+    disposable: Any = None
+
+    _opened: bool = False
+
+    def open(
+        self,
+        *,
+        train_state: Optional[Dict[str, Any]] = None,
+        val_state: Optional[Dict[str, Any]] = None,
+    ) -> "Session":
+        from ..data.pipeline import fetch
+
+        dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+
+        wp = self.worker_policy or WorkerPolicy.autotune()
+        wp = self.loader_policy.apply_soft_limits(wp, dev)
+        self.worker_policy = wp
+
+        dl = fetch(
+            sources=self.sources,
+            device=dev,
+            val_frac=float(self.val_frac),
+            non_blocking_copy=bool(self.non_blocking_copy),
+            labels_dtype=self.labels_dtype,
+            sanitize=bool(self.sanitize),
+            flatten_features=bool(self.flatten_features),
+            train_weights=self.train_weights,
+            val_weights=self.val_weights,
+            worker_policy=wp,
+        )
+
+        train_loader = dl.get("training_loader")
+        val_loader = dl.get("validation_loader")
+        self.disposable = dl.get("disposable")
+
+        self.raw_training_loader = train_loader
+        self.raw_validation_loader = val_loader
+
+        if train_state and train_loader is not None and hasattr(train_loader, "load_state_dict"):
+            try:
+                train_loader.load_state_dict(train_state)
+            except Exception:
+                pass
+        if val_state and val_loader is not None and hasattr(val_loader, "load_state_dict"):
+            try:
+                val_loader.load_state_dict(val_state)
+            except Exception:
+                pass
+
+        self.training_loader = (
+            self.loader_policy.wrap_input(train_loader, dev, name="train-input")
+            if train_loader is not None
+            else None
+        )
+        self.validation_loader = (
+            self.loader_policy.wrap_input(val_loader, dev, name="val-input")
+            if val_loader is not None
+            else None
+        )
+
+        self._opened = True
+        return self
+
+    def close(self) -> None:
+        if not self._opened:
+            return
+        keep = getattr(self, "disposable", None)
+        if keep is not None:
+            try:
+                keep.cleanup()
+            except Exception:
+                pass
+        self._opened = False
+
+    def __enter__(self) -> "Session":
+        return self.open()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+
+class LazyDict(_abc.Mapping):
+    def __init__(self, keys: Any, getter: Any, *, name: str = "LazyDict", cache: bool = False) -> None:
+        self._keys = keys
+        self._getter = getter
+        self._name = str(name or "LazyDict")
+        self._cache_enabled = bool(cache)
+        self._cache: Optional[dict[Any, Any]] = {} if self._cache_enabled else None
+
+    def __len__(self) -> int:
+        return int(len(self._keys))
+
+    def __iter__(self):
+        return iter(self._keys)
+
+    def __getitem__(self, key: Any) -> Any:
+        if self._cache is not None and key in self._cache:
+            return self._cache[key]
+        v = self._getter(key)
+        if self._cache is not None:
+            self._cache[key] = v
+        return v
+
+    def __contains__(self, key: object) -> bool:
+        try:
+            return key in self._keys
+        except Exception:
+            return False
+
+    def keys(self):
+        return self._keys
+
+    def values(self):
+        return (self[k] for k in self._keys)
+
+    def items(self):
+        return ((k, self[k]) for k in self._keys)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def collect(self) -> dict[Any, Any]:
+        return {k: self[k] for k in self._keys}
+
+    def materialize(self) -> dict[Any, Any]:
+        return self.collect()
+
+
 @dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
@@ -178,6 +379,12 @@ class Dataset(Generic[TExtra]):
     float_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
     int_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
     float8_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
+    input_data: Any = None
+    output_data: Any = None
+
+    feature_dtype: torch.dtype = torch.float32
+    label_float_dtype: torch.dtype = torch.float32
+
     scale_max_abs: Optional[float] = None
     scale_min_abs: Optional[float] = None
     scale_is_integral: Optional[bool] = None
@@ -186,6 +393,7 @@ class Dataset(Generic[TExtra]):
 
     def __post_init__(self) -> None:
         self._refresh_device_info()
+        self._refresh_dtypes_from_env()
 
     def _refresh_device_info(self) -> None:
         dev = torch.device(self.device)
@@ -255,7 +463,7 @@ class Dataset(Generic[TExtra]):
         if major < 9:
             return (False, f"FP8 requires sm_90+ (found sm_{major}{minor})")
         try:
-            import transformer_engine.pytorch as te  # type: ignore
+            import transformer_engine.pytorch as te
             backend = getattr(te, "__name__", "transformer_engine.pytorch")
             return (True, backend)
         except Exception:
@@ -506,6 +714,425 @@ class Dataset(Generic[TExtra]):
     def get_stat(self, name: str) -> Optional[torch.Tensor]:
         value = self.stats.get(name)
         return value.detach().clone() if isinstance(value, torch.Tensor) else None
+
+
+    @staticmethod
+    def _dtype_from_env(var: str, default: torch.dtype) -> torch.dtype:
+        raw = os.environ.get(var)
+        if raw is None:
+            return default
+        name = str(raw).strip()
+        if not name:
+            return default
+        if name.startswith("torch."):
+            name = name.split(".", 1)[1]
+        dt = getattr(torch, name, None)
+        return dt if isinstance(dt, torch.dtype) else default
+
+    @staticmethod
+    def _normalize_float_dtype(dtype: torch.dtype) -> torch.dtype:
+        try:
+            if torch.is_floating_point(torch.empty((), dtype=dtype)):
+                return dtype
+        except Exception:
+            pass
+        return torch.float32
+
+    def _refresh_dtypes_from_env(self) -> None:
+        self.feature_dtype = self._normalize_float_dtype(
+            self._dtype_from_env("STNET_FEATURE_DTYPE", getattr(self, "feature_dtype", torch.float32))
+        )
+        self.label_float_dtype = self._normalize_float_dtype(
+            self._dtype_from_env("STNET_LABEL_DTYPE", getattr(self, "label_float_dtype", torch.float32))
+        )
+
+    @staticmethod
+    def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        return t.to(dtype=dtype)
+
+    @staticmethod
+    def _assert_finites(tensor: torch.Tensor, name: str) -> torch.Tensor:
+        if torch.is_floating_point(tensor) or torch.is_complex(tensor):
+            if not torch.isfinite(tensor).all():
+                raise ValueError(f"{name} tensor contains non-finite values")
+        return tensor
+
+    def _preprocess_x(self, x_tuple: Any) -> torch.Tensor:
+        import math
+        from ..data.datatype import to_tuple
+
+        try:
+            values = [float(v) for v in to_tuple(x_tuple)]
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "preprocess: feature tuples must contain only numeric values. "
+                f"Invalid value={x_tuple!r}"
+            ) from exc
+        for value in values:
+            try:
+                if not math.isfinite(value):
+                    raise ValueError("preprocess: feature tuples must be finite")
+            except TypeError as exc:
+                raise TypeError(
+                    "preprocess: feature tuples must contain only numeric finite values. "
+                    f"Invalid value={value!r}"
+                ) from exc
+        tensor = torch.as_tensor(values, dtype=self.feature_dtype)
+        return self._assert_finites(tensor, "feature")
+
+    def _preprocess_y(self, value: Any) -> torch.Tensor:
+        from ..data.datatype import to_torch_tensor
+
+        try:
+            tensor = to_torch_tensor(value)
+        except Exception:
+            tensor = None
+        if not isinstance(tensor, torch.Tensor):
+            tensor = torch.as_tensor(value)
+        t = tensor.detach()
+        if t.is_floating_point() or t.is_complex():
+            t = self._to_dtype(t, self.label_float_dtype)
+        else:
+            t = self._to_dtype(t, torch.int64)
+        return t
+
+    def _preprocess_batch(self, x_value: Any, y_value: Any):
+        from contextlib import suppress
+        from ..data.datatype import to_torch_tensor
+
+        if isinstance(x_value, torch.Tensor):
+            feature_tensor: Any = x_value
+        else:
+            feature_tensor = None
+            for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
+                if not hasattr(x_value, attr):
+                    continue
+                with suppress(Exception):
+                    candidate = getattr(x_value, attr)()
+                if isinstance(candidate, torch.Tensor):
+                    feature_tensor = candidate
+                    break
+            if not isinstance(feature_tensor, torch.Tensor):
+                with suppress(Exception):
+                    feature_tensor = torch.as_tensor(x_value)
+        if not isinstance(feature_tensor, torch.Tensor):
+            return None
+
+        try:
+            label_tensor = to_torch_tensor(y_value)
+        except Exception:
+            return None
+        if not isinstance(label_tensor, torch.Tensor):
+            with suppress(Exception):
+                label_tensor = torch.as_tensor(y_value)
+        if not isinstance(label_tensor, torch.Tensor):
+            return None
+
+        feature_tensor = self._assert_finites(
+            self._to_dtype(feature_tensor.detach(), self.feature_dtype), "feature"
+        )
+        if feature_tensor.dim() == 0:
+            feature_tensor = feature_tensor.reshape(1, 1)
+        elif feature_tensor.dim() == 1:
+            feature_tensor = feature_tensor.reshape(-1, 1)
+        else:
+            batch_dim = int(feature_tensor.shape[0]) if feature_tensor.shape else 1
+            feature_tensor = feature_tensor.reshape(batch_dim, -1)
+        batch_size = int(feature_tensor.shape[0])
+
+        label_tensor = label_tensor.detach()
+        if label_tensor.is_floating_point() or label_tensor.is_complex():
+            label_tensor = self._to_dtype(label_tensor, self.label_float_dtype)
+        else:
+            label_tensor = self._to_dtype(label_tensor, torch.int64)
+        label_tensor = self._assert_finites(label_tensor, "label")
+
+        if label_tensor.dim() == 0:
+            label_tensor = label_tensor.unsqueeze(0)
+        if label_tensor.dim() == 1 and label_tensor.shape[0] == batch_size:
+            label_tensor = label_tensor.unsqueeze(-1)
+        if label_tensor.shape[0] != batch_size:
+            return None
+
+        label_shape = tuple(label_tensor.shape[1:])
+        batch_keys = [(int(index),) for index in range(batch_size)]
+        return (feature_tensor, label_tensor, batch_keys, label_shape)
+
+    def preprocess(self, data: Any):
+        from ..data.datatype import to_tuple
+        from collections.abc import Mapping as _Mapping
+
+        track_in = False
+        with contextlib.suppress(Exception):
+            v = str(os.environ.get("STNET_DATASET_TRACK_INPUT", "")).strip().lower()
+            track_in = v in {"1", "true", "yes", "y", "on"}
+        if track_in:
+            self.input_data = data
+        else:
+            self.input_data = None
+
+        try:
+            from tensordict import TensorDictBase
+        except Exception:
+            TensorDictBase = None
+
+        if TensorDictBase is not None and isinstance(data, TensorDictBase):
+            if "features" not in data.keys():
+                raise ValueError("preprocess(TensorDict): missing 'features'")
+            feats = torch.as_tensor(data.get("features"))
+            if feats.ndim == 1:
+                feats = feats.unsqueeze(0)
+            if "labels" in data.keys():
+                labels = torch.as_tensor(data.get("labels"))
+            elif "labels_flat" in data.keys():
+                labels = torch.as_tensor(data.get("labels_flat"))
+            else:
+                raise ValueError("preprocess(TensorDict): missing 'labels' or 'labels_flat'")
+            if labels.ndim == 1:
+                labels = labels.unsqueeze(0)
+            if labels.shape[0] != feats.shape[0]:
+                raise ValueError("preprocess(TensorDict): features and labels batch mismatch")
+
+            feats = self._assert_finites(self._to_dtype(feats.detach(), self.feature_dtype), "feature")
+            labels = labels.detach()
+            if labels.is_floating_point() or labels.is_complex():
+                labels = self._to_dtype(labels, self.label_float_dtype)
+            else:
+                labels = self._to_dtype(labels, torch.int64)
+            labels = self._assert_finites(labels, "label")
+
+            label_shape = tuple(labels.shape[1:])
+            keys = [(int(i),) for i in range(int(feats.shape[0]))]
+            self.accumulate_scale(feats)
+            return (feats, labels, keys, label_shape)
+
+        if isinstance(data, _Mapping) and "X" in data and ("Y" in data):
+            x, y = (data["X"], data["Y"])
+            batch_result = self._preprocess_batch(x, y)
+            if batch_result is not None:
+                feats, labels, keys, label_shape = batch_result
+                self.accumulate_scale(feats)
+                return (feats, labels, keys, label_shape)
+            xr, yt = (
+                self._preprocess_x(x).unsqueeze(0),
+                self._assert_finites(self._preprocess_y(y), "label"),
+            )
+            if yt.dim() == 0 or yt.dim() == 1:
+                yt = yt.unsqueeze(0)
+            keys = [to_tuple(x)]
+            label_shape = tuple(yt.shape[1:])
+            self.accumulate_scale(xr)
+            return (xr, yt, keys, label_shape)
+
+        if isinstance(data, (tuple, list)) and len(data) >= 2:
+            x, y = (data[0], data[1])
+            batch_result = self._preprocess_batch(x, y)
+            if batch_result is not None:
+                feats, labels, keys, label_shape = batch_result
+                self.accumulate_scale(feats)
+                return (feats, labels, keys, label_shape)
+            xr = self._preprocess_x(x).unsqueeze(0)
+            yt = self._assert_finites(self._preprocess_y(y), "label")
+            if yt.dim() == 0:
+                yt = yt.unsqueeze(0)
+            elif yt.shape[0] != 1:
+                yt = yt.unsqueeze(0)
+            keys = [to_tuple(x)]
+            label_shape = tuple(yt.shape[1:])
+            self.accumulate_scale(xr)
+            return (xr, yt, keys, label_shape)
+
+        if isinstance(data, _Mapping) and len(data) > 0:
+            items = list(data.items())
+            if any((isinstance(k, str) for k, _ in items)):
+                raise TypeError(
+                    "preprocess: keys in a multi-sample dict must be tuples. "
+                    "Provide single samples as {'X': ..., 'Y': ...}."
+                )
+            keys = [to_tuple(k) for k, _ in items]
+            feats = torch.stack([self._preprocess_x(k) for k in keys], dim=0)
+            lbl_list = [self._assert_finites(self._preprocess_y(v), "label") for _, v in items]
+            if lbl_list and all((t.shape == lbl_list[0].shape for t in lbl_list)):
+                labels = torch.stack(lbl_list, dim=0)
+            else:
+                labels = torch.cat([t.unsqueeze(0) for t in lbl_list], dim=0)
+            labels = self._assert_finites(labels, "label")
+            label_shape = tuple(labels.shape[1:])
+            self.accumulate_scale(feats)
+            return (feats, labels, keys, label_shape)
+
+        raise ValueError(
+            "preprocess: unsupported input format. Provide a mapping or an (X, Y) pair."
+        )
+
+    def postprocess(self, keys: list, preds: torch.Tensor | Sequence[torch.Tensor]):
+        if isinstance(preds, torch.Tensor):
+            if preds.dim() == 0:
+                preds = preds.unsqueeze(0)
+            if preds.shape[0] != len(keys):
+                raise ValueError(f"preds batch={preds.shape[0]} != len(keys)={len(keys)}")
+            rows = [preds[i].detach().cpu() for i in range(len(keys))]
+        else:
+            if len(preds) != len(keys):
+                raise ValueError(f"len(preds)={len(preds)} != len(keys)={len(keys)}")
+            rows = [
+                p.detach().cpu() if isinstance(p, torch.Tensor) else torch.as_tensor(p)
+                for p in preds
+            ]
+
+        fixed_keys: list = []
+        seen = set()
+        for i, k in enumerate(keys):
+            if not isinstance(k, tuple):
+                try:
+                    k = tuple(k)
+                except TypeError:
+                    k = (k,)
+            k_out = k
+            if k in seen:
+                k_out = k + (i,)
+            seen.add(k_out)
+            fixed_keys.append(k_out)
+
+        out = {k: v for k, v in zip(fixed_keys, rows)}
+        track_out = False
+        with contextlib.suppress(Exception):
+            v = str(os.environ.get("STNET_DATASET_TRACK_OUTPUT", "")).strip().lower()
+            track_out = v in {"1", "true", "yes", "y", "on"}
+        if track_out:
+            self.output_data = out
+        else:
+            self.output_data = None
+        return out
+
+    def batch_to_device(
+        self,
+        batch: Any,
+        device: torch.device,
+        *,
+        non_blocking: Optional[bool] = None,
+        pin_memory: Optional[bool] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        from ..data.datatype import to_torch_tensor
+
+        try:
+            from tensordict import TensorDictBase
+        except Exception:
+            TensorDictBase = None
+
+        def _extract_xy(sample: Any):
+            if TensorDictBase is not None and isinstance(sample, TensorDictBase):
+                x = sample.get("features", sample.get("X", None))
+                y = sample.get("labels", sample.get("Y", None))
+                return x, y
+            if isinstance(sample, Mapping):
+                x = sample.get("features", sample.get("X", None))
+                y = sample.get("labels", sample.get("Y", None))
+                return x, y
+            return (None, None)
+
+        dev = device if isinstance(device, torch.device) else torch.device(device)
+        dev_type = dev.type
+
+        if non_blocking is None:
+            non_blocking = bool(dev_type in {"cuda", "xpu"})
+        if pin_memory is None:
+            pin_memory = bool(dev_type in {"cuda", "xpu"})
+
+        X: Optional[torch.Tensor] = None
+        Y: Optional[torch.Tensor] = None
+
+        if (TensorDictBase is not None and isinstance(batch, TensorDictBase)) or isinstance(batch, Mapping):
+            x_raw, y_raw = _extract_xy(batch)
+            if x_raw is None or y_raw is None:
+                feats, labs, *_ = self.preprocess(batch)
+                x_raw, y_raw = feats, labs
+            X = to_torch_tensor(x_raw)
+            Y = to_torch_tensor(y_raw)
+        elif isinstance(batch, tuple) and len(batch) >= 2 and not isinstance(batch[0], (Mapping,)):
+            X = to_torch_tensor(batch[0])
+            Y = to_torch_tensor(batch[1])
+        elif isinstance(batch, (list, tuple)):
+            if len(batch) == 0:
+                X = torch.empty((0,), device="cpu")
+                Y = torch.empty((0,), device="cpu")
+            elif all((TensorDictBase is not None and isinstance(elem, TensorDictBase)) or isinstance(elem, Mapping) for elem in batch):
+                xs: list[torch.Tensor] = []
+                ys: list[torch.Tensor] = []
+                for elem in batch:
+                    x_raw, y_raw = _extract_xy(elem)
+                    if x_raw is None or y_raw is None:
+                        feats, labs, *_ = self.preprocess(elem)
+                        x_raw, y_raw = feats, labs
+                    xs.append(to_torch_tensor(x_raw))
+                    ys.append(to_torch_tensor(y_raw))
+
+                def _stack(tensors: list[torch.Tensor]) -> torch.Tensor:
+                    if tensors and all(torch.is_tensor(t) and t.device.type != "cpu" for t in tensors):
+                        return torch.stack(tensors, dim=0)
+                    if pin_memory and dev_type in {"cuda", "xpu"} and tensors:
+                        t0 = tensors[0]
+                        out = torch.empty(
+                            (len(tensors), *tuple(t0.shape)),
+                            dtype=t0.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        try:
+                            torch.stack(tensors, dim=0, out=out)
+                            return out
+                        except Exception:
+                            return torch.stack(tensors, dim=0).pin_memory()
+                    return torch.stack(tensors, dim=0)
+
+                X = _stack(xs)
+                Y = _stack(ys)
+            else:
+                feats, labs, *_ = self.preprocess(batch)
+                X = to_torch_tensor(feats)
+                Y = to_torch_tensor(labs)
+        else:
+            feats, labs, *_ = self.preprocess(batch)
+            X = to_torch_tensor(feats)
+            Y = to_torch_tensor(labs)
+
+        if X is None or Y is None:
+            raise ValueError(
+                f"batch_to_device: could not extract (X, Y) from batch type: {type(batch)!r}"
+            )
+
+        if dev_type == "cpu":
+            if X.device.type != "cpu":
+                X = X.to("cpu")
+            if Y.device.type != "cpu":
+                Y = Y.to("cpu")
+            return X, Y
+
+        if X.device == dev and Y.device == dev:
+            return X, Y
+
+        if dev_type in {"cuda", "xpu"}:
+            stream = None
+            with contextlib.suppress(Exception):
+                stream = getattr(torch, dev_type).current_stream(dev)
+
+            def _to_dev(t: torch.Tensor) -> torch.Tensor:
+                t_cpu = t
+                if t_cpu.device.type != "cpu":
+                    return t_cpu.to(dev, non_blocking=False)
+                if pin_memory and (not (hasattr(t_cpu, "is_pinned") and t_cpu.is_pinned())):
+                    pinned = torch.empty_like(t_cpu, device="cpu", pin_memory=True)
+                    pinned.copy_(t_cpu, non_blocking=False)
+                    t_cpu = pinned
+                out_dev = t_cpu.to(dev, non_blocking=bool(non_blocking))
+                if stream is not None and hasattr(t_cpu, "is_pinned") and t_cpu.is_pinned():
+                    with contextlib.suppress(Exception):
+                        t_cpu.record_stream(stream)
+                return out_dev
+
+            return _to_dev(X), _to_dev(Y)
+
+        return X.to(dev, non_blocking=False), Y.to(dev, non_blocking=False)
 
 
 @dataclass

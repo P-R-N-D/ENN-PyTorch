@@ -10,7 +10,7 @@ Spatio‑temporal neural network building blocks for PyTorch with pragmatic util
 - **Runtime utilities** (`stnet.backend.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.backend.distributed`): utilities to bootstrap and coordinate multi‑process training.
 - **Export** (`stnet.backend.export`): ONNX and serving-oriented conversion helpers (optional `service` extra).
-- **Data pipeline** (`stnet.data`): transforms, simple stats, and `torchdata`-driven nodes for scalable input pipelines.
+- **Data pipeline** (`stnet.data`): simple stats and `torchdata`-driven nodes for scalable input pipelines.
 - **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), FX utils, and optimizers/SWA.
 - **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `History`, `Instance`).
 
@@ -95,6 +95,20 @@ save_model(model, "ckpt.pth")
 model2 = load_model("ckpt.pth", device="cuda")
 ```
 
+Prediction outputs:
+```python
+from stnet.api.run import predict, get_prediction
+
+# Write streaming prediction chunks to disk without holding tensors in memory
+file_info = predict(model, data=my_data, output="file")
+
+# Later (or on another machine), reopen chunks as a mapping
+lazy_preds = get_prediction(file_info, output="tensor", lazy=True)
+for key, tensor in lazy_preds.items():
+    ...
+```
+`output="file"` streams per-rank parts to `chunks_dir` with stable key metadata; use `get_prediction` to reload eagerly or lazily without rematerializing keys.
+
 > API names above reflect the current package layout. If you have local changes, adjust imports accordingly.
 
 ## Project layout
@@ -121,7 +135,6 @@ stnet/
     nodes.py
     pipeline.py
     stats.py
-    transforms.py
   functional/
     __init__.py
     fx.py

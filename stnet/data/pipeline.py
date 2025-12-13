@@ -197,7 +197,7 @@ def _batch_interval(
         _lws = max(1, int(getattr(_wp, "local_world_size", 1)))
     else:
         try:
-            _wp = WorkerPolicy.autotune()
+            _wp = worker_policy if isinstance(worker_policy, WorkerPolicy) else WorkerPolicy.autotune()
             _max_conc = max(1, int(getattr(_wp, "max_concurrency", 1)))
             _streams = max(1, int(getattr(_wp, "h2d_streams", 1)))
             _lws = max(1, int(getattr(_wp, "local_world_size", 1)))
@@ -551,7 +551,10 @@ def _process(
         labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
     if sanitize and torch.is_floating_point(labels):
         torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
-    return {"X": features, "Y": labels}
+    out: Dict[str, Any] = {"X": features, "Y": labels}
+    if isinstance(batch, Mapping) and "row_ids" in batch:
+        out["row_ids"] = batch.get("row_ids")
+    return out
 
 
 def collate(
@@ -582,6 +585,8 @@ def collate(
             stacked["Y"] = conv["Y"]
             stacked["features"] = conv["X"]
             stacked["labels"] = conv["Y"]
+            if "row_ids" in conv:
+                stacked["row_ids"] = conv["row_ids"]
             return stacked
         if all(isinstance(elem, Mapping) for elem in batch):
             Xs = [elem.get("X") for elem in batch]
@@ -602,7 +607,23 @@ def collate(
                 conv = {"X": Xs, "Y": Ys}
             Xs = conv.get("X", Xs)
             Ys = conv.get("Y", Ys)
-            return TensorDict({"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}, batch_size=[])
+            # Optional stable row ids (used for inference result materialization).
+            row_ids = None
+            try:
+                rids = [elem.get("row_ids") for elem in batch]
+                if all(r is not None for r in rids):
+                    parts = []
+                    for r in rids:
+                        rt = r if isinstance(r, torch.Tensor) else torch.as_tensor(r)
+                        parts.append(rt.reshape(-1))
+                    row_ids = torch.cat(parts, dim=0)
+            except Exception:
+                row_ids = None
+
+            data = {"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}
+            if row_ids is not None:
+                data["row_ids"] = row_ids
+            return TensorDict(data, batch_size=[])
         return batch
     if isinstance(batch, Mapping):
         try:
@@ -611,7 +632,11 @@ def collate(
             conv = batch
         X = conv.get("X", batch.get("X"))
         Y = conv.get("Y", batch.get("Y"))
-        return TensorDict({"X": X, "Y": Y, "features": X, "labels": Y}, batch_size=[])
+        row_ids = conv.get("row_ids", batch.get("row_ids"))
+        data = {"X": X, "Y": Y, "features": X, "labels": Y}
+        if row_ids is not None:
+            data["row_ids"] = row_ids
+        return TensorDict(data, batch_size=[])
     return batch
 
 def compose(
@@ -664,11 +689,12 @@ def fetch(
     flatten_features: bool = True,
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
+    worker_policy: Optional[WorkerPolicy] = None,
 ) -> Dict[str, Any]:
     device_obj = (
         torch.device(device) if not isinstance(device, torch.device) else device
     )
-    _wp = WorkerPolicy.autotune()
+    _wp = worker_policy if isinstance(worker_policy, WorkerPolicy) else WorkerPolicy.autotune()
     _wp.apply_torch_threads()
     io_workers = int(_wp.num_workers)
     prebatch = int(_wp.prebatch)
@@ -1231,4 +1257,5 @@ def fetch(
         "validation_loader": val_loader,
         "disposable": allocated,
     }
+
 

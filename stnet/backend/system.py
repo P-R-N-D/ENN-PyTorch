@@ -1678,31 +1678,109 @@ class Memory:
             return bool(self._err_event.is_set())
 
     class Buffer:
+        """Bounded in-memory buffer with backpressure.
+
+        This is a small wrapper around :class:`queue.Queue` that adds:
+          - A stop flag so blocked producers/consumers can be interrupted.
+          - Type-agnostic payloads (Any).
+
+        It is intentionally minimal: higher-level coordination (sentinels,
+        producer/consumer threads) lives in BufferedLoader.
+        """
+
         def __init__(self, max_batches: int) -> None:
             import queue
             import threading
             self.max_batches = max(1, int(max_batches))
-            self._q: "queue.Queue[torch.Tensor]" = queue.Queue(maxsize=self.max_batches)
+            self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.max_batches)
             self._stop = threading.Event()
 
-        def put(self, tensor: "torch.Tensor") -> None:
+        def put(self, item: Any, *, timeout: float | None = None) -> bool:
+            """Put an item into the buffer.
+
+            Returns True if the item was enqueued, False if the buffer was stopped
+            before the item could be enqueued.
+
+            This method is interruptible even when `timeout` is None (infinite):
+            it uses a small internal timeout loop to periodically check the stop flag.
+            """
             import logging
+            import queue
             import time
 
+            if self._stop.is_set():
+                return False
+
             start = time.monotonic()
-            try:
-                self._q.put(tensor, block=True, timeout=None)
-            except Exception as e:
-                logging.error(f"Buffer.put encountered unexpected exception: {e!r}")
-                raise
+            # Use a timeout loop so stop() can interrupt a blocked put.
+            if timeout is None:
+                while not self._stop.is_set():
+                    try:
+                        self._q.put(item, block=True, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    return False
+            else:
+                deadline = time.monotonic() + float(timeout)
+                while not self._stop.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    try:
+                        self._q.put(item, block=True, timeout=min(0.1, remaining))
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    return False
+
             elapsed = time.monotonic() - start
             if elapsed > 0.1:
                 logging.warning(
                     f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
                 )
+            return True
 
-        def get(self, block: bool = True, timeout: float | None = None) -> "torch.Tensor":
-            return self._q.get(block=block, timeout=timeout)
+        def get(self, block: bool = True, timeout: float | None = None) -> Any:
+            """Get an item from the buffer.
+
+            If the buffer is stopped and empty, this raises queue.Empty.
+
+            Like put(), this method is interruptible even when `timeout` is None.
+            """
+            import queue
+            import time
+
+            # Keep backward compatibility with queue.Queue.get(block=..., timeout=...).
+            if not bool(block):
+                if self._stop.is_set() and self._q.empty():
+                    raise queue.Empty
+                return self._q.get(block=False)
+
+            # Infinite block, but still interruptible via stop().
+            if timeout is None:
+                while True:
+                    if self._stop.is_set() and self._q.empty():
+                        raise queue.Empty
+                    try:
+                        return self._q.get(block=True, timeout=0.1)
+                    except queue.Empty:
+                        continue
+
+            # Finite timeout, still interruptible.
+            deadline = time.monotonic() + float(timeout)
+            while True:
+                if self._stop.is_set() and self._q.empty():
+                    raise queue.Empty
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                try:
+                    return self._q.get(block=True, timeout=min(0.1, remaining))
+                except queue.Empty:
+                    continue
 
         def empty(self) -> bool:
             return self._q.empty()
