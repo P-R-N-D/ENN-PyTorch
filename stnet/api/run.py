@@ -30,9 +30,8 @@ from ..backend.distributed import (get_available_host, get_preferred_ip,
 from ..backend.runtime import _trim_dcp_keys, main
 from ..backend.system import (initialize_python_path, new_dir,
                               optimal_start_method, set_multiprocessing_env)
-from .templates import WorkerPolicy
+from .templates import WorkerPolicy, Dataset
 from ..data.nodes import preload_memmap
-from ..data.transforms import preprocess
 from ..model.layers import History, Instance
 from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
@@ -183,6 +182,8 @@ def train(
         torch.backends.cudnn.deterministic = False
         torch.backends.cudnn.benchmark = True
 
+    ds_meta = Dataset.for_device("cpu")
+
     def _check_shapes(
         first_in_dim: Optional[int],
         in_dim: int,
@@ -214,7 +215,7 @@ def train(
             chunk_size = 32
             chunk_size = min(chunk_size, count)
             first_td = td[:chunk_size]
-            fx0, lb0, _, _ = preprocess(first_td)
+            fx0, lb0, _, _ = ds_meta.preprocess(first_td)
             fx0 = fx0.contiguous()
             lb0 = lb0.contiguous()
 
@@ -251,7 +252,7 @@ def train(
                 end = min(idx + chunk_size, count)
                 td_chunk = td[idx:end]
 
-                fx, lb, _, _ = preprocess(td_chunk)
+                fx, lb, _, _ = ds_meta.preprocess(td_chunk)
                 fx = fx.contiguous()
                 lb = lb.contiguous()
 
@@ -282,7 +283,7 @@ def train(
             train_start, train_end = 0, train_count
             val_start, val_end = train_end, train_end + val_count
 
-            meta = {
+            meta_json = {
                 "N": int(count),
                 "feature_dim": int(in_dim),
                 "features_path": "features.mmt",
@@ -301,7 +302,7 @@ def train(
             }
 
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f)
+                json.dump(meta_json, f)
 
             return in_dim, label_shape, count
 
@@ -321,7 +322,7 @@ def train(
             first_keys = [k for k, _ in items[:chunk_size]]
             first_batch = {k: d[k] for k in first_keys}
 
-            fx0, lb0, _, lshape0 = preprocess(first_batch)
+            fx0, lb0, _, lshape0 = ds_meta.preprocess(first_batch)
             fx0 = fx0.contiguous()
             lb0 = lb0.contiguous()
 
@@ -356,7 +357,7 @@ def train(
                 batch_items = items[idx:end]
                 batch_dict = {k: v for (k, v) in batch_items}
 
-                fx, lb, _, lshape = preprocess(batch_dict)
+                fx, lb, _, lshape = ds_meta.preprocess(batch_dict)
                 fx = fx.contiguous()
                 lb = lb.contiguous()
 
@@ -386,7 +387,7 @@ def train(
             train_start, train_end = 0, train_count
             val_start, val_end = train_end, train_end + val_count
 
-            meta = {
+            meta_json = {
                 "N": int(count),
                 "feature_dim": int(in_dim),
                 "features_path": "features.mmt",
@@ -405,11 +406,11 @@ def train(
             }
 
             with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f)
+                json.dump(meta_json, f)
 
             return in_dim, label_shape, count
 
-        fx, lb, _, lshape = preprocess(d)
+        fx, lb, _, lshape = ds_meta.preprocess(d)
         fx = fx.contiguous()
         count = int(fx.shape[0])
         if count <= 0:
@@ -511,7 +512,6 @@ def train(
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
         master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
-        # Keep local world-size & threads consistent with WorkerPolicy used by loaders.
         _wp = WorkerPolicy.autotune()
         _wp.apply_torch_threads()
         nprocs = int(_wp.nproc_per_node)
@@ -784,8 +784,10 @@ def predict(
     mode: OpsMode = "predict",
     max_nodes: Optional[int] = None,
     rdzv_backend: Optional[str] = None,
+    output: str = "tensor",
+    lazy: bool = False,
     **kwargs: Any,
-) -> Dict[str, Any]:
+) -> Any:
 
     _reset_process_group()
     initialize_python_path()
@@ -814,6 +816,13 @@ def predict(
     cfg_dict = asdict(cfg_model)
     seed_value = _ensure_seed(seed)
     _seed_everything(seed_value)
+    ds = Dataset.for_device("cpu")
+
+    output_mode = str(kwargs.pop("output", output) or "tensor").strip().lower()
+    if output_mode not in {"tensor", "file"}:
+        raise ValueError(f"predict: output must be 'tensor' or 'file', got: {output_mode!r}")
+
+    lazy_flag = bool(kwargs.pop("lazy", lazy)) if output_mode == "tensor" else False
 
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
@@ -840,10 +849,10 @@ def predict(
         chunk_size = 32
         chunk_size = min(chunk_size, count)
 
-        keys = list(range(count))
+        keys = range(count)
 
         first_td = td[:chunk_size]
-        feats0, labels0, _, label_shape = preprocess(first_td)
+        feats0, labels0, _, label_shape = ds.preprocess(first_td)
         feats0 = feats0.contiguous()
         labels0 = labels0.contiguous()
 
@@ -880,7 +889,7 @@ def predict(
             end = min(idx + chunk_size, count)
             td_chunk = td[idx:end]
 
-            fx, lb, _, _ = preprocess(td_chunk)
+            fx, lb, _, _ = ds.preprocess(td_chunk)
             fx = fx.contiguous()
             lb = lb.contiguous()
 
@@ -925,7 +934,7 @@ def predict(
         first_items = items[:chunk_size]
         first_batch = {k: v for (k, v) in first_items}
 
-        feats0, labels0, _, label_shape = preprocess(first_batch)
+        feats0, labels0, _, label_shape = ds.preprocess(first_batch)
         feats0 = feats0.contiguous()
         labels0 = labels0.contiguous()
 
@@ -963,7 +972,7 @@ def predict(
             batch_items = items[idx:end]
             batch_dict = {k: v for (k, v) in batch_items}
 
-            fx, lb, _, _ = preprocess(batch_dict)
+            fx, lb, _, _ = ds.preprocess(batch_dict)
             fx = fx.contiguous()
             lb = lb.contiguous()
 
@@ -990,7 +999,7 @@ def predict(
             raise RuntimeError(f"memmap written={written}, expected={count}")
 
     else:
-        feats, labels, keys, label_shape = preprocess(data)
+        feats, labels, keys, label_shape = ds.preprocess(data)
         feats = feats.contiguous()
         labels = labels.contiguous()
 
@@ -1099,67 +1108,295 @@ def predict(
     try:
         chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
         if os.path.isdir(chunks_dir):
-            with open(os.path.join(chunks_dir, "keys.json"), "w", encoding="utf-8") as f:
-                json.dump(list(keys), f)
+            import logging
+
+            log = logging.getLogger(__name__)
+            nkeys = 0
+            with contextlib.suppress(Exception):
+                nkeys = int(len(keys))
+
+            keys_kind = "range" if isinstance(keys, range) else "list"
+            keys_meta_path = os.path.join(chunks_dir, "keys.meta.json")
+            try:
+                meta = {"N": int(nkeys), "kind": keys_kind}
+                if isinstance(keys, range):
+                    meta.update({"start": int(keys.start), "stop": int(keys.stop), "step": int(keys.step)})
+                with open(keys_meta_path, "w", encoding="utf-8") as f:
+                    json.dump(meta, f)
+            except Exception as e:
+                log.warning("predict: failed to write keys.meta.json (ignored): %r", e, exc_info=True)
+
+            if not isinstance(keys, range):
+                try:
+                    torch.save(keys, os.path.join(chunks_dir, "keys.pt"))
+                except Exception as e:
+                    log.warning("predict: failed to write keys.pt (ignored): %r", e, exc_info=True)
             final_dir = new_dir("predictions")
             moved_dir = shutil.move(chunks_dir, final_dir)
             chunk_root = moved_dir if os.path.isdir(moved_dir) else os.path.join(
                 final_dir, os.path.basename(chunks_dir)
             )
-            manifest_path = os.path.join(chunk_root, "manifest.json")
-            if not os.path.isfile(manifest_path):
-                return {"chunks_dir": chunk_root, "out_shape": tuple(label_shape)}
+            return get_prediction(chunk_root, output=output_mode, lazy=lazy_flag)
 
-            with open(manifest_path, "r", encoding="utf-8") as mf:
-                manifest = json.load(mf)
-
-            out_shape = tuple(manifest.get("out_shape") or tuple(label_shape))
-            variable_shape = bool(manifest.get("variable_shape"))
-
-            if variable_shape:
-                return {
-                    "chunks_dir": chunk_root,
-                    "out_shape": out_shape,
-                    "variable_shape": True,
-                }
-
-            num_chunks = int(manifest.get("num_chunks", 0))
-
-            chunks: List[torch.Tensor] = []
-            for idx in range(num_chunks):
-                base_mmt = os.path.join(chunk_root, f"chunk_{idx:06d}.mmt")
-                tensor = None
-                if os.path.exists(base_mmt):
-                    try:
-                        tensor = MemoryMappedTensor.from_filename(base_mmt)
-                    except Exception:
-                        with contextlib.suppress(Exception):
-                            tensor = torch.load(base_mmt, map_location="cpu")
-                else:
-                    alt_pt = os.path.join(chunk_root, f"chunk_{idx:06d}.pt")
-                    if os.path.exists(alt_pt):
-                        tensor = torch.load(alt_pt, map_location="cpu")
-                if tensor is not None:
-                    chunks.append(
-                        tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor)
-                    )
-
-            if chunks:
-                flat = torch.cat(chunks, dim=0)
-            else:
-                tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
-                flat = torch.empty((0, *tail), dtype=torch.float64)
-
-            pred_tensor = Instance.unflatten_y(flat, out_shape)
-
-            result: Dict[Tuple, torch.Tensor] = {}
-            for i, key in enumerate(keys):
-                if i >= pred_tensor.shape[0]:
-                    break
-                result[key] = pred_tensor[i].detach().cpu().to(dtype=torch.float64)
-
-            return result
         return {}
     finally:
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _load_legacy_flat(
+    chunk_root: str,
+    *,
+    num_chunks: int,
+    out_shape: Tuple[int, ...],
+) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    for idx in range(int(num_chunks)):
+        base_mmt = os.path.join(chunk_root, f"chunk_{idx:06d}.mmt")
+        tensor = None
+        if os.path.exists(base_mmt):
+            try:
+                tensor = MemoryMappedTensor.from_filename(base_mmt)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    tensor = torch.load(base_mmt, map_location="cpu")
+        else:
+            alt_pt = os.path.join(chunk_root, f"chunk_{idx:06d}.pt")
+            if os.path.exists(alt_pt):
+                tensor = torch.load(alt_pt, map_location="cpu")
+        if tensor is not None:
+            chunks.append(tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor))
+
+    if chunks:
+        return torch.cat(chunks, dim=0)
+    tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
+    return torch.empty((0, *tail), dtype=torch.float64)
+
+
+def get_prediction(
+    pred_or_dir: Any,
+    *,
+    output: str = "tensor",
+    lazy: bool = False,
+) -> Any:
+    from collections.abc import Mapping as _Mapping
+
+    if isinstance(pred_or_dir, _Mapping) and "chunks_dir" in pred_or_dir:
+        chunk_root = str(pred_or_dir.get("chunks_dir") or "")
+    else:
+        chunk_root = str(pred_or_dir or "")
+    if not chunk_root:
+        raise ValueError("get_prediction: chunks_dir is empty")
+
+    out_mode = str(output or "tensor").strip().lower()
+    if out_mode not in {"tensor", "file"}:
+        raise ValueError(f"get_prediction: output must be 'tensor' or 'file', got: {out_mode!r}")
+    lazy = bool(lazy) if out_mode == "tensor" else False
+
+    manifest_path = os.path.join(chunk_root, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        if out_mode == "file":
+            return {"chunks_dir": chunk_root, "format": "stnet.pred"}
+        raise FileNotFoundError(f"get_prediction: missing manifest.json: {manifest_path}")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    out_shape = tuple(manifest.get("out_shape") or ())
+    variable_shape = bool(manifest.get("variable_shape"))
+    file_result: Dict[str, Any] = {
+        "chunks_dir": chunk_root,
+        "out_shape": out_shape,
+        "format": manifest.get("format") or "stnet.pred",
+    }
+    if variable_shape:
+        file_result["variable_shape"] = True
+
+    if out_mode == "file":
+        return file_result
+
+    keys_meta_path = os.path.join(chunk_root, "keys.meta.json")
+    if not os.path.isfile(keys_meta_path):
+        raise FileNotFoundError(f"get_prediction: missing keys.meta.json: {keys_meta_path}")
+    with open(keys_meta_path, "r", encoding="utf-8") as f:
+        kmeta = json.load(f) if f is not None else {}
+    kind = str((kmeta or {}).get("kind") or "list").strip().lower()
+    nkeys = int((kmeta or {}).get("N") or 0)
+
+    keys: Any
+    if kind == "range":
+        start = int((kmeta or {}).get("start") or 0)
+        stop = int((kmeta or {}).get("stop") or nkeys)
+        step = int((kmeta or {}).get("step") or 1)
+        keys = range(start, stop, step)
+        nkeys = int(len(keys))
+    else:
+        keys_pt = os.path.join(chunk_root, "keys.pt")
+        if not os.path.isfile(keys_pt):
+            raise FileNotFoundError(f"get_prediction: missing keys.pt for kind=list: {keys_pt}")
+        keys = torch.load(keys_pt, map_location="cpu")
+        if not isinstance(keys, list):
+            try:
+                keys = list(keys)
+            except Exception:
+                raise TypeError(f"get_prediction: keys.pt must be list-like, got {type(keys)!r}")
+        nkeys = int(len(keys))
+
+    parts = manifest.get("parts")
+    has_parts = isinstance(parts, list) and bool(parts)
+
+    def _as_tuple_key(k: Any) -> Tuple[Any, ...]:
+        if isinstance(k, tuple):
+            return k
+        try:
+            return tuple(k)
+        except TypeError:
+            return (k,)
+
+    fixed_keys: Optional[list[Tuple[Any, ...]]] = None
+    key_to_row: Optional[dict[Tuple[Any, ...], int]] = None
+
+    if isinstance(keys, range):
+        class _TupleKeyRange:
+            __slots__ = ("_r",)
+            def __init__(self, r: range) -> None:
+                self._r = r
+            def __len__(self) -> int:
+                return int(len(self._r))
+            def __iter__(self):
+                for i in self._r:
+                    yield (int(i),)
+            def __getitem__(self, idx: int):
+                return (int(self._r[idx]),)
+        key_seq: Any = _TupleKeyRange(keys)
+
+        def _row_for_key(k: Any) -> int:
+            if isinstance(k, tuple) and len(k) == 1:
+                k = k[0]
+            rid = int(k)
+            if rid < 0 or rid >= nkeys:
+                raise KeyError(k)
+            return rid
+    else:
+        fixed_keys = []
+        key_to_row = {}
+        seen: set[Tuple[Any, ...]] = set()
+        for rid, k in enumerate(keys):
+            kt = _as_tuple_key(k)
+            kout = kt if kt not in seen else (kt + (rid,))
+            if kout in seen:
+                kout = kt + (rid, len(seen))
+            seen.add(kout)
+            fixed_keys.append(kout)
+            key_to_row[kout] = int(rid)
+        key_seq = fixed_keys
+
+        def _row_for_key(k: Any) -> int:
+            kt = _as_tuple_key(k)
+            rid = key_to_row.get(kt) if key_to_row is not None else None
+            if rid is None:
+                raise KeyError(k)
+            return int(rid)
+
+    if has_parts:
+        parts_list = parts
+        if lazy:
+            from .templates import LazyDict
+
+            row_to_part = np.full((nkeys,), -1, dtype=np.int32)
+            row_to_off = np.full((nkeys,), -1, dtype=np.int32)
+            pred_paths: list[Optional[str]] = [None] * len(parts_list)
+
+            _dup_env = str(os.environ.get("STNET_PRED_CHECK_ROWIDS_DUP", "")).strip().lower()
+            check_dups = _dup_env in {"1", "true", "yes", "y", "on"}
+
+            for p_idx, part in enumerate(parts_list):
+                rows_name = (part or {}).get("rows")
+                pred_name = (part or {}).get("pred")
+                if not rows_name or not pred_name:
+                    continue
+                rows_path = os.path.join(chunk_root, rows_name)
+                pred_paths[p_idx] = os.path.join(chunk_root, pred_name)
+
+                rows = torch.load(rows_path, map_location="cpu")
+                if not isinstance(rows, torch.Tensor):
+                    rows = torch.as_tensor(rows)
+                rows = rows.to(dtype=torch.int64).reshape(-1).contiguous()
+                if rows.numel() == 0:
+                    continue
+                rows_np = rows.numpy()
+
+                if check_dups:
+                    u = np.unique(rows_np)
+                    if u.size != rows_np.size:
+                        raise RuntimeError(f"get_prediction: duplicate row_ids within part {rows_name} (idx={p_idx})")
+                    if np.any(row_to_part[u] != -1):
+                        raise RuntimeError(f"get_prediction: duplicate row_ids across parts (current={rows_name}, idx={p_idx})")
+                    del u
+                else:
+                    if np.any(row_to_part[rows_np] != -1):
+                        raise RuntimeError(f"get_prediction: duplicate row_ids across parts (current={rows_name}, idx={p_idx})")
+
+                row_to_part[rows_np] = int(p_idx)
+                row_to_off[rows_np] = np.arange(rows_np.size, dtype=np.int32)
+
+            if np.any(row_to_part < 0):
+                missing = int(np.sum(row_to_part < 0))
+                raise RuntimeError(f"get_prediction: missing predictions for {missing}/{nkeys} rows")
+
+            _cache_part = {"idx": -1, "pred": None}
+
+            def _pred_for_row(row_id: int) -> torch.Tensor:
+                p = int(row_to_part[int(row_id)])
+                if p < 0:
+                    raise KeyError(row_id)
+                off = int(row_to_off[int(row_id)])
+                if _cache_part["idx"] != p or _cache_part["pred"] is None:
+                    path = pred_paths[p]
+                    if not path:
+                        raise KeyError(p)
+                    _cache_part["pred"] = torch.load(path, map_location="cpu")
+                    _cache_part["idx"] = p
+                return _cache_part["pred"][off].detach()
+
+            def _getter(key: Any) -> torch.Tensor:
+                rid = _row_for_key(key)
+                return _pred_for_row(rid)
+
+            return LazyDict(key_seq, _getter, name="predictions", cache=False)
+
+        out: Dict[Tuple[Any, ...], torch.Tensor] = {}
+        for part in parts_list:
+            rows_name = (part or {}).get("rows")
+            pred_name = (part or {}).get("pred")
+            if not rows_name or not pred_name:
+                continue
+            rows_path = os.path.join(chunk_root, rows_name)
+            pred_path = os.path.join(chunk_root, pred_name)
+            rows = torch.load(rows_path, map_location="cpu")
+            preds = torch.load(pred_path, map_location="cpu")
+            if not isinstance(rows, torch.Tensor):
+                rows = torch.as_tensor(rows)
+            if not isinstance(preds, torch.Tensor):
+                preds = torch.as_tensor(preds)
+            rows = rows.to(dtype=torch.int64).reshape(-1).contiguous()
+            if int(preds.shape[0]) != int(rows.shape[0]):
+                raise RuntimeError(
+                    f"get_prediction: part size mismatch rows={int(rows.shape[0])} preds={int(preds.shape[0])} ({rows_name},{pred_name})"
+                )
+            rows_np = rows.numpy()
+            for j, rid in enumerate(rows_np):
+                rid_i = int(rid)
+                k = (rid_i,) if isinstance(keys, range) else (fixed_keys[rid_i] if fixed_keys is not None else (rid_i,))
+                out[k] = preds[j].detach()
+        return out
+
+    num_chunks = int(manifest.get("num_chunks", 0) or 0)
+    flat = _load_legacy_flat(chunk_root, num_chunks=num_chunks, out_shape=out_shape)
+
+    pred_tensor = Instance.unflatten_y(flat, out_shape)
+    out_legacy: Dict[Tuple[Any, ...], torch.Tensor] = {}
+    for i, k in enumerate(key_seq):
+        if i >= int(pred_tensor.shape[0]):
+            break
+        out_legacy[k] = pred_tensor[i].detach().cpu().to(dtype=torch.float64)
+    return out_legacy

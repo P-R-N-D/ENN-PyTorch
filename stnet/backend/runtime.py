@@ -53,7 +53,6 @@ except Exception:
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..api.templates import Dataset
-from ..data.transforms import preprocess, batch_to_device
 from ..functional.fx import Autocast, Fusion, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
                                  LinearCombinationLoss, LossWeightController,
@@ -470,6 +469,7 @@ def _calibrate_per_sample_mem(
     model: Instance,
     device: torch.device,
     ops: RuntimeConfig,
+    dataset: Optional[Dataset] = None,
     max_probe_batch: int = 32,
     with_backward: bool = False,
     global_loss: Optional[nn.Module] = None,
@@ -581,14 +581,14 @@ def _calibrate_per_sample_mem(
 
         training_mode = bool(model.training)
 
+        meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
+
         try:
-            from ..data.transforms import preprocess
-            from ..data.io import to_torch_tensor, to_tensordict
             from ..functional.fx import Autocast
             from ..functional.fx import Gradient
             from tensordict import TensorDictBase
 
-            feats, labels, *_rest = preprocess(batch)
+            feats, labels, *_rest = meta.preprocess(batch)
             X = to_torch_tensor(feats)
             X = torch.atleast_2d(X)
 
@@ -1092,12 +1092,15 @@ def epochs(
     swa_helper: Optional[StochasticWeightAverage] = None,
     swa_start_epoch: int = 0,
     buffers_dtype: Optional[torch.dtype] = None,
+    dataset: Optional[Dataset] = None,
     **kwargs: Any,
 ) -> None:
     from ..data.nodes import Sampler
 
     if train_loader is None:
         raise RuntimeError("epochs requires a training dataloader")
+
+    meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
     autocast_dtype: Optional[torch.dtype] = None
     with contextlib.suppress(Exception):
@@ -1773,9 +1776,7 @@ def epochs(
                     return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
             return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
 
-        print(r"[epochs] BEFORE | for epoch_idx in range(int(total_epochs)):", flush=True)
         for epoch_idx in range(int(total_epochs)):
-            print(r"[epochs] AFTER | for epoch_idx in range(int(total_epochs)):", flush=True)
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -1793,11 +1794,7 @@ def epochs(
                 t_fetch_start = time.perf_counter_ns()
                 total_batches = len(train_loader)
                 train_accum_since_last = 0
-                logging.info("[epochs] BEFORE for loop")
-                print(r"[epochs] BEFORE | for step_idx, _raw in enumerate(train_loader):", flush=True)
-                print("len(train_loader) = ", len(train_loader), flush=True)
                 for step_idx, _raw in enumerate(train_loader):
-                    print(r"[epochs] AFTER | for step_idx, _raw in enumerate(train_loader):", flush=True)
                     # 배치 하나당 1번만 증가
                     train_accum_since_last += 1
                     while True:
@@ -1810,17 +1807,17 @@ def epochs(
                                         torch.Event(device=device, enable_timing=True),
                                     )
                                     h2d_s_ev.record()
-                                    X, Y = batch_to_device(_raw, device)
+                                    X, Y = meta.batch_to_device(_raw, device)
                                     h2d_e_ev.record()
                                     h2d_e_ev.synchronize()
                                     h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
                                 else:
                                     t_h2d_s = time.perf_counter_ns()
-                                    X, Y = batch_to_device(_raw, device)
+                                    X, Y = meta.batch_to_device(_raw, device)
                                     t_h2d_e = time.perf_counter_ns()
                                     h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
                             else:
-                                feat, label, *_ = preprocess(_raw)
+                                feat, label, *_ = meta.preprocess(_raw)
                                 X = to_torch_tensor(feat)
                                 Y = to_torch_tensor(label)
     
@@ -2169,17 +2166,17 @@ def epochs(
                                                 torch.Event(device=device, enable_timing=True),
                                             )
                                             h2d_s_ev.record()
-                                            X, Y = batch_to_device(_raw, device)
+                                            X, Y = meta.batch_to_device(_raw, device)
                                             h2d_e_ev.record()
                                             h2d_e_ev.synchronize()
                                             h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
                                         else:
                                             t_h2d_s = time.perf_counter_ns()
-                                            X, Y = batch_to_device(_raw, device)
+                                            X, Y = meta.batch_to_device(_raw, device)
                                             t_h2d_e = time.perf_counter_ns()
                                             h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
                                     else:
-                                        feat, label, *_ = preprocess(_raw)
+                                        feat, label, *_ = meta.preprocess(_raw)
                                         X = to_torch_tensor(feat)
                                         Y = to_torch_tensor(label)
 
@@ -2616,573 +2613,285 @@ def infer(
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
-    *args: Any,
-    data_loader: Any,
+    *,
+    data_loader: Optional[Iterable[TensorDictBase]] = None,
     chunk_dir: Optional[str] = None,
-    **kwargs: Any,
+    dataset: Optional[Dataset] = None,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
-    from typing import Dict, List
+    """Run inference and stream per-rank prediction chunks.
 
-    out_shape = tuple(ops.out_shape)
+    Each worker rank writes *two* files per chunk:
+      - part-r{rank:05d}-c{chunk:06d}-rows.pt : int64 row indices
+      - part-r{rank:05d}-c{chunk:06d}-pred.pt : prediction tensor
 
-    SPILL_TARGET_RATIO = 0.80
-    RESERVE_MB = 512
-    MIN_LIMIT_MB = 128
-    MAX_LIMIT_MB = 4096
-    CHUNK_MIN_MB = 64
-    CHUNK_MAX_MB = 512
+    Rank 0 emits a manifest.json enumerating all parts.
 
-    BYTES_PER_MB = 1024.0 * 1024.0
-    latest_avail_mb: float = float(Memory.available()) / BYTES_PER_MB
-    total_mb: float = 0.0
+    Notes
+    -----
+    - The row indices correspond to the memmap row ordering (i.e. the order of the
+      keys list in stnet.api.run.predict()).
+    - This avoids gathering large prediction tensors through the process group.
+    """
+
+    import gc
+    import glob
+
+    if data_loader is None:
+        return None
+
+    if dataset is None:
+        dataset = Dataset.for_device(str(device) if isinstance(device, torch.device) else "cpu")
+
+    if chunk_dir is None:
+        if not ops.ckpt_dir:
+            raise RuntimeError("infer: ckpt_dir is required when chunk_dir is not provided")
+        chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks")
+
+    # Rank/world_size helpers (avoid missing get_rank() import).
+    rank = torch.distributed.get_rank() if is_distributed() else 0
+    world_size = get_world_size(device) if is_distributed() else 1
+
+    if rank == 0:
+        os.makedirs(chunk_dir, exist_ok=True)
+    distributed_barrier(device)
+
+    # Fixed queue depth for prediction output (backend-independent).
+    # Avoid keyword mismatch across implementations.
+    cache = Memory.Cache(chunk_dir, max_queue=4)
+
+    # Chunking strategy: limit buffered rows in memory.
+    # Users can override via STNET_PRED_CHUNK_ROWS.
     try:
-        _tot = Memory.total()
-        if _tot and _tot > 0:
-            total_mb = float(_tot) / BYTES_PER_MB
+        target_rows = int(os.environ.get("STNET_PRED_CHUNK_ROWS", "0") or 0)
     except Exception:
-        total_mb = 0.0
+        target_rows = 0
 
-    def _memory_limit() -> float:
-        avail_mb = latest_avail_mb
-        if total_mb > 0.0:
-            used_mb = max(0.0, total_mb - avail_mb)
-            target_used_mb = total_mb * SPILL_TARGET_RATIO
-            dyn = max(0.0, target_used_mb - used_mb)
-        else:
-            usable = max(0.0, avail_mb - RESERVE_MB)
-            dyn = usable * SPILL_TARGET_RATIO
-        return max(MIN_LIMIT_MB, min(MAX_LIMIT_MB, dyn))
+    if target_rows <= 0:
+        # Derive a reasonable default from the expected output shape.
+        out_shape = tuple(int(x) for x in (ops.out_shape or ()))
+        out_numel = 1
+        for d in out_shape:
+            out_numel *= max(1, int(d))
+        # Assume float32 unless proven otherwise; we clamp to avoid extremes.
+        est_row_bytes = max(1, out_numel * 4)
+        target_bytes = int(os.environ.get("STNET_PRED_CHUNK_BYTES", str(64 * 1024 * 1024)))
+        target_rows = max(256, min(65536, target_bytes // est_row_bytes))
 
-    def _chunk_target_mb() -> float:
-        return max(CHUNK_MIN_MB, min(CHUNK_MAX_MB, _memory_limit() * 0.25))
-
-    pred_pool = Memory.Pool(capacity=4) if device.type in {"cuda", "xpu"} else None
-    with contextlib.suppress(Exception):
-        get_tlb().pin_thread()
-        Memory.prefer_local_numa()
-
+    # Wrap model for distributed inference.
     run_model = to_ddp(model, device=device)
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=device)
-    total_batches = _num_batches(data_loader)
+
     status_bar = (
-        get_tqdm(title="Prediction", total=total_batches, device=device)
+        get_tqdm(
+            total=_num_batches(data_loader),
+            desc=f"{ops.mode}:rank{rank:02d}",
+            leave=False,
+        )
         if local_rank == 0
         else None
     )
+    pending_rows: list[torch.Tensor] = []
+    pending_preds: list[torch.Tensor] = []
+    pending_count = 0
     chunk_idx = 0
-    queue_depth: int = max(
-        2, min(16, int(max(1.0, _memory_limit() / max(1.0, _chunk_target_mb()))))
-    )
 
-    if not chunk_dir:
-        raise RuntimeError(
-            "infer: chunk_dir must be specified to enable streaming saves."
-        )
-    os.makedirs(chunk_dir, exist_ok=True)
-    try:
-        import psutil
-        avail_bytes = psutil.virtual_memory().available
-    except ImportError:
-        avail_bytes = None
+    first_tail: Optional[Tuple[int, ...]] = None
+    variable_shape = False
 
-    if avail_bytes is not None:
-        budget_bytes = min(avail_bytes * 0.10, 4 * 1024**3)
-    else:
-        fallback_budget = 4 * 1024**3
-        fallback_budget = min(fallback_budget, queue_depth * 1 * 1024**2)
-        budget_bytes = fallback_budget
-        import logging
-        logging.warning(
-            f"psutil not available — using fallback budget_bytes={budget_bytes} bytes"
-        )
+    def _flush() -> None:
+        nonlocal chunk_idx, pending_count
+        if pending_count <= 0:
+            return
 
-    ref_tail_shape: Optional[Tuple[int, ...]] = None
-    ref_dtype: Optional[torch.dtype] = None
-    shape_inconsistent: bool = False
+        rows = torch.cat(pending_rows, dim=0).to(dtype=torch.int64, copy=False).contiguous()
+        preds = torch.cat(pending_preds, dim=0).contiguous()
 
-    dtype_size = (
-        torch.tensor([], dtype=ref_dtype or torch.float32).element_size()
-        if ref_dtype is not None
-        else torch.tensor([], dtype=torch.float32).element_size()
-    )
-    tail_prod = 1
-    for d in out_shape[1:]:
-        tail_prod *= d
+        rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
+        pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
 
-    batch_size = 1
-    try:
-        batch_size = int(out_shape[0])
-    except Exception:
-        import logging
+        cache.submit(rows, path=rows_path)
+        cache.submit(preds, path=pred_path)
 
-        logging.debug(
-            f"Could not infer batch_size from out_shape[0]={out_shape[0] if out_shape else None}"
-        )
-        batch_size = 1
-    item_bytes = batch_size * tail_prod * dtype_size
-    if item_bytes <= 0:
-        import logging
-        logging.error(
-            f"Estimated item_bytes non-positive ({item_bytes}). Defaulting to dtype_size={dtype_size}"
-        )
-        item_bytes = dtype_size
+        chunk_idx += 1
+        pending_rows.clear()
+        pending_preds.clear()
+        pending_count = 0
 
-    if item_bytes > 0:
-        max_batches_by_mem = int(budget_bytes / item_bytes)
-    else:
-        max_batches_by_mem = int(queue_depth)
-
-    max_batches_by_mem = max(1, max_batches_by_mem)
-    HARD_MAX_BATCHES = 256
-    buffer_max_batches = min(int(queue_depth), max_batches_by_mem, HARD_MAX_BATCHES)
-    buffer_max_batches = max(2, buffer_max_batches)
-
-    import logging
-
-    logging.info(
-        f"Buffer configured with max_batches={buffer_max_batches} "
-        f"(queue_depth={queue_depth}, budget_bytes={budget_bytes}, item_bytes={item_bytes})"
-    )
-
-    buffer = Memory.Buffer(max_batches=buffer_max_batches)
-
-    def _writer_loop() -> None:
-        nonlocal chunk_idx
-        while True:
-            if buffer.is_stopped() and buffer.empty():
-                break
-            try:
-                t = buffer.get(timeout=1)
-            except Exception:
-                continue
-            path = os.path.join(chunk_dir, f"chunk_{chunk_idx:06d}.pt")
-            with contextlib.suppress(Exception):
-                torch.save(t, path)
-            chunk_idx += 1
-
-    import threading as _threading_for_writer
-
-    _writer_thread = _threading_for_writer.Thread(target=_writer_loop, daemon=True)
-    _writer_thread.start()
-
-    def _is_shape_consistent(batch: List[Tuple[torch.Tensor, Optional[object], Optional[object]]]) -> bool:
-        if not batch:
-            return True
-        tail = tuple(batch[0][0].shape[1:])
-        dt = batch[0][0].dtype
-        for t, _, _ in batch:
-            if t.dtype != dt or tuple(t.shape[1:]) != tail:
-                return False
-        return True
-
-    flop_counter = FlopCounter(run_model, mode="eval", device=device)
-    use_timer = False
-    io_bytes: float = 0.0
-    io_time: float = 0.0
-    comp_time: float = 0.0
-    total_flops: float = 0.0
-    t_fetch_start = time.perf_counter_ns()
-    rank = torch.distributed.get_rank() if is_distributed() else 0
+        # Aggressive (but safe) host cleanup.
+        del rows, preds
+        gc.collect()
 
     try:
-        with flop_counter, Gradient.inference(run_model), Autocast.float(device):
+        # Keep mixed precision behavior consistent with the rest of runtime.
+        with Gradient.inference(run_model), Autocast.float(device):
+            for batch in data_loader:
+                if batch is None:
+                    if status_bar is not None:
+                        status_bar.update(1)
+                    continue
 
-            for _idx, _raw in enumerate(data_loader):
-                while True:
-                    batch_outputs: List[torch.Tensor] = []
+                # Preserve stable sample row indices for reconstruction on the driver.
+                row_ids: Optional[torch.Tensor] = None
+                try:
+                    if isinstance(batch, TensorDictBase):
+                        row_ids = batch.get("row_ids", None)
+                    elif isinstance(batch, dict):
+                        row_ids = batch.get("row_ids", None)
+                except Exception:
+                    row_ids = None
+
+                X, _Y = dataset.batch_to_device(batch, device=device, non_blocking=True)
+
+                bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
+                if bs <= 0:
+                    if status_bar is not None:
+                        status_bar.update(1)
+                    continue
+
+                # row_ids are REQUIRED for correct reconstruction on the driver.
+                if row_ids is None:
+                    raise RuntimeError(
+                        "infer: batch is missing required field 'row_ids'. "
+                        "This would silently corrupt predict() output. "
+                        "Ensure Sampler/_slice emits row_ids and collate/prefetch preserve it."
+                    )
+                if not isinstance(row_ids, torch.Tensor):
+                    row_ids = torch.as_tensor(row_ids, dtype=torch.int64)
+                else:
+                    row_ids = row_ids.to(dtype=torch.int64, copy=False)
+                row_ids = row_ids.reshape(-1)
+                if row_ids.numel() != bs:
+                    raise RuntimeError(f"infer: row_ids length mismatch: row_ids={row_ids.numel()} vs batch={bs}")
+                if row_ids.device.type != "cpu":
+                    row_ids = row_ids.to(device="cpu")
+
+                # Heuristic microbatch support.
+                mb = int(getattr(model, "microbatch", 0) or 0)
+                if mb <= 0:
+                    mb = bs
+                mb = max(1, min(bs, mb))
+
+                start = 0
+                while start < bs:
+                    end = min(bs, start + mb)
+                    sl = slice(start, end)
+
+                    Xi = X[sl]
+                    rows_i = row_ids[sl]
+
+                    tdp = to_tensordict({"features": Xi}, device=device)
+
+                    # Forward (retry on OOM by shrinking microbatch).
                     try:
-                        if device.type in ("cuda", "xpu", "mps"):
-                            if use_timer:
-                                h2d_s_ev, h2d_e_ev = (
-                                    torch.Event(device=device, enable_timing=True),
-                                    torch.Event(device=device, enable_timing=True),
-                                )
-                                h2d_s_ev.record()
-                                X, _ = batch_to_device(_raw, device)
-                                h2d_e_ev.record()
-                                h2d_e_ev.synchronize()
-                                h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                            else:
-                                t_h2d_s = time.perf_counter_ns()
-                                X, _ = batch_to_device(_raw, device)
-                                t_h2d_e = time.perf_counter_ns()
-                                h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                        else:
-                            feat, _label, *_ = preprocess(_raw)
-                            X = to_torch_tensor(feat)
-                            h2d_s = 0.0
-                            moved_h2d = False
-                            if device.type in ("cuda", "xpu") and X.device.type == "cpu":
-                                try:
-                                    if not (hasattr(X, "is_pinned") and X.is_pinned()):
-                                        X_pinned = torch.empty_like(X, device="cpu", pin_memory=True)
-                                        X_pinned.copy_(X, non_blocking=False)
-                                    else:
-                                        X_pinned = X
-                                    X = X_pinned.to(device, non_blocking=True)
-                                    X_pinned.record_stream(getattr(torch, device.type).current_stream(device))
-                                    moved_h2d = True
-                                except Exception:
-                                    X = X.to(device, non_blocking=(device.type in ("cuda", "xpu")))
-                                    moved_h2d = True
-                            if use_timer:
-                                ev_h2d_s, ev_h2d_e = (
-                                    torch.Event(device=device, enable_timing=True),
-                                    torch.Event(device=device, enable_timing=True),
-                                )
-                                ev_h2d_s.record()
-                                if not moved_h2d:
-                                    X = X.to(device, non_blocking=True)
-                                ev_h2d_e.record()
-                                ev_h2d_e.synchronize()
-                                h2d_s = float(ev_h2d_s.elapsed_time(ev_h2d_e)) / 1000.0
-                            else:
-                                t_h2d_s = time.perf_counter_ns()
-                                if not moved_h2d:
-                                    X = X.to(device, non_blocking=True)
-                                t_h2d_e = time.perf_counter_ns()
-                                h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-
-                        X = torch.atleast_2d(X)
-                        if X.dim() != 2:
-                            raise RuntimeError(
-                                f"infer: feats.ndim={X.dim()} (expect 2), shape={tuple(X.shape)}"
-                            )
-                        if X.shape[1] != int(ops.in_dim):
-                            raise AssertionError(
-                                "infer: feature dim mismatch — "
-                                f"feats.shape[1]={X.shape[1]} != in_dim={ops.in_dim}."
-                            )
-                        if X.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-                            X = X.to(dtype=torch.float32)
-                        wait_s = (time.perf_counter_ns() - t_fetch_start) / 1_000_000_000.0
-                        io_time += wait_s + h2d_s
-                        with contextlib.suppress(Exception):
-                            io_bytes += float(X.element_size() * X.nelement())
-
-                        t0 = time.perf_counter_ns()
-                        state = getattr(run_model, "_autobs_infer", None)
-                        if state is None:
-                            state = {"mb": 0, "util_prev": None, "bps_est": None, "util_ema": None}
-                            setattr(run_model, "_autobs_infer", state)
-                        B = int(X.shape[0])
-                        mb = int(state["mb"] or max(1, B // 2))
-                        mb = max(1, min(B, mb))
-                        chunks = max(1, math.ceil(B / mb))
-                        s_idx = 0
-                        pre_alloc = (
-                            torch.cuda.memory_allocated(device) if device.type == "cuda" else 0
-                        )
-
-                        comp_time_batch = 0.0
-                        io_time_batch = float(wait_s + h2d_s)
-                        for _micro in range(chunks):
-                            sl = slice(s_idx, min(B, s_idx + mb))
-                            s_idx += mb
-                            Xi = X[sl]
-                            with no_sync(run_model, enable=True):
-                                with flop_counter.step(display=False) as step_counter:
-                                    with contextlib.suppress(Exception):
-                                        mark_step = getattr(
-                                            getattr(torch, "compiler", None),
-                                            "cudagraph_mark_step_begin",
-                                            None,
-                                        )
-                                        if callable(mark_step):
-                                            mark_step()
-                                    tdp = to_tensordict({"features": Xi})
-                                    pred_out = run_model(
-                                        tdp,
-                                        global_loss=None,
-                                        local_loss=None,
-                                        loss_weights=None,
-                                        calibrate_output=True,
-                                    )
-                                    if isinstance(pred_out, TensorDictBase):
-                                        tdp = pred_out
-                                        y_hat = tdp.get("pred")
-                                    else:
-                                        y_hat = pred_out[0] if isinstance(pred_out, tuple) else pred_out
-                                    if y_hat is None:
-                                        raise RuntimeError("infer: model returned no prediction tensor.")
-
-                            y_hat_cpu = y_hat
-                            handle = None
-                            evt = None
-                            if pred_pool is not None and isinstance(y_hat, torch.Tensor):
-                                try:
-                                    backend = torch.cuda if device.type == "cuda" else getattr(torch, "xpu", None)
-                                    if backend is not None:
-                                        stream = backend.current_stream(device)
-                                        _shape = tuple(y_hat.shape)
-                                        _dtype = y_hat.dtype
-                                        handle, y_hat_cpu = pred_pool.allocate(_shape, _dtype)
-                                        if handle is None:
-                                            y_hat_cpu = y_hat.detach().cpu()
-                                        else:
-                                            y_hat_cpu.copy_(y_hat.detach(), non_blocking=True)
-                                            evt = backend.Event()
-                                            evt.record(stream)
-                                    else:
-                                        y_hat_cpu = y_hat.detach().cpu()
-                                except Exception:
-                                    y_hat_cpu = y_hat.detach().cpu().contiguous()
-                                    evt = None
-                                    handle = None
-
-                            try:
-                                tail = tuple(y_hat_cpu.shape[1:])
-                                if ref_tail_shape is None:
-                                    ref_tail_shape = tail
-                                    ref_dtype = y_hat_cpu.dtype
-                                else:
-                                    if tail != ref_tail_shape or y_hat_cpu.dtype != ref_dtype:
-                                        if not shape_inconsistent:
-                                            shape_inconsistent = True
-                            except Exception:
-                                pass
-                            if rank != 0:
-                                del y_hat_cpu
-                                if pred_pool is not None and handle is not None:
-                                    with contextlib.suppress(Exception):
-                                        pred_pool.release(handle)
-                                if evt is not None:
-                                    del evt
-                                continue
-                            if evt is not None:
-                                with contextlib.suppress(Exception):
-                                    evt.synchronize()
-
-                            _host = torch.empty_like(y_hat_cpu, device="cpu", pin_memory=False)
-                            _host.copy_(y_hat_cpu, non_blocking=False)
-                            batch_outputs.append(_host)
-
-                            if pred_pool is not None and handle is not None:
-                                with contextlib.suppress(Exception):
-                                    pred_pool.release(handle)
-                            with contextlib.suppress(Exception):
-                                step_flops = float(step_counter.get_total_flops())
-                            total_flops += max(0.0, step_flops)
-
-                        dt = (time.perf_counter_ns() - t0) / 1_000_000_000.0
-                        comp_time_batch += float(dt)
-                        comp_time += float(dt)
-
-                        total_t_batch = max(comp_time_batch + io_time_batch, 1e-6)
-                        util_cur = comp_time_batch / total_t_batch
-
-                        alpha = 0.2
-                        if state.get("util_ema") is None:
-                            state["util_ema"] = float(util_cur)
-                        else:
-                            state["util_ema"] = float(
-                                alpha * util_cur + (1.0 - alpha) * float(state["util_ema"])
-                            )
-                        util = float(state["util_ema"])
-                        state["util_prev"] = float(util)
-
-                        bps = float(B) / max(total_t_batch, 1e-6)
-                        if state.get("bps_est") is None:
-                            state["bps_est"] = float(bps)
-                        else:
-                            beta = 0.3
-                            state["bps_est"] = float(
-                                beta * bps + (1.0 - beta) * float(state["bps_est"])
-                            )
-
-                        target_lo = 0.80
-                        target_hi = 0.95
-                        new_mb = mb
-                        if util < target_lo:
-                            new_mb = min(B, mb + max(1, mb // 4))
-                        elif util > target_hi:
-                            new_mb = max(1, mb - max(1, mb // 4))
-
-                        mb_mem = B
-                        if device.type == "cuda" and state.get("bps_est"):
-                            try:
-                                _, total = torch.cuda.mem_get_info(device)
-                                alloc_now = torch.cuda.memory_allocated(device)
-                                target = int(total * 0.90)
-                                headroom = max(0, target - alloc_now)
-                                mb_mem = max(
-                                    1,
-                                    min(B, int(headroom / max(1, int(state["bps_est"])))),
-                                )
-                            except Exception:
-                                mb_mem = B
-
-                        host_avail_now: Optional[int] = None
-                        host_total_now: Optional[int] = None
-                        with contextlib.suppress(Exception):
-                            host_avail_now = Memory.available()
-                            host_total_now = Memory.total()
-                        host_low = False
-                        if host_avail_now is not None and host_avail_now > 0:
-                            host_low_abs = host_avail_now < (512 * 1024 * 1024)
-                            host_low_rel = False
-                            if host_total_now is not None and host_total_now > 0:
-                                host_low_rel = float(host_avail_now) / float(host_total_now) < 0.10
-                            host_low = host_low_abs or host_low_rel
-                        if host_low:
-                            _LOGGER.warning(
-                                "Host memory is low "
-                                f"(avail={host_avail_now}, total={host_total_now}). "
-                                "Restricting infer microbatch size."
-                            )
-                            mb_mem = max(1, min(mb_mem, int(B // 4)))
-
-                        min_mb_env = max(1, int(os.environ.get("STNET_INFER_MIN_MICROBATCH", "1")))
-                        max_mb_env = max(1, int(os.environ.get("STNET_INFER_MICROBATCH_MAX", str(B))))
-                        max_mb_env = min(max_mb_env, B)
-
-                        max_allowed = min(mb_mem, max_mb_env)
-                        new_mb = max(min_mb_env, min(new_mb, max_allowed))
-                        state["mb"] = new_mb
-
-                        if rank == 0:
-                            for _host in batch_outputs:
-                                buffer.put(_host)
-
-                        if local_rank == 0:
-                            mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
-                            tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-                            update_tqdm(status_bar, finish=1, mbps=mbps, tflops=tflops)
-                        t_fetch_start = time.perf_counter_ns()
-                        if pred_pool is not None and ((_idx + 1) & 255) == 0:
-                            with contextlib.suppress(Exception):
-                                pred_pool.collect()
-
-                        break
-
+                        out = run_model(tdp, calibrate_output=True)
                     except RuntimeError as e:
                         msg = str(e).lower()
-                        if "out of memory" in msg:
-                            _LOGGER.error(
-                                "[infer] OOM during batch %d. Trying to reduce microbatch and retry same batch.",
-                                _idx,
-                            )
-                            with contextlib.suppress(Exception):
-                                if device.type == "cuda" and torch.cuda.is_available():
+                        if "out of memory" in msg and mb > 1:
+                            if device.type == "cuda":
+                                try:
                                     torch.cuda.empty_cache()
-                                elif device.type == "xpu" and hasattr(torch, "xpu"):
-                                    empty_cache = getattr(torch.xpu, "empty_cache", None)
-                                    if callable(empty_cache):
-                                        empty_cache()
-
-                            reduced_any = False
-
-                            state = getattr(run_model, "_autobs_infer", None)
-                            if isinstance(state, dict):
-                                with contextlib.suppress(Exception):
-                                    cur_mb = int(state.get("mb") or 0)
-                                if "B" in locals() and (cur_mb <= 0 or cur_mb > B):
-                                    cur_mb = max(1, int(B // 2))
-                                if cur_mb > 1:
-                                    new_mb = max(1, cur_mb // 2)
-                                    state["mb"] = new_mb
-                                    _LOGGER.info(
-                                        "[infer] reduced _autobs_infer.mb from %d to %d after OOM",
-                                        cur_mb,
-                                        new_mb,
-                                    )
-                                    reduced_any = True
-
-                            inst = _unwrap_for_microbatch(run_model)
-                            if inst is not None:
-                                with contextlib.suppress(Exception):
-                                    cur_mb_inst = int(getattr(inst, "microbatch", 0) or 0)
-                                if cur_mb_inst > 1:
-                                    new_mb_inst = max(1, cur_mb_inst // 2)
-                                    if new_mb_inst < cur_mb_inst:
-                                        with contextlib.suppress(Exception):
-                                            inst.microbatch = new_mb_inst
-                                            inst._auto_microbatch_pending = False
-                                        _LOGGER.info(
-                                            "[infer] reduced Instance.microbatch from %d to %d after OOM",
-                                            cur_mb_inst,
-                                            new_mb_inst,
-                                        )
-                                        reduced_any = True
-
-                            if not reduced_any:
-                                _LOGGER.error(
-                                    "[infer] OOM and no more knobs to reduce "
-                                    "(autobs mb <= 1 and/or Instance.microbatch <= 1). "
-                                    "Giving up on recovery."
-                                )
-                                raise
-
-                            continue
+                                except Exception:
+                                    pass
+                            mb = max(1, mb // 2)
+                            try:
+                                setattr(model, "microbatch", mb)
+                            except Exception:
+                                pass
+                            # Ensure we release intermediate tensors before retry.
+                            with contextlib.suppress(Exception):
+                                del Xi, tdp
+                            gc.collect()
+                            continue  # retry same start with smaller mb
                         raise
 
+                    # Extract predictions.
+                    y_hat: Optional[torch.Tensor] = None
+                    if isinstance(out, TensorDictBase):
+                        y_hat = out.get("pred", None)
+                    if y_hat is None and isinstance(tdp, TensorDictBase):
+                        y_hat = tdp.get("pred", None)
+                    if y_hat is None:
+                        raise RuntimeError("infer: model output missing 'pred'")
+
+                    y_hat = y_hat.detach()
+
+                    # Track shape stability.
+                    tail = tuple(int(x) for x in y_hat.shape[1:])
+                    if first_tail is None:
+                        first_tail = tail
+                    elif tail != first_tail:
+                        variable_shape = True
+
+                    # Persist on host.
+                    y_cpu = y_hat.to(device="cpu")
+                    rows_cpu = (rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")).to(dtype=torch.int64)
+
+                    pending_rows.append(rows_cpu.reshape(-1))
+                    pending_preds.append(y_cpu)
+                    pending_count += int(y_cpu.shape[0])
+
+                    if pending_count >= target_rows:
+                        _flush()
+
+                    # Release per-step tensors aggressively.
+                    del Xi, rows_i, tdp, out, y_hat, y_cpu, rows_cpu
+                    start = end
+
+                if status_bar is not None:
+                    status_bar.update(1)
+
+                del X, _Y, batch, row_ids
+
     finally:
-        with contextlib.suppress(Exception):
-            buffer.stop()
-        _writer_thread.join(timeout=10.0)
-        if _writer_thread.is_alive():
-            logging.error(
-                "Writer thread did not finish within timeout; potential blocking on buffer drain"
-            )
-            logging.warning("Switching to non-blocking flush mode to avoid hang.")
-            try:
-                while not buffer.empty():
-                    t_rem = buffer.get(block=False)
-                    path_rem = os.path.join(chunk_dir, f"chunk_{chunk_idx:06d}.pt")
-                    torch.save(t_rem, path_rem)
-                    chunk_idx += 1
-            except Exception as ex:
-                logging.error(f"Fallback drain encountered exception: {ex!r}")
-        else:
-            logging.info("Writer thread terminated cleanly.")
-        if local_rank == 0 and status_bar is not None:
-            mbps = io_bytes / max(io_time, 1e-06) / MB_DIV
-            tflops = total_flops / max(comp_time, 1e-06) / 1_000_000_000_000.0
-            status_bar.set_postfix_str(
-                f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
-            )
-            status_bar.close()
-    if rank == 0:
-
-        if not chunk_dir:
+        # Flush remaining chunks and finish background writers.
+        _flush()
+        cache.close()
+        # Writer error propagation (don't clobber an existing exception).
+        exc_type, _, _ = sys.exc_info()
+        if exc_type is None:
             with contextlib.suppress(Exception):
-                chunk_dir = new_dir("pred_chunks")
-                os.makedirs(chunk_dir, exist_ok=True)
-        manifest = {
-            "dir": chunk_dir,
-            "num_chunks": int(chunk_idx),
-            "out_shape": list(ops.out_shape),
-            "dtype": (str(ref_dtype).replace("torch.", "") if ref_dtype is not None else None),
-        }
-        if shape_inconsistent:
-            manifest["variable_shape"] = True
-            if ref_tail_shape is not None:
-                manifest["example_tail_shape"] = list(ref_tail_shape)
-        with contextlib.suppress(Exception):
-            with open(
-                os.path.join(chunk_dir or "", "manifest.json"), "w", encoding="utf-8"
-            ) as manifest_file:
-                json.dump(manifest, manifest_file)
-        result = None
-    return None
+                if getattr(cache, "had_error", None) and cache.had_error():
+                    raise RuntimeError("infer: prediction writer encountered an error")
+        if status_bar is not None:
+            status_bar.close()
 
+        distributed_barrier(device)
 
-def _unwrap_for_microbatch(model: torch.nn.Module) -> Optional[torch.nn.Module]:
-    m: Any = model
-    for _ in range(8):
-        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
-            return m
-        child = getattr(m, "module", None)
-        if child is None or child is m:
-            break
-        m = child
+        # Rank 0 writes a manifest for the driver.
+        if rank == 0:
+            parts: list[dict[str, str]] = []
+            for rows_path in sorted(glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))):
+                base = rows_path[: -len("-rows.pt")]
+                pred_path = base + "-pred.pt"
+                if not os.path.exists(pred_path):
+                    # Fail fast: missing paired pred means incomplete output.
+                    raise RuntimeError(f"infer: missing pred file for rows part: {rows_path} -> {pred_path}")
+                parts.append({"rows": os.path.basename(rows_path), "pred": os.path.basename(pred_path)})
+
+            if not parts:
+                raise RuntimeError(f"infer: no prediction parts produced in {chunk_dir}")
+
+            manifest = {
+                "format": "stnet.pred.v2",
+                "rank_count": int(world_size),
+                "out_shape": list(int(x) for x in (ops.out_shape or ())),
+                "variable_shape": bool(variable_shape),
+                "parts": parts,
+            }
+
+            man_path = os.path.join(chunk_dir, "manifest.json")
+            with open(man_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+
+        distributed_barrier(device)
+
     return None
 
 
 def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
-    from ..data.pipeline import fetch
+    from ..api.templates import Session
 
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
@@ -3507,7 +3216,9 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     restore_dl_state = bool(state_train) or bool(state_val)
         train_loader: Any = None
         val_loader: Any = None
-        keep: Any = None
+        raw_train_loader: Any = None
+        raw_val_loader: Any = None
+        session: Optional[Session] = None
         try:
             expanded_sources = _expand(ops.sources)
             if expanded_sources is not ops.sources:
@@ -3523,6 +3234,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     model=model,
                     device=device,
                     ops=ops,
+                    dataset=metadata,
                     with_backward=True,
                     global_loss=top_loss,
                     local_loss=bottom_loss,
@@ -3531,23 +3243,22 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
 
             os.environ.setdefault("STNET_MICROBATCH_MAX", "64")
             os.environ.setdefault("STNET_MICROBATCH_STAGE_DIV", "4")
-            _dl = fetch(
+            session = Session(
                 sources=ops.sources,
                 device=device,
                 val_frac=float(ops.val_frac),
                 non_blocking_copy=non_blocking_copy,
+                sanitize=True,
                 flatten_features=True,
                 labels_dtype=param_dtype,
+            ).open(
+                train_state=(state_train if restore_dl_state else None),
+                val_state=(state_val if restore_dl_state else None),
             )
-            train_loader = _dl.get("training_loader")
-            val_loader = _dl.get("validation_loader")
-            keep = _dl.get("disposable")
-            if restore_dl_state:
-                with contextlib.suppress(Exception):
-                    train_loader.load_state_dict(state_train)
-                if val_loader is not None:
-                    with contextlib.suppress(Exception):
-                        val_loader.load_state_dict(state_val)
+            train_loader = session.training_loader
+            val_loader = session.validation_loader
+            raw_train_loader = session.raw_training_loader
+            raw_val_loader = session.raw_validation_loader
             train_steps = _num_batches(train_loader)
             val_steps = _num_batches(val_loader)
             steps_per_epoch = max(1, train_steps + val_steps)
@@ -3645,10 +3356,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 swa_helper=swa_helper,
                 swa_start_epoch=swa_start_epoch,
                 buffers_dtype=amp_buffers_dtype,
+                dataset=metadata,
             )
         finally:
-            if keep is not None:
-                keep.cleanup()
+            if session is not None:
+                session.close()
         if local_rank == 0:
             model_sd = get_model_state_dict(
                 model,
@@ -3668,17 +3380,21 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 model_fallback = dict(model_sd)
                 _trim_dcp_keys(model_fallback)
                 torch.save(model_fallback, fallback_path)
-            with contextlib.suppress(Exception):
-                _dl = {
-                    "train": (
-                        train_loader.state_dict() if train_loader is not None else {}
-                    ),
-                    "val": (val_loader.state_dict() if val_loader is not None else {}),
-                }
-                with open(
-                    loader_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
-                ) as _f:
-                    json.dump(_dl, _f)
+                with contextlib.suppress(Exception):
+                    _dl = {
+                        "train": (
+                            raw_train_loader.state_dict()
+                            if raw_train_loader is not None
+                            else {}
+                        ),
+                        "val": (
+                            raw_val_loader.state_dict() if raw_val_loader is not None else {}
+                        ),
+                    }
+                    with open(
+                        loader_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
+                    ) as _f:
+                        json.dump(_dl, _f)
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -3758,20 +3474,23 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 model=model,
                 device=device,
                 ops=ops,
+                dataset=metadata,
                 with_backward=False,
             )
 
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        _dl = fetch(
+        session: Optional[Session] = None
+        session = Session(
             sources=ops.sources,
             device=device,
             val_frac=0.0,
             non_blocking_copy=True,
-        )
-        data_loader = _dl.get("training_loader")
-        keep = _dl.get("disposable")
+            sanitize=True,
+            flatten_features=True,
+        ).open()
+        data_loader = session.training_loader
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
         if chunk_dir and torch.distributed.get_rank() == 0:
             with contextlib.suppress(Exception):
@@ -3790,16 +3509,29 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 ops=ops,
                 data_loader=data_loader,
                 chunk_dir=chunk_dir,
+                dataset=metadata,
             )
             if result is not None and ret_sink is not None:
                 ret_sink.update(result)
         finally:
-            if keep is not None:
-                keep.cleanup()
+            if session is not None:
+                session.close()
         distributed_barrier(device)
         torch.distributed.destroy_process_group()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
+
+
+def _unwrap_for_microbatch(model: torch.nn.Module) -> Optional[torch.nn.Module]:
+    m: Any = model
+    for _ in range(8):
+        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
+            return m
+        child = getattr(m, "module", None)
+        if child is None or child is m:
+            break
+        m = child
+    return None
 
 
 torch_compile_safe(runtime_module=sys.modules[__name__])

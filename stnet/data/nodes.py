@@ -5,6 +5,7 @@ import json
 import os
 import random
 import threading
+import queue
 from contextlib import suppress
 from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
                     Sequence, Tuple, TypedDict)
@@ -207,36 +208,39 @@ class Sampler(_Sampler):
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         start = int(start)
         end = int(end)
+        row_ids: torch.Tensor
         if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
             idx = self._perm[start:end]
-            if idx.numel() == 0:
+            row_ids = idx.to(dtype=torch.int64, copy=False) if torch.is_tensor(idx) else torch.as_tensor(idx, dtype=torch.int64)
+            if row_ids.numel() == 0:
                 x = self._features[:0]
                 y = self._labels[:0]
             else:
                 try:
-                    x = self._features.index_select(0, idx)
+                    x = self._features.index_select(0, row_ids)
                 except Exception:
                     x = (
-                        self._features[idx]
+                        self._features[row_ids]
                         if hasattr(self._features, "__getitem__")
-                        else torch.as_tensor(self._features)[idx]
+                        else torch.as_tensor(self._features)[row_ids]
                     )
                 try:
-                    y = self._labels.index_select(0, idx)
+                    y = self._labels.index_select(0, row_ids)
                 except Exception:
                     y = (
-                        self._labels[idx]
+                        self._labels[row_ids]
                         if hasattr(self._labels, "__getitem__")
-                        else torch.as_tensor(self._labels)[idx]
+                        else torch.as_tensor(self._labels)[row_ids]
                     )
         else:
+            row_ids = torch.arange(start, end, dtype=torch.int64)
             x = self._features[start:end]
             y = self._labels[start:end]
         if self._label_shape:
             y = y.reshape(end - start, *self._label_shape)
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
         yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
-        return {"X": xt, "Y": yt}
+        return {"X": xt, "Y": yt, "row_ids": row_ids}
 
     def __getitem__(
         self, idx: int | Tuple[int, int] | Sequence[int]
@@ -273,7 +277,8 @@ class Sampler(_Sampler):
                 )
             if self._label_shape:
                 y = y.reshape(y.shape[0], *self._label_shape)
-            return {"X": x, "Y": y}
+            row_ids = idx_tensor.to(dtype=torch.int64, copy=False)
+            return {"X": x, "Y": y, "row_ids": row_ids}
         i = self._start + int(idx)
         out = self._slice(i, i + 1)
         try:
@@ -283,7 +288,10 @@ class Sampler(_Sampler):
                 x = x.squeeze(0)
             if torch.is_tensor(y):
                 y = y.squeeze(0)
-            return {"X": x, "Y": y}
+            r = out.get("row_ids", None)
+            if torch.is_tensor(r):
+                r = r.squeeze(0)
+            return {"X": x, "Y": y, "row_ids": r}
         except Exception:
             return out
 
@@ -878,6 +886,109 @@ class Loader:
         return 0
 
 
+
+
+class BufferedLoader:
+    """A small in-memory backpressure wrapper for any iterable/loader.
+
+    Why this exists:
+      - Many loader graphs already prefetch internally (workers/prefetch_factor/etc).
+      - This wrapper provides an explicit, *small* inflight cap so upstream cannot
+        outrun the consumer and blow up host RAM.
+
+    Behavior:
+      - Iterating this object starts a daemon producer thread that pulls from the
+        source iterable and enqueues items.
+      - The consumer yields items by dequeuing.
+      - When the queue reaches max_batches, producer blocks (backpressure).
+      - Exceptions in producer are forwarded to the consumer.
+
+    Notes:
+      - This is an *iterable* (not a single iterator). Each __iter__ call starts a new
+        producer thread and a fresh queue, so you can iterate multiple times (epochs).
+    """
+
+    def __init__(
+        self,
+        iterable: Any,
+        *,
+        max_batches: int = 4,
+        name: str = "buffer",
+        daemon: bool = True,
+    ) -> None:
+        self._src = iterable
+        self._max_batches = max(1, int(max_batches))
+        self._name = str(name or "buffer")
+        self._daemon = bool(daemon)
+
+    def __len__(self) -> int:
+        try:
+            return int(len(self._src))  # type: ignore[arg-type]
+        except Exception:
+            return 1
+
+    def __iter__(self) -> Iterator[Any]:
+        import traceback
+
+        from ..backend.system import Memory
+
+        buf = Memory.Buffer(max_batches=self._max_batches)
+        stop = threading.Event()
+        SENTINEL = object()
+
+        class _Err:
+            __slots__ = ("exc", "tb")
+            def __init__(self, exc: BaseException, tb: str) -> None:
+                self.exc = exc
+                self.tb = tb
+
+        src_iter = iter(self._src)
+
+        def _producer() -> None:
+            try:
+                for item in src_iter:
+                    if stop.is_set() or buf.is_stopped():
+                        break
+                    if not buf.put(item):
+                        break
+            except BaseException as e:
+                tb = traceback.format_exc()
+                buf.put(_Err(e, tb))
+            finally:
+                # Always try to send a sentinel so the consumer can terminate cleanly.
+                buf.put(SENTINEL)
+
+        t = threading.Thread(
+            target=_producer,
+            name=f"{self._name}-producer",
+            daemon=self._daemon,
+        )
+        t.start()
+
+        try:
+            while True:
+                try:
+                    item = buf.get(timeout=0.1)
+                except queue.Empty:
+                    if stop.is_set() and not t.is_alive():
+                        break
+                    continue
+                if item is SENTINEL:
+                    break
+                if isinstance(item, _Err):
+                    raise RuntimeError(
+                        f"BufferedLoader producer crashed: {item.exc}\n{item.tb}"
+                    ) from item.exc
+                yield item
+        finally:
+            # Best-effort early-stop: ask producer to stop and close upstream if possible.
+            stop.set()
+            buf.stop()
+            with suppress(Exception):
+                close = getattr(src_iter, "close", None)
+                if callable(close):
+                    close()
+
 class Prefetcher:
     def __init__(
         self,
@@ -910,7 +1021,14 @@ class Prefetcher:
         if isinstance(x, (list, tuple)):
             return type(x)(self._to_device(t, device) for t in x)
         if isinstance(x, dict):
-            return {k: self._to_device(v, device) for k, v in x.items()}
+            out: dict[Any, Any] = {}
+            for k, v in x.items():
+                # Keep lightweight metadata on host.
+                if k == "row_ids":
+                    out[k] = v
+                else:
+                    out[k] = self._to_device(v, device)
+            return out
         return x
 
     def _pin_memory(self, x: Any) -> Any:
@@ -921,7 +1039,14 @@ class Prefetcher:
         if isinstance(x, (list, tuple)):
             return type(x)(self._pin_memory(t) for t in x)
         if isinstance(x, dict):
-            return {k: self._pin_memory(v) for k, v in x.items()}
+            out: dict[Any, Any] = {}
+            for k, v in x.items():
+                # row_ids are small metadata; do NOT pin to avoid unnecessary pinned allocations.
+                if k == "row_ids":
+                    out[k] = v
+                else:
+                    out[k] = self._pin_memory(v)
+            return out
         return x
 
     def __iter__(self) -> Iterator[Any]:
