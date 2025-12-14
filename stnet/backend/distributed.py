@@ -636,7 +636,7 @@ def to_fsdp(
     if "use_orig_params" in params:
         kwargs["use_orig_params"] = _env_flag("STNET_FSDP_USE_ORIG_PARAMS", True)
 
-    if "mesh" in params:
+    if "mesh" in params and mesh is not None:
         kwargs["mesh"] = mesh
     elif "process_group" in params and mesh is not None:
         kwargs["process_group"] = mesh
