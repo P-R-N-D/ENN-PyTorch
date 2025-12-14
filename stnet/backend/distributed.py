@@ -648,11 +648,24 @@ def to_fsdp(
     if "sync_module_states" in params:
         kwargs["sync_module_states"] = sync_module_states
     if "ignored_params" in params and ignored_params is not None:
-        kwargs["ignored_params"] = ignored_params
+        if not _env_flag("STNET_FSDP_DISABLE_IGNORED_PARAMS", False):
+            kwargs["ignored_params"] = ignored_params
 
     sharded = fully_shard(*args, **kwargs)
     try:
         sharded.set_requires_gradient_sync(True)
     except AttributeError:
         pass
+
+    try:
+        from torch.distributed.fsdp import register_fsdp_forward_method as _reg_fsdp_forward_method
+    except Exception:
+        _reg_fsdp_forward_method = None
+    if callable(_reg_fsdp_forward_method):
+        for _name in ("forward", "decode", "predict"):
+            if hasattr(sharded, _name):
+                try:
+                    _reg_fsdp_forward_method(sharded, _name)
+                except Exception:
+                    pass
     return sharded
