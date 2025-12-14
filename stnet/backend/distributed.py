@@ -550,11 +550,6 @@ def distributed_broadcast(
     if not is_distributed():
         return
 
-    try:
-        from torch.distributed._tensor import DTensor
-    except Exception:
-        DTensor = tuple()
-
     for buffer in module.buffers(recurse=True):
         data = getattr(buffer, "data", None)
         if not isinstance(data, torch.Tensor):
@@ -569,17 +564,7 @@ def distributed_broadcast(
         if not isinstance(data, torch.Tensor):
             continue
         try:
-            if isinstance(data, DTensor):
-                local = data.to_local()
-                dist.broadcast(local, src=src)
-                param.data = type(data).from_local(
-                    local,
-                    device_mesh=data.device_mesh,
-                    placements=tuple(data.placements),
-                    run_check=False,
-                )
-            else:
-                dist.broadcast(data, src=src)
+            dist.broadcast(data, src=src)
         except Exception:
             continue
 
