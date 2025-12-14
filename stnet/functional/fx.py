@@ -932,7 +932,8 @@ class Autocast:
                 contexts = cls._torchao_int4(dev, True)
                 if contexts:
                     cls._preferred_int_backend = "ao"
-            except Exception:
+            except Exception as exc:
+                _LOGGER.debug("Autocast INT4 enable failed: %s", exc)
                 contexts = []
         if not contexts and wants_int8:
             backend = cls._int_backend(cls._preferred_int_backend, device=dev)
