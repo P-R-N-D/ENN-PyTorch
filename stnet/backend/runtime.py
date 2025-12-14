@@ -3078,9 +3078,18 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         _cast_model_fp_dtype(model, param_dtype)
         model.train()
         world = get_world_size(device)
-        mesh = init_device_mesh(
-            "cuda" if device.type == "cuda" else device.type, (world,)
+        mesh = None
+        _enable_dtensor_param_coerce = str(
+            os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", "")
+        ).strip().lower() in {"1", "true", "yes", "y", "on"}
+        _enable_device_mesh = _enable_dtensor_param_coerce or (
+            str(os.environ.get("STNET_ENABLE_DEVICE_MESH", "")).strip().lower()
+            in {"1", "true", "yes", "y", "on"}
         )
+        if _enable_device_mesh:
+            mesh = init_device_mesh(
+                "cuda" if device.type == "cuda" else device.type, (world,)
+            )
         amp_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else Autocast.float_amp_priority(device)
         if not amp_candidates:
             amp_candidates = (torch.float32,)
@@ -3154,7 +3163,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 sync_module_states=True,
             )
         _enable_dtensor_param_coerce = (
-            mesh is not None
+            (mesh is not None)
             and str(os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", ""))
             .strip()
             .lower()
