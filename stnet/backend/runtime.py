@@ -176,26 +176,22 @@ def _enable_meta_monitor(model: torch.nn.Module) -> None:
 def _assert_no_fake_dtensor(
     root: nn.Module, *args: Any, allow_dtensor: bool = False, **kwargs: Any
 ) -> None:
-    dtensor_types: Tuple[type, ...] = tuple()
     bad: list[str] = []
     for name, module in root.named_modules():
         if not isinstance(module, nn.LayerNorm):
             continue
         for attr in ("weight", "bias"):
             tensor = getattr(module, attr, None)
-            if not isinstance(tensor, torch.Tensor):
+            if tensor is None:
                 continue
-            data_attr = getattr(tensor, "data", None)
             is_meta_or_fake = is_meta_or_fake_tensor(tensor)
-            is_dtensor = isinstance(tensor, dtensor_types) or isinstance(
-                data_attr, dtensor_types
-            )
-            if is_meta_or_fake or is_dtensor:
+            if is_meta_or_fake:
                 module_name = name or module.__class__.__name__
                 bad.append(f"{module_name}.{attr}{tuple(tensor.shape)}")
     if bad:
         raise RuntimeError(
-            "LayerNorm params must be real/local tensors:\n  " + "\n  ".join(bad)
+            "LayerNorm parameters must be materialized as a real Tensor: "
+            + ", ".join(bad)
         )
 
 
