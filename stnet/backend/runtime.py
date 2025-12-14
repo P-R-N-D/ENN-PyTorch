@@ -21,7 +21,6 @@ import torch
 import torch.distributed
 import torch.nn as nn
 from tensordict import TensorDictBase
-from torch.distributed._tensor import DTensor, Placement, Replicate
 from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
                                           load, save)
 from torch.distributed.checkpoint.api import CheckpointException
@@ -30,7 +29,6 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
                                                      get_optimizer_state_dict,
                                                      set_model_state_dict,
                                                      set_optimizer_state_dict)
-from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
@@ -178,12 +176,7 @@ def _enable_meta_monitor(model: torch.nn.Module) -> None:
 def _assert_no_fake_dtensor(
     root: nn.Module, *args: Any, allow_dtensor: bool = False, **kwargs: Any
 ) -> None:
-    try:
-        from torch.distributed._tensor import DTensor as _DTensor
-    except Exception:
-        dtensor_types: Tuple[type, ...] = tuple()
-    else:
-        dtensor_types = tuple() if allow_dtensor else (_DTensor,)
+    dtensor_types: Tuple[type, ...] = tuple()
     bad: list[str] = []
     for name, module in root.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -291,8 +284,6 @@ def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
             if (
                 not isinstance(weight, torch.Tensor)
                 or is_meta_or_fake_tensor(weight)
-                or isinstance(weight, DTensor)
-                or isinstance(getattr(weight, "data", None), DTensor)
             ):
                 data = torch.ones(
                     module.normalized_shape, device=device, dtype=target_dtype
@@ -304,8 +295,6 @@ def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
             if (
                 not isinstance(bias, torch.Tensor)
                 or is_meta_or_fake_tensor(bias)
-                or isinstance(bias, DTensor)
-                or isinstance(getattr(bias, "data", None), DTensor)
             ):
                 data = torch.zeros(
                     module.normalized_shape, device=device, dtype=target_dtype
@@ -777,60 +766,6 @@ def _calibrate_per_sample_mem(
 
     except Exception:
         return
-
-
-def _coerce_dtensor(
-    param: torch.nn.Parameter,
-    mesh: Any,
-    *args: Any,
-    placements: Optional[Sequence[Placement]] = None,
-    **kwargs: Any,
-) -> None:
-    if not isinstance(param, torch.nn.Parameter):
-        return
-    current_dtensor: Optional[DTensor]
-    current_dtensor = param.data if isinstance(param.data, DTensor) else None
-    placements_tuple: Optional[Tuple[Placement, ...]]
-    placements_tuple = tuple(placements) if placements is not None else None
-    if current_dtensor is None:
-        if (
-            getattr(param, "_is_sharded", False)
-            or hasattr(param, "_sharding_spec")
-            or param.__class__.__name__ == "FlatParameter"
-        ):
-            return
-        placements_tuple = placements_tuple or (Replicate(),)
-        try:
-            current_dtensor = DTensor.from_local(
-                param.data, mesh, placements_tuple, run_check=False
-            )
-        except Exception:
-            return
-        param.data = current_dtensor
-    else:
-        if (
-            placements_tuple is not None
-            and tuple(current_dtensor.placements) != placements_tuple
-        ):
-            try:
-                current_dtensor = current_dtensor.redistribute(
-                    device_mesh=current_dtensor.device_mesh, placements=placements_tuple
-                )
-                param.data = current_dtensor
-            except Exception:
-                placements_tuple = tuple(current_dtensor.placements)
-    if placements_tuple is None and current_dtensor is not None:
-        placements_tuple = tuple(current_dtensor.placements)
-    grad = param.grad
-    if grad is not None and not isinstance(grad, DTensor):
-        target_mesh = mesh if current_dtensor is None else current_dtensor.device_mesh
-        try:
-            param.grad = DTensor.from_local(
-                grad, target_mesh, placements_tuple or (Replicate(),), run_check=False
-            )
-        except Exception:
-            param.grad = None
-
 
 def _wrap_fsdp(
     target: Optional[torch.nn.Module],
@@ -3079,17 +3014,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         model.train()
         world = get_world_size(device)
         mesh = None
-        _enable_dtensor_param_coerce = str(
-            os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", "")
-        ).strip().lower() in {"1", "true", "yes", "y", "on"}
-        _enable_device_mesh = _enable_dtensor_param_coerce or (
-            str(os.environ.get("STNET_ENABLE_DEVICE_MESH", "")).strip().lower()
-            in {"1", "true", "yes", "y", "on"}
-        )
-        if _enable_device_mesh:
-            mesh = init_device_mesh(
-                "cuda" if device.type == "cuda" else device.type, (world,)
-            )
         amp_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else Autocast.float_amp_priority(device)
         if not amp_candidates:
             amp_candidates = (torch.float32,)
@@ -3162,22 +3086,10 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 reshard_after_forward=False,
                 sync_module_states=True,
             )
-        _enable_dtensor_param_coerce = (
-            (mesh is not None)
-            and str(os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", ""))
-            .strip()
-            .lower()
-            in {"1", "true", "yes", "y", "on"}
-        )
-        if _enable_dtensor_param_coerce:
-            for ignored_param in ignored_param_registry:
-                _coerce_dtensor(ignored_param, mesh, placements=(Replicate(),))
-            for parameter in model.parameters():
-                _coerce_dtensor(parameter, mesh)
         _m_post = model.module if hasattr(model, "module") else model
         _assert_unified_layer_dtype(_m_post, device)
         _assert_no_meta_tensors(_m_post)
-        _assert_no_fake_dtensor(_m_post, allow_dtensor=_enable_dtensor_param_coerce)
+        _assert_no_fake_dtensor(_m_post)
         _enable_meta_monitor(_m_post)
         distributed_sync(_m_post, device=device)
         net_params = [p for p in model.parameters()]

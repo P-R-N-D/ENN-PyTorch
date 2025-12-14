@@ -845,17 +845,9 @@ class PointTransformer(nn.Module):
             )
             w = getattr(ln, "weight", None)
             b = getattr(ln, "bias", None)
-            try:
-                from torch.distributed._tensor import DTensor as _DTensor
-            except Exception:
-                dtensor_types: Tuple[type, ...] = tuple()
-            else:
-                dtensor_types = (_DTensor,)
             w_data = getattr(w, "data", None)
             if isinstance(w, torch.Tensor) and (
                 is_meta_or_fake_tensor(w)
-                or isinstance(w, dtensor_types)
-                or isinstance(w_data, dtensor_types)
             ):
                 ln.weight = nn.Parameter(
                     torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
@@ -863,8 +855,6 @@ class PointTransformer(nn.Module):
             b_data = getattr(b, "data", None)
             if isinstance(b, torch.Tensor) and (
                 is_meta_or_fake_tensor(b)
-                or isinstance(b, dtensor_types)
-                or isinstance(b_data, dtensor_types)
             ):
                 ln.bias = nn.Parameter(
                     torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)

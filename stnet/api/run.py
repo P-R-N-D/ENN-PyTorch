@@ -36,8 +36,6 @@ from ..model.layers import History, Instance
 from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
 
-_DTENSOR_TYPE = getattr(getattr(torch.distributed, "_tensor", None), "DTensor", None)
-
 
 def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
@@ -77,8 +75,6 @@ def _reset_process_group() -> None:
 
 
 def _preload_state(value: Any) -> Any:
-    if _DTENSOR_TYPE is not None and isinstance(value, _DTENSOR_TYPE):
-        return value.to_local()
     if isinstance(value, dict):
         return {k: _preload_state(v) for k, v in value.items()}
     if isinstance(value, list):
