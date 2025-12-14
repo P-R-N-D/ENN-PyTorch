@@ -929,7 +929,7 @@ class Autocast:
 
         if wants_int4:
             try:
-                contexts = _torchao_int4(cls, dev, True)
+                contexts = cls._torchao_int4(dev, True)
                 if contexts:
                     cls._preferred_int_backend = "ao"
             except Exception:
