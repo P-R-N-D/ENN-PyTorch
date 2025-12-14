@@ -2896,303 +2896,325 @@ class Instance(nn.Module):
         is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
         infer_mode = not is_train_path
 
-        base_param = next(self.processor.parameters())
-        param_dtype = base_param.dtype
-        requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
-        if requested_base is not None:
-            base_dtype = requested_base
-        else:
-            base_dtype = (torch.float32 if amp_enabled else amp_dtype)
-        features = x_scaled.to(device=device, dtype=base_dtype)
-        assert features.ndim == 2 and features.shape[1] == self.in_dim
-        b = int(features.shape[0])
-
-        if self._auto_microbatch_pending:
+        _did_unshard_processor = False
+        _unshard = getattr(self.processor, "unshard", None)
+        _reshard = getattr(self.processor, "reshard", None)
+        if callable(_unshard):
             try:
-                mb = self._auto_microbatch(features, device)
-                self.microbatch = max(1, int(mb))
+                _unshard(async_op=False)
+                _did_unshard_processor = True
+            except TypeError:
+                try:
+                    _unshard()
+                    _did_unshard_processor = True
+                except Exception:
+                    _did_unshard_processor = False
             except Exception:
-                self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
-            self._auto_microbatch_pending = False
-        mb = max(1, min(int(b), int(self.microbatch) or int(b)))
-
-        if is_train_path:
-            self.processor.train()
-            self.controller.train()
-        else:
-            self.processor.eval()
-            self.controller.eval()
-
-        use_activation_checkpoint = bool(self._activation_checkpoint and is_train_path)
-
-        def _graph_break() -> None:
-            with contextlib.suppress(Exception):
-                try:
-                    import torch._inductor as _inductor
-
-                    gb = getattr(_inductor, "graph_break", None)
-                    if callable(gb):
-                        gb()
-                        return
-                except Exception:
-                    pass
-                try:
-                    import torch._dynamo as _dynamo
-
-                    _dynamo.graph_break()
-                except Exception:
-                    pass
-
-        def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                return self.processor(inp)
-
-        token_chunks: List[torch.Tensor] = []
-        context_chunks: List[torch.Tensor] = []
-        for s in range(0, int(b), mb):
-            x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
-            if is_train_path and use_activation_checkpoint:
-                tok, ctx_out = activation_checkpoint(_encode, x_slice)
+                _did_unshard_processor = False
+        try:
+            base_param = next(self.processor.parameters())
+            param_dtype = base_param.dtype
+            requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
+            if requested_base is not None:
+                base_dtype = requested_base
             else:
-                if infer_mode:
-                    with contextlib.ExitStack() as stack:
-                        stack.enter_context(Gradient.inference(self.processor))
+                base_dtype = (torch.float32 if amp_enabled else amp_dtype)
+            features = x_scaled.to(device=device, dtype=base_dtype)
+            assert features.ndim == 2 and features.shape[1] == self.in_dim
+            b = int(features.shape[0])
+    
+            if self._auto_microbatch_pending:
+                try:
+                    mb = self._auto_microbatch(features, device)
+                    self.microbatch = max(1, int(mb))
+                except Exception:
+                    self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
+                self._auto_microbatch_pending = False
+            mb = max(1, min(int(b), int(self.microbatch) or int(b)))
+    
+            if is_train_path:
+                self.processor.train()
+                self.controller.train()
+            else:
+                self.processor.eval()
+                self.controller.eval()
+    
+            use_activation_checkpoint = bool(self._activation_checkpoint and is_train_path)
+    
+            def _graph_break() -> None:
+                with contextlib.suppress(Exception):
+                    try:
+                        import torch._inductor as _inductor
+    
+                        gb = getattr(_inductor, "graph_break", None)
+                        if callable(gb):
+                            gb()
+                            return
+                    except Exception:
+                        pass
+                    try:
+                        import torch._dynamo as _dynamo
+    
+                        _dynamo.graph_break()
+                    except Exception:
+                        pass
+    
+            def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+                with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                    return self.processor(inp)
+    
+            token_chunks: List[torch.Tensor] = []
+            context_chunks: List[torch.Tensor] = []
+            for s in range(0, int(b), mb):
+                x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
+                if is_train_path and use_activation_checkpoint:
+                    tok, ctx_out = activation_checkpoint(_encode, x_slice)
+                else:
+                    if infer_mode:
+                        with contextlib.ExitStack() as stack:
+                            stack.enter_context(Gradient.inference(self.processor))
+                            tok, ctx_out = _encode(x_slice)
+                    else:
                         tok, ctx_out = _encode(x_slice)
-                else:
-                    tok, ctx_out = _encode(x_slice)
-            out_tokens = tok.to(dtype=base_dtype)
-            out_context = ctx_out.to(dtype=base_dtype)
-            token_chunks.append(out_tokens)
-            context_chunks.append(out_context)
-        tokens = torch.cat(token_chunks, dim=0)
-        context = torch.cat(context_chunks, dim=0)
-        tokens = _sanitize(tokens)
-        context = _sanitize(context)
-
-        assembled = context.reshape(b, -1)
-        if self.is_norm_linear and self.linear_branch is not None:
-            bl = self.linear_branch(
-                self._cast_graph_safe(features, self._device, assembled.dtype)
-            )
-            assembled = assembled + bl
-
-        mean_dtype = torch.float32 if amp_enabled else tokens.dtype
-        mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
-        tokens_centered = tokens - mean.to(dtype=tokens.dtype)
-        if not tokens_centered.is_contiguous():
-            tokens_centered = tokens_centered.contiguous()
-
-        if self._auto_ctrl_microbatch_pending:
-            try:
-                mb2 = self._auto_microbatch(tokens_centered, device)
-                self.ctrl_microbatch = max(1, int(mb2))
-            except Exception:
-                self.ctrl_microbatch = 1
-            self._auto_ctrl_microbatch_pending = False
-        ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
-
-        refined_tokens: torch.Tensor
-        residual_context: torch.Tensor
-
-        if infer_mode:
-            _graph_break()
-
-            with Gradient.inference(self.controller):
-
-                def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                        out, _ = self.controller(chunk)
-                    return out
-
-                if ctrl_mb < int(b):
-                    refined_tokens = torch.cat(
-                        [_infer_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                        dim=0,
-                    )
-                else:
-                    refined_tokens = _infer_controller(tokens_centered)
-
-            refined_tokens = _sanitize(refined_tokens)
-            decode_tokens = refined_tokens.detach()
-
-            _graph_break()
-
-            with Gradient.inference(self.processor):
-
-                def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                        dc = getattr(self, "_decode_compiled", None)
-                        if dc is not None:
-                            if (
-                                self._pad_compiled_microbatch
-                                and chunk.dim() == 3
-                                and chunk.shape[0] != ctrl_mb
-                                and chunk.shape[0] < ctrl_mb
-                            ):
-                                pad_n = int(ctrl_mb - chunk.shape[0])
-                                pad = torch.zeros(
-                                    (pad_n, chunk.shape[1], chunk.shape[2]),
-                                    device=chunk.device,
-                                    dtype=chunk.dtype,
-                                )
-                                out = dc(torch.cat([chunk, pad], dim=0))
-                                return out[: chunk.shape[0]]
-                            return dc(chunk)
-                        return self.processor.decode(chunk, apply_norm=True)
-
-                if ctrl_mb < int(b):
-                    residual_context = torch.cat(
-                        [_infer_decode(decode_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                        dim=0,
-                    )
-                else:
-                    residual_context = _infer_decode(decode_tokens)
-
-            residual_context = _sanitize(residual_context)
-        else:
-            with torch.enable_grad():
-                _graph_break()
-
-                def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                        out, _ = self.controller(inp)
-                    return out
-
-                def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    return _global_tokens(chunk)
-
-                if ctrl_mb < int(b):
-                    refined_tokens = torch.cat(
-                        [_run_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                        dim=0,
-                    )
-                else:
-                    refined_tokens = _run_controller(tokens_centered)
-
-                refined_tokens = _sanitize(refined_tokens)
-
-                _graph_break()
-
-                def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                        dc = getattr(self, "_decode_compiled", None)
-                        return dc(inp) if dc is not None else self.processor.decode(inp, apply_norm=True)
-
-                def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
-                    if use_activation_checkpoint:
-                        return activation_checkpoint(_decode_tokens, chunk)
-                    return _decode_tokens(chunk)
-
-                if ctrl_mb < int(b):
-                    residual_context = torch.cat(
-                        [_run_decode(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                        dim=0,
-                    )
-                else:
-                    residual_context = _run_decode(refined_tokens)
-
-                residual_context = _sanitize(residual_context)
-
-        residual = residual_context.reshape(b, -1)
-        if residual.dtype != assembled.dtype:
-            residual = residual.to(dtype=assembled.dtype)
-        y_hat = assembled + residual
-        y_hat = _sanitize(y_hat)
-
-        z_pred_raw = y_hat
-        pred = y_hat.reshape(b, *self.out_shape)
-        y_hat_for_loss = y_hat
-        loss_val: Optional[torch.Tensor] = None
-        z_true: Optional[torch.Tensor] = None
-        if labels_flat is not None:
-            y_true_raw = labels_flat.to(device=y_hat_for_loss.device)
-            z_true = self.scaler.normalize_y(y_true_raw)
-
-        if labels_flat is not None and (
-            global_loss is not None or local_loss is not None
-        ):
-
-            controller: Optional[LossWeightPolicy] = None
-            weights: Tuple[float, float]
-            if loss_weights is None:
-                weights = (1.0, 0.0)
-            elif isinstance(loss_weights, (tuple, list)):
-                seq = list(loss_weights)
-                if len(seq) != 2:
-                    raise ValueError("loss_weights requires two values")
-                weights = (float(seq[0]), float(seq[1]))
-            else:
-                controller = cast(LossWeightPolicy, loss_weights)
-                weights = controller.weights()
-            tgt = z_true.to(
-                device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-            )
-            total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
-            top_component: Optional[torch.Tensor] = None
-            bottom_component: Optional[torch.Tensor] = None
-            y_bot = assembled.to(
-                device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-            )
-
-            if global_loss is not None:
-                top_component = global_loss(z_pred_raw, z_true)
-                total = total + weights[0] * top_component
-            if local_loss is not None:
-                bottom_component = local_loss(y_bot, tgt)
-                total = total + weights[1] * bottom_component
-            if controller is not None:
-                controller.update(top_component, bottom_component)
-            loss_val = total
-        elif net_loss is not None and labels_flat is not None:
-            if is_cls_loss:
-                tgt = labels_flat.to(device=y_hat_for_loss.device).long()
-                loss_val = net_loss(y_hat_for_loss, tgt)
-            else:
-                if z_true is None:
-                    tgt = self.scaler.normalize_y(
-                        labels_flat.to(device=y_hat_for_loss.device)
-                    )
-                else:
-                    tgt = z_true.to(
-                        device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                    )
-                tgt = tgt.to(dtype=y_hat_for_loss.dtype)
-                loss_val = net_loss(y_hat_for_loss, tgt)
-
-        if loss_val is not None and not isinstance(loss_val, torch.Tensor):
-            loss_val = torch.as_tensor(
-                loss_val, device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-            )
-
-        if infer_mode and calibrate_output:
-            z_cal = self.scaler.calibrate(z_pred_raw)
-            pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
-
-        if td_input is not None:
-            if hasattr(td_input, "copy"):
-                out_td = td_input.copy()
-            else:
+                out_tokens = tok.to(dtype=base_dtype)
+                out_context = ctx_out.to(dtype=base_dtype)
+                token_chunks.append(out_tokens)
+                context_chunks.append(out_context)
+            tokens = torch.cat(token_chunks, dim=0)
+            context = torch.cat(context_chunks, dim=0)
+            tokens = _sanitize(tokens)
+            context = _sanitize(context)
+    
+            assembled = context.reshape(b, -1)
+            if self.is_norm_linear and self.linear_branch is not None:
+                bl = self.linear_branch(
+                    self._cast_graph_safe(features, self._device, assembled.dtype)
+                )
+                assembled = assembled + bl
+    
+            mean_dtype = torch.float32 if amp_enabled else tokens.dtype
+            mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
+            tokens_centered = tokens - mean.to(dtype=tokens.dtype)
+            if not tokens_centered.is_contiguous():
+                tokens_centered = tokens_centered.contiguous()
+    
+            if self._auto_ctrl_microbatch_pending:
                 try:
-                    out_td = td_input.clone(recurse=False)
-                except TypeError:
-                    out_td = td_input.clone(False)
-            out_td.set("pred", pred)
-            out_td.set("refined_tokens", refined_tokens)
-            out_td.set("residual_context", residual_context)
-            if loss_val is not None:
-                loss_td = loss_val
-                if isinstance(loss_td, torch.Tensor) and loss_td.ndim == 0:
-                    batch_size = tuple(out_td.batch_size)
-                    if len(batch_size):
-                        loss_td = loss_td.expand(batch_size)
-                out_td.set("loss_total", loss_td)
+                    mb2 = self._auto_microbatch(tokens_centered, device)
+                    self.ctrl_microbatch = max(1, int(mb2))
+                except Exception:
+                    self.ctrl_microbatch = 1
+                self._auto_ctrl_microbatch_pending = False
+            ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
+    
+            refined_tokens: torch.Tensor
+            residual_context: torch.Tensor
+    
+            if infer_mode:
+                _graph_break()
+    
+                with Gradient.inference(self.controller):
+    
+                    def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
+                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                            out, _ = self.controller(chunk)
+                        return out
+    
+                    if ctrl_mb < int(b):
+                        refined_tokens = torch.cat(
+                            [_infer_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                            dim=0,
+                        )
+                    else:
+                        refined_tokens = _infer_controller(tokens_centered)
+    
+                refined_tokens = _sanitize(refined_tokens)
+                decode_tokens = refined_tokens.detach()
+    
+                _graph_break()
+    
+                with Gradient.inference(self.processor):
+    
+                    def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
+                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                            dc = getattr(self, "_decode_compiled", None)
+                            if dc is not None:
+                                if (
+                                    self._pad_compiled_microbatch
+                                    and chunk.dim() == 3
+                                    and chunk.shape[0] != ctrl_mb
+                                    and chunk.shape[0] < ctrl_mb
+                                ):
+                                    pad_n = int(ctrl_mb - chunk.shape[0])
+                                    pad = torch.zeros(
+                                        (pad_n, chunk.shape[1], chunk.shape[2]),
+                                        device=chunk.device,
+                                        dtype=chunk.dtype,
+                                    )
+                                    out = dc(torch.cat([chunk, pad], dim=0))
+                                    return out[: chunk.shape[0]]
+                                return dc(chunk)
+                            return self.processor.decode(chunk, apply_norm=True)
+    
+                    if ctrl_mb < int(b):
+                        residual_context = torch.cat(
+                            [_infer_decode(decode_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                            dim=0,
+                        )
+                    else:
+                        residual_context = _infer_decode(decode_tokens)
+    
+                residual_context = _sanitize(residual_context)
             else:
-                with contextlib.suppress(KeyError):
-                    out_td.del_("loss_total")
-            return out_td
-        if return_loss is False:
-            return pred
-        return (pred, loss_val)
+                with torch.enable_grad():
+                    _graph_break()
+    
+                    def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
+                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                            out, _ = self.controller(inp)
+                        return out
+    
+                    def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
+                        return _global_tokens(chunk)
+    
+                    if ctrl_mb < int(b):
+                        refined_tokens = torch.cat(
+                            [_run_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                            dim=0,
+                        )
+                    else:
+                        refined_tokens = _run_controller(tokens_centered)
+    
+                    refined_tokens = _sanitize(refined_tokens)
+    
+                    _graph_break()
+    
+                    def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
+                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                            dc = getattr(self, "_decode_compiled", None)
+                            return dc(inp) if dc is not None else self.processor.decode(inp, apply_norm=True)
+    
+                    def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
+                        if use_activation_checkpoint:
+                            return activation_checkpoint(_decode_tokens, chunk)
+                        return _decode_tokens(chunk)
+    
+                    if ctrl_mb < int(b):
+                        residual_context = torch.cat(
+                            [_run_decode(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                            dim=0,
+                        )
+                    else:
+                        residual_context = _run_decode(refined_tokens)
+    
+                    residual_context = _sanitize(residual_context)
+    
+            residual = residual_context.reshape(b, -1)
+            if residual.dtype != assembled.dtype:
+                residual = residual.to(dtype=assembled.dtype)
+            y_hat = assembled + residual
+            y_hat = _sanitize(y_hat)
+    
+            z_pred_raw = y_hat
+            pred = y_hat.reshape(b, *self.out_shape)
+            y_hat_for_loss = y_hat
+            loss_val: Optional[torch.Tensor] = None
+            z_true: Optional[torch.Tensor] = None
+            if labels_flat is not None:
+                y_true_raw = labels_flat.to(device=y_hat_for_loss.device)
+                z_true = self.scaler.normalize_y(y_true_raw)
+    
+            if labels_flat is not None and (
+                global_loss is not None or local_loss is not None
+            ):
+    
+                controller: Optional[LossWeightPolicy] = None
+                weights: Tuple[float, float]
+                if loss_weights is None:
+                    weights = (1.0, 0.0)
+                elif isinstance(loss_weights, (tuple, list)):
+                    seq = list(loss_weights)
+                    if len(seq) != 2:
+                        raise ValueError("loss_weights requires two values")
+                    weights = (float(seq[0]), float(seq[1]))
+                else:
+                    controller = cast(LossWeightPolicy, loss_weights)
+                    weights = controller.weights()
+                tgt = z_true.to(
+                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+                )
+                total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
+                top_component: Optional[torch.Tensor] = None
+                bottom_component: Optional[torch.Tensor] = None
+                y_bot = assembled.to(
+                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+                )
+    
+                if global_loss is not None:
+                    top_component = global_loss(z_pred_raw, z_true)
+                    total = total + weights[0] * top_component
+                if local_loss is not None:
+                    bottom_component = local_loss(y_bot, tgt)
+                    total = total + weights[1] * bottom_component
+                if controller is not None:
+                    controller.update(top_component, bottom_component)
+                loss_val = total
+            elif net_loss is not None and labels_flat is not None:
+                if is_cls_loss:
+                    tgt = labels_flat.to(device=y_hat_for_loss.device).long()
+                    loss_val = net_loss(y_hat_for_loss, tgt)
+                else:
+                    if z_true is None:
+                        tgt = self.scaler.normalize_y(
+                            labels_flat.to(device=y_hat_for_loss.device)
+                        )
+                    else:
+                        tgt = z_true.to(
+                            device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+                        )
+                    tgt = tgt.to(dtype=y_hat_for_loss.dtype)
+                    loss_val = net_loss(y_hat_for_loss, tgt)
+    
+            if loss_val is not None and not isinstance(loss_val, torch.Tensor):
+                loss_val = torch.as_tensor(
+                    loss_val, device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
+                )
+    
+            if infer_mode and calibrate_output:
+                z_cal = self.scaler.calibrate(z_pred_raw)
+                pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
+    
+            if td_input is not None:
+                if hasattr(td_input, "copy"):
+                    out_td = td_input.copy()
+                else:
+                    try:
+                        out_td = td_input.clone(recurse=False)
+                    except TypeError:
+                        out_td = td_input.clone(False)
+                out_td.set("pred", pred)
+                out_td.set("refined_tokens", refined_tokens)
+                out_td.set("residual_context", residual_context)
+                if loss_val is not None:
+                    loss_td = loss_val
+                    if isinstance(loss_td, torch.Tensor) and loss_td.ndim == 0:
+                        batch_size = tuple(out_td.batch_size)
+                        if len(batch_size):
+                            loss_td = loss_td.expand(batch_size)
+                    out_td.set("loss_total", loss_td)
+                else:
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("loss_total")
+                return out_td
+            if return_loss is False:
+                return pred
+            return (pred, loss_val)
+        finally:
+            if _did_unshard_processor and callable(_reshard):
+                try:
+                    _reshard()
+                except Exception:
+                    pass
 
     def predict(
         self,
