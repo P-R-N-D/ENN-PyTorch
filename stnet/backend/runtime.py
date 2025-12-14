@@ -3153,10 +3153,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 reshard_after_forward=False,
                 sync_module_states=True,
             )
-        for ignored_param in ignored_param_registry:
-            _coerce_dtensor(ignored_param, mesh, placements=(Replicate(),))
-        for parameter in model.parameters():
-            _coerce_dtensor(parameter, mesh)
+        enable_dtensor_param_coerce = (
+            os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", "0")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "y", "on")
+        )
+        if enable_dtensor_param_coerce and (mesh is not None) and (Replicate is not None):
+            for ignored_param in ignored_param_registry:
+                _coerce_dtensor(ignored_param, mesh, placements=(Replicate(),))
+            for parameter in model.parameters():
+                _coerce_dtensor(parameter, mesh)
         _m_post = model.module if hasattr(model, "module") else model
         _assert_unified_layer_dtype(_m_post, device)
         _assert_no_meta_tensors(_m_post)
