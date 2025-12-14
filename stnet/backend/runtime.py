@@ -161,7 +161,11 @@ def _meta_monitor_pre_hook(
 
 
 def _enable_meta_monitor(model: torch.nn.Module) -> None:
-    hook_mode = os.environ.get("STNET_META_MONITOR", "off").strip().lower()
+    hook_mode = (
+        os.environ.get("STNET_META_MONITOR")
+        or os.environ.get("STNET_META_HOOK")
+        or "off"
+    ).strip().lower()
     if hook_mode in {"0", "", "false", "off"}:
         return
     warn_only = hook_mode in {"warn", "warning"}

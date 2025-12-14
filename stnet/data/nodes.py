@@ -145,13 +145,6 @@ class Sampler(_Sampler):
                     self._perm = torch.load(perm_path, map_location="cpu")
                     meta_shuffled = bool((self._meta or {}).get("shuffled", False))
                     self._perm_source = "runtime" if not meta_shuffled else "metadata"
-        if self._perm is None and False:
-            gen = torch.Generator(device="cpu")
-            with suppress(Exception):
-                gen.manual_seed(0)
-            with suppress(Exception):
-                self._perm = torch.randperm(self._N, generator=gen)
-                self._perm_source = "runtime"
         if self._perm is not None:
             try:
                 if int(self._perm.numel()) != self._N:
@@ -702,7 +695,8 @@ class Connector:
         )
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
-        self.max_concurrancy = max(1, int(self.io_workers))
+        self.max_concurrency = max(1, int(self.io_workers))
+        self.max_concurrancy = self.max_concurrency
         try:
             from ..backend.system import get_tlb
             get_tlb(io_workers=self.io_workers)
@@ -711,7 +705,9 @@ class Connector:
 
     def compose(self, source: "BaseNode") -> "BaseNode":
         from ..backend.system import wrap_with_tlb
-        
+
+        if ParallelMapper is None:
+            raise RuntimeError("torchdata.nodes.ParallelMapper is required")
         node: BaseNode = source
         mapper = self.map_fn
         if (self.prebatch or 0) and int(self.prebatch) > 1:
@@ -733,7 +729,7 @@ class Connector:
             num_workers=self.io_workers,
             in_order=False,
             method="thread",
-            max_concurrent=int(self.max_concurrancy),
+            max_concurrent=int(self.max_concurrency),
         )
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             node = _Unbatcher(node)

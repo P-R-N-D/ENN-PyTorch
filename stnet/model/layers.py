@@ -1799,8 +1799,6 @@ class Processor(nn.Module):
 
         flat = flat.contiguous()
         context = flat.reshape(B, *self.out_shape).contiguous()
-        dims = tuple(range(1, context.ndim))
-        offset = context.mean(dim=dims, keepdim=True).contiguous()
         return (tokens, context)
 
     def _forward_dynamically(
@@ -2578,8 +2576,6 @@ def resize_scaler_buffer(
     model: nn.Module,
     state: Mapping[str, Any],
 ) -> None:
-    from .layers import Scaler
-
     scaler: Optional[Scaler] = None
     for module in model.modules():
         if isinstance(module, Scaler):
@@ -2615,9 +2611,11 @@ def resize_scaler_buffer(
             try:
                 buf.resize_(src.shape)
             except Exception:
-                new_buf = buf.new_zeros(src.shape)
-                buf.resize_(new_buf.shape)
-                buf.copy_(new_buf)
+                new_buf = buf.detach().new_zeros(src.shape)
+                try:
+                    scaler._buffers[name] = new_buf
+                except Exception:
+                    setattr(scaler, name, new_buf)
 
 
 class Instance(nn.Module):
@@ -2814,9 +2812,22 @@ class Instance(nn.Module):
         global_loss: Optional[nn.Module] = None,
         local_loss: Optional[nn.Module] = None,
         loss_weights: Optional[Union[Tuple[float, float], LossWeightPolicy]] = None,
+        calibrate_output: bool = True,
+        sanitize_nan: bool = True,
+        return_loss: Optional[bool] = None,
         **kwargs: Any,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
-        calibrate_output: bool = bool(kwargs.pop("calibrate_output", True))
+    ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
+        if not isinstance(calibrate_output, bool):
+            raise TypeError("calibrate_output must be a bool")
+        if not isinstance(sanitize_nan, bool):
+            raise TypeError("sanitize_nan must be a bool")
+        if return_loss is not None and not isinstance(return_loss, bool):
+            raise TypeError("return_loss must be a bool or None")
+
+        def _sanitize(t: torch.Tensor) -> torch.Tensor:
+            if not sanitize_nan:
+                return t
+            return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
             td_input = features
@@ -2929,18 +2940,16 @@ class Instance(nn.Module):
                         tok, ctx_out = _encode(x_slice)
                 else:
                     tok, ctx_out = _encode(x_slice)
-            out_tokens = torch.nan_to_num(tok, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
-            out_context = torch.nan_to_num(ctx_out, nan=0.0, posinf=0.0, neginf=0.0).to(dtype=base_dtype)
+            out_tokens = tok.to(dtype=base_dtype)
+            out_context = ctx_out.to(dtype=base_dtype)
             token_chunks.append(out_tokens)
             context_chunks.append(out_context)
-        tokens = torch.cat(token_chunks, dim=0).to(device=device, dtype=base_dtype)
-        context = torch.cat(context_chunks, dim=0).to(device=device, dtype=base_dtype)
-        tokens = torch.nan_to_num(tokens, nan=0.0, posinf=0.0, neginf=0.0)
-        context = torch.nan_to_num(context, nan=0.0, posinf=0.0, neginf=0.0)
+        tokens = torch.cat(token_chunks, dim=0)
+        context = torch.cat(context_chunks, dim=0)
+        tokens = _sanitize(tokens)
+        context = _sanitize(context)
 
-        assembled = torch.nan_to_num(
-            context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
-        )
+        assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(
                 self._cast_graph_safe(features, self._device, assembled.dtype)
@@ -2949,7 +2958,9 @@ class Instance(nn.Module):
 
         mean_dtype = torch.float32 if amp_enabled else tokens.dtype
         mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
-        tokens_centered = (tokens - mean.to(dtype=tokens.dtype)).contiguous()
+        tokens_centered = tokens - mean.to(dtype=tokens.dtype)
+        if not tokens_centered.is_contiguous():
+            tokens_centered = tokens_centered.contiguous()
 
         if self._auto_ctrl_microbatch_pending:
             try:
@@ -2981,7 +2992,7 @@ class Instance(nn.Module):
                 else:
                     refined_tokens = _infer_controller(tokens_centered)
 
-            refined_tokens = torch.nan_to_num(refined_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+            refined_tokens = _sanitize(refined_tokens)
             decode_tokens = refined_tokens.detach()
 
             _graph_break()
@@ -3017,7 +3028,7 @@ class Instance(nn.Module):
                 else:
                     residual_context = _infer_decode(decode_tokens)
 
-            residual_context = torch.nan_to_num(residual_context, nan=0.0, posinf=0.0, neginf=0.0)
+            residual_context = _sanitize(residual_context)
         else:
             with torch.enable_grad():
                 _graph_break()
@@ -3038,7 +3049,7 @@ class Instance(nn.Module):
                 else:
                     refined_tokens = _run_controller(tokens_centered)
 
-                refined_tokens = torch.nan_to_num(refined_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+                refined_tokens = _sanitize(refined_tokens)
 
                 _graph_break()
 
@@ -3060,14 +3071,13 @@ class Instance(nn.Module):
                 else:
                     residual_context = _run_decode(refined_tokens)
 
-                residual_context = torch.nan_to_num(residual_context, nan=0.0, posinf=0.0, neginf=0.0)
+                residual_context = _sanitize(residual_context)
 
-        residual = torch.nan_to_num(
-            residual_context.reshape(b, -1), nan=0.0, posinf=0.0, neginf=0.0
-        )
+        residual = residual_context.reshape(b, -1)
         if residual.dtype != assembled.dtype:
             residual = residual.to(dtype=assembled.dtype)
-        y_hat = torch.nan_to_num(assembled + residual, nan=0.0, posinf=0.0, neginf=0.0)
+        y_hat = assembled + residual
+        y_hat = _sanitize(y_hat)
 
         z_pred_raw = y_hat
         pred = y_hat.reshape(b, *self.out_shape)
@@ -3160,7 +3170,18 @@ class Instance(nn.Module):
                 with contextlib.suppress(KeyError):
                     out_td.del_("loss_total")
             return out_td
+        if return_loss is False:
+            return pred
         return (pred, loss_val)
+
+    def predict(
+        self,
+        features: torch.Tensor | TensorDictBase,
+        *args: Any,
+        **kwargs: Any,
+    ) -> torch.Tensor | TensorDictBase:
+        kwargs.setdefault("return_loss", False)
+        return self.forward(features, *args, **kwargs)
 
     def history(self) -> Sequence[Mapping[str, Any]]:
         run_hist = getattr(self, "_train_history", None)
