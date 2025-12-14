@@ -635,6 +635,42 @@ class Autocast:
         return contexts
 
     @classmethod
+    def _torchao_int4(
+        cls: object,
+        device: torch.device,
+        enabled: bool,
+    ) -> List[contextlib.AbstractContextManager[None]]:
+        """Best-effort INT4 autocast/quant context (torchao-only).
+
+        TorchAO APIs may differ by version; we probe a small set of known names.
+        """
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            quant_mod = importlib.import_module("torchao.quantization")
+        except Exception as exc:
+            _LOGGER.debug("Autocast INT4 torchao import failed: %s", exc)
+            return contexts
+
+        for name in (
+            "int4_weight_only_autocast",
+            "int4_autocast",
+            "int4wo_autocast",
+            "int4w_autocast",
+        ):
+            fn = getattr(quant_mod, name, None)
+            if callable(fn):
+                try:
+                    contexts.append(fn(enabled=True))
+                    return contexts
+                except Exception as exc:
+                    _LOGGER.debug("Autocast INT4 torchao %s failed: %s", name, exc)
+                    return []
+        _LOGGER.debug("Autocast INT4 torchao context not found")
+        return contexts
+
+    @classmethod
     def configure(
         cls: object,
         model: Optional[nn.Module],
@@ -752,7 +788,7 @@ class Autocast:
         )
         amp_dtype = cls.negotiate(
             amp_candidates,
-            fallback=torch.float32,
+            fallback=torch.float64,
             logger=_LOGGER,
             context="float",
             device=dev,
@@ -794,8 +830,11 @@ class Autocast:
         if (
             isinstance(cls._last_float_dtype, torch.dtype)
             and cls._last_float_dtype in amp_candidates
+            and cls._last_float_dtype == amp_dtype
         ):
             requested_dtype = cls._last_float_dtype
+        if requested_dtype is torch.float64:
+            wants_fp8 = False
         if dev.type == "cuda" and requested_dtype is torch.bfloat16:
             bf16_ok = False
             if torch.cuda.is_available():
@@ -882,12 +921,26 @@ class Autocast:
             device=dev,
             meta=meta,
         )
-        backend = cls._int_backend(cls._preferred_int_backend, device=dev)
-        contexts = cls._torchao_int8(dev, True) if backend else []
-        if not contexts and backend == "te":
-            fallback_backend = cls._int_backend("ao", device=dev)
-            if fallback_backend == "ao":
-                contexts = cls._torchao_int8(dev, True)
+        quant_bits = getattr(meta, "int_quant_bits", None)
+        wants_int4 = quant_bits == 4
+        wants_int8 = (int_dtype == torch.int8) or (quant_bits == 8)
+
+        contexts: List[contextlib.AbstractContextManager[None]] = []
+
+        if wants_int4:
+            try:
+                contexts = _torchao_int4(cls, dev, True)
+                if contexts:
+                    cls._preferred_int_backend = "ao"
+            except Exception:
+                contexts = []
+        if not contexts and wants_int8:
+            backend = cls._int_backend(cls._preferred_int_backend, device=dev)
+            contexts = cls._torchao_int8(dev, True) if backend else []
+            if (not contexts) and backend == "te":
+                fallback_backend = cls._int_backend("ao", device=dev)
+                if fallback_backend == "ao":
+                    contexts = cls._torchao_int8(dev, True)
         if not contexts:
             contexts.append(contextlib.nullcontext())
 

@@ -381,6 +381,7 @@ class Dataset(Generic[TExtra]):
     float_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
     int_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
     float8_dtypes: Tuple[torch.dtype, ...] = field(default_factory=tuple)
+    int_quant_bits: Optional[int] = None
     input_data: Any = None
     output_data: Any = None
 
@@ -396,6 +397,7 @@ class Dataset(Generic[TExtra]):
     def __post_init__(self) -> None:
         self._refresh_device_info()
         self._refresh_dtypes_from_env()
+        self._refresh_quant_from_env()
 
     def _refresh_device_info(self) -> None:
         dev = torch.device(self.device)
@@ -553,35 +555,39 @@ class Dataset(Generic[TExtra]):
     def _float_amp_candidates(
         cls: object, device: torch.device
     ) -> Tuple[torch.dtype, ...]:
-        from ..functional.fx import Autocast as _Autocast
+        if device.type == "cuda":
+            cands = []
+            try:
+                if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+                    cands.append(torch.bfloat16)
+            except Exception:
+                pass
+            cands.append(torch.float16)
+            cands.append(torch.float32)
+            return tuple(cands)
 
-        global _BOOTSTRAP_DEPTH
-        if _BOOTSTRAP_DEPTH:
-            return (torch.float32,)
-        _BOOTSTRAP_DEPTH += 1
-        try:
-            return _Autocast.float_amp_priority(device)
-        except Exception:
-            return (torch.float32,)
-        finally:
-            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
+        if device.type == "cpu":
+            cands = []
+            try:
+                if bool(getattr(cls, "is_cpu_bf16_supported")()):  # type: ignore[misc]
+                    cands.append(torch.bfloat16)
+            except Exception:
+                pass
+            cands.append(torch.float32)
+            return tuple(cands)
+
+        cands = []
+        if device.type in {"xpu"}:
+            cands.append(torch.bfloat16)
+        cands.append(torch.float16)
+        cands.append(torch.float32)
+        return tuple(cands)
 
     @classmethod
     def _integer_candidates(
         cls: object, device: torch.device
     ) -> Tuple[torch.dtype, ...]:
-        from ..functional.fx import Autocast as _Autocast
-
-        global _BOOTSTRAP_DEPTH
-        if _BOOTSTRAP_DEPTH:
-            return (torch.int64,)
-        _BOOTSTRAP_DEPTH += 1
-        try:
-            return _Autocast.integer_amp_priority(device)
-        except Exception:
-            return (torch.int64,)
-        finally:
-            _BOOTSTRAP_DEPTH = max(0, _BOOTSTRAP_DEPTH - 1)
+        return (torch.int8, torch.int16, torch.int32, torch.int64)
 
     @classmethod
     def for_device(
@@ -617,6 +623,15 @@ class Dataset(Generic[TExtra]):
         self.float_dtypes = self._float_amp_candidates(dev)
         self.int_dtypes = self._integer_candidates(dev)
         self.float8_dtypes = self._float8_dtypes()
+        self._refresh_quant_from_scale()
+
+    def is_disabled(self) -> bool:
+        raw = os.environ.get("STNET_DISABLE_AUTOCAST")
+        if raw is None:
+            raw = os.environ.get("STNET_DISABLE_AMP")
+        if raw is None:
+            return False
+        return str(raw).strip().lower() in {"1", "true", "yes", "y", "on"}
 
     def ensure_device_info(self) -> None:
         self._refresh_device_info()
@@ -652,6 +667,7 @@ class Dataset(Generic[TExtra]):
             except Exception:
                 pass
         self.scale_is_integral = bool(is_integral) if is_integral is not None else None
+        self._refresh_quant_from_scale()
 
     @staticmethod
     def _scale_from_tensor(
@@ -747,6 +763,36 @@ class Dataset(Generic[TExtra]):
         self.label_float_dtype = self._normalize_float_dtype(
             self._dtype_from_env("STNET_LABEL_DTYPE", getattr(self, "label_float_dtype", torch.float32))
         )
+
+    def _refresh_quant_from_env(self) -> None:
+        raw = os.environ.get("STNET_INT_QUANT_BITS") or os.environ.get("STNET_INT_QUANT")
+        if raw is None:
+            return
+        try:
+            bits = int(str(raw).strip())
+        except Exception:
+            return
+        if bits in (4, 8):
+            self.int_quant_bits = bits
+
+    def _refresh_quant_from_scale(self) -> None:
+        if self.int_quant_bits in (4, 8):
+            return
+        if self.scale_is_integral is not True:
+            return
+        max_abs = self.scale_max_abs
+        if max_abs is None:
+            return
+        try:
+            v = float(abs(max_abs))
+        except Exception:
+            return
+        if not math.isfinite(v):
+            return
+        if v <= 7.0:
+            self.int_quant_bits = 4
+        elif v <= 127.0:
+            self.int_quant_bits = 8
 
     @staticmethod
     def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

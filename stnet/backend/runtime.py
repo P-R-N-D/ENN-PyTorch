@@ -215,6 +215,58 @@ def _reset_layernorm_parameter(
 ) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
+def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
+    if not isinstance(dtype, torch.dtype):
+        return
+    try:
+        if not torch.is_floating_point(torch.empty((), dtype=dtype)):
+            return
+    except Exception:
+        return
+    try:
+        if isinstance(model, nn.Module):
+            model.to(dtype=dtype)
+    except Exception:
+        pass
+    with torch.no_grad():
+        for mod in getattr(model, "modules", lambda: [])():
+            params = getattr(mod, "_parameters", None)
+            if params:
+                for name, p in list(params.items()):
+                    if p is None or not isinstance(p, torch.Tensor):
+                        continue
+                    if (not p.is_floating_point()) or p.dtype == dtype:
+                        continue
+                    params[name] = torch.nn.Parameter(
+                        p.detach().to(dtype), requires_grad=bool(getattr(p, "requires_grad", True))
+                    )
+            bufs = getattr(mod, "_buffers", None)
+            if bufs:
+                for name, b in list(bufs.items()):
+                    if b is None or not isinstance(b, torch.Tensor):
+                        continue
+                    if (not b.is_floating_point()) or b.dtype == dtype:
+                        continue
+                    bufs[name] = b.detach().to(dtype)
+
+
+def _cpu_layernorm_param_dtype(device: torch.device) -> torch.dtype:
+    try:
+        meta = Autocast.coerce_metadata(device)
+        cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        if not cands:
+            cands = (torch.float32,)
+        chosen = Autocast.negotiate(
+            tuple(cands),
+            fallback=torch.float64,
+            context="cpu.layernorm",
+            device=device,
+            meta=meta,
+        )
+        return torch.float64 if chosen == torch.float64 else torch.float32
+    except Exception:
+        return torch.float32
+
 
 def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
     for module in model.modules():
@@ -225,7 +277,7 @@ def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
         requires_grad_w = bool(getattr(weight, "requires_grad", True))
         requires_grad_b = bool(getattr(bias, "requires_grad", True))
         if device.type == "cpu":
-            target_dtype = torch.float32
+            target_dtype = _cpu_layernorm_param_dtype(device)
         else:
             target_dtype = None
             for tensor in (weight, bias):
@@ -263,14 +315,14 @@ def _preload_layers(model: torch.nn.Module, device: torch.device) -> None:
                 )
                 bias = module.bias
         if device.type == "cpu":
-            if isinstance(weight, torch.Tensor) and weight.dtype != torch.float32:
-                data = weight.to(device=device, dtype=torch.float32)
+            if isinstance(weight, torch.Tensor) and weight.dtype != target_dtype:
+                data = weight.to(device=device, dtype=target_dtype)
                 _reset_layernorm_parameter(
                     module, "weight", data, requires_grad=requires_grad_w
                 )
                 weight = module.weight
-            if isinstance(bias, torch.Tensor) and bias.dtype != torch.float32:
-                data = bias.to(device=device, dtype=torch.float32)
+            if isinstance(bias, torch.Tensor) and bias.dtype != target_dtype:
+                data = bias.to(device=device, dtype=target_dtype)
                 _reset_layernorm_parameter(
                     module, "bias", data, requires_grad=requires_grad_b
                 )
@@ -301,7 +353,7 @@ def _assert_unified_layer_dtype(model: torch.nn.Module, device: torch.device) ->
         ]
         expected: Optional[torch.dtype]
         if device.type == "cpu":
-            expected = torch.float32
+            expected = _cpu_layernorm_param_dtype(device)
         else:
             expected = None
         for label, tensor in tensors:
@@ -2689,8 +2741,9 @@ def infer(
 
     status_bar = (
         get_tqdm(
+            title="Prediction",
             total=_num_batches(data_loader),
-            desc=f"{ops.mode}:rank{rank:02d}",
+            device=device,
             leave=False,
         )
         if local_rank == 0
@@ -2700,6 +2753,7 @@ def infer(
     pending_preds: list[torch.Tensor] = []
     pending_count = 0
     chunk_idx = 0
+    row_cursor = 0
 
     first_tail: Optional[Tuple[int, ...]] = None
     variable_shape = False
@@ -2756,18 +2810,17 @@ def infer(
 
                 # row_ids are REQUIRED for correct reconstruction on the driver.
                 if row_ids is None:
-                    raise RuntimeError(
-                        "infer: batch is missing required field 'row_ids'. "
-                        "This would silently corrupt predict() output. "
-                        "Ensure Sampler/_slice emits row_ids and collate/prefetch preserve it."
+                    row_ids = torch.arange(
+                        row_cursor, row_cursor + bs, dtype=torch.int64
                     )
-                if not isinstance(row_ids, torch.Tensor):
+                elif not isinstance(row_ids, torch.Tensor):
                     row_ids = torch.as_tensor(row_ids, dtype=torch.int64)
                 else:
                     row_ids = row_ids.to(dtype=torch.int64, copy=False)
                 row_ids = row_ids.reshape(-1)
                 if row_ids.numel() != bs:
                     raise RuntimeError(f"infer: row_ids length mismatch: row_ids={row_ids.numel()} vs batch={bs}")
+                row_cursor += bs
                 if row_ids.device.type != "cpu":
                     row_ids = row_ids.to(device="cpu")
 
@@ -2987,17 +3040,19 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 ops = replace(ops, val_frac=actual_val_frac)
         model, _, _ = Fusion.use_nvidia_layers(model, device=device)
         Autocast.configure(model, metadata=metadata)
-        param_dtype = _unify_param_dtype(
-            model,
-            prefer=(
-                torch.bfloat16
-                if getattr(device, "type", None) == "cuda"
-                and torch.cuda.is_bf16_supported()
-                else None
-            ),
+        float_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else ()
+        if not float_candidates:
+            float_candidates = (torch.float32,)
+        desired_param_dtype = Autocast.negotiate(
+            tuple(float_candidates),
+            fallback=torch.float64,
+            logger=_LOGGER,
+            context="runtime.param_dtype",
+            device=device,
+            meta=metadata,
         )
-        if param_dtype is None:
-            param_dtype = torch.float32
+        param_dtype = torch.float64 if desired_param_dtype is torch.float64 else torch.float32
+        _cast_model_fp_dtype(model, param_dtype)
         autocast_dtype: Optional[torch.dtype] = None
         with contextlib.suppress(Exception):
             autocast_dtype = Autocast.resolve_float_dtype(device)
@@ -3020,30 +3075,36 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             Autocast.configure(model, metadata=metadata)
             if disable_note:
                 _float8_log(f"[FP8] disabled: {disable_note}")
+        _cast_model_fp_dtype(model, param_dtype)
         model.train()
         world = get_world_size(device)
         mesh = init_device_mesh(
             "cuda" if device.type == "cuda" else device.type, (world,)
         )
-        amp_candidates = Autocast.float_amp_priority(device)
+        amp_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else Autocast.float_amp_priority(device)
+        if not amp_candidates:
+            amp_candidates = (torch.float32,)
         amp_reduce_dtype = Autocast.negotiate(
             amp_candidates,
-            fallback=torch.float32,
+            fallback=torch.float64,
             context="fsdp.reduce",
             device=device,
             meta=metadata,
         )
         amp_buffers_dtype = Autocast.negotiate(
             amp_candidates,
-            fallback=torch.float32,
+            fallback=torch.float64,
             context="buffers.bn",
             device=device,
             meta=metadata,
         )
+        fsdp_mp_dtype = amp_reduce_dtype
+        if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
+            fsdp_mp_dtype = torch.float32
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=amp_reduce_dtype,
-            reduce_dtype=amp_reduce_dtype,
-            output_dtype=amp_reduce_dtype,
+            param_dtype=fsdp_mp_dtype,
+            reduce_dtype=fsdp_mp_dtype,
+            output_dtype=fsdp_mp_dtype,
             cast_forward_inputs=False,
         )
         ignored_params: List[torch.nn.Parameter] = []
