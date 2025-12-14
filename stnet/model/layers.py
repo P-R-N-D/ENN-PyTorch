@@ -2694,16 +2694,6 @@ class Instance(nn.Module):
         except Exception:
             pass
 
-        if self._device.type == "cpu":
-            with contextlib.suppress(Exception):
-                self.scaler = self.scaler.double()
-            with contextlib.suppress(Exception):
-                if self.linear_branch is not None:
-                    self.linear_branch = self.linear_branch.double()
-            with contextlib.suppress(Exception):
-                self.processor = self.processor.double()
-            with contextlib.suppress(Exception):
-                self.controller = self.controller.double()
         raw_mode = getattr(config, "compile_mode", "disabled")
         mode = str(raw_mode or "").strip()
         normalized_mode = mode.lower()
@@ -2757,6 +2747,30 @@ class Instance(nn.Module):
                     **compile_kwargs,
                 )
         self.__config = config
+
+    def _promote_float32_params(self) -> None:
+        def _promote_module(mod: Optional[nn.Module]) -> None:
+            if mod is None:
+                return
+            for name, param in list(mod.named_parameters(recurse=False)):
+                if torch.is_floating_point(param) and param.dtype == torch.float32:
+                    promoted = nn.Parameter(
+                        param.detach().to(dtype=torch.float64),
+                        requires_grad=param.requires_grad,
+                    )
+                    mod._parameters[name] = promoted
+            non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
+            for name, buf in list(mod.named_buffers(recurse=False)):
+                if torch.is_floating_point(buf) and buf.dtype == torch.float32:
+                    mod.register_buffer(
+                        name,
+                        buf.to(dtype=torch.float64),
+                        persistent=name not in non_persistent,
+                    )
+            for child in mod.children():
+                _promote_module(child)
+
+        _promote_module(self)
 
     @staticmethod
     def _cast_graph_safe(
@@ -2855,14 +2869,28 @@ class Instance(nn.Module):
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
         x_scaled = self.scaler.normalize_x(x_raw)
-        # Only break graphs when we're actually compiling.
         with contextlib.suppress(Exception):
             import torch._dynamo as _dynamo
             if _dynamo.is_compiling():
                 _dynamo.graph_break()
 
         device = self._device
-        amp_enabled = device.type != "cpu"
+        meta = None
+        with contextlib.suppress(Exception):
+            meta = Autocast.coerce_metadata(device)
+        amp_candidates = ()
+        with contextlib.suppress(Exception):
+            amp_candidates = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        if not amp_candidates:
+            amp_candidates = (torch.float32,)
+        amp_dtype = Autocast.negotiate(
+            tuple(amp_candidates),
+            fallback=torch.float64,
+            context="instance.forward",
+            device=device,
+            meta=meta,
+        )
+        amp_enabled = amp_dtype is not torch.float64
 
         is_cls_loss = (
             isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
@@ -2880,9 +2908,11 @@ class Instance(nn.Module):
 
         base_param = next(self.processor.parameters())
         param_dtype = base_param.dtype
-        # A안: CPU(AMP 비사용)면 float64 고정. GPU는 파라미터 dtype(또는 사용자 지정 base_dtype) 사용.
-        base_dtype = (torch.float64 if not amp_enabled
-                      else (getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None) or param_dtype))
+        requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
+        if requested_base is not None:
+            base_dtype = requested_base
+        else:
+            base_dtype = (torch.float32 if amp_enabled else amp_dtype)
         features = x_scaled.to(device=device, dtype=base_dtype)
         assert features.ndim == 2 and features.shape[1] == self.in_dim
         b = int(features.shape[0])
@@ -2924,7 +2954,7 @@ class Instance(nn.Module):
                     pass
 
         def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-            with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+            with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                 return self.processor(inp)
 
         token_chunks: List[torch.Tensor] = []
@@ -2980,7 +3010,7 @@ class Instance(nn.Module):
             with Gradient.inference(self.controller):
 
                 def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         out, _ = self.controller(chunk)
                     return out
 
@@ -3000,7 +3030,7 @@ class Instance(nn.Module):
             with Gradient.inference(self.processor):
 
                 def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         dc = getattr(self, "_decode_compiled", None)
                         if dc is not None:
                             if (
@@ -3034,7 +3064,7 @@ class Instance(nn.Module):
                 _graph_break()
 
                 def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         out, _ = self.controller(inp)
                     return out
 
@@ -3054,7 +3084,7 @@ class Instance(nn.Module):
                 _graph_break()
 
                 def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
-                    with (Autocast.float(device) if amp_enabled else Autocast.suspend(device)):
+                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         dc = getattr(self, "_decode_compiled", None)
                         return dc(inp) if dc is not None else self.processor.decode(inp, apply_norm=True)
 
