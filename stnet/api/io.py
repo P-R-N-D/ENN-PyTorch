@@ -87,6 +87,62 @@ def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
     return new_sd
 
 
+def _json_sanitize(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, torch.device):
+        return str(obj)
+    if isinstance(obj, Path):
+        return str(obj)
+    if isinstance(obj, torch.dtype):
+        return str(obj)
+    if isinstance(obj, torch.Tensor):
+        return {
+            "__tensor__": True,
+            "shape": list(obj.shape),
+            "dtype": str(obj.dtype),
+            "device": str(obj.device),
+        }
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(v) for v in obj]
+    return str(obj)
+
+
+def _json_default(obj: Any) -> Any:
+    return _json_sanitize(obj)
+
+
+def _is_rank0() -> bool:
+    try:
+        import torch.distributed as dist
+
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank()) == 0
+    except Exception:
+        pass
+    return True
+
+
+def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    tmp.replace(path)
+
+
+def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
+    meta_path = p / "meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to parse checkpoint metadata at {str(meta_path)!r}"
+        ) from exc
+
+
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     cfg_obj = getattr(model, "_Instance__config", None)
     if cfg_obj is None:
@@ -102,7 +158,11 @@ def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     else:
         candidate = None
     try:
-        return asdict(coerce_model_config(candidate))
+        data = asdict(coerce_model_config(candidate))
+        dev = data.get("device", None)
+        if isinstance(dev, torch.device):
+            data["device"] = str(dev)
+        return data
     except Exception:
         return {}
 
@@ -125,19 +185,35 @@ def load_model(
     map_location: Optional[torch.device | str] = None,
 ) -> nn.Module:
     p = Path(checkpoint_path)
+    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
     if p.is_dir():
-        if in_dim is None or out_shape is None:
+        meta: Dict[str, Any] = _read_checkpoint_dir_meta(p)
+
+        use_in_dim = int(in_dim if in_dim is not None else (meta.get("in_dim") or 0))
+        out_shape_meta = out_shape if out_shape is not None else (meta.get("out_shape") or ())
+        use_out_shape = tuple(int(x) for x in out_shape_meta) if out_shape_meta else ()
+
+        user_provided_config = config is not None
+
+        raw_cfg = config if user_provided_config else meta.get("config")
+        use_config = coerce_model_config(raw_cfg)
+        if not user_provided_config:
+            use_config.device = load_dev
+        elif map_location is not None and use_config.device is None:
+            use_config.device = load_dev
+
+        if use_in_dim <= 0 or not use_out_shape:
             raise ValueError(
-                "Loading from a checkpoint directory requires in_dim and out_shape."
+                "Loading from a checkpoint directory requires in_dim and out_shape, "
+                "or a valid meta.json inside the directory."
             )
-        model = new_model(int(in_dim), tuple(out_shape), config)
+
+        model = new_model(use_in_dim, use_out_shape, use_config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
         dcp_load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         resize_scaler_buffer(model, m_sd)
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-                                                       
-                                                            
         return model
 
     if not p.exists():
@@ -155,9 +231,15 @@ def load_model(
             out_shape if out_shape is not None else meta.get("out_shape") or ()
         )
         use_out_shape = tuple(int(x) for x in out_shape_meta)
+        user_provided_config = config is not None
+
         use_config = coerce_model_config(
-            config if config is not None else meta.get("config")
+            config if user_provided_config else meta.get("config")
         )
+        if not user_provided_config:
+            use_config.device = load_dev
+        elif map_location is not None and use_config.device is None:
+            use_config.device = load_dev
         if use_in_dim <= 0 or not use_out_shape:
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: "
@@ -189,7 +271,14 @@ def load_model(
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
     out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
     use_out_shape = tuple(int(x) for x in out_shape_meta)
-    use_config = coerce_model_config(config if config is not None else meta_cfg)
+    user_provided_config = config is not None
+
+    use_config = coerce_model_config(config if user_provided_config else meta_cfg)
+
+    if not user_provided_config:
+        use_config.device = load_dev
+    elif map_location is not None and use_config.device is None:
+        use_config.device = load_dev
 
     if use_in_dim <= 0 or not use_out_shape:
         raise RuntimeError(
@@ -271,6 +360,19 @@ class Model:
                 state_dict={"model": m_sd},
                 storage_writer=FileSystemWriter(str(p)),
             )
+            meta = {
+                "version": 1,
+                "format": "dcp-dir-v1",
+                "in_dim": int(getattr(model, "in_dim", 0)),
+                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                "config": _load_model_config(model),
+                "pytorch_version": torch.__version__,
+                "extra": _json_sanitize(extra or {}),
+            }
+            meta_path = p / "meta.json"
+            if _is_rank0():
+                meta_text = json.dumps(meta, indent=2, default=_json_default)
+                _atomic_write_text(meta_path, meta_text, encoding="utf-8")
             return p
 
         if not suffix:
@@ -292,11 +394,11 @@ class Model:
                 "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
                 "config": _load_model_config(model),
                 "pytorch_version": torch.__version__,
-                "extra": extra or {},
+                "extra": _json_sanitize(extra or {}),
             }
-            p.with_suffix(".json").write_text(
-                json.dumps(meta, indent=2), encoding="utf-8"
-            )
+            meta_path = p.with_suffix(".json")
+            meta_text = json.dumps(meta, indent=2, default=_json_default)
+            _atomic_write_text(meta_path, meta_text, encoding="utf-8")
             return p
 
         payload: Dict[str, Any] = {

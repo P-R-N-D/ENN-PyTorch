@@ -144,14 +144,16 @@ class WorkerPolicy:
         )
 
     def as_threads_dict(self) -> Dict[str, int]:
-        return {
+        out = {
             "intra_ops": int(self.intra_ops),
             "inter_ops": int(self.inter_ops),
             "num_workers": int(self.num_workers),
-            "max_concurrancy": int(self.max_concurrency),
+            "max_concurrency": int(self.max_concurrency),
             "prebatch": int(self.prebatch),
             "prefetch_factor": int(self.prefetch_factor),
         }
+        out["max_concurrancy"] = out["max_concurrency"]
+        return out
 
     def as_procs_dict(self) -> Dict[str, Union[int, str]]:
         return {
