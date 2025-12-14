@@ -3153,13 +3153,14 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 reshard_after_forward=False,
                 sync_module_states=True,
             )
-        enable_dtensor_param_coerce = (
-            os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", "0")
+        _enable_dtensor_param_coerce = (
+            mesh is not None
+            and str(os.environ.get("STNET_ENABLE_DTENSOR_PARAM_COERCE", ""))
             .strip()
             .lower()
-            in ("1", "true", "yes", "y", "on")
+            in {"1", "true", "yes", "y", "on"}
         )
-        if enable_dtensor_param_coerce and (mesh is not None) and (Replicate is not None):
+        if _enable_dtensor_param_coerce:
             for ignored_param in ignored_param_registry:
                 _coerce_dtensor(ignored_param, mesh, placements=(Replicate(),))
             for parameter in model.parameters():
@@ -3167,7 +3168,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         _m_post = model.module if hasattr(model, "module") else model
         _assert_unified_layer_dtype(_m_post, device)
         _assert_no_meta_tensors(_m_post)
-        _assert_no_fake_dtensor(_m_post, allow_dtensor=True)
+        _assert_no_fake_dtensor(_m_post, allow_dtensor=_enable_dtensor_param_coerce)
         _enable_meta_monitor(_m_post)
         distributed_sync(_m_post, device=device)
         net_params = [p for p in model.parameters()]
