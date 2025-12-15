@@ -3075,7 +3075,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     model,
                     mesh,
                     mp_policy,
-                    reshard_after_forward=False,
+                    reshard_after_forward=True,
                     wrapped=wrapped,
                     ignored_param_registry=ignored_param_registry,
                 )
