@@ -3212,7 +3212,7 @@ class Instance(nn.Module):
                 if global_loss is not None:
                     z_top = z_pred_raw
                     if is_train_path:
-                        z_top = _sanitize(assembled.detach() + residual)
+                        z_top = _sanitize(z_pred_raw)
                     top_component = global_loss(z_top, z_true)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
