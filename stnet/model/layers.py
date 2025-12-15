@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import os
 import math
+import warnings
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -42,23 +43,46 @@ def activation_checkpoint(function, *args: Any, **kwargs: Any) -> Any:
     use_reentrant = bool(kwargs.pop("use_reentrant", False))
     preserve_rng_state = bool(kwargs.pop("preserve_rng_state", True))
     determinism_check = kwargs.pop("determinism_check", "default")
+    suppress_no_input_grad_warning = False
+    if use_reentrant:
+        try:
+            suppress_no_input_grad_warning = not any(
+                isinstance(a, torch.Tensor) and bool(getattr(a, "requires_grad", False))
+                for a in args
+            )
+        except Exception:
+            suppress_no_input_grad_warning = False
     try:
-        return _activation_checkpoint_base(
-            function,
-            *args,
-            use_reentrant=use_reentrant,
-            preserve_rng_state=preserve_rng_state,
-            determinism_check=determinism_check,
-            **kwargs,
-        )
+        with warnings.catch_warnings():
+            if suppress_no_input_grad_warning:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"None of the inputs have requires_grad=True\..*",
+                    category=UserWarning,
+                )
+            return _activation_checkpoint_base(
+                function,
+                *args,
+                use_reentrant=use_reentrant,
+                preserve_rng_state=preserve_rng_state,
+                determinism_check=determinism_check,
+                **kwargs,
+            )
     except TypeError:
-        return _activation_checkpoint_base(
-            function,
-            *args,
-            use_reentrant=use_reentrant,
-            preserve_rng_state=preserve_rng_state,
-            **kwargs,
-        )
+        with warnings.catch_warnings():
+            if suppress_no_input_grad_warning:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"None of the inputs have requires_grad=True\..*",
+                    category=UserWarning,
+                )
+            return _activation_checkpoint_base(
+                function,
+                *args,
+                use_reentrant=use_reentrant,
+                preserve_rng_state=preserve_rng_state,
+                **kwargs,
+            )
 
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
@@ -3003,7 +3027,7 @@ class Instance(nn.Module):
                     tok, ctx_out = activation_checkpoint(
                         _encode,
                         x_slice,
-                        use_reentrant=False,
+                        use_reentrant=True,
                         preserve_rng_state=preserve,
                         determinism_check="none",
                     )
@@ -3053,14 +3077,15 @@ class Instance(nn.Module):
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
     
-            if self._auto_ctrl_microbatch_pending:
-                try:
-                    mb2 = self._auto_microbatch(tokens_centered, device)
-                    self.ctrl_microbatch = max(1, int(mb2))
-                except Exception:
-                    self.ctrl_microbatch = 1
-                self._auto_ctrl_microbatch_pending = False
-            ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
+                if self._auto_ctrl_microbatch_pending:
+                    try:
+                        mb2 = self._auto_microbatch(tokens_centered, device)
+                        self.ctrl_microbatch = max(1, int(mb2))
+                    except Exception:
+                        enc_mb = int(getattr(self, "microbatch", 0) or int(b))
+                        self.ctrl_microbatch = max(1, min(int(b), enc_mb))
+                    self._auto_ctrl_microbatch_pending = False
+                ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
     
             refined_tokens: torch.Tensor
             residual_context: torch.Tensor

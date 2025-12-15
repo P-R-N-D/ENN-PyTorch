@@ -14,8 +14,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, Iterator, List,
-                    Optional, Sequence, Tuple, Union)
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -769,19 +768,16 @@ def _wrap_fsdp(
     mp_policy: MixedPrecisionPolicy,
     reshard_after_forward: bool,
     wrapped: set[int],
-    ignored_param_registry: "_IdentityParamSet",
 ) -> Optional[torch.nn.Module]:
     if target is None or id(target) in wrapped:
         return target
     wrapped.add(id(target))
-    per_mod_ignored = _ignored_params(target, ignored_param_registry)
     return to_fsdp(
         target,
         mesh=mesh,
         mp_policy=mp_policy,
         reshard_after_forward=bool(reshard_after_forward),
         sync_module_states=True,
-        ignored_params=per_mod_ignored or None,
     )
 
 
@@ -886,35 +882,6 @@ def _initialize_group(backend: str, device: torch.device, local_rank: int) -> No
             torch.distributed.init_process_group(backend=backend)
     except TypeError:
         torch.distributed.init_process_group(backend=backend)
-
-
-def _ignored_params(
-    module: torch.nn.Module, registry: "_IdentityParamSet"
-) -> Optional["_IdentityParamSet"]:
-    if len(registry) == 0:
-        return None
-    params = [param for param in module.parameters(recurse=True) if param in registry]
-    return _IdentityParamSet(tuple(params)) if params else None
-
-
-class _IdentityParamSet(Sequence[torch.nn.Parameter]):
-    def __init__(self, params: Sequence[torch.nn.Parameter]) -> None:
-        self._params = tuple(params)
-        self._ids = {id(p) for p in self._params}
-
-    def __len__(self) -> int:
-        return len(self._params)
-
-    def __iter__(self) -> Iterator[torch.nn.Parameter]:
-        return iter(self._params)
-
-    def __getitem__(self, index: int) -> torch.nn.Parameter:
-        return self._params[index]
-
-    def __contains__(self, item: object) -> bool:
-        return isinstance(item, torch.nn.Parameter) and (id(item) in self._ids)
-
-
 def loader_state_path(directory: str) -> str:
     return os.path.join(directory, _DL_STATE_FILE)
 
@@ -1186,16 +1153,9 @@ def epochs(
 
     from ..api.templates import BatchPolicy
 
-    min_grad_accum = 1
-    max_grad_accum = 64
-    with contextlib.suppress(Exception):
-        env_min = os.environ.get("STNET_ACCUM_STEPS")
-        if env_min is not None and str(env_min).strip():
-            min_grad_accum = max(1, int(env_min))
-    with contextlib.suppress(Exception):
-        env_max = os.environ.get("STNET_MAX_ACCUM_STEPS")
-        if env_max is not None and str(env_max).strip():
-            max_grad_accum = max(min_grad_accum, int(env_max))
+    fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
+    min_grad_accum = fixed_accum
+    max_grad_accum = fixed_accum
 
 
     dev_margin = 0.8
@@ -3037,14 +2997,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             output_dtype=fsdp_mp_dtype,
             cast_forward_inputs=False,
         )
-        ignored_params: List[torch.nn.Parameter] = []
-        for module in model.modules():
-            for name in ("alpha_t", "alpha_s", "gem_p", "cls_query", "cls"):
-                if hasattr(module, name):
-                    p = getattr(module, name)
-                    if isinstance(p, torch.nn.Parameter):
-                        ignored_params.append(p)
-        ignored_param_registry = _IdentityParamSet(tuple(ignored_params))
         _m_pre = model.module if hasattr(model, "module") else model
         _preload_layers(_m_pre, device)
         _assert_unified_layer_dtype(_m_pre, device)
@@ -3059,7 +3011,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     mp_policy,
                     reshard_after_forward=True,
                     wrapped=wrapped,
-                    ignored_param_registry=ignored_param_registry,
                 )
             for submodule in _get_layers(getattr(model, "controller", None)):
                 _wrap_fsdp(
@@ -3068,7 +3019,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     mp_policy,
                     reshard_after_forward=True,
                     wrapped=wrapped,
-                    ignored_param_registry=ignored_param_registry,
                 )
             model = (
                 _wrap_fsdp(
@@ -3077,7 +3027,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     mp_policy,
                     reshard_after_forward=True,
                     wrapped=wrapped,
-                    ignored_param_registry=ignored_param_registry,
                 )
                 or model
             )
@@ -3086,9 +3035,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                 model,
                 mesh=mesh,
                 mp_policy=mp_policy,
-                ignored_params=(
-                    ignored_param_registry if len(ignored_param_registry) > 0 else None
-                ),
                 reshard_after_forward=False,
                 sync_module_states=True,
             )
