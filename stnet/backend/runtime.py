@@ -767,6 +767,7 @@ def _wrap_fsdp(
     target: Optional[torch.nn.Module],
     mesh: Any,
     mp_policy: MixedPrecisionPolicy,
+    reshard_after_forward: bool,
     wrapped: set[int],
     ignored_param_registry: "_IdentityParamSet",
 ) -> Optional[torch.nn.Module]:
@@ -778,7 +779,7 @@ def _wrap_fsdp(
         target,
         mesh=mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,
+        reshard_after_forward=bool(reshard_after_forward),
         sync_module_states=True,
         ignored_params=per_mod_ignored or None,
     )
@@ -3051,13 +3052,21 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         _assert_no_fake_dtensor(_m_pre)
         wrapped = set()
         try:
-            for submodule in _get_layers(
-                getattr(model, "processor", None)
-            ) + _get_layers(getattr(model, "controller", None)):
+            for submodule in _get_layers(getattr(model, "processor", None)):
                 _wrap_fsdp(
                     submodule,
                     mesh,
                     mp_policy,
+                    reshard_after_forward=True,
+                    wrapped=wrapped,
+                    ignored_param_registry=ignored_param_registry,
+                )
+            for submodule in _get_layers(getattr(model, "controller", None)):
+                _wrap_fsdp(
+                    submodule,
+                    mesh,
+                    mp_policy,
+                    reshard_after_forward=False,
                     wrapped=wrapped,
                     ignored_param_registry=ignored_param_registry,
                 )
@@ -3066,6 +3075,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     model,
                     mesh,
                     mp_policy,
+                    reshard_after_forward=False,
                     wrapped=wrapped,
                     ignored_param_registry=ignored_param_registry,
                 )
