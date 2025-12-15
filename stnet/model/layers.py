@@ -3076,16 +3076,16 @@ class Instance(nn.Module):
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
-    
-                if self._auto_ctrl_microbatch_pending:
-                    try:
-                        mb2 = self._auto_microbatch(tokens_centered, device)
-                        self.ctrl_microbatch = max(1, int(mb2))
-                    except Exception:
-                        enc_mb = int(getattr(self, "microbatch", 0) or int(b))
-                        self.ctrl_microbatch = max(1, min(int(b), enc_mb))
-                    self._auto_ctrl_microbatch_pending = False
-                ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
+
+            if self._auto_ctrl_microbatch_pending:
+                try:
+                    mb2 = self._auto_microbatch(tokens_centered, device)
+                    self.ctrl_microbatch = max(1, int(mb2))
+                except Exception:
+                    enc_mb = int(getattr(self, "microbatch", 0) or int(b))
+                    self.ctrl_microbatch = max(1, min(int(b), enc_mb))
+                self._auto_ctrl_microbatch_pending = False
+            ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
     
             refined_tokens: torch.Tensor
             residual_context: torch.Tensor
