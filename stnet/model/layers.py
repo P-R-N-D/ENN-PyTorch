@@ -2984,8 +2984,8 @@ class Instance(nn.Module):
             token_chunks: List[torch.Tensor] = []
             context_chunks: List[torch.Tensor] = []
             for s in range(0, int(b), mb):
-                tok = None  # type: ignore[assignment]
-                ctx_out = None  # type: ignore[assignment]
+                tok: Optional[torch.Tensor] = None
+                ctx_out: Optional[torch.Tensor] = None
                 x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
                 if is_train_path and use_activation_checkpoint:
                     preserve = True
@@ -3013,7 +3013,6 @@ class Instance(nn.Module):
                             tok, ctx_out = _encode(x_slice)
                     else:
                         tok, ctx_out = _encode(x_slice)
-                # Always append per-microbatch outputs (checkpoint + non-checkpoint).
                 if tok is None or ctx_out is None:
                     raise RuntimeError(
                         "Internal error: encoder returned no outputs. "
