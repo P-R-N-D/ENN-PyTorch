@@ -2984,6 +2984,8 @@ class Instance(nn.Module):
             token_chunks: List[torch.Tensor] = []
             context_chunks: List[torch.Tensor] = []
             for s in range(0, int(b), mb):
+                tok = None  # type: ignore[assignment]
+                ctx_out = None  # type: ignore[assignment]
                 x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
                 if is_train_path and use_activation_checkpoint:
                     preserve = True
@@ -3011,10 +3013,28 @@ class Instance(nn.Module):
                             tok, ctx_out = _encode(x_slice)
                     else:
                         tok, ctx_out = _encode(x_slice)
+                # Always append per-microbatch outputs (checkpoint + non-checkpoint).
+                if tok is None or ctx_out is None:
+                    raise RuntimeError(
+                        "Internal error: encoder returned no outputs. "
+                        f"is_train_path={is_train_path}, use_activation_checkpoint={use_activation_checkpoint}, "
+                        f"b={int(b)}, mb={int(mb)}, s={int(s)}"
+                    )
                 out_tokens = tok.to(dtype=base_dtype)
                 out_context = ctx_out.to(dtype=base_dtype)
                 token_chunks.append(out_tokens)
                 context_chunks.append(out_context)
+            if not token_chunks or not context_chunks:
+                raise RuntimeError(
+                    "Internal error: no microbatch outputs were collected. "
+                    f"is_train_path={is_train_path}, use_activation_checkpoint={use_activation_checkpoint}, "
+                    f"b={int(b)}, mb={int(mb)}"
+                )
+            if len(token_chunks) != len(context_chunks):
+                raise RuntimeError(
+                    "Internal error: microbatch output mismatch. "
+                    f"token_chunks={len(token_chunks)}, context_chunks={len(context_chunks)}"
+                )
             tokens = torch.cat(token_chunks, dim=0)
             context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
