@@ -3210,11 +3210,6 @@ class Instance(nn.Module):
                 )
 
                 if global_loss is not None:
-                    # Keep Processor trainable even when only global_loss is used:
-                    # - If local_loss is active (and bottom weight > 0), global_loss should not
-                    #   push on the base; it should focus on residual corrections.
-                    # - Otherwise (no local_loss or bottom weight ~0), use full prediction so
-                    #   Processor continues to receive gradients.
                     use_base_detach = bool(
                         is_train_path
                         and (local_loss is not None)
