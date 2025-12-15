@@ -3064,7 +3064,6 @@ class Instance(nn.Module):
             tokens = _sanitize(tokens)
             context = _sanitize(context)
 
-            # Optional safety: the microbatch concat should reconstruct the original batch size.
             if int(tokens.shape[0]) != int(b):
                 raise RuntimeError(
                     "Internal error: token batch mismatch after microbatch concat. "
@@ -3092,7 +3091,6 @@ class Instance(nn.Module):
                     enc_mb = int(getattr(self, "microbatch", 0) or int(b))
                     self.ctrl_microbatch = max(1, min(int(b), enc_mb))
                 self._auto_ctrl_microbatch_pending = False
-            # Optional safety: always initialize ctrl_mb and keep it in [1, b].
             try:
                 _raw_ctrl_mb = int(self.ctrl_microbatch) if self.ctrl_microbatch else int(b)
             except Exception:
