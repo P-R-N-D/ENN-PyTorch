@@ -3210,9 +3210,17 @@ class Instance(nn.Module):
                 )
 
                 if global_loss is not None:
-                    z_top = z_pred_raw
-                    if is_train_path:
-                        z_top = _sanitize(z_pred_raw)
+                    # Keep Processor trainable even when only global_loss is used:
+                    # - If local_loss is active (and bottom weight > 0), global_loss should not
+                    #   push on the base; it should focus on residual corrections.
+                    # - Otherwise (no local_loss or bottom weight ~0), use full prediction so
+                    #   Processor continues to receive gradients.
+                    use_base_detach = bool(
+                        is_train_path
+                        and (local_loss is not None)
+                        and (float(weights[1]) > 1e-12)
+                    )
+                    z_top = _sanitize(assembled.detach() + residual) if use_base_detach else _sanitize(z_pred_raw)
                     top_component = global_loss(z_top, z_true)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
