@@ -7,8 +7,7 @@ import ipaddress
 import os
 import socket
 from contextlib import AbstractContextManager
-from typing import (TYPE_CHECKING, Any, Dict, Iterable, List, Optional,
-                    Sequence, Tuple, TypeAlias, Union)
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, TypeAlias, Union
 
 import torch
 import torch.distributed as dist
@@ -620,7 +619,6 @@ def to_fsdp(
     mp_policy: Any | None = None,
     reshard_after_forward: bool = False,
     sync_module_states: bool = True,
-    ignored_params: Sequence[torch.nn.Parameter] | None = None,
     **kwargs: Any,
 ) -> torch.nn.Module:
 
@@ -647,9 +645,6 @@ def to_fsdp(
         kwargs["reshard_after_forward"] = reshard_after_forward
     if "sync_module_states" in params:
         kwargs["sync_module_states"] = sync_module_states
-    if "ignored_params" in params and ignored_params is not None:
-        if not _env_flag("STNET_FSDP_DISABLE_IGNORED_PARAMS", False):
-            kwargs["ignored_params"] = ignored_params
 
     sharded = fully_shard(*args, **kwargs)
     try:

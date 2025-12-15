@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import os
 import math
+import warnings
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -42,23 +43,46 @@ def activation_checkpoint(function, *args: Any, **kwargs: Any) -> Any:
     use_reentrant = bool(kwargs.pop("use_reentrant", False))
     preserve_rng_state = bool(kwargs.pop("preserve_rng_state", True))
     determinism_check = kwargs.pop("determinism_check", "default")
+    suppress_no_input_grad_warning = False
+    if use_reentrant:
+        try:
+            suppress_no_input_grad_warning = not any(
+                isinstance(a, torch.Tensor) and bool(getattr(a, "requires_grad", False))
+                for a in args
+            )
+        except Exception:
+            suppress_no_input_grad_warning = False
     try:
-        return _activation_checkpoint_base(
-            function,
-            *args,
-            use_reentrant=use_reentrant,
-            preserve_rng_state=preserve_rng_state,
-            determinism_check=determinism_check,
-            **kwargs,
-        )
+        with warnings.catch_warnings():
+            if suppress_no_input_grad_warning:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"None of the inputs have requires_grad=True\..*",
+                    category=UserWarning,
+                )
+            return _activation_checkpoint_base(
+                function,
+                *args,
+                use_reentrant=use_reentrant,
+                preserve_rng_state=preserve_rng_state,
+                determinism_check=determinism_check,
+                **kwargs,
+            )
     except TypeError:
-        return _activation_checkpoint_base(
-            function,
-            *args,
-            use_reentrant=use_reentrant,
-            preserve_rng_state=preserve_rng_state,
-            **kwargs,
-        )
+        with warnings.catch_warnings():
+            if suppress_no_input_grad_warning:
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"None of the inputs have requires_grad=True\..*",
+                    category=UserWarning,
+                )
+            return _activation_checkpoint_base(
+                function,
+                *args,
+                use_reentrant=use_reentrant,
+                preserve_rng_state=preserve_rng_state,
+                **kwargs,
+            )
 
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
@@ -3003,7 +3027,7 @@ class Instance(nn.Module):
                     tok, ctx_out = activation_checkpoint(
                         _encode,
                         x_slice,
-                        use_reentrant=False,
+                        use_reentrant=True,
                         preserve_rng_state=preserve,
                         determinism_check="none",
                     )
@@ -3039,7 +3063,13 @@ class Instance(nn.Module):
             context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
             context = _sanitize(context)
-    
+
+            if int(tokens.shape[0]) != int(b):
+                raise RuntimeError(
+                    "Internal error: token batch mismatch after microbatch concat. "
+                    f"got={int(tokens.shape[0])}, expected={int(b)}"
+                )
+
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
                 bl = self.linear_branch(
@@ -3052,19 +3082,29 @@ class Instance(nn.Module):
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
-    
+
             if self._auto_ctrl_microbatch_pending:
                 try:
                     mb2 = self._auto_microbatch(tokens_centered, device)
                     self.ctrl_microbatch = max(1, int(mb2))
                 except Exception:
-                    self.ctrl_microbatch = 1
+                    enc_mb = int(getattr(self, "microbatch", 0) or int(b))
+                    self.ctrl_microbatch = max(1, min(int(b), enc_mb))
                 self._auto_ctrl_microbatch_pending = False
-            ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
-    
+            try:
+                _raw_ctrl_mb = int(self.ctrl_microbatch) if self.ctrl_microbatch else int(b)
+            except Exception:
+                _raw_ctrl_mb = int(b)
+            ctrl_mb = max(1, min(int(b), int(_raw_ctrl_mb)))
+            if ctrl_mb <= 0 or ctrl_mb > int(b):
+                raise RuntimeError(
+                    "Internal error: invalid controller microbatch size. "
+                    f"ctrl_mb={int(ctrl_mb)}, b={int(b)}, ctrl_microbatch={self.ctrl_microbatch!r}"
+                )
+
             refined_tokens: torch.Tensor
             residual_context: torch.Tensor
-    
+
             if infer_mode:
                 _graph_break()
     
