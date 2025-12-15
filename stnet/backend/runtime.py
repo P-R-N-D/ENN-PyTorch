@@ -1724,6 +1724,41 @@ def epochs(
                     return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
             return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
 
+        def _resolve_train_process_group(meta, model):
+            pg = None
+            with contextlib.suppress(Exception):
+                pg = getattr(meta, "process_group", None)
+            with contextlib.suppress(Exception):
+                if pg is None:
+                    pg = getattr(meta, "distributed_process_group", None)
+            with contextlib.suppress(Exception):
+                if pg is None:
+                    tm = model.module if hasattr(model, "module") else model
+                    pg = getattr(tm, "process_group", None)
+            with contextlib.suppress(Exception):
+                if pg is None:
+                    tm = model.module if hasattr(model, "module") else model
+                    pg = getattr(tm, "distributed_process_group", None)
+            return pg
+
+        def _get_ws_for_pg(pg):
+            try:
+                if pg is None:
+                    return max(1, int(get_world_size()))
+                return int(torch.distributed.get_world_size(group=pg))
+            except Exception:
+                return max(1, int(get_world_size()))
+
+        def _all_reduce_sum_in_pg(t: torch.Tensor, pg):
+            if pg is None:
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+            else:
+                torch.distributed.all_reduce(
+                    t,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=pg,
+                )
+
         for epoch_idx in range(int(total_epochs)):
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
@@ -1737,11 +1772,15 @@ def epochs(
             flop_counter_train = FlopCounter(model, mode="train", device=device)
             with flop_counter_train:
                 model.train()
+                train_pg = _resolve_train_process_group(meta, model) if is_distributed() else None
                 global_step = 0
                 optimizer.zero_grad(set_to_none=True)
                 t_fetch_start = time.perf_counter_ns()
                 total_batches = len(train_loader)
                 train_accum_since_last = 0
+                lw_top_sum: Optional[torch.Tensor] = None
+                lw_bottom_sum: Optional[torch.Tensor] = None
+                lw_count: int = 0
                 for step_idx, _raw in enumerate(train_loader):
                     # 배치 하나당 1번만 증가
                     train_accum_since_last += 1
@@ -1855,12 +1894,26 @@ def epochs(
                                         td = model_out
                                         y_hat = td.get("pred")
                                         loss_val = td.get("loss_total", None)
+                                        loss_top_val = td.get("loss_top", None)
+                                        loss_bottom_val = td.get("loss_bottom", None)
                                         if (
                                             isinstance(loss_val, torch.Tensor)
                                             and loss_val.ndim > 0
                                         ):
                                             loss_val = loss_val.mean()
+                                        if (
+                                            isinstance(loss_top_val, torch.Tensor)
+                                            and loss_top_val.ndim > 0
+                                        ):
+                                            loss_top_val = loss_top_val.mean()
+                                        if (
+                                            isinstance(loss_bottom_val, torch.Tensor)
+                                            and loss_bottom_val.ndim > 0
+                                        ):
+                                            loss_bottom_val = loss_bottom_val.mean()
                                     else:
+                                        loss_top_val = None
+                                        loss_bottom_val = None
                                         y_hat, loss_val = model_out
                                     if loss_val is None:
                                         raise RuntimeError(
@@ -1879,6 +1932,20 @@ def epochs(
                                     loss_for_backprop = loss_val / float(accum_scale)
                                     loss_for_backprop = loss_for_backprop.clone()
                                     scaler.scale(loss_for_backprop).backward()
+
+                                    if (
+                                        loss_top_val is not None
+                                        or loss_bottom_val is not None
+                                    ):
+                                        lw_count += 1
+                                        if isinstance(loss_top_val, torch.Tensor):
+                                            v = loss_top_val.detach()
+                                            lw_top_sum = v if lw_top_sum is None else (lw_top_sum + v)
+                                        if isinstance(loss_bottom_val, torch.Tensor):
+                                            v = loss_bottom_val.detach()
+                                            lw_bottom_sum = (
+                                                v if lw_bottom_sum is None else (lw_bottom_sum + v)
+                                            )
                                     if should_sync:
                                         scaler.unscale_(optimizer)
                                         scaler.step(optimizer)
@@ -1887,6 +1954,31 @@ def epochs(
                                         if scheduler_step_per_batch:
                                             with contextlib.suppress(Exception):
                                                 sched.step()
+
+                                        if lw_count > 0:
+                                            top_avg_t: Optional[torch.Tensor] = (
+                                                (lw_top_sum / float(lw_count))
+                                                if lw_top_sum is not None
+                                                else None
+                                            )
+                                            bottom_avg_t: Optional[torch.Tensor] = (
+                                                (lw_bottom_sum / float(lw_count))
+                                                if lw_bottom_sum is not None
+                                                else None
+                                            )
+                                            if is_distributed():
+                                                ws = _get_ws_for_pg(train_pg)
+                                                if top_avg_t is not None:
+                                                    _all_reduce_sum_in_pg(top_avg_t, train_pg)
+                                                    top_avg_t = top_avg_t / float(ws)
+                                                if bottom_avg_t is not None:
+                                                    _all_reduce_sum_in_pg(bottom_avg_t, train_pg)
+                                                    bottom_avg_t = bottom_avg_t / float(ws)
+                                            loss_controller.update(top_avg_t, bottom_avg_t)
+
+                                        lw_top_sum = None
+                                        lw_bottom_sum = None
+                                        lw_count = 0
                                     with contextlib.suppress(Exception):
                                         flops += max(0.0, float(train_counter.get_total_flops()))
                                     breakdown_getter = getattr(
@@ -2097,6 +2189,29 @@ def epochs(
                             raise
                         finally:
                             pool_handles.clear()
+
+            if lw_count > 0:
+                top_avg_t: Optional[torch.Tensor] = (
+                    (lw_top_sum / float(lw_count)) if lw_top_sum is not None else None
+                )
+                bottom_avg_t: Optional[torch.Tensor] = (
+                    (lw_bottom_sum / float(lw_count)) if lw_bottom_sum is not None else None
+                )
+                if is_distributed():
+                    ws = _get_ws_for_pg(train_pg)
+                    if top_avg_t is not None:
+                        with contextlib.suppress(Exception):
+                            _all_reduce_sum_in_pg(top_avg_t, train_pg)
+                        top_avg_t = top_avg_t / float(ws)
+                    if bottom_avg_t is not None:
+                        with contextlib.suppress(Exception):
+                            _all_reduce_sum_in_pg(bottom_avg_t, train_pg)
+                        bottom_avg_t = bottom_avg_t / float(ws)
+                with contextlib.suppress(Exception):
+                    loss_controller.update(top_avg_t, bottom_avg_t)
+                lw_top_sum = None
+                lw_bottom_sum = None
+                lw_count = 0
             if val_loader is not None:
                 flop_counter_val = FlopCounter(model, mode="eval", device=device)
                 with flop_counter_val:

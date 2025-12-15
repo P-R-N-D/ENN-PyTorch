@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import os
 import math
-import warnings
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -25,7 +24,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tensordict import TensorDictBase
-from torch.utils.checkpoint import checkpoint as _activation_checkpoint_base
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 _DILATED_MASK_CACHE_MAX = 32
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
@@ -37,53 +36,6 @@ _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = int(
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = int(
     os.environ.get("STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", str(128 * 1024 * 1024))
 )
-
-
-def activation_checkpoint(function, *args: Any, **kwargs: Any) -> Any:
-    use_reentrant = bool(kwargs.pop("use_reentrant", False))
-    preserve_rng_state = bool(kwargs.pop("preserve_rng_state", True))
-    determinism_check = kwargs.pop("determinism_check", "default")
-    suppress_no_input_grad_warning = False
-    if use_reentrant:
-        try:
-            suppress_no_input_grad_warning = not any(
-                isinstance(a, torch.Tensor) and bool(getattr(a, "requires_grad", False))
-                for a in args
-            )
-        except Exception:
-            suppress_no_input_grad_warning = False
-    try:
-        with warnings.catch_warnings():
-            if suppress_no_input_grad_warning:
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"None of the inputs have requires_grad=True\..*",
-                    category=UserWarning,
-                )
-            return _activation_checkpoint_base(
-                function,
-                *args,
-                use_reentrant=use_reentrant,
-                preserve_rng_state=preserve_rng_state,
-                determinism_check=determinism_check,
-                **kwargs,
-            )
-    except TypeError:
-        with warnings.catch_warnings():
-            if suppress_no_input_grad_warning:
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"None of the inputs have requires_grad=True\..*",
-                    category=UserWarning,
-                )
-            return _activation_checkpoint_base(
-                function,
-                *args,
-                use_reentrant=use_reentrant,
-                preserve_rng_state=preserve_rng_state,
-                **kwargs,
-            )
-
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
 except Exception:
@@ -802,7 +754,24 @@ class DilatedAttention(nn.Module):
         x_out = x + self.dropout(attn_out)
         res2 = x_out
         x_out = self.norm2(x_out)
-        x_out = self.ffn(x_out)
+        if self.training and torch.is_grad_enabled():
+            try:
+                x_out = _checkpoint(
+                    self.ffn,
+                    x_out,
+                    use_reentrant=True,
+                    preserve_rng_state=True,
+                    determinism_check="none",
+                )
+            except TypeError:
+                x_out = _checkpoint(
+                    self.ffn,
+                    x_out,
+                    use_reentrant=True,
+                    preserve_rng_state=True,
+                )
+        else:
+            x_out = self.ffn(x_out)
         x_out = res2 + self.dropout(x_out)
 
         if transposed:
@@ -2709,14 +2678,6 @@ class Instance(nn.Module):
         self._auto_microbatch_pending = True
         self._auto_ctrl_microbatch_pending = True
         self._decode_compiled: Optional[nn.Module] = None
-
-        self._activation_checkpoint = True
-        with contextlib.suppress(Exception):
-            env_ac = os.environ.get("STNET_ACTIVATION_CHECKPOINT")
-            if env_ac is not None and str(env_ac).strip():
-                flag = str(env_ac).strip().lower()
-                if flag in {"0", "false", "no", "off"}:
-                    self._activation_checkpoint = False
         try:
             self.register_buffer(
                 "output_baked_flag",
@@ -2732,6 +2693,7 @@ class Instance(nn.Module):
         disable_compile = normalized_mode in {"", "disabled", "none"}
         compile_mode_arg = normalized_mode if not disable_compile else None
 
+        compile_enabled = compile_mode_arg is not None
         compile_dynamic = bool(
             getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead")
         )
@@ -2741,9 +2703,7 @@ class Instance(nn.Module):
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
-        self._pad_compiled_microbatch = bool(
-            getattr(config, "pad_compiled_microbatch", True)
-        ) and (not disable_compile)
+        self._pad_compiled_microbatch = bool(compile_enabled)
         if not disable_compile:
             with contextlib.suppress(Exception):
                 _raw_head = self.processor.head
@@ -2980,9 +2940,7 @@ class Instance(nn.Module):
             else:
                 self.processor.eval()
                 self.controller.eval()
-    
-            use_activation_checkpoint = bool(self._activation_checkpoint and is_train_path)
-    
+
             def _graph_break() -> None:
                 with contextlib.suppress(Exception):
                     try:
@@ -3011,39 +2969,33 @@ class Instance(nn.Module):
                 tok: Optional[torch.Tensor] = None
                 ctx_out: Optional[torch.Tensor] = None
                 x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
-                if is_train_path and use_activation_checkpoint:
-                    preserve = True
-                    tn = getattr(self.processor, "temporal_net", None)
-                    if tn is not None:
-                        cached = getattr(tn, "__stnet_has_dropout__", None)
-                        if cached is None:
-                            try:
-                                import torch.nn as _nn
-                                cached = any(isinstance(m, (_nn.Dropout, _nn.Dropout1d, _nn.Dropout2d, _nn.Dropout3d)) for m in tn.modules())
-                            except Exception:
-                                cached = True
-                            setattr(tn, "__stnet_has_dropout__", bool(cached))
-                        preserve = bool(cached)
-                    tok, ctx_out = activation_checkpoint(
-                        _encode,
-                        x_slice,
-                        use_reentrant=True,
-                        preserve_rng_state=preserve,
-                        determinism_check="none",
-                    )
+                slice_n = int(x_slice.shape[0])
+                x_in = x_slice
+                if (
+                    self._pad_compiled_microbatch
+                    and x_slice.dim() == 2
+                    and slice_n != int(mb)
+                    and slice_n < int(mb)
+                ):
+                    pad_n = int(mb) - slice_n
+                    pad = x_slice.new_zeros((pad_n, x_slice.shape[1]))
+                    x_in = torch.cat([x_slice, pad], dim=0)
+
+                if infer_mode:
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(Gradient.inference(self.processor))
+                        tok, ctx_out = _encode(x_in)
                 else:
-                    if infer_mode:
-                        with contextlib.ExitStack() as stack:
-                            stack.enter_context(Gradient.inference(self.processor))
-                            tok, ctx_out = _encode(x_slice)
-                    else:
-                        tok, ctx_out = _encode(x_slice)
+                    tok, ctx_out = _encode(x_in)
+
                 if tok is None or ctx_out is None:
                     raise RuntimeError(
                         "Internal error: encoder returned no outputs. "
-                        f"is_train_path={is_train_path}, use_activation_checkpoint={use_activation_checkpoint}, "
-                        f"b={int(b)}, mb={int(mb)}, s={int(s)}"
+                        f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}, s={int(s)}"
                     )
+                if x_in is not x_slice:
+                    tok = tok[:slice_n]
+                    ctx_out = ctx_out[:slice_n]
                 out_tokens = tok.to(dtype=base_dtype)
                 out_context = ctx_out.to(dtype=base_dtype)
                 token_chunks.append(out_tokens)
@@ -3051,8 +3003,7 @@ class Instance(nn.Module):
             if not token_chunks or not context_chunks:
                 raise RuntimeError(
                     "Internal error: no microbatch outputs were collected. "
-                    f"is_train_path={is_train_path}, use_activation_checkpoint={use_activation_checkpoint}, "
-                    f"b={int(b)}, mb={int(mb)}"
+                    f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}"
                 )
             if len(token_chunks) != len(context_chunks):
                 raise RuntimeError(
@@ -3082,6 +3033,10 @@ class Instance(nn.Module):
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
+            if is_train_path:
+                # Ensure Controller learns residual corrections without pushing
+                # gradients back into the Processor token stream.
+                tokens_centered = tokens_centered.detach()
 
             if self._auto_ctrl_microbatch_pending:
                 try:
@@ -3187,20 +3142,31 @@ class Instance(nn.Module):
                     def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
                         with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                             dc = getattr(self, "_decode_compiled", None)
-                            return dc(inp) if dc is not None else self.processor.decode(inp, apply_norm=True)
-    
-                    def _run_decode(chunk: torch.Tensor) -> torch.Tensor:
-                        if use_activation_checkpoint:
-                            return activation_checkpoint(_decode_tokens, chunk)
-                        return _decode_tokens(chunk)
-    
+                            if dc is not None:
+                                if (
+                                    self._pad_compiled_microbatch
+                                    and inp.dim() == 3
+                                    and inp.shape[0] != ctrl_mb
+                                    and inp.shape[0] < ctrl_mb
+                                ):
+                                    pad_n = int(ctrl_mb - inp.shape[0])
+                                    pad = torch.zeros(
+                                        (pad_n, inp.shape[1], inp.shape[2]),
+                                        device=inp.device,
+                                        dtype=inp.dtype,
+                                    )
+                                    out = dc(torch.cat([inp, pad], dim=0))
+                                    return out[: inp.shape[0]]
+                                return dc(inp)
+                            return self.processor.decode(inp, apply_norm=True)
+
                     if ctrl_mb < int(b):
                         residual_context = torch.cat(
-                            [_run_decode(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
+                            [_decode_tokens(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
                             dim=0,
                         )
                     else:
-                        residual_context = _run_decode(refined_tokens)
+                        residual_context = _decode_tokens(refined_tokens)
     
                     residual_context = _sanitize(residual_context)
     
@@ -3215,6 +3181,8 @@ class Instance(nn.Module):
             y_hat_for_loss = y_hat
             loss_val: Optional[torch.Tensor] = None
             z_true: Optional[torch.Tensor] = None
+            top_component: Optional[torch.Tensor] = None
+            bottom_component: Optional[torch.Tensor] = None
             if labels_flat is not None:
                 y_true_raw = labels_flat.to(device=y_hat_for_loss.device)
                 z_true = self.scaler.normalize_y(y_true_raw)
@@ -3223,7 +3191,6 @@ class Instance(nn.Module):
                 global_loss is not None or local_loss is not None
             ):
     
-                controller: Optional[LossWeightPolicy] = None
                 weights: Tuple[float, float]
                 if loss_weights is None:
                     weights = (1.0, 0.0)
@@ -3233,26 +3200,24 @@ class Instance(nn.Module):
                         raise ValueError("loss_weights requires two values")
                     weights = (float(seq[0]), float(seq[1]))
                 else:
-                    controller = cast(LossWeightPolicy, loss_weights)
-                    weights = controller.weights()
+                    weights = cast(LossWeightPolicy, loss_weights).weights()
                 tgt = z_true.to(
                     device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
                 )
                 total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
-                top_component: Optional[torch.Tensor] = None
-                bottom_component: Optional[torch.Tensor] = None
                 y_bot = assembled.to(
                     device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
                 )
-    
+
                 if global_loss is not None:
-                    top_component = global_loss(z_pred_raw, z_true)
+                    z_top = z_pred_raw
+                    if is_train_path:
+                        z_top = _sanitize(assembled.detach() + residual)
+                    top_component = global_loss(z_top, z_true)
                     total = total + weights[0] * top_component
                 if local_loss is not None:
                     bottom_component = local_loss(y_bot, tgt)
                     total = total + weights[1] * bottom_component
-                if controller is not None:
-                    controller.update(top_component, bottom_component)
                 loss_val = total
             elif net_loss is not None and labels_flat is not None:
                 if is_cls_loss:
@@ -3300,6 +3265,26 @@ class Instance(nn.Module):
                 else:
                     with contextlib.suppress(KeyError):
                         out_td.del_("loss_total")
+                if top_component is not None:
+                    top_td = top_component
+                    if isinstance(top_td, torch.Tensor) and top_td.ndim == 0:
+                        batch_size = tuple(out_td.batch_size)
+                        if len(batch_size):
+                            top_td = top_td.expand(batch_size)
+                    out_td.set("loss_top", top_td)
+                else:
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("loss_top")
+                if bottom_component is not None:
+                    bottom_td = bottom_component
+                    if isinstance(bottom_td, torch.Tensor) and bottom_td.ndim == 0:
+                        batch_size = tuple(out_td.batch_size)
+                        if len(batch_size):
+                            bottom_td = bottom_td.expand(batch_size)
+                    out_td.set("loss_bottom", bottom_td)
+                else:
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("loss_bottom")
                 return out_td
             if return_loss is False:
                 return pred
