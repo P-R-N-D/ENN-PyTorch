@@ -3003,8 +3003,9 @@ class Instance(nn.Module):
                     tok, ctx_out = activation_checkpoint(
                         _encode,
                         x_slice,
-                        use_reentrant=True,
+                        use_reentrant=False,
                         preserve_rng_state=preserve,
+                        determinism_check="none",
                     )
                 else:
                     if infer_mode:
