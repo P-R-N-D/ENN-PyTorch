@@ -3063,7 +3063,14 @@ class Instance(nn.Module):
             context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
             context = _sanitize(context)
-    
+
+            # Optional safety: the microbatch concat should reconstruct the original batch size.
+            if int(tokens.shape[0]) != int(b):
+                raise RuntimeError(
+                    "Internal error: token batch mismatch after microbatch concat. "
+                    f"got={int(tokens.shape[0])}, expected={int(b)}"
+                )
+
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
                 bl = self.linear_branch(
@@ -3085,11 +3092,21 @@ class Instance(nn.Module):
                     enc_mb = int(getattr(self, "microbatch", 0) or int(b))
                     self.ctrl_microbatch = max(1, min(int(b), enc_mb))
                 self._auto_ctrl_microbatch_pending = False
-            ctrl_mb = max(1, min(int(b), int(self.ctrl_microbatch) or int(b)))
-    
+            # Optional safety: always initialize ctrl_mb and keep it in [1, b].
+            try:
+                _raw_ctrl_mb = int(self.ctrl_microbatch) if self.ctrl_microbatch else int(b)
+            except Exception:
+                _raw_ctrl_mb = int(b)
+            ctrl_mb = max(1, min(int(b), int(_raw_ctrl_mb)))
+            if ctrl_mb <= 0 or ctrl_mb > int(b):
+                raise RuntimeError(
+                    "Internal error: invalid controller microbatch size. "
+                    f"ctrl_mb={int(ctrl_mb)}, b={int(b)}, ctrl_microbatch={self.ctrl_microbatch!r}"
+                )
+
             refined_tokens: torch.Tensor
             residual_context: torch.Tensor
-    
+
             if infer_mode:
                 _graph_break()
     
