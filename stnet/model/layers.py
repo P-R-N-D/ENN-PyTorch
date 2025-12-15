@@ -39,8 +39,26 @@ _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = int(
 
 
 def activation_checkpoint(function, *args: Any, **kwargs: Any) -> Any:
-    kwargs.pop("use_reentrant", None)
-    return _activation_checkpoint_base(function, *args, use_reentrant=False, **kwargs)
+    use_reentrant = bool(kwargs.pop("use_reentrant", False))
+    preserve_rng_state = bool(kwargs.pop("preserve_rng_state", True))
+    determinism_check = kwargs.pop("determinism_check", "default")
+    try:
+        return _activation_checkpoint_base(
+            function,
+            *args,
+            use_reentrant=use_reentrant,
+            preserve_rng_state=preserve_rng_state,
+            determinism_check=determinism_check,
+            **kwargs,
+        )
+    except TypeError:
+        return _activation_checkpoint_base(
+            function,
+            *args,
+            use_reentrant=use_reentrant,
+            preserve_rng_state=preserve_rng_state,
+            **kwargs,
+        )
 
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
@@ -2962,13 +2980,30 @@ class Instance(nn.Module):
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
-    
+
             token_chunks: List[torch.Tensor] = []
             context_chunks: List[torch.Tensor] = []
             for s in range(0, int(b), mb):
                 x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
                 if is_train_path and use_activation_checkpoint:
-                    tok, ctx_out = activation_checkpoint(_encode, x_slice)
+                    preserve = True
+                    tn = getattr(self.processor, "temporal_net", None)
+                    if tn is not None:
+                        cached = getattr(tn, "__stnet_has_dropout__", None)
+                        if cached is None:
+                            try:
+                                import torch.nn as _nn
+                                cached = any(isinstance(m, (_nn.Dropout, _nn.Dropout1d, _nn.Dropout2d, _nn.Dropout3d)) for m in tn.modules())
+                            except Exception:
+                                cached = True
+                            setattr(tn, "__stnet_has_dropout__", bool(cached))
+                        preserve = bool(cached)
+                    tok, ctx_out = activation_checkpoint(
+                        _encode,
+                        x_slice,
+                        use_reentrant=True,
+                        preserve_rng_state=preserve,
+                    )
                 else:
                     if infer_mode:
                         with contextlib.ExitStack() as stack:
@@ -2976,10 +3011,10 @@ class Instance(nn.Module):
                             tok, ctx_out = _encode(x_slice)
                     else:
                         tok, ctx_out = _encode(x_slice)
-                out_tokens = tok.to(dtype=base_dtype)
-                out_context = ctx_out.to(dtype=base_dtype)
-                token_chunks.append(out_tokens)
-                context_chunks.append(out_context)
+                    out_tokens = tok.to(dtype=base_dtype)
+                    out_context = ctx_out.to(dtype=base_dtype)
+                    token_chunks.append(out_tokens)
+                    context_chunks.append(out_context)
             tokens = torch.cat(token_chunks, dim=0)
             context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
