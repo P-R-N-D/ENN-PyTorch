@@ -72,7 +72,7 @@ def _get_tensor_shape(
         except (TypeError, ValueError):
             out_shape = None
     if (in_dim is None or out_shape is None) and sample_input is not None:
-        from ..functional.fx import Gradient
+        from ..functional.fused import Gradient
 
         dev = next(
             (p.device for p in model.parameters() if p is not None), torch.device("cpu")
@@ -183,7 +183,7 @@ class Onnx(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        out = Model._OnnxLayer.export(serving_model, dst, **_onnx_options(kwargs))
+        out = OnnxIO._OnnxLayer.export(serving_model, dst, **_onnx_options(kwargs))
         return (out,)
 
 
@@ -194,10 +194,10 @@ class Ort(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        onnx_path = Model._OnnxLayer.coerce(
+        onnx_path = OnnxIO._OnnxLayer.coerce(
             serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
-        ort_path, optimized = Model._OrtLayer.to_ort(
+        ort_path, optimized = OnnxIO._OrtLayer.to_ort(
             onnx_path,
             dst,
             optimization_level=str(kwargs.get("optimization_level", "all")),
@@ -217,7 +217,7 @@ class TensorRT(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        onnx_path = Model._OnnxLayer.coerce(
+        onnx_path = OnnxIO._OnnxLayer.coerce(
             serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
         try:
@@ -285,7 +285,7 @@ class Nnef(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        onnx_path = Model._OnnxLayer.coerce(
+        onnx_path = OnnxIO._OnnxLayer.coerce(
             serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
         )
         try:
@@ -337,7 +337,7 @@ class CoreML(Format):
         serving_model = _prepare_serving_model(model)
         import coremltools as ct
 
-        from ..functional.fx import Gradient
+        from ..functional.fused import Gradient
 
         sample = _pad_sample(model, kwargs.get("sample_input"))
         wrapper = _CompatLayer(serving_model).eval()
@@ -376,7 +376,7 @@ class LiteRT(Format):
         self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        onnx_path = Model._OnnxLayer.coerce(
+        onnx_path = OnnxIO._OnnxLayer.coerce(
             serving_model,
             _resolve_onnx_path(dst, kwargs),
             **_onnx_options(kwargs),
@@ -455,7 +455,7 @@ class TorchScript(Format):
         sample = kwargs.get("sample_input")
         serving_model = _prepare_serving_model(model)
         wrapper = _CompatLayer(serving_model).eval()
-        from ..functional.fx import Gradient
+        from ..functional.fused import Gradient
 
         if method == "trace":
             if sample is None:
@@ -510,7 +510,7 @@ class ExecuTorch(Format):
         sample = _pad_sample(serving_model, sample)
         wrapper = _CompatLayer(serving_model).eval()
 
-        from ..functional.fx import Gradient
+        from ..functional.fused import Gradient
 
         with Gradient.inference(wrapper):
             exported = torch_export(wrapper, (sample,))
@@ -536,7 +536,7 @@ class TensorFlow(Format):
         **kwargs: Any,
     ) -> Tuple[Path, ...]:
         serving_model = _prepare_serving_model(model)
-        onnx_path = Model._OnnxLayer.coerce(
+        onnx_path = OnnxIO._OnnxLayer.coerce(
             serving_model,
             _resolve_onnx_path(dst, kwargs),
             **_onnx_options(kwargs),
@@ -556,7 +556,7 @@ class TensorFlow(Format):
         return (saved_model_dir,)
 
 
-class Model:
+class OnnxIO:
     _by_name: Dict[str, Format] = {}
     _ext_map: Dict[str, str] = {}
 
@@ -619,7 +619,7 @@ class Model:
             model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any
         ) -> Path:
             if not onnx_path.exists():
-                return Model._OnnxLayer.export(model, onnx_path, **kwargs)
+                return OnnxIO._OnnxLayer.export(model, onnx_path, **kwargs)
             return onnx_path
 
     class _OrtLayer:
@@ -697,15 +697,15 @@ class Model:
         return cls._by_name.get(name) if name else None
 
 
-Model.register("onnx", (".onnx",), Onnx())
-Model.register("ort", (".ort",), Ort())
-Model.register("tensorrt", (".engine",), TensorRT())
-Model.register("nnef", (".nnef",), Nnef())
-Model.register("coreml", (".mlmodel",), CoreML())
-Model.register("litert", (".tflite",), LiteRT())
-Model.register("torchscript", (".ts", ".torchscript"), TorchScript())
-Model.register("executorch", (".pte",), ExecuTorch())
-Model.register(
+OnnxIO.register("onnx", (".onnx",), Onnx())
+OnnxIO.register("ort", (".ort",), Ort())
+OnnxIO.register("tensorrt", (".engine",), TensorRT())
+OnnxIO.register("nnef", (".nnef",), Nnef())
+OnnxIO.register("coreml", (".mlmodel",), CoreML())
+OnnxIO.register("litert", (".tflite",), LiteRT())
+OnnxIO.register("torchscript", (".ts", ".torchscript"), TorchScript())
+OnnxIO.register("executorch", (".pte",), ExecuTorch())
+OnnxIO.register(
     "tensorflow",
     (".savedmodel", ".pb", ".tf"),
     TensorFlow(),

@@ -12,8 +12,8 @@ from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
 from ..backend.system import get_device, optimal_optimizer_params
-from ..api.templates import Dataset
-from .fx import Autocast, Fusion, is_scale_safe
+from ..data.pipeline import Dataset
+from .fused import ModelPolicy, Autocast, is_scale_safe
 
 try:
     from torch.optim.swa_utils import SWALR
@@ -159,7 +159,7 @@ class AdamW:
     ) -> Tuple[torch.device, "Dataset[Any]"]:
         ref_tensor: Optional[torch.Tensor] = None
         if isinstance(model_or_params, nn.Module):
-            ref_tensor = Fusion._peek_layer(model_or_params)
+            ref_tensor = ModelPolicy._peek_layer(model_or_params)
         if metadata is not None:
             dev = torch.device(metadata.device)
         elif ref_tensor is not None:

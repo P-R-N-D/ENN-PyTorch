@@ -48,15 +48,17 @@ except Exception:
     _psutil = None
 
 from ..api.config import RuntimeConfig, coerce_model_config
+from ..data.collections import Cache, Pool
 from ..data.datatype import to_tensordict, to_torch_tensor
-from ..api.templates import Dataset
-from ..functional.fx import Autocast, Fusion, Gradient
+from ..data.pipeline import Dataset
+from ..functional import fused
+from ..functional.fused import Autocast, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
                                  LinearCombinationLoss, LossWeightController,
                                  StandardNormalLoss, StudentsTLoss, TiledLoss)
 from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                      stochastic_weight_average)
-from ..model.layers import History, Instance, resize_scaler_buffer
+from ..model import layers
 from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
                      torch_compile_safe, torch_no_compile,
                      torch_safe_distributed)
@@ -506,7 +508,7 @@ def _expand(sources: Any) -> Any:
 
 
 def _calibrate_per_sample_mem(
-    model: Instance,
+    model: layers.Model,
     device: torch.device,
     ops: RuntimeConfig,
     dataset: Optional[Dataset] = None,
@@ -624,8 +626,8 @@ def _calibrate_per_sample_mem(
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
         try:
-            from ..functional.fx import Autocast
-            from ..functional.fx import Gradient
+            from ..functional.fused import Autocast
+            from ..functional.fused import Gradient
             from tensordict import TensorDictBase
 
             feats, labels, *_rest = meta.preprocess(batch)
@@ -1028,7 +1030,7 @@ def update_tqdm(
 
 
 def epochs(
-    model: Instance,
+    model: layers.Model,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -1063,13 +1065,13 @@ def epochs(
     with contextlib.suppress(Exception):
         set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
-    cpu_pool: Optional[Memory.Pool] = None
+    cpu_pool: Optional[Pool] = None
     pool_capacity: int = 0
     if device.type in {"cuda", "xpu"}:
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         try:
-            cpu_pool = Memory.Pool(capacity=8)
+            cpu_pool = Pool(capacity=8)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
             cpu_pool = None
@@ -1151,7 +1153,7 @@ def epochs(
     if per_batch is None or per_batch <= 0:
         per_batch = 1
 
-    from ..api.templates import BatchPolicy
+    from ..data.pipeline import BatchPolicy
 
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
@@ -1467,22 +1469,22 @@ def epochs(
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
     model_for_hist = model.module if hasattr(model, "module") else model
-    hist: Optional[History] = None
+    hist: Optional[layers.History] = None
     maybe_hist = getattr(model_for_hist, "logger", None)
-    if isinstance(maybe_hist, History):
+    if isinstance(maybe_hist, layers.History):
         hist = maybe_hist
     if hist is None:
         maybe_hist = getattr(model_for_hist, "history", None)
-        if isinstance(maybe_hist, History):
+        if isinstance(maybe_hist, layers.History):
             hist = maybe_hist
     if hist is None:
-        hist = History()
+        hist = layers.History()
         try:
             setattr(model_for_hist, "logger", hist)
         except Exception:
             pass
 
-    if isinstance(hist, History):
+    if isinstance(hist, layers.History):
         start_ns = posix_time("Asia/Seoul")
         start_sec = round(float(start_ns) / 1e9, 6)
         hist.start_session(start_sec)
@@ -2105,7 +2107,7 @@ def epochs(
                                     tflops=tflops_cur,
                                 )
                                 train_accum_since_last = 0
-                            if isinstance(hist, History):
+                            if isinstance(hist, layers.History):
                                 try:
                                     if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
                                         hist.record_batch(X, Y)
@@ -2154,7 +2156,7 @@ def epochs(
                                                 inst.microbatch = new_mb
                                                 inst._auto_microbatch_pending = False
                                             _LOGGER.info(
-                                                "[epochs] reduced Instance.microbatch from %d to %d after OOM",
+                                                "[epochs] reduced Model.microbatch from %d to %d after OOM",
                                                 cur_mb,
                                                 new_mb,
                                             )
@@ -2420,7 +2422,7 @@ def epochs(
                                                         inst.microbatch = new_mb
                                                         inst._auto_microbatch_pending = False
                                                     _LOGGER.info(
-                                                        "[epochs] reduced Instance.microbatch from %d to %d after OOM in validation",
+                                                        "[epochs] reduced Model.microbatch from %d to %d after OOM in validation",
                                                         cur_mb,
                                                         new_mb,
                                                     )
@@ -2632,7 +2634,7 @@ def epochs(
             else:
                 if util_fallback > 0.80:
                     time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
-        if isinstance(hist, History):
+        if isinstance(hist, layers.History):
             try:
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
                 world = max(1, get_world_size(device)) if is_distributed() else 1
@@ -2672,7 +2674,7 @@ def epochs(
 
 
 def infer(
-    model: Instance,
+    model: layers.Model,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -2720,7 +2722,7 @@ def infer(
 
     # Fixed queue depth for prediction output (backend-independent).
     # Avoid keyword mismatch across implementations.
-    cache = Memory.Cache(chunk_dir, max_queue=4)
+    cache = Cache(chunk_dir, max_queue=4)
 
     # Chunking strategy: limit buffered rows in memory.
     # Users can override via STNET_PRED_CHUNK_ROWS.
@@ -2954,8 +2956,8 @@ def infer(
     return None
 
 
-def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
-    from ..api.templates import Session
+def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
+    from ..data.pipeline import Session
 
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
@@ -2990,12 +2992,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = Instance(ops.in_dim, ops.out_shape, config=cfg)
+        model = layers.Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
                 cpu_state = torch.load(fallback_init, map_location="cpu")
-                resize_scaler_buffer(model, cpu_state)
+                layers.resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 m_sd = get_model_state_dict(
@@ -3009,7 +3011,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.init_ckpt_dir),
                 )
-                resize_scaler_buffer(model, m_sd)
+                layers.resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
@@ -3045,7 +3047,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        model, _, _ = Fusion.use_nvidia_layers(model, device=device)
+        model, _, _ = fused.ModelPolicy.use_nvidia_layers(model, device=device)
         Autocast.configure(model, metadata=metadata)
         float_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else ()
         if not float_candidates:
@@ -3071,7 +3073,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
         if fp8_ok:
-            model, fp8_enabled, fp8_backend = Fusion.enable_float8_training(
+            model, fp8_enabled, fp8_backend = fused.ModelPolicy.enable_float8_training(
                 model, metadata=metadata, logger=_float8_log
             )
             if not fp8_enabled:
@@ -3475,12 +3477,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
-        model = Instance(ops.in_dim, ops.out_shape, config=cfg)
+        model = layers.Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
                 cpu_state = torch.load(fallback_model, map_location="cpu")
-                resize_scaler_buffer(model, cpu_state)
+                layers.resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 m_sd = get_model_state_dict(
@@ -3494,13 +3496,13 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.model_ckpt_dir),
                 )
-                resize_scaler_buffer(model, m_sd)
+                layers.resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
         model.to(device, non_blocking=True).eval()
         metadata = Dataset.for_device(device)
-        model, _, _ = Fusion.use_nvidia_layers(model, device=device)
+        model, _, _ = fused.ModelPolicy.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
         _assert_unified_layer_dtype(_m_eval, device)
@@ -3521,7 +3523,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Instance]:
         Autocast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
         if fp8_infer_ok:
-            model, _, _ = Fusion.enable_float8_prediction(
+            model, _, _ = fused.ModelPolicy.enable_float8_prediction(
                 model, metadata=metadata, logger=_float8_log
             )
         else:

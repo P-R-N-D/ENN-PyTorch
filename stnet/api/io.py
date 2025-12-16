@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
                                                      get_model_state_dict,
                                                      set_model_state_dict)
 
-from ..model.layers import Instance, resize_scaler_buffer
+from ..model.layers import Model, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config
 
 
@@ -144,12 +144,12 @@ def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "_Instance__config", None)
+    cfg_obj = getattr(model, "_Model__config", None)
     if cfg_obj is None:
         cfg_obj = getattr(model, "__stnet_instance_config__", None)
     if cfg_obj is None:
         for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Instance__config", None)
+            cfg_obj = getattr(submodule, "_Model__config", None)
             if cfg_obj is not None:
                 break
     candidate: ModelConfig | Dict[str, Any] | None
@@ -173,7 +173,7 @@ def new_model(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> nn.Module:
     cfg = coerce_model_config(config)
-    core = Instance(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    core = Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     return core
 
 
@@ -304,7 +304,7 @@ def save_model(
 ) -> str:
     p = Path(path)
 
-    if Model.is_native_target(p):
+    if TorchIO.is_native_target(p):
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
@@ -312,7 +312,7 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = Model.save(
+        out = TorchIO.save(
             model,
             p,
             optimizer=optimizer,
@@ -321,14 +321,14 @@ def save_model(
         )
         return str(out)
 
-    conv = _export_backend().Model.for_export(p.suffix)
+    conv = _export_backend().OnnxIO.for_export(p.suffix)
     if conv is None:
         raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, **kwargs)
     return str(p)
 
 
-class Model:
+class TorchIO:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
@@ -337,7 +337,7 @@ class Model:
         suffix = p.suffix.lower()
         if not suffix:
             return True
-        return suffix in Model.NATIVE_EXTS
+        return suffix in TorchIO.NATIVE_EXTS
 
     @staticmethod
     def save(
