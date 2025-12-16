@@ -1630,6 +1630,46 @@ class Dataset(Generic[TExtra]):
             return torch.device("cuda")
         return torch.device("cpu")
 
+    def _refresh_dtypes_from_env(self) -> None:
+        def _parse_dtypes(value: str) -> Tuple[torch.dtype, ...]:
+            entries = []
+            for token in value.split(","):
+                name = token.strip()
+                if not name:
+                    continue
+                dtype = getattr(torch, name, None)
+                if isinstance(dtype, torch.dtype):
+                    entries.append(dtype)
+            return tuple(entries)
+
+        float_env = os.environ.get("STNET_DATA_FLOAT_DTYPES") or os.environ.get(
+            "STNET_FLOAT_DTYPES"
+        )
+        if float_env:
+            parsed = _parse_dtypes(float_env)
+            if parsed:
+                self.float_dtypes = parsed
+
+        int_env = os.environ.get("STNET_DATA_INT_DTYPES") or os.environ.get(
+            "STNET_INT_DTYPES"
+        )
+        if int_env:
+            parsed = _parse_dtypes(int_env)
+            if parsed:
+                self.int_dtypes = parsed
+
+    def _refresh_quant_from_env(self) -> None:
+        env_bits = os.environ.get("STNET_INT_QUANT_BITS") or os.environ.get(
+            "STNET_DATA_INT_QUANT_BITS"
+        )
+        if env_bits:
+            try:
+                bits = int(env_bits)
+                if bits > 0:
+                    self.int_quant_bits = bits
+            except Exception:
+                pass
+
     @classmethod
     def is_float8_supported(
         cls, device: Optional[Union[torch.device, str]] = None
