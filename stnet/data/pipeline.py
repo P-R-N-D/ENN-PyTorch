@@ -1659,10 +1659,11 @@ class Dataset(Generic[TExtra]):
                 self.int_dtypes = parsed
 
     def _refresh_quant_from_env(self) -> None:
-        env_bits = os.environ.get("STNET_INT_QUANT_BITS") or os.environ.get(
-            "STNET_DATA_INT_QUANT_BITS"
+        env_bits = os.environ.get("STNET_DATA_INT_QUANT_BITS") or os.environ.get(
+            "STNET_INT_QUANT_BITS"
         )
         if env_bits:
+            env_bits = env_bits.strip()
             try:
                 bits = int(env_bits)
                 if bits > 0:
