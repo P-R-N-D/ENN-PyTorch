@@ -1575,6 +1575,124 @@ class Dataset(Generic[TExtra]):
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
 
+    def ensure_device_info(self) -> "Dataset[TExtra]":
+        self._refresh_device_info()
+        return self
+
+    def refresh(self) -> "Dataset[TExtra]":
+        self._refresh_device_info()
+        self._refresh_dtypes_from_env()
+        self._refresh_quant_from_env()
+
+        if not self.float_dtypes:
+            floats: list[torch.dtype] = [torch.float32]
+            if self.device_type == "cuda" and torch.cuda.is_available():
+                floats.insert(0, torch.float16)
+                if self.is_cuda_bf16_supported():
+                    floats.insert(0, torch.bfloat16)
+            elif self.device_type == "cpu" and self.is_cpu_bf16_supported():
+                floats.insert(0, torch.bfloat16)
+            self.float_dtypes = tuple(dict.fromkeys(floats))
+
+        if not self.int_dtypes:
+            self.int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
+
+        if not self.float8_dtypes:
+            self.float8_dtypes = tuple()
+
+        if self.int_quant_bits is None:
+            self.int_quant_bits = 8
+        return self
+
+    def preprocess(
+        self, data: Any
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[Any], Tuple[int, ...]]:
+        def _to_tensor(obj: Any, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+            t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
+            if dtype is not None:
+                with contextlib.suppress(Exception):
+                    t = t.to(dtype=dtype)
+            return t
+
+        features: Optional[torch.Tensor] = None
+        labels: Optional[torch.Tensor] = None
+        keys: Sequence[Any] = ()
+
+        def _pick(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
+            for k in keys:
+                value = mapping.get(k, None)
+                if value is not None:
+                    return value
+            return None
+
+        if isinstance(data, TensorDictBase):
+            features = _pick(data, ("features", "X"))
+            labels = _pick(data, ("labels", "Y", "targets", "target"))
+            keys = _pick(data, ("row_ids", "keys")) or ()
+            if features is None:
+                for v in data.values():
+                    if isinstance(v, torch.Tensor):
+                        features = v
+                        break
+        elif isinstance(data, Mapping):
+            if "X" in data or "features" in data:
+                features = _pick(data, ("X", "features"))
+                labels = _pick(data, ("Y", "labels", "targets", "target"))
+                keys = _pick(data, ("row_ids", "keys")) or ()
+            else:
+                values = list(data.values())
+                keys = list(data.keys())
+                if values and isinstance(values[0], (list, tuple)) and len(values[0]) >= 2:
+                    feat_list = [_to_tensor(v[0], dtype=self.feature_dtype) for v in values]
+                    label_list = [_to_tensor(v[1], dtype=self.label_float_dtype) for v in values]
+                    features = torch.stack(feat_list) if feat_list else None
+                    labels = torch.stack(label_list) if label_list else None
+                else:
+                    features = torch.stack(
+                        [_to_tensor(v, dtype=self.feature_dtype) for v in values]
+                    )
+                    labels = None
+
+        if features is None:
+            raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
+
+        features = _to_tensor(features, dtype=self.feature_dtype).contiguous()
+        if features.ndim == 0:
+            features = features.reshape(1, 1)
+        if features.ndim == 1:
+            features = features.unsqueeze(1)
+
+        if labels is not None:
+            labels = _to_tensor(labels, dtype=self.label_float_dtype).contiguous()
+            if labels.ndim == 0:
+                labels = labels.view(1, 1)
+            if labels.shape[0] != features.shape[0]:
+                labels = labels.reshape(features.shape[0], -1)
+            label_shape = tuple(labels.shape[1:])
+        else:
+            label_shape = tuple()
+
+        if isinstance(keys, torch.Tensor):
+            with contextlib.suppress(Exception):
+                keys = keys.detach().cpu().tolist()
+        elif keys is None:
+            keys = ()
+
+        if not keys:
+            keys = range(int(features.shape[0]))
+
+        return features, labels, keys, label_shape
+
+    def batch_to_device(
+        self, batch: Any, device: Union[str, torch.device], non_blocking: bool = True
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        dev = torch.device(device)
+        feats, labels, _, _ = self.preprocess(batch)
+        feats = feats.to(device=dev, non_blocking=non_blocking)
+        if labels is not None:
+            labels = labels.to(device=dev, non_blocking=non_blocking)
+        return feats, labels
+
     def _refresh_device_info(self) -> None:
         dev = torch.device(self.device)
         self.device = dev
