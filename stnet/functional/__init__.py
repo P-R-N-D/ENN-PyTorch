@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from . import fx, losses, optimizers
+from . import fused, losses, optimizers
 
 __all__ = [
-    "fx",
+    "fused",
     "losses",
     "optimizers",
 ]

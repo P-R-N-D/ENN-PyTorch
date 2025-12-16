@@ -83,7 +83,7 @@ for _name in ("cuda", "xpu", "mps"):
 
 from ..backend.compat import torch_no_compile
 from ..backend.profiler import FLOP_PROFILER
-from ..functional.fx import Autocast, Gradient
+from ..functional.fused import Autocast, Gradient
 from .kernels import (DotProductAttention, MultiHeadAttention,
                       MultiScaleRetention)
 
@@ -994,7 +994,7 @@ def reshape_for_mha(x: torch.Tensor, batch: int, heads: int, head_dim: int) -> t
     return x.view(batch, -1, heads, head_dim).transpose(1, 2).contiguous()
 
 
-class SpatialNet(nn.Module):
+class AxisS(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1044,7 +1044,7 @@ class SpatialNet(nn.Module):
         depth = len(self.blocks)
         if coords.dim() != 3:
             raise ValueError(
-                f"SpatialNet coords must be (B,N,C), got shape {tuple(coords.shape)}"
+                f"AxisS coords must be (B,N,C), got shape {tuple(coords.shape)}"
             )
         _, N, _ = coords.shape
         patch = int(getattr(self, "patch_size", 512))
@@ -1088,7 +1088,7 @@ class SpatialNet(nn.Module):
         self._perm_cache_meta = meta
         return perm_new, inv_new
 
-    @torch_no_compile(reason="SpatialNet uses dynamic gather/scatter", recursive=True)
+    @torch_no_compile(reason="AxisS uses dynamic gather/scatter", recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -1096,16 +1096,16 @@ class SpatialNet(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_meta_or_fake_tensor(x):
-            raise RuntimeError("x is meta/fake before SpatialNet.forward")
+            raise RuntimeError("x is meta/fake before AxisS.forward")
         if is_meta_or_fake_tensor(coords):
-            raise RuntimeError("coords is meta/fake before SpatialNet.forward")
+            raise RuntimeError("coords is meta/fake before AxisS.forward")
         if x.dim() != 3:
             raise ValueError(
-                f"SpatialNet expects (B, N, C) tokens, got shape {tuple(x.shape)}"
+                f"AxisS expects (B, N, C) tokens, got shape {tuple(x.shape)}"
             )
         if coords.dim() != 3:
             raise ValueError(
-                f"SpatialNet expects (B, N, D) coords, got shape {tuple(coords.shape)}"
+                f"AxisS expects (B, N, D) coords, got shape {tuple(coords.shape)}"
             )
         if x.shape[:2] != coords.shape[:2]:
             raise ValueError(
@@ -1119,7 +1119,7 @@ class SpatialNet(nn.Module):
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError(
-                    "attn_mask is meta/fake before SpatialNet.forward"
+                    "attn_mask is meta/fake before AxisS.forward"
                 )
             attn_mask = attn_mask.contiguous()
         perm_cache, inv_cache = self._ensure_permutation_cache(coords)
@@ -1161,7 +1161,7 @@ class SpatialNet(nn.Module):
             x = out_s.gather(1, invperm.unsqueeze(-1).expand(B, N, D))
         out = self.norm(x)
         if is_meta_or_fake_tensor(out):
-            raise RuntimeError("SpatialNet produced meta/fake tensor")
+            raise RuntimeError("AxisS produced meta/fake tensor")
         return out.contiguous()
 
 
@@ -1217,7 +1217,7 @@ class RetNet(nn.Module):
         return x, new_state
 
 
-class TemporalNet(nn.Module):
+class AxisT(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -1561,7 +1561,7 @@ class LongNet(nn.Module):
         return out, attn_w
 
 
-class Controller(nn.Module):
+class Context(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -1611,7 +1611,7 @@ class Controller(nn.Module):
         )
 
 
-class Processor(nn.Module):
+class Subcontext(nn.Module):
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -1639,7 +1639,7 @@ class Processor(nn.Module):
             self._get_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
             persistent=False,
         )
-        self.spatial_net = SpatialNet(
+        self.spatial_net = AxisS(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.spatial_depth)),
@@ -1649,7 +1649,7 @@ class Processor(nn.Module):
             drop_path=self.drop_path,
             norm_type=self.norm_type,
         )
-        self.temporal_net = TemporalNet(
+        self.temporal_net = AxisT(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.temporal_depth)),
@@ -1710,11 +1710,11 @@ class Processor(nn.Module):
             coords = coords.to(device=device, dtype=torch.float32)
         return coords.unsqueeze(0).expand(batch, -1, -1)
 
-    # Processor.forward is intentionally kept eager. We selectively torch.compile()
-    # only stable, hot submodules (TemporalNet / CrossTransformer / head) and keep
-    # orchestration + SpatialNet calls outside the compiled graph to reduce graph
+    # Subcontext.forward is intentionally kept eager. We selectively torch.compile()
+    # only stable, hot submodules (AxisT / CrossTransformer / head) and keep
+    # orchestration + AxisS calls outside the compiled graph to reduce graph
     # breaks and compilation fragility.
-    @torch_no_compile(reason="Processor orchestrates eager + compiled submodules", recursive=False)
+    @torch_no_compile(reason="Subcontext orchestrates eager + compiled submodules", recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = x.shape[0]
         spatial_raw = self.spatial_tokenizer(x)
@@ -2619,7 +2619,7 @@ def resize_scaler_buffer(
                     setattr(scaler, name, new_buf)
 
 
-class Instance(nn.Module):
+class Model(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -2658,12 +2658,12 @@ class Instance(nn.Module):
             if self.is_norm_linear
             else None
         )
-        self.processor = Processor(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.processor = Subcontext(self.in_dim, self.out_shape, config=config).to(self._device)
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
-        controller = Controller(
+        controller = Context(
             int(config.depth),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -3034,8 +3034,8 @@ class Instance(nn.Module):
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
             if is_train_path:
-                # Ensure Controller learns residual corrections without pushing
-                # gradients back into the Processor token stream.
+                # Ensure Context learns residual corrections without pushing
+                # gradients back into the Subcontext token stream.
                 tokens_centered = tokens_centered.detach()
 
             if self._auto_ctrl_microbatch_pending:

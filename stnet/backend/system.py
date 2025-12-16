@@ -4,7 +4,7 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import importlib
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import itertools
 import multiprocessing
 import os
@@ -37,6 +37,263 @@ _RUNTIME_CFG = SimpleNamespace(
 )
 
 _FP32_PRECISION_CACHE: Dict[Tuple[str, int], str] = {}
+
+
+@dataclass(slots=True)
+class WorkerPolicy:
+    nproc_per_node: int = 1
+    device: str = "cpu"
+    local_world_size: int = 1
+
+    intra_ops: int = 1
+    inter_ops: int = 1
+
+    num_workers: int = 1
+    prebatch: int = 1
+    prefetch_factor: int = 1
+    max_concurrency: int = 1
+    h2d_streams: int = 1
+
+    @staticmethod
+    def _cpu_count() -> int:
+        try:
+            return len(os.sched_getaffinity(0))
+        except Exception:
+            return os.cpu_count() or 1
+
+    @staticmethod
+    def _detect_accelerator() -> Tuple[str, int]:
+        dev_type = "cpu"
+        n = 0
+
+        try:
+            accel = getattr(torch, "accelerator", None)
+            if accel is not None and hasattr(accel, "is_available") and accel.is_available():
+                current = getattr(accel, "current_accelerator", None)
+                if callable(current):
+                    dev = current(False)
+                    if isinstance(dev, torch.device):
+                        dev_type = dev.type
+                dc = getattr(accel, "device_count", None)
+                if callable(dc):
+                    n = int(dc())
+        except Exception:
+            dev_type, n = "cpu", 0
+
+        try:
+            if n <= 0:
+                if torch.cuda.is_available():
+                    dev_type = "cuda"
+                    n = int(torch.cuda.device_count())
+                else:
+                    xpu = getattr(torch, "xpu", None)
+                    if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+                        dev_type = "xpu"
+                        n = int(getattr(xpu, "device_count", lambda: 1)())
+                    else:
+                        mps_backend = getattr(torch.backends, "mps", None)
+                        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
+                            dev_type = "mps"
+                            n = 1
+        except Exception:
+            pass
+
+        if n <= 0:
+            dev_type, n = "cpu", 0
+        return dev_type, max(0, n)
+
+    @classmethod
+    def autotune(cls) -> "WorkerPolicy":
+        ncpu_raw = max(1, int(cls._cpu_count() or 1))
+        dev_type, nacc = cls._detect_accelerator()
+        is_accel = bool(nacc and int(nacc) > 0)
+
+        def _read_int_env(keys: Sequence[str], default: int) -> int:
+            for k in keys:
+                with contextlib.suppress(Exception):
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return int(v)
+            return int(default)
+
+        def _read_float_env(keys: Sequence[str], default: float) -> float:
+            for k in keys:
+                with contextlib.suppress(Exception):
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return float(v)
+            return float(default)
+
+        local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
+        local_world_guess = max(
+            1,
+            _read_int_env(
+                ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
+                local_world_guess,
+            ),
+        )
+
+        cap_mult = 2
+        with contextlib.suppress(Exception):
+            v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
+            if v is None:
+                v = os.environ.get("STNET_THREADS_CAP_MULTIPLIER")
+            if v is not None and str(v).strip():
+                cap_mult = int(v)
+        cap_mult = max(1, min(8, int(cap_mult)))
+        node_thread_cap = max(2, int(ncpu_raw) * int(cap_mult))
+
+        distribute = (is_accel and int(local_world_guess) > 1)
+        distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute)))
+        thread_cap = int(node_thread_cap)
+        if distribute:
+            thread_cap = max(2, int(node_thread_cap) // max(1, int(local_world_guess)))
+
+        eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
+
+        soft_inflight = 8 if is_accel else 4
+        with contextlib.suppress(Exception):
+            from ..data.pipeline import LoaderPolicy
+
+            lp = LoaderPolicy()
+            hard = int(lp.hard_inflight_batches(dev_type))
+            soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
+
+        soft_auto_enabled = bool(_read_int_env(("STNET_SOFT_INFLIGHT_AUTO",), 1))
+        soft_inflight_max_default = 16 if is_accel else 12
+        soft_inflight_max = max(8, _read_int_env(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
+        soft_inflight_explicit = _read_int_env(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        if soft_inflight_explicit > 0:
+            soft_inflight = max(1, int(soft_inflight_explicit))
+        elif soft_auto_enabled:
+            soft_base = max(0, _read_int_env(("STNET_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, _read_int_env(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
+            soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
+
+        soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
+
+        if is_accel:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.90
+            elif eff_cores <= 16:
+                model_ratio = 0.80
+            elif eff_cores <= 32:
+                model_ratio = 0.70
+            else:
+                model_ratio = 0.60
+        else:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.95
+            elif eff_cores <= 16:
+                model_ratio = 0.90
+            else:
+                model_ratio = 0.85
+
+        with contextlib.suppress(Exception):
+            env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
+            v = os.environ.get(env_key)
+            if v is not None and str(v).strip():
+                model_ratio = float(v)
+        model_ratio = float(max(0.25, min(1.0, model_ratio)))
+
+        model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
+
+        if model_budget <= 2:
+            inter_ops = 1
+        elif model_budget <= 8:
+            inter_ops = max(1, model_budget // 4)
+        else:
+            inter_ops = max(2, min(8, model_budget // 6))
+        inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
+        intra_ops = max(1, int(model_budget) - int(inter_ops))
+
+        data_budget = max(1, int(thread_cap) - (int(intra_ops) + int(inter_ops)))
+
+        prebatch = 1
+        prefetch_factor = 1
+
+        env_pre = os.environ.get("STNET_PREBATCH")
+        if env_pre:
+            with contextlib.suppress(Exception):
+                prebatch = max(1, int(env_pre))
+        env_pf = os.environ.get("STNET_PREFETCH_FACTOR")
+        if env_pf:
+            with contextlib.suppress(Exception):
+                prefetch_factor = max(1, int(env_pf))
+
+        prebatch = max(1, int(prebatch))
+        prefetch_factor = max(1, int(prefetch_factor))
+
+        base_workers = max(1, int(data_budget))
+        base_workers = min(int(base_workers), int(thread_cap), int(soft_inflight))
+
+        max_workers = max(
+            1,
+            int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
+        )
+        num_workers = max(1, min(int(base_workers), int(max_workers), int(soft_inflight)))
+
+        max_concurrency = max(1, int(num_workers))
+
+        total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
+        if total_threads > int(thread_cap):
+            overflow = int(total_threads) - int(thread_cap)
+            if dev_type == "cpu":
+                num_workers = max(1, int(num_workers) - int(overflow))
+            else:
+                intra_ops = max(1, int(intra_ops) - int(overflow))
+
+            intra_ops = max(1, int(thread_cap) - int(inter_ops) - int(num_workers))
+            max_concurrency = max(1, min(int(max_concurrency), int(num_workers)))
+
+        local_world = int(local_world_guess)
+
+        return cls(
+            nproc_per_node=local_world,
+            device=dev_type,
+            local_world_size=local_world,
+            intra_ops=int(intra_ops),
+            inter_ops=int(inter_ops),
+            num_workers=int(num_workers),
+            prebatch=int(prebatch),
+            prefetch_factor=int(prefetch_factor),
+            max_concurrency=int(max_concurrency),
+            h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
+        )
+
+    def as_threads_dict(self) -> Dict[str, int]:
+        out = {
+            "intra_ops": int(self.intra_ops),
+            "inter_ops": int(self.inter_ops),
+            "num_workers": int(self.num_workers),
+            "max_concurrency": int(self.max_concurrency),
+            "prebatch": int(self.prebatch),
+            "prefetch_factor": int(self.prefetch_factor),
+        }
+        out["max_concurrancy"] = out["max_concurrency"]
+        return out
+
+    def as_procs_dict(self) -> Dict[str, Union[int, str]]:
+        return {
+            "nproc_per_node": int(self.nproc_per_node),
+            "device": str(self.device),
+        }
+
+    def apply_torch_threads(self) -> None:
+        try:
+            torch.set_num_threads(max(1, int(self.intra_ops)))
+        except Exception:
+            pass
+        if hasattr(torch, "set_num_interop_threads"):
+            try:
+                torch.set_num_interop_threads(max(1, int(self.inter_ops)))
+            except Exception:
+                pass
 
 def set_float32_precision(
     device: torch.device,
@@ -379,13 +636,13 @@ def get_dpa_backends() -> List[object]:
 
 
 def is_cpu_bf16_supported() -> bool:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.is_cpu_bf16_supported()
 
 
 def is_cuda_bf16_supported() -> bool:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.is_cuda_bf16_supported()
 
@@ -477,7 +734,7 @@ def optimal_optimizer_params(
 
 
 def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.cuda_compute_capability(device)
 
@@ -485,7 +742,7 @@ def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
 def is_float8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.is_float8_supported(device)
 
@@ -493,7 +750,7 @@ def is_float8_supported(
 def is_int8_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.is_int8_supported(device)
 
@@ -501,14 +758,12 @@ def is_int8_supported(
 def is_int4_supported(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[bool, str]:
-    from ..api.templates import Dataset
+    from ..data.pipeline import Dataset
 
     return Dataset.is_int4_supported(device)
 
 
 def optimal_procs() -> Dict[str, Union[int, str]]:
-    from ..api.templates import WorkerPolicy
-
     return WorkerPolicy.autotune().as_procs_dict()
 
 
@@ -567,14 +822,10 @@ def num_accelerators() -> int:
 
 
 def optimal_threads() -> Dict[str, Union[int, bool]]:
-    from ..api.templates import WorkerPolicy
-
     return WorkerPolicy.autotune().as_threads_dict()
 
 
 def optimize_threads() -> Dict[str, Union[int, bool]]:
-    from ..api.templates import WorkerPolicy
-
     wp = WorkerPolicy.autotune()
     wp.apply_torch_threads()
     return wp.as_threads_dict()
@@ -846,8 +1097,6 @@ class Thread:
     def optimize_threads(
         intra: Optional[int] = None, inter: Optional[int] = None
     ) -> None:
-        from ..api.templates import WorkerPolicy
-
         wp = WorkerPolicy.autotune()
         if intra is not None:
             wp = replace(wp, intra_ops=int(intra))
@@ -1488,393 +1737,3 @@ class Memory:
         except Exception:
             return False
         return False
-
-    class Page:
-
-        __slots__ = ("_buf", "_numel", "_dtype")
-
-        def __init__(self, numel: int, dtype: "torch.dtype") -> None:
-            import torch
-
-            self._numel = int(max(1, numel))
-            self._dtype = dtype
-            self._buf = torch.empty(
-                self._numel, dtype=self._dtype, device="cpu", pin_memory=True
-            )
-
-        @property
-        def numel(self) -> int:
-            return self._numel
-
-        @property
-        def dtype(self) -> "torch.dtype":
-            return self._dtype
-
-        def view(self, *shape: int) -> "torch.Tensor":
-            import torch
-
-            needed = 1
-            for s in shape:
-                needed *= int(s)
-            if needed > self._numel:
-                self._numel = int(needed)
-                self._buf = torch.empty(
-                    self._numel, dtype=self._dtype, device="cpu", pin_memory=True
-                )
-            return self._buf[:needed].view(*shape)
-
-    class Pool:
-
-        class Token:
-            __slots__ = ("i", "g")
-
-            def __init__(self, i: int, g: int) -> None:
-                self.i = i
-                self.g = g
-
-        class _Entry:
-            __slots__ = ("page", "busy", "fence", "gen")
-
-            def __init__(self, page: "Memory.Page") -> None:
-                self.page = page
-                self.busy = False
-                self.fence = None
-                self.gen = 0
-
-        def __init__(self, capacity: int = 4) -> None:
-            import threading
-
-            self._cap = max(1, int(capacity))
-            self._pages: list[Memory.Pool._Entry] = []
-            self._rr = 0
-            self._lock = threading.Lock()
-
-        def _evt_done(self, evt: object) -> bool:
-            if evt is None:
-                return True
-            try:
-                q = getattr(evt, "query", None)
-                if callable(q):
-                    return bool(q())
-            except Exception:
-                return False
-            return False
-
-        def _scavenge(self) -> None:
-            for e in self._pages:
-                if e.busy and e.fence is not None and self._evt_done(e.fence):
-                    e.busy = False
-                    e.fence = None
-
-        def _ensure_view(
-            self, e: "Memory.Pool._Entry", shape: "Tuple[int, ...]", dtype: "torch.dtype"
-        ) -> "torch.Tensor":
-            need = 1
-            for s in shape:
-                need *= int(s)
-            if (e.page.dtype != dtype) or (e.page.numel < need):
-                e.page = Memory.Page(numel=need, dtype=dtype)
-                e.gen += 1
-            return e.page.view(*shape)
-
-        def get(
-            self,
-            shape: "Tuple[int, ...]",
-            dtype: "torch.dtype",
-            *,
-            return_handle: bool = False,
-        ) -> "torch.Tensor" | "tuple[torch.Tensor, Memory.Pool.Token | None]":
-            with self._lock:
-                self._scavenge()
-                n = len(self._pages)
-                if n:
-                    start = self._rr
-                    for k in range(n):
-                        idx = (start + k) % n
-                        e = self._pages[idx]
-                        if not e.busy:
-                            e.busy = True
-                            e.fence = None
-                            self._rr = (idx + 1) % max(1, n)
-                            view = self._ensure_view(e, shape, dtype)
-                            if return_handle:
-                                return view, Memory.Pool.Token(idx, e.gen)
-                            return view
-                need = 1
-                for s in shape:
-                    need *= int(s)
-                new = Memory.Pool._Entry(Memory.Page(numel=need, dtype=dtype))
-                new.busy = True
-                if len(self._pages) < self._cap:
-                    self._pages.append(new)
-                    idx = len(self._pages) - 1
-                    self._rr = (idx + 1) % self._cap
-                    view = new.page.view(*shape)
-                    if return_handle:
-                        return view, Memory.Pool.Token(idx, new.gen)
-                    return view
-                start = self._rr
-                for k in range(self._cap):
-                    idx = (start + k) % self._cap
-                    if not self._pages[idx].busy:
-                        self._pages[idx] = new
-                        self._rr = (idx + 1) % self._cap
-                        view = new.page.view(*shape)
-                        if return_handle:
-                            return view, Memory.Pool.Token(idx, new.gen)
-                        return view
-                view = new.page.view(*shape)
-                if return_handle:
-                    return view, None
-                return view
-
-        def get_like(self, t: "torch.Tensor", *args: Any, return_handle: bool = False) -> "torch.Tensor" | "tuple[torch.Tensor, Memory.Pool.Token | None]":
-            return self.get(tuple(t.shape), t.dtype, return_handle=return_handle)
-
-        def release_after(self, token: "Memory.Pool.Token", wait_event: object | None) -> None:
-            if token is None:
-                return
-            with self._lock:
-                i = int(getattr(token, "i", -1))
-                g = int(getattr(token, "g", -1))
-                if 0 <= i < len(self._pages):
-                    e = self._pages[i]
-                    if e.gen == g:
-                        e.busy = True
-                        e.fence = wait_event
-
-        def release(self, token: "Memory.Pool.Token") -> None:
-            if token is None:
-                return
-            with self._lock:
-                i = int(getattr(token, "i", -1))
-                g = int(getattr(token, "g", -1))
-                if 0 <= i < len(self._pages):
-                    e = self._pages[i]
-                    if e.gen == g:
-                        e.busy = False
-                        e.fence = None
-
-        def collect(self) -> None:
-            with self._lock:
-                self._scavenge()
-
-    class Cache:
-
-        def __init__(self, root: str, max_queue: int = 8) -> None:
-            import os
-            import queue
-            import threading
-
-            self._q = queue.Queue(maxsize=max_queue)
-            self._root = root
-            os.makedirs(root, exist_ok=True)
-            self._t = threading.Thread(target=self._run, daemon=True)
-            self._err = None
-            self._err_event = threading.Event()
-            self._t.start()
-
-        def submit(
-            self,
-            tensor: "torch.Tensor",
-            path: Optional[str] = None,
-            idx: Optional[int] = None,
-            wait_event: Optional[object] = None,
-            release_cb: Optional[object] = None,
-        ) -> None:
-            import contextlib
-            import queue
-
-            if self._err_event.is_set():
-                raise RuntimeError(f"Async writer error: {self._err!r}")
-            if path is None:
-                if idx is None:
-                    raise ValueError("either path or idx required")
-                path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
-            try:
-                self._q.put((tensor, path, wait_event, release_cb), timeout=0.05)
-            except queue.Full:
-                if wait_event is not None:
-                    with contextlib.suppress(Exception):
-                        wait_event.synchronize()
-                self._save_tensor(tensor, path)
-                if callable(release_cb):
-                    with contextlib.suppress(Exception):
-                        release_cb()
-
-        def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
-            import json
-            import os
-
-            import torch
-
-            try:
-                if path.endswith(".mmt"):
-                    from tensordict import MemoryMappedTensor
-                    buf = tensor
-                    if hasattr(tensor, "is_pinned") and tensor.is_pinned():
-                        buf = torch.empty_like(tensor, device="cpu", pin_memory=False); buf.copy_(tensor, non_blocking=False)
-                    MemoryMappedTensor.from_tensor(buf.contiguous(), filename=path)
-                    meta = {"shape": list(buf.shape), "dtype": str(buf.dtype).replace("torch.", "")}
-                    with open(path + ".json", "w", encoding="utf-8") as f:
-                        json.dump(meta, f)
-                    return
-            except Exception:
-                pass
-
-            if hasattr(tensor, "is_pinned") and tensor.is_pinned():
-                buf = torch.empty_like(tensor, device="cpu", pin_memory=False)
-                buf.copy_(tensor, non_blocking=False)
-            else:
-                buf = tensor.contiguous()
-            torch.save(buf, path)
-
-        def close(self) -> None:
-            self._q.put((None, None, None, None))
-            self._t.join()
-
-        def _run(self) -> None:
-            import contextlib
-
-            while True:
-                item = self._q.get()
-                if isinstance(item, tuple) and len(item) == 4:
-                    tensor, path, evt, rel = item
-                else:
-                    tensor, path = item
-                    evt = None
-                    rel = None
-                if tensor is None:
-                    break
-                try:
-                    if evt is not None:
-                        with contextlib.suppress(Exception):
-                            evt.synchronize()
-                    self._save_tensor(tensor, path)
-                    if callable(rel):
-                        with contextlib.suppress(Exception):
-                            rel()
-                except Exception as e:
-                    self._err = e
-                    self._err_event.set()
-                    break
-
-        def had_error(self) -> bool:
-            return bool(self._err_event.is_set())
-
-    class Buffer:
-        """Bounded in-memory buffer with backpressure.
-
-        This is a small wrapper around :class:`queue.Queue` that adds:
-          - A stop flag so blocked producers/consumers can be interrupted.
-          - Type-agnostic payloads (Any).
-
-        It is intentionally minimal: higher-level coordination (sentinels,
-        producer/consumer threads) lives in BufferedLoader.
-        """
-
-        def __init__(self, max_batches: int) -> None:
-            import queue
-            import threading
-            self.max_batches = max(1, int(max_batches))
-            self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.max_batches)
-            self._stop = threading.Event()
-
-        def put(self, item: Any, *, timeout: float | None = None) -> bool:
-            """Put an item into the buffer.
-
-            Returns True if the item was enqueued, False if the buffer was stopped
-            before the item could be enqueued.
-
-            This method is interruptible even when `timeout` is None (infinite):
-            it uses a small internal timeout loop to periodically check the stop flag.
-            """
-            import logging
-            import queue
-            import time
-
-            if self._stop.is_set():
-                return False
-
-            start = time.monotonic()
-            # Use a timeout loop so stop() can interrupt a blocked put.
-            if timeout is None:
-                while not self._stop.is_set():
-                    try:
-                        self._q.put(item, block=True, timeout=0.1)
-                        break
-                    except queue.Full:
-                        continue
-                else:
-                    return False
-            else:
-                deadline = time.monotonic() + float(timeout)
-                while not self._stop.is_set():
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        return False
-                    try:
-                        self._q.put(item, block=True, timeout=min(0.1, remaining))
-                        break
-                    except queue.Full:
-                        continue
-                else:
-                    return False
-
-            elapsed = time.monotonic() - start
-            if elapsed > 0.1:
-                logging.warning(
-                    f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
-                )
-            return True
-
-        def get(self, block: bool = True, timeout: float | None = None) -> Any:
-            """Get an item from the buffer.
-
-            If the buffer is stopped and empty, this raises queue.Empty.
-
-            Like put(), this method is interruptible even when `timeout` is None.
-            """
-            import queue
-            import time
-
-            # Keep backward compatibility with queue.Queue.get(block=..., timeout=...).
-            if not bool(block):
-                if self._stop.is_set() and self._q.empty():
-                    raise queue.Empty
-                return self._q.get(block=False)
-
-            # Infinite block, but still interruptible via stop().
-            if timeout is None:
-                while True:
-                    if self._stop.is_set() and self._q.empty():
-                        raise queue.Empty
-                    try:
-                        return self._q.get(block=True, timeout=0.1)
-                    except queue.Empty:
-                        continue
-
-            # Finite timeout, still interruptible.
-            deadline = time.monotonic() + float(timeout)
-            while True:
-                if self._stop.is_set() and self._q.empty():
-                    raise queue.Empty
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise queue.Empty
-                try:
-                    return self._q.get(block=True, timeout=min(0.1, remaining))
-                except queue.Empty:
-                    continue
-
-        def empty(self) -> bool:
-            return self._q.empty()
-
-        def size(self) -> int:
-            return self._q.qsize()
-
-        def stop(self) -> None:
-            self._stop.set()
-
-        def is_stopped(self) -> bool:
-            return bool(self._stop.is_set())

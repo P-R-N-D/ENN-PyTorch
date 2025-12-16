@@ -384,7 +384,7 @@ class Sampler(_Sampler):
             pass
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
-        from ..functional.fx import Gradient as FxGradient
+        from ..functional.fused import Gradient as FxGradient
 
         s = int(start)
         e = int(end)
@@ -657,7 +657,7 @@ class Connector:
         **kwargs: Any,
     ) -> None:
         self.map_fn = map_fn
-        from ..api.templates import WorkerPolicy
+        from ..backend.system import WorkerPolicy
 
         wp = WorkerPolicy.autotune()
         wp.apply_torch_threads()
@@ -926,9 +926,9 @@ class BufferedLoader:
     def __iter__(self) -> Iterator[Any]:
         import traceback
 
-        from ..backend.system import Memory
+        from .collections import Buffer
 
-        buf = Memory.Buffer(max_batches=self._max_batches)
+        buf = Buffer(max_batches=self._max_batches)
         stop = threading.Event()
         SENTINEL = object()
 

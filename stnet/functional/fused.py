@@ -14,7 +14,7 @@ from torch import nn
 
 from ..backend.compat import patch_torch
 from ..backend.system import get_device
-from ..api.templates import Dataset
+from ..data.pipeline import Dataset
 
 patch_torch()
 
@@ -1181,7 +1181,7 @@ class Quantization:
         return (model, False, f"PTQ failed: {why}")
 
 
-class Fusion:
+class ModelPolicy:
     @staticmethod
     def negotiate(
         device: Optional[Union[torch.device, str]] = None,
@@ -1230,7 +1230,7 @@ class Fusion:
         Autocast.configure(model, metadata=metadata)
         meta = Autocast._metadata
         if meta is None:
-            ref = Fusion._peek_layer(model)
+            ref = ModelPolicy._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
             meta = Dataset.for_device(dev)
             Autocast.configure(model, metadata=meta)
@@ -1242,7 +1242,7 @@ class Fusion:
         dst: nn.Module,
         params_dtype: Optional[torch.dtype],
     ) -> None:
-        ref = Fusion._peek_layer(src)
+        ref = ModelPolicy._peek_layer(src)
         if ref is not None:
             with contextlib.suppress(Exception):
                 dst.to(device=ref.device)
@@ -1258,7 +1258,7 @@ class Fusion:
             state = src.state_dict()
         except (RuntimeError, AttributeError):
             return
-        ref = Fusion._peek_layer(dst)
+        ref = ModelPolicy._peek_layer(dst)
         device = ref.device if ref is not None else None
         converted = {}
         for key, value in state.items():
@@ -1294,8 +1294,8 @@ class Fusion:
             replacement = te_linear(**kwargs)
         except Exception:
             return None
-        Fusion._align_layers(module, replacement, params_dtype)
-        Fusion._clone_state(module, replacement, params_dtype)
+        ModelPolicy._align_layers(module, replacement, params_dtype)
+        ModelPolicy._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1317,9 +1317,9 @@ class Fusion:
             replacement = te_layer_norm(**kwargs)
         except Exception:
             return None
-        Fusion._align_layers(module, replacement, params_dtype)
+        ModelPolicy._align_layers(module, replacement, params_dtype)
         if module.elementwise_affine:
-            Fusion._clone_state(module, replacement, params_dtype)
+            ModelPolicy._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1343,8 +1343,8 @@ class Fusion:
             replacement = te_rms_norm(**kwargs)
         except Exception:
             return None
-        Fusion._align_layers(module, replacement, params_dtype)
-        Fusion._clone_state(module, replacement, params_dtype)
+        ModelPolicy._align_layers(module, replacement, params_dtype)
+        ModelPolicy._clone_state(module, replacement, params_dtype)
         return replacement
 
     @staticmethod
@@ -1369,9 +1369,9 @@ class Fusion:
                 replacement: Optional[nn.Module] = None
                 if apply_te_linear and isinstance(child, nn.Linear):
                     if filter_linear is None or filter_linear(child, name):
-                        replacement = Fusion._nvidia_linear(child, params_dtype, te)
+                        replacement = ModelPolicy._nvidia_linear(child, params_dtype, te)
                 elif apply_te_layer_norm and isinstance(child, nn.LayerNorm):
-                    replacement = Fusion._nvidia_layer_norm(child, params_dtype, te)
+                    replacement = ModelPolicy._nvidia_layer_norm(child, params_dtype, te)
                 else:
                     rms_cls = getattr(torch.nn, "RMSNorm", None)
                     if (
@@ -1379,7 +1379,7 @@ class Fusion:
                         and rms_cls is not None
                         and isinstance(child, rms_cls)
                     ):
-                        replacement = Fusion._nvidia_rms_norm(child, params_dtype, te)
+                        replacement = ModelPolicy._nvidia_rms_norm(child, params_dtype, te)
                 if replacement is not None:
                     setattr(parent, name, replacement)
                     converted += 1
@@ -1427,8 +1427,8 @@ class Fusion:
         fp8_ok, why = Dataset.is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = Fusion.negotiate(dev, metadata=metadata)
-        model, n_layers = Fusion._to_nvidia_layers(
+        params_dtype = ModelPolicy.negotiate(dev, metadata=metadata)
+        model, n_layers = ModelPolicy._to_nvidia_layers(
             model,
             apply_te_linear=True,
             apply_te_layer_norm=True,
@@ -1437,7 +1437,7 @@ class Fusion:
             params_dtype=params_dtype,
         )
         try:
-            model, attn_swapped = Fusion._to_nvidia_attention(
+            model, attn_swapped = ModelPolicy._to_nvidia_attention(
                 model, params_dtype=params_dtype
             )
         except Exception:
@@ -1460,7 +1460,7 @@ class Fusion:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped_model, n = Fusion._to_nvidia_layers(
+            swapped_model, n = ModelPolicy._to_nvidia_layers(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1502,7 +1502,7 @@ class Fusion:
         logger: Optional[Callable[[str], None]],
     ) -> Tuple[nn.Module, bool, str]:
         try:
-            swapped, n = Fusion._to_nvidia_layers(
+            swapped, n = ModelPolicy._to_nvidia_layers(
                 model,
                 apply_te_linear=True,
                 apply_te_layer_norm=True,
@@ -1569,7 +1569,7 @@ class Fusion:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._coerce_metadata(model, metadata)
+        meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
@@ -1585,15 +1585,15 @@ class Fusion:
                 )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Fusion.negotiate(device, metadata=meta)
+        params_dtype = ModelPolicy.negotiate(device, metadata=meta)
 
         for backend in ("te", "torchao"):
             if backend == "te":
-                m2, ok2, why = Fusion._enable_nvidia_training(
+                m2, ok2, why = ModelPolicy._enable_nvidia_training(
                     model, params_dtype, logger
                 )
             else:
-                m2, ok2, why = Fusion._enable_torchao_training(model, logger)
+                m2, ok2, why = ModelPolicy._enable_torchao_training(model, logger)
             if ok2:
                 _log_info(logger, f"[FP8] training enabled via {why} ({reason})")
                 Autocast.configure(m2, metadata=meta)
@@ -1609,7 +1609,7 @@ class Fusion:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._coerce_metadata(model, metadata)
+        meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         ok, reason = Dataset.is_float8_supported(device)
         if not ok:
@@ -1625,7 +1625,7 @@ class Fusion:
                 )
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
-        params_dtype = Fusion.negotiate(device, metadata=meta)
+        params_dtype = ModelPolicy.negotiate(device, metadata=meta)
         dynamic_activations = not (
             getattr(meta, "has_scale", False)
             and getattr(meta, "scale_is_integral", None) is True
@@ -1633,13 +1633,13 @@ class Fusion:
         order = ("te_swap", "te_present", "ao")
         for step in order:
             if step == "te_swap":
-                m2, ok2, why = Fusion._enable_nvidia_inference(
+                m2, ok2, why = ModelPolicy._enable_nvidia_inference(
                     model, params_dtype, logger
                 )
             elif step == "te_present":
-                m2, ok2, why = Fusion._reuse_nvidia_layers(model, logger)
+                m2, ok2, why = ModelPolicy._reuse_nvidia_layers(model, logger)
             else:
-                m2, ok2, why = Fusion._enable_torchao_inference(
+                m2, ok2, why = ModelPolicy._enable_torchao_inference(
                     model, dynamic_activations, logger
                 )
             if ok2:
@@ -1657,7 +1657,7 @@ class Fusion:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._coerce_metadata(model, metadata)
+        meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
@@ -1681,7 +1681,7 @@ class Fusion:
         metadata: Optional[Dataset[Any]] = None,
         logger: Optional[Callable[[str], None]] = None,
     ) -> Tuple[nn.Module, bool, str]:
-        meta = Fusion._coerce_metadata(model, metadata)
+        meta = ModelPolicy._coerce_metadata(model, metadata)
         device = torch.device(meta.device)
         with contextlib.suppress(Exception):
             model.to(device)
