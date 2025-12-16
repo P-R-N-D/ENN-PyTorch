@@ -347,7 +347,7 @@ def torch_compile_safe(
 ) -> None:
     if layers_module is None:
         with suppress(Exception):
-            layers_module = importlib.import_module("stnet.model.layers")
+            layers_module = importlib.import_module("stnet.model.nn")
     if layers_module is not None:
         torch_disable_compile(
             getattr(layers_module, "Normal", None),

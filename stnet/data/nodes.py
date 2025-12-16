@@ -384,7 +384,7 @@ class Sampler(_Sampler):
             pass
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
-        from ..functional.fused import Gradient as FxGradient
+        from ..model.fused import Gradient as FxGradient
 
         s = int(start)
         e = int(end)

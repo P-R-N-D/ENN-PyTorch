@@ -29,7 +29,7 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
                                                      get_model_state_dict,
                                                      set_model_state_dict)
 
-from ..model.layers import Model, resize_scaler_buffer
+from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config
 
 
@@ -144,12 +144,12 @@ def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "_Model__config", None)
+    cfg_obj = getattr(model, "_Root__config", None)
     if cfg_obj is None:
         cfg_obj = getattr(model, "__stnet_instance_config__", None)
     if cfg_obj is None:
         for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Model__config", None)
+            cfg_obj = getattr(submodule, "_Root__config", None)
             if cfg_obj is not None:
                 break
     candidate: ModelConfig | Dict[str, Any] | None
@@ -173,7 +173,7 @@ def new_model(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> nn.Module:
     cfg = coerce_model_config(config)
-    core = Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     return core
 
 
