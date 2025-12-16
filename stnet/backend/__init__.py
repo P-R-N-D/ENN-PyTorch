@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from types import ModuleType
 
-from . import compat, distributed, profiler, system
+from . import compat, distributed, system
 
 __all__ = [
     "compat",
     "distributed",
-    "profiler",
     "system",
     "export",
     "runtime",

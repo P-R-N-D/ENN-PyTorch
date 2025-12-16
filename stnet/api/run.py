@@ -37,7 +37,7 @@ from ..backend.system import (
 )
 from ..data.pipeline import Dataset
 from ..data.nodes import preload_memmap
-from ..model.layers import History, Model
+from ..model.nn import History, Root
 from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
 
@@ -142,7 +142,7 @@ def _seed_everything(seed_value: Optional[int]) -> None:
 
 
 def train(
-    model: Model,
+    model: Root,
     data: (
         Dict[Tuple, torch.Tensor]
         | Sequence[Dict[Tuple, torch.Tensor]]
@@ -166,7 +166,7 @@ def train(
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
-) -> Model:
+) -> Root:
     _reset_process_group()
     try:
         val_frac = float(val_frac)
@@ -516,7 +516,7 @@ def train(
         _wp = WorkerPolicy.autotune()
         _wp.apply_torch_threads()
         nprocs = int(_wp.nproc_per_node)
-        cfg_obj = getattr(model, "_Model__config", None)
+        cfg_obj = getattr(model, "_Root__config", None)
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
         else:
@@ -778,7 +778,7 @@ def train(
 
 
 def predict(
-    model: Model,
+    model: Root,
     data: Dict[Tuple, torch.Tensor],
     *args: Any,
     seed: int = 7,
@@ -809,7 +809,7 @@ def predict(
         {k: v.detach().cpu() for k, v in model.state_dict().items()},
         os.path.join(dcp_dir, "model.pt"),
     )
-    cfg_obj = getattr(model, "_Model__config", None)
+    cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
     else:
@@ -1394,7 +1394,7 @@ def get_prediction(
     num_chunks = int(manifest.get("num_chunks", 0) or 0)
     flat = _load_legacy_flat(chunk_root, num_chunks=num_chunks, out_shape=out_shape)
 
-    pred_tensor = Model.unflatten_y(flat, out_shape)
+    pred_tensor = Root.unflatten_y(flat, out_shape)
     out_legacy: Dict[Tuple[Any, ...], torch.Tensor] = {}
     for i, k in enumerate(key_seq):
         if i >= int(pred_tensor.shape[0]):

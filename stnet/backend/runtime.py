@@ -51,21 +51,21 @@ from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.collections import Cache, Pool
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.pipeline import Dataset
-from ..functional import fused
-from ..functional.fused import Autocast, Gradient
+from ..model import fused
+from ..model.fused import Autocast, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
                                  LinearCombinationLoss, LossWeightController,
                                  StandardNormalLoss, StudentsTLoss, TiledLoss)
 from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                      stochastic_weight_average)
-from ..model import layers
+from ..model.nn import History, Root, resize_scaler_buffer
 from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
                      torch_compile_safe, torch_no_compile,
                      torch_safe_distributed)
 from .distributed import (distributed_barrier, distributed_sync,
                           get_world_size, is_distributed, joining, no_sync,
                           to_ddp, to_fsdp)
-from .profiler import FlopCounter
+from ..functional.profiler import FlopCounter
 from .system import (Memory, get_device, get_tlb, initialize_python_path,
                      new_dir, posix_time, set_float32_precision)
 
@@ -508,7 +508,7 @@ def _expand(sources: Any) -> Any:
 
 
 def _calibrate_per_sample_mem(
-    model: layers.Model,
+    model: Root,
     device: torch.device,
     ops: RuntimeConfig,
     dataset: Optional[Dataset] = None,
@@ -626,8 +626,8 @@ def _calibrate_per_sample_mem(
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
         try:
-            from ..functional.fused import Autocast
-            from ..functional.fused import Gradient
+            from ..model.fused import Autocast
+            from ..model.fused import Gradient
             from tensordict import TensorDictBase
 
             feats, labels, *_rest = meta.preprocess(batch)
@@ -1030,7 +1030,7 @@ def update_tqdm(
 
 
 def epochs(
-    model: layers.Model,
+    model: Root,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -1469,22 +1469,22 @@ def epochs(
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
     model_for_hist = model.module if hasattr(model, "module") else model
-    hist: Optional[layers.History] = None
+    hist: Optional[History] = None
     maybe_hist = getattr(model_for_hist, "logger", None)
-    if isinstance(maybe_hist, layers.History):
+    if isinstance(maybe_hist, History):
         hist = maybe_hist
     if hist is None:
         maybe_hist = getattr(model_for_hist, "history", None)
-        if isinstance(maybe_hist, layers.History):
+        if isinstance(maybe_hist, History):
             hist = maybe_hist
     if hist is None:
-        hist = layers.History()
+        hist = History()
         try:
             setattr(model_for_hist, "logger", hist)
         except Exception:
             pass
 
-    if isinstance(hist, layers.History):
+    if isinstance(hist, History):
         start_ns = posix_time("Asia/Seoul")
         start_sec = round(float(start_ns) / 1e9, 6)
         hist.start_session(start_sec)
@@ -2107,7 +2107,7 @@ def epochs(
                                     tflops=tflops_cur,
                                 )
                                 train_accum_since_last = 0
-                            if isinstance(hist, layers.History):
+                            if isinstance(hist, History):
                                 try:
                                     if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
                                         hist.record_batch(X, Y)
@@ -2634,7 +2634,7 @@ def epochs(
             else:
                 if util_fallback > 0.80:
                     time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
-        if isinstance(hist, layers.History):
+        if isinstance(hist, History):
             try:
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
                 world = max(1, get_world_size(device)) if is_distributed() else 1
@@ -2674,7 +2674,7 @@ def epochs(
 
 
 def infer(
-    model: layers.Model,
+    model: Root,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -2956,7 +2956,7 @@ def infer(
     return None
 
 
-def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
+def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     from ..data.pipeline import Session
 
     if not args:
@@ -2992,12 +2992,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = layers.Model(ops.in_dim, ops.out_shape, config=cfg)
+        model = Root(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
                 cpu_state = torch.load(fallback_init, map_location="cpu")
-                layers.resize_scaler_buffer(model, cpu_state)
+                resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 m_sd = get_model_state_dict(
@@ -3011,7 +3011,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.init_ckpt_dir),
                 )
-                layers.resize_scaler_buffer(model, m_sd)
+                resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
@@ -3477,12 +3477,12 @@ def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
-        model = layers.Model(ops.in_dim, ops.out_shape, config=cfg)
+        model = Root(ops.in_dim, ops.out_shape, config=cfg)
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
                 cpu_state = torch.load(fallback_model, map_location="cpu")
-                layers.resize_scaler_buffer(model, cpu_state)
+                resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
                 m_sd = get_model_state_dict(
@@ -3496,7 +3496,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[layers.Model]:
                     state_dict={"model": m_sd},
                     storage_reader=FileSystemReader(ops.model_ckpt_dir),
                 )
-                layers.resize_scaler_buffer(model, m_sd)
+                resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )

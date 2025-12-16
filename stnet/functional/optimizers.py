@@ -13,7 +13,7 @@ from torch import nn, optim
 
 from ..backend.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-from .fused import ModelPolicy, Autocast, is_scale_safe
+from ..model.fused import Autocast, ModelPolicy, is_scale_safe
 
 try:
     from torch.optim.swa_utils import SWALR
