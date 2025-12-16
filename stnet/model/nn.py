@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import contextlib
-import os
 import math
+import os
 import weakref
+from collections.abc import Iterator
 from typing import (
-    TYPE_CHECKING,
     Any,
     Dict,
-    Iterator,
     List,
     Mapping,
     Optional,
@@ -22,14 +21,12 @@ from typing import (
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from tensordict import TensorDictBase
-from torch.utils.checkpoint import checkpoint as _checkpoint
 
+from ..api.config import ModelConfig
 from ..backend.compat import torch_no_compile
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
-from .kernels import MultiHeadAttention
 from .layers import (
     CrossAttention,
     DilatedAttention,
@@ -94,14 +91,81 @@ def _serialize_z_index(
     invperm.scatter_(1, perm, scatter_src)
     return perm, invperm
 
-def _block_ranges(N: int, patch: int) -> "Iterator[tuple[int, int]]":
+def _block_ranges(N: int, patch: int) -> Iterator[tuple[int, int]]:
     for s in range(0, N, patch):
         e = min(s + patch, N)
         yield s, e
 
-                                
-                           
-                                
+
+def _materialize_layernorm_(ln: nn.Module, ref: torch.Tensor) -> None:
+    if not isinstance(ln, nn.LayerNorm):
+        return
+
+    dev = ref.device
+    target_dtype = (
+        torch.float32
+        if (
+            dev.type == "cpu"
+            and ref.is_floating_point()
+            and ref.dtype in (torch.float16, torch.bfloat16)
+        )
+        else ref.dtype
+    )
+
+    w = getattr(ln, "weight", None)
+    if isinstance(w, torch.Tensor) and is_meta_or_fake_tensor(w):
+        ln.weight = nn.Parameter(
+            torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
+        )
+
+    b = getattr(ln, "bias", None)
+    if isinstance(b, torch.Tensor) and is_meta_or_fake_tensor(b):
+        ln.bias = nn.Parameter(
+            torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
+        )
+
+
+def _apply_norm_fp16_safe(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    if is_meta_or_fake_tensor(x):
+        raise RuntimeError("meta/fake tensor reached normalization")
+
+    x_in = x
+    cast_back = False
+    if (
+        x_in.device.type == "cpu"
+        and x_in.is_floating_point()
+        and x_in.dtype in (torch.float16, torch.bfloat16)
+    ):
+        x_in = x_in.float()
+        cast_back = True
+
+    y = norm(x_in)
+    if is_meta_or_fake_tensor(y):
+        raise RuntimeError("meta/fake tensor produced by normalization")
+
+    if cast_back:
+        y = y.to(dtype=x.dtype)
+    return y
+
+
+def _graph_break() -> None:
+    with contextlib.suppress(Exception):
+        try:
+            import torch._inductor as _inductor
+
+            gb = getattr(_inductor, "graph_break", None)
+            if callable(gb):
+                gb()
+                return
+        except Exception:
+            pass
+        try:
+            import torch._dynamo as _dynamo
+
+            _dynamo.graph_break()
+        except Exception:
+            pass
+
 class PointTransformer(nn.Module):
 
     def __init__(
@@ -129,7 +193,6 @@ class PointTransformer(nn.Module):
         from .activations import SwiGLU
 
         self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
-        self._ln_materialized = False
 
     def forward(
         self,
@@ -140,100 +203,38 @@ class PointTransformer(nn.Module):
         if is_meta_or_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
         if is_meta_or_fake_tensor(coords):
-            raise RuntimeError("meta/fake tensor reached PointTransformer.forward")
+            raise RuntimeError("meta/fake tensor reached PointTransformer.forward (coords)")
         if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
             raise ValueError(
                 f"coords must be (B, N, {self.coord_dim}), got {tuple(coords.shape)} vs x {tuple(x.shape)}"
             )
+        N = x.shape[1]
         x = x.contiguous()
         coords = coords.contiguous()
         if attn_mask is not None:
             attn_mask = attn_mask.contiguous()
             if is_meta_or_fake_tensor(attn_mask):
-                raise RuntimeError("attn_mask is meta before attention")
-            if attn_mask.dim() == 4:
-                Bm, Hm, Nm1, Nm2 = attn_mask.shape
-                if Bm != B or Nm1 != N or Nm2 != N:
-                    raise ValueError(
-                        f"attn_mask shape {tuple(attn_mask.shape)} incompatible with (B={B},H=?,N={N})"
-                    )
-                if Hm not in (1, self.nhead):
-                    raise ValueError(
-                        f"per-head attn_mask H dimension {Hm} must be 1 or match nhead={self.nhead}"
-                    )
-
-        def _materialize_ln_(ln: nn.LayerNorm, ref: torch.Tensor) -> None:
-            if not isinstance(ln, nn.LayerNorm):
-                return
-            dev = ref.device
-            target_dtype = (
-                torch.float32
-                if (
-                    dev.type == "cpu"
-                    and ref.is_floating_point()
-                    and ref.dtype in (torch.float16, torch.bfloat16)
+                raise RuntimeError("attn_mask is meta/fake before attention")
+            if attn_mask.dim() == 0:
+                pass
+            elif attn_mask.dim() < 2:
+                raise ValueError(
+                    f"attn_mask must have rank 0 or >=2; got rank {attn_mask.dim()}"
                 )
-                else ref.dtype
-            )
-            w = getattr(ln, "weight", None)
-            b = getattr(ln, "bias", None)
-            w_data = getattr(w, "data", None)
-            if isinstance(w, torch.Tensor) and (
-                is_meta_or_fake_tensor(w)
-            ):
-                ln.weight = nn.Parameter(
-                    torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
-                )
-            b_data = getattr(b, "data", None)
-            if isinstance(b, torch.Tensor) and (
-                is_meta_or_fake_tensor(b)
-            ):
-                ln.bias = nn.Parameter(
-                    torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
+            elif attn_mask.shape[-2:] != (N, N):
+                raise ValueError(
+                    f"attn_mask trailing dims {tuple(attn_mask.shape[-2:])} must match (N={N}, N={N})"
                 )
 
-        _materialize_ln_(self.norm1, x)
-        _materialize_ln_(self.norm2, x)
-        self._ln_materialized = True
-        _x = x
-        if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
-            raise RuntimeError("x is meta before LayerNorm")
-        if (
-            _x.device.type == "cpu"
-            and _x.is_floating_point()
-            and _x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            _x = _x.float()
-        _x = self.norm1(_x)
-        if isinstance(_x, torch.Tensor) and is_meta_or_fake_tensor(_x):
-            raise RuntimeError("x is meta after LayerNorm")
-        if (
-            _x.device.type == "cpu"
-            and x.is_floating_point()
-            and x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            _x = _x.to(x.dtype)
-        y = self.attn(_x, coords, attn_mask=attn_mask)
+        _materialize_layernorm_(self.norm1, x)
+        _materialize_layernorm_(self.norm2, x)
+
+        x1 = _apply_norm_fp16_safe(self.norm1, x)
+        y = self.attn(x1, coords, attn_mask=attn_mask)
         x = x + self.drop_path(self.dropout(y))
-        _x2 = x
-        if is_meta_or_fake_tensor(_x2):
-            raise RuntimeError("x is meta before LayerNorm(norm2)")
-        if (
-            _x2.device.type == "cpu"
-            and _x2.is_floating_point()
-            and _x2.dtype in (torch.float16, torch.bfloat16)
-        ):
-            _x2 = _x2.float()
-        _x2 = self.norm2(_x2)
-        if is_meta_or_fake_tensor(_x2):
-            raise RuntimeError("x is meta after LayerNorm(norm2)")
-        if (
-            _x2.device.type == "cpu"
-            and x.is_floating_point()
-            and x.dtype in (torch.float16, torch.bfloat16)
-        ):
-            _x2 = _x2.to(x.dtype)
-        x = x + self.drop_path(self.dropout(self.ffn(_x2)))
+
+        x2 = _apply_norm_fp16_safe(self.norm2, x)
+        x = x + self.drop_path(self.dropout(self.ffn(x2)))
         return x
 
 
@@ -563,42 +564,6 @@ class TemporalAxis(nn.Module):
             return x, next_state
         return x
 
-
-class CrossAttention(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        dropout: float = 0.0,
-        norm_type: str = "layernorm",
-        drop_path: float = 0.0,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.norm_q = norm_layer(norm_type, self.d_model)
-        self.norm_kv = norm_layer(norm_type, self.d_model)
-        self.attn = MultiHeadAttention(
-            embed_dim=self.d_model,
-            num_heads=self.nhead,
-            dropout=dropout,
-            batch_first=True,
-            bias=True,
-        )
-        self.out_proj = nn.Linear(self.d_model, self.d_model)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-
-    def forward(self, q_tokens: torch.Tensor, kv_tokens: torch.Tensor) -> torch.Tensor:
-        qn = self.norm_q(q_tokens)
-        kvn = self.norm_kv(kv_tokens)
-        ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
-        ctx = self.out_proj(ctx)
-        return q_tokens + self.drop_path(self.dropout(ctx))
-
-
 class CrossTransformer(nn.Module):
     def __init__(
         self,
@@ -650,34 +615,36 @@ class CrossTransformer(nn.Module):
             )
         if self._fixed_mode is not None:
             mode_l = _coerce_modeling_types(self._fixed_mode)
-            if mode_l == "ss":
-                return self.cross_s(spatial_tokens, temporal_tokens)
-            if mode_l == "tt":
-                return self.cross_t(temporal_tokens, spatial_tokens)
-            if mode_l == "ts":
-                s_context = self.cross_s(spatial_tokens, temporal_tokens)
-                t_context = self.cross_t(temporal_tokens, spatial_tokens)
-                base = torch.cat(
-                    [
-                        t_context,
-                        s_context.mean(dim=1, keepdim=True).expand_as(t_context),
-                    ],
-                    dim=-1,
-                )
-                fused = self.mix(self.mix_norm(base))
-                return t_context + self.drop_path(self.dropout(fused))
-            if mode_l == "st":
-                s_context = self.cross_s(spatial_tokens, temporal_tokens)
-                t_context = self.cross_t(temporal_tokens, spatial_tokens)
-                base = torch.cat(
-                    [
-                        s_context,
-                        t_context.mean(dim=1, keepdim=True).expand_as(s_context),
-                    ],
-                    dim=-1,
-                )
-                fused = self.mix(self.mix_norm(base))
-                return s_context + self.drop_path(self.dropout(fused))
+            match mode_l:
+                case "ss":
+                    return self.cross_s(spatial_tokens, temporal_tokens)
+                case "tt":
+                    return self.cross_t(temporal_tokens, spatial_tokens)
+                case "ts" | "st":
+                    s_context = self.cross_s(spatial_tokens, temporal_tokens)
+                    t_context = self.cross_t(temporal_tokens, spatial_tokens)
+                    if mode_l == "ts":
+                        base = torch.cat(
+                            [
+                                t_context,
+                                s_context.mean(dim=1, keepdim=True).expand_as(t_context),
+                            ],
+                            dim=-1,
+                        )
+                        fused = self.mix(self.mix_norm(base))
+                        return t_context + self.drop_path(self.dropout(fused))
+
+                    base = torch.cat(
+                        [
+                            s_context,
+                            t_context.mean(dim=1, keepdim=True).expand_as(s_context),
+                        ],
+                        dim=-1,
+                    )
+                    fused = self.mix(self.mix_norm(base))
+                    return s_context + self.drop_path(self.dropout(fused))
+                case _:
+                    raise RuntimeError(f"Unhandled modeling type: {mode_l}")
         requested = mode if mode is not None else "spatiotemporal"
         return self._forward_dynamically(spatial_tokens, temporal_tokens, requested)
 
@@ -688,36 +655,37 @@ class CrossTransformer(nn.Module):
         mode: str,
     ) -> torch.Tensor:
         mode_l = _coerce_modeling_types(mode)
-        if mode_l == "ss":
-            s_context = self.cross_s(spatial_tokens, temporal_tokens)
-            return s_context
-        if mode_l == "tt":
-            t_context = self.cross_t(temporal_tokens, spatial_tokens)
-            return t_context
-        s_context = self.cross_s(spatial_tokens, temporal_tokens)
-        t_context = self.cross_t(temporal_tokens, spatial_tokens)
+        match mode_l:
+            case "ss":
+                return self.cross_s(spatial_tokens, temporal_tokens)
+            case "tt":
+                return self.cross_t(temporal_tokens, spatial_tokens)
+            case "ts" | "st":
+                s_context = self.cross_s(spatial_tokens, temporal_tokens)
+                t_context = self.cross_t(temporal_tokens, spatial_tokens)
 
-        if mode_l == "ts":
-            base = torch.cat(
-                [
-                    t_context,
-                    s_context.mean(dim=1, keepdim=True).expand_as(t_context),
-                ],
-                dim=-1,
-            )
-            fused = self.mix(self.mix_norm(base))
-            return t_context + self.drop_path(self.dropout(fused))
-        if mode_l == "st":
-            base = torch.cat(
-                [
-                    s_context,
-                    t_context.mean(dim=1, keepdim=True).expand_as(s_context),
-                ],
-                dim=-1,
-            )
-            fused = self.mix(self.mix_norm(base))
-            return s_context + self.drop_path(self.dropout(fused))
-        raise RuntimeError(f"Unhandled mode: {mode_l}")
+                if mode_l == "ts":
+                    base = torch.cat(
+                        [
+                            t_context,
+                            s_context.mean(dim=1, keepdim=True).expand_as(t_context),
+                        ],
+                        dim=-1,
+                    )
+                    fused = self.mix(self.mix_norm(base))
+                    return t_context + self.drop_path(self.dropout(fused))
+
+                base = torch.cat(
+                    [
+                        s_context,
+                        t_context.mean(dim=1, keepdim=True).expand_as(s_context),
+                    ],
+                    dim=-1,
+                )
+                fused = self.mix(self.mix_norm(base))
+                return s_context + self.drop_path(self.dropout(fused))
+            case _:
+                raise RuntimeError(f"Unhandled mode: {mode_l}")
 
 
 def _auto_microbatch(
@@ -1108,15 +1076,17 @@ class Subcontext(nn.Module):
         if mode is None:
             raise RuntimeError("modeling_type is not set")
         mode_l = _coerce_modeling_types(mode)
-        if mode_l == "ss":
-            return spatial_out
-        if mode_l == "tt":
-            return temporal_out
-        if mode_l == "ts":
-            return self.perception(temporal_out, spatial_out, mode="ts")
-        if mode_l == "st":
-            return self.perception(spatial_out, temporal_out, mode="st")
-        raise RuntimeError(f"Unhandled modeling type '{mode_l}'")
+        match mode_l:
+            case "ss":
+                return spatial_out
+            case "tt":
+                return temporal_out
+            case "ts":
+                return self.perception(temporal_out, spatial_out, mode="ts")
+            case "st":
+                return self.perception(spatial_out, temporal_out, mode="st")
+            case _:
+                raise RuntimeError(f"Unhandled modeling type '{mode_l}'")
 
     def decode(
         self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
@@ -2213,15 +2183,16 @@ class Root(nn.Module):
             except Exception:
                 _did_unshard_processor = False
         try:
-            base_param = next(self.processor.parameters())
-            param_dtype = base_param.dtype
             requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
             if requested_base is not None:
                 base_dtype = requested_base
             else:
                 base_dtype = (torch.float32 if amp_enabled else amp_dtype)
             features = x_scaled.to(device=device, dtype=base_dtype)
-            assert features.ndim == 2 and features.shape[1] == self.in_dim
+            if features.ndim != 2 or features.shape[1] != self.in_dim:
+                raise ValueError(
+                    f"Expected features shaped (B, {self.in_dim}), got {tuple(features.shape)}"
+                )
             b = int(features.shape[0])
     
             if self._auto_microbatch_pending:
@@ -2240,24 +2211,6 @@ class Root(nn.Module):
                 self.processor.eval()
                 self.controller.eval()
 
-            def _graph_break() -> None:
-                with contextlib.suppress(Exception):
-                    try:
-                        import torch._inductor as _inductor
-    
-                        gb = getattr(_inductor, "graph_break", None)
-                        if callable(gb):
-                            gb()
-                            return
-                    except Exception:
-                        pass
-                    try:
-                        import torch._dynamo as _dynamo
-    
-                        _dynamo.graph_break()
-                    except Exception:
-                        pass
-    
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
@@ -2358,117 +2311,72 @@ class Root(nn.Module):
 
             refined_tokens: torch.Tensor
             residual_context: torch.Tensor
+            # --- Controller stage ---
+            _graph_break()
+            controller_ctx = (
+                Gradient.inference(self.controller) if infer_mode else torch.enable_grad()
+            )
+            with controller_ctx:
 
-            if infer_mode:
-                _graph_break()
-    
-                with Gradient.inference(self.controller):
-    
-                    def _infer_controller(chunk: torch.Tensor) -> torch.Tensor:
-                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                            out, _ = self.controller(chunk)
-                        return out
-    
-                    if ctrl_mb < int(b):
-                        refined_tokens = torch.cat(
-                            [_infer_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                            dim=0,
-                        )
-                    else:
-                        refined_tokens = _infer_controller(tokens_centered)
-    
-                refined_tokens = _sanitize(refined_tokens)
-                decode_tokens = refined_tokens.detach()
-    
-                _graph_break()
-    
-                with Gradient.inference(self.processor):
-    
-                    def _infer_decode(chunk: torch.Tensor) -> torch.Tensor:
-                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                            dc = getattr(self, "_decode_compiled", None)
-                            if dc is not None:
-                                if (
-                                    self._pad_compiled_microbatch
-                                    and chunk.dim() == 3
-                                    and chunk.shape[0] != ctrl_mb
-                                    and chunk.shape[0] < ctrl_mb
-                                ):
-                                    pad_n = int(ctrl_mb - chunk.shape[0])
-                                    pad = torch.zeros(
-                                        (pad_n, chunk.shape[1], chunk.shape[2]),
-                                        device=chunk.device,
-                                        dtype=chunk.dtype,
-                                    )
-                                    out = dc(torch.cat([chunk, pad], dim=0))
-                                    return out[: chunk.shape[0]]
-                                return dc(chunk)
-                            return self.processor.decode(chunk, apply_norm=True)
-    
-                    if ctrl_mb < int(b):
-                        residual_context = torch.cat(
-                            [_infer_decode(decode_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                            dim=0,
-                        )
-                    else:
-                        residual_context = _infer_decode(decode_tokens)
-    
-                residual_context = _sanitize(residual_context)
-            else:
-                with torch.enable_grad():
-                    _graph_break()
-    
-                    def _global_tokens(inp: torch.Tensor) -> torch.Tensor:
-                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                            out, _ = self.controller(inp)
-                        return out
-    
-                    def _run_controller(chunk: torch.Tensor) -> torch.Tensor:
-                        return _global_tokens(chunk)
-    
-                    if ctrl_mb < int(b):
-                        refined_tokens = torch.cat(
-                            [_run_controller(tokens_centered[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                            dim=0,
-                        )
-                    else:
-                        refined_tokens = _run_controller(tokens_centered)
-    
-                    refined_tokens = _sanitize(refined_tokens)
-    
-                    _graph_break()
-    
-                    def _decode_tokens(inp: torch.Tensor) -> torch.Tensor:
-                        with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                            dc = getattr(self, "_decode_compiled", None)
-                            if dc is not None:
-                                if (
-                                    self._pad_compiled_microbatch
-                                    and inp.dim() == 3
-                                    and inp.shape[0] != ctrl_mb
-                                    and inp.shape[0] < ctrl_mb
-                                ):
-                                    pad_n = int(ctrl_mb - inp.shape[0])
-                                    pad = torch.zeros(
-                                        (pad_n, inp.shape[1], inp.shape[2]),
-                                        device=inp.device,
-                                        dtype=inp.dtype,
-                                    )
-                                    out = dc(torch.cat([inp, pad], dim=0))
-                                    return out[: inp.shape[0]]
-                                return dc(inp)
-                            return self.processor.decode(inp, apply_norm=True)
+                def _run_controller_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                    with (
+                        Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
+                    ):
+                        out, _ = self.controller(chunk)
+                    return out
 
-                    if ctrl_mb < int(b):
-                        residual_context = torch.cat(
-                            [_decode_tokens(refined_tokens[s : s + ctrl_mb]) for s in range(0, int(b), ctrl_mb)],
-                            dim=0,
-                        )
-                    else:
-                        residual_context = _decode_tokens(refined_tokens)
-    
-                    residual_context = _sanitize(residual_context)
-    
+                if ctrl_mb < int(b):
+                    refined_tokens = torch.cat(
+                        [
+                            _run_controller_chunk(tokens_centered[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    refined_tokens = _run_controller_chunk(tokens_centered)
+
+            refined_tokens = _sanitize(refined_tokens)
+            tokens_for_decode = refined_tokens.detach() if infer_mode else refined_tokens
+
+            # --- Decode stage ---
+            _graph_break()
+            processor_ctx = (
+                Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
+            )
+            with processor_ctx:
+
+                def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
+                    with (
+                        Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
+                    ):
+                        dc = getattr(self, "_decode_compiled", None)
+                        if dc is not None:
+                            if (
+                                self._pad_compiled_microbatch
+                                and chunk.dim() == 3
+                                and chunk.shape[0] != ctrl_mb
+                                and chunk.shape[0] < ctrl_mb
+                            ):
+                                pad_n = int(ctrl_mb - chunk.shape[0])
+                                pad = chunk.new_zeros((pad_n, chunk.shape[1], chunk.shape[2]))
+                                out = dc(torch.cat([chunk, pad], dim=0))
+                                return out[: chunk.shape[0]]
+                            return dc(chunk)
+                        return self.processor.decode(chunk, apply_norm=True)
+
+                if ctrl_mb < int(b):
+                    residual_context = torch.cat(
+                        [
+                            _run_decode_chunk(tokens_for_decode[s : s + ctrl_mb])
+                            for s in range(0, int(b), ctrl_mb)
+                        ],
+                        dim=0,
+                    )
+                else:
+                    residual_context = _run_decode_chunk(tokens_for_decode)
+
+            residual_context = _sanitize(residual_context)
             residual = residual_context.reshape(b, -1)
             if residual.dtype != assembled.dtype:
                 residual = residual.to(dtype=assembled.dtype)

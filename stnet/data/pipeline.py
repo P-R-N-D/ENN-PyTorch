@@ -1640,18 +1640,53 @@ class Dataset(Generic[TExtra]):
                 labels = _pick(data, ("Y", "labels", "targets", "target"))
                 keys = _pick(data, ("row_ids", "keys")) or ()
             else:
-                values = list(data.values())
-                keys = list(data.keys())
+                items = list(data.items())
+                keys = [k for (k, _v) in items]
+                values = [_v for (_k, _v) in items]
+
                 if values and isinstance(values[0], (list, tuple)) and len(values[0]) >= 2:
                     feat_list = [_to_tensor(v[0], dtype=self.feature_dtype) for v in values]
                     label_list = [_to_tensor(v[1], dtype=self.label_float_dtype) for v in values]
                     features = torch.stack(feat_list) if feat_list else None
                     labels = torch.stack(label_list) if label_list else None
                 else:
-                    features = torch.stack(
-                        [_to_tensor(v, dtype=self.feature_dtype) for v in values]
-                    )
-                    labels = None
+                    parsed = False
+
+                    def _key_feature_size(obj: Any) -> Optional[int]:
+                        if isinstance(obj, torch.Tensor):
+                            if obj.ndim == 0:
+                                return 1
+                            try:
+                                return int(obj.numel())
+                            except Exception:
+                                return None
+                        if isinstance(obj, (tuple, list)):
+                            try:
+                                return int(len(obj))
+                            except Exception:
+                                return None
+                        return None
+
+                    if keys and values:
+                        ksize0 = _key_feature_size(keys[0])
+                        if ksize0 is not None and 1 < int(ksize0) <= 64:
+                            if all(_key_feature_size(k) == ksize0 for k in keys):
+                                try:
+                                    feat_list = [
+                                        _to_tensor(k, dtype=self.feature_dtype).reshape(-1) for k in keys
+                                    ]
+                                    label_list = [
+                                        _to_tensor(v, dtype=self.label_float_dtype) for v in values
+                                    ]
+                                    features = torch.stack(feat_list, dim=0) if feat_list else None
+                                    labels = torch.stack(label_list, dim=0) if label_list else None
+                                    parsed = features is not None and labels is not None
+                                except Exception:
+                                    parsed = False
+
+                    if not parsed:
+                        features = torch.stack([_to_tensor(v, dtype=self.feature_dtype) for v in values])
+                        labels = None
 
         if features is None:
             raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
