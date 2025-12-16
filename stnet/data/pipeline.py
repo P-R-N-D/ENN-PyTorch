@@ -942,17 +942,17 @@ def fetch(
         )
         train_length = sum(lengths) if lengths else None
 
-        else:
-            ds = dataset(sources, split="train", val_frac=float(val_frac))
-            allocated.add(ds)
-            if batch_size is None or int(batch_size) <= 0:
-                B_i, ms_i = _stream_batch(ds, _device_obj)
-                batch_size = max(1, int(B_i) if B_i > 0 else 1)
-                pf_depth_before = int(pf_depth)
-                if int(pf_depth) != int(pf_depth_before):
-                    batch_size = max(
-                        1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
-                    )
+    else:
+        ds = dataset(sources, split="train", val_frac=float(val_frac))
+        allocated.add(ds)
+        if batch_size is None or int(batch_size) <= 0:
+            B_i, ms_i = _stream_batch(ds, _device_obj)
+            batch_size = max(1, int(B_i) if B_i > 0 else 1)
+            pf_depth_before = int(pf_depth)
+            if int(pf_depth) != int(pf_depth_before):
+                batch_size = max(
+                    1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
+                )
         sampler_node = ds.compose(
             batch_size=int(batch_size),
             shuffle=True,
