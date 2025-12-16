@@ -1095,7 +1095,6 @@ def epochs(
                 nonlocal batch_dim, bytes_per_sample
                 if not isinstance(t, torch.Tensor) or t.numel() <= 0:
                     return
-                # infer batch dimension
                 b = int(t.shape[0]) if t.ndim >= 1 else 1
                 if batch_dim is None:
                     batch_dim = b
@@ -1123,7 +1122,6 @@ def epochs(
 
             walk(obj)
 
-            # If we didn't see any tensors, signal failure.
             if bytes_per_sample <= 0:
                 return None, 0
             return batch_dim, bytes_per_sample
@@ -1134,7 +1132,6 @@ def epochs(
 
             bs, bytes_ps = _accumulate_sample_bytes(sample)
 
-            # Infer per_batch if still unknown
             if (per_batch is None or int(per_batch) <= 0) and bs is not None and bs > 0:
                 per_batch = int(bs)
 
@@ -1158,16 +1155,8 @@ def epochs(
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
     max_grad_accum = fixed_accum
-
-
     dev_margin = 0.8
     host_margin = 0.8
-
-    # When budgets are not explicitly set, we derive a conservative per-run budget
-    # from the observed per-sample bytes and the minimum accumulation requirement.
-    # This avoids hard-coding fixed caps like 8/16GB while still preventing
-    # "data eats all RAM/VRAM" behaviors on very large systems.
-    # Soft slack for auto-derived budgets (only used when budgets are unset).
     budget_slack = 1.25
     with contextlib.suppress(Exception):
         v = os.environ.get("STNET_BUDGET_SLACK")
@@ -1232,7 +1221,6 @@ def epochs(
     host_budget_max_bytes = (
         None if host_budget_max_bytes is None else max(0, int(host_budget_max_bytes))
     )
-    # Treat 0 (or less) as "unset/disabled" for max-bytes, to avoid confusing states.
     if dev_budget_max_bytes is not None and int(dev_budget_max_bytes) <= 0:
         dev_budget_max_bytes = None
     if host_budget_max_bytes is not None and int(host_budget_max_bytes) <= 0:
@@ -1285,36 +1273,22 @@ def epochs(
                 host_total = Memory.total()
                 if host_total is not None and host_total > 0:
                     safe_host_total = int(host_total)
-
             safe_dev_bytes, safe_dev_total = _device_mem_get_info(device)
-
-            # If budgets were not explicitly configured, derive a conservative cap
-            # based on "data bytes we need to not starve" (per-batch * min-accum),
-            # scaled by a small slack factor to tolerate variability.
-            #
-            # NOTE: In this codebase, est_bytes_per_sample is derived from input
-            # tensors (data size), not model/optimizer state.
             if tpl.device_budget_max_bytes is None or tpl.host_budget_max_bytes is None:
                 try:
-                    # Minimum total samples we must support to satisfy min_grad_accum.
                     target_total_samples = max(1, int(per_batch or 1)) * max(
                         1, int(min_grad_accum)
                     )
-
                     new_dev_cap: Optional[int] = tpl.device_budget_max_bytes
                     new_host_cap: Optional[int] = tpl.host_budget_max_bytes
-
-                    # Device budget: cap data bytes on device.
                     if new_dev_cap is None and int(tpl.sample_bytes or 0) > 0:
                         base_dev = int(tpl.sample_bytes) * int(target_total_samples)
                         cap_dev = int(float(base_dev) * float(budget_slack))
-                        # Never exceed known total if available.
                         if safe_dev_total is not None and int(safe_dev_total) > 0:
                             cap_dev = min(int(cap_dev), int(safe_dev_total))
                         cap_dev = max(0, int(cap_dev))
                         new_dev_cap = None if cap_dev <= 0 else cap_dev
 
-                    # Host budget: cap data bytes staged in host inflight queues.
                     if new_host_cap is None and int(tpl.host_sample_bytes or 0) > 0:
                         inflight = int(tpl.host_inflight_batches_per_proc())
                         lw = max(1, int(getattr(tpl, "local_world_size", 1) or 1))
@@ -1327,29 +1301,13 @@ def epochs(
                         cap_host = max(0, int(cap_host))
                         new_host_cap = None if cap_host <= 0 else cap_host
 
-                    # Rebuild tpl via dataclasses.replace to avoid bypassing dataclass invariants.
                     if (new_dev_cap != tpl.device_budget_max_bytes) or (new_host_cap != tpl.host_budget_max_bytes):
                         tpl = dataclasses.replace(
                             tpl,
                             device_budget_max_bytes=new_dev_cap,
                             host_budget_max_bytes=new_host_cap,
                         )
-                        with contextlib.suppress(Exception):
-                            _LOGGER.info(
-                                "[epochs] auto-derived budgets: dev_max=%s host_max=%s slack=%.3f "
-                                "(sample=%s host_sample=%s per_batch=%s min_accum=%s inflight=%s lws=%s)",
-                                str(new_dev_cap),
-                                str(new_host_cap),
-                                float(budget_slack),
-                                str(getattr(tpl, "sample_bytes", None)),
-                                str(getattr(tpl, "host_sample_bytes", None)),
-                                str(per_batch),
-                                str(min_grad_accum),
-                                str(getattr(tpl, "host_inflight_batches_per_proc", lambda: None)()),
-                                str(getattr(tpl, "local_world_size", None)),
-                            )
                 except Exception:
-                    # If derivation fails, keep budgets unset (margin-only behavior).
                     pass
 
             if safe_host_bytes is not None or safe_dev_bytes is not None:
@@ -1784,7 +1742,6 @@ def epochs(
                 lw_bottom_sum: Optional[torch.Tensor] = None
                 lw_count: int = 0
                 for step_idx, _raw in enumerate(train_loader):
-                    # 배치 하나당 1번만 증가
                     train_accum_since_last += 1
                     while True:
                         try:
@@ -2118,7 +2075,6 @@ def epochs(
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
 
-                            # Successful processing of this batch; exit retry loop
                             break
 
                         except RuntimeError as e:
@@ -2138,8 +2094,6 @@ def epochs(
                                         if callable(empty_cache):
                                             empty_cache()
 
-                                # 이 배치에서 중간까지 쌓인 gradient는 버리고,
-                                # 줄인 설정으로 완전히 처음부터 다시 계산한다.
                                 with contextlib.suppress(Exception):
                                     optimizer.zero_grad(set_to_none=True)
 
@@ -2683,20 +2637,6 @@ def infer(
     chunk_dir: Optional[str] = None,
     dataset: Optional[Dataset] = None,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
-    """Run inference and stream per-rank prediction chunks.
-
-    Each worker rank writes *two* files per chunk:
-      - part-r{rank:05d}-c{chunk:06d}-rows.pt : int64 row indices
-      - part-r{rank:05d}-c{chunk:06d}-pred.pt : prediction tensor
-
-    Rank 0 emits a manifest.json enumerating all parts.
-
-    Notes
-    -----
-    - The row indices correspond to the memmap row ordering (i.e. the order of the
-      keys list in stnet.api.run.predict()).
-    - This avoids gathering large prediction tensors through the process group.
-    """
 
     import gc
     import glob
@@ -2712,37 +2652,28 @@ def infer(
             raise RuntimeError("infer: ckpt_dir is required when chunk_dir is not provided")
         chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks")
 
-    # Rank/world_size helpers (avoid missing get_rank() import).
     rank = torch.distributed.get_rank() if is_distributed() else 0
     world_size = get_world_size(device) if is_distributed() else 1
 
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
     distributed_barrier(device)
-
-    # Fixed queue depth for prediction output (backend-independent).
-    # Avoid keyword mismatch across implementations.
     cache = Cache(chunk_dir, max_queue=4)
 
-    # Chunking strategy: limit buffered rows in memory.
-    # Users can override via STNET_PRED_CHUNK_ROWS.
     try:
         target_rows = int(os.environ.get("STNET_PRED_CHUNK_ROWS", "0") or 0)
     except Exception:
         target_rows = 0
 
     if target_rows <= 0:
-        # Derive a reasonable default from the expected output shape.
         out_shape = tuple(int(x) for x in (ops.out_shape or ()))
         out_numel = 1
         for d in out_shape:
             out_numel *= max(1, int(d))
-        # Assume float32 unless proven otherwise; we clamp to avoid extremes.
         est_row_bytes = max(1, out_numel * 4)
         target_bytes = int(os.environ.get("STNET_PRED_CHUNK_BYTES", str(64 * 1024 * 1024)))
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
 
-    # Wrap model for distributed inference.
     run_model = to_ddp(model, device=device)
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
@@ -2763,7 +2694,6 @@ def infer(
     pending_count = 0
     chunk_idx = 0
     row_cursor = 0
-
     first_tail: Optional[Tuple[int, ...]] = None
     variable_shape = False
 
@@ -2774,32 +2704,26 @@ def infer(
 
         rows = torch.cat(pending_rows, dim=0).to(dtype=torch.int64, copy=False).contiguous()
         preds = torch.cat(pending_preds, dim=0).contiguous()
-
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
         pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
-
         cache.submit(rows, path=rows_path)
         cache.submit(preds, path=pred_path)
-
         chunk_idx += 1
         pending_rows.clear()
         pending_preds.clear()
         pending_count = 0
 
-        # Aggressive (but safe) host cleanup.
+
         del rows, preds
         gc.collect()
 
     try:
-        # Keep mixed precision behavior consistent with the rest of runtime.
         with Gradient.inference(run_model), Autocast.float(device):
             for batch in data_loader:
                 if batch is None:
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
-
-                # Preserve stable sample row indices for reconstruction on the driver.
                 row_ids: Optional[torch.Tensor] = None
                 try:
                     if isinstance(batch, TensorDictBase):
@@ -2810,14 +2734,12 @@ def infer(
                     row_ids = None
 
                 X, _Y = dataset.batch_to_device(batch, device=device, non_blocking=True)
-
                 bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
                 if bs <= 0:
                     if status_bar is not None:
                         status_bar.update(1)
                     continue
 
-                # row_ids are REQUIRED for correct reconstruction on the driver.
                 if row_ids is None:
                     row_ids = torch.arange(
                         row_cursor, row_cursor + bs, dtype=torch.int64
@@ -2833,7 +2755,6 @@ def infer(
                 if row_ids.device.type != "cpu":
                     row_ids = row_ids.to(device="cpu")
 
-                # Heuristic microbatch support.
                 mb = int(getattr(model, "microbatch", 0) or 0)
                 if mb <= 0:
                     mb = bs
@@ -2846,10 +2767,8 @@ def infer(
 
                     Xi = X[sl]
                     rows_i = row_ids[sl]
-
                     tdp = to_tensordict({"features": Xi}, device=device)
 
-                    # Forward (retry on OOM by shrinking microbatch).
                     try:
                         out = run_model(tdp, calibrate_output=True)
                     except RuntimeError as e:
@@ -2865,14 +2784,12 @@ def infer(
                                 setattr(model, "microbatch", mb)
                             except Exception:
                                 pass
-                            # Ensure we release intermediate tensors before retry.
                             with contextlib.suppress(Exception):
                                 del Xi, tdp
                             gc.collect()
-                            continue  # retry same start with smaller mb
+                            continue  
                         raise
 
-                    # Extract predictions.
                     y_hat: Optional[torch.Tensor] = None
                     if isinstance(out, TensorDictBase):
                         y_hat = out.get("pred", None)
@@ -2882,15 +2799,12 @@ def infer(
                         raise RuntimeError("infer: model output missing 'pred'")
 
                     y_hat = y_hat.detach()
-
-                    # Track shape stability.
                     tail = tuple(int(x) for x in y_hat.shape[1:])
                     if first_tail is None:
                         first_tail = tail
                     elif tail != first_tail:
                         variable_shape = True
 
-                    # Persist on host.
                     y_cpu = y_hat.to(device="cpu")
                     rows_cpu = (rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")).to(dtype=torch.int64)
 
@@ -2901,7 +2815,6 @@ def infer(
                     if pending_count >= target_rows:
                         _flush()
 
-                    # Release per-step tensors aggressively.
                     del Xi, rows_i, tdp, out, y_hat, y_cpu, rows_cpu
                     start = end
 
@@ -2911,10 +2824,8 @@ def infer(
                 del X, _Y, batch, row_ids
 
     finally:
-        # Flush remaining chunks and finish background writers.
         _flush()
         cache.close()
-        # Writer error propagation (don't clobber an existing exception).
         exc_type, _, _ = sys.exc_info()
         if exc_type is None:
             with contextlib.suppress(Exception):
@@ -2925,7 +2836,6 @@ def infer(
 
         distributed_barrier(device)
 
-        # Rank 0 writes a manifest for the driver.
         if rank == 0:
             parts: list[dict[str, str]] = []
             for rows_path in sorted(glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))):
