@@ -941,7 +941,6 @@ def fetch(
             weights=train_weights,
         )
         train_length = sum(lengths) if lengths else None
-
     else:
         ds = dataset(sources, split="train", val_frac=float(val_frac))
         allocated.add(ds)
