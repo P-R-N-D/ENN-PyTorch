@@ -874,15 +874,58 @@ class Thread:
                 ),
             )
             self._io_workers = tuned_workers
+            def _read_int_env(keys, default):
+                for k in keys:
+                    with contextlib.suppress(Exception):
+                        v = os.environ.get(k)
+                        if v is not None and str(v).strip():
+                            return int(v)
+                return int(default)
+
+            cap_mult = 2
+            with contextlib.suppress(Exception):
+                v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
+                if v is None:
+                    v = os.environ.get("STNET_THREADS_CAP_MULTIPLIER")
+                if v is not None and str(v).strip():
+                    cap_mult = int(v)
+            cap_mult = max(1, min(8, int(cap_mult)))
+            node_thread_cap = max(2, int(cpus) * int(cap_mult))
+
+            local_world = max(
+                1,
+                _read_int_env(
+                    ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
+                    1,
+                ),
+            )
+            distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
+            thread_cap = int(node_thread_cap)
+            if distribute and local_world > 1:
+                thread_cap = max(2, int(node_thread_cap) // int(local_world))
+
             try:
                 intra = int(torch.get_num_threads())
             except Exception:
                 intra = cpus
-            if intra * tuned_workers > cpus:
-                new_intra = max(1, cpus // tuned_workers)
-                self.optimize_threads(intra=new_intra)
+
             want_inter = max(1, min(tuned_workers // 2, 4))
-            self.optimize_threads(inter=want_inter)
+            total = int(intra) + int(want_inter) + int(tuned_workers)
+            if total > int(thread_cap):
+                new_intra = max(
+                    1,
+                    int(thread_cap) - int(want_inter) - int(tuned_workers),
+                )
+                if int(new_intra) != int(intra):
+                    self.optimize_threads(intra=int(new_intra))
+                    intra = int(new_intra)
+                total = int(intra) + int(want_inter) + int(tuned_workers)
+                if total > int(thread_cap):
+                    want_inter = max(
+                        1,
+                        int(thread_cap) - int(tuned_workers) - int(intra),
+                    )
+            self.optimize_threads(inter=int(want_inter))
             return
         self._retune_threads()
 
@@ -898,20 +941,62 @@ class Thread:
         self._last_retune_ts = now
         if wall_ns <= 0:
             return
-        cpu_ratio = cpu_ns / float(wall_ns)
         cpus = max(1, len(self._allowed_cpus))
         workers = max(1, self._io_workers)
-        if cpu_ratio >= 0.5:
-            target_intra = max(1, cpus // workers)
-            if cpus >= 8:
-                target_intra = min(target_intra, 2)
-            self.optimize_threads(intra=target_intra)
-            self.optimize_threads(inter=max(1, min(2, workers)))
-        else:
-            relaxed = min(4, max(1, cpus // max(1, workers // 2)))
-            current = max(1, torch.get_num_threads())
-            if current < relaxed:
-                self.optimize_threads(intra=relaxed)
+
+        def _read_int_env(keys, default):
+            for k in keys:
+                with contextlib.suppress(Exception):
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return int(v)
+            return int(default)
+
+        cap_mult = 2
+        with contextlib.suppress(Exception):
+            v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
+            if v is None:
+                v = os.environ.get("STNET_THREADS_CAP_MULTIPLIER")
+            if v is not None and str(v).strip():
+                cap_mult = int(v)
+        cap_mult = max(1, min(8, int(cap_mult)))
+        node_thread_cap = max(2, int(cpus) * int(cap_mult))
+
+        local_world = max(
+            1,
+            _read_int_env(
+                ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
+                1,
+            ),
+        )
+        distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
+        thread_cap = int(node_thread_cap)
+        if distribute and local_world > 1:
+            thread_cap = max(2, int(node_thread_cap) // int(local_world))
+
+        try:
+            intra = max(1, int(torch.get_num_threads()))
+        except Exception:
+            intra = int(cpus)
+
+        inter = 1
+        if hasattr(torch, "get_num_interop_threads"):
+            with contextlib.suppress(Exception):
+                inter = max(1, int(torch.get_num_interop_threads()))
+
+        total = int(intra) + int(inter) + int(workers)
+        if total <= int(thread_cap):
+            return
+
+        new_intra = max(1, int(thread_cap) - int(workers) - int(inter))
+        if int(new_intra) < int(intra):
+            self.optimize_threads(intra=int(new_intra))
+            intra = int(new_intra)
+        total = int(intra) + int(inter) + int(workers)
+        if total > int(thread_cap):
+            new_inter = max(1, int(thread_cap) - int(workers) - int(intra))
+            if int(new_inter) < int(inter):
+                self.optimize_threads(inter=int(new_inter))
 
     def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
         if not self._enabled:
