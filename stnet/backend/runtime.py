@@ -757,7 +757,6 @@ def _calibrate_per_sample_mem(
             Sampler._per_sample_mem_bytes = int(per_sample)
         except Exception:
             pass
-        print("[calibrate] per_sample =", per_sample, "B0 =", B0, "delta =", delta, flush=True)
         with contextlib.suppress(Exception):
             os.environ["STNET_PER_SAMPLE_MEM_BYTES"] = str(int(per_sample))
 
@@ -1336,24 +1335,6 @@ def epochs(
     grad_accum_steps: int = int(min_grad_accum)
     grad_accum_steps = _sync_int_across_ranks(grad_accum_steps, device=device, src=0)
 
-    print(
-        f"[epochs] grad_accum_steps initial={grad_accum_steps} ",
-        f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, ",
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
-        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
-        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
-        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})",
-        flush=True,
-    )
-    logging.info(
-        f"[epochs] grad_accum_steps initial={grad_accum_steps} "
-        f"(min={min_grad_accum}, max={max_grad_accum}, per_batch={per_batch}, "
-        f"est_bytes_per_sample={est_bytes_per_sample}, safe_host_bytes={safe_host_bytes}, "
-        f"safe_host_total={safe_host_total}, safe_dev_bytes={safe_dev_bytes}, "
-        f"safe_dev_total={safe_dev_total}, host_margin={host_margin}, device_margin={dev_margin}, "
-        f"host_budget_max_bytes={host_budget_max_bytes}, device_budget_max_bytes={dev_budget_max_bytes})"
-    )
-
     proc = None
     if _psutil is not None:
         try:
@@ -1361,51 +1342,6 @@ def epochs(
         except Exception:
             proc = None
 
-    def _log_step_state(
-        tag: str,
-        step_idx: int,
-        total_batches: int,
-        micro_batch: int,
-        grad_accum: int,
-        should_sync: bool,
-        device: torch.device = device,
-    ) -> None:
-        if not logging.getLogger().isEnabledFor(logging.INFO):
-            return
-
-        rss = None
-        host_avail = None
-        host_total = None
-        if proc is not None:
-            with contextlib.suppress(Exception):
-                rss = proc.memory_info().rss
-        with contextlib.suppress(Exception):
-            host_avail = Memory.available()
-            host_total = Memory.total()
-
-        cuda_alloc = None
-        cuda_reserved = None
-        if device.type == "cuda" and torch.cuda.is_available():
-            with contextlib.suppress(Exception):
-                cuda_alloc = torch.cuda.memory_allocated(device)
-                cuda_reserved = torch.cuda.memory_reserved(device)
-
-        eff_batch = int(micro_batch) * max(1, int(grad_accum))
-        print(
-            f"[epochs][{tag}] step={step_idx+1}/{total_batches} ",
-            f"micro_batch={micro_batch} grad_accum={grad_accum} ",
-            f"eff_batch_per_update={eff_batch} should_sync={should_sync} ",
-            f"rss={rss} host_avail={host_avail} host_total={host_total} ",
-            f"cuda_alloc={cuda_alloc} cuda_reserved={cuda_reserved}",
-            flush=True,
-        )
-        logging.info(
-            f"[epochs][{tag}] step={step_idx+1}/{total_batches} "
-            f"micro_batch={micro_batch} grad_accum={grad_accum} "
-            f"eff_batch_per_update={eff_batch} should_sync={should_sync} "
-            f"rss={rss} host_avail={host_avail} host_total={host_total} "
-            f"cuda_alloc={cuda_alloc} cuda_reserved={cuda_reserved}"
-        )
     gpu_util_ema: Optional[float] = None
     mem_util_ema: Optional[float] = None
     util_alpha: float = 0.2
@@ -1807,15 +1743,7 @@ def epochs(
                             should_sync = ((step_idx + 1) % max(1, grad_accum_steps) == 0) or (
                                 step_idx + 1 == total_batches
                             )
-                            if step_idx < 50 or ((step_idx + 1) % 100 == 0):
-                                _log_step_state(
-                                    tag="train",
-                                    step_idx=step_idx,
-                                    total_batches=total_batches,
-                                    micro_batch=int(X.shape[0]),
-                                    grad_accum=int(grad_accum_steps),
-                                    should_sync=bool(should_sync),
-                                )
+                            
                             if use_timer:
                                 ev_s, ev_e = (
                                     torch.Event(device=device, enable_timing=True),
