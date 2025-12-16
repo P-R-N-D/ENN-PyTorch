@@ -11,7 +11,6 @@ import torch._dynamo
 from torch import nn
 
 from ..functional.profiler import FLOP_PROFILER, capture
-from ..data.pipeline import Dataset
 from ..backend.system import get_device, get_dpa_backends, get_runtime_config
 
 try:
