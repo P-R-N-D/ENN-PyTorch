@@ -16,7 +16,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase, stack
 
 from ..backend.system import Memory, get_tlb
-from ..api.templates import BatchPolicy, WorkerPolicy
+from ..api.templates import BatchPolicy, LoaderPolicy, WorkerPolicy
 
 try:
     from torchdata.nodes import BaseNode
@@ -699,6 +699,7 @@ def fetch(
     io_workers = int(_wp.num_workers)
     prebatch = int(_wp.prebatch)
     pf_depth = int(_wp.prefetch_factor)
+    pf_depth_fixed = max(1, int(pf_depth))
 
     map_fn = partial(
         collate,
@@ -773,7 +774,15 @@ def fetch(
             if bytes_per_batch <= 0:
                 return int(_pf)
             pf_cap = max(1, int(budget // max(1, bytes_per_batch)))
-            return int(max(1, min(int(_pf), pf_cap, 8)))
+            with contextlib.suppress(Exception):
+                lp = LoaderPolicy()
+                hard = int(lp.hard_inflight_batches(_device_obj))
+                soft_cap = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
+                pb = max(1, int(prebatch))
+                workers = max(1, int(io_workers))
+                inflight_pf_cap = max(1, int((soft_cap - pb) // max(1, workers)))
+                pf_cap = min(int(pf_cap), int(inflight_pf_cap))
+            return int(max(1, min(int(_pf), int(pf_cap), 8)))
         except Exception:
             return int(_pf)
 
@@ -798,16 +807,10 @@ def fetch(
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
                 pf_depth_before = int(pf_depth)
-                if _auto_ms_candidates:
-                    _m = min(_auto_ms_candidates)
-                    if _m < 0.35:
-                        pf_depth = max(pf_depth, 6)
-                    elif _m < 0.70:
-                        pf_depth = max(pf_depth, 4)
-                    elif _m < 1.00:
-                        pf_depth = max(pf_depth, 3)
-                pf_depth = int(max(2, min(8, pf_depth)))
+                pf_depth = int(max(1, min(8, pf_depth)))
+                pf_depth = int(pf_depth_fixed)
                 pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
+                pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
                 if int(pf_depth) != int(pf_depth_before):
                     batch_size = _rescale_batch(datasets, int(batch_size))
             else:
@@ -883,16 +886,10 @@ def fetch(
                 cand_max = max(_auto_bs_candidates)
                 batch_size = max(1, min(cand_max, cand_mean))
                 pf_depth_before = int(pf_depth)
-                if _auto_ms_candidates:
-                    _m = min(_auto_ms_candidates)
-                    if _m < 0.35:
-                        pf_depth = max(pf_depth, 6)
-                    elif _m < 0.70:
-                        pf_depth = max(pf_depth, 4)
-                    elif _m < 1.00:
-                        pf_depth = max(pf_depth, 3)
-                pf_depth = int(max(2, min(8, pf_depth)))
+                pf_depth = int(max(1, min(8, pf_depth)))
+                pf_depth = int(pf_depth_fixed)
                 pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
+                pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
                 if int(pf_depth) != int(pf_depth_before):
                     batch_size = _rescale_batch(datasets, int(batch_size))
             else:
@@ -945,24 +942,17 @@ def fetch(
         )
         train_length = sum(lengths) if lengths else None
 
-    else:
-        ds = dataset(sources, split="train", val_frac=float(val_frac))
-        allocated.add(ds)
-        if batch_size is None or int(batch_size) <= 0:
-            B_i, ms_i = _stream_batch(ds, _device_obj)
-            batch_size = max(1, int(B_i) if B_i > 0 else 1)
-            pf_depth_before = int(pf_depth)
-            if ms_i:
-                if ms_i < 0.35:
-                    pf_depth = max(pf_depth, 6)
-                elif ms_i < 0.70:
-                    pf_depth = max(pf_depth, 4)
-                elif ms_i < 1.00:
-                    pf_depth = max(pf_depth, 3)
-            if int(pf_depth) != int(pf_depth_before):
-                batch_size = max(
-                    1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
-                )
+        else:
+            ds = dataset(sources, split="train", val_frac=float(val_frac))
+            allocated.add(ds)
+            if batch_size is None or int(batch_size) <= 0:
+                B_i, ms_i = _stream_batch(ds, _device_obj)
+                batch_size = max(1, int(B_i) if B_i > 0 else 1)
+                pf_depth_before = int(pf_depth)
+                if int(pf_depth) != int(pf_depth_before):
+                    batch_size = max(
+                        1, int(_stream_batch(ds, _device_obj)[0]) if len(ds) > 0 else 1
+                    )
         sampler_node = ds.compose(
             batch_size=int(batch_size),
             shuffle=True,
@@ -1032,16 +1022,10 @@ def fetch(
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
                     pf_depth_before = int(pf_depth)
-                    if _auto_ms_candidates:
-                        _m = min(_auto_ms_candidates)
-                        if _m < 0.35:
-                            pf_depth = max(pf_depth, 6)
-                        elif _m < 0.70:
-                            pf_depth = max(pf_depth, 4)
-                        elif _m < 1.00:
-                            pf_depth = max(pf_depth, 3)
-                    pf_depth = int(max(2, min(8, pf_depth)))
+                    pf_depth = int(max(1, min(8, pf_depth)))
+                    pf_depth = int(pf_depth_fixed)
                     pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
+                    pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
                     if int(pf_depth) != int(pf_depth_before):
                         batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_nodes: Dict[str, BaseNode] = {}
@@ -1122,16 +1106,10 @@ def fetch(
                     cand_max = max(_auto_bs_candidates)
                     batch_size = max(1, min(cand_max, cand_mean))
                     pf_depth_before = int(pf_depth)
-                    if _auto_ms_candidates:
-                        _m = min(_auto_ms_candidates)
-                        if _m < 0.35:
-                            pf_depth = max(pf_depth, 6)
-                        elif _m < 0.70:
-                            pf_depth = max(pf_depth, 4)
-                        elif _m < 1.00:
-                            pf_depth = max(pf_depth, 3)
-                    pf_depth = int(max(2, min(8, pf_depth)))
+                    pf_depth = int(max(1, min(8, pf_depth)))
+                    pf_depth = int(pf_depth_fixed)
                     pf_depth = _cap_pf_depth(_device_obj, datasets, pf_depth, batch_size)
+                    pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
                     if int(pf_depth) != int(pf_depth_before):
                         batch_size = _rescale_batch(datasets, int(batch_size))
             sampler_list: list[BaseNode] = []
@@ -1194,13 +1172,6 @@ def fetch(
                 B_i, ms_i = _stream_batch(ds, _device_obj)
                 batch_size = max(1, int(B_i) if B_i > 0 else 1)
                 pf_depth_before = int(pf_depth)
-                if ms_i:
-                    if ms_i < 0.35:
-                        pf_depth = max(pf_depth, 6)
-                    elif ms_i < 0.70:
-                        pf_depth = max(pf_depth, 4)
-                    elif ms_i < 1.00:
-                        pf_depth = max(pf_depth, 3)
                 if int(pf_depth) != int(pf_depth_before):
                     batch_size = max(
                         1,

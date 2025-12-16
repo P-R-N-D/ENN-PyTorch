@@ -26,7 +26,7 @@ class WorkerPolicy:
 
     num_workers: int = 1
     prebatch: int = 1
-    prefetch_factor: int = 2
+    prefetch_factor: int = 1
     max_concurrency: int = 1
     h2d_streams: int = 1
 
@@ -80,55 +80,152 @@ class WorkerPolicy:
 
     @classmethod
     def autotune(cls) -> "WorkerPolicy":
-        ncpu = cls._cpu_count()
+        ncpu_raw = max(1, int(cls._cpu_count() or 1))
         dev_type, nacc = cls._detect_accelerator()
-        is_accel = nacc > 0
+        is_accel = bool(nacc and int(nacc) > 0)
 
-        if ncpu <= 2:
-            inter_ops = 1
-            intra_ops = max(1, ncpu - inter_ops)
-            num_workers = max(1, ncpu)
-        elif 2 < ncpu <= 8:
-            inter_ops = max(1, ncpu // 4)
-            intra_ops = max(1, ncpu - inter_ops)
-            num_workers = max(2, min(8, ncpu // 2))
-        else:
-            inter_ops = max(2, min(8, ncpu // 6))
-            intra_ops = max(1, ncpu - inter_ops)
-            num_workers = max(4, min(16, ncpu // 2))
+        def _read_int_env(keys: Sequence[str], default: int) -> int:
+            for k in keys:
+                with contextlib.suppress(Exception):
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return int(v)
+            return int(default)
 
-        max_concurrency = max(1, num_workers)
+        def _read_float_env(keys: Sequence[str], default: float) -> float:
+            for k in keys:
+                with contextlib.suppress(Exception):
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return float(v)
+            return float(default)
+
+        local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
+        local_world_guess = max(
+            1,
+            _read_int_env(
+                ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
+                local_world_guess,
+            ),
+        )
+
+        cap_mult = 2
+        with contextlib.suppress(Exception):
+            v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
+            if v is None:
+                v = os.environ.get("STNET_THREADS_CAP_MULTIPLIER")
+            if v is not None and str(v).strip():
+                cap_mult = int(v)
+        cap_mult = max(1, min(8, int(cap_mult)))
+        node_thread_cap = max(2, int(ncpu_raw) * int(cap_mult))
+
+        distribute = (is_accel and int(local_world_guess) > 1)
+        distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute)))
+        thread_cap = int(node_thread_cap)
+        if distribute:
+            thread_cap = max(2, int(node_thread_cap) // max(1, int(local_world_guess)))
+
+        eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
+
+        soft_inflight = 8 if is_accel else 4
+        with contextlib.suppress(Exception):
+            lp = LoaderPolicy()
+            hard = int(lp.hard_inflight_batches(dev_type))
+            soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
+
+        soft_auto_enabled = bool(_read_int_env(("STNET_SOFT_INFLIGHT_AUTO",), 1))
+        soft_inflight_max_default = 16 if is_accel else 12
+        soft_inflight_max = max(8, _read_int_env(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
+        soft_inflight_explicit = _read_int_env(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        if soft_inflight_explicit > 0:
+            soft_inflight = max(1, int(soft_inflight_explicit))
+        elif soft_auto_enabled:
+            soft_base = max(0, _read_int_env(("STNET_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, _read_int_env(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
+            soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
+
+        soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
 
         if is_accel:
-            prebatch = 4
-            prefetch_factor = 2
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.90
+            elif eff_cores <= 16:
+                model_ratio = 0.80
+            elif eff_cores <= 32:
+                model_ratio = 0.70
+            else:
+                model_ratio = 0.60
         else:
-            prebatch = 1
-            prefetch_factor = 1
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.95
+            elif eff_cores <= 16:
+                model_ratio = 0.90
+            else:
+                model_ratio = 0.85
+
+        with contextlib.suppress(Exception):
+            env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
+            v = os.environ.get(env_key)
+            if v is not None and str(v).strip():
+                model_ratio = float(v)
+        model_ratio = float(max(0.25, min(1.0, model_ratio)))
+
+        model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
+
+        if model_budget <= 2:
+            inter_ops = 1
+        elif model_budget <= 8:
+            inter_ops = max(1, model_budget // 4)
+        else:
+            inter_ops = max(2, min(8, model_budget // 6))
+        inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
+        intra_ops = max(1, int(model_budget) - int(inter_ops))
+
+        data_budget = max(1, int(thread_cap) - (int(intra_ops) + int(inter_ops)))
+
+        prebatch = 1
+        prefetch_factor = 1
 
         env_pre = os.environ.get("STNET_PREBATCH")
         if env_pre:
-            try:
+            with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
-            except Exception:
-                pass
         env_pf = os.environ.get("STNET_PREFETCH_FACTOR")
         if env_pf:
-            try:
+            with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
-            except Exception:
-                pass
 
-        max_total_ahead = 8 if is_accel else 4
-        total = prebatch * prefetch_factor
-        if total > max_total_ahead:
-            scale = max_total_ahead / float(total)
-            prefetch_factor = max(1, int(prefetch_factor * scale))
-            total = prebatch * prefetch_factor
-            if total > max_total_ahead:
-                prebatch = max(1, int(max_total_ahead // max(1, prefetch_factor)))
+        prebatch = max(1, int(prebatch))
+        prefetch_factor = max(1, int(prefetch_factor))
 
-        local_world = max(1, nacc or 1) if is_accel else 1
+        base_workers = max(1, int(data_budget))
+        base_workers = min(int(base_workers), int(thread_cap), int(soft_inflight))
+
+        max_workers = max(
+            1,
+            int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
+        )
+        num_workers = max(1, min(int(base_workers), int(max_workers), int(soft_inflight)))
+
+        max_concurrency = max(1, int(num_workers))
+
+        total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
+        if total_threads > int(thread_cap):
+            overflow = int(total_threads) - int(thread_cap)
+            if dev_type == "cpu":
+                num_workers = max(1, int(num_workers) - int(overflow))
+            else:
+                intra_ops = max(1, int(intra_ops) - int(overflow))
+
+            intra_ops = max(1, int(thread_cap) - int(inter_ops) - int(num_workers))
+            max_concurrency = max(1, min(int(max_concurrency), int(num_workers)))
+
+        local_world = int(local_world_guess)
 
         return cls(
             nproc_per_node=local_world,
@@ -189,28 +286,33 @@ class LoaderPolicy:
         hard = int(self.hard_inflight_batches(device))
         soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
 
-        num_workers = max(0, int(getattr(wp, "num_workers", 0) or 0))
-        if num_workers > soft_cap:
-            wp.num_workers = max(1, int(soft_cap))
-            num_workers = int(wp.num_workers)
         prefetch_factor = max(1, int(getattr(wp, "prefetch_factor", 1) or 1))
-        prebatch = max(0, int(getattr(wp, "prebatch", 0) or 0))
+        prebatch = max(1, int(getattr(wp, "prebatch", 1) or 1))
 
-        inflight = num_workers * prefetch_factor + prebatch
-        if inflight > soft_cap:
-            budget = max(1, soft_cap - prebatch)
-            if num_workers > 0:
-                prefetch_factor = max(1, min(prefetch_factor, budget // max(1, num_workers)))
-            else:
-                prefetch_factor = 1
-            wp.prefetch_factor = int(prefetch_factor)
+        num_workers = max(1, int(getattr(wp, "num_workers", 1) or 1))
 
-            inflight = num_workers * int(wp.prefetch_factor) + prebatch
-            if inflight > soft_cap:
-                wp.prebatch = max(0, int(soft_cap - num_workers * int(wp.prefetch_factor)))
+        max_workers_inflight = max(1, int((soft_cap - prebatch) // max(1, prefetch_factor)))
+        num_workers = max(1, min(int(num_workers), int(max_workers_inflight), int(soft_cap)))
+
+        inflight = int(num_workers) * int(prefetch_factor) + int(prebatch)
+        if inflight > int(soft_cap):
+            prefetch_factor = max(1, int((int(soft_cap) - int(prebatch)) // max(1, int(num_workers))))
+            max_workers_inflight = max(1, int((soft_cap - prebatch) // max(1, prefetch_factor)))
+            num_workers = max(1, min(int(num_workers), int(max_workers_inflight), int(soft_cap)))
+
+        wp.num_workers = int(num_workers)
+        wp.prebatch = int(prebatch)
+        wp.prefetch_factor = int(prefetch_factor)
 
         with contextlib.suppress(Exception):
-            wp.max_concurrency = max(1, min(int(getattr(wp, "max_concurrency", 1) or 1), soft_cap))
+            wp.max_concurrency = max(
+                1,
+                min(
+                    int(getattr(wp, "max_concurrency", 1) or 1),
+                    int(wp.num_workers),
+                    int(soft_cap),
+                ),
+            )
         return wp
 
     def wrap_input(self, loader: Any, device: torch.device | str, *, name: str) -> Any:
@@ -1189,7 +1291,7 @@ class BatchPolicy:
     host_sample_bytes: Optional[int] = None
 
     prebatch: int = 1
-    prefetch_factor: int = 2
+    prefetch_factor: int = 1
     num_workers: int = 0
     num_streams: int = 1
     max_concurrency: int = 1
