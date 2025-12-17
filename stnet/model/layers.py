@@ -44,10 +44,19 @@ try:
 
     _HAS_FLEX_ATTENTION = True
 except Exception:
+    create_block_mask = None
+    flex_attention = None
     _HAS_FLEX_ATTENTION = False
 
 if os.environ.get("STNET_DISABLE_FLEX_ATTENTION") in {"1", "true", "True"}:
     _HAS_FLEX_ATTENTION = False
+
+_FLEX_ATTENTION_KWARGS: set[str] = set()
+if _HAS_FLEX_ATTENTION and flex_attention is not None:
+    with contextlib.suppress(Exception):
+        import inspect
+
+        _FLEX_ATTENTION_KWARGS = set(inspect.signature(flex_attention).parameters.keys())
 
 _DILATED_MASK_CACHE_MAX = 32
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
@@ -104,6 +113,11 @@ class PatchAttention(nn.Module):
         self.coord_dim = int(coord_dim)
         self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
         self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
+        self._fallback_attn: DotProductAttention | None = None
+        if not _HAS_FLEX_ATTENTION:
+            self._fallback_attn = DotProductAttention(
+                num_heads=self.nhead, head_dim=self.head_dim
+            )
 
     def forward(
         self,
@@ -121,8 +135,11 @@ class PatchAttention(nn.Module):
             reshape_for_mha(k, B, self.nhead, self.head_dim),
             reshape_for_mha(v, B, self.nhead, self.head_dim),
         )
-        if not _HAS_FLEX_ATTENTION:
-            attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        if (not _HAS_FLEX_ATTENTION) or (not x.is_cuda):
+            attn = self._fallback_attn
+            if attn is None:
+                attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+                self._fallback_attn = attn
             yh = attn(qh, kh, vh, attn_mask=attn_mask, training=self.training)
             return yh.transpose(1, 2).contiguous().view(B, N, self.d_model)
 
@@ -536,12 +553,16 @@ class DilatedAttention(nn.Module):
 
         L_q = L
 
-        if _HAS_FLEX_ATTENTION:
+        if _HAS_FLEX_ATTENTION and x_k.is_cuda:
             qkv = self.qkv(x_k)
             q, k, v = qkv.chunk(3, dim=-1)
 
             H = self.num_heads
             Dh = self.head_dim
+
+            training = bool(self.training)
+            scale = 1.0 / math.sqrt(float(Dh))
+            dropout_p = float(self.dropout_p) if training else 0.0
 
             qh = q[:, :L_q, :].view(B, L_q, H, Dh).transpose(1, 2)
             kh = k.view(B, L_k, H, Dh).transpose(1, 2)
@@ -565,16 +586,15 @@ class DilatedAttention(nn.Module):
                     b1 = min(B, b0 + group_size)
                     B_g = b1 - b0
 
-                    qh_g = qh[b0:b1]  # (B_g, H, L_q, Dh)
-                    kh_g = kh[b0:b1]  # (B_g, H, L_k, Dh)
-                    vh_g = vh[b0:b1]  # (B_g, H, L_k, Dh)
+                    qh_g = qh[b0:b1]
+                    kh_g = kh[b0:b1]
+                    vh_g = vh[b0:b1]
 
                     kpm_g: Optional[torch.Tensor] = None
                     if kpm_k is not None:
                         kpm_g = kpm_k[b0:b1]
 
                     if kpm_g is None:
-                        # Fast path: no padding mask => reuse a cached block mask.
                         block_mask_g = self._get_flex_block_mask(
                             B_g,
                             H,
@@ -617,7 +637,42 @@ class DilatedAttention(nn.Module):
                             BLOCK_SIZE=_block_size,
                         )
 
-                    y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g)
+                    if flex_attention is None:
+                        raise RuntimeError("flex_attention was not imported")
+
+                    if _FLEX_ATTENTION_KWARGS:
+                        flex_kwargs: dict[str, Any] = {"block_mask": block_mask_g}
+                        if "scale" in _FLEX_ATTENTION_KWARGS:
+                            flex_kwargs["scale"] = scale
+                        if dropout_p > 0.0:
+                            if "dropout_p" in _FLEX_ATTENTION_KWARGS:
+                                flex_kwargs["dropout_p"] = dropout_p
+                            elif "dropout" in _FLEX_ATTENTION_KWARGS:
+                                flex_kwargs["dropout"] = dropout_p
+                        y_g = flex_attention(qh_g, kh_g, vh_g, **flex_kwargs)
+                    else:
+                        try:
+                            y_g = flex_attention(
+                                qh_g,
+                                kh_g,
+                                vh_g,
+                                block_mask=block_mask_g,
+                                scale=scale,
+                                dropout_p=dropout_p,
+                            )
+                        except TypeError:
+                            try:
+                                y_g = flex_attention(
+                                    qh_g,
+                                    kh_g,
+                                    vh_g,
+                                    block_mask=block_mask_g,
+                                    scale=scale,
+                                )
+                            except TypeError:
+                                y_g = flex_attention(
+                                    qh_g, kh_g, vh_g, block_mask=block_mask_g
+                                )
                     out_g = self.out_proj(
                         y_g.transpose(1, 2).contiguous().view(B_g, L_q, self.embed_dim)
                     )

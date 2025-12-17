@@ -27,7 +27,14 @@ TensorLike = Any
 TExtra = TypeVar("TExtra")
 
 import torch
-from tensordict import TensorDict, TensorDictBase, stack
+try:
+    from tensordict import TensorDict, TensorDictBase, stack
+except Exception:
+    TensorDict = None  # type: ignore[assignment]
+    stack = None  # type: ignore[assignment]
+
+    class TensorDictBase:  # type: ignore[no-redef]
+        pass
 
 from ..backend.system import Memory, WorkerPolicy, get_tlb
 
@@ -240,9 +247,23 @@ class BatchPolicy:
 try:
     from torchdata.nodes import BaseNode
 except Exception:
-    from torchdata.nodes import BaseNode
+    class BaseNode:  # type: ignore[no-redef]
+        pass
 
-from .nodes import Connector, Disposable, Loader, Sampler, Source, Wrapper
+
+_NODES_IMPORT_ERROR: Exception | None = None
+try:
+    from .nodes import Connector, Disposable, Loader, Sampler, Source, Wrapper
+except Exception as _e:
+    Connector = Disposable = Loader = Sampler = Source = Wrapper = None  # type: ignore[assignment]
+    _NODES_IMPORT_ERROR = _e
+
+def _require_nodes() -> None:
+    if _NODES_IMPORT_ERROR is not None:
+        raise ImportError(
+            "stnet.data.pipeline: data-pipeline components require torchdata (and tensordict). "
+            "Install full dependencies listed in requirements.txt."
+        ) from _NODES_IMPORT_ERROR
 
 
 def _sync_device(device: torch.device) -> None:
@@ -842,6 +863,8 @@ def collate(
             data = {"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}
             if row_ids is not None:
                 data["row_ids"] = row_ids
+            if TensorDict is None:
+                return data
             return TensorDict(data, batch_size=[])
         return batch
     if isinstance(batch, Mapping):
@@ -855,6 +878,8 @@ def collate(
         data = {"X": X, "Y": Y, "features": X, "labels": Y}
         if row_ids is not None:
             data["row_ids"] = row_ids
+        if TensorDict is None:
+            return data
         return TensorDict(data, batch_size=[])
     return batch
 
@@ -870,6 +895,7 @@ def compose(
     weights: Optional[Mapping[str, float]] = None,
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
+    _require_nodes()
     device_obj = (
         torch.device(device) if not isinstance(device, torch.device) else device
     )

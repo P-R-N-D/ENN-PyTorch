@@ -21,7 +21,11 @@ from typing import (
 
 import torch
 import torch.nn as nn
-from tensordict import TensorDictBase
+try:
+    from tensordict import TensorDictBase
+except Exception:
+    class TensorDictBase:  # type: ignore[no-redef]
+        pass
 
 from ..api.config import ModelConfig
 from ..backend.compat import torch_no_compile
@@ -77,12 +81,14 @@ def _serialize_z_index(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     coords01 = _norm_vector(coords)
     keys = _to_z_index(coords01, bits=bits)
-    perm = keys.argsort(dim=-1, stable=True)                               
+    perm = keys.argsort(dim=-1, stable=True)
     if shift_order and (block_index % 2 == 1):
         B, N = perm.shape
         shift = (patch // 2) % max(N, 1)
         if shift:
-            roll = torch.arange(N, device=perm.device).roll(shift)
+            roll = torch.roll(
+                torch.arange(N, device=perm.device), shifts=int(shift), dims=0
+            )
             perm = perm.gather(1, roll.unsqueeze(0).expand(B, N))
     invperm = torch.empty_like(perm)
     scatter_src = torch.arange(perm.size(1), device=perm.device)
