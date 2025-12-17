@@ -8,6 +8,7 @@ import weakref
 from collections.abc import Iterator
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -23,7 +24,7 @@ import torch
 import torch.nn as nn
 try:
     from tensordict import TensorDictBase
-except Exception:
+except ImportError:
     class TensorDictBase:  # type: ignore[no-redef]
         pass
 
@@ -2076,13 +2077,103 @@ class Root(nn.Module):
             stage_div = max(1, int(os.environ.get("STNET_MICROBATCH_STAGE_DIV", stage_div)))
         per_sample = max(1, int(per_sample // stage_div))
 
-        # Decide microbatch size based on combined host + device free memory.
         mb_size = _auto_microbatch(
             device=device,
             hard_max=hard_max,
             per_sample_bytes=per_sample,
         )
         return int(mb_size)
+
+    @torch_no_compile(reason="microbatch prealloc helper")
+    def _microbatch_prealloc(
+        self,
+        inp: torch.Tensor,
+        microbatch: int,
+        run_fn: Callable[[torch.Tensor], Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+        *,
+        pad_to: Optional[int] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        stage: str = "microbatch",
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+
+        if inp.ndim < 1:
+            raise ValueError(f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}")
+
+        total_b = int(inp.shape[0])
+        mb_i = max(1, min(total_b, int(microbatch) if microbatch else total_b))
+        pad_i = int(pad_to) if pad_to is not None else None
+        if pad_i is not None:
+            pad_i = max(1, pad_i)
+            if pad_i < mb_i:
+                raise ValueError(f"{stage}: pad_to ({pad_i}) must be >= microbatch ({mb_i})")
+
+        out_bufs: Optional[List[torch.Tensor]] = None
+
+        for s in range(0, total_b, mb_i):
+            x_slice = inp[s : s + mb_i]
+            if cast_slice is not None:
+                x_slice = cast_slice(x_slice)
+
+            slice_n = int(x_slice.shape[0])
+            x_in = x_slice
+            did_pad = False
+            if pad_i is not None and slice_n < pad_i:
+                x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
+                x_in[:slice_n].copy_(x_slice)
+                did_pad = True
+
+            out = run_fn(x_in)
+
+            if torch.is_tensor(out):
+                outs = (out,)
+            else:
+                outs = cast(Tuple[torch.Tensor, ...], out)
+
+            if len(outs) == 0:
+                raise RuntimeError(f"{stage}: run_fn returned an empty tuple at slice s={s}")
+
+            processed: List[torch.Tensor] = []
+            for j, t in enumerate(outs):
+                if not torch.is_tensor(t):
+                    raise TypeError(f"{stage}: run_fn output #{j} is not a Tensor (type={type(t)})")
+                y = t
+                if did_pad:
+                    if y.shape[0] < slice_n:
+                        raise RuntimeError(
+                            f"{stage}: output batch too small after pad-slice: got={int(y.shape[0])}, expected>={slice_n} (s={s})"
+                        )
+                    y = y[:slice_n]
+                if int(y.shape[0]) != slice_n:
+                    raise RuntimeError(
+                        f"{stage}: output batch mismatch at s={s}: got={int(y.shape[0])}, expected={slice_n}"
+                    )
+                if out_dtype is not None and y.dtype != out_dtype:
+                    y = y.to(dtype=out_dtype)
+                processed.append(y)
+
+            if out_bufs is None:
+                out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
+            else:
+                if len(out_bufs) != len(processed):
+                    raise RuntimeError(
+                        f"{stage}: output arity changed across microbatches: first={len(out_bufs)}, now={len(processed)} (s={s})"
+                    )
+                for k, (buf, y) in enumerate(zip(out_bufs, processed)):
+                    if buf.shape[1:] != y.shape[1:]:
+                        raise RuntimeError(
+                            f"{stage}: output shape changed for output#{k}: first={tuple(buf.shape)}, now={(total_b, *y.shape[1:])} (s={s})"
+                        )
+
+            for buf, y in zip(out_bufs, processed):
+                buf[s : s + slice_n] = y
+
+        if out_bufs is None:
+            raise RuntimeError(f"{stage}: produced no outputs (b={total_b}, microbatch={mb_i})")
+
+        if len(out_bufs) == 1:
+            return out_bufs[0]
+        return tuple(out_bufs)
 
     def forward(
         self,
@@ -2132,16 +2223,25 @@ class Root(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
 
+        buf0 = next(self.buffers(), None)
+        if buf0 is not None:
+            device = buf0.device
+        else:
+            p0 = next(self.parameters(), None)
+            device = p0.device if p0 is not None else self._device
+
         x_raw = features
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
+
+        if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
+            x_raw = x_raw.to(device=device, non_blocking=True)
+
         x_scaled = self.scaler.normalize_x(x_raw)
         with contextlib.suppress(Exception):
             import torch._dynamo as _dynamo
             if _dynamo.is_compiling():
                 _dynamo.graph_break()
-
-        device = self._device
         meta = None
         with contextlib.suppress(Exception):
             meta = Autocast.coerce_metadata(device)
@@ -2194,7 +2294,9 @@ class Root(nn.Module):
                 base_dtype = requested_base
             else:
                 base_dtype = (torch.float32 if amp_enabled else amp_dtype)
-            features = x_scaled.to(device=device, dtype=base_dtype)
+            if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
+                x_scaled = x_scaled.to(device=device, non_blocking=True)
+            features = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
             if features.ndim != 2 or features.shape[1] != self.in_dim:
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features.shape)}"
@@ -2221,55 +2323,20 @@ class Root(nn.Module):
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            token_chunks: List[torch.Tensor] = []
-            context_chunks: List[torch.Tensor] = []
-            for s in range(0, int(b), mb):
-                tok: Optional[torch.Tensor] = None
-                ctx_out: Optional[torch.Tensor] = None
-                x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
-                slice_n = int(x_slice.shape[0])
-                x_in = x_slice
-                if (
-                    self._pad_compiled_microbatch
-                    and x_slice.dim() == 2
-                    and slice_n != int(mb)
-                    and slice_n < int(mb)
-                ):
-                    pad_n = int(mb) - slice_n
-                    pad = x_slice.new_zeros((pad_n, x_slice.shape[1]))
-                    x_in = torch.cat([x_slice, pad], dim=0)
-
-                if infer_mode:
-                    with contextlib.ExitStack() as stack:
-                        stack.enter_context(Gradient.inference(self.processor))
-                        tok, ctx_out = _encode(x_in)
-                else:
-                    tok, ctx_out = _encode(x_in)
-
-                if tok is None or ctx_out is None:
-                    raise RuntimeError(
-                        "Internal error: encoder returned no outputs. "
-                        f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}, s={int(s)}"
-                    )
-                if x_in is not x_slice:
-                    tok = tok[:slice_n]
-                    ctx_out = ctx_out[:slice_n]
-                out_tokens = tok.to(dtype=base_dtype)
-                out_context = ctx_out.to(dtype=base_dtype)
-                token_chunks.append(out_tokens)
-                context_chunks.append(out_context)
-            if not token_chunks or not context_chunks:
-                raise RuntimeError(
-                    "Internal error: no microbatch outputs were collected. "
-                    f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}"
+            enc_ctx = Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
+            with enc_ctx:
+                tokens, context = cast(
+                    Tuple[torch.Tensor, torch.Tensor],
+                    self._microbatch_prealloc(
+                        features,
+                        mb,
+                        _encode,
+                        pad_to=int(mb) if self._pad_compiled_microbatch else None,
+                        out_dtype=base_dtype,
+                        cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
+                        stage="encoder",
+                    ),
                 )
-            if len(token_chunks) != len(context_chunks):
-                raise RuntimeError(
-                    "Internal error: microbatch output mismatch. "
-                    f"token_chunks={len(token_chunks)}, context_chunks={len(context_chunks)}"
-                )
-            tokens = torch.cat(token_chunks, dim=0)
-            context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
             context = _sanitize(context)
 
@@ -2282,7 +2349,7 @@ class Root(nn.Module):
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
                 bl = self.linear_branch(
-                    self._cast_graph_safe(features, self._device, assembled.dtype)
+                    self._cast_graph_safe(features, device, assembled.dtype)
                 )
                 assembled = assembled + bl
     
@@ -2331,16 +2398,15 @@ class Root(nn.Module):
                         out, _ = self.controller(chunk)
                     return out
 
-                if ctrl_mb < int(b):
-                    refined_tokens = torch.cat(
-                        [
-                            _run_controller_chunk(tokens_centered[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
-                        dim=0,
-                    )
-                else:
-                    refined_tokens = _run_controller_chunk(tokens_centered)
+                refined_tokens = cast(
+                    torch.Tensor,
+                    self._microbatch_prealloc(
+                        tokens_centered,
+                        ctrl_mb,
+                        _run_controller_chunk,
+                        stage="controller",
+                    ),
+                )
 
             refined_tokens = _sanitize(refined_tokens)
             tokens_for_decode = refined_tokens.detach() if infer_mode else refined_tokens
@@ -2352,35 +2418,26 @@ class Root(nn.Module):
             )
             with processor_ctx:
 
+                dc = getattr(self, "_decode_compiled", None)
+
                 def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                     with (
                         Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
                     ):
-                        dc = getattr(self, "_decode_compiled", None)
                         if dc is not None:
-                            if (
-                                self._pad_compiled_microbatch
-                                and chunk.dim() == 3
-                                and chunk.shape[0] != ctrl_mb
-                                and chunk.shape[0] < ctrl_mb
-                            ):
-                                pad_n = int(ctrl_mb - chunk.shape[0])
-                                pad = chunk.new_zeros((pad_n, chunk.shape[1], chunk.shape[2]))
-                                out = dc(torch.cat([chunk, pad], dim=0))
-                                return out[: chunk.shape[0]]
                             return dc(chunk)
                         return self.processor.decode(chunk, apply_norm=True)
 
-                if ctrl_mb < int(b):
-                    residual_context = torch.cat(
-                        [
-                            _run_decode_chunk(tokens_for_decode[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
-                        dim=0,
-                    )
-                else:
-                    residual_context = _run_decode_chunk(tokens_for_decode)
+                residual_context = cast(
+                    torch.Tensor,
+                    self._microbatch_prealloc(
+                        tokens_for_decode,
+                        ctrl_mb,
+                        _run_decode_chunk,
+                        pad_to=(int(ctrl_mb) if (dc is not None and self._pad_compiled_microbatch) else None),
+                        stage="decoder",
+                    ),
+                )
 
             residual_context = _sanitize(residual_context)
             residual = residual_context.reshape(b, -1)
