@@ -1063,6 +1063,7 @@ class Prefetcher:
 
     def __iter__(self) -> Iterator[Any]:
         import time
+        import traceback
 
         from torch.utils.data import get_worker_info
 
@@ -1104,55 +1105,110 @@ class Prefetcher:
                 if self._backpressure:
                     time.sleep(0)
         else:
-                                                           
+
+            # N-ahead prefetch implemented with a bounded queue.
+            #
+            # - Producer thread keeps up to `depth` batches in-flight.
+            # - When using CUDA, device copies are scheduled on a dedicated stream and
+            #   synchronized via events when the consumer yields the batch.
+            # - Backpressure is enforced by the queue (always) and optionally by host/GPU
+            #   memory guards.
             if use_cuda_stream and self._gpu_stream is None:
                 self._gpu_stream = torch.cuda.Stream(device=device)
-            preloaded = None
+
+            SENTINEL = object()
+
+            class _Err:
+                def __init__(self, exc: BaseException, tb: str) -> None:
+                    self.exc = exc
+                    self.tb = tb
+
+            # Each queue item is either:
+            # - (batch, cuda_event | None)
+            # - _Err
+            # - SENTINEL
+            q: "queue.Queue[Any]" = queue.Queue(maxsize=int(self._depth))
+            stop = threading.Event()
             it = iter(iterable)
 
-            def _preload() -> Any | None:
-                try:
-                    b = next(it)
-                except StopIteration:
-                    return None
-                b = self._pin_memory(b)
-                                                       
-                tries = 0
-                if self._backpressure:
-                    while (not _host_mem_ok()) or (not _gpu_mem_ok()):
-                        time.sleep(0.001 if tries < 1000 else 0.005)
-                        tries += 1
-                if use_device:
-                    if use_cuda_stream and self._gpu_stream is not None:
-                        with torch.cuda.stream(self._gpu_stream):
-                            b = self._to_device(b, device)
-                    else:
-                                            
-                        b = self._to_device(b, device)
-                return b
-
-                       
-            preloaded = _preload()
-            while preloaded is not None:
-                if use_cuda_stream and self._gpu_stream is not None:
-                    cs = torch.cuda.current_stream(
-                        device=device if isinstance(device, torch.device) else None
-                    )
-                    cs.wait_stream(self._gpu_stream)
-                                                         
-                    def _record(x: Any) -> None:
-                        if torch.is_tensor(x):
-                            x.record_stream(cs)
-                            return
-                        if isinstance(x, (list, tuple)):
-                            for t in x:
-                                _record(t)
-                        elif isinstance(x, dict):
-                            for t in x.values():
-                                _record(t)
+            def _put(item: Any) -> None:
+                # Avoid deadlock on early-stop: use timeouts and check `stop`.
+                while not stop.is_set():
                     try:
-                        _record(preloaded)
-                    except Exception:
-                        pass
-                yield preloaded
-                preloaded = _preload()
+                        q.put(item, timeout=0.1)
+                        return
+                    except queue.Full:
+                        continue
+
+            def _producer() -> None:
+                try:
+                    # In multi-GPU setups, CUDA device selection can be thread-local.
+                    if use_cuda_stream and isinstance(device, torch.device):
+                        with suppress(Exception):
+                            if device.index is not None:
+                                torch.cuda.set_device(device.index)
+                    for batch in it:
+                        if stop.is_set():
+                            break
+                        if self._pin:
+                            batch = self._pin_memory(batch)
+
+                        tries = 0
+                        if self._backpressure:
+                            while (not stop.is_set()) and (
+                                (not _host_mem_ok()) or (not _gpu_mem_ok())
+                            ):
+                                time.sleep(0.001 if tries < 1000 else 0.005)
+                                tries += 1
+
+                        if use_device:
+                            if use_cuda_stream and self._gpu_stream is not None:
+                                with torch.cuda.stream(self._gpu_stream):
+                                    batch_dev = self._to_device(batch, device)
+                                ev = torch.cuda.Event()
+                                ev.record(self._gpu_stream)
+                                _put((batch_dev, ev))
+                            else:
+                                batch_dev = self._to_device(batch, device)
+                                _put((batch_dev, None))
+                        else:
+                            _put((batch, None))
+                except BaseException as exc:
+                    _put(_Err(exc, traceback.format_exc()))
+                finally:
+                    _put(SENTINEL)
+
+            t = threading.Thread(target=_producer, name="PrefetcherProducer", daemon=True)
+            t.start()
+
+            def _maybe_close_upstream() -> None:
+                with suppress(Exception):
+                    close = getattr(it, "close", None)
+                    if callable(close):
+                        close()
+
+            try:
+                while True:
+                    item = q.get()
+                    if item is SENTINEL:
+                        break
+                    if isinstance(item, _Err):
+                        raise RuntimeError(
+                            f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
+                        ) from item.exc
+
+                    batch, ev = item
+                    if use_cuda_stream and ev is not None:
+                        cs = torch.cuda.current_stream(
+                            device=device if isinstance(device, torch.device) else None
+                        )
+                        with suppress(Exception):
+                            cs.wait_event(ev)
+
+                    yield batch
+            finally:
+                stop.set()
+                _maybe_close_upstream()
+                with suppress(Exception):
+                    # Best effort: let the producer thread exit promptly.
+                    t.join(timeout=1.0)

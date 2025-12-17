@@ -8,6 +8,7 @@ import weakref
 from collections.abc import Iterator
 from typing import (
     Any,
+    Callable,
     Dict,
     List,
     Mapping,
@@ -2134,7 +2135,12 @@ class Root(nn.Module):
 
         # Prefer the actual module device (covers cases where the caller moved the module
         # via `.to(...)` after construction).
-        device = next((p.device for p in self.parameters() if p is not None), self._device)
+        buf0 = next(self.buffers(), None)
+        if buf0 is not None:
+            device = buf0.device
+        else:
+            p0 = next(self.parameters(), None)
+            device = p0.device if p0 is not None else self._device
 
         x_raw = features
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
@@ -2234,58 +2240,87 @@ class Root(nn.Module):
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            tokens: Optional[torch.Tensor] = None
-            context: Optional[torch.Tensor] = None
-            for s in range(0, int(b), mb):
-                tok: Optional[torch.Tensor] = None
-                ctx_out: Optional[torch.Tensor] = None
-                x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
-                slice_n = int(x_slice.shape[0])
-                x_in = x_slice
-                did_pad = False
-                if (
-                    self._pad_compiled_microbatch
-                    and x_slice.dim() == 2
-                    and slice_n != int(mb)
-                    and slice_n < int(mb)
-                ):
-                    # Avoid `torch.cat` here: allocate once and copy the slice into the front.
-                    x_in = x_slice.new_zeros((int(mb), x_slice.shape[1]))
-                    x_in[:slice_n] = x_slice
-                    did_pad = True
+            MicroOut = Union[torch.Tensor, Tuple[torch.Tensor, ...]]
 
-                if infer_mode:
-                    with contextlib.ExitStack() as stack:
-                        stack.enter_context(Gradient.inference(self.processor))
-                        tok, ctx_out = _encode(x_in)
-                else:
-                    tok, ctx_out = _encode(x_in)
+            def _microbatch_prealloc(
+                inp: torch.Tensor,
+                microbatch: int,
+                run_fn: Callable[[torch.Tensor], MicroOut],
+                *,
+                pad_to: Optional[int] = None,
+                out_dtype: Optional[torch.dtype] = None,
+                cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+                stage: str = "microbatch",
+            ) -> MicroOut:
+                """Run `run_fn` over `inp` in microbatches and stitch outputs without `torch.cat`.
 
-                if tok is None or ctx_out is None:
+                - If `pad_to` is provided, the last chunk is zero-padded along dim=0 to `pad_to`.
+                  This is useful when the wrapped function was compiled assuming a fixed batch size.
+                - Supports a single Tensor output or a tuple of Tensor outputs.
+                """
+
+                total_b = int(inp.shape[0])
+                mb_i = max(1, min(total_b, int(microbatch)))
+                pad_i = int(pad_to) if pad_to is not None else None
+
+                out_buf: Optional[torch.Tensor] = None
+                out_bufs: Optional[List[torch.Tensor]] = None
+
+                for s in range(0, total_b, mb_i):
+                    x_slice = inp[s : s + mb_i]
+                    if cast_slice is not None:
+                        x_slice = cast_slice(x_slice)
+                    slice_n = int(x_slice.shape[0])
+
+                    x_in = x_slice
+                    did_pad = False
+                    if pad_i is not None and slice_n < pad_i:
+                        x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
+                        x_in[:slice_n] = x_slice
+                        did_pad = True
+
+                    out = run_fn(x_in)
+
+                    def _post(t: torch.Tensor) -> torch.Tensor:
+                        if did_pad:
+                            t = t[:slice_n]
+                        if out_dtype is not None and t.dtype != out_dtype:
+                            t = t.to(dtype=out_dtype)
+                        return t
+
+                    if torch.is_tensor(out):
+                        y = _post(out)
+                        if out_buf is None:
+                            out_buf = y.new_empty((total_b, *y.shape[1:]))
+                        out_buf[s : s + slice_n] = y
+                    else:
+                        ys = tuple(_post(t) for t in cast(Tuple[torch.Tensor, ...], out))
+                        if out_bufs is None:
+                            out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in ys]
+                        for buf, y in zip(out_bufs, ys):
+                            buf[s : s + slice_n] = y
+
+                if out_buf is None and out_bufs is None:
                     raise RuntimeError(
-                        "Internal error: encoder returned no outputs. "
-                        f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}, s={int(s)}"
+                        f"Internal error: {stage} produced no outputs. "
+                        f"b={int(total_b)}, microbatch={int(mb_i)}"
                     )
-                if did_pad:
-                    tok = tok[:slice_n]
-                    ctx_out = ctx_out[:slice_n]
 
-                out_tokens = tok if tok.dtype == base_dtype else tok.to(dtype=base_dtype)
-                out_context = (
-                    ctx_out if ctx_out.dtype == base_dtype else ctx_out.to(dtype=base_dtype)
-                )
+                return out_buf if out_buf is not None else tuple(out_bufs or [])  # type: ignore[return-value]
 
-                if tokens is None:
-                    tokens = out_tokens.new_empty((int(b), *out_tokens.shape[1:]))
-                    context = out_context.new_empty((int(b), *out_context.shape[1:]))
-
-                tokens[s : s + slice_n] = out_tokens
-                context[s : s + slice_n] = out_context
-
-            if tokens is None or context is None:
-                raise RuntimeError(
-                    "Internal error: no microbatch outputs were collected. "
-                    f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}"
+            enc_ctx = Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
+            with enc_ctx:
+                tokens, context = cast(
+                    Tuple[torch.Tensor, torch.Tensor],
+                    _microbatch_prealloc(
+                        features,
+                        mb,
+                        _encode,
+                        pad_to=int(mb) if self._pad_compiled_microbatch else None,
+                        out_dtype=base_dtype,
+                        cast_slice=lambda t: self._cast_graph_safe(t, device, base_dtype),
+                        stage="encoder",
+                    ),
                 )
             tokens = _sanitize(tokens)
             context = _sanitize(context)
@@ -2348,22 +2383,15 @@ class Root(nn.Module):
                         out, _ = self.controller(chunk)
                     return out
 
-                if ctrl_mb < int(b):
-                    refined_tokens_mb: Optional[torch.Tensor] = None
-                    for s in range(0, int(b), ctrl_mb):
-                        chunk = tokens_centered[s : s + ctrl_mb]
-                        out = _run_controller_chunk(chunk)
-                        if refined_tokens_mb is None:
-                            refined_tokens_mb = out.new_empty((int(b), *out.shape[1:]))
-                        refined_tokens_mb[s : s + int(out.shape[0])] = out
-                    if refined_tokens_mb is None:
-                        raise RuntimeError(
-                            "Internal error: controller produced no outputs. "
-                            f"b={int(b)}, ctrl_mb={int(ctrl_mb)}"
-                        )
-                    refined_tokens = refined_tokens_mb
-                else:
-                    refined_tokens = _run_controller_chunk(tokens_centered)
+                refined_tokens = cast(
+                    torch.Tensor,
+                    _microbatch_prealloc(
+                        tokens_centered,
+                        ctrl_mb,
+                        _run_controller_chunk,
+                        stage="controller",
+                    ),
+                )
 
             refined_tokens = _sanitize(refined_tokens)
             tokens_for_decode = refined_tokens.detach() if infer_mode else refined_tokens
@@ -2375,40 +2403,26 @@ class Root(nn.Module):
             )
             with processor_ctx:
 
+                dc = getattr(self, "_decode_compiled", None)
+
                 def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
                     with (
                         Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
                     ):
-                        dc = getattr(self, "_decode_compiled", None)
                         if dc is not None:
-                            if (
-                                self._pad_compiled_microbatch
-                                and chunk.dim() == 3
-                                and chunk.shape[0] != ctrl_mb
-                                and chunk.shape[0] < ctrl_mb
-                            ):
-                                padded = chunk.new_zeros((int(ctrl_mb), *chunk.shape[1:]))
-                                padded[: chunk.shape[0]] = chunk
-                                out = dc(padded)
-                                return out[: chunk.shape[0]]
                             return dc(chunk)
                         return self.processor.decode(chunk, apply_norm=True)
 
-                if ctrl_mb < int(b):
-                    residual_context: Optional[torch.Tensor] = None
-                    for s in range(0, int(b), ctrl_mb):
-                        chunk = tokens_for_decode[s : s + ctrl_mb]
-                        out = _run_decode_chunk(chunk)
-                        if residual_context is None:
-                            residual_context = out.new_empty((int(b), *out.shape[1:]))
-                        residual_context[s : s + int(out.shape[0])] = out
-                    if residual_context is None:
-                        raise RuntimeError(
-                            "Internal error: decoder produced no outputs. "
-                            f"b={int(b)}, ctrl_mb={int(ctrl_mb)}"
-                        )
-                else:
-                    residual_context = _run_decode_chunk(tokens_for_decode)
+                residual_context = cast(
+                    torch.Tensor,
+                    _microbatch_prealloc(
+                        tokens_for_decode,
+                        ctrl_mb,
+                        _run_decode_chunk,
+                        pad_to=(int(ctrl_mb) if (dc is not None and self._pad_compiled_microbatch) else None),
+                        stage="decoder",
+                    ),
+                )
 
             residual_context = _sanitize(residual_context)
             residual = residual_context.reshape(b, -1)
