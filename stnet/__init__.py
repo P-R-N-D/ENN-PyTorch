@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import re
 import warnings
+from types import ModuleType
 
 os.environ.setdefault("TORCH_LOGS", "-all")
 os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import torch
-from tensordict import set_list_to_stack
-
-from . import api, backend, data, functional, model
+try:
+    from tensordict import set_list_to_stack as _set_list_to_stack
+except Exception:
+    _set_list_to_stack = None
 
 __all__ = [
     "api",
@@ -22,6 +25,18 @@ __all__ = [
     "functional",
     "model",
 ]
+
+
+def __getattr__(name: str) -> ModuleType:
+    if name in __all__:
+        module = importlib.import_module(f".{name}", __name__)
+        globals()[name] = module
+        return module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted(list(globals().keys()) + list(__all__))
 
 
 class IgnoreTorchCompileMsg(logging.Filter):
@@ -91,4 +106,10 @@ for logger_name in (
     logger.addFilter(IgnoreTorchCompileMsg())
     logger.setLevel(logging.ERROR)
 
-set_list_to_stack(True).set()
+if _set_list_to_stack is not None:
+    try:
+        setter = _set_list_to_stack(True)
+        if hasattr(setter, "set") and callable(getattr(setter, "set")):
+            setter.set()
+    except Exception:
+        pass

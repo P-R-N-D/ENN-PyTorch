@@ -21,6 +21,27 @@ try:
 except Exception:
     _HAS_TRITON_LIB = False
 
+    class _TritonStub:
+        def jit(self, fn=None, **kwargs):
+            if fn is None:
+                def _deco(f):
+                    return f
+
+                return _deco
+            return fn
+
+        @staticmethod
+        def cdiv(a: int, b: int) -> int:
+            a_i = int(a)
+            b_i = int(b)
+            return (a_i + b_i - 1) // max(1, b_i)
+
+    class _TLStub:
+        constexpr = object()
+
+    triton = _TritonStub()  # type: ignore[assignment]
+    tl = _TLStub()  # type: ignore[assignment]
+
 _HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
 
 
