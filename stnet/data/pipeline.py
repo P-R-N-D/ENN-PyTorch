@@ -1781,11 +1781,17 @@ class Dataset(Generic[TExtra]):
     @staticmethod
     def is_cpu_bf16_supported() -> bool:
         try:
+            mkldnn = getattr(torch.backends, "mkldnn", None)
+            if mkldnn is None:
+                return False
+            if not bool(mkldnn.is_available()) or not bool(getattr(mkldnn, "enabled", True)):
+                return False
             mkldnn_ops = getattr(torch.ops, "mkldnn", None)
-            if mkldnn_ops is not None and hasattr(mkldnn_ops, "_is_mkldnn_bf16_supported"):
-                return bool(torch.ops.mkldnn._is_mkldnn_bf16_supported())
+            f = getattr(mkldnn_ops, "_is_mkldnn_bf16_supported", None) if mkldnn_ops is not None else None
+            if callable(f):
+                return bool(f())
         except Exception:
-            pass
+            return False
         return False
 
     @staticmethod
@@ -1795,7 +1801,10 @@ class Dataset(Generic[TExtra]):
                 return False
             f = getattr(torch.cuda, "is_bf16_supported", None)
             if callable(f):
-                return bool(f())
+                try:
+                    return bool(f(including_emulation=False))
+                except TypeError:
+                    return bool(f())
             major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
             return major >= 8
         except Exception:
