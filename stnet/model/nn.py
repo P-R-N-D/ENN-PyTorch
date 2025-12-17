@@ -24,7 +24,7 @@ import torch
 import torch.nn as nn
 try:
     from tensordict import TensorDictBase
-except Exception:
+except ImportError:
     class TensorDictBase:  # type: ignore[no-redef]
         pass
 
@@ -2085,6 +2085,119 @@ class Root(nn.Module):
         )
         return int(mb_size)
 
+    @torch_no_compile(reason="microbatch prealloc helper")
+    def _microbatch_prealloc(
+        self,
+        inp: torch.Tensor,
+        microbatch: int,
+        run_fn: Callable[[torch.Tensor], Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+        *,
+        pad_to: Optional[int] = None,
+        out_dtype: Optional[torch.dtype] = None,
+        cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        stage: str = "microbatch",
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+        """Run `run_fn` over `inp` in microbatches and stitch outputs without `torch.cat`.
+
+        This helper exists to:
+        - reduce intermediate allocations (no list-append + `torch.cat`)
+        - support fixed-batch compiled kernels via optional padding on the last chunk
+
+        Args:
+            inp: Batched input tensor shaped (B, ...).
+            microbatch: Microbatch size (clamped to [1, B]).
+            run_fn: Function called on each microbatch. Must return either a Tensor
+                shaped (b_i, ...) or a tuple of such tensors.
+            pad_to: If set, last chunk is zero-padded along dim=0 up to `pad_to` before
+                calling `run_fn`, and the output is sliced back to the original size.
+                Typical use: compiled modules that assume a fixed batch size.
+            out_dtype: If set, cast outputs to this dtype before stitching.
+            cast_slice: Optional function applied to each slice before padding/run.
+            stage: Label used in error messages.
+
+        Returns:
+            A Tensor or tuple of Tensors with batch dimension == inp.shape[0].
+        """
+
+        if inp.ndim < 1:
+            raise ValueError(f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}")
+
+        total_b = int(inp.shape[0])
+        mb_i = max(1, min(total_b, int(microbatch) if microbatch else total_b))
+        pad_i = int(pad_to) if pad_to is not None else None
+        if pad_i is not None:
+            pad_i = max(1, pad_i)
+            if pad_i < mb_i:
+                raise ValueError(f"{stage}: pad_to ({pad_i}) must be >= microbatch ({mb_i})")
+
+        out_bufs: Optional[List[torch.Tensor]] = None
+
+        for s in range(0, total_b, mb_i):
+            x_slice = inp[s : s + mb_i]
+            if cast_slice is not None:
+                x_slice = cast_slice(x_slice)
+
+            slice_n = int(x_slice.shape[0])
+            x_in = x_slice
+            did_pad = False
+            if pad_i is not None and slice_n < pad_i:
+                # Avoid torch.cat: allocate padded buffer and copy the slice into the front.
+                x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
+                x_in[:slice_n].copy_(x_slice)
+                did_pad = True
+
+            out = run_fn(x_in)
+
+            if torch.is_tensor(out):
+                outs = (out,)
+            else:
+                outs = cast(Tuple[torch.Tensor, ...], out)
+
+            if len(outs) == 0:
+                raise RuntimeError(f"{stage}: run_fn returned an empty tuple at slice s={s}")
+
+            processed: List[torch.Tensor] = []
+            for j, t in enumerate(outs):
+                if not torch.is_tensor(t):
+                    raise TypeError(f"{stage}: run_fn output #{j} is not a Tensor (type={type(t)})")
+                y = t
+                if did_pad:
+                    if y.shape[0] < slice_n:
+                        raise RuntimeError(
+                            f"{stage}: output batch too small after pad-slice: got={int(y.shape[0])}, expected>={slice_n} (s={s})"
+                        )
+                    y = y[:slice_n]
+                if int(y.shape[0]) != slice_n:
+                    raise RuntimeError(
+                        f"{stage}: output batch mismatch at s={s}: got={int(y.shape[0])}, expected={slice_n}"
+                    )
+                if out_dtype is not None and y.dtype != out_dtype:
+                    y = y.to(dtype=out_dtype)
+                processed.append(y)
+
+            if out_bufs is None:
+                out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
+            else:
+                if len(out_bufs) != len(processed):
+                    raise RuntimeError(
+                        f"{stage}: output arity changed across microbatches: first={len(out_bufs)}, now={len(processed)} (s={s})"
+                    )
+                for k, (buf, y) in enumerate(zip(out_bufs, processed)):
+                    if buf.shape[1:] != y.shape[1:]:
+                        raise RuntimeError(
+                            f"{stage}: output shape changed for output#{k}: first={tuple(buf.shape)}, now={(total_b, *y.shape[1:])} (s={s})"
+                        )
+
+            for buf, y in zip(out_bufs, processed):
+                buf[s : s + slice_n] = y
+
+        if out_bufs is None:
+            raise RuntimeError(f"{stage}: produced no outputs (b={total_b}, microbatch={mb_i})")
+
+        if len(out_bufs) == 1:
+            return out_bufs[0]
+        return tuple(out_bufs)
+
     def forward(
         self,
         features: torch.Tensor | TensorDictBase,
@@ -2240,79 +2353,11 @@ class Root(nn.Module):
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            MicroOut = Union[torch.Tensor, Tuple[torch.Tensor, ...]]
-
-            def _microbatch_prealloc(
-                inp: torch.Tensor,
-                microbatch: int,
-                run_fn: Callable[[torch.Tensor], MicroOut],
-                *,
-                pad_to: Optional[int] = None,
-                out_dtype: Optional[torch.dtype] = None,
-                cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-                stage: str = "microbatch",
-            ) -> MicroOut:
-                """Run `run_fn` over `inp` in microbatches and stitch outputs without `torch.cat`.
-
-                - If `pad_to` is provided, the last chunk is zero-padded along dim=0 to `pad_to`.
-                  This is useful when the wrapped function was compiled assuming a fixed batch size.
-                - Supports a single Tensor output or a tuple of Tensor outputs.
-                """
-
-                total_b = int(inp.shape[0])
-                mb_i = max(1, min(total_b, int(microbatch)))
-                pad_i = int(pad_to) if pad_to is not None else None
-
-                out_buf: Optional[torch.Tensor] = None
-                out_bufs: Optional[List[torch.Tensor]] = None
-
-                for s in range(0, total_b, mb_i):
-                    x_slice = inp[s : s + mb_i]
-                    if cast_slice is not None:
-                        x_slice = cast_slice(x_slice)
-                    slice_n = int(x_slice.shape[0])
-
-                    x_in = x_slice
-                    did_pad = False
-                    if pad_i is not None and slice_n < pad_i:
-                        x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
-                        x_in[:slice_n] = x_slice
-                        did_pad = True
-
-                    out = run_fn(x_in)
-
-                    def _post(t: torch.Tensor) -> torch.Tensor:
-                        if did_pad:
-                            t = t[:slice_n]
-                        if out_dtype is not None and t.dtype != out_dtype:
-                            t = t.to(dtype=out_dtype)
-                        return t
-
-                    if torch.is_tensor(out):
-                        y = _post(out)
-                        if out_buf is None:
-                            out_buf = y.new_empty((total_b, *y.shape[1:]))
-                        out_buf[s : s + slice_n] = y
-                    else:
-                        ys = tuple(_post(t) for t in cast(Tuple[torch.Tensor, ...], out))
-                        if out_bufs is None:
-                            out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in ys]
-                        for buf, y in zip(out_bufs, ys):
-                            buf[s : s + slice_n] = y
-
-                if out_buf is None and out_bufs is None:
-                    raise RuntimeError(
-                        f"Internal error: {stage} produced no outputs. "
-                        f"b={int(total_b)}, microbatch={int(mb_i)}"
-                    )
-
-                return out_buf if out_buf is not None else tuple(out_bufs or [])  # type: ignore[return-value]
-
             enc_ctx = Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
-                    _microbatch_prealloc(
+                    self._microbatch_prealloc(
                         features,
                         mb,
                         _encode,
@@ -2385,7 +2430,7 @@ class Root(nn.Module):
 
                 refined_tokens = cast(
                     torch.Tensor,
-                    _microbatch_prealloc(
+                    self._microbatch_prealloc(
                         tokens_centered,
                         ctrl_mb,
                         _run_controller_chunk,
@@ -2415,7 +2460,7 @@ class Root(nn.Module):
 
                 residual_context = cast(
                     torch.Tensor,
-                    _microbatch_prealloc(
+                    self._microbatch_prealloc(
                         tokens_for_decode,
                         ctrl_mb,
                         _run_decode_chunk,
