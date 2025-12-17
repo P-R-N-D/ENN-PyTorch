@@ -2132,16 +2132,25 @@ class Root(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
 
+        # Prefer the actual module device (covers cases where the caller moved the module
+        # via `.to(...)` after construction).
+        device = next((p.device for p in self.parameters() if p is not None), self._device)
+
         x_raw = features
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
+
+        # NOTE: scaler buffers live on the module device. Move inputs first so
+        # normalize_x doesn't hit a device mismatch (common when DataLoader
+        # yields CPU tensors but the model is on CUDA/XPU/MPS).
+        if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
+            x_raw = x_raw.to(device=device, non_blocking=True)
+
         x_scaled = self.scaler.normalize_x(x_raw)
         with contextlib.suppress(Exception):
             import torch._dynamo as _dynamo
             if _dynamo.is_compiling():
                 _dynamo.graph_break()
-
-        device = self._device
         meta = None
         with contextlib.suppress(Exception):
             meta = Autocast.coerce_metadata(device)
@@ -2194,7 +2203,11 @@ class Root(nn.Module):
                 base_dtype = requested_base
             else:
                 base_dtype = (torch.float32 if amp_enabled else amp_dtype)
-            features = x_scaled.to(device=device, dtype=base_dtype)
+            # x_scaled is already on `device` (we moved x_raw earlier). Avoid an
+            # extra device copy; cast dtype only when needed.
+            if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
+                x_scaled = x_scaled.to(device=device, non_blocking=True)
+            features = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
             if features.ndim != 2 or features.shape[1] != self.in_dim:
                 raise ValueError(
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features.shape)}"
@@ -2221,23 +2234,25 @@ class Root(nn.Module):
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            token_chunks: List[torch.Tensor] = []
-            context_chunks: List[torch.Tensor] = []
+            tokens: Optional[torch.Tensor] = None
+            context: Optional[torch.Tensor] = None
             for s in range(0, int(b), mb):
                 tok: Optional[torch.Tensor] = None
                 ctx_out: Optional[torch.Tensor] = None
                 x_slice = self._cast_graph_safe(features[s : s + mb], device, base_dtype)
                 slice_n = int(x_slice.shape[0])
                 x_in = x_slice
+                did_pad = False
                 if (
                     self._pad_compiled_microbatch
                     and x_slice.dim() == 2
                     and slice_n != int(mb)
                     and slice_n < int(mb)
                 ):
-                    pad_n = int(mb) - slice_n
-                    pad = x_slice.new_zeros((pad_n, x_slice.shape[1]))
-                    x_in = torch.cat([x_slice, pad], dim=0)
+                    # Avoid `torch.cat` here: allocate once and copy the slice into the front.
+                    x_in = x_slice.new_zeros((int(mb), x_slice.shape[1]))
+                    x_in[:slice_n] = x_slice
+                    did_pad = True
 
                 if infer_mode:
                     with contextlib.ExitStack() as stack:
@@ -2251,25 +2266,27 @@ class Root(nn.Module):
                         "Internal error: encoder returned no outputs. "
                         f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}, s={int(s)}"
                     )
-                if x_in is not x_slice:
+                if did_pad:
                     tok = tok[:slice_n]
                     ctx_out = ctx_out[:slice_n]
-                out_tokens = tok.to(dtype=base_dtype)
-                out_context = ctx_out.to(dtype=base_dtype)
-                token_chunks.append(out_tokens)
-                context_chunks.append(out_context)
-            if not token_chunks or not context_chunks:
+
+                out_tokens = tok if tok.dtype == base_dtype else tok.to(dtype=base_dtype)
+                out_context = (
+                    ctx_out if ctx_out.dtype == base_dtype else ctx_out.to(dtype=base_dtype)
+                )
+
+                if tokens is None:
+                    tokens = out_tokens.new_empty((int(b), *out_tokens.shape[1:]))
+                    context = out_context.new_empty((int(b), *out_context.shape[1:]))
+
+                tokens[s : s + slice_n] = out_tokens
+                context[s : s + slice_n] = out_context
+
+            if tokens is None or context is None:
                 raise RuntimeError(
                     "Internal error: no microbatch outputs were collected. "
                     f"is_train_path={is_train_path}, b={int(b)}, mb={int(mb)}"
                 )
-            if len(token_chunks) != len(context_chunks):
-                raise RuntimeError(
-                    "Internal error: microbatch output mismatch. "
-                    f"token_chunks={len(token_chunks)}, context_chunks={len(context_chunks)}"
-                )
-            tokens = torch.cat(token_chunks, dim=0)
-            context = torch.cat(context_chunks, dim=0)
             tokens = _sanitize(tokens)
             context = _sanitize(context)
 
@@ -2282,7 +2299,7 @@ class Root(nn.Module):
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
                 bl = self.linear_branch(
-                    self._cast_graph_safe(features, self._device, assembled.dtype)
+                    self._cast_graph_safe(features, device, assembled.dtype)
                 )
                 assembled = assembled + bl
     
@@ -2332,13 +2349,19 @@ class Root(nn.Module):
                     return out
 
                 if ctrl_mb < int(b):
-                    refined_tokens = torch.cat(
-                        [
-                            _run_controller_chunk(tokens_centered[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
-                        dim=0,
-                    )
+                    refined_tokens_mb: Optional[torch.Tensor] = None
+                    for s in range(0, int(b), ctrl_mb):
+                        chunk = tokens_centered[s : s + ctrl_mb]
+                        out = _run_controller_chunk(chunk)
+                        if refined_tokens_mb is None:
+                            refined_tokens_mb = out.new_empty((int(b), *out.shape[1:]))
+                        refined_tokens_mb[s : s + int(out.shape[0])] = out
+                    if refined_tokens_mb is None:
+                        raise RuntimeError(
+                            "Internal error: controller produced no outputs. "
+                            f"b={int(b)}, ctrl_mb={int(ctrl_mb)}"
+                        )
+                    refined_tokens = refined_tokens_mb
                 else:
                     refined_tokens = _run_controller_chunk(tokens_centered)
 
@@ -2364,21 +2387,26 @@ class Root(nn.Module):
                                 and chunk.shape[0] != ctrl_mb
                                 and chunk.shape[0] < ctrl_mb
                             ):
-                                pad_n = int(ctrl_mb - chunk.shape[0])
-                                pad = chunk.new_zeros((pad_n, chunk.shape[1], chunk.shape[2]))
-                                out = dc(torch.cat([chunk, pad], dim=0))
+                                padded = chunk.new_zeros((int(ctrl_mb), *chunk.shape[1:]))
+                                padded[: chunk.shape[0]] = chunk
+                                out = dc(padded)
                                 return out[: chunk.shape[0]]
                             return dc(chunk)
                         return self.processor.decode(chunk, apply_norm=True)
 
                 if ctrl_mb < int(b):
-                    residual_context = torch.cat(
-                        [
-                            _run_decode_chunk(tokens_for_decode[s : s + ctrl_mb])
-                            for s in range(0, int(b), ctrl_mb)
-                        ],
-                        dim=0,
-                    )
+                    residual_context: Optional[torch.Tensor] = None
+                    for s in range(0, int(b), ctrl_mb):
+                        chunk = tokens_for_decode[s : s + ctrl_mb]
+                        out = _run_decode_chunk(chunk)
+                        if residual_context is None:
+                            residual_context = out.new_empty((int(b), *out.shape[1:]))
+                        residual_context[s : s + int(out.shape[0])] = out
+                    if residual_context is None:
+                        raise RuntimeError(
+                            "Internal error: decoder produced no outputs. "
+                            f"b={int(b)}, ctrl_mb={int(ctrl_mb)}"
+                        )
                 else:
                     residual_context = _run_decode_chunk(tokens_for_decode)
 

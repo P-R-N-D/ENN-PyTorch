@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import inspect
 import json
 import shutil
 import subprocess
@@ -12,7 +13,11 @@ from tempfile import TemporaryDirectory
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
-from tensordict import TensorDictBase
+try:
+    from tensordict import TensorDictBase
+except ImportError:  # pragma: no cover
+    class TensorDictBase:  # type: ignore
+        pass
 from torch import nn
 
 from ..api.io import Format
@@ -596,21 +601,45 @@ class OnnxIO:
                 "dynamic_axes": dynamic_axes,
             }
             onnx_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
+
+            # NOTE: `torch.onnx.export(..., dynamo=...)` is only available on newer
+            # PyTorch versions.  Filter kwargs by signature so this code degrades
+            # gracefully across torch releases.
+            export_sig = None
+            with contextlib.suppress(Exception):
+                export_sig = inspect.signature(torch.onnx.export)
+
+            def _filter_kwargs(kws: Mapping[str, Any]) -> Dict[str, Any]:
+                if export_sig is None:
+                    return dict(kws)
+                return {k: v for k, v in kws.items() if k in export_sig.parameters}
+
+            base_kwargs = _filter_kwargs(common_kwargs)
+            supports_dynamo = export_sig is not None and "dynamo" in export_sig.parameters
+
+            if supports_dynamo:
+                try:
+                    torch.onnx.export(
+                        wrapper,
+                        sample,
+                        str(onnx_path),
+                        dynamo=True,
+                        **base_kwargs,
+                    )
+                except fallback_errors:
+                    torch.onnx.export(
+                        wrapper,
+                        sample,
+                        str(onnx_path),
+                        dynamo=False,
+                        **base_kwargs,
+                    )
+            else:
                 torch.onnx.export(
                     wrapper,
                     sample,
                     str(onnx_path),
-                    dynamo=True,
-                    **common_kwargs,
-                )
-            except fallback_errors:
-                torch.onnx.export(
-                    wrapper,
-                    sample,
-                    str(onnx_path),
-                    dynamo=False,
-                    **common_kwargs,
+                    **base_kwargs,
                 )
             return onnx_path
 

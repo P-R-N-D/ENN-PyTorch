@@ -12,6 +12,11 @@ from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
 
 import torch
 
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
 TensorLike = Any
 
 try:
@@ -24,7 +29,10 @@ except Exception:
 
     ParallelMapper = None
 
-from tensordict import MemoryMappedTensor
+try:
+    from tensordict import MemoryMappedTensor
+except ImportError:  # pragma: no cover
+    MemoryMappedTensor = None  # type: ignore
 
 try:
     from torchdata.nodes import Batcher as _Batcher
@@ -115,6 +123,11 @@ class Sampler(_Sampler):
             self._meta.get("features_dtype", "float64"), torch.float64
         )
         l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
+        if MemoryMappedTensor is None:
+            raise ImportError(
+                "tensordict is required for MemoryMappedTensor-backed pipelines. "
+                "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
+            )
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
@@ -994,6 +1007,7 @@ class Prefetcher:
         depth: int = 2,
         non_blocking: bool = True,
         oom_safe: bool = True,
+        memory_backpressure: bool | None = None,
         gpu_guard_bytes: int | None = None,
         host_guard_bytes: int | None = None,
         **kwargs: Any,
@@ -1004,6 +1018,8 @@ class Prefetcher:
         )
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
+        if memory_backpressure is not None:
+            oom_safe = bool(memory_backpressure)
         self._backpressure = bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
@@ -1013,7 +1029,7 @@ class Prefetcher:
 
     def _to_device(self, x: Any, device: torch.device) -> Any:
         if torch.is_tensor(x):
-            return x.to(device, non_blocking=True)
+            return x.to(device, non_blocking=self._non_blocking)
         if isinstance(x, (list, tuple)):
             return type(x)(self._to_device(t, device) for t in x)
         if isinstance(x, dict):
@@ -1071,9 +1087,10 @@ class Prefetcher:
         def _host_mem_ok() -> bool:
             if self._host_guard_bytes <= 0:
                 return True
+            if _psutil is None:
+                return True
             try:
-                import psutil            
-                return bool(psutil.virtual_memory().available >= self._host_guard_bytes)
+                return bool(_psutil.virtual_memory().available >= self._host_guard_bytes)
             except Exception:
                 return True
 

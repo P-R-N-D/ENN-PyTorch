@@ -581,7 +581,9 @@ class DilatedAttention(nn.Module):
             max_group = max(1, min(B, max_group))
 
             def _run_flex_for_group(group_size: int) -> torch.Tensor:
-                outputs: List[torch.Tensor] = []
+                # Pre-allocate output to avoid repeated small allocations + `torch.cat`
+                # (helps especially when `group_size` is small due to OOM back-off).
+                out_full: Optional[torch.Tensor] = None
                 for b0 in range(0, B, group_size):
                     b1 = min(B, b0 + group_size)
                     B_g = b1 - b0
@@ -676,11 +678,17 @@ class DilatedAttention(nn.Module):
                     out_g = self.out_proj(
                         y_g.transpose(1, 2).contiguous().view(B_g, L_q, self.embed_dim)
                     )
-                    outputs.append(out_g)
+                    if out_full is None:
+                        # Fast-path: one group == whole batch.
+                        if B_g == B:
+                            return out_g
+                        out_full = out_g.new_empty((B, *out_g.shape[1:]))
 
-                if len(outputs) == 1:
-                    return outputs[0]
-                return torch.cat(outputs, dim=0)  # type: ignore[return-value]
+                    out_full[b0:b1] = out_g
+
+                if out_full is None:
+                    raise RuntimeError("Internal error: flex_attention produced no outputs")
+                return out_full
 
             group = max_group
             last_oom: Optional[RuntimeError] = None
