@@ -2,17 +2,19 @@
 
 Spatio‑temporal neural network building blocks for PyTorch with pragmatic utilities for data pipelines, training, export, and system tuning. The package is structured to keep the *model code* small while providing a clean façade over configuration, I/O, distributed runtime, and export helpers.
 
+This repository also includes a worked example notebook (`notebook.ipynb`, Korean) and a small sample dataset (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
+
 > **Python**: 3.10+ · **License**: PolyForm Noncommercial 1.0.0
 
 ## Features
-- **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation.
+- **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
 - **I/O helpers** (`stnet.api.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
 - **Runtime utilities** (`stnet.backend.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.backend.distributed`): utilities to bootstrap and coordinate multi‑process training.
-- **Export** (`stnet.backend.export`): ONNX and serving-oriented conversion helpers (optional `service` extra).
-- **Data pipeline** (`stnet.data`): `torchdata`-driven nodes for scalable input pipelines.
-- **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), FX utils, and optimizers/SWA.
-- **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `History`, `Instance`).
+- **Export** (`stnet.backend.export`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
+- **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
+- **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
+- **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `Root`, `History`).
 
 ## Installation
 
@@ -27,7 +29,7 @@ Spatio‑temporal neural network building blocks for PyTorch with pragmatic util
 
 Optional extras:
 ```bash
-# ONNX/CoreML/TensorRT/ExecuTorch export helpers
+# ONNX / ORT / CoreML / TensorRT / ExecuTorch export helpers
 pip install -e .[deployment]
 
 # Dataframe integrations
@@ -43,9 +45,17 @@ pip install -e .[torchao]
 
 # Telemetry (NVIDIA GPU info)
 pip install -e .[telemetry]
+
+# NUFFT losses (CUDA, optional)
+pip install -e .[nufft]
+
+# Dev tooling (lint/test)
+pip install -e .[dev]
 ```
 
 > **Note**: Do **not** install `triton` manually; the correct Triton build is pulled automatically by PyTorch.
+
+> **Platform note**: some `deployment` backends are OS/driver dependent (e.g., CoreML on macOS, TensorRT on Linux with NVIDIA CUDA). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
 
 ## Quickstart
 
@@ -122,6 +132,9 @@ for key, tensor in lazy_preds.items():
 ```
 `output="file"` streams per-rank parts to `chunks_dir` with stable key metadata; use `get_prediction` to reload eagerly or lazily without rematerializing keys.
 
+Notebook demo:
+- Open `notebook.ipynb` for an end-to-end workflow using `raw_data.xlsx`.
+
 > API names above reflect the current package layout. If you have local changes, adjust imports accordingly.
 
 ## Project layout
@@ -139,24 +152,26 @@ stnet/
     compat.py
     distributed.py
     export.py
-    profiler.py
     runtime.py
     system.py
   data/
     __init__.py
+    collections.py
     datatype.py
     nodes.py
     pipeline.py
   functional/
     __init__.py
-    fx.py
     losses.py
     optimizers.py
+    profiler.py
   model/
     __init__.py
     activations.py
+    fused.py
     kernels.py
     layers.py
+    nn.py
 
 ```
 
@@ -168,11 +183,13 @@ stnet/
 ## Version & compatibility notes
 
 - Python ≥ 3.10 is required.
-- PyTorch is expected to be **≥ 2.8.0**. If you rely on features that landed later (e.g., advanced Inductor options), bump the constraint accordingly.
+- PyTorch is expected to be **≥ 2.8.0**. If you rely on features that landed later (e.g., newer Inductor options), bump the constraint accordingly.
 - `torchdata` is used by the data pipeline nodes; it is listed as a dependency to avoid runtime import errors.
+- `tensordict` is used for TensorDict integration and memory-mapped tensor utilities.
 - `triton` is intentionally **not** pinned here; the correct binary is installed as a transitive dependency of PyTorch.
+- Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
 
 ## License
 
 **Code** is licensed under **PolyForm Noncommercial 1.0.0**.  
-**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license.
+**Weights/datasets/other artifacts** remain under the terms described in your `LICENSE` file. For commercial use, obtain a separate license
