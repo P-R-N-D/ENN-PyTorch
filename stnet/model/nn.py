@@ -2077,7 +2077,6 @@ class Root(nn.Module):
             stage_div = max(1, int(os.environ.get("STNET_MICROBATCH_STAGE_DIV", stage_div)))
         per_sample = max(1, int(per_sample // stage_div))
 
-        # Decide microbatch size based on combined host + device free memory.
         mb_size = _auto_microbatch(
             device=device,
             hard_max=hard_max,
@@ -2097,27 +2096,6 @@ class Root(nn.Module):
         cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
         stage: str = "microbatch",
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """Run `run_fn` over `inp` in microbatches and stitch outputs without `torch.cat`.
-
-        This helper exists to:
-        - reduce intermediate allocations (no list-append + `torch.cat`)
-        - support fixed-batch compiled kernels via optional padding on the last chunk
-
-        Args:
-            inp: Batched input tensor shaped (B, ...).
-            microbatch: Microbatch size (clamped to [1, B]).
-            run_fn: Function called on each microbatch. Must return either a Tensor
-                shaped (b_i, ...) or a tuple of such tensors.
-            pad_to: If set, last chunk is zero-padded along dim=0 up to `pad_to` before
-                calling `run_fn`, and the output is sliced back to the original size.
-                Typical use: compiled modules that assume a fixed batch size.
-            out_dtype: If set, cast outputs to this dtype before stitching.
-            cast_slice: Optional function applied to each slice before padding/run.
-            stage: Label used in error messages.
-
-        Returns:
-            A Tensor or tuple of Tensors with batch dimension == inp.shape[0].
-        """
 
         if inp.ndim < 1:
             raise ValueError(f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}")
@@ -2141,7 +2119,6 @@ class Root(nn.Module):
             x_in = x_slice
             did_pad = False
             if pad_i is not None and slice_n < pad_i:
-                # Avoid torch.cat: allocate padded buffer and copy the slice into the front.
                 x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
                 x_in[:slice_n].copy_(x_slice)
                 did_pad = True
@@ -2246,8 +2223,6 @@ class Root(nn.Module):
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
 
-        # Prefer the actual module device (covers cases where the caller moved the module
-        # via `.to(...)` after construction).
         buf0 = next(self.buffers(), None)
         if buf0 is not None:
             device = buf0.device
@@ -2259,9 +2234,6 @@ class Root(nn.Module):
         if x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
 
-        # NOTE: scaler buffers live on the module device. Move inputs first so
-        # normalize_x doesn't hit a device mismatch (common when DataLoader
-        # yields CPU tensors but the model is on CUDA/XPU/MPS).
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
             x_raw = x_raw.to(device=device, non_blocking=True)
 
@@ -2322,8 +2294,6 @@ class Root(nn.Module):
                 base_dtype = requested_base
             else:
                 base_dtype = (torch.float32 if amp_enabled else amp_dtype)
-            # x_scaled is already on `device` (we moved x_raw earlier). Avoid an
-            # extra device copy; cast dtype only when needed.
             if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
             features = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled

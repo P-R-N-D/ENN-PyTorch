@@ -602,9 +602,6 @@ class OnnxIO:
             }
             onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # NOTE: `torch.onnx.export(..., dynamo=...)` is only available on newer
-            # PyTorch versions.  Filter kwargs by signature so this code degrades
-            # gracefully across torch releases.
             export_sig = None
             with contextlib.suppress(Exception):
                 export_sig = inspect.signature(torch.onnx.export)

@@ -1106,13 +1106,6 @@ class Prefetcher:
                     time.sleep(0)
         else:
 
-            # N-ahead prefetch implemented with a bounded queue.
-            #
-            # - Producer thread keeps up to `depth` batches in-flight.
-            # - When using CUDA, device copies are scheduled on a dedicated stream and
-            #   synchronized via events when the consumer yields the batch.
-            # - Backpressure is enforced by the queue (always) and optionally by host/GPU
-            #   memory guards.
             if use_cuda_stream and self._gpu_stream is None:
                 self._gpu_stream = torch.cuda.Stream(device=device)
 
@@ -1123,16 +1116,11 @@ class Prefetcher:
                     self.exc = exc
                     self.tb = tb
 
-            # Each queue item is either:
-            # - (batch, cuda_event | None)
-            # - _Err
-            # - SENTINEL
             q: "queue.Queue[Any]" = queue.Queue(maxsize=int(self._depth))
             stop = threading.Event()
             it = iter(iterable)
 
             def _put(item: Any) -> None:
-                # Avoid deadlock on early-stop: use timeouts and check `stop`.
                 while not stop.is_set():
                     try:
                         q.put(item, timeout=0.1)
@@ -1142,7 +1130,6 @@ class Prefetcher:
 
             def _producer() -> None:
                 try:
-                    # In multi-GPU setups, CUDA device selection can be thread-local.
                     if use_cuda_stream and isinstance(device, torch.device):
                         with suppress(Exception):
                             if device.index is not None:
@@ -1210,5 +1197,4 @@ class Prefetcher:
                 stop.set()
                 _maybe_close_upstream()
                 with suppress(Exception):
-                    # Best effort: let the producer thread exit promptly.
                     t.join(timeout=1.0)

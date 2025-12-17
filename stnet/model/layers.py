@@ -679,7 +679,6 @@ class DilatedAttention(nn.Module):
                         y_g.transpose(1, 2).contiguous().view(B_g, L_q, self.embed_dim)
                     )
                     if out_full is None:
-                        # Fast-path: one group == whole batch.
                         if B_g == B:
                             return out_g
                         out_full = out_g.new_empty((B, *out_g.shape[1:]))
