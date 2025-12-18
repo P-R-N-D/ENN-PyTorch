@@ -660,7 +660,7 @@ def _batch_interval(
                 new_host_cap = None if cap_host <= 0 else cap_host
 
             if (new_dev_cap != tpl.device_budget_max_bytes) or (new_host_cap != tpl.host_budget_max_bytes):
-                tpl = dataclasses.replace(
+                tpl = replace(
                     tpl,
                     device_budget_max_bytes=new_dev_cap,
                     host_budget_max_bytes=new_host_cap,
