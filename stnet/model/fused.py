@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import logging
 import math
+from dataclasses import dataclass
 from contextlib import AbstractContextManager
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
@@ -14,7 +15,7 @@ from torch import nn
 
 from ..backend.compat import patch_torch
 from ..backend.system import get_device
-from ..data.pipeline import Dataset
+from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
 patch_torch()
 
@@ -153,41 +154,194 @@ def is_scale_safe(
     meta: Optional[Dataset[Any]],
     *args: Any,
     safety_margin: float = 8.0,
+    underflow_action: Optional[str] = None,
     **kwargs: Any,
 ) -> bool:
+    """Return True if `dtype` can represent the dataset scale without overflow.
+
+    This is used during AMP / low-precision negotiation.
+
+    Underflow handling is policy-controlled:
+    - allow: underflow is allowed
+    - warn: allow (loggers may warn elsewhere)
+    - forbid: treat underflow as unsafe for downcasting
+    """
     if meta is None or not getattr(meta, "has_scale", False):
         return True
     if not isinstance(dtype, torch.dtype):
         return False
+    # If we already observed NaN/Inf in data, do not downcast.
+    if bool(getattr(meta, "has_nonfinite", False)):
+        return False
+
     max_abs = getattr(meta, "scale_max_abs", None)
     if max_abs is None:
         return True
-    max_abs = float(abs(max_abs))
+    try:
+        max_abs = float(abs(max_abs))
+    except Exception:
+        return False
     if not math.isfinite(max_abs):
         return False
+
+    # Resolve underflow policy
+    action = normalize_underflow_action(
+        underflow_action if underflow_action is not None else getattr(meta, "underflow_action", None),
+        default=default_underflow_action(),
+    )
+
     if getattr(dtype, "is_complex", False):
         base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
-        return is_scale_safe(base_dtype, meta, safety_margin=safety_margin)
-    elif getattr(dtype, "is_floating_point", False):
+        return is_scale_safe(base_dtype, meta, safety_margin=safety_margin, underflow_action=action)
+
+    if getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
-        if max_abs > float(info.max) / safety_margin:
+        if max_abs > float(info.max) / max(1.0, float(safety_margin)):
             return False
         min_pos = getattr(meta, "scale_min_positive", None)
-        if min_pos is not None and min_pos < float(info.tiny) * safety_margin:
-            return False
+        if action == "forbid" and min_pos is not None:
+            try:
+                min_pos_f = float(min_pos)
+            except Exception:
+                return False
+            if math.isfinite(min_pos_f) and min_pos_f > 0.0:
+                if min_pos_f < float(info.tiny) * max(1.0, float(safety_margin)):
+                    return False
         return True
-    elif dtype == torch.bool:
+
+    if dtype == torch.bool:
         is_integral = getattr(meta, "scale_is_integral", None)
         return (is_integral is None or is_integral) and max_abs <= 1.0
-    else:
-        try:
-            info = torch.iinfo(dtype)
-        except TypeError:
-            return False
-        is_integral = getattr(meta, "scale_is_integral", None)
-        if is_integral is False:
-            return False
-        return max_abs <= float(info.max)
+
+    try:
+        info = torch.iinfo(dtype)
+    except TypeError:
+        return False
+    is_integral = getattr(meta, "scale_is_integral", None)
+    if is_integral is False:
+        return False
+    return max_abs <= float(info.max)
+
+
+@dataclass(slots=True)
+class PrecisionPolicy:
+    """End-to-end precision policy used by runtime.
+
+    B-mode policy:
+    - master_float is determined by dataset negotiability (fp64 or fp32)
+    - AMP / FSDP communication dtypes are negotiated only if master_float is fp32
+    - BN buffers stay in master_float (fp32 or fp64)
+    - modules marked __stnet_precision_exempt__ must not be cast by runtime
+    """
+
+    master_float: torch.dtype = torch.float32
+    amp_dtype: Optional[torch.dtype] = None
+
+    fsdp_param_dtype: torch.dtype = torch.float32
+    fsdp_reduce_dtype: torch.dtype = torch.float32
+    fsdp_output_dtype: torch.dtype = torch.float32
+
+    bn_buffers_dtype: torch.dtype = torch.float32
+    underflow_action: str = "warn"
+
+    @property
+    def amp_float(self) -> Optional[torch.dtype]:
+        return self.amp_dtype
+
+    @classmethod
+    def from_metadata(
+        cls,
+        device: Union[torch.device, str],
+        metadata: Optional[Dataset[Any]],
+        *,
+        logger: Optional[logging.Logger] = None,
+        safety_margin: float = 8.0,
+    ) -> "PrecisionPolicy":
+        dev = torch.device(device)
+        meta = metadata
+        if meta is None:
+            meta = Dataset.for_device(dev)
+        else:
+            with contextlib.suppress(Exception):
+                meta.device = dev
+                meta.refresh()
+
+        action = normalize_underflow_action(getattr(meta, "underflow_action", None), default=default_underflow_action())
+        with contextlib.suppress(Exception):
+            meta.underflow_action = action
+
+        negotiable = getattr(meta, "is_negotiable", None)
+        if negotiable is False:
+            # Dataset cannot safely be represented in fp32.
+            master = torch.float64
+            return cls(
+                master_float=master,
+                amp_dtype=None,
+                fsdp_param_dtype=master,
+                fsdp_reduce_dtype=master,
+                fsdp_output_dtype=master,
+                bn_buffers_dtype=master,
+                underflow_action=action,
+            )
+
+        master = torch.float32
+
+        # AMP negotiation candidates from dataset metadata
+        candidates = list(getattr(meta, "float_dtypes", ()) or ())
+        if not candidates:
+            # Conservative default ordering
+            if dev.type == "cuda":
+                candidates = [torch.bfloat16, torch.float16, torch.float32]
+            else:
+                candidates = [torch.bfloat16, torch.float32]
+
+        # remove float64 and non-float candidates
+        cleaned: list[torch.dtype] = []
+        for d in candidates:
+            if not isinstance(d, torch.dtype):
+                continue
+            try:
+                if not torch.is_floating_point(torch.empty((), dtype=d)):
+                    continue
+            except Exception:
+                continue
+            if d == torch.float64:
+                continue
+            cleaned.append(d)
+        if torch.float32 not in cleaned:
+            cleaned.append(torch.float32)
+
+        amp: Optional[torch.dtype] = None
+        for d in cleaned:
+            if d in (torch.float16, torch.bfloat16):
+                if is_scale_safe(d, meta, safety_margin=safety_margin, underflow_action=action):
+                    amp = d
+                    break
+        reduce_dtype = amp if amp is not None else master
+        # CPU FSDP reduce in fp16 is fragile; keep fp32 unless bf16 is explicitly safe.
+        if dev.type == "cpu" and reduce_dtype == torch.float16:
+            reduce_dtype = torch.float32
+            amp = None
+
+        return cls(
+            master_float=master,
+            amp_dtype=amp,
+            fsdp_param_dtype=master,
+            fsdp_reduce_dtype=reduce_dtype,
+            fsdp_output_dtype=reduce_dtype,
+            bn_buffers_dtype=master,
+            underflow_action=action,
+        )
+
+    def for_fsdp(self) -> Any:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+
+        return MixedPrecisionPolicy(
+            param_dtype=self.fsdp_param_dtype,
+            reduce_dtype=self.fsdp_reduce_dtype,
+            output_dtype=self.fsdp_output_dtype,
+            cast_forward_inputs=False,
+        )
 
 
 def _is_for_cuda(module: nn.Module) -> bool:
@@ -1427,7 +1581,12 @@ class ModelPolicy:
         fp8_ok, why = Dataset.is_float8_supported(dev)
         if fp8_ok:
             setattr(model, "__te_fp8_default__", True)
-        params_dtype = ModelPolicy.negotiate(dev, metadata=metadata)
+        params_dtype = kwargs.pop("params_dtype", None)
+        if not isinstance(params_dtype, torch.dtype):
+            params_dtype = ModelPolicy.negotiate(dev, metadata=metadata)
+        # TE kernels are not intended for fp64 params; keep torch layers.
+        if params_dtype is torch.float64:
+            return (model, False, "TE disabled for fp64 params")
         model, n_layers = ModelPolicy._to_nvidia_layers(
             model,
             apply_te_linear=True,

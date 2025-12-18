@@ -206,6 +206,11 @@ def _reset_layernorm_parameter(
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
 def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
+    """Cast *floating* parameters/buffers to dtype, skipping precision-exempt modules.
+
+    NOTE: We intentionally avoid nn.Module.to(dtype=...) here, because it would also
+    cast bookkeeping buffers (History, Scaler, etc.) that must remain float64/int64.
+    """
     if not isinstance(dtype, torch.dtype):
         return
     try:
@@ -213,13 +218,15 @@ def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
             return
     except Exception:
         return
-    try:
-        if isinstance(model, nn.Module):
-            model.to(dtype=dtype)
-    except Exception:
-        pass
+
+    def _is_exempt(mod: Any) -> bool:
+        return bool(getattr(mod, "__stnet_precision_exempt__", False))
+
     with torch.no_grad():
         for mod in getattr(model, "modules", lambda: [])():
+            if _is_exempt(mod):
+                continue
+
             params = getattr(mod, "_parameters", None)
             if params:
                 for name, p in list(params.items()):
@@ -428,6 +435,99 @@ def _set_backend(device: torch.device) -> None:
             pass
 
 
+def _iter_source_paths(obj: Any):
+    """Yield memmap directory paths from a (possibly nested) ops.sources object."""
+    if obj is None:
+        return
+    if isinstance(obj, str):
+        yield obj
+        return
+    if isinstance(obj, dict):
+        # common form: {"kind": "memmap", "path": "..."}
+        if obj.get("kind") == "memmap" and isinstance(obj.get("path"), str):
+            yield obj["path"]
+            return
+        # otherwise: recurse values
+        for v in obj.values():
+            yield from _iter_source_paths(v)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            yield from _iter_source_paths(v)
+        return
+
+
+def _merge_meta_dicts(metas: list[dict]) -> dict:
+    """Merge multiple meta.json dicts with conservative scale negotiation.
+
+    - feature_dim / label_shape must match.
+    - scale_max_abs is merged by max.
+    - scale_min_positive is merged by min (ignoring None).
+    - has_scale / has_nonfinite are merged by OR.
+    - is_negotiable is merged by AND (if present).
+    - underflow_action is merged by strictest: forbid > warn > allow.
+    """
+    if not metas:
+        return {}
+    base = dict(metas[0])
+
+    def _strictest_underflow(a: str | None, b: str | None) -> str | None:
+        order = {"allow": 0, "warn": 1, "forbid": 2}
+        if a is None:
+            return b
+        if b is None:
+            return a
+        return a if order.get(a, 1) >= order.get(b, 1) else b
+
+    # sanity dims
+    feature_dim = base.get("feature_dim")
+    label_shape = base.get("label_shape")
+
+    has_scale = bool(base.get("has_scale", False)) or base.get("scale_max_abs") is not None or base.get("scale_min_positive") is not None
+    has_nonfinite = bool(base.get("has_nonfinite", False))
+    max_abs = base.get("scale_max_abs")
+    min_pos = base.get("scale_min_positive")
+    is_integral = base.get("scale_is_integral")
+    is_negotiable = base.get("is_negotiable")
+    underflow_action = base.get("underflow_action")
+
+    for m in metas[1:]:
+        if feature_dim is not None and m.get("feature_dim") is not None and int(m.get("feature_dim")) != int(feature_dim):
+            raise ValueError(f"feature_dim mismatch across sources: {feature_dim} vs {m.get('feature_dim')}")
+        if label_shape is not None and m.get("label_shape") is not None and tuple(m.get("label_shape")) != tuple(label_shape):
+            raise ValueError(f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}")
+
+        has_scale = has_scale or bool(m.get("has_scale", False)) or m.get("scale_max_abs") is not None or m.get("scale_min_positive") is not None
+        has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
+
+        a = m.get("scale_max_abs")
+        if a is not None:
+            max_abs = a if max_abs is None else max(float(max_abs), float(a))
+
+        p = m.get("scale_min_positive")
+        if p is not None:
+            min_pos = p if min_pos is None else min(float(min_pos), float(p))
+
+        i = m.get("scale_is_integral")
+        if i is not None:
+            is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
+
+        n = m.get("is_negotiable")
+        if n is not None:
+            is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
+
+        underflow_action = _strictest_underflow(underflow_action, m.get("underflow_action"))
+
+    base["has_scale"] = has_scale
+    base["has_nonfinite"] = has_nonfinite
+    base["scale_max_abs"] = max_abs
+    base["scale_min_positive"] = min_pos
+    base["scale_is_integral"] = is_integral
+    base["is_negotiable"] = is_negotiable
+    base["underflow_action"] = underflow_action
+    return base
+
+
 def _from_meta(memmap_dir: str) -> Dict[str, Any]:
     meta_path = os.path.join(memmap_dir, "meta.json")
     with open(meta_path, "r", encoding="utf-8") as f:
@@ -472,6 +572,18 @@ def _first_source_path(obj: Any) -> str:
     if isinstance(obj, (list, tuple)) and obj:
         return _first_source_path(obj[0])
     raise RuntimeError("sources is empty or invalid")
+
+
+def _merge_meta_infos(sources: Any) -> Dict[str, Any]:
+    metas: list[dict] = []
+    for path in _iter_source_paths(sources):
+        try:
+            metas.append(_from_meta(path))
+        except Exception:
+            continue
+    if not metas:
+        return {}
+    return _merge_meta_dicts(metas)
 
 
 def _expand(sources: Any) -> Any:
@@ -1059,8 +1171,20 @@ def epochs(
     meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
     autocast_dtype: Optional[torch.dtype] = None
+    # Compatibility: older Autocast.resolve_float_dtype may not accept `metadata=`.
     with contextlib.suppress(Exception):
-        autocast_dtype = Autocast.resolve_float_dtype(device)
+        import inspect
+
+        f = getattr(Autocast, "resolve_float_dtype", None)
+        if callable(f):
+            try:
+                sig = inspect.signature(f)
+                if "metadata" in getattr(sig, "parameters", {}):
+                    autocast_dtype = f(device, metadata=meta)
+                else:
+                    autocast_dtype = f(device)
+            except Exception:
+                autocast_dtype = f(device)
     with contextlib.suppress(Exception):
         set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
 
@@ -1350,13 +1474,37 @@ def epochs(
     util_warmup_steps: int = 0
 
     def _cast_fp_buffers(module: torch.nn.Module, dtype: torch.dtype) -> None:
-        for buf in module.buffers(recurse=True):
-            if isinstance(buf, torch.Tensor) and buf.is_floating_point():
-                try:
-                    if buf.dtype != dtype:
-                        buf.data = buf.data.to(dtype=dtype)
-                except Exception:
-                    pass
+        # Cast *only* BatchNorm/SyncBatchNorm buffers, and skip precision-exempt modules.
+        if dtype is None:
+            return
+
+        def _is_exempt(m: torch.nn.Module) -> bool:
+            return bool(getattr(m, "__stnet_precision_exempt__", False))
+
+        with torch.no_grad():
+            for mod in module.modules():
+                if _is_exempt(mod):
+                    continue
+                if isinstance(
+                    mod,
+                    (
+                        torch.nn.BatchNorm1d,
+                        torch.nn.BatchNorm2d,
+                        torch.nn.BatchNorm3d,
+                        torch.nn.SyncBatchNorm,
+                    ),
+                ):
+                    for name, buf in mod._buffers.items():
+                        if buf is None or not isinstance(buf, torch.Tensor):
+                            continue
+                        if not buf.is_floating_point():
+                            continue
+                        if buf.dtype == dtype:
+                            continue
+                        try:
+                            mod._buffers[name] = buf.to(dtype=dtype)
+                        except Exception:
+                            pass
 
     if buffers_dtype is not None:
         target_for_buffers = model.module if hasattr(model, "module") else model
@@ -1457,7 +1605,7 @@ def epochs(
             if feats.ndim == 3 and feats.shape[1] == 1:
                 feats = feats.reshape(feats.shape[0], -1)
 
-            xf = feats.to(device=scaler_x_device, dtype=torch.float32)
+            xf = feats.to(device=scaler_x_device, dtype=torch.float64)
             n_x = xf.shape[0]
             if n_x > 0:
                 x_count += n_x
@@ -1470,7 +1618,7 @@ def epochs(
                     x_sum += sx
                     x_sum_sq += sx2
 
-            yf = labs.to(device=scaler_y_device, dtype=torch.float32)
+            yf = labs.to(device=scaler_y_device, dtype=torch.float64)
             if yf.ndim >= 2:
                 yf = yf.reshape(yf.shape[0], -1)
             n_y = yf.shape[0]
@@ -2816,6 +2964,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             "main expects (RuntimeConfig,), (RuntimeConfig, ret_sink), (local_rank, RuntimeConfig), or (local_rank, RuntimeConfig, ret_sink) arguments"
         )
 
+    verbose = bool(getattr(ops, "verbose", False))
     if ops.mode == "train":
         with contextlib.suppress(Exception):
             if torch.cuda.is_available():
@@ -2825,6 +2974,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         device = get_device()
         _set_backend(device)
         backend = _backend_type(device)
+        enable_tf32 = bool(getattr(ops, "enable_tf32", True))
         _initialize_group(backend, device, local_rank)
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
@@ -2859,7 +3009,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         expanded_sources = _expand(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        meta_info = _from_meta(_first_source_path(ops.sources))
+        meta_info = _merge_meta_infos(ops.sources)
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(
@@ -2885,69 +3035,88 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                     % (ops.val_frac, actual_val_frac)
                 )
                 ops = replace(ops, val_frac=actual_val_frac)
-        model, _, _ = fused.ModelPolicy.use_nvidia_layers(model, device=device)
-        Autocast.configure(model, metadata=metadata)
-        float_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else ()
-        if not float_candidates:
-            float_candidates = (torch.float32,)
-        desired_param_dtype = Autocast.negotiate(
-            tuple(float_candidates),
-            fallback=torch.float64,
-            logger=_LOGGER,
-            context="runtime.param_dtype",
-            device=device,
-            meta=metadata,
+        # Apply scale metadata from memmap meta.json to the in-memory Dataset descriptor.
+        # (Older meta.json files may not have these fields.)
+        metadata.has_scale = bool(
+            meta_info.get("has_scale", False)
+            or meta_info.get("scale_max_abs") is not None
+            or meta_info.get("scale_min_positive") is not None
+            or meta_info.get("scale_min_abs") is not None
         )
-        param_dtype = torch.float64 if desired_param_dtype is torch.float64 else torch.float32
-        _cast_model_fp_dtype(model, param_dtype)
-        autocast_dtype: Optional[torch.dtype] = None
-        with contextlib.suppress(Exception):
-            autocast_dtype = Autocast.resolve_float_dtype(device)
-        with contextlib.suppress(Exception):
-            set_float32_precision(device, dtype=param_dtype, autocast_dtype=autocast_dtype)
+        metadata.has_nonfinite = bool(meta_info.get("has_nonfinite", False))
+        metadata.scale_max_abs = meta_info.get("scale_max_abs")
+        metadata.scale_min_positive = meta_info.get("scale_min_positive") or meta_info.get("scale_min_abs")
+        metadata.scale_is_integral = meta_info.get("scale_is_integral")
+        if meta_info.get("is_negotiable") is not None:
+            metadata.is_negotiable = bool(meta_info.get("is_negotiable"))
+        if meta_info.get("underflow_action") is not None:
+            metadata.underflow_action = str(meta_info.get("underflow_action"))
 
+        # If the dataset was *stored* in float64, keep master dtype at float64 to avoid
+        # accidental promotion/TE incompatibilities, even if the values would be fp32-castable.
+        feat_dtype_name = str(meta_info.get("features_dtype", "")).lower()
+        lab_dtype_name = str(meta_info.get("labels_dtype", "")).lower()
+        if "float64" in feat_dtype_name or "float64" in lab_dtype_name:
+            metadata.is_negotiable = False
+
+        # Resolve a coherent precision policy (master dtype + optional AMP compute dtype) from metadata.
+        precision = fused.PrecisionPolicy.from_metadata(device=device, metadata=metadata, logger=_LOGGER)
+        param_dtype = precision.master_float
+
+        if device.type != "cuda":
+            _LOGGER.warning(
+                "Forcing CPU / non-CUDA config: mixed precision + NVIDIA fused layers may be unavailable."
+            )
+
+        model, _, _ = fused.ModelPolicy.use_nvidia_layers(
+            model,
+            device=device,
+            metadata=metadata,
+            params_dtype=param_dtype,
+            verbose=verbose,
+        )
+        Autocast.configure(model, metadata=metadata)
+
+        # TF32 (when available) is orthogonal: it affects matmul/conv execution, not storage dtypes.
+        set_float32_precision(
+            device=device,
+            autocast_dtype=precision.amp_float or param_dtype,
+            enable_tf32=enable_tf32,
+        )
+
+        # Optional FP8 (only makes sense when master params are <= FP32 and a CUDA backend exists).
         fp8_ok, fp8_reason = Dataset.is_float8_supported(device)
-        fp8_enabled = False
+        fp8_enabled: bool = False
         fp8_backend: Optional[str] = None
         disable_note: Optional[str] = None
-        if fp8_ok:
+        if param_dtype is torch.float64:
+            disable_note = "master dtype is float64"
+        elif fp8_ok:
             model, fp8_enabled, fp8_backend = fused.ModelPolicy.enable_float8_training(
-                model, metadata=metadata, logger=_float8_log
+                model,
+                metadata=metadata,
+                logger=_float8_log,
             )
             if not fp8_enabled:
-                disable_note = fp8_backend
+                disable_note = fp8_backend or fp8_reason
         else:
             disable_note = fp8_reason
         if not fp8_enabled:
             Autocast.configure(model, metadata=metadata)
             if disable_note:
                 _float8_log(f"[FP8] disabled: {disable_note}")
+
         _cast_model_fp_dtype(model, param_dtype)
         model.train()
         world = get_world_size(device)
         mesh = None
-        amp_candidates = tuple(getattr(metadata, "float_dtypes", ())) if metadata is not None else Autocast.float_amp_priority(device)
-        if not amp_candidates:
-            amp_candidates = (torch.float32,)
-        amp_reduce_dtype = Autocast.negotiate(
-            amp_candidates,
-            fallback=torch.float64,
-            context="fsdp.reduce",
-            device=device,
-            meta=metadata,
-        )
-        amp_buffers_dtype = Autocast.negotiate(
-            amp_candidates,
-            fallback=torch.float64,
-            context="buffers.bn",
-            device=device,
-            meta=metadata,
-        )
-        fsdp_mp_dtype = amp_reduce_dtype
+        # FSDP: keep parameters in master dtype; use reduce/output in AMP dtype when enabled.
+        fsdp_mp_dtype = precision.fsdp_reduce_dtype
         if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
             fsdp_mp_dtype = torch.float32
+        amp_buffers_dtype = precision.bn_buffers_dtype
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=fsdp_mp_dtype,
+            param_dtype=param_dtype,
             reduce_dtype=fsdp_mp_dtype,
             output_dtype=fsdp_mp_dtype,
             cast_forward_inputs=False,

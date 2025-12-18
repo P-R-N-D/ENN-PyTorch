@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import re
 from contextlib import contextmanager, suppress
 from functools import partial
 from typing import Any, Callable, Iterator
@@ -66,6 +67,53 @@ except Exception:
         _ = backends
         del _
         yield
+
+
+MIN_TORCHDATA_VERSION = "0.11.0"
+
+
+def _parse_version(v: str) -> tuple[int, int, int]:
+    parts = re.findall(r"\d+", str(v))
+    nums = [int(x) for x in parts[:3]]
+    while len(nums) < 3:
+        nums.append(0)
+    return (nums[0], nums[1], nums[2])
+
+
+def ensure_torchdata(
+    *, min_version: str = MIN_TORCHDATA_VERSION, err: Exception | None = None, context: str = "stnet"
+) -> None:
+    """Fail-fast if torchdata is missing/too old, or torchdata.nodes API is unavailable.
+
+    Intended usage: call inside an `except Exception as _e:` that failed to import torchdata.nodes APIs.
+    This function ALWAYS raises ImportError.
+    """
+    try:
+        import torchdata  # type: ignore
+
+        v = getattr(torchdata, "__version__", "") or ""
+        if not v:
+            try:
+                from importlib.metadata import version as _md_version
+
+                v = _md_version("torchdata")
+            except Exception:
+                v = "0.0.0"
+        if _parse_version(v) < _parse_version(min_version):
+            raise ImportError(
+                f"torchdata>={min_version} required (found {v}). "
+                f"Upgrade: pip install -U 'torchdata>={min_version}'"
+            )
+    except Exception as e:
+        raise ImportError(
+            f"{context}: torchdata>={min_version} is required. "
+            f"Install/upgrade: pip install -U 'torchdata>={min_version}'"
+        ) from (err or e)
+
+    raise ImportError(
+        f"{context}: torchdata.nodes APIs required (torchdata>={min_version}). "
+        f"Install/upgrade: pip install -U 'torchdata>={min_version}'"
+    ) from err
 
 
 def _fmin_impl(torch_mod: Any, a: Any, b: Any) -> Any:
