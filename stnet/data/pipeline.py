@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import dataclasses
-import math
 import os
-import random
+import math
 import contextlib
+import random
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import (
@@ -37,6 +36,28 @@ except Exception:
         pass
 
 from ..backend.system import Memory, WorkerPolicy, get_tlb
+from ..backend.compat import ensure_torchdata, MIN_TORCHDATA_VERSION
+
+
+_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
+
+
+def default_underflow_action() -> str:
+    """Return underflow policy used by precision negotiation.
+
+    - allow: underflow (flush-to-zero / subnormals) is allowed
+    - warn: allowed but may be logged
+    - forbid: treat underflow as unsafe for downcasting
+    """
+    raw = str(os.environ.get('STNET_DATA_UNDERFLOW_ACTION') or os.environ.get('STNET_UNDERFLOW_ACTION') or 'warn').strip().lower()
+    return raw if raw in _DEF_UNDERFLOW_ACTIONS else 'warn'
+
+
+def normalize_underflow_action(value: object, *, default: str = 'warn') -> str:
+    raw = str(value if value is not None else default).strip().lower()
+    if raw in _DEF_UNDERFLOW_ACTIONS:
+        return raw
+    return str(default).strip().lower() if str(default).strip().lower() in _DEF_UNDERFLOW_ACTIONS else 'warn'
 
 @dataclass(slots=True)
 class LoaderPolicy:
@@ -244,11 +265,11 @@ class BatchPolicy:
         b = max(int(b), int(self.min_batch))
         return max(1, b)
 
+
 try:
     from torchdata.nodes import BaseNode
-except Exception:
-    class BaseNode:  # type: ignore[no-redef]
-        pass
+except Exception as _e:
+    ensure_torchdata(err=_e, context="stnet.data.pipeline")
 
 
 _NODES_IMPORT_ERROR: Exception | None = None
@@ -261,8 +282,8 @@ except Exception as _e:
 def _require_nodes() -> None:
     if _NODES_IMPORT_ERROR is not None:
         raise ImportError(
-            "stnet.data.pipeline: data-pipeline components require torchdata (and tensordict). "
-            "Install full dependencies listed in requirements.txt."
+            f"stnet.data.pipeline: data-pipeline components require torchdata>={MIN_TORCHDATA_VERSION} (and tensordict). "
+            f"Install/upgrade: pip install -U 'torchdata>={MIN_TORCHDATA_VERSION}'."
         ) from _NODES_IMPORT_ERROR
 
 
@@ -1590,9 +1611,14 @@ class Dataset(Generic[TExtra]):
     feature_dtype: torch.dtype = torch.float32
     label_float_dtype: torch.dtype = torch.float32
 
+    # --- Scale / precision negotiation metadata (populated from data or meta.json)
+    has_scale: bool = False
+    has_nonfinite: bool = False
     scale_max_abs: Optional[float] = None
-    scale_min_abs: Optional[float] = None
+    scale_min_positive: Optional[float] = None
     scale_is_integral: Optional[bool] = None
+    is_negotiable: Optional[bool] = None
+    underflow_action: str = field(default_factory=default_underflow_action)
     stats: MutableMapping[str, torch.Tensor] = field(default_factory=dict)
     extra: Dict[str, TExtra] = field(default_factory=dict)
 
@@ -1743,6 +1769,201 @@ class Dataset(Generic[TExtra]):
             keys = range(int(features.shape[0]))
 
         return features, labels, keys, label_shape
+
+    # ---- Precision negotiation helpers
+    @property
+    def scale_min_abs(self) -> Optional[float]:
+        """Backward-compatible alias for scale_min_positive.
+
+        Older meta.json used scale_min_abs; internally we treat it as the
+        minimum *positive* magnitude excluding zeros.
+        """
+        return self.scale_min_positive
+
+    @staticmethod
+    def tensor_scale_stats(t: torch.Tensor) -> Dict[str, Any]:
+        """Compute scale statistics used for safe downcasting decisions.
+
+        Returns a dict with keys:
+        - has_scale (bool)
+        - has_nonfinite (bool)
+        - scale_max_abs (float|None)
+        - scale_min_positive (float|None) # smallest abs(value)>0 among finite entries
+        - scale_is_integral (bool|None)
+        """
+        if not isinstance(t, torch.Tensor):
+            raise TypeError('tensor_scale_stats expects a torch.Tensor')
+        if t.numel() == 0:
+            return {
+                'has_scale': False,
+                'has_nonfinite': False,
+                'scale_max_abs': None,
+                'scale_min_positive': None,
+                'scale_is_integral': None,
+            }
+        # robust complex detection across torch versions
+        is_complex = False
+        _is_complex_fn = getattr(torch, "is_complex", None)
+        if callable(_is_complex_fn):
+            try:
+                is_complex = bool(_is_complex_fn(t))
+            except Exception:
+                is_complex = False
+        else:
+            # fallback for very old builds: Tensor.is_complex may be property or method
+            v = getattr(t, "is_complex", False)
+            try:
+                is_complex = bool(v() if callable(v) else v)
+            except Exception:
+                is_complex = False
+        if is_complex:
+            return Dataset.tensor_scale_stats(t.detach().abs())
+        if t.is_floating_point():
+            x = t.detach()
+            finite = torch.isfinite(x)
+            has_nonfinite = bool((~finite).any().item())
+            if finite.any().item():
+                xf = x[finite]
+                absf = xf.abs()
+                max_abs = float(absf.max().item()) if absf.numel() else 0.0
+                nonzero = absf > 0
+                if nonzero.any().item():
+                    min_pos = float(absf[nonzero].min().item())
+                else:
+                    min_pos = None
+            else:
+                max_abs = float('nan')
+                min_pos = None
+            return {
+                'has_scale': True,
+                'has_nonfinite': has_nonfinite,
+                'scale_max_abs': max_abs,
+                'scale_min_positive': min_pos,
+                'scale_is_integral': None,
+            }
+        # integer / bool
+        x = t.detach()
+        try:
+            absx = x.abs() if x.dtype != torch.bool else x.to(dtype=torch.int64)
+        except Exception:
+            absx = x.to(dtype=torch.int64).abs()
+        max_abs = float(absx.max().item()) if absx.numel() else 0.0
+        nonzero = absx > 0
+        min_pos = float(absx[nonzero].min().item()) if nonzero.any().item() else None
+        is_integral = True
+        return {
+            'has_scale': True,
+            'has_nonfinite': False,
+            'scale_max_abs': max_abs,
+            'scale_min_positive': min_pos,
+            'scale_is_integral': is_integral,
+        }
+
+    @staticmethod
+    def merge_scale_stats(a: Mapping[str, Any], b: Mapping[str, Any]) -> Dict[str, Any]:
+        """Merge two scale stats dicts conservatively (worst-case).
+
+        - max_abs takes max
+        - min_positive takes min of non-None
+        - has_nonfinite OR
+        - scale_is_integral AND when both specified
+        """
+        out: Dict[str, Any] = {}
+        out['has_scale'] = bool(a.get('has_scale') or b.get('has_scale'))
+        out['has_nonfinite'] = bool(a.get('has_nonfinite') or b.get('has_nonfinite'))
+
+        def _max(v1: Any, v2: Any) -> Any:
+            if v1 is None:
+                return v2
+            if v2 is None:
+                return v1
+            try:
+                return float(v1) if float(v1) >= float(v2) else float(v2)
+            except Exception:
+                return v1
+
+        def _min_pos(v1: Any, v2: Any) -> Any:
+            if v1 is None:
+                return v2
+            if v2 is None:
+                return v1
+            try:
+                return float(v1) if float(v1) <= float(v2) else float(v2)
+            except Exception:
+                return v1
+
+        out['scale_max_abs'] = _max(a.get('scale_max_abs'), b.get('scale_max_abs'))
+        out['scale_min_positive'] = _min_pos(a.get('scale_min_positive'), b.get('scale_min_positive'))
+
+        ia = a.get('scale_is_integral')
+        ib = b.get('scale_is_integral')
+        if ia is None:
+            out['scale_is_integral'] = ib
+        elif ib is None:
+            out['scale_is_integral'] = ia
+        else:
+            out['scale_is_integral'] = bool(ia) and bool(ib)
+        return out
+
+    @classmethod
+    def is_fp32_castable(
+        cls,
+        stats: Mapping[str, Any],
+        *,
+        underflow_action: Optional[str] = None,
+        safety_margin: float = 1.0,
+    ) -> bool:
+        """Return True if data can be safely represented in FP32 without overflow/NaN/Inf.
+
+        If underflow_action == 'forbid', also rejects values smaller than fp32.tiny
+        (after applying safety_margin).
+        """
+        if not stats.get('has_scale'):
+            return True
+        if bool(stats.get('has_nonfinite')):
+            return False
+        max_abs = stats.get('scale_max_abs')
+        if max_abs is None:
+            return True
+        try:
+            max_abs_f = float(abs(max_abs))
+        except Exception:
+            return False
+        if not math.isfinite(max_abs_f):
+            return False
+        info = torch.finfo(torch.float32)
+        if max_abs_f > float(info.max) / max(1.0, float(safety_margin)):
+            return False
+        action = normalize_underflow_action(underflow_action, default=default_underflow_action())
+        if action == 'forbid':
+            min_pos = stats.get('scale_min_positive')
+            if min_pos is not None:
+                try:
+                    min_pos_f = float(min_pos)
+                except Exception:
+                    return False
+                if math.isfinite(min_pos_f) and min_pos_f > 0.0:
+                    if min_pos_f < float(info.tiny) * max(1.0, float(safety_margin)):
+                        return False
+        return True
+
+    def update_scale_stats(self, stats: Mapping[str, Any]) -> None:
+        """Populate this Dataset's scale metadata from a stats dict.
+
+        This is intended to be called from memmap writers (nodes/run) or
+        from runtime after reading meta.json.
+        """
+        self.has_scale = bool(stats.get('has_scale') or False)
+        self.has_nonfinite = bool(stats.get('has_nonfinite') or False)
+        self.scale_max_abs = (float(stats['scale_max_abs']) if stats.get('scale_max_abs') is not None else None)
+        self.scale_min_positive = (float(stats['scale_min_positive']) if stats.get('scale_min_positive') is not None else None)
+        self.scale_is_integral = (bool(stats['scale_is_integral']) if stats.get('scale_is_integral') is not None else None)
+        # If float scale present, negotiable means safe to cast to fp32
+        self.is_negotiable = bool(
+            self.has_scale
+            and (not self.has_nonfinite)
+            and self.is_fp32_castable(stats, underflow_action=self.underflow_action, safety_margin=1.0)
+        )
 
     def batch_to_device(
         self, batch: Any, device: Union[str, torch.device], non_blocking: bool = True
@@ -1929,5 +2150,3 @@ class Dataset(Generic[TExtra]):
             )
         )
         return tpl
-
-

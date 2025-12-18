@@ -1134,16 +1134,18 @@ class LossWeightPolicy(Protocol):
 class Scaler(nn.Module):
     def __init__(self, eps: float = 1e-6) -> None:
         super().__init__()
+        # Precision-exempt: scaler stats must remain FP64 for numerical stability.
+        self.__stnet_precision_exempt__ = True
         self.eps = float(eps)
         self.calib_mode: str = "none"
-        self.register_buffer("x_mean", torch.zeros(1))
-        self.register_buffer("x_std", torch.ones(1))
-        self.register_buffer("y_mean", torch.zeros(1))
-        self.register_buffer("y_std", torch.ones(1))
-        self.register_buffer("affine_a", torch.ones(1))
-        self.register_buffer("affine_b", torch.zeros(1))
-        self.register_buffer("pw_x", torch.empty(0))
-        self.register_buffer("pw_y", torch.empty(0))
+        self.register_buffer("x_mean", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
+        self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
 
     @torch.no_grad()
     def update_x(self, x: torch.Tensor) -> None:
@@ -1154,6 +1156,7 @@ class Scaler(nn.Module):
             x_flat = x_work.view(-1, 1)
         else:
             x_flat = x_work.reshape(-1, x_work.shape[-1])
+        x_flat = x_flat.to(dtype=torch.float64)
         mean = x_flat.mean(dim=0)
         std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
         if self.x_mean.shape != mean.shape:
@@ -1172,6 +1175,7 @@ class Scaler(nn.Module):
             y_flat = y_work.view(-1, 1)
         else:
             y_flat = y_work.reshape(-1, y_work.shape[-1])
+        y_flat = y_flat.to(dtype=torch.float64)
         mean = y_flat.mean(dim=0)
         std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
         if self.y_mean.shape != mean.shape:
@@ -1199,11 +1203,13 @@ class Scaler(nn.Module):
                     "Scaler.normalize_x: feature dimension mismatch: "
                     f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
                 )
+        mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
+        std_b = self.x_std.to(device=x.device, dtype=x.dtype)
         if x.dim() == 1:
-            return (x - self.x_mean) / (self.x_std + self.eps)
+            return (x - mean_b) / (std_b + self.eps)
         view_shape = [1] * (x.dim() - 1) + [-1]
-        mean = self.x_mean.view(*view_shape)
-        std = self.x_std.view(*view_shape)
+        mean = mean_b.view(*view_shape)
+        std = std_b.view(*view_shape)
         return (x - mean) / (std + self.eps)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
@@ -1218,11 +1224,13 @@ class Scaler(nn.Module):
                 "Scaler.denormalize_x: feature dimension mismatch: "
                 f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
             )
+        mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
+        std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
         if x_scaled.dim() == 1:
-            return x_scaled * (self.x_std + self.eps) + self.x_mean
+            return x_scaled * (std_b + self.eps) + mean_b
         view_shape = [1] * (x_scaled.dim() - 1) + [-1]
-        std = self.x_std.view(*view_shape)
-        mean = self.x_mean.view(*view_shape)
+        std = std_b.view(*view_shape)
+        mean = mean_b.view(*view_shape)
         return x_scaled * (std + self.eps) + mean
 
     def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1255,6 +1263,8 @@ class Scaler(nn.Module):
             batch_first = True
 
         mean, std = self._y_stats_vector()
+        mean = mean.to(device=y_flat.device, dtype=y_flat.dtype)
+        std = std.to(device=y_flat.device, dtype=y_flat.dtype)
 
         if mean.numel() == 1 and std.numel() == 1:
             z_flat = (y_flat - mean) / (std + self.eps)
@@ -1284,6 +1294,8 @@ class Scaler(nn.Module):
             batch_first = True
 
         mean, std = self._y_stats_vector()
+        mean = mean.to(device=z_flat.device, dtype=z_flat.dtype)
+        std = std.to(device=z_flat.device, dtype=z_flat.dtype)
 
         if mean.numel() == 1 and std.numel() == 1:
             y_flat = z_flat * std + mean
@@ -1310,7 +1322,9 @@ class Scaler(nn.Module):
     def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
         if self.affine_a.numel() == 0:
             return z_raw
-        return z_raw * self.affine_a + self.affine_b
+        a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
+        b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
+        return z_raw * a + b
 
     @torch.no_grad()
     def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -1374,8 +1388,8 @@ class Scaler(nn.Module):
         a64[tiny_mask] = 1.0
         b64[tiny_mask] = 0.0
 
-        a = a64.to(dtype=torch.float32)
-        b = b64.to(dtype=torch.float32)
+        a = a64.to(dtype=torch.float64, device=self.affine_a.device)
+        b = b64.to(dtype=torch.float64, device=self.affine_b.device)
 
         if self.affine_a.shape != a.shape:
             self.affine_a.resize_(a.shape)
@@ -1412,8 +1426,8 @@ class Scaler(nn.Module):
 
         _, C = x.shape
         device = self.affine_a.device
-        knots_x = torch.empty(C, num_bins, dtype=torch.float32, device=device)
-        knots_y = torch.empty(C, num_bins, dtype=torch.float32, device=device)
+        knots_x = torch.empty(C, num_bins, dtype=torch.float64, device=device)
+        knots_y = torch.empty(C, num_bins, dtype=torch.float64, device=device)
 
         for j in range(C):
             xj = x[:, j]
@@ -1433,8 +1447,8 @@ class Scaler(nn.Module):
             )
             qx = xj_sorted[idx_q]
             qy = yj_sorted[idx_q]
-            knots_x[j] = qx.to(dtype=torch.float32, device=device)
-            knots_y[j] = qy.to(dtype=torch.float32, device=device)
+            knots_x[j] = qx.to(dtype=torch.float64, device=device)
+            knots_y[j] = qy.to(dtype=torch.float64, device=device)
 
         if self.pw_x.shape != knots_x.shape:
             self.pw_x.resize_(knots_x.shape)
@@ -1506,6 +1520,8 @@ class Scaler(nn.Module):
 class History(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        # Precision-exempt: history/logging buffers must remain FP64/INT64.
+        self.__stnet_precision_exempt__ = True
         self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
         self.timezone: str = "UTC"

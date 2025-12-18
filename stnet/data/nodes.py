@@ -12,6 +12,8 @@ from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
 
 import torch
 
+from ..backend.compat import ensure_torchdata
+
 try:
     import psutil as _psutil
 except ImportError:
@@ -23,11 +25,8 @@ try:
     from torchdata.nodes import BaseNode
     from torchdata.nodes import Loader as _Loader
     from torchdata.nodes import ParallelMapper
-except Exception:
-    from torchdata.nodes import BaseNode
-    from torchdata.nodes import Loader as _Loader
-
-    ParallelMapper = None
+except Exception as _e:
+    ensure_torchdata(err=_e, context="stnet.data.nodes")
 
 try:
     from tensordict import MemoryMappedTensor
@@ -40,14 +39,8 @@ try:
     from torchdata.nodes import Prefetcher as _Prefetcher
     from torchdata.nodes import SamplerWrapper
     from torchdata.nodes import Unbatcher as _Unbatcher
-except Exception:
-    from torchdata.nodes import PinMemory
-    from torchdata.nodes import Prefetcher as _Prefetcher
-
-    MultiNodeWeightedSampler = None
-    SamplerWrapper = None
-    _Batcher = None
-    _Unbatcher = None
+except Exception as _e:
+    ensure_torchdata(err=_e, context="stnet.data.nodes")
 
 try:
     from torch.utils.data import Sampler as _Sampler
@@ -436,24 +429,19 @@ class Sampler(_Sampler):
 
 
 def _to_high_precision(value: Any) -> torch.Tensor:
+    """Convert arbitrary array-like input to a tensor suitable for scale analysis.
+
+    - floating inputs are promoted to FP64
+    - small integers are promoted to INT64
+
+    This function is used only for *analysis*/memmap writing; runtime will later cast
+    per PrecisionPolicy.
+    """
     tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-
-    float_name = os.environ.get("STNET_MEMMAP_FLOAT_DTYPE", "").strip()
-    if float_name.startswith("torch."):
-        float_name = float_name.split(".", 1)[1]
-    memmap_float = getattr(torch, float_name, None) if float_name else None
-    if not isinstance(memmap_float, torch.dtype) or not torch.is_floating_point(
-        torch.empty((), dtype=memmap_float)
-    ):
-        memmap_float = torch.float32
-
-    def _to_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
-        return t.to(dtype=dtype)
-
     if tensor.is_floating_point():
-        return _to_dtype(tensor, memmap_float)
+        return tensor.to(dtype=torch.float64)
     if tensor.dtype in {torch.uint8, torch.int8, torch.int16, torch.int32}:
-        return _to_dtype(tensor, torch.int64)
+        return tensor.to(dtype=torch.int64)
     return tensor
 
 
@@ -471,6 +459,9 @@ def preload_memmap(
         raise TypeError("preload_memmap expects a Mapping with 'features' and 'labels'")
     if "features" not in data or "labels" not in data:
         raise ValueError("preload_memmap expects 'features' and 'labels'")
+
+    # Avoid circular imports: pipeline imports nodes; nodes must not import pipeline at module import time.
+    from .pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
     os.makedirs(memmap_dir, exist_ok=True)
 
@@ -496,6 +487,42 @@ def preload_memmap(
     feature_dim = int(feature_flat.shape[1])
     features_dtype = to_platform_dtype(feature_flat.dtype, "name")
     labels_dtype = to_platform_dtype(label_flat.dtype, "name")
+
+    # --- Scale negotiation (B-mode)
+    action = normalize_underflow_action(kwargs.pop('underflow_action', None), default=default_underflow_action())
+
+    # Compute scale stats from the original (high-precision) tensors.
+    f_stats = Dataset.tensor_scale_stats(feature_flat)
+    l_stats = Dataset.tensor_scale_stats(label_flat)
+    merged = Dataset.merge_scale_stats(f_stats, l_stats)
+    merged['underflow_action'] = action
+
+    negotiable = Dataset.is_fp32_castable(merged, underflow_action=action, safety_margin=1.0)
+    # Respect explicit memmap float dtype request when safe.
+    req = str(os.environ.get('STNET_MEMMAP_FLOAT_DTYPE', '') or '').strip()
+    req = req.split('.', 1)[1] if req.startswith('torch.') else req
+    req_dtype = getattr(torch, req, None) if req else None
+    if not isinstance(req_dtype, torch.dtype) or not torch.is_floating_point(torch.empty((), dtype=req_dtype)):
+        req_dtype = torch.float32
+    store_float = torch.float32 if (negotiable and req_dtype != torch.float64) else torch.float64
+
+    # Cast tensors to storage dtypes.
+    if feature_flat.is_floating_point():
+        feature_flat = feature_flat.to(dtype=store_float)
+        features_dtype = to_platform_dtype(feature_flat.dtype, 'name')
+    else:
+        # keep integer as int64
+        if feature_flat.dtype != torch.int64 and feature_flat.dtype != torch.bool:
+            feature_flat = feature_flat.to(dtype=torch.int64)
+            features_dtype = to_platform_dtype(feature_flat.dtype, 'name')
+
+    if label_flat.is_floating_point():
+        label_flat = label_flat.to(dtype=store_float)
+        labels_dtype = to_platform_dtype(label_flat.dtype, 'name')
+    else:
+        if label_flat.dtype != torch.int64 and label_flat.dtype != torch.bool:
+            label_flat = label_flat.to(dtype=torch.int64)
+            labels_dtype = to_platform_dtype(label_flat.dtype, 'name')
 
     perm: torch.Tensor | None = None
     shuffle_mode = "none"
@@ -546,6 +573,15 @@ def preload_memmap(
         "train_end": train_end,
         "val_start": val_start,
         "val_end": val_end,
+
+        # Scale negotiation metadata
+        "has_scale": bool(merged.get("has_scale")),
+        "has_nonfinite": bool(merged.get("has_nonfinite")),
+        "scale_max_abs": merged.get("scale_max_abs"),
+        "scale_min_positive": merged.get("scale_min_positive"),
+        "scale_is_integral": merged.get("scale_is_integral"),
+        "is_negotiable": bool(negotiable),
+        "underflow_action": str(action),
     }
 
     if shuffle_mode == "perm" and perm is not None:

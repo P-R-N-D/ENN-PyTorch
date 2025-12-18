@@ -299,17 +299,19 @@ def set_float32_precision(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
     autocast_dtype: Optional[torch.dtype] = None,
+    enable_tf32: bool = True,
 ) -> None:
     if device.type != "cuda":
         return
 
     use_tf32 = False
-    for _dt in (dtype, autocast_dtype):
-        if _dt is None:
-            continue
-        if _dt not in (torch.float32, torch.float64):
-            use_tf32 = True
-            break
+    if enable_tf32:
+        for _dt in (dtype, autocast_dtype):
+            if _dt is None:
+                continue
+            if _dt not in (torch.float32, torch.float64):
+                use_tf32 = True
+                break
 
     precision = "tf32" if use_tf32 else "ieee"
     key = (device.type, int(device.index) if device.index is not None else -1)
