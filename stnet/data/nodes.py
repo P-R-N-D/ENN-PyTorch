@@ -460,70 +460,162 @@ def preload_memmap(
     if "features" not in data or "labels" not in data:
         raise ValueError("preload_memmap expects 'features' and 'labels'")
 
+    if MemoryMappedTensor is None:
+        raise ImportError("preload_memmap requires tensordict (MemoryMappedTensor)")
+
     # Avoid circular imports: pipeline imports nodes; nodes must not import pipeline at module import time.
     from .pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
     os.makedirs(memmap_dir, exist_ok=True)
 
-    def _as_cpu_contig(x: Any) -> torch.Tensor:
-        t = _to_high_precision(x).detach()
-        if t.device.type != "cpu":
-            t = t.cpu()
-        return t.contiguous() if not t.is_contiguous() else t
+    features_path = os.path.join(memmap_dir, "features.mmt")
+    labels_path = os.path.join(memmap_dir, "labels.mmt")
 
-    features = _as_cpu_contig(data["features"])
-    labels = _as_cpu_contig(data["labels"])
+    if MemoryMappedTensor is None:
+        raise ImportError("preload_memmap requires tensordict (MemoryMappedTensor)")
 
-    if features.shape[0] != labels.shape[0]:
+    # ---- streaming options
+    underflow_action = normalize_underflow_action(
+        kwargs.pop("underflow_action", None),
+        default=default_underflow_action(),
+    )
+
+    chunk_size = int(kwargs.pop("chunk_size", 4096) or 4096)
+    chunk_size = max(1, chunk_size)
+    with suppress(Exception):
+        env_cs = int(os.environ.get("STNET_MEMMAP_CHUNK_SIZE", "") or 0)
+        if env_cs > 0:
+            chunk_size = max(1, env_cs)
+
+    raw_X = data["features"]
+    raw_Y = data["labels"]
+
+    def _len0(obj: Any) -> int:
+        if isinstance(obj, torch.Tensor):
+            return int(obj.shape[0]) if getattr(obj, "ndim", 0) > 0 else 1
+        try:
+            return int(len(obj))  # type: ignore[arg-type]
+        except Exception:
+            t = torch.as_tensor(obj)
+            return int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
+
+    def _slice(obj: Any, s: int, e: int) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return obj[s:e]
+        try:
+            return obj[s:e]  # type: ignore[index]
+        except Exception:
+            return [obj[i] for i in range(int(s), int(e))]  # type: ignore[index]
+
+    def _gather(obj: Any, idx: torch.Tensor) -> Any:
+        if isinstance(obj, torch.Tensor):
+            return obj.index_select(0, idx)
+        ii = idx.detach().cpu().tolist()
+        return [obj[i] for i in ii]  # type: ignore[index]
+
+    count = _len0(raw_X)
+    if count <= 0:
+        raise ValueError("cannot create memmap with zero samples")
+    if _len0(raw_Y) != int(count):
         raise ValueError("features and labels must have the same length")
 
-    count = int(features.shape[0])
-    if count == 0:
-        raise ValueError("cannot create memmap with zero samples")
+    chunk = min(int(count), int(chunk_size))
 
-    feature_flat = features.view(count, -1)
-    label_flat = labels.view(count, -1)
-    label_shape = tuple(labels.shape[1:])
-    feature_dim = int(feature_flat.shape[1])
-    features_dtype = to_platform_dtype(feature_flat.dtype, "name")
-    labels_dtype = to_platform_dtype(label_flat.dtype, "name")
+    # ---- pass 1: infer dims + scale stats without materializing full high-precision arrays
+    stats: Dict[str, Any] = {
+        "has_scale": False,
+        "has_nonfinite": False,
+        "scale_max_abs": None,
+        "scale_min_positive": None,
+        "scale_is_integral": None,
+    }
+    feature_dim: Optional[int] = None
+    label_shape: Optional[Tuple[int, ...]] = None
+    label_dim: Optional[int] = None
 
-    # --- Scale negotiation (B-mode)
-    action = normalize_underflow_action(kwargs.pop('underflow_action', None), default=default_underflow_action())
+    feat_kind: Optional[str] = None  # "float"|"int"|"bool"
+    lab_kind: Optional[str] = None
 
-    # Compute scale stats from the original (high-precision) tensors.
-    f_stats = Dataset.tensor_scale_stats(feature_flat)
-    l_stats = Dataset.tensor_scale_stats(label_flat)
-    merged = Dataset.merge_scale_stats(f_stats, l_stats)
-    merged['underflow_action'] = action
+    for s in range(0, int(count), int(chunk)):
+        e = min(int(count), int(s) + int(chunk))
+        fx = _to_high_precision(_slice(raw_X, s, e)).detach()
+        lb = _to_high_precision(_slice(raw_Y, s, e)).detach()
 
-    negotiable = Dataset.is_fp32_castable(merged, underflow_action=action, safety_margin=1.0)
-    # Respect explicit memmap float dtype request when safe.
-    req = str(os.environ.get('STNET_MEMMAP_FLOAT_DTYPE', '') or '').strip()
-    req = req.split('.', 1)[1] if req.startswith('torch.') else req
+        if fx.device.type != "cpu":
+            fx = fx.cpu()
+        if lb.device.type != "cpu":
+            lb = lb.cpu()
+        if not fx.is_contiguous():
+            fx = fx.contiguous()
+        if not lb.is_contiguous():
+            lb = lb.contiguous()
+
+        n = int(fx.shape[0]) if getattr(fx, "ndim", 0) > 0 else 1
+        if n <= 0:
+            continue
+
+        fx_flat = fx.reshape(n, -1)
+        lb_flat = lb.reshape(n, -1)
+
+        cur_fdim = int(fx_flat.shape[1])
+        cur_lshape = tuple(lb.shape[1:])
+        cur_ldim = int(lb_flat.shape[1])
+
+        if feature_dim is None:
+            feature_dim = cur_fdim
+        elif cur_fdim != int(feature_dim):
+            raise ValueError(f"feature dim mismatch: {feature_dim} vs {cur_fdim}")
+
+        if label_shape is None:
+            label_shape = cur_lshape
+            label_dim = cur_ldim
+        else:
+            if tuple(label_shape) != tuple(cur_lshape):
+                raise ValueError(f"label shape mismatch: {label_shape} vs {cur_lshape}")
+            if label_dim is not None and cur_ldim != int(label_dim):
+                raise ValueError(f"label flat-dim mismatch: {label_dim} vs {cur_ldim}")
+
+        fk = "float" if fx_flat.is_floating_point() else ("bool" if fx_flat.dtype == torch.bool else "int")
+        lk = "float" if lb_flat.is_floating_point() else ("bool" if lb_flat.dtype == torch.bool else "int")
+
+        feat_kind = fk if feat_kind is None else feat_kind
+        lab_kind = lk if lab_kind is None else lab_kind
+        if feat_kind != fk:
+            raise ValueError(f"feature dtype kind mismatch: {feat_kind} vs {fk}")
+        if lab_kind != lk:
+            raise ValueError(f"label dtype kind mismatch: {lab_kind} vs {lk}")
+
+        f_stats = Dataset.tensor_scale_stats(fx_flat)
+        l_stats = Dataset.tensor_scale_stats(lb_flat)
+        stats = Dataset.merge_scale_stats(stats, Dataset.merge_scale_stats(f_stats, l_stats))
+
+    if feature_dim is None or label_shape is None or label_dim is None:
+        raise RuntimeError("Failed to infer feature/label shapes from data")
+
+    # ---- decide float storage dtype (float32 if negotiable, else float64; allow override)
+    stats["underflow_action"] = str(underflow_action)
+    negotiable = Dataset.is_fp32_castable(stats, underflow_action=underflow_action, safety_margin=1.0)
+
+    req = str(os.environ.get("STNET_MEMMAP_FLOAT_DTYPE", "") or "").strip()
+    req = req.split(".", 1)[1] if req.startswith("torch.") else req
     req_dtype = getattr(torch, req, None) if req else None
-    if not isinstance(req_dtype, torch.dtype) or not torch.is_floating_point(torch.empty((), dtype=req_dtype)):
+    if not isinstance(req_dtype, torch.dtype):
         req_dtype = torch.float32
-    store_float = torch.float32 if (negotiable and req_dtype != torch.float64) else torch.float64
+    try:
+        if not torch.is_floating_point(torch.empty((), dtype=req_dtype)):
+            req_dtype = torch.float32
+    except Exception:
+        req_dtype = torch.float32
 
-    # Cast tensors to storage dtypes.
-    if feature_flat.is_floating_point():
-        feature_flat = feature_flat.to(dtype=store_float)
-        features_dtype = to_platform_dtype(feature_flat.dtype, 'name')
-    else:
-        # keep integer as int64
-        if feature_flat.dtype != torch.int64 and feature_flat.dtype != torch.bool:
-            feature_flat = feature_flat.to(dtype=torch.int64)
-            features_dtype = to_platform_dtype(feature_flat.dtype, 'name')
+    store_float = torch.float32 if (bool(negotiable) and req_dtype != torch.float64) else torch.float64
 
-    if label_flat.is_floating_point():
-        label_flat = label_flat.to(dtype=store_float)
-        labels_dtype = to_platform_dtype(label_flat.dtype, 'name')
-    else:
-        if label_flat.dtype != torch.int64 and label_flat.dtype != torch.bool:
-            label_flat = label_flat.to(dtype=torch.int64)
-            labels_dtype = to_platform_dtype(label_flat.dtype, 'name')
+    feat_store = store_float if feat_kind == "float" else (torch.bool if feat_kind == "bool" else torch.int64)
+    lab_store = store_float if lab_kind == "float" else (torch.bool if lab_kind == "bool" else torch.int64)
 
+    features_dtype = to_platform_dtype(feat_store, "name")
+    labels_dtype = to_platform_dtype(lab_store, "name")
+
+    # ---- shuffle handling
     perm: torch.Tensor | None = None
     shuffle_mode = "none"
     if shuffle:
@@ -531,35 +623,94 @@ def preload_memmap(
         if seed is not None:
             with suppress(Exception):
                 generator.manual_seed(int(seed))
-        perm = torch.randperm(count, generator=generator)
-
+        perm = torch.randperm(int(count), generator=generator)
         perm_path = os.path.join(memmap_dir, "perm.pt")
         with suppress(Exception):
             torch.save(perm, perm_path)
         if os.path.isfile(perm_path):
             shuffle_mode = "perm"
+            # Not needed for writing in perm mode; free memory for very large datasets.
+            perm = None
         else:
             shuffle_mode = "physical"
-            feature_flat = feature_flat.index_select(0, perm)
-            label_flat = label_flat.index_select(0, perm)
 
     features_path = os.path.join(memmap_dir, "features.mmt")
     labels_path = os.path.join(memmap_dir, "labels.mmt")
 
-    MemoryMappedTensor.from_tensor(feature_flat, filename=features_path)
-    MemoryMappedTensor.from_tensor(label_flat, filename=labels_path)
+    X_mmt = MemoryMappedTensor.empty(
+        (int(count), int(feature_dim)),
+        dtype=feat_store,
+        filename=features_path,
+        existsok=True,
+    )
+    Y_mmt = MemoryMappedTensor.empty(
+        (int(count), int(label_dim)),
+        dtype=lab_store,
+        filename=labels_path,
+        existsok=True,
+    )
 
-    with suppress(Exception):
-        del features, labels, feature_flat, label_flat
+    # ---- pass 2: write chunks
+    written = 0
+    for s in range(0, int(count), int(chunk)):
+        e = min(int(count), int(s) + int(chunk))
 
-    val_count = max(0, min(count, int(round(count * float(val_frac)))))
-    train_count = max(0, min(count, count - val_count))
+        if shuffle_mode == "physical":
+            assert perm is not None
+            idx = perm[s:e]
+            fx_src = _gather(raw_X, idx)
+            lb_src = _gather(raw_Y, idx)
+        else:
+            fx_src = _slice(raw_X, s, e)
+            lb_src = _slice(raw_Y, s, e)
+
+        fx = _to_high_precision(fx_src).detach()
+        lb = _to_high_precision(lb_src).detach()
+
+        if fx.device.type != "cpu":
+            fx = fx.cpu()
+        if lb.device.type != "cpu":
+            lb = lb.cpu()
+        if not fx.is_contiguous():
+            fx = fx.contiguous()
+        if not lb.is_contiguous():
+            lb = lb.contiguous()
+
+        n = int(fx.shape[0]) if getattr(fx, "ndim", 0) > 0 else 1
+        if n <= 0:
+            continue
+        if n != int(e - s):
+            raise RuntimeError(f"unexpected chunk length: got {n}, expected {int(e - s)}")
+
+        fx_flat = fx.reshape(n, -1)
+        lb_flat = lb.reshape(n, -1)
+
+        if int(fx_flat.shape[1]) != int(feature_dim):
+            raise RuntimeError(f"feature dim mismatch while writing: {feature_dim} vs {int(fx_flat.shape[1])}")
+        if int(lb_flat.shape[1]) != int(label_dim):
+            raise RuntimeError(f"label dim mismatch while writing: {label_dim} vs {int(lb_flat.shape[1])}")
+
+        if fx_flat.dtype != feat_store:
+            fx_flat = fx_flat.to(dtype=feat_store)
+        if lb_flat.dtype != lab_store:
+            lb_flat = lb_flat.to(dtype=lab_store)
+
+        X_mmt[s : s + n].copy_(fx_flat)
+        Y_mmt[s : s + n].copy_(lb_flat)
+        written += n
+
+    if written != int(count):
+        raise RuntimeError(f"memmap written={written}, expected={int(count)}")
+
+    # ---- split metadata
+    val_count = max(0, min(int(count), int(round(int(count) * float(val_frac)))))
+    train_count = max(0, min(int(count), int(count) - val_count))
     train_start, train_end = 0, train_count
     val_start, val_end = train_end, train_end + val_count
 
     meta: Dict[str, Any] = {
-        "N": count,
-        "feature_dim": feature_dim,
+        "N": int(count),
+        "feature_dim": int(feature_dim),
         "features_path": "features.mmt",
         "labels_path": "labels.mmt",
         "label_shape": list(label_shape),
@@ -569,22 +720,22 @@ def preload_memmap(
         "shuffled": bool(shuffle_mode == "physical"),
         "shuffle_seed": int(seed) if seed is not None else None,
         "shuffle_mode": str(shuffle_mode),
-        "train_start": train_start,
-        "train_end": train_end,
-        "val_start": val_start,
-        "val_end": val_end,
+        "train_start": int(train_start),
+        "train_end": int(train_end),
+        "val_start": int(val_start),
+        "val_end": int(val_end),
 
         # Scale negotiation metadata
-        "has_scale": bool(merged.get("has_scale")),
-        "has_nonfinite": bool(merged.get("has_nonfinite")),
-        "scale_max_abs": merged.get("scale_max_abs"),
-        "scale_min_positive": merged.get("scale_min_positive"),
-        "scale_is_integral": merged.get("scale_is_integral"),
+        "has_scale": bool(stats.get("has_scale")),
+        "has_nonfinite": bool(stats.get("has_nonfinite")),
+        "scale_max_abs": stats.get("scale_max_abs"),
+        "scale_min_positive": stats.get("scale_min_positive"),
+        "scale_is_integral": stats.get("scale_is_integral"),
         "is_negotiable": bool(negotiable),
-        "underflow_action": str(action),
+        "underflow_action": str(underflow_action),
     }
 
-    if shuffle_mode == "perm" and perm is not None:
+    if shuffle_mode == "perm" and os.path.isfile(os.path.join(memmap_dir, "perm.pt")):
         meta["perm_filename"] = "perm.pt"
 
     with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:

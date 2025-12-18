@@ -83,6 +83,23 @@ class _KeySliceMappingView(_MappingABC):
         return self._data[k]
 
 
+def _is_feature_label_batch_mapping(obj: Mapping[Any, Any]) -> bool:
+    """True if `obj` looks like a single (features, labels) batch mapping.
+
+    This prevents mis-classifying a batch dict (keys like 'features'/'labels')
+    as a dataset-mapping input (key->label), which in STNet uses tuple keys.
+
+    We intentionally treat *feature-only* dicts (e.g., {'features': ...}) as
+    batch mappings too, because `predict()` supports missing labels.
+    """
+    if not isinstance(obj, Mapping) or not obj:
+        return False
+    for k in ("features", "X", "labels", "Y", "targets", "target"):
+        if k in obj:
+            return True
+    return False
+
+
 def _write_memmap_streaming_two_pass(
     *,
     ds: Dataset,
@@ -459,6 +476,7 @@ def train(
             and not isinstance(d, TensorDictBase)
             and d
             and all(not isinstance(v, _Mapping) for v in d.values())
+            and not _is_feature_label_batch_mapping(d)
         ):
             keys = list(d.keys())
             count = len(keys)
@@ -950,6 +968,7 @@ def predict(
         and not isinstance(data, TensorDictBase)
         and data
         and all(not isinstance(v, _Mapping) for v in data.values())
+        and not _is_feature_label_batch_mapping(data)
     ):
         keys = list(data.keys())
         count = len(keys)
