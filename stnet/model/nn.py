@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import contextlib
+import gc
+import logging
 import math
 import os
 import weakref
@@ -27,6 +29,8 @@ try:
 except ImportError:
     class TensorDictBase:  # type: ignore[no-redef]
         pass
+
+_LOGGER = logging.getLogger(__name__)
 
 from ..api.config import ModelConfig
 from ..backend.compat import torch_no_compile
@@ -343,11 +347,23 @@ class SpatialAxis(nn.Module):
             torch.empty(0, dtype=torch.int64),
             persistent=False,
         )
-        self._perm_cache_meta: Optional[Tuple[int, int, int, int, int]] = None
+        # Cache is only valid when coords are shared across batch (expanded/stride0 or B==1).
+        # Meta also captures coords identity/version to avoid stale permutations when coords change in-place.
+        self._perm_cache_meta: Optional[Tuple[int, int, int, int, int, int, int]] = None
 
-    def _ensure_permutation_cache(
+    def _compute_per_sample_permutations(
         self, coords: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute Morton permutations per sample.
+
+        Returns:
+            perm: (depth, B, N)
+            invperm: (depth, B, N)
+
+        Notes:
+            This is intentionally uncached. Per-sample coordinates defeat the
+            shared-template assumption that enables caching.
+        """
         depth = len(self.blocks)
         if coords.dim() != 3:
             raise ValueError(
@@ -357,43 +373,98 @@ class SpatialAxis(nn.Module):
         patch = int(getattr(self, "patch_size", 512))
         shift = bool(getattr(self, "shift_order", True))
         bits = int(getattr(self, "morton_bits", 10))
-        meta = (int(N), int(patch), int(bits), int(shift), int(depth))
-
-        perm_cache = getattr(self, "_perm_cache", None)
-        inv_cache = getattr(self, "_invperm_cache", None)
-        if (
-            isinstance(perm_cache, torch.Tensor)
-            and isinstance(inv_cache, torch.Tensor)
-            and self._perm_cache_meta == meta
-            and perm_cache.numel() == depth * N
-            and inv_cache.numel() == depth * N
-            and perm_cache.shape == (depth, N)
-            and inv_cache.shape == (depth, N)
-            and perm_cache.device == coords.device
-            and inv_cache.device == coords.device
-        ):
-            return perm_cache, inv_cache
-
-        coords_one = coords[:1].contiguous()
         perms: List[torch.Tensor] = []
         invperms: List[torch.Tensor] = []
         for i in range(depth):
             perm_i, inv_i = _serialize_z_index(
-                coords_one,
+                coords,
                 bits=bits,
                 patch=patch,
                 shift_order=shift,
                 block_index=i,
             )
-            perms.append(perm_i[0].to(dtype=torch.int64))
-            invperms.append(inv_i[0].to(dtype=torch.int64))
+            perms.append(perm_i.to(dtype=torch.int64))
+            invperms.append(inv_i.to(dtype=torch.int64))
+        return (
+            torch.stack(perms, dim=0),
+            torch.stack(invperms, dim=0),
+        )
 
-        perm_new = torch.stack(perms, dim=0).to(device=coords.device)
-        inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
-        self._perm_cache = perm_new
-        self._invperm_cache = inv_new
-        self._perm_cache_meta = meta
-        return perm_new, inv_new
+    def _ensure_permutation_cache(
+        self, coords: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        depth = len(self.blocks)
+        if coords.dim() != 3:
+            raise ValueError(
+                f"SpatialAxis coords must be (B,N,C), got shape {tuple(coords.shape)}"
+            )
+        B, N, _ = coords.shape
+        patch = int(getattr(self, "patch_size", 512))
+        shift = bool(getattr(self, "shift_order", True))
+        bits = int(getattr(self, "morton_bits", 10))
+
+        # Heuristic: expanded coords (stride(0)==0) are identical across batch.
+        # If stride(0)!=0, coords may differ per-sample; compute per-sample permutations to avoid distortion.
+        shared_template = (B <= 1) or (coords.stride(0) == 0)
+
+        perm_cache = getattr(self, "_perm_cache", None)
+        inv_cache = getattr(self, "_invperm_cache", None)
+
+        if shared_template:
+            coords_ptr = int(coords.data_ptr()) if coords.numel() else 0
+            coords_ver = int(getattr(coords, "_version", 0))
+            meta = (int(N), int(patch), int(bits), int(shift), int(depth), coords_ptr, coords_ver)
+            if (
+                isinstance(perm_cache, torch.Tensor)
+                and isinstance(inv_cache, torch.Tensor)
+                and self._perm_cache_meta == meta
+                and perm_cache.numel() == depth * N
+                and inv_cache.numel() == depth * N
+                and perm_cache.shape == (depth, N)
+                and inv_cache.shape == (depth, N)
+                and perm_cache.device == coords.device
+                and inv_cache.device == coords.device
+            ):
+                return perm_cache, inv_cache
+
+            coords_one = coords[:1].contiguous()
+            perms: List[torch.Tensor] = []
+            invperms: List[torch.Tensor] = []
+            for i in range(depth):
+                perm_i, inv_i = _serialize_z_index(
+                    coords_one,
+                    bits=bits,
+                    patch=patch,
+                    shift_order=shift,
+                    block_index=i,
+                )
+                perms.append(perm_i[0].to(dtype=torch.int64))
+                invperms.append(inv_i[0].to(dtype=torch.int64))
+
+            perm_new = torch.stack(perms, dim=0).to(device=coords.device)
+            inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
+            self._perm_cache = perm_new
+            self._invperm_cache = inv_new
+            self._perm_cache_meta = meta
+            return perm_new, inv_new
+
+        # Per-sample coords: compute permutations for each batch entry (no caching).
+        perms_b: List[torch.Tensor] = []
+        invperms_b: List[torch.Tensor] = []
+        coords_batch = coords.contiguous()
+        for i in range(depth):
+            perm_i, inv_i = _serialize_z_index(
+                coords_batch,
+                bits=bits,
+                patch=patch,
+                shift_order=shift,
+                block_index=i,
+            )
+            perms_b.append(perm_i.to(dtype=torch.int64))
+            invperms_b.append(inv_i.to(dtype=torch.int64))
+        perm_b = torch.stack(perms_b, dim=0)
+        inv_b = torch.stack(invperms_b, dim=0)
+        return perm_b, inv_b
 
     @torch_no_compile(reason="SpatialAxis uses dynamic gather/scatter", recursive=True)
     def forward(
@@ -420,9 +491,19 @@ class SpatialAxis(nn.Module):
                 f"tokens={tuple(x.shape)} vs coords={tuple(coords.shape)}"
             )
         x = x.contiguous()
-        coords = coords.contiguous()
-        if coords.dtype != torch.float32:
-            coords = coords.float()
+        # Preserve expanded/shared coordinate templates (stride(0)==0) to keep permutation
+        # caching effective and avoid expensive per-sample Morton permutations.
+        Bc = int(coords.size(0))
+        if Bc > 1 and coords.stride(0) == 0:
+            coords0 = coords[0].contiguous()
+            if coords0.dtype != torch.float32:
+                coords0 = coords0.float()
+            coords = coords0.unsqueeze(0).expand(Bc, -1, -1)
+        else:
+            coords = coords.contiguous()
+            if coords.dtype != torch.float32:
+                coords = coords.float()
+
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError(
@@ -434,8 +515,14 @@ class SpatialAxis(nn.Module):
 
         for i, blk in enumerate(self.blocks):
             B, N, D = x.shape
-            perm = perm_cache[i].unsqueeze(0).expand(B, N)
-            invperm = inv_cache[i].unsqueeze(0).expand(B, N)
+            perm_i = perm_cache[i]
+            inv_i = inv_cache[i]
+            if perm_i.dim() == 2:
+                perm = perm_i
+                invperm = inv_i
+            else:
+                perm = perm_i.unsqueeze(0).expand(B, N)
+                invperm = inv_i.unsqueeze(0).expand(B, N)
 
             x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
             c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
@@ -954,7 +1041,9 @@ class Subcontext(nn.Module):
 
     @staticmethod
     def _get_spatial_coords(n_tokens: int, device: torch.device) -> torch.Tensor:
-        side = max(1, int(round(n_tokens ** (1.0 / 3.0))))
+        # Use ceil(...) so that side**3 >= n_tokens, preserving spatial diversity
+        # even for small token counts (e.g. 2-7 tokens).
+        side = max(1, int(math.ceil(n_tokens ** (1.0 / 3.0))))
         coords: List[Tuple[float, float, float]] = []
         for idx in range(n_tokens):
             z = idx // (side * side)
@@ -1985,51 +2074,144 @@ class Root(nn.Module):
         disable_compile = normalized_mode in {"", "disabled", "none"}
         compile_mode_arg = normalized_mode if not disable_compile else None
 
-        compile_enabled = compile_mode_arg is not None
+        compile_requested = compile_mode_arg is not None
+        compile_available = callable(getattr(torch, "compile", None))
+        compile_enabled = bool(compile_requested and compile_available)
+        if compile_requested and not compile_available:
+            _LOGGER.warning(
+                "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; "
+                "running eagerly",
+                raw_mode,
+            )
         compile_dynamic = bool(
             getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead")
         )
         compile_cudagraphs = bool(
-            getattr(config, "compile_cudagraphs", normalized_mode != "reduce-overhead")
+            getattr(
+                config,
+                "compile_cudagraphs",
+                normalized_mode not in {"reduce-overhead", "max-autotune-no-cudagraphs"},
+            )
         )
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
-        self._pad_compiled_microbatch = bool(compile_enabled)
-        if not disable_compile:
-            with contextlib.suppress(Exception):
+        # max-autotune modes are significantly more memory hungry. To avoid hard OOM kills
+        # (SIGKILL -9), default to compiling only the small decode head unless overridden.
+        compile_heavy_submodules = bool(
+            getattr(
+                config,
+                "compile_heavy_submodules",
+                normalized_mode not in {"max-autotune", "max-autotune-no-cudagraphs"},
+            )
+        )
+        if (
+            compile_enabled
+            and not compile_heavy_submodules
+            and normalized_mode in {"max-autotune", "max-autotune-no-cudagraphs"}
+        ):
+            _LOGGER.warning(
+                "max-autotune hotfix: compiling only decode head (skip temporal/perception). "
+                "Set config.compile_heavy_submodules=True to override."
+            )
+        compiled_decode = False
+        compiled_temporal = False
+        compiled_perception = False
+        if compile_enabled:
+            try:
                 _raw_head = self.processor.head
-                _decode_mod = _CompiledDecode(self.processor.norm, _raw_head, self.out_shape).to(self._device)
-                self._decode_compiled = Gradient.compile(
+                _decode_mod = _CompiledDecode(
+                    self.processor.norm, _raw_head, self.out_shape
+                ).to(self._device)
+                _compiled = Gradient.compile(
                     _decode_mod,
                     mode=compile_mode_arg,
                     fullgraph=False,
-                    dynamic=True,
+                    dynamic=compile_dynamic,
                     backend="inductor",
-                    disable=disable_compile,
+                    disable=False,
                     **compile_kwargs,
                 )
+                self._decode_compiled = _compiled
+                compiled_decode = _compiled is not _decode_mod
+            except Exception:
+                self._decode_compiled = None
+                _LOGGER.warning(
+                    "torch.compile failed for decode head; continuing without compilation",
+                    exc_info=True,
+                )
+            with contextlib.suppress(Exception):
+                gc.collect()
+            with contextlib.suppress(Exception):
+                if getattr(self._device, "type", None) == "cuda":
+                    torch.cuda.empty_cache()
 
-            with contextlib.suppress(Exception):
-                self.processor.temporal_net = Gradient.compile(
-                    self.processor.temporal_net,
-                    mode=compile_mode_arg,
-                    fullgraph=False,
-                    dynamic=compile_dynamic,
-                    backend="inductor",
-                    disable=disable_compile,
-                    **compile_kwargs,
-                )
-            with contextlib.suppress(Exception):
-                self.processor.perception = Gradient.compile(
-                    self.processor.perception,
-                    mode=compile_mode_arg,
-                    fullgraph=False,
-                    dynamic=compile_dynamic,
-                    backend="inductor",
-                    disable=disable_compile,
-                    **compile_kwargs,
-                )
+            if compile_heavy_submodules:
+                try:
+                    _orig = self.processor.temporal_net
+                    _compiled = Gradient.compile(
+                        _orig,
+                        mode=compile_mode_arg,
+                        fullgraph=False,
+                        dynamic=compile_dynamic,
+                        backend="inductor",
+                        disable=False,
+                        **compile_kwargs,
+                    )
+                    self.processor.temporal_net = _compiled
+                    compiled_temporal = _compiled is not _orig
+                except Exception:
+                    _LOGGER.warning(
+                        "torch.compile failed for processor.temporal_net; continuing eagerly",
+                        exc_info=True,
+                    )
+                with contextlib.suppress(Exception):
+                    gc.collect()
+                with contextlib.suppress(Exception):
+                    if getattr(self._device, "type", None) == "cuda":
+                        torch.cuda.empty_cache()
+
+            if compile_heavy_submodules:
+                try:
+                    _orig = self.processor.perception
+                    _compiled = Gradient.compile(
+                        _orig,
+                        mode=compile_mode_arg,
+                        fullgraph=False,
+                        dynamic=compile_dynamic,
+                        backend="inductor",
+                        disable=False,
+                        **compile_kwargs,
+                    )
+                    self.processor.perception = _compiled
+                    compiled_perception = _compiled is not _orig
+                except Exception:
+                    _LOGGER.warning(
+                        "torch.compile failed for processor.perception; continuing eagerly",
+                        exc_info=True,
+                    )
+                with contextlib.suppress(Exception):
+                    gc.collect()
+                with contextlib.suppress(Exception):
+                    if getattr(self._device, "type", None) == "cuda":
+                        torch.cuda.empty_cache()
+
+        self._compiled_submodules = {
+            "decode": bool(compiled_decode),
+            "temporal_net": bool(compiled_temporal),
+            "perception": bool(compiled_perception),
+        }
+        # Only enable microbatch padding if we actually have any compiled submodule.
+        self._pad_compiled_microbatch = bool(
+            compiled_decode or compiled_temporal or compiled_perception
+        )
+
+        # AMP negotiation caching (keyed by device + dataset scale stats).
+        # This avoids re-scanning dtypes and scale metadata on every forward.
+        self._amp_dtype_cache: Dict[Tuple[Any, ...], torch.dtype] = {}
+        self._amp_dtype_cache_last_key: Tuple[Any, ...] | None = None
+        self._amp_dtype_cache_last_dtype: torch.dtype | None = None
+        self._amp_dtype_cache_max = 64
         self.__config = config
 
     def _promote_float32_params(self) -> None:
@@ -2254,25 +2436,83 @@ class Root(nn.Module):
             x_raw = x_raw.to(device=device, non_blocking=True)
 
         x_scaled = self.scaler.normalize_x(x_raw)
-        with contextlib.suppress(Exception):
+        try:
             import torch._dynamo as _dynamo
+
             if _dynamo.is_compiling():
                 _dynamo.graph_break()
+        except Exception:
+            pass
+
         meta = None
-        with contextlib.suppress(Exception):
+        try:
             meta = Autocast.coerce_metadata(device)
-        amp_candidates = ()
-        with contextlib.suppress(Exception):
-            amp_candidates = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
+        except Exception:
+            meta = None
+            _LOGGER.debug(
+                "Autocast.coerce_metadata failed; falling back to fp32",
+                exc_info=True,
+            )
+
+        amp_candidates: Tuple[torch.dtype, ...] = ()
+        if meta is not None:
+            try:
+                amp_candidates = tuple(getattr(meta, "float_dtypes", ()))
+            except Exception:
+                amp_candidates = ()
         if not amp_candidates:
             amp_candidates = (torch.float32,)
-        amp_dtype = Autocast.negotiate(
-            tuple(amp_candidates),
-            fallback=torch.float64,
-            context="instance.forward",
-            device=device,
-            meta=meta,
-        )
+
+        # Cache AMP negotiation keyed by device + scale statistics.
+        dev_index = int(device.index) if getattr(device, "index", None) is not None else -1
+        if meta is None:
+            cache_key = (device.type, dev_index, amp_candidates, None)
+        else:
+            has_scale = bool(getattr(meta, "has_scale", False))
+            has_nonfinite = bool(getattr(meta, "has_nonfinite", False))
+            max_abs_v = getattr(meta, "scale_max_abs", None)
+            min_pos_v = getattr(meta, "scale_min_positive", None)
+            try:
+                max_abs_f = float(max_abs_v) if max_abs_v is not None else None
+            except Exception:
+                max_abs_f = None
+            try:
+                min_pos_f = float(min_pos_v) if min_pos_v is not None else None
+            except Exception:
+                min_pos_f = None
+            underflow_action = getattr(meta, "underflow_action", "")
+            cache_key = (
+                device.type,
+                dev_index,
+                amp_candidates,
+                bool(has_scale),
+                bool(has_nonfinite),
+                max_abs_f,
+                min_pos_f,
+                str(underflow_action),
+            )
+
+        amp_dtype = None
+        last_key = getattr(self, "_amp_dtype_cache_last_key", None)
+        if last_key == cache_key:
+            amp_dtype = getattr(self, "_amp_dtype_cache_last_dtype", None)
+        if amp_dtype is None:
+            amp_dtype = self._amp_dtype_cache.get(cache_key)
+        if amp_dtype is None:
+            amp_dtype = Autocast.negotiate(
+                tuple(amp_candidates),
+                fallback=torch.float64,
+                logger=_LOGGER,
+                context="instance.forward",
+                device=device,
+                meta=meta,
+                decision_key=cache_key,
+            )
+            if len(self._amp_dtype_cache) >= int(getattr(self, "_amp_dtype_cache_max", 64)):
+                self._amp_dtype_cache.clear()
+            self._amp_dtype_cache[cache_key] = amp_dtype
+        self._amp_dtype_cache_last_key = cache_key
+        self._amp_dtype_cache_last_dtype = amp_dtype
         amp_enabled = amp_dtype is not torch.float64
 
         is_cls_loss = (

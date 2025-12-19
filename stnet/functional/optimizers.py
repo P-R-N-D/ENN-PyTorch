@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import json
 import logging
+# json is used for structured optimizer decision logs.
+from collections import OrderedDict
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
                     Sequence, Tuple, Union)
 
@@ -26,6 +29,45 @@ except Exception:
 
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Deduplicate optimizer decision logs (best-effort, bounded).
+_OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
+_OPT_LOGGED_MAX: int = 128
+
+
+def _log_opt_decision_once(
+    logger: Optional[Callable[[str], None]],
+    key: object,
+    payload: Dict[str, Any],
+    *,
+    level: str = "info",
+) -> None:
+    if key is None:
+        key = ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
+    if key in _OPT_LOGGED_KEYS:
+        try:
+            _OPT_LOGGED_KEYS.move_to_end(key)
+        except Exception:
+            pass
+        return
+    _OPT_LOGGED_KEYS[key] = None
+    try:
+        if len(_OPT_LOGGED_KEYS) > int(_OPT_LOGGED_MAX):
+            _OPT_LOGGED_KEYS.popitem(last=False)
+    except Exception:
+        pass
+    try:
+        msg = "[OPT][DECISION] " + json.dumps(payload, sort_keys=True, default=str)
+    except Exception:
+        msg = f"[OPT][DECISION] {payload}"
+    if logger:
+        logger(msg)
+        return
+    if level == "debug":
+        _LOGGER.debug(msg)
+    else:
+        _LOGGER.info(msg)
 
 
 def _log_info(logger: Optional[Callable[[str], None]], msg: str) -> None:
@@ -188,18 +230,60 @@ class AdamW:
             else model_or_params
         )
         dev, meta = AdamW._from_metadata(model_or_params, metadata)
+
+        dev_index = int(getattr(dev, "index", -1)) if getattr(dev, "index", None) is not None else -1
+        scale_key = (
+            bool(getattr(meta, "has_scale", False)),
+            bool(getattr(meta, "has_nonfinite", False)),
+            getattr(meta, "scale_max_abs", None),
+            getattr(meta, "scale_min_positive", None),
+            getattr(meta, "scale_min_value", None),
+            getattr(meta, "scale_max_value", None),
+            str(getattr(meta, "underflow_action", "")),
+            getattr(meta, "int_quant_bits", None),
+        )
+        decision_key = ("opt", "adamw-float", str(getattr(dev, "type", "")), dev_index, scale_key)
+
+        attempts: List[Dict[str, Any]] = []
+
+        # 1) Transformer Engine fused AdamW (float)
         if hasattr(dev, "type") and dev.type == "cuda":
             try:
                 from transformer_engine.pytorch.optimizers import \
                     FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
-                if logger:
-                    logger("[OPT] Using FusedAdam (Transformer Engine)")
+                attempts.append({"backend": "te.FusedAdam", "ok": True})
+                _log_opt_decision_once(
+                    logger,
+                    decision_key,
+                    {
+                        "mode": "adamw-float",
+                        "device": f"{dev.type}:{dev_index}",
+                        "selected": "te.FusedAdam",
+                        "attempts": attempts,
+                        "scale": {
+                            "has_scale": bool(getattr(meta, "has_scale", False)),
+                            "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)),
+                            "max_abs": getattr(meta, "scale_max_abs", None),
+                            "min_positive": getattr(meta, "scale_min_positive", None),
+                            "min_value": getattr(meta, "scale_min_value", None),
+                            "max_value": getattr(meta, "scale_max_value", None),
+                            "underflow_action": str(getattr(meta, "underflow_action", "")),
+                            "int_quant_bits": getattr(meta, "int_quant_bits", None),
+                        },
+                    },
+                    level="info",
+                )
                 return opt
             except Exception as exc:
-                if logger:
-                    logger(f"[OPT] TE FusedAdam unavailable: {exc}")
+                attempts.append({"backend": "te.FusedAdam", "ok": False, "error": str(exc)})
+
+        # 2) FP8 optimizer path (TorchAO).
+        #
+        # IMPORTANT: Dataset.is_float8_supported() describes hardware support (and sometimes
+        # runtime constraints). It is NOT a signal for which software backend is installed.
+        # Do not branch on substrings like "TE"/"AO" in the reason string.
         if hasattr(dev, "type") and dev.type == "cuda":
             fp8_allowed = True
             if getattr(meta, "has_scale", False):
@@ -209,50 +293,125 @@ class AdamW:
                     for dtype in float8_dtypes
                 ):
                     fp8_allowed = False
-                    if logger:
-                        logger(
-                            "[OPT] FP8 optimizers disabled: data scale exceeds float8 range"
-                        )
-            ok, reason = Dataset.is_float8_supported(dev)
-            if fp8_allowed and ok:
-                if "TE" in str(reason):
-                    try:
-                        from transformer_engine.pytorch.optimizers import \
-                            FusedAdam
+                    attempts.append(
+                        {
+                            "backend": "fp8",
+                            "ok": False,
+                            "reason": "data scale exceeds float8 range",
+                        }
+                    )
 
-                        opt = FusedAdam(params, lr=lr, weight_decay=weight_decay)
-                        if logger:
-                            logger(
-                                f"[OPT] Using FusedAdam (transformer_engine) — {reason}"
-                            )
-                        return opt
-                    except Exception as exc:
-                        if logger:
-                            logger(
-                                f"[OPT] transformer_engine.FusedAdam unavailable: {exc}"
-                            )
-                if "AO" in str(reason):
-                    try:
-                        from torchao.optim import AdamWFp8
+            fp8_hw_ok, fp8_hw_reason = Dataset.is_float8_supported(dev)
+            if fp8_allowed and fp8_hw_ok:
+                try:
+                    # Some TorchAO builds require importing torchao.float8 before optimizers.
+                    with contextlib.suppress(Exception):
+                        __import__("torchao.float8")
 
-                        opt = AdamWFp8(params, lr=lr, weight_decay=weight_decay)
-                        if logger:
-                            logger(f"[OPT] Using AdamW-FP8 (torchao) — {reason}")
-                        return opt
-                    except Exception as exc:
-                        if logger:
-                            logger(f"[OPT] torchao.AdamWFp8 unavailable: {exc}")
-                elif logger:
-                    logger(f"[OPT] FP8 optimizers not supported ({reason}) — fallback")
+                    AdamWFp8 = None
+                    with contextlib.suppress(Exception):
+                        from torchao.optim import AdamWFp8  # type: ignore
+                    if AdamWFp8 is None:
+                        # Older/newer TorchAO layouts
+                        from torchao.prototype.float8.optim import AdamWFp8  # type: ignore
+
+                    opt = AdamWFp8(params, lr=lr, weight_decay=weight_decay)
+                    attempts.append({"backend": "torchao.AdamWFp8", "ok": True, "reason": str(fp8_hw_reason)})
+                    _log_opt_decision_once(
+                        logger,
+                        decision_key,
+                        {
+                            "mode": "adamw-float",
+                            "device": f"{dev.type}:{dev_index}",
+                            "selected": "torchao.AdamWFp8",
+                            "attempts": attempts,
+                            "fp8_reason": str(fp8_hw_reason),
+                            "scale": {
+                                "has_scale": bool(getattr(meta, "has_scale", False)),
+                                "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)),
+                                "max_abs": getattr(meta, "scale_max_abs", None),
+                                "min_positive": getattr(meta, "scale_min_positive", None),
+                                "min_value": getattr(meta, "scale_min_value", None),
+                                "max_value": getattr(meta, "scale_max_value", None),
+                                "underflow_action": str(getattr(meta, "underflow_action", "")),
+                                "int_quant_bits": getattr(meta, "int_quant_bits", None),
+                            },
+                        },
+                        level="info",
+                    )
+                    return opt
+                except Exception as exc:
+                    attempts.append(
+                        {
+                            "backend": "torchao.AdamWFp8",
+                            "ok": False,
+                            "error": str(exc),
+                            "reason": str(fp8_hw_reason),
+                        }
+                    )
+            else:
+                attempts.append({"backend": "fp8", "ok": False, "reason": str(fp8_hw_reason)})
+
+        # 3) Low-bit optimizer path (TorchAO) when explicitly requested via metadata.int_quant_bits.
+        quant_bits = getattr(meta, "int_quant_bits", None)
+        if quant_bits in (4, 8):
+            try:
+                try:
+                    from torchao.optim import AdamW4bit, AdamW8bit  # type: ignore
+                except ImportError:
+                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit  # type: ignore
+
+                if int(quant_bits) == 8:
+                    opt = AdamW8bit(params, lr=lr, weight_decay=weight_decay)
+                    selected = "torchao.AdamW8bit"
+                else:
+                    opt = AdamW4bit(params, lr=lr, weight_decay=weight_decay)
+                    selected = "torchao.AdamW4bit"
+                attempts.append({"backend": selected, "ok": True, "bits": int(quant_bits)})
+                _log_opt_decision_once(
+                    logger,
+                    decision_key,
+                    {
+                        "mode": "adamw-float",
+                        "device": f"{dev.type}:{dev_index}",
+                        "selected": selected,
+                        "attempts": attempts,
+                        "scale": {
+                            "has_scale": bool(getattr(meta, "has_scale", False)),
+                            "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)),
+                            "max_abs": getattr(meta, "scale_max_abs", None),
+                            "min_positive": getattr(meta, "scale_min_positive", None),
+                            "min_value": getattr(meta, "scale_min_value", None),
+                            "max_value": getattr(meta, "scale_max_value", None),
+                            "underflow_action": str(getattr(meta, "underflow_action", "")),
+                            "int_quant_bits": getattr(meta, "int_quant_bits", None),
+                        },
+                    },
+                    level="info",
+                )
+                return opt
+            except Exception as exc:
+                attempts.append({"backend": "torchao.AdamW(lowbit)", "ok": False, "error": str(exc), "bits": quant_bits})
+
+        # 4) Fallback: torch.optim.AdamW
         flags: Dict[str, bool] = optimal_optimizer_params(
             dev, use_foreach=None, use_fused=False
         )
         opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
-        if logger:
-            logger(f"[OPT] Using torch.optim.AdamW (flags={flags})")
+        attempts.append({"backend": "torch.optim.AdamW", "ok": True, "flags": flags})
+        _log_opt_decision_once(
+            logger,
+            decision_key,
+            {
+                "mode": "adamw-float",
+                "device": f"{dev.type}:{dev_index}",
+                "selected": "torch.optim.AdamW",
+                "attempts": attempts,
+            },
+            level="info",
+        )
         return opt
 
-    @staticmethod
     def integer(
         model_or_params: Union[
             nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]
@@ -270,77 +429,119 @@ class AdamW:
             else model_or_params
         )
         dev, meta = AdamW._from_metadata(model_or_params, metadata)
-        if hasattr(dev, "type") and dev.type == "cuda":
+
+        dev_index = int(getattr(dev, "index", -1)) if getattr(dev, "index", None) is not None else -1
+        scale_key = (
+            bool(getattr(meta, "has_scale", False)),
+            bool(getattr(meta, "has_nonfinite", False)),
+            getattr(meta, "scale_max_abs", None),
+            getattr(meta, "scale_min_positive", None),
+            getattr(meta, "scale_min_value", None),
+            getattr(meta, "scale_max_value", None),
+            bool(getattr(meta, "scale_is_integral", False)),
+            str(getattr(meta, "underflow_action", "")),
+            getattr(meta, "int_quant_bits", None),
+        )
+        decision_key = ("opt", "adamw-integer", str(getattr(dev, "type", "")), dev_index, scale_key)
+
+        decision: Dict[str, Any] = {
+            "mode": "adamw-integer",
+            "device": str(dev),
+            "selected": None,
+            "attempts": [],
+            "scale": {
+                "has_scale": bool(getattr(meta, "has_scale", False)),
+                "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)),
+                "is_integral": getattr(meta, "scale_is_integral", None),
+                "max_abs": getattr(meta, "scale_max_abs", None),
+                "min": getattr(meta, "scale_min_value", None),
+                "max": getattr(meta, "scale_max_value", None),
+                "int_quant_bits": getattr(meta, "int_quant_bits", None),
+            },
+        }
+
+        opt: Optional[optim.Optimizer] = None
+        selected: Optional[str] = None
+
+        # 1) Prefer Transformer Engine fused optimizer when available.
+        if getattr(dev, "type", None) == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import \
-                    FusedAdam as TEFusedAdam
+                from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, lr=lr, weight_decay=weight_decay)
-                if logger:
-                    logger("[OPT] Using FusedAdam (Transformer Engine)")
-                return opt
+                selected = "transformer_engine.FusedAdam"
+                decision["attempts"].append({"name": "TE.FusedAdam", "ok": True})
             except Exception as exc:
-                if logger:
-                    logger(f"[OPT] TE FusedAdam unavailable: {exc}")
+                decision["attempts"].append({"name": "TE.FusedAdam", "ok": False, "error": str(exc)})
+
+        # 2) Low-bit integer optimizers (TorchAO) when dataset is integral and within range.
         quant_choice: Optional[str] = None
         quant_reason: Optional[str] = None
-        if getattr(meta, "has_scale", False):
+        if opt is None and bool(getattr(meta, "has_scale", False)):
             if getattr(meta, "scale_is_integral", None) is False:
-                if logger:
-                    logger("[OPT] Low-bit optimizers disabled: data is not integral")
+                decision["attempts"].append({"name": "lowbit", "ok": False, "reason": "non-integral"})
             else:
+                min_v = getattr(meta, "scale_min_value", None)
+                max_v = getattr(meta, "scale_max_value", None)
+                try:
+                    min_f = float(min_v) if min_v is not None else None
+                except Exception:
+                    min_f = None
+                try:
+                    max_f = float(max_v) if max_v is not None else None
+                except Exception:
+                    max_f = None
+
                 max_abs = float(abs(getattr(meta, "scale_max_abs", 0.0)))
-                candidates: List[
-                    Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]
-                ] = []
-                if max_abs <= 7.0:
-                    candidates.append(("int4", Dataset.is_int4_supported))
-                if max_abs <= 127.0:
-                    candidates.append(("int8", Dataset.is_int8_supported))
-                if not candidates:
-                    if logger:
-                        logger(
-                            "[OPT] Low-bit optimizers disabled: magnitude %.3f exceeds int8 range",
-                            max_abs,
-                        )
+                candidates: List[Tuple[str, Callable[[Optional[torch.device]], Tuple[bool, str]]]] = []
+                if (min_f is not None) and (max_f is not None):
+                    if (min_f >= -8.0) and (max_f <= 7.0):
+                        candidates.append(("int4", Dataset.is_int4_supported))
+                    if (min_f >= -128.0) and (max_f <= 127.0):
+                        candidates.append(("int8", Dataset.is_int8_supported))
                 else:
-                    for name, checker in candidates:
-                        ok, reason = checker(dev)
-                        if ok:
-                            quant_choice = name
-                            quant_reason = reason
-                            break
-                        if logger:
-                            logger(
-                                f"[OPT] {name.upper()} optimizers not supported ({reason}) — fallback"
-                            )
-        if quant_choice in {"int8", "int4"}:
+                    if max_abs <= 7.0:
+                        candidates.append(("int4", Dataset.is_int4_supported))
+                    if max_abs <= 127.0:
+                        candidates.append(("int8", Dataset.is_int8_supported))
+
+                for name, checker in candidates:
+                    ok, reason = checker(dev)
+                    decision["attempts"].append({"name": f"{name}-supported", "ok": bool(ok), "reason": str(reason)})
+                    if ok:
+                        quant_choice = name
+                        quant_reason = reason
+                        break
+                if not candidates:
+                    decision["attempts"].append({"name": "lowbit", "ok": False, "reason": f"magnitude>{max_abs}"})
+
+        if opt is None and quant_choice in {"int8", "int4"}:
             try:
                 try:
                     from torchao.optim import AdamW4bit, AdamW8bit
                 except ImportError:
-                    from torchao.prototype.low_bit_optim import (AdamW4bit,
-                                                                 AdamW8bit)
+                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit
+
                 if quant_choice == "int8":
                     opt = AdamW8bit(params, lr=lr, weight_decay=weight_decay)
-                    if logger:
-                        note = f" — {quant_reason}" if quant_reason else ""
-                        logger(f"[OPT] TorchAO AdamW8bit{note}")
-                    return opt
-                opt = AdamW4bit(params, lr=lr, weight_decay=weight_decay)
-                if logger:
-                    note = f" — {quant_reason}" if quant_reason else ""
-                    logger(f"[OPT] TorchAO AdamW4bit{note}")
-                return opt
+                    selected = "torchao.optim.AdamW8bit"
+                    decision["attempts"].append({"name": "AO.AdamW8bit", "ok": True, "reason": str(quant_reason)})
+                else:
+                    opt = AdamW4bit(params, lr=lr, weight_decay=weight_decay)
+                    selected = "torchao.optim.AdamW4bit"
+                    decision["attempts"].append({"name": "AO.AdamW4bit", "ok": True, "reason": str(quant_reason)})
             except Exception as exc:
-                if logger:
-                    logger(f"[OPT] TorchAO low-bit optimizer unavailable: {exc}")
-        flags: Dict[str, bool] = optimal_optimizer_params(
-            dev, use_foreach=None, use_fused=False
-        )
-        opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
-        if logger:
-            logger(f"[OPT] Using AdamW (flags={flags})")
+                decision["attempts"].append({"name": "AO.AdamW(lowbit)", "ok": False, "error": str(exc)})
+
+        # 3) Default fallback.
+        if opt is None:
+            flags: Dict[str, bool] = optimal_optimizer_params(dev, use_foreach=None, use_fused=False)
+            opt = optim.AdamW(params, lr=lr, weight_decay=weight_decay, **flags)
+            selected = f"torch.optim.AdamW(flags={flags})"
+            decision["attempts"].append({"name": "torch.optim.AdamW", "ok": True, "flags": flags})
+
+        decision["selected"] = selected
+        _log_opt_decision_once(logger, decision_key, decision)
         return opt
 
 

@@ -526,6 +526,8 @@ def preload_memmap(
         "has_scale": False,
         "has_nonfinite": False,
         "scale_max_abs": None,
+        "scale_min_value": None,
+        "scale_max_value": None,
         "scale_min_positive": None,
         "scale_is_integral": None,
     }
@@ -656,7 +658,10 @@ def preload_memmap(
         e = min(int(count), int(s) + int(chunk))
 
         if shuffle_mode == "physical":
-            assert perm is not None
+            if perm is None:
+                raise RuntimeError(
+                    "Internal error: shuffle permutation missing in physical shuffle mode"
+                )
             idx = perm[s:e]
             fx_src = _gather(raw_X, idx)
             lb_src = _gather(raw_Y, idx)
@@ -729,6 +734,8 @@ def preload_memmap(
         "has_scale": bool(stats.get("has_scale")),
         "has_nonfinite": bool(stats.get("has_nonfinite")),
         "scale_max_abs": stats.get("scale_max_abs"),
+        "scale_min_value": stats.get("scale_min_value"),
+        "scale_max_value": stats.get("scale_max_value"),
         "scale_min_positive": stats.get("scale_min_positive"),
         "scale_is_integral": stats.get("scale_is_integral"),
         "is_negotiable": bool(negotiable),
@@ -896,7 +903,6 @@ class Connector:
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
         self.max_concurrency = max(1, int(self.io_workers))
-        self.max_concurrancy = self.max_concurrency
         try:
             from ..backend.system import get_tlb
             get_tlb(io_workers=self.io_workers)

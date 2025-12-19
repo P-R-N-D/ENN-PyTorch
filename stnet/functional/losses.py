@@ -214,13 +214,19 @@ class MultipleQuantileLoss(nn.Module):
     ) -> None:
         super().__init__()
         q = torch.tensor(list(quantiles), dtype=torch.float32)
-        assert q.ndim == 1 and torch.all((q > 0) & (q < 1))
+        if q.ndim != 1 or not bool(torch.all((q > 0) & (q < 1))):
+            raise ValueError(
+                "quantiles must be a 1D sequence with all values in the open interval (0, 1)"
+            )
         self.register_buffer("q", q)
         if weights is None:
             w = torch.ones_like(q)
         else:
             w = torch.tensor(list(weights), dtype=torch.float32)
-            assert w.shape == q.shape
+            if w.shape != q.shape:
+                raise ValueError(
+                    f"weights must have the same shape as quantiles: expected {tuple(q.shape)}, got {tuple(w.shape)}"
+                )
         self.register_buffer("w", w / (w.sum() + 1e-12))
         self.quantile_dim = None if quantile_dim is None else int(quantile_dim)
         self.reduction = str(reduction)
@@ -228,8 +234,14 @@ class MultipleQuantileLoss(nn.Module):
     def _resolve_q_dim(self, shape: torch.Size) -> int:
         Q = int(self.q.numel())
         if self.quantile_dim is not None:
-            assert 0 <= self.quantile_dim < len(shape)
-            assert shape[self.quantile_dim] == Q
+            if not (0 <= self.quantile_dim < len(shape)):
+                raise ValueError(
+                    f"quantile_dim={self.quantile_dim} is out of bounds for shape {tuple(shape)}"
+                )
+            if int(shape[self.quantile_dim]) != Q:
+                raise ValueError(
+                    f"quantile_dim={self.quantile_dim} expects size {Q}, got {int(shape[self.quantile_dim])}"
+                )
             return self.quantile_dim
         candidates = [i for i, s in enumerate(shape) if s == Q]
         if 1 in candidates:
@@ -1186,8 +1198,12 @@ class TiledLoss(nn.Module):
         self.mask_value = mask_value
         self.tile_dim = tile_dim
         self.tile_size = int(tile_size) if tile_size is not None else None
-        assert reduction in ("mean", "sum", "none")
-        self.reduction = reduction
+        reduction_v = str(reduction)
+        if reduction_v not in ("mean", "sum", "none"):
+            raise ValueError(
+                f"reduction must be one of ('mean', 'sum', 'none'), got {reduction!r}"
+            )
+        self.reduction = reduction_v
 
     def _mask(self, pred: torch.Tensor, target: torch.Tensor) -> Optional[torch.Tensor]:
         match self.mask_mode:

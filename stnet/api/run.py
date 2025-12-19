@@ -145,6 +145,8 @@ def _write_memmap_streaming_two_pass(
         "has_scale": False,
         "has_nonfinite": False,
         "scale_max_abs": None,
+        "scale_min_value": None,
+        "scale_max_value": None,
         "scale_min_positive": None,
         "scale_is_integral": None,
     }
@@ -176,6 +178,8 @@ def _write_memmap_streaming_two_pass(
                 "has_scale": True,
                 "has_nonfinite": False,
                 "scale_max_abs": 0.0,
+                "scale_min_value": 0.0,
+                "scale_max_value": 0.0,
                 "scale_min_positive": None,
                 "scale_is_integral": None,
             }
@@ -232,7 +236,10 @@ def _write_memmap_streaming_two_pass(
         if lb is None:
             if not allow_missing_labels:
                 raise RuntimeError("streaming memmap writer requires labels tensor (non-None)")
-            assert zeros_label_buf is not None
+            if zeros_label_buf is None:
+                raise RuntimeError(
+                    "Internal error: zeros_label_buf missing while allow_missing_labels=True"
+                )
             lb_out = zeros_label_buf[:n]
         else:
             if tuple(lb.shape[1:]) != tuple(label_shape):
@@ -272,6 +279,8 @@ def _write_memmap_streaming_two_pass(
         "has_scale": bool(stats.get("has_scale")),
         "has_nonfinite": bool(stats.get("has_nonfinite")),
         "scale_max_abs": stats.get("scale_max_abs"),
+        "scale_min_value": stats.get("scale_min_value"),
+        "scale_max_value": stats.get("scale_max_value"),
         "scale_min_positive": stats.get("scale_min_positive"),
         "scale_is_integral": stats.get("scale_is_integral"),
         "is_negotiable": bool(negotiable),
