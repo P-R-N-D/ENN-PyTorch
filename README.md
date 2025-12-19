@@ -7,8 +7,17 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 > **License**: PolyForm Noncommercial 1.0.0
 
 ## Requirements
-- **Mandatory**: Python 3.10, or newer.
-- **Optional** (for best performance): Python 3.14t, or newer, as free-threading (no-GIL) build
+
+### Mandatory
+- **Python**: >= 3.10 (uses `match` / `case`)
+- **PyTorch**: >= 2.8.0
+- **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
+- **tensordict**: >= 0.10.0
+
+### Recommended (throughput)
+- **Python 3.14t** (free-threading / no-GIL build)
+  - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
+  - 3.14t can further improve throughput by removing the GIL, but it is not required.
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
@@ -191,8 +200,8 @@ stnet/
 
 - Python ≥ 3.10 is required.
 - PyTorch is expected to be **≥ 2.8.0**. If you rely on features that landed later (e.g., newer Inductor options), bump the constraint accordingly.
-- `torchdata` is used by the data pipeline nodes; it is listed as a dependency to avoid runtime import errors.
-- `tensordict` is used for TensorDict integration and memory-mapped tensor utilities.
+- `torchdata` (`torchdata.nodes`) powers the data pipeline.
+- `tensordict` provides TensorDict integration and memory-mapped tensor utilities.
 - `triton` is intentionally **not** pinned here; the correct binary is installed as a transitive dependency of PyTorch.
 - Export backends (TensorRT/CoreML/ExecuTorch/ORT) have additional system requirements; install only what you need.
 
