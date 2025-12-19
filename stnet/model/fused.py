@@ -916,7 +916,7 @@ class Autocast:
         **kwargs: Any,
     ) -> torch.dtype:
         # Evaluate candidates in order.
-        safety_margin = float(kwargs.pop("safety_margin", 1.0))
+        safety_margin = float(kwargs.pop("safety_margin", 8.0))
         checks: List[Dict[str, Any]] = []
         selected: Optional[torch.dtype] = None
         selected_from: str = "candidate"
