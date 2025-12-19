@@ -4,7 +4,7 @@ Spatio‑temporal modular neural network (MNN) model for PyTorch with pragmatic 
 
 This repository also includes a worked example notebook (`notebook.ipynb`, Korean) and a small sample dataset (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
-> **Python**: 3.10+ (recommended: Python 3.14+ with Free-Threading / PEP 703 enabled) · **License**: PolyForm Noncommercial 1.0.0
+> **Python**: 3.10 (Minimal), 3.14t (Recommanded for free-threading) · **License**: PolyForm Noncommercial 1.0.0
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
