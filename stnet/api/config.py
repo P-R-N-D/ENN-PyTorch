@@ -131,6 +131,7 @@ class ModelConfig:
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
+    safety_margin_pow2: int = 3
 
 
 def coerce_patch_config(
@@ -296,6 +297,13 @@ def coerce_model_config(
         else:
             normalized_compile_mode = normalized_compile_mode.lower()
     resolved["compile_mode"] = normalized_compile_mode
+    raw_pow2 = filtered.get("safety_margin_pow2", getattr(defaults, "safety_margin_pow2", 3))
+    resolved["safety_margin_pow2"] = _coerce_int(
+        raw_pow2,
+        name="safety_margin_pow2",
+        minimum=0,
+        maximum=30,
+    )
 
     return ModelConfig(**resolved)
 
