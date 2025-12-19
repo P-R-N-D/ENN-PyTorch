@@ -1,6 +1,7 @@
 # Notes
 # - Do NOT add `triton` here; PyTorch will install a matching Triton build automatically.
 # - Install the correct PyTorch build for your accelerator (CUDA/ROCm/XPU/CPU) **before** installing this project.
+# - Python >= 3.10 is required; Python 3.14t (free-threading) is recommended for higher data pipeline throughput.
 #
 # This file is kept as a convenience for environments that still prefer `pip install -r requirements.txt`.
 # The canonical dependency set is in `pyproject.toml`.
