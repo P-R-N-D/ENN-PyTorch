@@ -4,7 +4,7 @@ Spatio‑temporal modular neural network (MNN) model for PyTorch with pragmatic 
 
 This repository also includes a worked example notebook (`notebook.ipynb`, Korean) and a small sample dataset (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
-> **Python**: 3.10+ · **License**: PolyForm Noncommercial 1.0.0
+> **Python**: 3.10+ (recommended: Python 3.14+ with Free-Threading / PEP 703 enabled) · **License**: PolyForm Noncommercial 1.0.0
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
@@ -15,6 +15,8 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
 - **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
 - **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `Root`, `History`).
+
+- **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
 
 ## Installation
 
@@ -74,6 +76,8 @@ cfg = ModelConfig(
     depth=4,
     heads=4,
     device="cuda" if torch.cuda.is_available() else "cpu",
+    # AMP dtype negotiation guard band: safety_margin = 2**n (default n=3 -> margin=8)
+    safety_margin_pow2=3,
 )
 model = new_model(in_dim=16, out_shape=(1,), config=cfg)
 

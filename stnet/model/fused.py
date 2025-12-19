@@ -916,13 +916,63 @@ class Autocast:
         **kwargs: Any,
     ) -> torch.dtype:
         # Evaluate candidates in order.
-        safety_margin = float(kwargs.pop("safety_margin", 8.0))
+        #
+        # Safety margin controls how conservative dtype negotiation is.
+        # It can be specified either directly (safety_margin=float) or as a
+        # power-of-two exponent n (safety_margin_pow2),
+        # where safety_margin = 2**n.
+        #
+        # Safety margin is validated: non-finite or <=0 values fall back to a
+        # conservative default.
+        raw_pow2 = kwargs.pop("safety_margin_pow2", None)
+
+        safety_margin_pow2: Optional[int] = None
+        if raw_pow2 is not None:
+            try:
+                safety_margin_pow2 = int(raw_pow2)
+            except Exception:
+                safety_margin_pow2 = 3
+            if safety_margin_pow2 < 0:
+                safety_margin_pow2 = 0
+            # Hard cap to avoid pathological margins.
+            if safety_margin_pow2 > 30:
+                safety_margin_pow2 = 30
+            safety_margin = float(2 ** safety_margin_pow2)
+        else:
+            raw_margin = kwargs.pop("safety_margin", 8.0)
+            try:
+                safety_margin = float(raw_margin)
+            except Exception:
+                safety_margin = 8.0
+            if (not math.isfinite(safety_margin)) or (safety_margin <= 0.0):
+                safety_margin = 8.0
+            # Infer pow2 for logging when safety_margin is exactly a power of two.
+            with contextlib.suppress(Exception):
+                n = int(round(math.log2(safety_margin)))
+                if n >= 0:
+                    ref = float(2 ** n)
+                    if abs(ref - safety_margin) / max(abs(safety_margin), 1.0) < 1e-12:
+                        safety_margin_pow2 = n
+
+        # Optional override: allow callers to specify underflow policy for this
+        # negotiation only.
+        raw_underflow = kwargs.pop("underflow_action", None)
+        if raw_underflow is None:
+            raw_underflow = kwargs.pop("underflow", None)
+        underflow_override: Optional[str] = None
+        if raw_underflow is not None:
+            underflow_override = normalize_underflow_action(
+                raw_underflow, default=default_underflow_action()
+            )
+
         checks: List[Dict[str, Any]] = []
         selected: Optional[torch.dtype] = None
         selected_from: str = "candidate"
 
         for dtype in candidates:
-            ok, why = _scale_safety_check(dtype, meta, safety_margin=safety_margin)
+            ok, why = _scale_safety_check(
+                dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
+            )
             checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
             if ok:
                 selected = dtype
@@ -942,7 +992,9 @@ class Autocast:
             else:
                 fallback_order = (fallback, torch.int64, torch.float32, torch.float64)
             for dtype in fallback_order:
-                ok, why = _scale_safety_check(dtype, meta, safety_margin=safety_margin)
+                ok, why = _scale_safety_check(
+                    dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
+                )
                 checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
                 if ok:
                     selected = dtype
@@ -972,6 +1024,9 @@ class Autocast:
                     tuple(_dtype_short(x) for x in candidates),
                     _dtype_short(fallback),
                     scale_key,
+                    float(safety_margin),
+                    (int(safety_margin_pow2) if safety_margin_pow2 is not None else None),
+                    (underflow_override or ""),
                 )
             payload: Dict[str, Any] = {
                 "context": str(context),
@@ -983,6 +1038,8 @@ class Autocast:
                 "fallback_order": ([_dtype_short(x) for x in fallback_order] if fallback_order else []),
                 "checks": checks,
                 "safety_margin": safety_margin,
+                "safety_margin_pow2": safety_margin_pow2,
+                "underflow_action_override": underflow_override,
                 "scale": {
                     "has_scale": bool(getattr(meta, "has_scale", False)) if meta is not None else False,
                     "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)) if meta is not None else False,

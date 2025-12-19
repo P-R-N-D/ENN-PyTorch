@@ -2464,9 +2464,18 @@ class Root(nn.Module):
             amp_candidates = (torch.float32,)
 
         # Cache AMP negotiation keyed by device + scale statistics.
+        safety_margin_pow2 = 3
+        try:
+            safety_margin_pow2 = int(getattr(self.__config, "safety_margin_pow2", 3))
+        except Exception:
+            safety_margin_pow2 = 3
+        if safety_margin_pow2 < 0:
+            safety_margin_pow2 = 0
+        elif safety_margin_pow2 > 30:
+            safety_margin_pow2 = 30
         dev_index = int(device.index) if getattr(device, "index", None) is not None else -1
         if meta is None:
-            cache_key = (device.type, dev_index, amp_candidates, None)
+            cache_key = (device.type, dev_index, amp_candidates, None, int(safety_margin_pow2))
         else:
             has_scale = bool(getattr(meta, "has_scale", False))
             has_nonfinite = bool(getattr(meta, "has_nonfinite", False))
@@ -2490,6 +2499,7 @@ class Root(nn.Module):
                 max_abs_f,
                 min_pos_f,
                 str(underflow_action),
+                int(safety_margin_pow2),
             )
 
         amp_dtype = None
@@ -2507,6 +2517,7 @@ class Root(nn.Module):
                 device=device,
                 meta=meta,
                 decision_key=cache_key,
+                safety_margin_pow2=int(safety_margin_pow2),
             )
             if len(self._amp_dtype_cache) >= int(getattr(self, "_amp_dtype_cache_max", 64)):
                 self._amp_dtype_cache.clear()
