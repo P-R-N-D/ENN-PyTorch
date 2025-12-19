@@ -4,6 +4,7 @@ from __future__ import annotations
 import inspect
 import math
 import warnings
+import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -569,42 +570,37 @@ class DotProductAttention(nn.Module):
                     )
                 return mask.contiguous(), int(batch_dim), int(head_count)
 
-            def _to_bhls(
-                x: torch.Tensor | None, *args: Any, dtype: torch.dtype | None = None
+            # Keep masks in compact (batch_dim, head_count, L, S) form.
+            # This avoids materializing full (B, H, L, S) masks (memory), and keeps Flash/Efficient
+            # SDPA eligible when a boolean mask is supplied.
+            if mask_bool is not None:
+                mask_bool, _, _ = _flatten_mask(mask_bool)
+            if bias_float is not None:
+                bias_float, _, _ = _flatten_mask(bias_float.to(dtype=q_bshd.dtype))
+
+            def _expand_bhls(
+                x: torch.Tensor | None, *, dtype: torch.dtype | None = None
             ) -> torch.Tensor | None:
                 if x is None:
                     return None
-                mask, batch_dim, head_count = _flatten_mask(x)
+                batch_dim, head_count, _, _ = x.shape
+                if batch_dim not in (1, B):
+                    raise RuntimeError(
+                        f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
+                    )
+                if head_count not in (1, H):
+                    raise RuntimeError(
+                        f"attn_mask head count {head_count} incompatible with num_heads {H}"
+                    )
+                out = x
                 if batch_dim != B:
-                    mask = mask.expand(B, head_count, L, S)
+                    out = out.expand(B, head_count, L, S)
                     batch_dim = B
-                if head_count == 1:
-                    mask = mask.expand(batch_dim, H, L, S)
-                elif head_count == H and batch_dim != B:
-                    mask = mask.expand(B, head_count, L, S)
-                if dtype is not None and mask.dtype != dtype:
-                    mask = mask.to(dtype=dtype)
-                return mask.contiguous()
-
-            mask_bool = _to_bhls(mask_bool)
-            if bias_float is not None:
-                bias_float = _to_bhls(bias_float, dtype=q_bshd.dtype)
-
-            if (
-                mask_bool is not None
-                and bias_float is None
-                and self._te_ok
-                and self._te_attn is not None
-                and not self._te_supports_mask
-                and self._te_supports_core_bias
-            ):
-                finfo = torch.finfo(q_bshd.dtype)
-                zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                neg_inf = torch.full(
-                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
-                )
-                bias_float = torch.where(mask_bool, neg_inf, zero)
-                mask_bool = None
+                if head_count == 1 and H != 1:
+                    out = out.expand(batch_dim, H, L, S)
+                if dtype is not None and out.dtype != dtype:
+                    out = out.to(dtype=dtype)
+                return out.contiguous()
 
         try:
             is_compiling = torch._dynamo.is_compiling()
@@ -616,13 +612,39 @@ class DotProductAttention(nn.Module):
             and self.te_first
             and not self._force_pt
             and (self._te_attn is not None)
-            and (attn_mask is None or mask_bool is None or self._te_supports_mask)
             and not is_compiling
             and q_bshd.is_cuda
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
-            and ((mask_bool is None) or self._te_supports_mask)
-            and ((bias_float is None) or self._te_supports_core_bias)
         )
+        te_mask: torch.Tensor | None = None
+        te_bias: torch.Tensor | None = None
+        if use_te:
+            # Transformer Engine support for masks/bias varies by version.
+            # Convert boolean masks into an additive bias only when necessary.
+            if mask_bool is not None:
+                if self._te_supports_mask:
+                    te_mask = _expand_bhls(mask_bool, dtype=torch.bool)
+                elif self._te_supports_core_bias:
+                    finfo = torch.finfo(q_bshd.dtype)
+                    zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
+                    neg_inf = torch.full(
+                        (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                    )
+                    mask_te = _expand_bhls(mask_bool, dtype=torch.bool)
+                    mask_bias = torch.where(mask_te, neg_inf, zero)
+                    if bias_float is not None:
+                        bias_te = _expand_bhls(bias_float, dtype=q_bshd.dtype)
+                        te_bias = mask_bias + bias_te
+                    else:
+                        te_bias = mask_bias
+                else:
+                    use_te = False
+
+            if use_te and bias_float is not None and te_bias is None:
+                if self._te_supports_core_bias:
+                    te_bias = _expand_bhls(bias_float, dtype=q_bshd.dtype)
+                else:
+                    use_te = False
         if use_te:
             q_te = q_bshd.transpose(1, 2).contiguous()
             k_te = k_bshd.transpose(1, 2).contiguous()
@@ -634,12 +656,12 @@ class DotProductAttention(nn.Module):
                 te_kwargs["is_causal"] = bool(is_causal)
             if self._te_supports_training:
                 te_kwargs["training"] = training
-            if mask_bool is not None and self._te_mask_param:
-                te_kwargs[self._te_mask_param] = mask_bool
+            if te_mask is not None and self._te_mask_param:
+                te_kwargs[self._te_mask_param] = te_mask
                 if self._te_supports_mask_type and self._te_mask_type_param:
                     te_kwargs[self._te_mask_type_param] = "arbitrary"
-            if bias_float is not None and self._te_core_bias_param:
-                te_kwargs[self._te_core_bias_param] = bias_float
+            if te_bias is not None and self._te_core_bias_param:
+                te_kwargs[self._te_core_bias_param] = te_bias
                 if self._te_supports_core_bias_type and self._te_core_bias_type_param:
                     te_kwargs[self._te_core_bias_type_param] = "post_scale_bias"
             try:
@@ -657,24 +679,39 @@ class DotProductAttention(nn.Module):
                 except Exception:
                     pass
                 return out_te
-        sdpa_bias: torch.Tensor | None = None
-        if mask_bool is not None:
-            finfo = torch.finfo(q_bshd.dtype)
-            zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-            neg_inf = torch.full(
-                (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
-            )
-            sdpa_bias = torch.where(mask_bool, neg_inf, zero).expand(B, H, L, S)
-        if bias_float is not None:
-            base = (
-                sdpa_bias
-                if sdpa_bias is not None
-                else torch.zeros(B, H, L, S, device=q_bshd.device, dtype=q_bshd.dtype)
-            )
-            sdpa_bias = base + bias_float
-        final_mask = (
-            attn_mask if (attn_mask is not None and sdpa_bias is None) else sdpa_bias
-        )
+
+        # SDPA path: keep boolean masks as boolean when possible.
+        # Converting masks to additive biases forces materialization of large (B,H,L,S) tensors and
+        # can prevent Flash/Efficient SDPA kernels from being used.
+        final_mask: torch.Tensor | None = None
+        if bias_float is None:
+            final_mask = mask_bool
+        else:
+            if mask_bool is not None:
+                finfo = torch.finfo(q_bshd.dtype)
+                zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
+                neg_inf = torch.full(
+                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                )
+                mask_bias = torch.where(mask_bool, neg_inf, zero)
+                mb, mh, _, _ = mask_bias.shape
+                bb, bh, _, _ = bias_float.shape
+                tgt_b = B if (mb == B or bb == B) else 1
+                tgt_h = H if (mh == H or bh == H) else 1
+                if mb != tgt_b:
+                    mask_bias = mask_bias.expand(tgt_b, mh, L, S)
+                    mb = tgt_b
+                if mh != tgt_h:
+                    mask_bias = mask_bias.expand(mb, tgt_h, L, S)
+                bias_b = bias_float
+                if bb != tgt_b:
+                    bias_b = bias_b.expand(tgt_b, bh, L, S)
+                    bb = tgt_b
+                if bh != tgt_h:
+                    bias_b = bias_b.expand(bb, tgt_h, L, S)
+                final_mask = (mask_bias + bias_b).contiguous()
+            else:
+                final_mask = bias_float
         sdpa_kwargs = {
             "attn_mask": final_mask,
             "dropout_p": dropout_val,
@@ -701,7 +738,8 @@ class DotProductAttention(nn.Module):
                 raise RuntimeError(
                     f"attn_mask head count {head_count} incompatible with num_heads {H}"
                 )
-            sdpa_kwargs["attn_mask"] = fm.contiguous()
+            # Keep mask broadcastable to avoid materializing a full (B, H, L, S) tensor.
+            sdpa_kwargs["attn_mask"] = fm
             sdpa_kwargs["is_causal"] = False
         backends = get_dpa_backends()
         sdpa_out: Optional[torch.Tensor] = None
@@ -1075,7 +1113,40 @@ class MultiScaleRetentionTriton(nn.Module):
         SVB, SVL, SVH, SVD = v_blhc.stride()
         SOB, SOL, SOH, SOD = out_state.stride()
 
-        BLOCK_DH = 32
+        # Tuned defaults: use larger blocks for larger head_dim to reduce launch overhead.
+        # num_warps chosen to balance occupancy vs register pressure.
+        #
+        # Optional environment overrides:
+        #   - STNET_MSR_TRITON_BLOCK_DH  (16/32/64/128)
+        #   - STNET_MSR_TRITON_NUM_WARPS (1/2/4/8/16)
+        BLOCK_DH: int
+        num_warps: int
+        env_block = os.environ.get("STNET_MSR_TRITON_BLOCK_DH", "").strip()
+        if env_block:
+            try:
+                _b = int(env_block)
+                if _b in (16, 32, 64, 128):
+                    BLOCK_DH = _b
+                else:
+                    raise ValueError
+            except Exception:
+                BLOCK_DH = 64 if head_dim >= 64 else 32
+        else:
+            BLOCK_DH = 64 if head_dim >= 64 else 32
+
+        env_warps = os.environ.get("STNET_MSR_TRITON_NUM_WARPS", "").strip()
+        if env_warps:
+            try:
+                _w = int(env_warps)
+                if _w in (1, 2, 4, 8, 16):
+                    num_warps = _w
+                else:
+                    raise ValueError
+            except Exception:
+                num_warps = 8 if BLOCK_DH >= 64 else 4
+        else:
+            num_warps = 8 if BLOCK_DH >= 64 else 4
+
         grid = (B * self.nhead, triton.cdiv(head_dim, BLOCK_DH))
 
         _triton_retention[grid](
@@ -1095,6 +1166,7 @@ class MultiScaleRetentionTriton(nn.Module):
             SOH,
             SOD,
             BLOCK_DH=BLOCK_DH,
+            num_warps=num_warps,
         )
 
         state_tensor = out_state.to(v.dtype)
@@ -1255,7 +1327,25 @@ class _MultiHeadAttentionNvidia(nn.Module):
         is_causal: Optional[bool] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         embed_dim = int(query.shape[-1])
-        if self._force_pt or (self._te_mha is None):
+
+        def _call_fallback() -> tuple[torch.Tensor, torch.Tensor | None]:
+            backends = get_dpa_backends()
+            if backends:
+                try:
+                    from torch.nn.attention import sdpa_kernel
+                except Exception:
+                    backends = []
+            if backends:
+                with sdpa_kernel(backends):
+                    return self._fallback(
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=need_weights,
+                        is_causal=is_causal,
+                    )
             return self._fallback(
                 query,
                 key,
@@ -1265,6 +1355,8 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 need_weights=need_weights,
                 is_causal=is_causal,
             )
+        if self._force_pt or (self._te_mha is None):
+            return _call_fallback()
         te_attn_mask = attn_mask
         if attn_mask is not None or key_padding_mask is not None:
             te_attn_mask = _to_nvidia_mask(
@@ -1277,15 +1369,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
             )
             if te_attn_mask is None:
                 self._force_pt = True
-                return self._fallback(
-                    query,
-                    key,
-                    value,
-                    attn_mask=attn_mask,
-                    key_padding_mask=key_padding_mask,
-                    need_weights=need_weights,
-                    is_causal=is_causal,
-                )
+                return _call_fallback()
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
@@ -1334,15 +1418,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
             except Exception:
                 continue
         self._force_pt = True
-        return self._fallback(
-            query,
-            key,
-            value,
-            attn_mask=attn_mask,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            is_causal=is_causal,
-        )
+        return _call_fallback()
 
 
 class MultiHeadAttention(nn.Module):

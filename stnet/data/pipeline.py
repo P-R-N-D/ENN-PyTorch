@@ -266,10 +266,14 @@ class BatchPolicy:
         return max(1, b)
 
 
+_TORCHDATA_IMPORT_ERROR: Exception | None = None
 try:
     from torchdata.nodes import BaseNode
 except Exception as _e:
-    ensure_torchdata(err=_e, context="stnet.data.pipeline")
+    # torchdata is an optional dependency unless the streaming pipeline is used.
+    # Defer the hard failure to runtime when nodes/pipeline composition is requested.
+    BaseNode = object  # type: ignore[assignment]
+    _TORCHDATA_IMPORT_ERROR = _e
 
 
 _NODES_IMPORT_ERROR: Exception | None = None
@@ -280,6 +284,8 @@ except Exception as _e:
     _NODES_IMPORT_ERROR = _e
 
 def _require_nodes() -> None:
+    if _TORCHDATA_IMPORT_ERROR is not None:
+        ensure_torchdata(err=_TORCHDATA_IMPORT_ERROR, context="stnet.data.pipeline")
     if _NODES_IMPORT_ERROR is not None:
         raise ImportError(
             f"stnet.data.pipeline: data-pipeline components require torchdata>={MIN_TORCHDATA_VERSION} (and tensordict). "
@@ -1615,6 +1621,8 @@ class Dataset(Generic[TExtra]):
     has_scale: bool = False
     has_nonfinite: bool = False
     scale_max_abs: Optional[float] = None
+    scale_min_value: Optional[float | int] = None
+    scale_max_value: Optional[float | int] = None
     scale_min_positive: Optional[float] = None
     scale_is_integral: Optional[bool] = None
     is_negotiable: Optional[bool] = None
@@ -1747,7 +1755,10 @@ class Dataset(Generic[TExtra]):
         if features.ndim == 0:
             features = features.reshape(1, 1)
         if features.ndim == 1:
-            features = features.unsqueeze(1)
+            # Interpret a 1D tensor as a single sample with (1, in_dim)
+            # rather than (N, 1). This aligns with the model reference
+            # convention: features are shaped (B, in_dim).
+            features = features.reshape(1, -1)
 
         if labels is not None:
             labels = _to_tensor(labels, dtype=self.label_float_dtype).contiguous()
@@ -1788,6 +1799,8 @@ class Dataset(Generic[TExtra]):
         - has_scale (bool)
         - has_nonfinite (bool)
         - scale_max_abs (float|None)
+        - scale_min_value (float|int|None)
+        - scale_max_value (float|int|None)
         - scale_min_positive (float|None) # smallest abs(value)>0 among finite entries
         - scale_is_integral (bool|None)
         """
@@ -1798,6 +1811,8 @@ class Dataset(Generic[TExtra]):
                 'has_scale': False,
                 'has_nonfinite': False,
                 'scale_max_abs': None,
+                'scale_min_value': None,
+                'scale_max_value': None,
                 'scale_min_positive': None,
                 'scale_is_integral': None,
             }
@@ -1824,6 +1839,13 @@ class Dataset(Generic[TExtra]):
             has_nonfinite = bool((~finite).any().item())
             if finite.any().item():
                 xf = x[finite]
+                # Track signed min/max (useful for int-range negotiation and diagnostics).
+                try:
+                    min_val = float(xf.min().item()) if xf.numel() else None
+                    max_val = float(xf.max().item()) if xf.numel() else None
+                except Exception:
+                    min_val, max_val = (None, None)
+
                 absf = xf.abs()
                 max_abs = float(absf.max().item()) if absf.numel() else 0.0
                 nonzero = absf > 0
@@ -1833,28 +1855,47 @@ class Dataset(Generic[TExtra]):
                     min_pos = None
             else:
                 max_abs = float('nan')
+                min_val = None
+                max_val = None
                 min_pos = None
             return {
                 'has_scale': True,
                 'has_nonfinite': has_nonfinite,
                 'scale_max_abs': max_abs,
+                'scale_min_value': min_val,
+                'scale_max_value': max_val,
                 'scale_min_positive': min_pos,
                 'scale_is_integral': None,
             }
         # integer / bool
         x = t.detach()
+        if x.dtype == torch.bool:
+            x_i64 = x.to(dtype=torch.int64)
+        else:
+            # Keep integer values exact for boundary checks; avoid abs() overflow on signed min.
+            x_i64 = x.to(dtype=torch.int64) if x.dtype != torch.int64 else x
+
         try:
-            absx = x.abs() if x.dtype != torch.bool else x.to(dtype=torch.int64)
+            min_i = int(x_i64.min().item()) if x_i64.numel() else 0
+            max_i = int(x_i64.max().item()) if x_i64.numel() else 0
         except Exception:
-            absx = x.to(dtype=torch.int64).abs()
-        max_abs = float(absx.max().item()) if absx.numel() else 0.0
-        nonzero = absx > 0
-        min_pos = float(absx[nonzero].min().item()) if nonzero.any().item() else None
+            # Extremely defensive: fall back to Python list path (slow, but only for stats).
+            vals = x_i64.detach().cpu().reshape(-1).tolist()
+            min_i = int(min(vals)) if vals else 0
+            max_i = int(max(vals)) if vals else 0
+
+        # abs() overflow-safe: compute max(|min|, |max|) in Python int space.
+        max_abs = float(max(abs(min_i), abs(max_i)))
+
+        # For integral stats, subnormal/underflow is not meaningful; keep min_positive=None.
+        min_pos = None
         is_integral = True
         return {
             'has_scale': True,
             'has_nonfinite': False,
             'scale_max_abs': max_abs,
+            'scale_min_value': min_i,
+            'scale_max_value': max_i,
             'scale_min_positive': min_pos,
             'scale_is_integral': is_integral,
         }
@@ -1864,6 +1905,8 @@ class Dataset(Generic[TExtra]):
         """Merge two scale stats dicts conservatively (worst-case).
 
         - max_abs takes max
+        - min_value takes min of non-None
+        - max_value takes max of non-None
         - min_positive takes min of non-None
         - has_nonfinite OR
         - scale_is_integral AND when both specified
@@ -1892,7 +1935,23 @@ class Dataset(Generic[TExtra]):
             except Exception:
                 return v1
 
+        def _min_num(v1: Any, v2: Any) -> Any:
+            if v1 is None:
+                return v2
+            if v2 is None:
+                return v1
+            try:
+                return v1 if v1 <= v2 else v2
+            except Exception:
+                try:
+                    f1, f2 = float(v1), float(v2)
+                    return v1 if f1 <= f2 else v2
+                except Exception:
+                    return v1
+
         out['scale_max_abs'] = _max(a.get('scale_max_abs'), b.get('scale_max_abs'))
+        out['scale_min_value'] = _min_num(a.get('scale_min_value'), b.get('scale_min_value'))
+        out['scale_max_value'] = _max(a.get('scale_max_value'), b.get('scale_max_value'))
         out['scale_min_positive'] = _min_pos(a.get('scale_min_positive'), b.get('scale_min_positive'))
 
         ia = a.get('scale_is_integral')
@@ -1956,6 +2015,8 @@ class Dataset(Generic[TExtra]):
         self.has_scale = bool(stats.get('has_scale') or False)
         self.has_nonfinite = bool(stats.get('has_nonfinite') or False)
         self.scale_max_abs = (float(stats['scale_max_abs']) if stats.get('scale_max_abs') is not None else None)
+        self.scale_min_value = stats.get('scale_min_value')
+        self.scale_max_value = stats.get('scale_max_value')
         self.scale_min_positive = (float(stats['scale_min_positive']) if stats.get('scale_min_positive') is not None else None)
         self.scale_is_integral = (bool(stats['scale_is_integral']) if stats.get('scale_is_integral') is not None else None)
         # If float scale present, negotiable means safe to cast to fp32

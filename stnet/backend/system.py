@@ -275,7 +275,6 @@ class WorkerPolicy:
             "prebatch": int(self.prebatch),
             "prefetch_factor": int(self.prefetch_factor),
         }
-        out["max_concurrancy"] = out["max_concurrency"]
         return out
 
     def as_procs_dict(self) -> Dict[str, Union[int, str]]:

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import contextlib
+import logging
+import os
 import json
+import tempfile
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
@@ -31,6 +34,9 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 
 from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class Format(Protocol):
@@ -126,9 +132,69 @@ def _is_rank0() -> bool:
 
 
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding=encoding)
-    tmp.replace(path)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=path.suffix + ".tmp", dir=str(path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(text, encoding=encoding)
+        tmp_path.replace(path)
+    finally:
+        with contextlib.suppress(Exception):
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+
+def _atomic_torch_save(obj: Any, path: Path, **opts: Any) -> None:
+    """Atomically write a torch checkpoint.
+
+    Writes to a temporary file in the same directory and then renames into place.
+    This avoids corrupting checkpoints if the process is interrupted mid-write.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.name + ".", suffix=path.suffix + ".tmp", dir=str(path.parent)
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(obj, str(tmp_path), **opts)
+        tmp_path.replace(path)
+    finally:
+        with contextlib.suppress(Exception):
+            if tmp_path.exists():
+                tmp_path.unlink()
+
+
+def _torch_load_checkpoint(
+    path: Path,
+    *,
+    map_location: Optional[torch.device | str] = None,
+    weights_only: bool = True,
+) -> Any:
+    """Load a torch checkpoint with a safe default.
+
+    - Prefer `weights_only=True` when supported by the installed torch.
+    - Fall back for older torch versions that don't support this argument.
+    """
+    try:
+        return torch.load(
+            str(path), map_location=map_location or "cpu", weights_only=bool(weights_only)
+        )
+    except TypeError:
+        # Older PyTorch: no weights_only support.
+        return torch.load(str(path), map_location=map_location or "cpu")
+    except Exception as exc:
+        if weights_only:
+            raise RuntimeError(
+                "Failed to load checkpoint with weights_only=True. "
+                "If you trust the checkpoint source, retry with weights_only=False."
+            ) from exc
+        raise
 
 
 def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
@@ -183,6 +249,7 @@ def load_model(
     out_shape: Optional[Sequence[int]] = None,
     config: ModelConfig | Dict[str, Any] | None = None,
     map_location: Optional[torch.device | str] = None,
+    weights_only: bool = True,
 ) -> nn.Module:
     p = Path(checkpoint_path)
     load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
@@ -256,7 +323,7 @@ def load_model(
         model.load_state_dict(sd, strict=False)
         return model
 
-    obj = torch.load(str(p), map_location=map_location or "cpu", weights_only=False)
+    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
@@ -307,11 +374,21 @@ def save_model(
     if TorchIO.is_native_target(p):
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
-            with contextlib.suppress(Exception):
+            try:
                 merged_extra["ema_averager_state"] = ema_averager.state_dict()
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to serialize ema_averager_state; skipping",
+                    exc_info=True,
+                )
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
-            with contextlib.suppress(Exception):
+            try:
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to serialize swa_averager_state; skipping",
+                    exc_info=True,
+                )
         out = TorchIO.save(
             model,
             p,
@@ -387,7 +464,21 @@ class TorchIO:
 
             sd = model.state_dict()
             cpu_sd = {k: _to_cpu(v) for k, v in sd.items()}
-            save_tensors(cpu_sd, str(p), metadata={"format": "safetensors-v1"})
+            # Write safetensors atomically to avoid partial files.
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
+            try:
+                save_tensors(
+                    cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"}
+                )
+                tmp_path.replace(p)
+            finally:
+                with contextlib.suppress(Exception):
+                    if tmp_path.exists():
+                        tmp_path.unlink()
             meta = {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
@@ -410,11 +501,16 @@ class TorchIO:
             "pytorch_version": torch.__version__,
         }
         if optimizer is not None and hasattr(optimizer, "state_dict"):
-            with contextlib.suppress(Exception):
+            try:
                 payload["optimizer_state_dict"] = optimizer.state_dict()
+            except Exception:
+                _LOGGER.debug(
+                    "Failed to serialize optimizer_state_dict; skipping",
+                    exc_info=True,
+                )
         if extra:
             payload["extra"] = extra
-        torch.save(payload, str(p), **opts)
+        _atomic_torch_save(payload, p, **opts)
         return p
 
 

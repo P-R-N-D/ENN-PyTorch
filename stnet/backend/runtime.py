@@ -462,6 +462,8 @@ def _merge_meta_dicts(metas: list[dict]) -> dict:
 
     - feature_dim / label_shape must match.
     - scale_max_abs is merged by max.
+    - scale_min_value is merged by min (ignoring None).
+    - scale_max_value is merged by max (ignoring None).
     - scale_min_positive is merged by min (ignoring None).
     - has_scale / has_nonfinite are merged by OR.
     - is_negotiable is merged by AND (if present).
@@ -483,9 +485,11 @@ def _merge_meta_dicts(metas: list[dict]) -> dict:
     feature_dim = base.get("feature_dim")
     label_shape = base.get("label_shape")
 
-    has_scale = bool(base.get("has_scale", False)) or base.get("scale_max_abs") is not None or base.get("scale_min_positive") is not None
+    has_scale = bool(base.get("has_scale", False)) or base.get("scale_max_abs") is not None or base.get("scale_min_value") is not None or base.get("scale_max_value") is not None or base.get("scale_min_positive") is not None
     has_nonfinite = bool(base.get("has_nonfinite", False))
     max_abs = base.get("scale_max_abs")
+    min_val = base.get("scale_min_value")
+    max_val = base.get("scale_max_value")
     min_pos = base.get("scale_min_positive")
     is_integral = base.get("scale_is_integral")
     is_negotiable = base.get("is_negotiable")
@@ -497,12 +501,26 @@ def _merge_meta_dicts(metas: list[dict]) -> dict:
         if label_shape is not None and m.get("label_shape") is not None and tuple(m.get("label_shape")) != tuple(label_shape):
             raise ValueError(f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}")
 
-        has_scale = has_scale or bool(m.get("has_scale", False)) or m.get("scale_max_abs") is not None or m.get("scale_min_positive") is not None
+        has_scale = has_scale or bool(m.get("has_scale", False)) or m.get("scale_max_abs") is not None or m.get("scale_min_value") is not None or m.get("scale_max_value") is not None or m.get("scale_min_positive") is not None
         has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
 
         a = m.get("scale_max_abs")
         if a is not None:
             max_abs = a if max_abs is None else max(float(max_abs), float(a))
+
+        mn = m.get("scale_min_value")
+        if mn is not None:
+            try:
+                min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
+            except Exception:
+                min_val = mn if min_val is None else min(float(min_val), float(mn))
+
+        mx = m.get("scale_max_value")
+        if mx is not None:
+            try:
+                max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
+            except Exception:
+                max_val = mx if max_val is None else max(float(max_val), float(mx))
 
         p = m.get("scale_min_positive")
         if p is not None:
@@ -521,6 +539,8 @@ def _merge_meta_dicts(metas: list[dict]) -> dict:
     base["has_scale"] = has_scale
     base["has_nonfinite"] = has_nonfinite
     base["scale_max_abs"] = max_abs
+    base["scale_min_value"] = min_val
+    base["scale_max_value"] = max_val
     base["scale_min_positive"] = min_pos
     base["scale_is_integral"] = is_integral
     base["is_negotiable"] = is_negotiable
@@ -3040,11 +3060,15 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         metadata.has_scale = bool(
             meta_info.get("has_scale", False)
             or meta_info.get("scale_max_abs") is not None
+            or meta_info.get("scale_min_value") is not None
+            or meta_info.get("scale_max_value") is not None
             or meta_info.get("scale_min_positive") is not None
             or meta_info.get("scale_min_abs") is not None
         )
         metadata.has_nonfinite = bool(meta_info.get("has_nonfinite", False))
         metadata.scale_max_abs = meta_info.get("scale_max_abs")
+        metadata.scale_min_value = meta_info.get("scale_min_value")
+        metadata.scale_max_value = meta_info.get("scale_max_value")
         metadata.scale_min_positive = meta_info.get("scale_min_positive") or meta_info.get("scale_min_abs")
         metadata.scale_is_integral = meta_info.get("scale_is_integral")
         if meta_info.get("is_negotiable") is not None:

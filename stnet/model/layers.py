@@ -92,7 +92,8 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
 def reshape_for_mha(x: torch.Tensor, batch: int, heads: int, head_dim: int) -> torch.Tensor:
     if x.dim() != 3:
         raise ValueError(f"Expected (B, N, D) tensor for MHA reshape, got shape {tuple(x.shape)}")
-    return x.view(batch, -1, heads, head_dim).transpose(1, 2).contiguous()
+    # Prefer reshape over view for stability when inputs are non-contiguous.
+    return x.reshape(batch, -1, heads, head_dim).transpose(1, 2).contiguous()
 
 
 class PatchAttention(nn.Module):
@@ -564,9 +565,9 @@ class DilatedAttention(nn.Module):
             scale = 1.0 / math.sqrt(float(Dh))
             dropout_p = float(self.dropout_p) if training else 0.0
 
-            qh = q[:, :L_q, :].view(B, L_q, H, Dh).transpose(1, 2)
-            kh = k.view(B, L_k, H, Dh).transpose(1, 2)
-            vh = v.view(B, L_k, H, Dh).transpose(1, 2)
+            qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
+            kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
+            vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
 
             win = int(self.window_size) if self.window_size is not None else None
 
@@ -716,9 +717,9 @@ class DilatedAttention(nn.Module):
             H = self.num_heads
             Dh = self.head_dim
 
-            qh = q[:, :L_q, :].view(B, L_q, H, Dh).transpose(1, 2)
-            kh = k.view(B, L_k, H, Dh).transpose(1, 2)
-            vh = v.view(B, L_k, H, Dh).transpose(1, 2)
+            qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
+            kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
+            vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
 
             base_mask_full = self._get_mask(L_k, x_k.device)
             base_mask = base_mask_full[:L_q, :]
