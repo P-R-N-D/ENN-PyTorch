@@ -7,7 +7,6 @@
 # The canonical dependency set is in `pyproject.toml`.
 
 # Base runtime (mirrors pyproject.toml -> [project].dependencies)
-netifaces>=0.11.0
 numpy>=2.2.5
 psutil>=7.0.0
 py-cpuinfo>=9.0.0
@@ -15,7 +14,10 @@ torch>=2.8.0
 torchdata>=0.11.0
 tensordict>=0.10.0
 tqdm>=4.67.1
-safetensors>=0.4.0
+
+# Checkpoint / IO formats (optional)
+# - safetensors: enables .safetensors checkpoints
+# safetensors>=0.4.0
 
 # Optional extras (install via `pip install -e .[extra]`)
 #
@@ -35,7 +37,7 @@ safetensors>=0.4.0
 #              coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
 #
 # Telemetry
-# - telemetry: pynvml>=11.5.0
+# - telemetry: nvidia-ml-py>=11.515.48
 #
 # NUFFT losses (CUDA)
 # - nufft: cufinufft

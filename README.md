@@ -196,6 +196,18 @@ stnet/
 - `STNET_META_MONITOR` (alias: `STNET_META_HOOK`): set to `1` to fail fast on meta-tensor inputs during model wiring/forward; set to `warn` to log only.
 - `STNET_DISABLE_MKLDNN`: set to `1` to disable oneDNN (MKLDNN) before model construction if it causes issues for your CPU build.
 
+- **Free-threading / no-GIL**
+  - `STNET_NOGIL_OPT` (aliases: `STNET_NO_GIL_OPT`, `STNET_FREE_THREADING_OPT`): enable/disable no-GIL-specific tuning. Default: auto-detect (enabled only when running on a free-threaded build *and* the GIL is disabled).
+  - `STNET_MEMMAP_THREAD_LOCAL`: use per-thread `MemoryMappedTensor` handles (`1`/`0`). Default: auto-enabled when no-GIL optimizations are enabled.
+  - `STNET_TLB_FLUSH_EVERY`, `STNET_TLB_SAMPLE_EVERY`: reduce thread-local telemetry overhead in high-throughput thread pipelines (defaults are higher when no-GIL optimizations are enabled).
+
+- **NVML telemetry** (optional extra: `.[telemetry]`)
+  - `STNET_NVML_DISABLE=1`: disable NVML telemetry unconditionally.
+  - `STNET_NVML_MIN_INTERVAL_S` (alias: `STNET_NVML_MIN_INTERVAL`): throttle NVML utilization queries (seconds).
+
+- **TorchInductor compilation**
+  - `STNET_INDUCTOR_COMPILE_THREADS` (alias: `STNET_COMPILE_THREADS`): cap Inductor compile threads per process to avoid oversubscription on multi-rank nodes.
+
 ## Version & compatibility notes
 
 - Python ≥ 3.10 is required.

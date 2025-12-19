@@ -9,6 +9,7 @@ import math
 import os
 import platform
 import sys
+import threading
 import time
 import warnings
 from collections.abc import Mapping
@@ -31,17 +32,196 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
-try:
-    import pynvml as _nvml
+_nvml = None
+_NVML_READY = False
+_NVML_TRIED = False
+_NVML_LOCK = threading.Lock()
 
+_NVML_QUERY_LOCK = threading.Lock()
+_NVML_HANDLE_CACHE: dict[int, Any] = {}
+_NVML_UTIL_CACHE: dict[int, tuple[float, Optional[float], Optional[float]]] = {}
+_NVML_MIN_INTERVAL_S: Optional[float] = None
+
+# NVML failure backoff:
+# - When NVML is flaky (driver reset, container permissions, MIG changes, etc.),
+#   repeated exceptions inside tight training loops become expensive, especially
+#   on no-GIL builds where the loop runs much faster.
+# - We keep NVML optional and best-effort: on repeated failures, temporarily
+#   disable NVML queries and fall back to torch.cuda.mem_get_info().
+_NVML_FAIL_COUNT: int = 0
+_NVML_BACKOFF_UNTIL: float = 0.0
+_NVML_BACKOFF_S: Optional[float] = None
+_NVML_FAIL_MAX: Optional[int] = None
+
+
+def _nvml_disabled() -> bool:
+    """Return True if NVML telemetry is explicitly disabled via env vars."""
+
+    def _parse_bool(v: object) -> Optional[bool]:
+        if v is None:
+            return None
+        s = str(v).strip().lower()
+        if not s:
+            return None
+        if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+            return True
+        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+            return False
+        return None
+
+    # STNET_NVML_DISABLE=1 disables NVML unconditionally.
+    v = _parse_bool(os.environ.get("STNET_NVML_DISABLE"))
+    if v is True:
+        return True
+
+    # STNET_NVML=0 also disables (mirrors other STNET toggles).
+    v = _parse_bool(os.environ.get("STNET_NVML"))
+    if v is False:
+        return True
+    return False
+
+
+def _nvml_fail_max() -> int:
+    """Number of consecutive NVML query failures before entering backoff."""
+
+    global _NVML_FAIL_MAX
+    if _NVML_FAIL_MAX is not None:
+        return int(_NVML_FAIL_MAX)
+
+    v = os.environ.get("STNET_NVML_FAIL_MAX")
+    if v is None:
+        v = os.environ.get("STNET_NVML_FAILURES")
+    if v is not None and str(v).strip():
+        try:
+            _NVML_FAIL_MAX = max(1, int(v))
+            return int(_NVML_FAIL_MAX)
+        except Exception:
+            pass
+    _NVML_FAIL_MAX = 3
+    return int(_NVML_FAIL_MAX)
+
+
+def _nvml_backoff_s() -> float:
+    """Backoff duration (seconds) once NVML is considered unhealthy.
+
+    Override with:
+      - STNET_NVML_BACKOFF_S / STNET_NVML_BACKOFF
+      - Set to 0 to disable backoff (not recommended).
+    """
+
+    global _NVML_BACKOFF_S
+    if _NVML_BACKOFF_S is not None:
+        return float(_NVML_BACKOFF_S)
+
+    for key in ("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"):
+        v = os.environ.get(key)
+        if v is not None and str(v).strip():
+            try:
+                _NVML_BACKOFF_S = max(0.0, float(v))
+                return float(_NVML_BACKOFF_S)
+            except Exception:
+                pass
+
+    # Default: slightly longer backoff when no-GIL optimizations are enabled,
+    # because telemetry is polled much more frequently.
     try:
-        _nvml.nvmlInit()
-        _NVML_READY = True
+        from .system import Thread
+
+        _NVML_BACKOFF_S = 30.0 if bool(Thread.nogil_optimizations_enabled()) else 10.0
     except Exception:
+        _NVML_BACKOFF_S = 10.0
+    return float(_NVML_BACKOFF_S)
+
+
+def _nvml_in_backoff(now: Optional[float] = None) -> bool:
+    """True if NVML queries are currently in backoff."""
+
+    if now is None:
+        now = float(time.perf_counter())
+    with _NVML_LOCK:
+        until = float(_NVML_BACKOFF_UNTIL or 0.0)
+    return bool(until > 0.0 and float(now) < until)
+
+
+def _nvml_min_interval_s() -> float:
+    """Minimum seconds between NVML queries per device.
+
+    NVML calls are relatively expensive. On no-GIL builds (or when STNET_NOGIL_OPT is enabled),
+    the input pipeline can run at much higher throughput, and querying NVML every step can
+    become noticeable overhead.
+
+    - Default: 0.0s (no throttling) on regular builds.
+    - Default: 0.10s on no-GIL optimized runs.
+    - Override with STNET_NVML_MIN_INTERVAL_S / STNET_NVML_MIN_INTERVAL (float seconds).
+    """
+
+    global _NVML_MIN_INTERVAL_S
+    if _NVML_MIN_INTERVAL_S is not None:
+        return float(_NVML_MIN_INTERVAL_S)
+
+    # Env override (seconds)
+    for key in ("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"):
+        v = os.environ.get(key)
+        if v is not None and str(v).strip():
+            try:
+                _NVML_MIN_INTERVAL_S = max(0.0, float(v))
+                return float(_NVML_MIN_INTERVAL_S)
+            except Exception:
+                pass
+
+    # Default: throttle only when no-GIL optimizations are enabled.
+    try:
+        from .system import Thread
+
+        _NVML_MIN_INTERVAL_S = 0.10 if bool(Thread.nogil_optimizations_enabled()) else 0.0
+    except Exception:
+        _NVML_MIN_INTERVAL_S = 0.0
+    return float(_NVML_MIN_INTERVAL_S)
+
+
+def _ensure_nvml() -> bool:
+    """Best-effort NVML init.
+
+    - Keeps NVML optional (no hard dependency).
+    - Avoids NVML initialization at import time.
+    - Thread-safe (important on free-threaded/no-GIL builds).
+    """
+
+    global _nvml, _NVML_READY, _NVML_TRIED
+    if _nvml_in_backoff():
+        return False
+    if _nvml_disabled():
+        _NVML_TRIED = True
         _NVML_READY = False
-except Exception:
-    _nvml = None
-    _NVML_READY = False
+        _nvml = None
+        return False
+    if _NVML_READY:
+        return True
+    if _NVML_TRIED:
+        return False
+    with _NVML_LOCK:
+        if _nvml_in_backoff():
+            return False
+        if _NVML_READY:
+            return True
+        if _NVML_TRIED:
+            return False
+        _NVML_TRIED = True
+        try:
+            with warnings.catch_warnings():
+                # The deprecated `pynvml` PyPI package can emit FutureWarnings.
+                # The recommended distribution is `nvidia-ml-py`, which still
+                # provides the `pynvml` import path.
+                warnings.simplefilter("ignore", category=FutureWarning)
+                import pynvml as _pynvml
+
+            _nvml = _pynvml
+            _nvml.nvmlInit()
+            _NVML_READY = True
+        except Exception:
+            _nvml = None
+            _NVML_READY = False
+    return bool(_NVML_READY)
 try:
     import psutil as _psutil
 except Exception:
@@ -66,7 +246,7 @@ from .distributed import (distributed_barrier, distributed_sync,
                           get_world_size, is_distributed, joining, no_sync,
                           to_ddp, to_fsdp)
 from ..functional.profiler import FlopCounter
-from .system import (Memory, get_device, get_tlb, initialize_python_path,
+from .system import (Memory, Thread, get_device, get_tlb, initialize_python_path,
                      new_dir, posix_time, set_float32_precision)
 
 if TYPE_CHECKING:
@@ -412,27 +592,64 @@ def _set_backend(device: torch.device) -> None:
     elif device.type == "xpu":
         torch.xpu.set_device(rank)
     else:
-        try:
-            import netifaces
+        # CPU / Gloo: pick a sensible NIC without extra dependencies.
+        # Some clusters require GLOO_SOCKET_IFNAME/TP_SOCKET_IFNAME to be set.
+        iface: str | None = None
 
-            gws = netifaces.gateways()
-            iface: str | None = None
-            default_gateways = gws.get("default", {}) if isinstance(gws, dict) else {}
-            families = []
-            with contextlib.suppress(AttributeError):
-                families.append(netifaces.AF_INET6)
-            families.append(netifaces.AF_INET)
-            for family in families:
-                info = default_gateways.get(family)
-                if info and len(info) >= 2:
-                    iface = info[1]
-                    if iface:
-                        break
-            if iface:
-                os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
-                os.environ.setdefault("TP_SOCKET_IFNAME", iface)
-        except (ImportError, KeyError, OSError):
-            pass
+        # 0) Respect explicit user configuration.
+        gloo_if = os.environ.get("GLOO_SOCKET_IFNAME")
+        tp_if = os.environ.get("TP_SOCKET_IFNAME")
+        if gloo_if or tp_if:
+            # If the user set only one of the variables, mirror it to the other
+            # so both subsystems stay consistent.
+            if gloo_if and not tp_if:
+                os.environ.setdefault("TP_SOCKET_IFNAME", str(gloo_if))
+            elif tp_if and not gloo_if:
+                os.environ.setdefault("GLOO_SOCKET_IFNAME", str(tp_if))
+            return
+
+        # 1) Linux: default route interface from /proc/net/route.
+        try:
+            with open("/proc/net/route", "r", encoding="utf-8") as f:
+                for line in f.readlines()[1:]:
+                    fields = line.strip().split()
+                    # Destination == 00000000 means default route.
+                    if len(fields) >= 2 and fields[1] == "00000000":
+                        iface = fields[0]
+                        if iface:
+                            break
+        except Exception:
+            iface = None
+
+        # 2) Cross-platform fallback: infer egress IPv4 and match psutil.net_if_addrs().
+        if iface is None and _psutil is not None:
+            try:
+                import socket
+
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    # No packets are sent for UDP connect; this only queries the route.
+                    s.connect(("8.8.8.8", 80))
+                    ip = s.getsockname()[0]
+                finally:
+                    s.close()
+
+                if ip:
+                    for name, addrs in _psutil.net_if_addrs().items():
+                        for a in addrs:
+                            if getattr(a, "family", None) == socket.AF_INET and getattr(
+                                a, "address", None
+                            ) == ip:
+                                iface = str(name)
+                                break
+                        if iface:
+                            break
+            except Exception:
+                iface = None
+
+        if iface:
+            os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+            os.environ.setdefault("TP_SOCKET_IFNAME", iface)
 
 
 def _iter_source_paths(obj: Any):
@@ -1048,25 +1265,97 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
     if getattr(device, "type", "") != "cuda":
         return None, None
 
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    idx_i = int(idx)
+
     gpu_util: Optional[float] = None
     mem_util: Optional[float] = None
 
-    if _NVML_READY:
-        try:
-            idx = device.index if device.index is not None else torch.cuda.current_device()
-            h = _nvml.nvmlDeviceGetHandleByIndex(int(idx))
-            u = _nvml.nvmlDeviceGetUtilizationRates(h)
-            mi = _nvml.nvmlDeviceGetMemoryInfo(h)
-            gpu_util = float(getattr(u, "gpu", 0.0))
-            if getattr(mi, "total", 0):
-                mem_util = 100.0 * float(mi.used) / float(mi.total)
-        except Exception:
-            pass
+    if _ensure_nvml() and _nvml is not None:
+        # NVML queries are relatively expensive; throttle them (optionally) and cache
+        # device handles to reduce overhead in tight training loops.
+        min_interval = float(_nvml_min_interval_s())
+        now = float(time.perf_counter())
+
+        if _nvml_in_backoff(now):
+            return None, None
+
+        if min_interval > 0.0:
+            cached = _NVML_UTIL_CACHE.get(idx_i)
+            if cached is not None:
+                ts, cg, cm = cached
+                if (now - float(ts)) < min_interval:
+                    return cg, cm
+
+        with _NVML_QUERY_LOCK:
+            # Re-check backoff after acquiring query lock.
+            if _nvml_in_backoff(now):
+                return None, None
+            if min_interval > 0.0:
+                cached = _NVML_UTIL_CACHE.get(idx_i)
+                if cached is not None:
+                    ts, cg, cm = cached
+                    if (now - float(ts)) < min_interval:
+                        return cg, cm
+
+            try:
+                h = _NVML_HANDLE_CACHE.get(idx_i)
+                if h is None:
+                    h = _nvml.nvmlDeviceGetHandleByIndex(idx_i)
+                    _NVML_HANDLE_CACHE[idx_i] = h
+
+                u = _nvml.nvmlDeviceGetUtilizationRates(h)
+                mi = _nvml.nvmlDeviceGetMemoryInfo(h)
+                gpu_util = float(getattr(u, "gpu", 0.0))
+                if getattr(mi, "total", 0):
+                    mem_util = 100.0 * float(mi.used) / float(mi.total)
+
+                # Success: clear failure/backoff state.
+                with _NVML_LOCK:
+                    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
+                    _NVML_FAIL_COUNT = 0
+                    _NVML_BACKOFF_UNTIL = 0.0
+            except Exception:
+                # Handle can become invalid after driver reset; clear caches so we can retry.
+                with contextlib.suppress(Exception):
+                    _NVML_HANDLE_CACHE.pop(idx_i, None)
+                with contextlib.suppress(Exception):
+                    _NVML_UTIL_CACHE.pop(idx_i, None)
+
+                # Failure backoff: if NVML keeps failing, temporarily disable NVML
+                # queries to avoid paying exception cost in tight loops.
+                fail_max = int(_nvml_fail_max())
+                backoff_s = float(_nvml_backoff_s())
+                trigger_backoff = False
+                with _NVML_LOCK:
+                    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
+                    _NVML_FAIL_COUNT = int(_NVML_FAIL_COUNT) + 1
+                    if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(fail_max):
+                        _NVML_BACKOFF_UNTIL = float(time.perf_counter()) + float(backoff_s)
+                        _NVML_FAIL_COUNT = 0
+                        trigger_backoff = True
+
+                if trigger_backoff:
+                    # Drop all cached handles/util metrics while backing off.
+                    with contextlib.suppress(Exception):
+                        _NVML_HANDLE_CACHE.clear()
+                    with contextlib.suppress(Exception):
+                        _NVML_UTIL_CACHE.clear()
+                    with contextlib.suppress(Exception):
+                        _LOGGER.warning(
+                            "[NVML] repeated failures; backing off NVML queries for %.1fs "
+                            "(override: STNET_NVML_BACKOFF_S, STNET_NVML_FAIL_MAX).",
+                            float(backoff_s),
+                        )
+                gpu_util = None
+                mem_util = None
+
+            if (gpu_util is not None) or (mem_util is not None):
+                _NVML_UTIL_CACHE[idx_i] = (now, gpu_util, mem_util)
 
     if mem_util is None:
         with contextlib.suppress(Exception):
-            idx = device.index if device.index is not None else torch.cuda.current_device()
-            free_bytes, total_bytes = torch.cuda.mem_get_info(idx)
+            free_bytes, total_bytes = torch.cuda.mem_get_info(idx_i)
             if total_bytes:
                 used_bytes = float(total_bytes - free_bytes)
                 mem_util = 100.0 * used_bytes / float(total_bytes)
@@ -3420,8 +3709,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                         scheduler_step_per_batch = True
                         swa_helper = None
                         swa_start_epoch = total_epochs
+            # AMP GradScaler should be enabled when *compute* uses FP16.
+            #
+            # NOTE: Do not infer this from *device capabilities* (e.g. BF16 support).
+            # We must check the dtype we actually run the compute path in.
+            #
+            # - If autocast uses FP16 -> enable GradScaler
+            # - If autocast is disabled but parameters/compute are FP16 -> enable GradScaler
+            amp_dtype = getattr(precision, "amp_float", None)
+            compute_dtype = amp_dtype or param_dtype
             scaler = torch.amp.GradScaler(
-                enabled=(device.type == "cuda" and (not torch.cuda.is_bf16_supported()))
+                enabled=bool(device.type == "cuda" and compute_dtype == torch.float16)
             )
 
                                                                                         
@@ -3558,7 +3856,6 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 model, metadata=metadata, logger=_float8_log
             )
         else:
-            Autocast.configure(model, metadata=metadata)
             _float8_log(f"[FP8] disabled: {fp8_infer_reason}")
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")

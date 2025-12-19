@@ -559,6 +559,66 @@ class Gradient:
         }
 
         canonical_mode = normalized_alias or normalized_mode
+
+        # TorchInductor compilation can be very CPU hungry. When running multiple local
+        # ranks (DDP/FSDP), each process compiling with a large thread pool can easily
+        # oversubscribe the node and slow down *both* compilation and the input pipeline.
+        #
+        # Keep this conservative and fully overridable:
+        #   - STNET_INDUCTOR_COMPILE_THREADS / STNET_COMPILE_THREADS
+        #   - TORCHINDUCTOR_COMPILE_THREADS
+        try:
+            from torch._inductor import config as _inductor_config  # type: ignore
+        except Exception:
+            _inductor_config = None
+
+        if _inductor_config is not None:
+            try:
+                import os
+
+                def _read_int_env(keys, default=None):
+                    for k in keys:
+                        try:
+                            v = os.environ.get(k)
+                            if v is not None and str(v).strip():
+                                return int(v)
+                        except Exception:
+                            pass
+                    return default
+
+                if getattr(_inductor_config, "compile_threads", None) is not None:
+                    override = _read_int_env(
+                        ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
+                        None,
+                    )
+                    if override is None:
+                        override = _read_int_env(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+
+                    if override is not None:
+                        _inductor_config.compile_threads = max(1, int(override))
+                    else:
+                        local_world = _read_int_env(
+                            (
+                                "STNET_LOCAL_WORLD_SIZE",
+                                "LOCAL_WORLD_SIZE",
+                                "SLURM_NTASKS_PER_NODE",
+                            ),
+                            1,
+                        )
+                        if int(local_world) > 1:
+                            # Pick a small per-rank compile thread count. Too many threads
+                            # across multiple ranks oversubscribes the node and hurts both
+                            # compilation latency and the data pipeline.
+                            cpu_count = None
+                            with contextlib.suppress(Exception):
+                                if hasattr(os, "sched_getaffinity"):
+                                    cpu_count = len(os.sched_getaffinity(0))
+                            if not cpu_count:
+                                cpu_count = int(os.cpu_count() or 1)
+                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                            _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
+            except Exception:
+                pass
         if canonical_mode == "max-autotune" and not _is_for_cuda(module):
             canonical_mode = "max-autotune-no-cudagraphs"
         if canonical_mode == "max-autotune-no-cudagraphs":
@@ -597,7 +657,25 @@ class Gradient:
 
                 try:
                     if getattr(_inductor_config, "compile_threads", None) is not None:
-                        _inductor_config.compile_threads = 1
+                        import os
+                        # max-autotune can be very memory hungry; default to serial compilation
+                        # unless the user explicitly overrides the thread count.
+                        override = None
+                        for _k in (
+                            "STNET_INDUCTOR_COMPILE_THREADS",
+                            "STNET_COMPILE_THREADS",
+                            "TORCHINDUCTOR_COMPILE_THREADS",
+                        ):
+                            try:
+                                _v = os.environ.get(_k)
+                                if _v is not None and str(_v).strip():
+                                    override = int(_v)
+                                    break
+                            except Exception:
+                                continue
+
+                        if override is None:
+                            _inductor_config.compile_threads = 1
                 except Exception:
                     pass
 

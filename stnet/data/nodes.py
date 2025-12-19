@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import logging
 import json
 import os
 import random
@@ -13,6 +14,10 @@ from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
 import torch
 
 from ..backend.compat import ensure_torchdata
+from ..backend.system import Thread
+
+_LOGGER = logging.getLogger(__name__)
+_MMAP_TL_LIMIT_LOCK = threading.Lock()
 
 try:
     import psutil as _psutil
@@ -116,6 +121,12 @@ class Sampler(_Sampler):
             self._meta.get("features_dtype", "float64"), torch.float64
         )
         l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
+        # Keep the raw memmap config so we can optionally open per-thread handles (useful on no-GIL).
+        self._feat_path = feat_path
+        self._lab_path = lab_path
+        self._feat_dtype = f_dtype
+        self._label_dtype = l_dtype
+        self._feat_shape = torch.Size([self._N, fdim])
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
@@ -125,9 +136,56 @@ class Sampler(_Sampler):
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
         lshape = tuple(lshape_meta) if lshape_meta else tuple()
+        self._label_shape_full = torch.Size([self._N] + list(lshape))
         self._labels = MemoryMappedTensor.from_filename(
             filename=lab_path, dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
         )
+        # Optional: open per-thread MemoryMappedTensor handles. This is
+        # conservative by default (auto-enabled only when no-GIL optimizations
+        # are active). Override with STNET_MEMMAP_THREAD_LOCAL=0/1.
+        # NOTE: keep the TLS object lazy/optional so the Sampler remains picklable
+        # on platforms that use the "spawn" start method.
+        self._mmap_tls: Optional[threading.local] = None
+        self._mmap_init_lock = threading.Lock()
+        self._mmap_thread_local = False
+        # Limit the number of thread-local memmap handle pairs. On no-GIL builds,
+        # it's easy to spawn many more threads, and each thread-local mmap consumes
+        # file descriptors / VMAs.
+        #
+        # Override with:
+        #   - STNET_MEMMAP_THREAD_LOCAL_MAX / STNET_MEMMAP_TL_MAX
+        #   - Set <= 0 for "unlimited" (not recommended on large servers).
+        self._mmap_thread_local_max = 0
+        self._mmap_thread_local_created = 0
+        self._mmap_thread_local_overflow_warned = False
+
+        def _read_int_env(keys, default):
+            for k in keys:
+                try:
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return int(v)
+                except Exception:
+                    pass
+            return int(default)
+
+        env_tl = os.environ.get("STNET_MEMMAP_THREAD_LOCAL")
+        if env_tl is not None and str(env_tl).strip():
+            v = str(env_tl).strip().lower()
+            self._mmap_thread_local = v in {"1", "true", "yes", "on"}
+        else:
+            with suppress(Exception):
+                self._mmap_thread_local = bool(Thread.nogil_optimizations_enabled())
+
+        if self._mmap_thread_local:
+            # Default max: scale with CPU count, cap at 64 to avoid FD blowups.
+            cpu = int(os.cpu_count() or 8)
+            default_max = max(8, min(64, cpu))
+            self._mmap_thread_local_max = _read_int_env(
+                ("STNET_MEMMAP_THREAD_LOCAL_MAX", "STNET_MEMMAP_TL_MAX"),
+                default_max,
+            )
+            self._mmap_thread_local_max = int(self._mmap_thread_local_max)
         self._memmap_features = self._features
         self._memmap_labels = self._labels
         self._X = self._memmap_features
@@ -192,6 +250,134 @@ class Sampler(_Sampler):
         else:
             self._start, self._end = (train_start, train_end)
 
+    def __getstate__(self):
+        """Make the Sampler picklable.
+
+        TorchData graphs may be pickled when using spawn-based multiprocessing.
+        threading.local / Lock objects are not picklable, and MemoryMappedTensor
+        holds process-local resources (file descriptors / mmaps).
+
+        We drop those objects from the state and re-open the memmaps on unpickle.
+        """
+
+        state = dict(self.__dict__)
+        for key in (
+            "_features",
+            "_labels",
+            "_memmap_features",
+            "_memmap_labels",
+            "_X",
+            "_Y",
+            "_mmap_tls",
+            "_mmap_init_lock",
+        ):
+            state.pop(key, None)
+        state["_mmap_tls"] = None
+        state["_mmap_init_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # Recreate thread-local holders / locks lazily in the new process.
+        self._mmap_tls = None
+        self._mmap_init_lock = threading.Lock()
+
+        if MemoryMappedTensor is None:
+            raise ImportError(
+                "tensordict is required for MemoryMappedTensor-backed pipelines. "
+                "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
+            )
+
+        # Re-open memmap-backed tensors in the current process.
+        self._features = MemoryMappedTensor.from_filename(
+            filename=str(self._feat_path),
+            dtype=self._feat_dtype,
+            shape=self._feat_shape,
+        )
+        self._labels = MemoryMappedTensor.from_filename(
+            filename=str(self._lab_path),
+            dtype=self._label_dtype,
+            shape=self._label_shape_full,
+        )
+        self._memmap_features = self._features
+        self._memmap_labels = self._labels
+        self._X = self._memmap_features
+        self._Y = self._memmap_labels
+
+    def _get_mmaps(self):
+        """Return (features, labels) MemoryMappedTensor handles for the current thread.
+
+        On free-threading / no-GIL builds, some extension types may internally rely
+        on per-object state that used to be implicitly protected by the GIL. Using
+        thread-local handles avoids sharing that state across threads while still
+        allowing true parallelism.
+        """
+        if not getattr(self, "_mmap_thread_local", False):
+            return self._features, self._labels
+
+        tls = getattr(self, "_mmap_tls", None)
+        if tls is None:
+            tls = threading.local()
+            self._mmap_tls = tls
+
+        f = getattr(tls, "features", None)
+        l = getattr(tls, "labels", None)
+        if f is not None and l is not None:
+            return f, l
+
+        max_pairs = int(getattr(self, "_mmap_thread_local_max", 0) or 0)
+        if max_pairs > 0:
+            # Only limit the number of *created* thread-local pairs per Sampler instance.
+            with _MMAP_TL_LIMIT_LOCK:
+                created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
+                if created >= max_pairs:
+                    # Overflow: fall back to shared handles.
+                    if not bool(getattr(self, "_mmap_thread_local_overflow_warned", False)):
+                        setattr(self, "_mmap_thread_local_overflow_warned", True)
+                        with suppress(Exception):
+                            _LOGGER.warning(
+                                "[memmap] thread-local handle limit reached (%d). "
+                                "Falling back to shared memmap handles for overflow threads. "
+                                "Override: STNET_MEMMAP_THREAD_LOCAL_MAX / STNET_MEMMAP_TL_MAX.",
+                                int(max_pairs),
+                            )
+                    return self._features, self._labels
+                setattr(self, "_mmap_thread_local_created", created + 1)
+
+        init_lock = getattr(self, "_mmap_init_lock", None)
+        if init_lock is None:
+            init_lock = threading.Lock()
+            self._mmap_init_lock = init_lock
+
+        # Only lock around first-time initialization per thread.
+        with init_lock:
+            f = getattr(tls, "features", None)
+            l = getattr(tls, "labels", None)
+            if f is None or l is None:
+                try:
+                    f = MemoryMappedTensor.from_filename(
+                        filename=str(self._feat_path),
+                        dtype=self._feat_dtype,
+                        shape=self._feat_shape,
+                    )
+                    l = MemoryMappedTensor.from_filename(
+                        filename=str(self._lab_path),
+                        dtype=self._label_dtype,
+                        shape=self._label_shape_full,
+                    )
+                except Exception:
+                    # If creation failed, return shared handles and undo our "created" counter increment.
+                    if max_pairs > 0:
+                        with _MMAP_TL_LIMIT_LOCK:
+                            created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
+                            setattr(self, "_mmap_thread_local_created", max(0, created - 1))
+                    return self._features, self._labels
+
+                setattr(tls, "features", f)
+                setattr(tls, "labels", l)
+
+        return f, l
+
     @property
     def start(self) -> int:
         return int(self._start)
@@ -207,34 +393,39 @@ class Sampler(_Sampler):
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         start = int(start)
         end = int(end)
-        row_ids: torch.Tensor
+        features, labels = self._get_mmaps()
+
         if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
             idx = self._perm[start:end]
-            row_ids = idx.to(dtype=torch.int64, copy=False) if torch.is_tensor(idx) else torch.as_tensor(idx, dtype=torch.int64)
-            if row_ids.numel() == 0:
-                x = self._features[:0]
-                y = self._labels[:0]
-            else:
+            row_ids: torch.Tensor
+            row_ids = (
+                idx.to(dtype=torch.int64, copy=False)
+                if torch.is_tensor(idx)
+                else torch.as_tensor(idx, dtype=torch.int64)
+            )
+            x = features[:0]
+            y = labels[:0]
+            if row_ids.numel():
                 try:
-                    x = self._features.index_select(0, row_ids)
+                    x = features.index_select(0, row_ids)
                 except Exception:
                     x = (
-                        self._features[row_ids]
-                        if hasattr(self._features, "__getitem__")
-                        else torch.as_tensor(self._features)[row_ids]
+                        features[row_ids]
+                        if hasattr(features, "__getitem__")
+                        else torch.as_tensor(features)[row_ids]
                     )
                 try:
-                    y = self._labels.index_select(0, row_ids)
+                    y = labels.index_select(0, row_ids)
                 except Exception:
                     y = (
-                        self._labels[row_ids]
-                        if hasattr(self._labels, "__getitem__")
-                        else torch.as_tensor(self._labels)[row_ids]
+                        labels[row_ids]
+                        if hasattr(labels, "__getitem__")
+                        else torch.as_tensor(labels)[row_ids]
                     )
         else:
             row_ids = torch.arange(start, end, dtype=torch.int64)
-            x = self._features[start:end]
-            y = self._labels[start:end]
+            x = features[start:end]
+            y = labels[start:end]
         if self._label_shape:
             y = y.reshape(end - start, *self._label_shape)
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
@@ -244,6 +435,7 @@ class Sampler(_Sampler):
     def __getitem__(
         self, idx: int | Tuple[int, int] | Sequence[int]
     ) -> Mapping[str, torch.Tensor]:
+        features, labels = self._get_mmaps()
         if isinstance(idx, tuple) and len(idx) == 2:
             s, e = int(idx[0]), int(idx[1])
             return self._slice(s, e)
@@ -259,20 +451,20 @@ class Sampler(_Sampler):
             ):
                 idx_tensor = self._perm.index_select(0, idx_tensor)
             try:
-                x = self._features.index_select(0, idx_tensor)
+                x = features.index_select(0, idx_tensor)
             except Exception:
                 x = (
-                    self._features[idx_tensor]
-                    if hasattr(self._features, "__getitem__")
-                    else torch.as_tensor(self._features)[idx_tensor]
+                    features[idx_tensor]
+                    if hasattr(features, "__getitem__")
+                    else torch.as_tensor(features)[idx_tensor]
                 )
             try:
-                y = self._labels.index_select(0, idx_tensor)
+                y = labels.index_select(0, idx_tensor)
             except Exception:
                 y = (
-                    self._labels[idx_tensor]
-                    if hasattr(self._labels, "__getitem__")
-                    else torch.as_tensor(self._labels)[idx_tensor]
+                    labels[idx_tensor]
+                    if hasattr(labels, "__getitem__")
+                    else torch.as_tensor(labels)[idx_tensor]
                 )
             if self._label_shape:
                 y = y.reshape(y.shape[0], *self._label_shape)
@@ -395,6 +587,7 @@ class Sampler(_Sampler):
         s = int(start)
         e = int(end)
         n = max(0, e - s)
+        features, labels = self._get_mmaps()
 
         def _is_accelerator_available() -> bool:
             if torch.cuda.is_available():
@@ -413,11 +606,11 @@ class Sampler(_Sampler):
 
         with FxGradient.inference(torch.nn.Module()):
             if n <= 0:
-                X = self._X.narrow(0, 0, 0)
-                Y = self._Y.narrow(0, 0, 0)
+                X = features.narrow(0, 0, 0)
+                Y = labels.narrow(0, 0, 0)
                 return {"X": X, "Y": Y}
-            X = self._X.narrow(0, s, n)
-            Y = self._Y.narrow(0, s, n)
+            X = features.narrow(0, s, n)
+            Y = labels.narrow(0, s, n)
             if self._label_shape:
                 Y = Y.view(n, *self._label_shape)
             pin_in_dataset = os.environ.get("STNET_PIN_IN_DATASET", "0") == "1"
