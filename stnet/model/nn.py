@@ -34,7 +34,7 @@ except ImportError:
 _LOGGER = logging.getLogger(__name__)
 
 from ..api.config import ModelConfig
-from ..backend.compat import torch_no_compile
+from ..backend.compat import is_meta_or_fake_tensor, torch_no_compile
 from ..backend.system import empty_device_cache
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
@@ -287,24 +287,6 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         return [float(drop_path)]
     step = float(drop_path) / float(depth - 1)
     return [float(i * step) for i in range(depth)]
-
-
-def is_meta_or_fake_tensor(x: Any) -> bool:
-    if not isinstance(x, torch.Tensor):
-        return False
-    if x.is_meta:
-        return True
-    try:
-        from torch._subclasses.fake_tensor import FakeTensor                
-
-        if isinstance(x, FakeTensor):
-            return True
-    except Exception:
-        pass
-    try:
-        return bool(getattr(x, "fake_mode", None))
-    except Exception:
-        return False
 
 
 class SpatialAxis(nn.Module):

@@ -23,6 +23,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing as mp
 
+from ..data.datatype import env_bool, env_first_float, env_first_int, env_float, env_str, parse_bool
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -81,20 +83,6 @@ def _empty_cache_device_key(
                 idx = int(cur())
 
     return (str(dev.type), int(idx))
-
-
-def _env_flag(name: str, default: bool = True) -> bool:
-    v = os.environ.get(name)
-    if v is None:
-        return bool(default)
-    s = str(v).strip().lower()
-    if not s:
-        return bool(default)
-    if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
-        return True
-    if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
-        return False
-    return bool(default)
 
 
 def process_cpu_count() -> int:
@@ -190,20 +178,9 @@ class WorkerPolicy:
         is_accel = bool(nacc and int(nacc) > 0)
 
         def _read_int_env(keys: Sequence[str], default: int) -> int:
-            for k in keys:
-                with contextlib.suppress(Exception):
-                    v = os.environ.get(k)
-                    if v is not None and str(v).strip():
-                        return int(v)
-            return int(default)
-
+            return env_first_int(tuple(keys), int(default))
         def _read_float_env(keys: Sequence[str], default: float) -> float:
-            for k in keys:
-                with contextlib.suppress(Exception):
-                    v = os.environ.get(k)
-                    if v is not None and str(v).strip():
-                        return float(v)
-            return float(default)
+            return env_first_float(tuple(keys), float(default))
 
         local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
         local_world_guess = max(
@@ -289,9 +266,7 @@ class WorkerPolicy:
 
         with contextlib.suppress(Exception):
             env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
-            v = os.environ.get(env_key)
-            if v is not None and str(v).strip():
-                model_ratio = float(v)
+            model_ratio = float(env_float(env_key, float(model_ratio)))
         model_ratio = float(max(0.25, min(1.0, model_ratio)))
 
         model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
@@ -310,7 +285,7 @@ class WorkerPolicy:
         prebatch = 1
         prefetch_factor = 1
 
-        env_pre = os.environ.get("STNET_PREBATCH")
+        env_pre = env_str("STNET_PREBATCH")
         if env_pre:
             with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
@@ -319,7 +294,7 @@ class WorkerPolicy:
             # thread-based parallelism is real. Keep this conservative; users can
             # still override with STNET_PREBATCH.
             prebatch = 2
-        env_pf = os.environ.get("STNET_PREFETCH_FACTOR")
+        env_pf = env_str("STNET_PREFETCH_FACTOR")
         if env_pf:
             with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
@@ -411,14 +386,11 @@ def empty_device_cache(
       - STNET_EMPTY_CACHE=0/false/off to disable
       - STNET_EMPTY_CACHE_MIN_INTERVAL_S (default: 0.5)
     """
-    if not _env_flag("STNET_EMPTY_CACHE", True):
+    if not env_bool("STNET_EMPTY_CACHE", True):
         return
 
     if min_interval_s is None:
-        try:
-            min_interval_s = float(os.environ.get("STNET_EMPTY_CACHE_MIN_INTERVAL_S", "0.5"))
-        except Exception:
-            min_interval_s = 0.5
+        min_interval_s = env_first_float(("STNET_EMPTY_CACHE_MIN_INTERVAL_S",), 0.5)
     try:
         min_interval_s = float(min_interval_s)
     except Exception:
@@ -1064,14 +1036,7 @@ class Thread:
             self._nogil = False
 
         def _read_int_env(keys, default):
-            for k in keys:
-                try:
-                    v = os.environ.get(k)
-                    if v is not None and str(v).strip():
-                        return int(v)
-                except Exception:
-                    pass
-            return int(default)
+            return env_first_int(tuple(keys), int(default))
 
         flush_default = 64 if self._nogil else 1
         sample_default = 8 if self._nogil else 1
@@ -1086,21 +1051,6 @@ class Thread:
         self.tune_threads(io_workers, initial=True)
 
     # --- Free-threading helpers (inlined from freethreading.py) ---
-    _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
-    _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
-
-    @staticmethod
-    def _parse_bool(value: object) -> Optional[bool]:
-        if value is None:
-            return None
-        s = str(value).strip().lower()
-        if not s:
-            return None
-        if s in Thread._TRUE:
-            return True
-        if s in Thread._FALSE:
-            return False
-        return None
 
     @staticmethod
     def is_free_threaded_build() -> bool:
@@ -1151,7 +1101,7 @@ class Thread:
             "STNET_NO_GIL_OPT",
             "STNET_FREE_THREADING_OPT",
         ):
-            override = Thread._parse_bool(os.environ.get(key))
+            override = parse_bool(os.environ.get(key))
             if override is not None:
                 return bool(override)
         return Thread.nogil_active()
@@ -1412,12 +1362,7 @@ class Thread:
             )
             self._io_workers = tuned_workers
             def _read_int_env(keys, default):
-                for k in keys:
-                    with contextlib.suppress(Exception):
-                        v = os.environ.get(k)
-                        if v is not None and str(v).strip():
-                            return int(v)
-                return int(default)
+                return env_first_int(tuple(keys), int(default))
 
             cap_mult = 3 if self._nogil else 2
             with contextlib.suppress(Exception):
@@ -1482,12 +1427,7 @@ class Thread:
         workers = max(1, self._io_workers)
 
         def _read_int_env(keys, default):
-            for k in keys:
-                with contextlib.suppress(Exception):
-                    v = os.environ.get(k)
-                    if v is not None and str(v).strip():
-                        return int(v)
-            return int(default)
+            return env_first_int(tuple(keys), int(default))
 
         cap_mult = 3 if self._nogil else 2
         with contextlib.suppress(Exception):

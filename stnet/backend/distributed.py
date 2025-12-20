@@ -15,21 +15,8 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
+from ..data.datatype import env_bool, env_int
 from .system import get_device, process_cpu_count
-
-
-def _env_flag(name: str, default: bool) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return bool(default)
-    return str(val).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return int(default)
 
 
 try:
@@ -602,7 +589,7 @@ def to_ddp(
         params = set(sig.parameters.keys())
     except Exception:
         params = set()
-    bucket_mb = _env_int("STNET_DDP_BUCKET_MB", 25)
+    bucket_mb = env_int("STNET_DDP_BUCKET_MB", 25)
     if "bucket_cap_mb" in params:
         ddp_kwargs["bucket_cap_mb"] = bucket_mb
     if "gradient_as_bucket_view" in params:
@@ -628,11 +615,11 @@ def to_fsdp(
     args = [module]
     kwargs = {}
     if "forward_prefetch" in params:
-        kwargs["forward_prefetch"] = _env_flag("STNET_FSDP_FWD_PREFETCH", True)
+        kwargs["forward_prefetch"] = env_bool("STNET_FSDP_FWD_PREFETCH", True)
     if "limit_all_gathers" in params:
-        kwargs["limit_all_gathers"] = _env_flag("STNET_FSDP_LIMIT_AG", True)
+        kwargs["limit_all_gathers"] = env_bool("STNET_FSDP_LIMIT_AG", True)
     if "use_orig_params" in params:
-        kwargs["use_orig_params"] = _env_flag("STNET_FSDP_USE_ORIG_PARAMS", True)
+        kwargs["use_orig_params"] = env_bool("STNET_FSDP_USE_ORIG_PARAMS", True)
 
     if "mesh" in params and mesh is not None:
         kwargs["mesh"] = mesh
