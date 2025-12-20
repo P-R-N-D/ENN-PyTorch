@@ -278,9 +278,9 @@ except Exception as _e:
 
 _NODES_IMPORT_ERROR: Exception | None = None
 try:
-    from .nodes import Connector, Disposable, Loader, Sampler, Source, Wrapper
+    from .nodes import Connector, Disposable, Loader, Sampler, SamplerScale, Source, Wrapper
 except Exception as _e:
-    Connector = Disposable = Loader = Sampler = Source = Wrapper = None  # type: ignore[assignment]
+    Connector = Disposable = Loader = Sampler = Source = Wrapper = SamplerScale = None  # type: ignore[assignment]
     _NODES_IMPORT_ERROR = _e
 
 def _require_nodes() -> None:
@@ -684,7 +684,13 @@ def _batch_interval(
     if cap_from_mem > 0:
         B_cap = min(B_cap, cap_from_mem)
 
-    B_cap = max(1, min(int(B_cap * Sampler._scale), len(_ds)))
+    # IMPORTANT:
+    # - No global/per-function scaling here anymore.
+    # - We compute an upper cap once and store it on the Sampler.
+    #   Runtime scaling is applied during actual sampling (dynamic batch).
+    B_cap = max(1, min(int(B_cap), len(_ds)))
+    with contextlib.suppress(Exception):
+        setattr(_ds, "_S_B_cap", int(B_cap))
 
     env_max = os.environ.get("STNET_MAX_BATCH_SIZE") or os.environ.get("STNET_MAX_BATCH")
     try:
@@ -692,6 +698,10 @@ def _batch_interval(
             B_cap = max(1, min(B_cap, int(env_max)))
     except Exception:
         pass
+
+    # Update cap after env clamp as well.
+    with contextlib.suppress(Exception):
+        setattr(_ds, "_S_B_cap", int(B_cap))
 
     candidates = _random_batches(sbytes, _dev, len(_ds))
     if candidates:
@@ -771,8 +781,10 @@ def dataset(
     *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
+    sampler_scale: Optional["SamplerScale"] = None,
     **kwargs: Any,
 ) -> "Sampler":
+    _require_nodes()
     if not isinstance(source, Mapping):
         raise TypeError(f"dataset expects a Source mapping, got {type(source)}")
 
@@ -795,7 +807,7 @@ def dataset(
     vf = float(val_frac)
     if not (0.0 <= vf <= 1.0):
         raise ValueError(f"val_frac must be in [0,1], got: {vf}")
-    return Sampler(path, split=sp, val_frac=vf)
+    return Sampler(path, split=sp, val_frac=vf, sampler_scale=sampler_scale)
 
 
 def _process(
@@ -962,7 +974,9 @@ def fetch(
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
     worker_policy: Optional[WorkerPolicy] = None,
+    sampler_scale: Optional["SamplerScale"] = None,
 ) -> Dict[str, Any]:
+    _require_nodes()
     device_obj = (
         torch.device(device) if not isinstance(device, torch.device) else device
     )
@@ -982,6 +996,7 @@ def fetch(
 
     allocated = Disposable()
     batch_size: Optional[int] = None
+    scale_ctl = sampler_scale if sampler_scale is not None else SamplerScale()
 
     def _stream_batch(_ds: Sampler, _dev: torch.device) -> Tuple[int, float]:
         try:
@@ -1065,7 +1080,7 @@ def fetch(
     if isinstance(sources, Mapping) and not _is_source_spec(sources):
         datasets: Dict[str, Any] = {}
         for key, spec in sources.items():
-            ds = dataset(spec, split="train", val_frac=float(val_frac))
+            ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
             allocated.add(ds)
             datasets[str(key)] = ds
         if batch_size is None or int(batch_size) <= 0:
@@ -1144,7 +1159,7 @@ def fetch(
         datasets: Dict[str, Any] = {}
         for i, spec in enumerate(sources):
             key = str(i)
-            ds = dataset(spec, split="train", val_frac=float(val_frac))
+            ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
             allocated.add(ds)
             datasets[key] = ds
         if batch_size is None or int(batch_size) <= 0:
@@ -1214,7 +1229,7 @@ def fetch(
         )
         train_length = sum(lengths) if lengths else None
     else:
-        ds = dataset(sources, split="train", val_frac=float(val_frac))
+        ds = dataset(sources, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
         allocated.add(ds)
         if batch_size is None or int(batch_size) <= 0:
             B_i, ms_i = _stream_batch(ds, _device_obj)
@@ -1277,7 +1292,7 @@ def fetch(
         if isinstance(sources, Mapping) and not _is_source_spec(sources):
             datasets: Dict[str, Any] = {}
             for key, spec in sources.items():
-                ds = dataset(spec, split="val", val_frac=float(val_frac))
+                ds = dataset(spec, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
                 allocated.add(ds)
                 datasets[str(key)] = ds
             if batch_size is None or int(batch_size) <= 0:
@@ -1361,7 +1376,7 @@ def fetch(
             datasets: Dict[str, Any] = {}
             for i, spec in enumerate(sources):
                 k = str(i)
-                ds = dataset(spec, split="val", val_frac=float(val_frac))
+                ds = dataset(spec, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
                 allocated.add(ds)
                 datasets[k] = ds
             if batch_size is None or int(batch_size) <= 0:
@@ -1437,7 +1452,7 @@ def fetch(
             )
 
         else:
-            ds = dataset(sources, split="val", val_frac=float(val_frac))
+            ds = dataset(sources, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
             allocated.add(ds)
             if batch_size is None or int(batch_size) <= 0:
                 B_i, ms_i = _stream_batch(ds, _device_obj)
@@ -1494,10 +1509,17 @@ def fetch(
                 length=len(ds),
             )
 
+    with contextlib.suppress(Exception):
+        if train_loader is not None:
+            setattr(train_loader, "_stnet_sampler_scale", scale_ctl)
+        if val_loader is not None:
+            setattr(val_loader, "_stnet_sampler_scale", scale_ctl)
+
     return {
         "training_loader": train_loader,
         "validation_loader": val_loader,
         "disposable": allocated,
+        "sampler_scale": scale_ctl,
     }
 
 
@@ -1524,6 +1546,7 @@ class Session:
     training_loader: Any = None
     validation_loader: Any = None
     disposable: Any = None
+    sampler_scale: Optional["SamplerScale"] = None
 
     _opened: bool = False
 
@@ -1533,6 +1556,13 @@ class Session:
         train_state: Optional[Dict[str, Any]] = None,
         val_state: Optional[Dict[str, Any]] = None,
     ) -> "Session":
+        # Ensure torchdata/tensordict pipeline components are available BEFORE
+        # constructing SamplerScale. Otherwise SamplerScale may be None due to
+        # deferred import failure handling and we'd raise a confusing TypeError.
+        _require_nodes()
+        if self.sampler_scale is None:
+            self.sampler_scale = SamplerScale()
+
         dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
 
         wp = self.worker_policy or WorkerPolicy.autotune()
@@ -1550,6 +1580,7 @@ class Session:
             train_weights=self.train_weights,
             val_weights=self.val_weights,
             worker_policy=wp,
+            sampler_scale=self.sampler_scale,
         )
 
         train_loader = dl.get("training_loader")
@@ -1580,6 +1611,13 @@ class Session:
             if val_loader is not None
             else None
         )
+
+        # Propagate scale controller to (wrapped) loaders as well.
+        with contextlib.suppress(Exception):
+            if self.training_loader is not None:
+                setattr(self.training_loader, "_stnet_sampler_scale", self.sampler_scale)
+            if self.validation_loader is not None:
+                setattr(self.validation_loader, "_stnet_sampler_scale", self.sampler_scale)
 
         self._opened = True
         return self

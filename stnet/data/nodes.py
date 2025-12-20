@@ -5,6 +5,7 @@ import logging
 import json
 import os
 import random
+import multiprocessing as mp
 import threading
 import queue
 from contextlib import suppress
@@ -14,7 +15,7 @@ from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
 import torch
 
 from ..backend.compat import ensure_torchdata
-from ..backend.system import Thread
+from ..backend.system import Thread, process_cpu_count
 
 _LOGGER = logging.getLogger(__name__)
 _MMAP_TL_LIMIT_LOCK = threading.Lock()
@@ -66,9 +67,123 @@ def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = Tru
     return batch
 
 
+class SamplerScale:
+    """Per-session (or per-loader) scaling factor for auto batch sizing.
+
+    NOTE:
+      - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
+      - Thread-safe: Value has an internal lock; we also guard bounds carefully.
+
+    Design note (DynamicBatcher responsibility):
+      - We intentionally keep "dynamic batch sizing" out of BufferedLoader.
+      - The Sampler is the correct owner because it is the component that decides
+        sampling granularity (batch size) and is already shared/pickled into worker
+        processes.
+      - Runtime recovery (e.g. OOM) is achieved by calling sampler_scale.request_scale_down(),
+        and the very next sampler batch will reflect the new effective batch size via
+        Sampler._S_B (dynamic property).
+    """
+
+    __slots__ = ("_v", "_min_scale", "_max_scale")
+
+    def __init__(self, scale: float = 1.0, *, min_scale: float = 0.5, max_scale: float = 2.0) -> None:
+        self._min_scale = float(min_scale)
+        self._max_scale = float(max_scale)
+        # Shared double, synchronized (propagates across spawn/fork worker processes).
+        self._v = mp.Value("d", 1.0, lock=True)
+        self.reset(scale)
+
+    def __getstate__(self):
+        # Keep the shared value handle so children see updates.
+        return (self._v, float(self._min_scale), float(self._max_scale))
+
+    def __setstate__(self, state):
+        try:
+            # New format: (mp.Value, min, max)
+            v, mn, mx = state
+        except Exception:
+            v, mn, mx = None, 0.5, 2.0
+        try:
+            self._min_scale = float(mn)
+        except Exception:
+            self._min_scale = 0.5
+        try:
+            self._max_scale = float(mx)
+        except Exception:
+            self._max_scale = 2.0
+        if v is None:
+            self._v = mp.Value("d", 1.0, lock=True)
+        else:
+            self._v = v
+        # Backward-compat: if someone pickled old-style (scale,mn,mx), handle it.
+        try:
+            if not hasattr(self._v, "get_lock"):
+                # state was actually (scale,mn,mx)
+                scale = float(v)
+                self._v = mp.Value("d", 1.0, lock=True)
+                self.reset(scale)
+            else:
+                # Keep existing value; no implicit reset.
+                pass
+        except Exception:
+            self._v = mp.Value("d", 1.0, lock=True)
+
+    def get(self) -> float:
+        try:
+            with self._v.get_lock():
+                return float(self._v.value)
+        except Exception:
+            # best-effort fallback
+            try:
+                return float(self._v.value)
+            except Exception:
+                return 1.0
+
+    def reset(self, value: float = 1.0) -> None:
+        try:
+            v = float(value)
+        except Exception:
+            v = 1.0
+        if not (v > 0.0):
+            v = 1.0
+        v = max(float(self._min_scale), min(float(self._max_scale), float(v)))
+        try:
+            with self._v.get_lock():
+                self._v.value = float(v)
+        except Exception:
+            with suppress(Exception):
+                self._v.value = float(v)
+
+    def request_scale_up(self, factor: float) -> None:
+        try:
+            f = float(factor)
+        except Exception:
+            f = 1.0
+        if not (f > 0.0):
+            return
+        try:
+            with self._v.get_lock():
+                cur = float(self._v.value)
+                self._v.value = float(min(float(self._max_scale), cur * float(f)))
+        except Exception:
+            pass
+
+    def request_scale_down(self, factor: float) -> None:
+        try:
+            f = float(factor)
+        except Exception:
+            f = 1.0
+        if not (f > 0.0):
+            return
+        try:
+            with self._v.get_lock():
+                cur = float(self._v.value)
+                self._v.value = float(max(float(self._min_scale), cur * float(f)))
+        except Exception:
+            pass
+
+
 class Sampler(_Sampler):
-    
-    _scale: float = 1.0
     _per_sample_mem_bytes: int = 0
 
     @staticmethod
@@ -89,25 +204,25 @@ class Sampler(_Sampler):
             raise ValueError(f"meta.json under {memmap_dir} must contain a mapping")
         return meta
 
-    @classmethod
-    def request_scale_up(cls: type["Sampler"], factor: float) -> None:
-        cls._scale = min(2.0, cls._scale * float(factor))
-
-    @classmethod
-    def request_scale_down(cls: type["Sampler"], factor: float) -> None:
-        cls._scale = max(0.5, cls._scale * float(factor))
-
     def __init__(
         self,
         memmap_dir: str,
         *args: Any,
         split: str = "train",
         val_frac: float = 0.0,
+        sampler_scale: Optional["SamplerScale"] = None,
         **kwargs: Any,
     ) -> None:
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
+
+        # Per-session/per-loader scale controller (NOT global).
+        self._sampler_scale = sampler_scale if sampler_scale is not None else SamplerScale()
+
+        # Runtime dynamic-batch cap (computed in pipeline._batch_interval).
+        # 0 => unknown/unlimited (will still be clamped by split end).
+        self._S_B_cap = 0
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
             raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
@@ -179,7 +294,7 @@ class Sampler(_Sampler):
 
         if self._mmap_thread_local:
             # Default max: scale with CPU count, cap at 64 to avoid FD blowups.
-            cpu = int(os.cpu_count() or 8)
+            cpu = int(process_cpu_count() or 8)
             default_max = max(8, min(64, cpu))
             self._mmap_thread_local_max = _read_int_env(
                 ("STNET_MEMMAP_THREAD_LOCAL_MAX", "STNET_MEMMAP_TL_MAX"),
@@ -190,6 +305,9 @@ class Sampler(_Sampler):
         self._memmap_labels = self._labels
         self._X = self._memmap_features
         self._Y = self._memmap_labels
+        # Base batch size is stored separately; _S_B is a dynamic property that applies sampler_scale.
+        self._S_B_base = 1
+        # initialize via setter for compatibility
         self._S_B = 1
         self._S_shuffle = True
         self._S_seed = 0
@@ -249,6 +367,54 @@ class Sampler(_Sampler):
             )
         else:
             self._start, self._end = (train_start, train_end)
+
+    @property
+    def sampler_scale(self) -> "SamplerScale":
+        return self._sampler_scale
+
+    @property
+    def base_batch_size(self) -> int:
+        try:
+            b = int(getattr(self, "_S_B_base", 1) or 1)
+        except Exception:
+            b = 1
+        return max(1, int(b))
+
+    def _effective_batch_size(self) -> int:
+        # Base * current scale, clamped by cap when present.
+        base = self.base_batch_size
+        scale = 1.0
+        with suppress(Exception):
+            scale = float(self._sampler_scale.get())
+        if not (scale > 0.0):
+            scale = 1.0
+
+        # Use rounding so small scale changes can still take effect for mid/large base.
+        eff = int(round(float(base) * float(scale)))
+        eff = max(1, int(eff))
+
+        cap = 0
+        with suppress(Exception):
+            cap = int(getattr(self, "_S_B_cap", 0) or 0)
+        if cap > 0:
+            eff = min(int(eff), int(cap))
+        return max(1, int(eff))
+
+    # Backward-compatible dynamic attribute:
+    # Any existing code that reads Sampler._S_B now gets the scaled batch size immediately.
+    @property
+    def _S_B(self) -> int:  # noqa: N802 (keep legacy internal name)
+        return self._effective_batch_size()
+
+    @_S_B.setter
+    def _S_B(self, value: int) -> None:  # noqa: N802
+        try:
+            v = int(value)
+        except Exception:
+            v = 1
+        if v <= 0:
+            v = 1
+        setattr(self, "_S_B_base", int(v))
 
     def __getstate__(self):
         """Make the Sampler picklable.

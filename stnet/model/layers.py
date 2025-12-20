@@ -4,6 +4,8 @@ from __future__ import annotations
 import contextlib
 import math
 import os
+import threading
+from collections import OrderedDict
 from typing import Any, Optional, Tuple
 
 import torch
@@ -70,6 +72,7 @@ _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = int(
 )
 
 from ..functional.profiler import FLOP_PROFILER
+from ..backend.system import empty_device_cache
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 
@@ -378,6 +381,13 @@ class DilatedAttention(nn.Module):
         )
         self.length_bucket_multiple: int = 64
 
+        # Thread-safe bounded caches (important for free-threaded / no-GIL Python).
+        # NOTE: these are best-effort runtime caches (not part of state_dict).
+        self._mask_cache_lock = threading.Lock()
+        self._flex_block_mask_cache_lock = threading.Lock()
+        self._mask_cache = OrderedDict()
+        self._flex_block_mask_cache = OrderedDict()
+
     @staticmethod
     def _device_key(device: torch.device) -> Tuple[str, int]:
         idx = -1
@@ -385,6 +395,23 @@ class DilatedAttention(nn.Module):
             if device.index is not None:
                 idx = int(device.index)
         return (str(device.type), idx)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        # Locks are not picklable; caches are runtime-only (drop both).
+        state.pop("_mask_cache_lock", None)
+        state.pop("_flex_block_mask_cache_lock", None)
+        state.pop("_mask_cache", None)
+        state.pop("_flex_block_mask_cache", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._mask_cache_lock = threading.Lock()
+        self._flex_block_mask_cache_lock = threading.Lock()
+        self._mask_cache = OrderedDict()
+        self._flex_block_mask_cache = OrderedDict()
+
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
         if int(L) > _DILATED_MASK_CACHE_MAX_L:
@@ -404,13 +431,23 @@ class DilatedAttention(nn.Module):
             int(self.causal),
             self._device_key(device),
         )
+
         cache = getattr(self, "_mask_cache", None)
         if cache is None:
-            cache = {}
+            cache = OrderedDict()
             setattr(self, "_mask_cache", cache)
-        cached = cache.get(key)
-        if cached is not None:
-            return cached
+        lock = getattr(self, "_mask_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(self, "_mask_cache_lock", lock)
+
+        with lock:
+            cached = cache.get(key)
+            if cached is not None:
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                return cached
+
         mask = _get_dilated_mask(
             int(L),
             dilation=self.dilation,
@@ -424,10 +461,23 @@ class DilatedAttention(nn.Module):
             if mask_bytes > _DILATED_MASK_CACHE_ENTRY_MAX_BYTES:
                 return mask
 
-        if key not in cache and len(cache) >= _DILATED_MASK_CACHE_MAX:
-            cache.pop(next(iter(cache)))
-        cache[key] = mask
+        with lock:
+            cached = cache.get(key)
+            if cached is not None:
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                return cached
+            cache[key] = mask
+            with contextlib.suppress(Exception):
+                cache.move_to_end(key)
+            try:
+                while len(cache) > int(_DILATED_MASK_CACHE_MAX):
+                    cache.popitem(last=False)
+            except Exception:
+                pass
         return mask
+
+
 
     def _get_flex_block_mask(
         self,
@@ -452,13 +502,22 @@ class DilatedAttention(nn.Module):
             win_key,
             int(self.causal),
         )
+
         cache = getattr(self, "_flex_block_mask_cache", None)
         if cache is None:
-            cache = {}
+            cache = OrderedDict()
             setattr(self, "_flex_block_mask_cache", cache)
-        cached = cache.get(key)
-        if cached is not None:
-            return cached
+        lock = getattr(self, "_flex_block_mask_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(self, "_flex_block_mask_cache_lock", lock)
+
+        with lock:
+            cached = cache.get(key)
+            if cached is not None:
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                return cached
 
         try:
             est_bool_bytes = int(B) * int(H) * int(L_q) * int(L_k)
@@ -469,6 +528,15 @@ class DilatedAttention(nn.Module):
         def _mask_mod(b, h, q_idx, kv_idx):
             dq = q_idx - kv_idx
             keep = torch.ones_like(dq, dtype=torch.bool)
+            # Bucket padding handling:
+            # When we pad keys to L_k > L_q (length bucketing), prevent attention to padded keys.
+            # This keeps flex_attention outputs consistent with the SDPA path without building
+            # an explicit padding mask tensor.
+            try:
+                if int(L_k) > int(L_q):
+                    keep &= (kv_idx < int(L_q))
+            except Exception:
+                pass
             if self.causal:
                 keep &= (kv_idx <= q_idx)
             if win is not None:
@@ -490,10 +558,22 @@ class DilatedAttention(nn.Module):
         if skip_cache:
             return block_mask
 
-        if key not in cache and len(cache) >= _FLEX_BLOCK_MASK_CACHE_MAX:
-            cache.pop(next(iter(cache)))
-        cache[key] = block_mask
+        with lock:
+            cached = cache.get(key)
+            if cached is not None:
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                return cached
+            cache[key] = block_mask
+            with contextlib.suppress(Exception):
+                cache.move_to_end(key)
+            try:
+                while len(cache) > int(_FLEX_BLOCK_MASK_CACHE_MAX):
+                    cache.popitem(last=False)
+            except Exception:
+                pass
         return block_mask
+
 
     def forward(
         self,
@@ -522,6 +602,16 @@ class DilatedAttention(nn.Module):
             kpm = key_padding_mask
             if kpm.dtype is not torch.bool:
                 kpm = kpm.to(torch.bool)
+            # SDPA/flex_attention require masks on the same device as inputs.
+            # In practice kpm is often constructed on CPU and passed to CUDA tensors.
+            if kpm.device != x.device:
+                with contextlib.suppress(Exception):
+                    kpm = kpm.to(device=x.device, non_blocking=True)
+            with contextlib.suppress(Exception):
+                kpm = kpm.contiguous()
+
+        # Flex attention is currently only safe when we don't have a true key_padding_mask.
+        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (kpm is None))
 
         base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
         if L <= 512:
@@ -538,14 +628,24 @@ class DilatedAttention(nn.Module):
         x_k = x
         kpm_k: Optional[torch.Tensor] = kpm
         if pad_len > 0:
-            pad = x.new_zeros((B, pad_len, D))
-            x_k = torch.cat((x, pad), dim=1)
+            # Avoid `torch.cat` (extra allocations). Pre-allocate once and copy.
+            x_pad = x.new_zeros((B, L_k, D))
+            x_pad[:, :L, :].copy_(x)
+            x_k = x_pad
             if kpm is not None:
-                pad_mask = torch.ones((B, pad_len), device=kpm.device, dtype=torch.bool)
-                kpm_k = torch.cat((kpm, pad_mask), dim=1)
+                kpm_b = kpm.to(torch.bool)
+                kpm_pad = torch.ones((B, L_k), device=kpm_b.device, dtype=torch.bool)
+                kpm_pad[:, :L].copy_(kpm_b)
+                kpm_k = kpm_pad
+            elif (not bool(self.causal)) and (not use_flex):
+                # Non-causal attention can "see" padded keys → must mask bucket padding.
+                # Use a 1D mask (L_k,) so SDPA can broadcast without B replication.
+                kpm_pad_1d = torch.zeros((L_k,), device=x.device, dtype=torch.bool)
+                kpm_pad_1d[L:] = True
+                kpm_k = kpm_pad_1d
             else:
-                kpm_k = torch.zeros((B, L_k), device=x.device, dtype=torch.bool)
-                kpm_k[:, -pad_len:] = True
+                # Causal attention never attends to kv positions >= L (kv_idx > q_idx for all q_idx < L).
+                kpm_k = None
 
         residual = x_k
         x_k = self.norm1(x_k)
@@ -554,7 +654,7 @@ class DilatedAttention(nn.Module):
 
         L_q = L
 
-        if _HAS_FLEX_ATTENTION and x_k.is_cuda:
+        if use_flex:
             qkv = self.qkv(x_k)
             q, k, v = qkv.chunk(3, dim=-1)
 
@@ -612,6 +712,12 @@ class DilatedAttention(nn.Module):
                         def mask_mod_g(b, h, q_idx, kv_idx):
                             dq = q_idx - kv_idx
                             keep = torch.ones_like(dq, dtype=torch.bool)
+
+                            try:
+                                if int(L_k) > int(L_q):
+                                    keep &= (kv_idx < int(L_q))
+                            except Exception:
+                                pass
 
                             if self.causal:
                                 keep &= (kv_idx <= q_idx)
@@ -704,7 +810,7 @@ class DilatedAttention(nn.Module):
                     last_oom = e
                     if x_k.device.type == "cuda":
                         with contextlib.suppress(Exception):
-                            torch.cuda.empty_cache()
+                            empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
                     group //= 2
 
             if last_oom is not None:
@@ -721,29 +827,63 @@ class DilatedAttention(nn.Module):
             kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
             vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
 
-            base_mask_full = self._get_mask(L_k, x_k.device)
-            base_mask = base_mask_full[:L_q, :]
+            # IMPORTANT:
+            # PyTorch SDPA raises if both attn_mask and is_causal are set.
+            # So only use is_causal when we truly have no additional masking needs.
+            base_mask: Optional[torch.Tensor] = None
+            is_causal = False
+            is_simple = (int(self.dilation) == 1) and (self.window_size is None)
 
-            attn_mask = base_mask
+            if is_simple and bool(self.causal) and (kpm_k is None):
+                # Safe fast-path: no padding mask, no dilation/window mask.
+                is_causal = True
+            elif not (is_simple and (not bool(self.causal))):
+                # Need explicit mask for:
+                #  - causal + any padding mask
+                #  - dilation/windowed attention (with or without causal)
+                base_mask_full = self._get_mask(L_k, x_k.device)
+                base_mask = base_mask_full[:L_q, :]
+                is_causal = False
+
+            attn_mask: Optional[torch.Tensor] = base_mask
             if kpm_k is not None:
                 kpm_b = kpm_k.to(torch.bool)
-                attn_mask = (
-                    base_mask[None, None, :, :]
-                    | kpm_b[:, None, None, :]
-                    | kpm_b[:, None, :L_q, None]
-                )
+                # Support either (B, L_k) or (L_k,) masks:
+                if kpm_b.dim() == 1:
+                    key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k) -> broadcast to B and L_q
+                else:
+                    key_mask = kpm_b[:, None, None, :]     # (B,1,1,L_k)
+
+                if attn_mask is None:
+                    attn_mask = key_mask
+                else:
+                    # If the padding mask is batch-constant (shape[0]==1), keep mask at batch=1 and broadcast in SDPA.
+                    if key_mask.shape[0] == 1:
+                        attn_mask = (attn_mask[None, None, :, :] | key_mask)
+                    else:
+                        attn_b = attn_mask[None, None, :, :].expand(B, 1, L_q, L_k).clone()
+                        attn_b |= key_mask
+                        attn_mask = attn_b
+
+            q_pad: Optional[torch.Tensor] = None
+            if kpm is not None:
+                # Avoid inflating attn_mask with query padding; mask output instead.
+                q_pad = kpm.to(torch.bool)[:, :L_q]
 
             y = F.scaled_dot_product_attention(
+
                 qh,
                 kh,
                 vh,
                 attn_mask=attn_mask,
                 dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=False,
+                is_causal=bool(is_causal),
             )
             attn_out = self.out_proj(
                 y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
             )
+            if q_pad is not None:
+                attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
 
         x_out = x + self.dropout(attn_out)
         res2 = x_out

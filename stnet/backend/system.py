@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import gc
 import importlib
 from dataclasses import dataclass, replace
 import itertools
@@ -38,6 +39,88 @@ _RUNTIME_CFG = SimpleNamespace(
 )
 
 _FP32_PRECISION_CACHE: Dict[Tuple[str, int], str] = {}
+_FP32_PRECISION_LOCK = threading.Lock()
+
+
+_EMPTY_CACHE_LOCK = threading.Lock()
+_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: Dict[Tuple[str, int], float] = {}
+
+
+def _empty_cache_device_key(
+    device: Optional[Union[torch.device, str]] = None,
+) -> Tuple[str, int]:
+    """Return a stable (device_type, device_index) key for rate limiting.
+
+    If device is None, returns a dedicated ('all', -1) key (meaning: global cache clear).
+    If device is provided without an index, best-effort uses the backend's current device.
+    """
+    if device is None:
+        return ("all", -1)
+
+    dev: Optional[torch.device] = None
+    with contextlib.suppress(Exception):
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    if dev is None:
+        return ("all", -1)
+
+    idx = -1
+    with contextlib.suppress(Exception):
+        if dev.index is not None:
+            idx = int(dev.index)
+
+    # Best-effort fill-in for "cuda"/"xpu" when index is omitted.
+    if dev.type == "cuda" and idx < 0:
+        with contextlib.suppress(Exception):
+            if torch.cuda.is_available():
+                idx = int(torch.cuda.current_device())
+    if dev.type == "xpu" and idx < 0:
+        with contextlib.suppress(Exception):
+            xpu = getattr(torch, "xpu", None)
+            cur = getattr(xpu, "current_device", None) if xpu is not None else None
+            if callable(cur):
+                idx = int(cur())
+
+    return (str(dev.type), int(idx))
+
+
+def _env_flag(name: str, default: bool = True) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if not s:
+        return bool(default)
+    if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def process_cpu_count() -> int:
+    """Best-effort CPU count usable by this process/thread.
+
+    Prefer Python 3.13+'s os.process_cpu_count() when available.
+    Fallback to os.sched_getaffinity(0) and os.cpu_count().
+    """
+    # Python 3.13+: respects affinity/cgroup and -X cpu_count / PYTHON_CPU_COUNT override.
+    with contextlib.suppress(Exception):
+        fn = getattr(os, "process_cpu_count", None)
+        if callable(fn):
+            n = fn()
+            if isinstance(n, int) and n > 0:
+                return int(n)
+
+    # Linux/Unix affinity fallback
+    with contextlib.suppress(Exception):
+        return max(1, len(os.sched_getaffinity(0)))
+
+    # Last resort
+    with contextlib.suppress(Exception):
+        n = os.cpu_count()
+        if isinstance(n, int) and n > 0:
+            return int(n)
+    return 1
 
 
 @dataclass(slots=True)
@@ -57,10 +140,7 @@ class WorkerPolicy:
 
     @staticmethod
     def _cpu_count() -> int:
-        try:
-            return len(os.sched_getaffinity(0))
-        except Exception:
-            return os.cpu_count() or 1
+        return process_cpu_count()
 
     @staticmethod
     def _detect_accelerator() -> Tuple[str, int]:
@@ -315,6 +395,93 @@ class WorkerPolicy:
             except Exception:
                 pass
 
+
+def empty_device_cache(
+    *,
+    device: Optional[Union[torch.device, str]] = None,
+    do_gc: bool = True,
+    min_interval_s: Optional[float] = None,
+) -> None:
+    """Best-effort device cache clearing with rate limiting.
+
+    This centralizes cache clearing across CUDA/XPU/MPS/accelerator backends and avoids
+    `empty_cache()` storms (which can become very expensive on fast/no-GIL loops).
+
+    Env:
+      - STNET_EMPTY_CACHE=0/false/off to disable
+      - STNET_EMPTY_CACHE_MIN_INTERVAL_S (default: 0.5)
+    """
+    if not _env_flag("STNET_EMPTY_CACHE", True):
+        return
+
+    if min_interval_s is None:
+        try:
+            min_interval_s = float(os.environ.get("STNET_EMPTY_CACHE_MIN_INTERVAL_S", "0.5"))
+        except Exception:
+            min_interval_s = 0.5
+    try:
+        min_interval_s = float(min_interval_s)
+    except Exception:
+        min_interval_s = 0.5
+    if min_interval_s < 0:
+        min_interval_s = 0.0
+
+    now = time.monotonic()
+    key = _empty_cache_device_key(device)
+    with _EMPTY_CACHE_LOCK:
+        last = float(_EMPTY_CACHE_LAST_CALL_S_BY_DEVICE.get(key, 0.0))
+        if min_interval_s and (now - last) < float(min_interval_s):
+            return
+        _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE[key] = float(now)
+
+    if do_gc:
+        with contextlib.suppress(Exception):
+            gc.collect()
+
+    with contextlib.suppress(Exception):
+        accelerator = getattr(torch, "accelerator", None)
+        memory_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
+        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
+        if callable(empty_cache):
+            empty_cache()
+
+    # Backend-specific clearing:
+    # - If device is provided, clear only that backend (avoid cross-backend blast radius).
+    # - If device is None, keep the previous "clear everything best-effort" behavior.
+    target = None
+    with contextlib.suppress(Exception):
+        if device is not None:
+            target = device if isinstance(device, torch.device) else torch.device(str(device))
+
+    with contextlib.suppress(Exception):
+        if target is None or target.type == "cuda":
+            if torch.cuda.is_available():
+                # Try to empty the specific CUDA device if index is known.
+                if target is not None and target.index is not None:
+                    with torch.cuda.device(int(target.index)):
+                        torch.cuda.empty_cache()
+                else:
+                    torch.cuda.empty_cache()
+
+    with contextlib.suppress(Exception):
+        if target is None or getattr(target, "type", None) == "mps":
+            mps_mod = getattr(torch, "mps", None)
+            empty_cache = getattr(mps_mod, "empty_cache", None) if mps_mod is not None else None
+            if callable(empty_cache):
+                empty_cache()
+
+    with contextlib.suppress(Exception):
+        if target is None or getattr(target, "type", None) == "xpu":
+            xpu_mod = getattr(torch, "xpu", None)
+            empty_cache = getattr(xpu_mod, "empty_cache", None) if xpu_mod is not None else None
+            if callable(empty_cache):
+                empty_cache()
+            else:
+                memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
+                empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
+                if callable(empty_cache):
+                    empty_cache()
+
 def set_float32_precision(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
@@ -335,9 +502,10 @@ def set_float32_precision(
 
     precision = "tf32" if use_tf32 else "ieee"
     key = (device.type, int(device.index) if device.index is not None else -1)
-    if _FP32_PRECISION_CACHE.get(key) == precision:
-        return
-    _FP32_PRECISION_CACHE[key] = precision
+    with _FP32_PRECISION_LOCK:
+        if _FP32_PRECISION_CACHE.get(key) == precision:
+            return
+        _FP32_PRECISION_CACHE[key] = precision
 
     with contextlib.suppress(Exception):
         if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
@@ -790,10 +958,7 @@ def optimal_procs() -> Dict[str, Union[int, str]]:
 
 
 def cpu_count() -> int:
-    try:
-        return len(os.sched_getaffinity(0))
-    except Exception:
-        return os.cpu_count() or 1
+    return process_cpu_count()
 
 
 def num_accelerators() -> int:
@@ -1441,7 +1606,7 @@ def get_tlb(io_workers: Optional[int] = None) -> Thread:
         with _TLB_SINGLETON_LOCK:
             if _TLB_SINGLETON is None:
                 default_workers = (
-                    io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
+                    io_workers if io_workers is not None else max(1, process_cpu_count() // 2)
                 )
                 _TLB_SINGLETON = Thread(io_workers=default_workers)
     tlb = _TLB_SINGLETON

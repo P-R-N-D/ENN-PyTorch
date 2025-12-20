@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import json
 import logging
+import threading
 # json is used for structured AMP negotiation logs.
 import math
 from collections import OrderedDict
@@ -17,7 +18,7 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..backend.system import get_device
+from ..backend.system import get_device, process_cpu_count
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
 patch_torch()
@@ -35,6 +36,7 @@ _LOGGER = logging.getLogger(__name__)
 # Deduplicate AMP negotiation logs (best-effort, bounded).
 _NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _NEGO_LOGGED_MAX: int = 256
+_NEGO_LOGGED_LOCK = threading.Lock()
 
 
 def _log_negotiate_once(
@@ -47,32 +49,47 @@ def _log_negotiate_once(
     """Log a structured negotiation decision once per key.
 
     This avoids spam when negotiation happens repeatedly across steps.
+
+    Thread-safe and best-effort: in free-threaded/no-GIL Python, we must
+    guard the shared dedupe cache explicitly.
     """
+    lg = logger if logger is not None else _LOGGER
+    lvl = logging.INFO if str(level).lower() == "info" else logging.DEBUG
+    try:
+        if not lg.isEnabledFor(lvl):
+            return
+    except Exception:
+        # If logger capability probing fails, continue best-effort.
+        pass
+
     if key is None:
         key = (payload.get("context"), payload.get("device"), payload.get("selected"))
-    if key in _NEGO_LOGGED_KEYS:
+
+    with _NEGO_LOGGED_LOCK:
+        if key in _NEGO_LOGGED_KEYS:
+            try:
+                _NEGO_LOGGED_KEYS.move_to_end(key)
+            except Exception:
+                pass
+            return
+        _NEGO_LOGGED_KEYS[key] = None
         try:
-            _NEGO_LOGGED_KEYS.move_to_end(key)
+            while len(_NEGO_LOGGED_KEYS) > int(_NEGO_LOGGED_MAX):
+                _NEGO_LOGGED_KEYS.popitem(last=False)
         except Exception:
             pass
-        return
-    _NEGO_LOGGED_KEYS[key] = None
-    try:
-        if len(_NEGO_LOGGED_KEYS) > int(_NEGO_LOGGED_MAX):
-            _NEGO_LOGGED_KEYS.popitem(last=False)
-    except Exception:
-        pass
     try:
         msg = "[AMP][NEGOTIATE] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:
         msg = f"[AMP][NEGOTIATE] {payload}"
-    if logger is not None:
-        if level == "info":
-            logger.info(msg)
+    try:
+        if lvl == logging.INFO:
+            lg.info(msg)
         else:
-            logger.debug(msg)
-    else:
-        _LOGGER.debug(msg)
+            lg.debug(msg)
+    except Exception:
+        # Best-effort logging: never fail negotiation because logging broke.
+        pass
 
 
 
@@ -609,12 +626,7 @@ class Gradient:
                             # Pick a small per-rank compile thread count. Too many threads
                             # across multiple ranks oversubscribes the node and hurts both
                             # compilation latency and the data pipeline.
-                            cpu_count = None
-                            with contextlib.suppress(Exception):
-                                if hasattr(os, "sched_getaffinity"):
-                                    cpu_count = len(os.sched_getaffinity(0))
-                            if not cpu_count:
-                                cpu_count = int(os.cpu_count() or 1)
+                            cpu_count = int(process_cpu_count() or 1)
                             per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
                             _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
             except Exception:

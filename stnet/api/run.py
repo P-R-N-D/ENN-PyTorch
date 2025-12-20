@@ -35,6 +35,7 @@ from ..backend.system import (
     new_dir,
     optimal_start_method,
     set_multiprocessing_env,
+    empty_device_cache,
 )
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..data.nodes import preload_memmap
@@ -293,32 +294,8 @@ def _write_memmap_streaming_two_pass(
 
 
 def _clear_device_caches() -> None:
-    with contextlib.suppress(Exception):
-        gc.collect()
-
-    with contextlib.suppress(Exception):
-        accelerator = getattr(torch, "accelerator", None)
-        memory_mod = getattr(accelerator, "memory", None) if accelerator is not None else None
-        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
-        if callable(empty_cache):
-            empty_cache()
-
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    with contextlib.suppress(Exception):
-        mps_mod = getattr(torch, "mps", None)
-        empty_cache = getattr(mps_mod, "empty_cache", None) if mps_mod is not None else None
-        if callable(empty_cache):
-            empty_cache()
-
-    with contextlib.suppress(Exception):
-        xpu_mod = getattr(torch, "xpu", None)
-        memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
-        empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
-        if callable(empty_cache):
-            empty_cache()
+    # Centralized + rate-limited cache clearing.
+    empty_device_cache(do_gc=True)
 
 
 def _reset_process_group() -> None:
