@@ -4,8 +4,6 @@ Spatio‑temporal modular neural network (MNN) model for PyTorch with pragmatic 
 
 This repository also includes a worked example notebook (`notebook.ipynb`, Korean) and a small sample dataset (`raw_data.xlsx`) demonstrating a tabular‑to‑grid regression workflow.
 
-> **License**: PolyForm Noncommercial 1.0.0
-
 ## Requirements
 
 ### Mandatory
@@ -14,10 +12,11 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
 
-### Recommended (throughput)
+### Recommended
 - **Python**: >= 3.13t (free-threading / no-GIL build)
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
   - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
+- **PyTorch**: >= 2.9.1
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
