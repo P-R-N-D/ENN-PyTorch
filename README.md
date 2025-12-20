@@ -17,7 +17,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 ### Recommended (throughput)
 - **Python 3.13t** (free-threading / no-GIL build)
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
-  - 3.14t can further improve throughput by removing the GIL, but it is not required.
+  - 3.13t can further improve throughput by removing the GIL, but it is not required.
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
