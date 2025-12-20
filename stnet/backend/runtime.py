@@ -231,6 +231,7 @@ from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.collections import Cache, Pool
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.pipeline import Dataset
+# NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
 from ..model import fused
 from ..model.fused import Autocast, Gradient
 from ..functional.losses import (CRPSLoss, DataFidelityLoss,
@@ -246,8 +247,9 @@ from .distributed import (distributed_barrier, distributed_sync,
                           get_world_size, is_distributed, joining, no_sync,
                           to_ddp, to_fsdp)
 from ..functional.profiler import FlopCounter
-from .system import (Memory, Thread, get_device, get_tlb, initialize_python_path,
-                     new_dir, posix_time, set_float32_precision)
+from .system import (Memory, Thread, empty_device_cache, get_device, get_tlb,
+                     initialize_python_path, new_dir, posix_time,
+                     set_float32_precision)
 
 if TYPE_CHECKING:
     import numpy as _np
@@ -260,6 +262,132 @@ else:
 _LOGGER = logging.getLogger(__name__)
 
 torch_safe_distributed()
+
+_SAMPLER_SCALE_LOG_LOCK = threading.Lock()
+_SAMPLER_SCALE_LOG_LAST_S: Dict[Tuple[int, str], float] = {}
+
+_OOM_RETRY_LOCK = threading.Lock()
+_OOM_RETRY_COUNT: Dict[Tuple[int, str, int], int] = {}
+
+
+def _rt_env_flag(name: str, default: bool) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    s = str(v).strip().lower()
+    if not s:
+        return bool(default)
+    if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
+        return False
+    return bool(default)
+
+
+def _rt_env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except Exception:
+        return int(default)
+
+
+def _rt_env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except Exception:
+        return float(default)
+
+
+def _oom_retry_inc(loader: Any, phase: str, step: int) -> int:
+    key = (int(id(loader)), str(phase), int(step))
+    with _OOM_RETRY_LOCK:
+        cur = int(_OOM_RETRY_COUNT.get(key, 0)) + 1
+        _OOM_RETRY_COUNT[key] = int(cur)
+        return int(cur)
+
+
+def _oom_retry_clear(loader: Any, phase: str, step: int) -> None:
+    key = (int(id(loader)), str(phase), int(step))
+    with _OOM_RETRY_LOCK:
+        _OOM_RETRY_COUNT.pop(key, None)
+
+
+def _oom_max_retries(phase: str) -> int:
+    # Defaults chosen to avoid infinite retry storms.
+    # Override with:
+    #   - STNET_OOM_MAX_RETRIES_TRAIN
+    #   - STNET_OOM_MAX_RETRIES_VAL
+    #   - STNET_OOM_MAX_RETRIES_PER_BATCH
+    phase = str(phase).strip().lower()
+    if phase == "train":
+        v = _rt_env_int("STNET_OOM_MAX_RETRIES_TRAIN", _rt_env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 4))
+    elif phase in {"val", "valid", "validation"}:
+        v = _rt_env_int("STNET_OOM_MAX_RETRIES_VAL", _rt_env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 2))
+    else:
+        v = _rt_env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
+    return max(0, int(v))
+
+
+def _oom_skip_enabled(phase: str) -> bool:
+    # Default: skip the batch after retry budget is exhausted (prevents OOM storms).
+    # Override:
+    #   - STNET_OOM_SKIP_BATCH=0 to raise instead
+    #   - STNET_OOM_SKIP_TRAIN / STNET_OOM_SKIP_VAL for per-phase control
+    phase = str(phase).strip().lower()
+    if phase == "train":
+        return _rt_env_flag("STNET_OOM_SKIP_TRAIN", _rt_env_flag("STNET_OOM_SKIP_BATCH", True))
+    if phase in {"val", "valid", "validation"}:
+        return _rt_env_flag("STNET_OOM_SKIP_VAL", _rt_env_flag("STNET_OOM_SKIP_BATCH", True))
+    return _rt_env_flag("STNET_OOM_SKIP_BATCH", True)
+
+
+def _oom_scale_down_factor(attempt: int) -> float:
+    # More aggressive with repeated OOMs.
+    # 1st: 0.8, 2nd: 0.7, 3rd: 0.6, 4th+: 0.5
+    seq = (0.8, 0.7, 0.6, 0.5)
+    i = max(1, int(attempt)) - 1
+    if i < 0:
+        i = 0
+    if i >= len(seq):
+        i = len(seq) - 1
+    return float(seq[i])
+
+
+def _log_sampler_scale_rate_limited(
+    *,
+    logger: logging.Logger,
+    scale_ctl: Any,
+    tag: str,
+    msg: str,
+    level: str = "info",
+    min_interval_s: Optional[float] = None,
+) -> None:
+    # Env default:
+    #   STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S=5
+    if min_interval_s is None:
+        min_interval_s = _rt_env_float("STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0)
+    try:
+        min_interval_s = float(min_interval_s)
+    except Exception:
+        min_interval_s = 5.0
+    if min_interval_s < 0:
+        min_interval_s = 0.0
+
+    key = (int(id(scale_ctl)), str(tag))
+    now = time.monotonic()
+    with _SAMPLER_SCALE_LOG_LOCK:
+        last = float(_SAMPLER_SCALE_LOG_LAST_S.get(key, 0.0))
+        if min_interval_s and (now - last) < float(min_interval_s):
+            return
+        _SAMPLER_SCALE_LOG_LAST_S[key] = float(now)
+
+    try:
+        if str(level).lower() == "debug":
+            logger.debug(msg)
+        else:
+            logger.info(msg)
+    except Exception:
+        pass
 
 
 MB_DIV = 1024.0 * 1024.0
@@ -2460,24 +2588,97 @@ def epochs(
                                 with contextlib.suppress(Exception):
                                     cpu_pool.collect()
 
+                            with contextlib.suppress(Exception):
+                                _oom_retry_clear(train_loader, "train", step_idx)
+
                             break
 
                         except RuntimeError as e:
                             msg = str(e).lower()
                             if "out of memory" in msg:
-                                _LOGGER.error(
-                                    "[epochs] OOM during train step %d (global_step=%d). "
-                                    "Trying to reduce microbatch / grad_accum and retry same batch.",
-                                    step_idx,
-                                    global_step,
-                                )
+                                oom_try = _oom_retry_inc(train_loader, "train", step_idx)
+                                max_tries = _oom_max_retries("train")
+                                if oom_try <= 1:
+                                    _LOGGER.error(
+                                        "[epochs] OOM during train step %d (global_step=%d). "
+                                        "Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)",
+                                        step_idx,
+                                        global_step,
+                                        oom_try,
+                                        max_tries,
+                                    )
+                                else:
+                                    _LOGGER.warning(
+                                        "[epochs] OOM during train step %d (global_step=%d). Retrying. (try=%d/%d)",
+                                        step_idx,
+                                        global_step,
+                                        oom_try,
+                                        max_tries,
+                                    )
+
+                                if max_tries > 0 and oom_try > max_tries:
+                                    if _oom_skip_enabled("train"):
+                                        _LOGGER.error(
+                                            "[epochs] OOM storm: exceeded retry budget (try=%d/%d) at train step %d (global_step=%d). "
+                                            "Skipping this batch.",
+                                            oom_try,
+                                            max_tries,
+                                            step_idx,
+                                            global_step,
+                                        )
+                                        with contextlib.suppress(Exception):
+                                            _oom_retry_clear(train_loader, "train", step_idx)
+                                        with contextlib.suppress(Exception):
+                                            empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                                        with contextlib.suppress(Exception):
+                                            optimizer.zero_grad(set_to_none=True)
+                                        break
+                                    raise
+
+                                # Also request input batch scale-down for NEXT batches (true runtime recovery).
+                                # NOTE: scale controller is per-session/per-loader (see SamplerScale).
+                                try:
+                                    scale_ctl = None
+                                    obj = train_loader
+                                    for _ in range(4):
+                                        if obj is None:
+                                            break
+                                        scale_ctl = getattr(obj, "_stnet_sampler_scale", None)
+                                        if scale_ctl is not None:
+                                            break
+                                        obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
+                                    if scale_ctl is not None:
+                                        prev = None
+                                        with contextlib.suppress(Exception):
+                                            prev = float(scale_ctl.get())
+                                        with contextlib.suppress(Exception):
+                                            scale_ctl.request_scale_down(_oom_scale_down_factor(oom_try))
+                                        with contextlib.suppress(Exception):
+                                            cur = float(scale_ctl.get())
+                                            if prev is not None and cur < prev:
+                                                _log_sampler_scale_rate_limited(
+                                                    logger=_LOGGER,
+                                                    scale_ctl=scale_ctl,
+                                                    tag="oom-train-scale-down",
+                                                    msg=(
+                                                        "[epochs] reduced sampler scale from %.4f to %.4f after OOM "
+                                                        "(factor=%.2f, try=%d/%d)"
+                                                    )
+                                                    % (
+                                                        prev,
+                                                        cur,
+                                                        _oom_scale_down_factor(oom_try),
+                                                        oom_try,
+                                                        max_tries,
+                                                    ),
+                                                    level="info",
+                                                )
+                                except Exception:
+                                    pass
+
                                 with contextlib.suppress(Exception):
-                                    if device.type == "cuda" and torch.cuda.is_available():
-                                        torch.cuda.empty_cache()
-                                    elif device.type == "xpu" and hasattr(torch, "xpu"):
-                                        empty_cache = getattr(torch.xpu, "empty_cache", None)
-                                        if callable(empty_cache):
-                                            empty_cache()
+                                    ec_min = 0.0 if oom_try <= 1 else _rt_env_float("STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S", 0.05)
+                                    empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
 
                                 with contextlib.suppress(Exception):
                                     optimizer.zero_grad(set_to_none=True)
@@ -2519,10 +2720,20 @@ def epochs(
                                         reduced_any = True
 
                                 if not reduced_any:
+                                    if _oom_skip_enabled("train"):
+                                        _LOGGER.error(
+                                            "[epochs] OOM in train and no more knobs to reduce "
+                                            "(microbatch <= 1, grad_accum at min). Skipping this batch."
+                                        )
+                                        with contextlib.suppress(Exception):
+                                            _oom_retry_clear(train_loader, "train", step_idx)
+                                        with contextlib.suppress(Exception):
+                                            empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                                        with contextlib.suppress(Exception):
+                                            optimizer.zero_grad(set_to_none=True)
+                                        break
                                     _LOGGER.error(
-                                        "[epochs] OOM but no more knobs to reduce "
-                                        "(microbatch <= 1 and grad_accum_steps <= min_grad_accum). "
-                                        "Giving up on recovery."
+                                        "[epochs] OOM in train and no more knobs to reduce; giving up on recovery."
                                     )
                                     raise
 
@@ -2730,23 +2941,90 @@ def epochs(
                                         with contextlib.suppress(Exception):
                                             cpu_pool.collect()
 
+                                    with contextlib.suppress(Exception):
+                                        _oom_retry_clear(val_loader, "val", _vstep)
+
                                     break
 
                                 except RuntimeError as e:
                                     msg = str(e).lower()
                                     if "out of memory" in msg:
-                                        _LOGGER.error(
-                                            "[epochs] OOM during validation step %d. "
-                                            "Trying to reduce microbatch and retry same batch.",
-                                            _vstep,
-                                        )
+                                        oom_try = _oom_retry_inc(val_loader, "val", _vstep)
+                                        max_tries = _oom_max_retries("val")
+                                        if oom_try <= 1:
+                                            _LOGGER.error(
+                                                "[epochs] OOM during validation step %d. "
+                                                "Trying to reduce microbatch and retry same batch. (try=%d/%d)",
+                                                _vstep,
+                                                oom_try,
+                                                max_tries,
+                                            )
+                                        else:
+                                            _LOGGER.warning(
+                                                "[epochs] OOM during validation step %d. Retrying. (try=%d/%d)",
+                                                _vstep,
+                                                oom_try,
+                                                max_tries,
+                                            )
+
+                                        if max_tries > 0 and oom_try > max_tries:
+                                            if _oom_skip_enabled("val"):
+                                                _LOGGER.error(
+                                                    "[epochs] OOM storm: exceeded retry budget (try=%d/%d) at validation step %d. "
+                                                    "Skipping this batch.",
+                                                    oom_try,
+                                                    max_tries,
+                                                    _vstep,
+                                                )
+                                                with contextlib.suppress(Exception):
+                                                    _oom_retry_clear(val_loader, "val", _vstep)
+                                                with contextlib.suppress(Exception):
+                                                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                                                break
+                                            raise
+                                        # Also request input batch scale-down for NEXT batches (true runtime recovery).
+                                        try:
+                                            scale_ctl = None
+                                            obj = val_loader
+                                            for _ in range(4):
+                                                if obj is None:
+                                                    break
+                                                scale_ctl = getattr(obj, "_stnet_sampler_scale", None)
+                                                if scale_ctl is not None:
+                                                    break
+                                                obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
+                                            if scale_ctl is not None:
+                                                prev = None
+                                                with contextlib.suppress(Exception):
+                                                    prev = float(scale_ctl.get())
+                                                with contextlib.suppress(Exception):
+                                                    scale_ctl.request_scale_down(_oom_scale_down_factor(oom_try))
+                                                with contextlib.suppress(Exception):
+                                                    cur = float(scale_ctl.get())
+                                                    if prev is not None and cur < prev:
+                                                        _log_sampler_scale_rate_limited(
+                                                            logger=_LOGGER,
+                                                            scale_ctl=scale_ctl,
+                                                            tag="oom-val-scale-down",
+                                                            msg=(
+                                                                "[epochs] reduced sampler scale from %.4f to %.4f after OOM (validation) "
+                                                                "(factor=%.2f, try=%d/%d)"
+                                                            )
+                                                            % (
+                                                                prev,
+                                                                cur,
+                                                                _oom_scale_down_factor(oom_try),
+                                                                oom_try,
+                                                                max_tries,
+                                                            ),
+                                                            level="info",
+                                                        )
+                                        except Exception:
+                                            pass
+
                                         with contextlib.suppress(Exception):
-                                            if device.type == "cuda" and torch.cuda.is_available():
-                                                torch.cuda.empty_cache()
-                                            elif device.type == "xpu" and hasattr(torch, "xpu"):
-                                                empty_cache = getattr(torch.xpu, "empty_cache", None)
-                                                if callable(empty_cache):
-                                                    empty_cache()
+                                            ec_min = 0.0 if oom_try <= 1 else _rt_env_float("STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S", 0.05)
+                                            empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
 
                                         reduced_any = False
 
@@ -2768,6 +3046,16 @@ def epochs(
                                                     reduced_any = True
 
                                         if not reduced_any:
+                                            if _oom_skip_enabled("val"):
+                                                _LOGGER.error(
+                                                    "[epochs] OOM in validation and no more knobs to reduce "
+                                                    "(microbatch <= 1). Skipping this batch."
+                                                )
+                                                with contextlib.suppress(Exception):
+                                                    _oom_retry_clear(val_loader, "val", _vstep)
+                                                with contextlib.suppress(Exception):
+                                                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+                                                break
                                             _LOGGER.error(
                                                 "[epochs] OOM in validation and no more knobs to reduce "
                                                 "(microbatch <= 1). Giving up on recovery."
@@ -2961,10 +3249,57 @@ def epochs(
         if dev_t != "cpu":
             util_for_cap = gpu_util_frac if gpu_util_frac is not None else util_fallback
             util_for_cap = max(0.0, min(1.0, util_for_cap))
-            if mem_util_frac is not None and mem_util_frac > 0.92:
-                Sampler.request_scale_down(0.95)
-            elif util_for_cap < 0.90 and (mem_util_frac is None or mem_util_frac < 0.88):
-                Sampler.request_scale_up(1.10)
+
+            # Adapt *this loader's* sampler scale (per-session/per-loader; best-effort).
+            try:
+                if train_loader is not None:
+                    scale_ctl = None
+                    obj = train_loader
+                    for _ in range(4):
+                        if obj is None:
+                            break
+                        scale_ctl = getattr(obj, "_stnet_sampler_scale", None)
+                        if scale_ctl is not None:
+                            break
+                        obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
+
+                    if scale_ctl is not None:
+                        if mem_util_frac is not None and mem_util_frac > 0.92:
+                            prev = None
+                            with contextlib.suppress(Exception):
+                                prev = float(scale_ctl.get())
+                            with contextlib.suppress(Exception):
+                                scale_ctl.request_scale_down(0.95)
+                            with contextlib.suppress(Exception):
+                                cur = float(scale_ctl.get())
+                                if prev is not None and cur < prev:
+                                    _log_sampler_scale_rate_limited(
+                                        logger=_LOGGER,
+                                        scale_ctl=scale_ctl,
+                                        tag="auto-scale-down",
+                                        msg=("[epochs] auto scale_down (mem_util=%.3f): %.4f -> %.4f")
+                                        % (float(mem_util_frac), float(prev), float(cur)),
+                                        level="debug",
+                                    )
+                        elif util_for_cap < 0.90 and (mem_util_frac is None or mem_util_frac < 0.88):
+                            prev = None
+                            with contextlib.suppress(Exception):
+                                prev = float(scale_ctl.get())
+                            with contextlib.suppress(Exception):
+                                scale_ctl.request_scale_up(1.10)
+                            with contextlib.suppress(Exception):
+                                cur = float(scale_ctl.get())
+                                if prev is not None and cur > prev:
+                                    _log_sampler_scale_rate_limited(
+                                        logger=_LOGGER,
+                                        scale_ctl=scale_ctl,
+                                        tag="auto-scale-up",
+                                        msg=("[epochs] auto scale_up (util=%.3f): %.4f -> %.4f")
+                                        % (float(util_for_cap), float(prev), float(cur)),
+                                        level="debug",
+                                    )
+            except Exception:
+                pass
         else:
             cpu_pct = _cpu_percent_now()
             if cpu_pct is not None:
@@ -3159,11 +3494,8 @@ def infer(
                     except RuntimeError as e:
                         msg = str(e).lower()
                         if "out of memory" in msg and mb > 1:
-                            if device.type == "cuda":
-                                try:
-                                    torch.cuda.empty_cache()
-                                except Exception:
-                                    pass
+                            with contextlib.suppress(Exception):
+                                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
                             mb = max(1, mb // 2)
                             try:
                                 setattr(model, "microbatch", mb)

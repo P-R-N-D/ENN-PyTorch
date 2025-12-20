@@ -15,7 +15,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
-from .system import get_device
+from .system import get_device, process_cpu_count
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -477,8 +477,8 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
                 if count > 0:
                     return count
         return 1
-    cpu_count = os.cpu_count() or 1
-    return max(1, min(cpu_count, 4))
+    ncpu = process_cpu_count()
+    return max(1, min(int(ncpu), 4))
 
 
 @contextlib.contextmanager

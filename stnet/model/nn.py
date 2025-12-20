@@ -6,6 +6,7 @@ import gc
 import logging
 import math
 import os
+import threading
 import weakref
 from collections.abc import Iterator
 from typing import (
@@ -34,6 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 
 from ..api.config import ModelConfig
 from ..backend.compat import torch_no_compile
+from ..backend.system import empty_device_cache
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
 from .layers import (
@@ -351,6 +353,18 @@ class SpatialAxis(nn.Module):
         # Meta also captures coords identity/version to avoid stale permutations when coords change in-place.
         self._perm_cache_meta: Optional[Tuple[int, int, int, int, int, int, int]] = None
 
+        self._perm_cache_lock = threading.Lock()
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        # Locks are not picklable; recreate on load.
+        state.pop("_perm_cache_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._perm_cache_lock = threading.Lock()
+
     def _compute_per_sample_permutations(
         self, coords: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -407,25 +421,31 @@ class SpatialAxis(nn.Module):
         # If stride(0)!=0, coords may differ per-sample; compute per-sample permutations to avoid distortion.
         shared_template = (B <= 1) or (coords.stride(0) == 0)
 
-        perm_cache = getattr(self, "_perm_cache", None)
-        inv_cache = getattr(self, "_invperm_cache", None)
-
         if shared_template:
             coords_ptr = int(coords.data_ptr()) if coords.numel() else 0
             coords_ver = int(getattr(coords, "_version", 0))
             meta = (int(N), int(patch), int(bits), int(shift), int(depth), coords_ptr, coords_ver)
-            if (
-                isinstance(perm_cache, torch.Tensor)
-                and isinstance(inv_cache, torch.Tensor)
-                and self._perm_cache_meta == meta
-                and perm_cache.numel() == depth * N
-                and inv_cache.numel() == depth * N
-                and perm_cache.shape == (depth, N)
-                and inv_cache.shape == (depth, N)
-                and perm_cache.device == coords.device
-                and inv_cache.device == coords.device
-            ):
-                return perm_cache, inv_cache
+
+            lock = getattr(self, "_perm_cache_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(self, "_perm_cache_lock", lock)
+
+            with lock:
+                perm_cache = getattr(self, "_perm_cache", None)
+                inv_cache = getattr(self, "_invperm_cache", None)
+                if (
+                    isinstance(perm_cache, torch.Tensor)
+                    and isinstance(inv_cache, torch.Tensor)
+                    and self._perm_cache_meta == meta
+                    and perm_cache.numel() == depth * N
+                    and inv_cache.numel() == depth * N
+                    and perm_cache.shape == (depth, N)
+                    and inv_cache.shape == (depth, N)
+                    and perm_cache.device == coords.device
+                    and inv_cache.device == coords.device
+                ):
+                    return perm_cache, inv_cache
 
             coords_one = coords[:1].contiguous()
             perms: List[torch.Tensor] = []
@@ -443,9 +463,27 @@ class SpatialAxis(nn.Module):
 
             perm_new = torch.stack(perms, dim=0).to(device=coords.device)
             inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
-            self._perm_cache = perm_new
-            self._invperm_cache = inv_new
-            self._perm_cache_meta = meta
+
+            with lock:
+                # Double-check: another thread may have filled it while we computed.
+                perm_cache = getattr(self, "_perm_cache", None)
+                inv_cache = getattr(self, "_invperm_cache", None)
+                if (
+                    isinstance(perm_cache, torch.Tensor)
+                    and isinstance(inv_cache, torch.Tensor)
+                    and self._perm_cache_meta == meta
+                    and perm_cache.numel() == depth * N
+                    and inv_cache.numel() == depth * N
+                    and perm_cache.shape == (depth, N)
+                    and inv_cache.shape == (depth, N)
+                    and perm_cache.device == coords.device
+                    and inv_cache.device == coords.device
+                ):
+                    return perm_cache, inv_cache
+
+                self._perm_cache = perm_new
+                self._invperm_cache = inv_new
+                self._perm_cache_meta = meta
             return perm_new, inv_new
 
         # Per-sample coords: compute permutations for each batch entry (no caching).
@@ -526,7 +564,11 @@ class SpatialAxis(nn.Module):
 
             x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
             c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
-            out_s = torch.empty_like(x_s)
+            if torch.is_grad_enabled():
+                out_s = torch.empty_like(x_s)
+            else:
+                # Inference / no-grad: reuse buffer to avoid an extra allocation.
+                out_s = x_s
 
             m_s = None
             if attn_mask is not None:
@@ -2144,7 +2186,7 @@ class Root(nn.Module):
                 gc.collect()
             with contextlib.suppress(Exception):
                 if getattr(self._device, "type", None) == "cuda":
-                    torch.cuda.empty_cache()
+                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
 
             if compile_heavy_submodules:
                 try:
@@ -2167,9 +2209,9 @@ class Root(nn.Module):
                     )
                 with contextlib.suppress(Exception):
                     gc.collect()
-                with contextlib.suppress(Exception):
-                    if getattr(self._device, "type", None) == "cuda":
-                        torch.cuda.empty_cache()
+            with contextlib.suppress(Exception):
+                if getattr(self._device, "type", None) == "cuda":
+                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
 
             if compile_heavy_submodules:
                 try:
@@ -2192,9 +2234,9 @@ class Root(nn.Module):
                     )
                 with contextlib.suppress(Exception):
                     gc.collect()
-                with contextlib.suppress(Exception):
-                    if getattr(self._device, "type", None) == "cuda":
-                        torch.cuda.empty_cache()
+            with contextlib.suppress(Exception):
+                if getattr(self._device, "type", None) == "cuda":
+                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
 
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
@@ -2212,6 +2254,7 @@ class Root(nn.Module):
         self._amp_dtype_cache_last_key: Tuple[Any, ...] | None = None
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
+        self._amp_dtype_cache_lock = threading.Lock()
         self.__config = config
 
     def _promote_float32_params(self) -> None:
@@ -2502,14 +2545,20 @@ class Root(nn.Module):
                 int(safety_margin_pow2),
             )
 
-        amp_dtype = None
-        last_key = getattr(self, "_amp_dtype_cache_last_key", None)
-        if last_key == cache_key:
-            amp_dtype = getattr(self, "_amp_dtype_cache_last_dtype", None)
+        amp_dtype: Optional[torch.dtype] = None
+        cache_lock = getattr(self, "_amp_dtype_cache_lock", None)
+        if cache_lock is None:
+            cache_lock = threading.Lock()
+            setattr(self, "_amp_dtype_cache_lock", cache_lock)
+
+        with cache_lock:
+            last_key = getattr(self, "_amp_dtype_cache_last_key", None)
+            if last_key == cache_key:
+                amp_dtype = getattr(self, "_amp_dtype_cache_last_dtype", None)
+            if amp_dtype is None:
+                amp_dtype = self._amp_dtype_cache.get(cache_key)
         if amp_dtype is None:
-            amp_dtype = self._amp_dtype_cache.get(cache_key)
-        if amp_dtype is None:
-            amp_dtype = Autocast.negotiate(
+            negotiated = Autocast.negotiate(
                 tuple(amp_candidates),
                 fallback=torch.float64,
                 logger=_LOGGER,
@@ -2519,11 +2568,20 @@ class Root(nn.Module):
                 decision_key=cache_key,
                 safety_margin_pow2=int(safety_margin_pow2),
             )
-            if len(self._amp_dtype_cache) >= int(getattr(self, "_amp_dtype_cache_max", 64)):
-                self._amp_dtype_cache.clear()
-            self._amp_dtype_cache[cache_key] = amp_dtype
-        self._amp_dtype_cache_last_key = cache_key
-        self._amp_dtype_cache_last_dtype = amp_dtype
+            with cache_lock:
+                # Double-check: another thread may have filled it while we negotiated.
+                amp_dtype = self._amp_dtype_cache.get(cache_key)
+                if amp_dtype is None:
+                    amp_dtype = negotiated
+                    if len(self._amp_dtype_cache) >= int(getattr(self, "_amp_dtype_cache_max", 64)):
+                        self._amp_dtype_cache.clear()
+                    self._amp_dtype_cache[cache_key] = amp_dtype
+                self._amp_dtype_cache_last_key = cache_key
+                self._amp_dtype_cache_last_dtype = amp_dtype
+        else:
+            with cache_lock:
+                self._amp_dtype_cache_last_key = cache_key
+                self._amp_dtype_cache_last_dtype = amp_dtype
         amp_enabled = amp_dtype is not torch.float64
 
         is_cls_loss = (
