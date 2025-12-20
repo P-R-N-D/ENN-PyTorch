@@ -10,6 +10,7 @@ import multiprocessing
 import os
 import platform
 import sys
+import sysconfig
 import threading
 import time
 from datetime import datetime, timezone
@@ -133,7 +134,17 @@ class WorkerPolicy:
             ),
         )
 
-        cap_mult = 2
+        # Free-threading/No-GIL: only turn on more aggressive defaults when
+        # the runtime is actually running with the GIL disabled (or user enables
+        # STNET_NOGIL_OPT).
+        _nogil = False
+        with contextlib.suppress(Exception):
+            _nogil = bool(Thread.nogil_optimizations_enabled())
+
+        # Only default to more oversubscription when the input pipeline is likely
+        # to be the bottleneck (i.e. accelerator training). Users can still
+        # override via STNET_THREAD_CAP_MULTIPLIER.
+        cap_mult = 3 if (_nogil and is_accel) else 2
         with contextlib.suppress(Exception):
             v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
             if v is None:
@@ -143,7 +154,9 @@ class WorkerPolicy:
         cap_mult = max(1, min(8, int(cap_mult)))
         node_thread_cap = max(2, int(ncpu_raw) * int(cap_mult))
 
-        distribute = (is_accel and int(local_world_guess) > 1)
+        # Split the thread budget across *local* processes whenever we have
+        # multiple ranks on a node (GPU or CPU DDP). This avoids oversubscription.
+        distribute = (int(local_world_guess) > 1)
         distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute)))
         thread_cap = int(node_thread_cap)
         if distribute:
@@ -160,7 +173,7 @@ class WorkerPolicy:
             soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
 
         soft_auto_enabled = bool(_read_int_env(("STNET_SOFT_INFLIGHT_AUTO",), 1))
-        soft_inflight_max_default = 16 if is_accel else 12
+        soft_inflight_max_default = (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
         soft_inflight_max = max(8, _read_int_env(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
         soft_inflight_explicit = _read_int_env(("STNET_SOFT_INFLIGHT_CAP",), 0)
         if soft_inflight_explicit > 0:
@@ -221,10 +234,18 @@ class WorkerPolicy:
         if env_pre:
             with contextlib.suppress(Exception):
                 prebatch = max(1, int(env_pre))
+        elif _nogil:
+            # Slightly higher task coalescing helps reduce Python overhead when
+            # thread-based parallelism is real. Keep this conservative; users can
+            # still override with STNET_PREBATCH.
+            prebatch = 2
         env_pf = os.environ.get("STNET_PREFETCH_FACTOR")
         if env_pf:
             with contextlib.suppress(Exception):
                 prefetch_factor = max(1, int(env_pf))
+        elif _nogil:
+            # A bit more prefetch reduces bubbles in the input pipeline on no-GIL.
+            prefetch_factor = 2
 
         prebatch = max(1, int(prebatch))
         prefetch_factor = max(1, int(prefetch_factor))
@@ -848,6 +869,9 @@ class Thread:
         "_pin_attempts",
         "_pin_success",
         "_omp_ok",
+        "_nogil",
+        "_flush_every",
+        "_sample_every",
     )
 
     def __init__(self, io_workers: int) -> None:
@@ -867,7 +891,105 @@ class Thread:
         self._pin_success = 0
         self._omp_ok = self.spread_threads()
         self._enabled = (len(self._allowed_cpus) >= 2) or self._omp_ok
+        # Free-threading/No-GIL: reduce contention in the telemetry path and
+        # allow slightly more oversubscription when thread parallelism is real.
+        try:
+            self._nogil = bool(Thread.nogil_optimizations_enabled())
+        except Exception:
+            self._nogil = False
+
+        def _read_int_env(keys, default):
+            for k in keys:
+                try:
+                    v = os.environ.get(k)
+                    if v is not None and str(v).strip():
+                        return int(v)
+                except Exception:
+                    pass
+            return int(default)
+
+        flush_default = 64 if self._nogil else 1
+        sample_default = 8 if self._nogil else 1
+        self._flush_every = max(
+            1,
+            min(1024, _read_int_env(("STNET_TLB_FLUSH_EVERY", "STNET_TLB_FLUSH"), flush_default)),
+        )
+        self._sample_every = max(
+            1,
+            min(1024, _read_int_env(("STNET_TLB_SAMPLE_EVERY", "STNET_TLB_SAMPLE"), sample_default)),
+        )
         self.tune_threads(io_workers, initial=True)
+
+    # --- Free-threading helpers (inlined from freethreading.py) ---
+    _TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+    _FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+    @staticmethod
+    def _parse_bool(value: object) -> Optional[bool]:
+        if value is None:
+            return None
+        s = str(value).strip().lower()
+        if not s:
+            return None
+        if s in Thread._TRUE:
+            return True
+        if s in Thread._FALSE:
+            return False
+        return None
+
+    @staticmethod
+    def is_free_threaded_build() -> bool:
+        """True if the *interpreter build* supports free-threading."""
+
+        try:
+            v = sysconfig.get_config_var("Py_GIL_DISABLED")
+            return bool(int(v)) if v is not None else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_gil_enabled() -> bool:
+        """True if the GIL is enabled in the current process.
+
+        On free-threaded builds, the GIL can be enabled at runtime (e.g. by importing
+        an extension module not marked as free-threading safe, or by user request via
+        PYTHON_GIL / -X gil).
+        """
+
+        fn = getattr(sys, "_is_gil_enabled", None)
+        if callable(fn):
+            try:
+                return bool(fn())
+            except Exception:
+                return True
+        # Python < 3.13: always GIL.
+        return True
+
+    @staticmethod
+    def nogil_active() -> bool:
+        """True only when this is a free-threaded build *and* the GIL is disabled."""
+
+        return Thread.is_free_threaded_build() and (not Thread.is_gil_enabled())
+
+    @staticmethod
+    def nogil_optimizations_enabled() -> bool:
+        """Whether STNet should enable no-GIL specific optimizations.
+
+        Default: follow the runtime state (nogil_active()).
+        Users can override with environment variables:
+          - STNET_NOGIL_OPT / STNET_NO_GIL_OPT / STNET_FREE_THREADING_OPT
+            values in {0/1, true/false, yes/no, on/off}.
+        """
+
+        for key in (
+            "STNET_NOGIL_OPT",
+            "STNET_NO_GIL_OPT",
+            "STNET_FREE_THREADING_OPT",
+        ):
+            override = Thread._parse_bool(os.environ.get(key))
+            if override is not None:
+                return bool(override)
+        return Thread.nogil_active()
 
     @staticmethod
     def _import_psutil() -> ModuleType | None:
@@ -1132,7 +1254,7 @@ class Thread:
                             return int(v)
                 return int(default)
 
-            cap_mult = 2
+            cap_mult = 3 if self._nogil else 2
             with contextlib.suppress(Exception):
                 v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
                 if v is None:
@@ -1202,7 +1324,7 @@ class Thread:
                         return int(v)
             return int(default)
 
-        cap_mult = 2
+        cap_mult = 3 if self._nogil else 2
         with contextlib.suppress(Exception):
             v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
             if v is None:
@@ -1254,17 +1376,48 @@ class Thread:
 
         def _inner(x: Any) -> Any:
             self.pin_thread()
-            t0 = time.perf_counter_ns()
-            thread_time = getattr(time, "thread_time_ns", None)
-            tc0 = thread_time() if callable(thread_time) else 0
-            y = fn(x)
-            tc1 = thread_time() if callable(thread_time) else 0
-            t1 = time.perf_counter_ns()
-            with self._lock:
-                self._samples += 1
-                self._cpu_ns += max(0, int(tc1) - int(tc0))
-                self._wall_ns += max(0, int(t1) - int(t0))
-            self.tune_threads()
+
+            tls = self._tls
+            # Per-thread counters; flushed to the shared totals periodically.
+            local_samples = getattr(tls, "samples", 0) + 1
+            setattr(tls, "samples", local_samples)
+
+            # Sample wall/cpu time to reduce per-item overhead in high-throughput
+            # thread pipelines (especially on no-GIL builds).
+            sample_every = int(getattr(self, "_sample_every", 1) or 1)
+            do_sample = (sample_every <= 1) or (local_samples % sample_every == 0)
+
+            if do_sample:
+                t0 = time.perf_counter_ns()
+                thread_time = getattr(time, "thread_time_ns", None)
+                tc0 = thread_time() if callable(thread_time) else 0
+                y = fn(x)
+                tc1 = thread_time() if callable(thread_time) else 0
+                t1 = time.perf_counter_ns()
+                # Scale sampled deltas to approximate total time.
+                scale = int(sample_every) if int(sample_every) > 1 else 1
+                d_cpu = max(0, int(tc1) - int(tc0)) * scale
+                d_wall = max(0, int(t1) - int(t0)) * scale
+            else:
+                y = fn(x)
+                d_cpu = 0
+                d_wall = 0
+
+            setattr(tls, "cpu_ns", getattr(tls, "cpu_ns", 0) + int(d_cpu))
+            setattr(tls, "wall_ns", getattr(tls, "wall_ns", 0) + int(d_wall))
+
+            flush_every = int(getattr(self, "_flush_every", 1) or 1)
+            if local_samples >= flush_every:
+                with self._lock:
+                    self._samples += int(getattr(tls, "samples", 0) or 0)
+                    self._cpu_ns += int(getattr(tls, "cpu_ns", 0) or 0)
+                    self._wall_ns += int(getattr(tls, "wall_ns", 0) or 0)
+                setattr(tls, "samples", 0)
+                setattr(tls, "cpu_ns", 0)
+                setattr(tls, "wall_ns", 0)
+                # Retune is itself rate-limited inside tune_threads().
+                self.tune_threads()
+
             return y
 
         return _inner
@@ -1279,16 +1432,27 @@ class Thread:
 
 
 _TLB_SINGLETON: Optional[Thread] = None
+_TLB_SINGLETON_LOCK = Lock()
 
 
 def get_tlb(io_workers: Optional[int] = None) -> Thread:
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
-        default_workers = (
-            io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
-        )
-        _TLB_SINGLETON = Thread(io_workers=default_workers)
-    return _TLB_SINGLETON
+        with _TLB_SINGLETON_LOCK:
+            if _TLB_SINGLETON is None:
+                default_workers = (
+                    io_workers if io_workers is not None else max(1, (os.cpu_count() or 4) // 2)
+                )
+                _TLB_SINGLETON = Thread(io_workers=default_workers)
+    tlb = _TLB_SINGLETON
+    # Best-effort update for callers that provide an explicit io_workers value
+    # after the singleton has been created.
+    if tlb is not None and io_workers is not None:
+        try:
+            tlb.optimize_procs(int(io_workers))
+        except Exception:
+            pass
+    return tlb
 
 
 def worker_init_pin(_: Any) -> None:
