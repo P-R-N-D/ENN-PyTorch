@@ -1268,6 +1268,8 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
     idx = device.index if device.index is not None else torch.cuda.current_device()
     idx_i = int(idx)
 
+    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
+
     gpu_util: Optional[float] = None
     mem_util: Optional[float] = None
 
@@ -1312,7 +1314,6 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
 
                 # Success: clear failure/backoff state.
                 with _NVML_LOCK:
-                    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
                     _NVML_FAIL_COUNT = 0
                     _NVML_BACKOFF_UNTIL = 0.0
             except Exception:
@@ -1328,7 +1329,6 @@ def _gpu_nvml_utils(device: torch.device) -> Tuple[Optional[float], Optional[flo
                 backoff_s = float(_nvml_backoff_s())
                 trigger_backoff = False
                 with _NVML_LOCK:
-                    global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
                     _NVML_FAIL_COUNT = int(_NVML_FAIL_COUNT) + 1
                     if backoff_s > 0.0 and int(_NVML_FAIL_COUNT) >= int(fail_max):
                         _NVML_BACKOFF_UNTIL = float(time.perf_counter()) + float(backoff_s)
