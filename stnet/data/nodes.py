@@ -715,21 +715,21 @@ class Sampler(_Sampler):
                 pass
             return False
 
-            with FxGradient.inference(torch.nn.Module()):
-                if n <= 0:
-                    X = features.narrow(0, 0, 0)
-                    Y = labels.narrow(0, 0, 0)
-                    return {"X": X, "Y": Y}
-                X = features.narrow(0, s, n)
-                Y = labels.narrow(0, s, n)
-                if self._label_shape:
-                    Y = Y.reshape(n, *self._label_shape)
-                pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
-                if pin_in_dataset and _is_accelerator_available():
-                    with suppress(Exception):
-                        X = X.pin_memory()
-                        Y = Y.pin_memory()
+        with FxGradient.inference(torch.nn.Module()):
+            if n <= 0:
+                X = features.narrow(0, 0, 0)
+                Y = labels.narrow(0, 0, 0)
                 return {"X": X, "Y": Y}
+            X = features.narrow(0, s, n)
+            Y = labels.narrow(0, s, n)
+            if self._label_shape:
+                Y = Y.reshape(n, *self._label_shape)
+            pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
+            if pin_in_dataset and _is_accelerator_available():
+                with suppress(Exception):
+                    X = X.pin_memory()
+                    Y = Y.pin_memory()
+            return {"X": X, "Y": Y}
 def preload_memmap(
     data: Mapping[str, Any],
     *,
