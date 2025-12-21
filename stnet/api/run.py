@@ -287,23 +287,25 @@ def train(
                 payload = manifest if isinstance(manifest, dict) else list(manifest)
                 json.dump(payload, f)
         ckpt_dir = new_dir("ckpt_dcp")
-        init_dir = new_dir("init_dcp")
+        init_dir = None
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
-        if save_dcp:
-            save(
-                state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(
-                    init_dir, sync_files=True, overwrite=True
-                ),
-            )
-        if save_pt:
-            torch.save(
-                {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                os.path.join(init_dir, "model.pt"),
-            )
+        if save_dcp or save_pt:
+            init_dir = new_dir("init_dcp")
+            if save_dcp:
+                save(
+                    state_dict={"model": m_sd},
+                    storage_writer=FileSystemWriter(
+                        init_dir, sync_files=True, overwrite=True
+                    ),
+                )
+            if save_pt:
+                torch.save(
+                    {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                    os.path.join(init_dir, "model.pt"),
+                )
         default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
@@ -332,11 +334,12 @@ def train(
         base = dict(
             sources={"kind": "memmap", "path": memmap_dir},
             ckpt_dir=ckpt_dir,
-            init_ckpt_dir=init_dir,
             in_dim=int(first_in_dim),
             out_shape=tuple(label_shape),
             cfg_dict=cfg_dict,
         )
+        if init_dir is not None:
+            base["init_ckpt_dir"] = init_dir
         default_kwargs = {
             "epochs": epochs,
             "val_frac": val_frac,
@@ -591,7 +594,7 @@ def predict(
     initialize_python_path()
     set_multiprocessing_env()
     tmp_dir = new_dir("infer")
-    dcp_dir = os.path.join(tmp_dir, "dcp")
+    dcp_dir: Optional[str] = None
     memmap_dir = os.path.join(tmp_dir, "memmap")
     ckpt_dir = os.path.join(tmp_dir, "pred_ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -600,16 +603,18 @@ def predict(
     m_sd = get_model_state_dict(model, options=opts)
     save_dcp = env_bool("STNET_SAVE_DCP", True)
     save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
-    if save_dcp:
-        save(
-            state_dict={"model": m_sd},
-            storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
-        )
-    if save_pt:
-        torch.save(
-            {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            os.path.join(dcp_dir, "model.pt"),
-        )
+    if save_dcp or save_pt:
+        dcp_dir = os.path.join(tmp_dir, "dcp")
+        if save_dcp:
+            save(
+                state_dict={"model": m_sd},
+                storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
+            )
+        if save_pt:
+            torch.save(
+                {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                os.path.join(dcp_dir, "model.pt"),
+            )
     cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
@@ -740,7 +745,6 @@ def predict(
         if keys is None:
             keys = list(range(count))
     base = dict(
-        model_ckpt_dir=dcp_dir,
         sources={"kind": "memmap", "path": memmap_dir},
         in_dim=int(in_dim),
         out_shape=tuple(label_shape),
@@ -748,6 +752,8 @@ def predict(
         keys=list(keys),
         ckpt_dir=ckpt_dir,
     )
+    if dcp_dir is not None:
+        base["model_ckpt_dir"] = dcp_dir
     mode = mode if mode in ("predict", "infer") else "predict"
     default_kwargs = {"seed": seed}
     positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
