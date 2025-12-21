@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import json
 import os
-import random
+import math
 import multiprocessing as mp
 import threading
 import queue
@@ -53,7 +53,8 @@ try:
 except Exception:
     _Sampler = object
 
-from .datatype import to_platform_dtype
+from .datatype import env_bool, env_first_int
+from .collections import LazyTensor
 
 
 def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = True) -> TensorLike:
@@ -284,21 +285,19 @@ class Sampler(_Sampler):
                     pass
             return int(default)
 
-        env_tl = os.environ.get("STNET_MEMMAP_THREAD_LOCAL")
-        if env_tl is not None and str(env_tl).strip():
-            v = str(env_tl).strip().lower()
-            self._mmap_thread_local = v in {"1", "true", "yes", "on"}
-        else:
-            with suppress(Exception):
-                self._mmap_thread_local = bool(Thread.nogil_optimizations_enabled())
+        # Thread-local mmap handles are optional; default is "auto" for no-GIL builds.
+        default_tl = False
+        with suppress(Exception):
+            default_tl = bool(Thread.nogil_optimizations_enabled())
+        self._mmap_thread_local = env_bool("STNET_MEMMAP_THREAD_LOCAL", default=default_tl)
 
         if self._mmap_thread_local:
             # Default max: scale with CPU count, cap at 64 to avoid FD blowups.
             cpu = int(process_cpu_count() or 8)
             default_max = max(8, min(64, cpu))
-            self._mmap_thread_local_max = _read_int_env(
+            self._mmap_thread_local_max = env_first_int(
                 ("STNET_MEMMAP_THREAD_LOCAL_MAX", "STNET_MEMMAP_TL_MAX"),
-                default_max,
+                default=default_max,
             )
             self._mmap_thread_local_max = int(self._mmap_thread_local_max)
         self._memmap_features = self._features
@@ -311,45 +310,11 @@ class Sampler(_Sampler):
         self._S_B = 1
         self._S_shuffle = True
         self._S_seed = 0
-        self._S_rng = random.Random(0)
-        self._S_cuts: list[int] = []
+        self._S_epoch = 0
         self._num_shards = 1
         self._shard_id = 0
         self._key = ""
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
-        self._perm: Optional[torch.Tensor] = None
-        self._perm_source: Optional[Literal["runtime", "metadata"]] = None
-        perm_fn = (self._meta or {}).get("perm_filename", None)
-        if perm_fn:
-            perm_path = os.path.join(self.dir, str(perm_fn))
-            if os.path.isfile(perm_path):
-                with suppress(Exception):
-                    self._perm = torch.load(perm_path, map_location="cpu")
-                    meta_shuffled = bool((self._meta or {}).get("shuffled", False))
-                    self._perm_source = "runtime" if not meta_shuffled else "metadata"
-        if self._perm is not None:
-            try:
-                if int(self._perm.numel()) != self._N:
-                    with suppress(Exception):
-                        import warnings as _warn
-
-                        _warn.warn(
-                            f"[stnet] ignoring invalid perm: length={int(self._perm.numel())}, expected N={self._N}"
-                        )
-                    self._perm = None
-                    self._perm_source = None
-                else:
-                    if self._perm.dtype != torch.long:
-                        with suppress(Exception):
-                            self._perm = self._perm.to(dtype=torch.long)
-                    if getattr(self._perm, "device", torch.device("cpu")).type != "cpu":
-                        with suppress(Exception):
-                            self._perm = self._perm.cpu()
-            except Exception:
-                self._perm = None
-                self._perm_source = None
-        if self._perm is None:
-            self._perm_source = None
         train_start = int(self._meta.get("train_start", 0))
         train_end = int(self._meta.get("train_end", self._N))
         val_start = int(self._meta.get("val_start", 0))
@@ -560,38 +525,9 @@ class Sampler(_Sampler):
         start = int(start)
         end = int(end)
         features, labels = self._get_mmaps()
-
-        if self._perm_source == "runtime" and getattr(self, "_perm", None) is not None:
-            idx = self._perm[start:end]
-            row_ids: torch.Tensor
-            row_ids = (
-                idx.to(dtype=torch.int64, copy=False)
-                if torch.is_tensor(idx)
-                else torch.as_tensor(idx, dtype=torch.int64)
-            )
-            x = features[:0]
-            y = labels[:0]
-            if row_ids.numel():
-                try:
-                    x = features.index_select(0, row_ids)
-                except Exception:
-                    x = (
-                        features[row_ids]
-                        if hasattr(features, "__getitem__")
-                        else torch.as_tensor(features)[row_ids]
-                    )
-                try:
-                    y = labels.index_select(0, row_ids)
-                except Exception:
-                    y = (
-                        labels[row_ids]
-                        if hasattr(labels, "__getitem__")
-                        else torch.as_tensor(labels)[row_ids]
-                    )
-        else:
-            row_ids = torch.arange(start, end, dtype=torch.int64)
-            x = features[start:end]
-            y = labels[start:end]
+        row_ids = torch.arange(start, end, dtype=torch.int64)
+        x = features[start:end]
+        y = labels[start:end]
         if self._label_shape:
             y = y.reshape(end - start, *self._label_shape)
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
@@ -611,11 +547,6 @@ class Sampler(_Sampler):
             if len(idx) == 0:
                 return self._slice(0, 0)
             idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
-            if (
-                self._perm_source == "runtime"
-                and getattr(self, "_perm", None) is not None
-            ):
-                idx_tensor = self._perm.index_select(0, idx_tensor)
             try:
                 x = features.index_select(0, idx_tensor)
             except Exception:
@@ -653,38 +584,30 @@ class Sampler(_Sampler):
             return out
 
     def _shard(self) -> None:
-        start = int(getattr(self, "start", 0))
-        end = int(getattr(self, "end", 0))
-        B = max(1, int(self._S_B))
-        cuts = list(range(start, end + 1, B))
-        if cuts and cuts[-1] != end:
-            cuts.append(end)
-        elif not cuts:
-            cuts = [start, end]
-        self._S_cuts = cuts
         try:
             dist = getattr(torch, "distributed", None)
             if dist is not None and dist.is_available() and dist.is_initialized():
                 self._num_shards = max(1, int(dist.get_world_size()))
                 self._shard_id = max(0, int(dist.get_rank()))
-            else:
-                env_world = os.environ.get("WORLD_SIZE")
-                env_rank = os.environ.get("RANK")
-                try:
-                    env_world_int = int(env_world) if env_world is not None else 1
-                except Exception:
-                    env_world_int = 1
-                try:
-                    env_rank_int = int(env_rank) if env_rank is not None else 0
-                except Exception:
-                    env_rank_int = 0
-                if env_world_int > 1:
-                    self._num_shards = env_world_int
-                    self._shard_id = max(0, min(env_world_int - 1, env_rank_int))
-                else:
-                    self._num_shards = 1
-                    self._shard_id = 0
+                return
         except Exception:
+            pass
+
+        env_world = os.environ.get("WORLD_SIZE")
+        env_rank = os.environ.get("RANK")
+        try:
+            world = int(env_world) if env_world is not None else 1
+        except Exception:
+            world = 1
+        try:
+            rank = int(env_rank) if env_rank is not None else 0
+        except Exception:
+            rank = 0
+
+        if world > 1:
+            self._num_shards = max(1, int(world))
+            self._shard_id = max(0, min(int(world) - 1, int(rank)))
+        else:
             self._num_shards = 1
             self._shard_id = 0
 
@@ -698,10 +621,11 @@ class Sampler(_Sampler):
         **kwargs: Any,
     ) -> "BaseNode":
 
+        # Base batch size is stored in _S_B_base via the legacy _S_B setter.
         self._S_B = max(1, int(batch_size))
         self._S_shuffle = bool(shuffle)
         self._S_seed = int(seed)
-        self._S_rng = random.Random(self._S_seed)
+        self._S_epoch = 0
         self._key = str(key)
         self._shard()
         if SamplerWrapper is None:
@@ -709,43 +633,64 @@ class Sampler(_Sampler):
         return SamplerWrapper(self)
 
     def __iter__(self) -> Iterator[tuple[str, tuple[int, int]]]:
-        cuts = getattr(self, "_S_cuts", None)
-        if not cuts:
-            self._shard()
-            cuts = self._S_cuts
-        n = max(0, len(cuts) - 1)
-        idxs = list(range(n))
-        if self._S_shuffle:
-            try:
-                self._S_rng.shuffle(idxs)
-            except Exception:
-                pass
-        ns = getattr(self, "_num_shards", 1)
-        si = getattr(self, "_shard_id", 0)
+        start = int(getattr(self, "start", 0))
+        end = int(getattr(self, "end", 0))
+        if end <= start:
+            return
+
+        # Refresh distributed sharding each epoch/iteration.
+        self._shard()
+        ns = int(getattr(self, "_num_shards", 1) or 1)
+        si = int(getattr(self, "_shard_id", 0) or 0)
+
+        base = int(self.base_batch_size)
+        max_scale = 2.0
+        with suppress(Exception):
+            max_scale = float(getattr(self._sampler_scale, "_max_scale", 2.0))
+        block = max(1, int(math.ceil(float(base) * float(max_scale))))
+        with suppress(Exception):
+            cap = int(getattr(self, "_S_B_cap", 0) or 0)
+            if cap > 0:
+                block = min(int(block), int(cap))
+
+        total = int(end - start)
+        n_blocks = max(1, int((total + block - 1) // block))
+
+        if bool(getattr(self, "_S_shuffle", True)):
+            g = torch.Generator(device="cpu")
+            g.manual_seed(int(getattr(self, "_S_seed", 0)) + int(getattr(self, "_S_epoch", 0)))
+            order = torch.randperm(n_blocks, generator=g, dtype=torch.int64)
+        else:
+            order = torch.arange(n_blocks, dtype=torch.int64)
+
         if ns > 1:
-            idxs = idxs[si::ns]
-        for i in idxs:
-            s = cuts[i]
-            e = cuts[i + 1]
-            if e > s:
-                yield (self._key, (int(s), int(e)))
+            order = order[si::ns]
+
+        for b in order.tolist():
+            bs = start + int(b) * int(block)
+            be = min(end, bs + int(block))
+            cur = int(bs)
+            while cur < int(be):
+                B = int(self._effective_batch_size())
+                nxt = min(int(be), cur + max(1, int(B)))
+                if nxt <= cur:
+                    break
+                yield (self._key, (int(cur), int(nxt)))
+                cur = int(nxt)
 
     def __len__(self) -> int:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
-        B = max(1, int(self._S_B))
+        B = max(1, int(self._effective_batch_size()))
         total = max(0, (end - start + B - 1) // B)
-        ns = getattr(self, "_num_shards", 1)
-        si = getattr(self, "_shard_id", 0)
+        ns = int(getattr(self, "_num_shards", 1) or 1)
+        si = int(getattr(self, "_shard_id", 0) or 0)
         if ns <= 1:
-            return total
-        return max(0, (total - si + ns - 1) // ns)
+            return int(total)
+        return max(0, (int(total) - si + ns - 1) // ns)
 
     def set_epoch(self, epoch: int) -> None:
-        try:
-            self._S_rng.seed(self._S_seed + int(epoch))
-        except Exception:
-            pass
+        self._S_epoch = int(epoch)
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
         from ..model.fused import Gradient as FxGradient
@@ -770,343 +715,64 @@ class Sampler(_Sampler):
                 pass
             return False
 
-        with FxGradient.inference(torch.nn.Module()):
-            if n <= 0:
-                X = features.narrow(0, 0, 0)
-                Y = labels.narrow(0, 0, 0)
+            with FxGradient.inference(torch.nn.Module()):
+                if n <= 0:
+                    X = features.narrow(0, 0, 0)
+                    Y = labels.narrow(0, 0, 0)
+                    return {"X": X, "Y": Y}
+                X = features.narrow(0, s, n)
+                Y = labels.narrow(0, s, n)
+                if self._label_shape:
+                    Y = Y.reshape(n, *self._label_shape)
+                pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
+                if pin_in_dataset and _is_accelerator_available():
+                    with suppress(Exception):
+                        X = X.pin_memory()
+                        Y = Y.pin_memory()
                 return {"X": X, "Y": Y}
-            X = features.narrow(0, s, n)
-            Y = labels.narrow(0, s, n)
-            if self._label_shape:
-                Y = Y.view(n, *self._label_shape)
-            pin_in_dataset = os.environ.get("STNET_PIN_IN_DATASET", "0") == "1"
-            if pin_in_dataset and _is_accelerator_available():
-                with suppress(Exception):
-                    X = X.pin_memory()
-                    Y = Y.pin_memory()
-            return {"X": X, "Y": Y}
-
-
-def _to_high_precision(value: Any) -> torch.Tensor:
-    """Convert arbitrary array-like input to a tensor suitable for scale analysis.
-
-    - floating inputs are promoted to FP64
-    - small integers are promoted to INT64
-
-    This function is used only for *analysis*/memmap writing; runtime will later cast
-    per PrecisionPolicy.
-    """
-    tensor = value if isinstance(value, torch.Tensor) else torch.as_tensor(value)
-    if tensor.is_floating_point():
-        return tensor.to(dtype=torch.float64)
-    if tensor.dtype in {torch.uint8, torch.int8, torch.int16, torch.int32}:
-        return tensor.to(dtype=torch.int64)
-    return tensor
-
-
 def preload_memmap(
     data: Mapping[str, Any],
-    *args: Any,
+    *,
     memmap_dir: str,
-    train_frac: float = 1.0,
+    train_frac: float = 0.0,
     val_frac: float = 0.0,
     shuffle: bool = False,
     seed: int | None = None,
     **kwargs: Any,
 ) -> None:
-    if not isinstance(data, Mapping):
-        raise TypeError("preload_memmap expects a Mapping with 'features' and 'labels'")
-    if "features" not in data or "labels" not in data:
-        raise ValueError("preload_memmap expects 'features' and 'labels'")
+    """Create a memory-mapped dataset on disk.
 
-    if MemoryMappedTensor is None:
-        raise ImportError("preload_memmap requires tensordict (MemoryMappedTensor)")
+    This function is kept for backwards compatibility but the implementation is
+    centralized in :class:`stnet.data.collections.LazyTensor`.
 
-    # Avoid circular imports: pipeline imports nodes; nodes must not import pipeline at module import time.
-    from .pipeline import Dataset, default_underflow_action, normalize_underflow_action
-
-    os.makedirs(memmap_dir, exist_ok=True)
-
-    features_path = os.path.join(memmap_dir, "features.mmt")
-    labels_path = os.path.join(memmap_dir, "labels.mmt")
-
-    if MemoryMappedTensor is None:
-        raise ImportError("preload_memmap requires tensordict (MemoryMappedTensor)")
-
-    # ---- streaming options
-    underflow_action = normalize_underflow_action(
-        kwargs.pop("underflow_action", None),
-        default=default_underflow_action(),
-    )
-
+    Notes:
+      - `shuffle=True` performs *physical* shuffle at write time (no perm file).
+      - `train_frac` is currently metadata-only; the split is driven by `val_frac`.
+    """
+    # Preserve old kwargs but route into the unified implementation.
     chunk_size = int(kwargs.pop("chunk_size", 4096) or 4096)
-    chunk_size = max(1, chunk_size)
     with suppress(Exception):
-        env_cs = int(os.environ.get("STNET_MEMMAP_CHUNK_SIZE", "") or 0)
+        env_cs = int(env_first_int(("STNET_MEMMAP_CHUNK_SIZE",), default=0) or 0)
         if env_cs > 0:
-            chunk_size = max(1, env_cs)
+            chunk_size = max(1, int(env_cs))
 
-    raw_X = data["features"]
-    raw_Y = data["labels"]
+    underflow_action = kwargs.pop("underflow_action", None)
+    allow_missing_labels = bool(kwargs.pop("allow_missing_labels", False))
+    default_label_shape = kwargs.pop("default_label_shape", None)
 
-    def _len0(obj: Any) -> int:
-        if isinstance(obj, torch.Tensor):
-            return int(obj.shape[0]) if getattr(obj, "ndim", 0) > 0 else 1
-        try:
-            return int(len(obj))  # type: ignore[arg-type]
-        except Exception:
-            t = torch.as_tensor(obj)
-            return int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
-
-    def _slice(obj: Any, s: int, e: int) -> Any:
-        if isinstance(obj, torch.Tensor):
-            return obj[s:e]
-        try:
-            return obj[s:e]  # type: ignore[index]
-        except Exception:
-            return [obj[i] for i in range(int(s), int(e))]  # type: ignore[index]
-
-    def _gather(obj: Any, idx: torch.Tensor) -> Any:
-        if isinstance(obj, torch.Tensor):
-            return obj.index_select(0, idx)
-        ii = idx.detach().cpu().tolist()
-        return [obj[i] for i in ii]  # type: ignore[index]
-
-    count = _len0(raw_X)
-    if count <= 0:
-        raise ValueError("cannot create memmap with zero samples")
-    if _len0(raw_Y) != int(count):
-        raise ValueError("features and labels must have the same length")
-
-    chunk = min(int(count), int(chunk_size))
-
-    # ---- pass 1: infer dims + scale stats without materializing full high-precision arrays
-    stats: Dict[str, Any] = {
-        "has_scale": False,
-        "has_nonfinite": False,
-        "scale_max_abs": None,
-        "scale_min_value": None,
-        "scale_max_value": None,
-        "scale_min_positive": None,
-        "scale_is_integral": None,
-    }
-    feature_dim: Optional[int] = None
-    label_shape: Optional[Tuple[int, ...]] = None
-    label_dim: Optional[int] = None
-
-    feat_kind: Optional[str] = None  # "float"|"int"|"bool"
-    lab_kind: Optional[str] = None
-
-    for s in range(0, int(count), int(chunk)):
-        e = min(int(count), int(s) + int(chunk))
-        fx = _to_high_precision(_slice(raw_X, s, e)).detach()
-        lb = _to_high_precision(_slice(raw_Y, s, e)).detach()
-
-        if fx.device.type != "cpu":
-            fx = fx.cpu()
-        if lb.device.type != "cpu":
-            lb = lb.cpu()
-        if not fx.is_contiguous():
-            fx = fx.contiguous()
-        if not lb.is_contiguous():
-            lb = lb.contiguous()
-
-        n = int(fx.shape[0]) if getattr(fx, "ndim", 0) > 0 else 1
-        if n <= 0:
-            continue
-
-        fx_flat = fx.reshape(n, -1)
-        lb_flat = lb.reshape(n, -1)
-
-        cur_fdim = int(fx_flat.shape[1])
-        cur_lshape = tuple(lb.shape[1:])
-        cur_ldim = int(lb_flat.shape[1])
-
-        if feature_dim is None:
-            feature_dim = cur_fdim
-        elif cur_fdim != int(feature_dim):
-            raise ValueError(f"feature dim mismatch: {feature_dim} vs {cur_fdim}")
-
-        if label_shape is None:
-            label_shape = cur_lshape
-            label_dim = cur_ldim
-        else:
-            if tuple(label_shape) != tuple(cur_lshape):
-                raise ValueError(f"label shape mismatch: {label_shape} vs {cur_lshape}")
-            if label_dim is not None and cur_ldim != int(label_dim):
-                raise ValueError(f"label flat-dim mismatch: {label_dim} vs {cur_ldim}")
-
-        fk = "float" if fx_flat.is_floating_point() else ("bool" if fx_flat.dtype == torch.bool else "int")
-        lk = "float" if lb_flat.is_floating_point() else ("bool" if lb_flat.dtype == torch.bool else "int")
-
-        feat_kind = fk if feat_kind is None else feat_kind
-        lab_kind = lk if lab_kind is None else lab_kind
-        if feat_kind != fk:
-            raise ValueError(f"feature dtype kind mismatch: {feat_kind} vs {fk}")
-        if lab_kind != lk:
-            raise ValueError(f"label dtype kind mismatch: {lab_kind} vs {lk}")
-
-        f_stats = Dataset.tensor_scale_stats(fx_flat)
-        l_stats = Dataset.tensor_scale_stats(lb_flat)
-        stats = Dataset.merge_scale_stats(stats, Dataset.merge_scale_stats(f_stats, l_stats))
-
-    if feature_dim is None or label_shape is None or label_dim is None:
-        raise RuntimeError("Failed to infer feature/label shapes from data")
-
-    # ---- decide float storage dtype (float32 if negotiable, else float64; allow override)
-    stats["underflow_action"] = str(underflow_action)
-    negotiable = Dataset.is_fp32_castable(stats, underflow_action=underflow_action, safety_margin=1.0)
-
-    req = str(os.environ.get("STNET_MEMMAP_FLOAT_DTYPE", "") or "").strip()
-    req = req.split(".", 1)[1] if req.startswith("torch.") else req
-    req_dtype = getattr(torch, req, None) if req else None
-    if not isinstance(req_dtype, torch.dtype):
-        req_dtype = torch.float32
-    try:
-        if not torch.is_floating_point(torch.empty((), dtype=req_dtype)):
-            req_dtype = torch.float32
-    except Exception:
-        req_dtype = torch.float32
-
-    store_float = torch.float32 if (bool(negotiable) and req_dtype != torch.float64) else torch.float64
-
-    feat_store = store_float if feat_kind == "float" else (torch.bool if feat_kind == "bool" else torch.int64)
-    lab_store = store_float if lab_kind == "float" else (torch.bool if lab_kind == "bool" else torch.int64)
-
-    features_dtype = to_platform_dtype(feat_store, "name")
-    labels_dtype = to_platform_dtype(lab_store, "name")
-
-    # ---- shuffle handling
-    perm: torch.Tensor | None = None
-    shuffle_mode = "none"
-    if shuffle:
-        generator = torch.Generator(device="cpu")
-        if seed is not None:
-            with suppress(Exception):
-                generator.manual_seed(int(seed))
-        perm = torch.randperm(int(count), generator=generator)
-        perm_path = os.path.join(memmap_dir, "perm.pt")
-        with suppress(Exception):
-            torch.save(perm, perm_path)
-        if os.path.isfile(perm_path):
-            shuffle_mode = "perm"
-            # Not needed for writing in perm mode; free memory for very large datasets.
-            perm = None
-        else:
-            shuffle_mode = "physical"
-
-    features_path = os.path.join(memmap_dir, "features.mmt")
-    labels_path = os.path.join(memmap_dir, "labels.mmt")
-
-    X_mmt = MemoryMappedTensor.empty(
-        (int(count), int(feature_dim)),
-        dtype=feat_store,
-        filename=features_path,
-        existsok=True,
+    # Any unexpected kwargs are ignored for compatibility.
+    LazyTensor.preload_memmap(
+        data,
+        memmap_dir=os.fspath(memmap_dir),
+        val_frac=float(val_frac),
+        shuffle=bool(shuffle),
+        seed=int(seed) if seed is not None else None,
+        underflow_action=underflow_action,
+        chunk_size=int(chunk_size),
+        allow_missing_labels=bool(allow_missing_labels),
+        default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
     )
-    Y_mmt = MemoryMappedTensor.empty(
-        (int(count), int(label_dim)),
-        dtype=lab_store,
-        filename=labels_path,
-        existsok=True,
-    )
-
-    # ---- pass 2: write chunks
-    written = 0
-    for s in range(0, int(count), int(chunk)):
-        e = min(int(count), int(s) + int(chunk))
-
-        if shuffle_mode == "physical":
-            if perm is None:
-                raise RuntimeError(
-                    "Internal error: shuffle permutation missing in physical shuffle mode"
-                )
-            idx = perm[s:e]
-            fx_src = _gather(raw_X, idx)
-            lb_src = _gather(raw_Y, idx)
-        else:
-            fx_src = _slice(raw_X, s, e)
-            lb_src = _slice(raw_Y, s, e)
-
-        fx = _to_high_precision(fx_src).detach()
-        lb = _to_high_precision(lb_src).detach()
-
-        if fx.device.type != "cpu":
-            fx = fx.cpu()
-        if lb.device.type != "cpu":
-            lb = lb.cpu()
-        if not fx.is_contiguous():
-            fx = fx.contiguous()
-        if not lb.is_contiguous():
-            lb = lb.contiguous()
-
-        n = int(fx.shape[0]) if getattr(fx, "ndim", 0) > 0 else 1
-        if n <= 0:
-            continue
-        if n != int(e - s):
-            raise RuntimeError(f"unexpected chunk length: got {n}, expected {int(e - s)}")
-
-        fx_flat = fx.reshape(n, -1)
-        lb_flat = lb.reshape(n, -1)
-
-        if int(fx_flat.shape[1]) != int(feature_dim):
-            raise RuntimeError(f"feature dim mismatch while writing: {feature_dim} vs {int(fx_flat.shape[1])}")
-        if int(lb_flat.shape[1]) != int(label_dim):
-            raise RuntimeError(f"label dim mismatch while writing: {label_dim} vs {int(lb_flat.shape[1])}")
-
-        if fx_flat.dtype != feat_store:
-            fx_flat = fx_flat.to(dtype=feat_store)
-        if lb_flat.dtype != lab_store:
-            lb_flat = lb_flat.to(dtype=lab_store)
-
-        X_mmt[s : s + n].copy_(fx_flat)
-        Y_mmt[s : s + n].copy_(lb_flat)
-        written += n
-
-    if written != int(count):
-        raise RuntimeError(f"memmap written={written}, expected={int(count)}")
-
-    # ---- split metadata
-    val_count = max(0, min(int(count), int(round(int(count) * float(val_frac)))))
-    train_count = max(0, min(int(count), int(count) - val_count))
-    train_start, train_end = 0, train_count
-    val_start, val_end = train_end, train_end + val_count
-
-    meta: Dict[str, Any] = {
-        "N": int(count),
-        "feature_dim": int(feature_dim),
-        "features_path": "features.mmt",
-        "labels_path": "labels.mmt",
-        "label_shape": list(label_shape),
-        "features_dtype": features_dtype,
-        "labels_dtype": labels_dtype,
-        "fractions": [float(train_frac), float(val_frac)],
-        "shuffled": bool(shuffle_mode == "physical"),
-        "shuffle_seed": int(seed) if seed is not None else None,
-        "shuffle_mode": str(shuffle_mode),
-        "train_start": int(train_start),
-        "train_end": int(train_end),
-        "val_start": int(val_start),
-        "val_end": int(val_end),
-
-        # Scale negotiation metadata
-        "has_scale": bool(stats.get("has_scale")),
-        "has_nonfinite": bool(stats.get("has_nonfinite")),
-        "scale_max_abs": stats.get("scale_max_abs"),
-        "scale_min_value": stats.get("scale_min_value"),
-        "scale_max_value": stats.get("scale_max_value"),
-        "scale_min_positive": stats.get("scale_min_positive"),
-        "scale_is_integral": stats.get("scale_is_integral"),
-        "is_negotiable": bool(negotiable),
-        "underflow_action": str(underflow_action),
-    }
-
-    if shuffle_mode == "perm" and os.path.isfile(os.path.join(memmap_dir, "perm.pt")):
-        meta["perm_filename"] = "perm.pt"
-
-    with open(os.path.join(memmap_dir, "meta.json"), "w", encoding="utf-8") as handle:
-        json.dump(meta, handle)
-
+    return None
 
 SourceType = Literal["memmap"]
 
@@ -1180,6 +846,71 @@ class Wrapper:
         self.stop_criteria = str(stop_criteria)
         self.weights = dict(weights) if isinstance(weights, Mapping) else None
         self.seed = int(seed)
+        self._epoch = 0
+        # Holds a reference to the composed MultiNodeWeightedSampler (if used).
+        # This allows set_epoch() to update the sampler's epoch/seed.
+        self._node: Optional[Any] = None
+        self._source_keys: list[str] = []
+
+    def set_epoch(self, epoch: int) -> None:
+        """Per-epoch reseed for multi-source mixing.
+
+        torchdata.nodes.MultiNodeWeightedSampler stores an epoch counter in its state dict
+        (EPOCH_KEY), and uses it (together with the base seed) to initialize its RNG.
+        To reliably change the mixing order each epoch, we set EPOCH_KEY and clear the
+        cached weighted-sampler RNG state, while resetting bookkeeping/exhaustion flags.
+
+        Stability notes:
+        - Avoid mutating an arbitrary existing state dict (can contain stale child-node states
+          and can vary across torchdata versions).
+        - Prefer reset(initial_state) with a minimal, consistent state dict built from the
+          node's documented state keys.
+        """
+
+        self._epoch = int(epoch)
+        node = getattr(self, "_node", None)
+        if node is None:
+            return
+
+        reset = getattr(node, "reset", None)
+        if not callable(reset):
+            return
+
+        def _key(attr: str, fallback: str) -> str:
+            k = getattr(node, attr, None) or getattr(type(node), attr, None)
+            return k if isinstance(k, str) else fallback
+
+        # State keys (prefer node's constants; fall back to common names).
+        epoch_key = _key("EPOCH_KEY", "epoch")
+        ws_key = _key("WEIGHTED_SAMPLER_STATE_KEY", "weighted_sampler_state")
+        ny_key = _key("NUM_YIELDED_KEY", "num_yielded")
+        ex_key = _key("DATASETS_EXHAUSTED_KEY", "datasets_exhausted")
+        dns_key = _key("DATASET_NODE_STATES_KEY", "dataset_node_states")
+
+        keys = list(getattr(self, "_source_keys", []) or [])
+        initial_state: Dict[str, Any] = {
+            epoch_key: int(self._epoch),
+            ny_key: 0,
+            ws_key: None,
+        }
+        if keys:
+            # Child nodes: pass None so each source resets cleanly, and per-dataset epoch hooks
+            # can apply independently.
+            initial_state[ex_key] = {k: False for k in keys}
+            initial_state[dns_key] = {k: None for k in keys}
+
+        try:
+            reset(initial_state)
+            return
+        except Exception:
+            pass
+
+        # Fallback: perturb seed and reset to start. This keeps training running even if
+        # torchdata internals differ, while still varying the RNG each epoch.
+        with suppress(Exception):
+            setattr(node, "seed", int(self.seed) + int(self._epoch))
+        with suppress(Exception):
+            reset(None)
 
     def compose(
         self,
@@ -1204,9 +935,15 @@ class Wrapper:
                 "torchdata.nodes.MultiNodeWeightedSampler is required for multi-source mixing"
             )
         w = self.weights or {k: 1.0 for k in sources_map}
-        return MultiNodeWeightedSampler(
-            sources_map, w, stop_criteria=self.stop_criteria
+        self._source_keys = list(sources_map.keys())
+        node = MultiNodeWeightedSampler(
+            sources_map,
+            w,
+            stop_criteria=self.stop_criteria,
+            seed=int(self.seed),
         )
+        self._node = node
+        return node
 
 
 class Connector:

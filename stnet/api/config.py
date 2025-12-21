@@ -366,6 +366,8 @@ class RuntimeConfig:
     warmup_ratio: float = 0.0
     eta_min: float = 0.0
     seed: int = 42
+    shuffle: bool = True
+    deterministic: bool = False
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
@@ -426,6 +428,8 @@ class RuntimeConfig:
                 "warmup_ratio",
                 "eta_min",
                 "seed",
+                "shuffle",
+                "deterministic",
                 "loss_tile_dim",
                 "loss_tile_size",
                 "loss_mask_mode",
@@ -465,6 +469,8 @@ class RuntimeConfig:
                 warmup_ratio=float(kwargs.get("warmup_ratio", 0.0)),
                 eta_min=float(kwargs.get("eta_min", 0.0)),
                 seed=int(kwargs.get("seed", 42)),
+                shuffle=bool(kwargs.get("shuffle", True)),
+                deterministic=bool(kwargs.get("deterministic", False)),
                 loss_tile_dim=kwargs.get("loss_tile_dim"),
                 loss_tile_size=kwargs.get("loss_tile_size"),
                 loss_mask_mode=str(kwargs.get("loss_mask_mode", "none")),

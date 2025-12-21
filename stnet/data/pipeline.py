@@ -37,6 +37,7 @@ except Exception:
 
 from ..backend.system import Memory, WorkerPolicy, get_tlb
 from ..backend.compat import ensure_torchdata, MIN_TORCHDATA_VERSION
+from .datatype import env_first
 
 
 _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
@@ -49,7 +50,7 @@ def default_underflow_action() -> str:
     - warn: allowed but may be logged
     - forbid: treat underflow as unsafe for downcasting
     """
-    raw = str(os.environ.get('STNET_DATA_UNDERFLOW_ACTION') or os.environ.get('STNET_UNDERFLOW_ACTION') or 'warn').strip().lower()
+    raw = str(env_first(('STNET_DATA_UNDERFLOW_ACTION','STNET_UNDERFLOW_ACTION'), default='warn') or 'warn').strip().lower()
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else 'warn'
 
 
@@ -825,7 +826,7 @@ def _process(
         and isinstance(features, torch.Tensor)
         and (features.dim() >= 2)
     ):
-        features = features.view(features.shape[0], -1)
+        features = features.reshape(features.shape[0], -1)
     if labels_dtype is not None and isinstance(labels, torch.Tensor):
         labels = labels.to(dtype=labels_dtype, non_blocking=True, copy=False)
     if sanitize and torch.is_floating_point(labels):
@@ -932,6 +933,8 @@ def compose(
     io_workers: int,
     prebatch: int,
     weights: Optional[Mapping[str, float]] = None,
+    seed: int = 0,
+    epochables: Optional[list[Any]] = None,
     **kwargs: Any,
 ) -> Tuple[BaseNode, BaseNode, BaseNode]:
     _require_nodes()
@@ -945,8 +948,13 @@ def compose(
     mx_weights = None
     if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping):
         mx_weights = weights
-    sampler = Wrapper(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=0, weights=mx_weights)
+    sampler = Wrapper(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=mx_weights)
     source = sampler.compose(node_or_nodes)
+    # If multi-source mixing is active, register the Wrapper for per-epoch reseeding.
+    if epochables is not None and getattr(sampler, "_node", None) is not None:
+        with suppress(Exception):
+            # Put it first so it runs before per-dataset epoch hooks.
+            epochables.insert(0, sampler)
     mapper = Connector(
         map_fn=map_fn,
         io_workers=io_workers,
@@ -971,6 +979,8 @@ def fetch(
     labels_dtype: Optional[torch.dtype] = None,
     sanitize: bool = True,
     flatten_features: bool = True,
+    train_shuffle: bool = True,
+    seed: int = 0,
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
     worker_policy: Optional[WorkerPolicy] = None,
@@ -997,6 +1007,10 @@ def fetch(
     allocated = Disposable()
     batch_size: Optional[int] = None
     scale_ctl = sampler_scale if sampler_scale is not None else SamplerScale()
+    # Objects that support per-epoch reseeding via .set_epoch(epoch).
+    # We attach these to the training loader so the runtime can call set_epoch()
+    # at the start of every epoch (mirrors DistributedSampler behavior).
+    train_epochables: list[Any] = []
 
     def _stream_batch(_ds: Sampler, _dev: torch.device) -> Tuple[int, float]:
         try:
@@ -1082,6 +1096,7 @@ def fetch(
         for key, spec in sources.items():
             ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
             allocated.add(ds)
+            train_epochables.append(ds)
             datasets[str(key)] = ds
         if batch_size is None or int(batch_size) <= 0:
             for _k, _ds in datasets.items():
@@ -1102,18 +1117,18 @@ def fetch(
                     batch_size = _rescale_batch(datasets, int(batch_size))
             else:
                 batch_size = 1
-        sampler_nodes: Dict[str, BaseNode] = {}
-        lengths: Dict[str, int] = {}
-        for key, ds in datasets.items():
-            sampler_node = ds.compose(
-                batch_size=int(batch_size),
-                shuffle=True,
-                seed=0,
-                key=str(key),
-            )
-            if len(ds) > 0:
-                sampler_nodes[str(key)] = sampler_node
-                lengths[str(key)] = len(ds)
+            sampler_nodes: Dict[str, BaseNode] = {}
+            lengths: Dict[str, int] = {}
+            for key, ds in datasets.items():
+                sampler_node = ds.compose(
+                    batch_size=int(batch_size),
+                    shuffle=bool(train_shuffle),
+                    seed=int(seed),
+                    key=str(key),
+                )
+                if len(ds) > 0:
+                    sampler_nodes[str(key)] = sampler_node
+                    lengths[str(key)] = len(ds)
 
         if isinstance(train_weights, Mapping):
             train_weights = {
@@ -1152,6 +1167,8 @@ def fetch(
             io_workers=io_workers,
             prebatch=prebatch,
             weights=train_weights,
+            seed=int(seed),
+            epochables=train_epochables,
         )
         train_length = sum(lengths.values()) if lengths else None
 
@@ -1161,6 +1178,7 @@ def fetch(
             key = str(i)
             ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
             allocated.add(ds)
+            train_epochables.append(ds)
             datasets[key] = ds
         if batch_size is None or int(batch_size) <= 0:
             for _k, _ds in datasets.items():
@@ -1186,8 +1204,8 @@ def fetch(
         for key, ds in datasets.items():
             sampler_node = ds.compose(
                 batch_size=int(batch_size),
-                shuffle=True,
-                seed=0,
+                shuffle=bool(train_shuffle),
+                seed=int(seed),
                 key=str(key),
             )
             if len(ds) > 0:
@@ -1226,11 +1244,14 @@ def fetch(
             io_workers=io_workers,
             prebatch=prebatch,
             weights=train_weights,
+            seed=int(seed),
+            epochables=train_epochables,
         )
         train_length = sum(lengths) if lengths else None
     else:
         ds = dataset(sources, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
         allocated.add(ds)
+        train_epochables.append(ds)
         if batch_size is None or int(batch_size) <= 0:
             B_i, ms_i = _stream_batch(ds, _device_obj)
             batch_size = max(1, int(B_i) if B_i > 0 else 1)
@@ -1241,8 +1262,8 @@ def fetch(
                 )
         sampler_node = ds.compose(
             batch_size=int(batch_size),
-            shuffle=True,
-            seed=0,
+            shuffle=bool(train_shuffle),
+            seed=int(seed),
             key="0",
         )
         datasets: Dict[str, Any] = {"0": ds}
@@ -1276,6 +1297,7 @@ def fetch(
             io_workers=io_workers,
             prebatch=prebatch,
             weights=train_weights,
+            seed=int(seed),
         )
         train_length = len(ds)
 
@@ -1320,7 +1342,7 @@ def fetch(
                 sn = ds.compose(
                     batch_size=int(batch_size),
                     shuffle=False,
-                    seed=0,
+                    seed=int(seed),
                     key=str(key),
                 )
                 if len(ds) > 0:
@@ -1363,6 +1385,7 @@ def fetch(
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
+                seed=int(seed),
             )
             val_loader = Loader.compose(
                 mapped_val,
@@ -1404,7 +1427,7 @@ def fetch(
                 sn = ds.compose(
                     batch_size=int(batch_size),
                     shuffle=False,
-                    seed=0,
+                    seed=int(seed),
                     key=str(k),
                 )
                 if len(ds) > 0:
@@ -1442,6 +1465,7 @@ def fetch(
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
+                seed=int(seed),
             )
             val_loader = Loader.compose(
                 mapped_val,
@@ -1466,7 +1490,7 @@ def fetch(
             sampler_node = ds.compose(
                 batch_size=int(batch_size),
                 shuffle=False,
-                seed=0,
+                seed=int(seed),
                 key="0",
             )
             datasets: Dict[str, Any] = {"0": ds}
@@ -1500,6 +1524,7 @@ def fetch(
                 io_workers=io_workers,
                 prebatch=prebatch,
                 weights=val_weights,
+                seed=int(seed),
             )
             val_loader = Loader.compose(
                 mapped_val,
@@ -1512,6 +1537,7 @@ def fetch(
     with contextlib.suppress(Exception):
         if train_loader is not None:
             setattr(train_loader, "_stnet_sampler_scale", scale_ctl)
+            setattr(train_loader, "_stnet_epochables", list(train_epochables))
         if val_loader is not None:
             setattr(val_loader, "_stnet_sampler_scale", scale_ctl)
 
@@ -1533,6 +1559,8 @@ class Session:
     labels_dtype: Optional[torch.dtype] = None
     sanitize: bool = True
     flatten_features: bool = True
+    train_shuffle: bool = True
+    seed: int = 0
 
     train_weights: Optional[Mapping[str, float]] = None
     val_weights: Optional[Mapping[str, float]] = None
@@ -1577,6 +1605,8 @@ class Session:
             labels_dtype=self.labels_dtype,
             sanitize=bool(self.sanitize),
             flatten_features=bool(self.flatten_features),
+            train_shuffle=bool(self.train_shuffle),
+            seed=int(self.seed),
             train_weights=self.train_weights,
             val_weights=self.val_weights,
             worker_policy=wp,
@@ -1618,6 +1648,15 @@ class Session:
                 setattr(self.training_loader, "_stnet_sampler_scale", self.sampler_scale)
             if self.validation_loader is not None:
                 setattr(self.validation_loader, "_stnet_sampler_scale", self.sampler_scale)
+
+        # Propagate per-epoch epochables (samplers) to the wrapped training loader.
+        # This enables the runtime to call .set_epoch(epoch) at the beginning of each epoch,
+        # ensuring shuffle changes across epochs (mirrors DistributedSampler best practice).
+        with contextlib.suppress(Exception):
+            if self.raw_training_loader is not None and self.training_loader is not None:
+                epochables = getattr(self.raw_training_loader, "_stnet_epochables", None)
+                if epochables is not None:
+                    setattr(self.training_loader, "_stnet_epochables", epochables)
 
         self._opened = True
         return self
@@ -1801,7 +1840,7 @@ class Dataset(Generic[TExtra]):
         if labels is not None:
             labels = _to_tensor(labels, dtype=self.label_float_dtype).contiguous()
             if labels.ndim == 0:
-                labels = labels.view(1, 1)
+                labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
                 labels = labels.reshape(features.shape[0], -1)
             label_shape = tuple(labels.shape[1:])

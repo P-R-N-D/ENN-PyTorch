@@ -850,11 +850,27 @@ class MultiScaleRetentionCompat(nn.Module):
                 mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
                 v = torch.where(mask, torch.zeros_like(v), v)
 
-        states = [prev]
-        for index in range(1, seq_len):
-            prev = lam * prev + v[:, index]
-            states.append(prev)
-        state_tensor = torch.stack(states, dim=1).contiguous()
+        # Vectorized exponential-smoothing recurrence (no Python loop).
+        # state_t = lam * state_{t-1} + v_t, with state_0 = prev.
+        # => state_t / lam^t = prev + sum_{k=1..t} v_k / lam^k
+        calc_dtype = (
+            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        )
+        lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, self.nhead, 1)
+        t = torch.arange(seq_len, device=v.device, dtype=calc_dtype).view(1, seq_len, 1, 1)
+        p = torch.pow(lam_calc, t)  # (1, T, H, 1)
+        # Avoid p underflowing to 0 (which would create inf/NaNs via reciprocal).
+        tiny = torch.finfo(calc_dtype).tiny
+        p = p.clamp_min(tiny)
+        inv_p = torch.reciprocal(p)
+
+        v_scaled = v.to(dtype=calc_dtype) * inv_p
+        v_scaled[:, 0].zero_()  # exclude v_0 (already absorbed into prev)
+        cumsum_scaled = torch.cumsum(v_scaled, dim=1)
+
+        prev_scaled = prev.to(dtype=calc_dtype).unsqueeze(1)
+        state_tensor = p * (prev_scaled + cumsum_scaled)
+        state_tensor = state_tensor.to(dtype=v.dtype).contiguous()
         y = (q * state_tensor).contiguous().view(batch, seq_len, self.d_model)
         y = self.norm(y)
         if self.use_gate and self.g_proj is not None:
