@@ -15,7 +15,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
-from ..backend.system import get_device, optimal_optimizer_params
+from ..backend.system import _log_debug, _log_info, get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 from ..model.fused import Autocast, ModelPolicy, is_scale_safe
 
@@ -71,19 +71,6 @@ def _log_opt_decision_once(
         _LOGGER.debug(msg)
     else:
         _LOGGER.info(msg)
-
-
-def _log_info(logger: Optional[Callable[[str], None]], msg: str) -> None:
-    if logger:
-        logger(msg)
-    else:
-        _LOGGER.info(msg)
-
-
-def _log_debug(logger: Optional[Callable[[str], None]], msg: str) -> None:
-    _LOGGER.debug(msg)
-
-
 class ExponentialMovingAverage:
     def __init__(self, model: nn.Module, decay: float = 0.9999) -> None:
         if not 0.0 < decay < 1.0:

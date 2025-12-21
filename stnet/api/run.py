@@ -39,38 +39,9 @@ from ..backend.system import (
 from ..data.collections import LazyTensor
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..data.nodes import preload_memmap
-from ..model.nn import History, Root
+from ..model.nn import History, Root, resize_scaler_buffer
 from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
-
-
-def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
-    scaler = getattr(model, "scaler", None)
-    if scaler is None:
-        return
-
-    tensor_keys = (
-        "x_mean",
-        "x_std",
-        "y_mean",
-        "y_std",
-        "affine_a",
-        "affine_b",
-        "pw_x",
-        "pw_y",
-    )
-    for name in tensor_keys:
-        key = f"scaler.{name}"
-        if key not in state:
-            continue
-        buf = getattr(scaler, name, None)
-        tensor = state[key]
-        if not isinstance(buf, torch.Tensor) or not isinstance(tensor, torch.Tensor):
-            continue
-        if buf.shape == tensor.shape:
-            continue
-        with contextlib.suppress(Exception):
-            buf.resize_(tensor.shape)
 
 
 def _ensure_seed(seed: Optional[int]) -> Optional[int]:
@@ -85,15 +56,23 @@ def _ensure_seed(seed: Optional[int]) -> Optional[int]:
 def _seed_everything(seed_value: Optional[int]) -> None:
     if seed_value is None:
         return
-    with contextlib.suppress(Exception):
+    try:
         torch.manual_seed(seed_value)
+    except (TypeError, ValueError, RuntimeError):
+        pass
     if torch.cuda.is_available():
-        with contextlib.suppress(Exception):
+        try:
             torch.cuda.manual_seed_all(seed_value)
-    with contextlib.suppress(Exception):
+        except (TypeError, ValueError, RuntimeError):
+            pass
+    try:
         random.seed(seed_value)
-    with contextlib.suppress(Exception):
+    except (TypeError, ValueError):
+        pass
+    try:
         np.random.seed(seed_value)
+    except (TypeError, ValueError):
+        pass
 
 
 def train(
@@ -389,7 +368,7 @@ def train(
         if os.path.isfile(fallback):
             cpu_state = torch.load(fallback, map_location="cpu")
             cpu_state = _preload_state(cpu_state)
-            _resize_scaler_buffers(model, cpu_state)
+            resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
@@ -399,7 +378,7 @@ def train(
                 state_dict={"model": m_sd},
                 storage_reader=FileSystemReader(ckpt_dir),
             )
-            _resize_scaler_buffers(model, m_sd)
+            resize_scaler_buffer(model, m_sd)
             set_model_state_dict(
                 model, m_sd, options=StateDictOptions(strict=False)
             )

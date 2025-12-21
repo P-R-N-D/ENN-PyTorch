@@ -18,7 +18,7 @@ import torch
 from torch import nn
 
 from ..backend.compat import patch_torch
-from ..backend.system import get_device, process_cpu_count
+from ..backend.system import _log_debug, _log_info, get_device, process_cpu_count
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
 patch_torch()
@@ -90,19 +90,6 @@ def _log_negotiate_once(
     except Exception:
         # Best-effort logging: never fail negotiation because logging broke.
         pass
-
-
-
-def _log_info(logger: Optional[Callable[[str], None]], msg: str) -> None:
-    if logger is not None:
-        logger(msg)
-    else:
-        _LOGGER.info(msg)
-
-
-def _log_debug(logger: Optional[Callable[[str], None]], msg: str) -> None:
-    _LOGGER.debug(msg)
-
 
 def _is_ptq_unavailable(
     model: nn.Module, *args: Any, **kwargs: Any
@@ -188,15 +175,6 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
             return True
     return False
-
-
-def reshape_for_mha(
-    tensor: torch.Tensor, batch_size: int, head_count: int, head_dim: int
-) -> torch.Tensor:
-
-    return tensor.reshape(batch_size, -1, head_count, head_dim).transpose(1, 2)
-
-
 def _dtype_short(dtype: Any) -> str:
     if isinstance(dtype, torch.dtype):
         return str(dtype).split(".")[-1]
