@@ -1,11 +1,110 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
+
+import os
 
 import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
+
+_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
+_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+
+
+def parse_bool(value: object) -> Optional[bool]:
+    """Parse common boolean env tokens.
+
+    Returns:
+        True/False for recognized tokens, otherwise None.
+    """
+
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return None
+
+
+def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    s = str(v).strip()
+    return s if s else default
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    v = parse_bool(os.environ.get(name))
+    if v is None:
+        return bool(default)
+    return bool(v)
+
+
+def env_int(name: str, default: int = 0) -> int:
+    s = env_str(name)
+    if s is None:
+        return int(default)
+    try:
+        return int(s)
+    except Exception:
+        return int(default)
+
+
+def env_float(name: str, default: float = 0.0) -> float:
+    s = env_str(name)
+    if s is None:
+        return float(default)
+    try:
+        return float(s)
+    except Exception:
+        return float(default)
+
+
+def env_first(keys: Sequence[str]) -> Optional[str]:
+    """Return the first non-empty env value among keys."""
+
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if s:
+            return s
+    return None
+
+
+def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
+    v = parse_bool(env_first(keys))
+    if v is None:
+        return bool(default)
+    return bool(v)
+
+
+def env_first_int(keys: Sequence[str], default: int = 0) -> int:
+    v = env_first(keys)
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except Exception:
+        return int(default)
+
+
+def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
+    v = env_first(keys)
+    if v is None:
+        return float(default)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
 
 _CANONICAL_DTYPES: Dict[str, Dict[str, Any]] = {
     "float64": {

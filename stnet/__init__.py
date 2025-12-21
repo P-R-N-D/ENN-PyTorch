@@ -18,6 +18,8 @@ try:
 except Exception:
     _set_list_to_stack = None
 
+from .data.datatype import env_bool
+
 __all__ = [
     "api",
     "backend",
@@ -60,14 +62,7 @@ class IgnoreTorchCompileMsg(logging.Filter):
         return not any(substr in msg for substr in self._DROP_SUBSTRINGS)
 
 
-def _env_flag(name: str, default: bool = False) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return bool(default)
-    return str(val).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-if _env_flag("STNET_DISABLE_MKLDNN", False):
+if env_bool("STNET_DISABLE_MKLDNN", False):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         try:

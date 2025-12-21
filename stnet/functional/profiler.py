@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import threading
 from functools import partial
 from types import TracebackType
 from typing import (Any, Callable, Dict, Iterable, List, Optional, Sequence,
@@ -147,24 +148,31 @@ class _FlopProfiler:
         self._tracking_depth = 0
         self._nvtx_soft_counter: float = 0.0
         self._nvtx_getter: Optional[Callable[[], float]] = None
+        self._lock = threading.Lock()
 
     def is_active(self) -> bool:
-        return self._tracking_depth > 0
+        with self._lock:
+            return self._tracking_depth > 0
 
     def activate(self) -> None:
-        self._tracking_depth += 1
+        with self._lock:
+            self._tracking_depth += 1
 
     def deactivate(self) -> None:
-        self._tracking_depth = max(0, self._tracking_depth - 1)
+        with self._lock:
+            self._tracking_depth = max(0, self._tracking_depth - 1)
 
     def reset(self) -> None:
-        self._manual_total = 0.0
-        self._manual_by_type.clear()
+        with self._lock:
+            self._manual_total = 0.0
+            self._manual_by_type.clear()
 
     def pop(self) -> Tuple[float, Dict[str, float]]:
-        total = float(self._manual_total)
-        breakdown = {k: float(v) for k, v in self._manual_by_type.items()}
-        self.reset()
+        with self._lock:
+            total = float(self._manual_total)
+            breakdown = {k: float(v) for k, v in self._manual_by_type.items()}
+            self._manual_total = 0.0
+            self._manual_by_type.clear()
         return (total, breakdown)
 
     def get(self) -> float:
@@ -172,64 +180,81 @@ class _FlopProfiler:
         return total
 
     def sum(self, *args: Any, sort: bool = True) -> Tuple[float, Dict[str, float]]:
-        total = float(self._manual_total)
+        with self._lock:
+            total = float(self._manual_total)
+            items = list(self._manual_by_type.items())
         if not sort:
-            return total, dict(self._manual_by_type)
+            return total, {k: float(v) for k, v in items}
         ordered: Dict[str, float] = {}
-        for name, value in sorted(
-            self._manual_by_type.items(), key=lambda kv: kv[1], reverse=True
-        ):
+        for name, value in sorted(items, key=lambda kv: kv[1], reverse=True):
             ordered[name] = float(value)
         return total, ordered
 
     def add(self, typ: str, value: float) -> None:
-        if self.is_active():
-            try:
-                fv = float(value)
-            except Exception:
-                return
-            if fv <= 0:
+        try:
+            fv = float(value)
+        except Exception:
+            return
+        if fv <= 0.0:
+            return
+        with self._lock:
+            if self._tracking_depth <= 0:
                 return
             self._manual_total += fv
             self._manual_by_type[typ] = self._manual_by_type.get(typ, 0.0) + fv
 
     def _add_ntvx(self, value: float) -> None:
         try:
-            self._nvtx_soft_counter += float(value) if float(value) > 0 else 0.0
+            dv = float(value)
         except Exception:
-            pass
+            return
+        if dv <= 0.0:
+            return
+        with self._lock:
+            self._nvtx_soft_counter += dv
 
     def _get_ntvx(self) -> float:
-        return float(self._nvtx_soft_counter)
+        with self._lock:
+            return float(self._nvtx_soft_counter)
 
     def coerce_flops_ntvx(self) -> None:
-        if self._nvtx_getter is not None:
-            return
+        # Double-checked locking to avoid holding the lock during imports.
+        with self._lock:
+            if self._nvtx_getter is not None:
+                return
         hook = os.getenv("STNET_NVTX_GETTER", "")
         if not hook:
-            self._nvtx_getter = self._get_ntvx
+            with self._lock:
+                if self._nvtx_getter is None:
+                    self._nvtx_getter = self._get_ntvx
             return
         try:
             module_name, attr = hook.split(":", 1)
         except ValueError:
-            self._nvtx_getter = self._get_ntvx
+            with self._lock:
+                if self._nvtx_getter is None:
+                    self._nvtx_getter = self._get_ntvx
             return
+        getter: Optional[Callable[[], float]] = None
         try:
             module = __import__(module_name, fromlist=[attr])
-            getter = getattr(module, attr)
-            if callable(getter):
-                self._nvtx_getter = getter
-                return
+            candidate = getattr(module, attr)
+            if callable(candidate):
+                getter = candidate
         except Exception as exc:
             _LOGGER.debug("Failed to import NVTX getter %s: %s", hook, exc)
-        self._nvtx_getter = self._get_ntvx
+        with self._lock:
+            if self._nvtx_getter is not None:
+                return
+            self._nvtx_getter = getter if getter is not None else self._get_ntvx
 
     def capture_ntvx(self, value: float) -> None:
         self._add_ntvx(value)
 
     def new_flops_ntvx(self, device: Optional[torch.device] = None) -> Any:
         self.coerce_flops_ntvx()
-        getter = self._nvtx_getter or self._get_ntvx
+        with self._lock:
+            getter = self._nvtx_getter or self._get_ntvx
         try:
             if not torch.cuda.is_available():
                 raise RuntimeError("CUDA not available")

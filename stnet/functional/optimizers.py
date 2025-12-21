@@ -5,6 +5,7 @@ import contextlib
 import copy
 import json
 import logging
+import threading
 # json is used for structured optimizer decision logs.
 from collections import OrderedDict
 from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
@@ -34,6 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 # Deduplicate optimizer decision logs (best-effort, bounded).
 _OPT_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _OPT_LOGGED_MAX: int = 128
+_OPT_LOGGED_LOCK = threading.Lock()
 
 
 def _log_opt_decision_once(
@@ -43,20 +45,21 @@ def _log_opt_decision_once(
     *,
     level: str = "info",
 ) -> None:
-    if key is None:
-        key = ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
-    if key in _OPT_LOGGED_KEYS:
+    with _OPT_LOGGED_LOCK:
+        if key is None:
+            key = ("opt", payload.get("mode"), payload.get("device"), payload.get("selected"))
+        if key in _OPT_LOGGED_KEYS:
+            try:
+                _OPT_LOGGED_KEYS.move_to_end(key)
+            except Exception:
+                pass
+            return
+        _OPT_LOGGED_KEYS[key] = None
         try:
-            _OPT_LOGGED_KEYS.move_to_end(key)
+            if len(_OPT_LOGGED_KEYS) > int(_OPT_LOGGED_MAX):
+                _OPT_LOGGED_KEYS.popitem(last=False)
         except Exception:
             pass
-        return
-    _OPT_LOGGED_KEYS[key] = None
-    try:
-        if len(_OPT_LOGGED_KEYS) > int(_OPT_LOGGED_MAX):
-            _OPT_LOGGED_KEYS.popitem(last=False)
-    except Exception:
-        pass
     try:
         msg = "[OPT][DECISION] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:

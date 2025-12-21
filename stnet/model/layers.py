@@ -610,8 +610,15 @@ class DilatedAttention(nn.Module):
             with contextlib.suppress(Exception):
                 kpm = kpm.contiguous()
 
-        # Flex attention is currently only safe when we don't have a true key_padding_mask.
-        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (kpm is None))
+        q_pad: Optional[torch.Tensor] = None
+        if kpm is not None:
+            # Avoid inflating attention masks with query padding; mask output instead.
+            q_pad = kpm[:, :L]
+            with contextlib.suppress(Exception):
+                q_pad = q_pad.contiguous()
+
+        # Flex attention can support per-batch padding via a block mask.
+        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda)
 
         base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
         if L <= 512:
@@ -647,7 +654,6 @@ class DilatedAttention(nn.Module):
                 # Causal attention never attends to kv positions >= L (kv_idx > q_idx for all q_idx < L).
                 kpm_k = None
 
-        residual = x_k
         x_k = self.norm1(x_k)
 
         attn_w: Optional[torch.Tensor] = None
@@ -729,10 +735,8 @@ class DilatedAttention(nn.Module):
                                 keep &= ((dq % self.dilation) == 0)
 
                             if kpm_g is not None:
-                                is_pad_q = kpm_g[b, q_idx]
-                                is_pad_k = kpm_g[b, kv_idx]
-                                bad = (is_pad_q | is_pad_k)
-                                keep = keep & (~bad)
+                                # Mask only keys; query padding is handled by zeroing the output.
+                                keep = keep & (~kpm_g[b, kv_idx])
 
                             return keep
 
@@ -785,6 +789,8 @@ class DilatedAttention(nn.Module):
                     out_g = self.out_proj(
                         y_g.transpose(1, 2).contiguous().view(B_g, L_q, self.embed_dim)
                     )
+                    if q_pad is not None:
+                        out_g = out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
                     if out_full is None:
                         if B_g == B:
                             return out_g
@@ -827,63 +833,172 @@ class DilatedAttention(nn.Module):
             kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
             vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
 
-            # IMPORTANT:
-            # PyTorch SDPA raises if both attn_mask and is_causal are set.
-            # So only use is_causal when we truly have no additional masking needs.
-            base_mask: Optional[torch.Tensor] = None
-            is_causal = False
+            training = bool(self.training)
+            dropout_p = float(self.dropout_p) if training else 0.0
+
             is_simple = (int(self.dilation) == 1) and (self.window_size is None)
 
-            if is_simple and bool(self.causal) and (kpm_k is None):
-                # Safe fast-path: no padding mask, no dilation/window mask.
-                is_causal = True
-            elif not (is_simple and (not bool(self.causal))):
-                # Need explicit mask for:
-                #  - causal + any padding mask
-                #  - dilation/windowed attention (with or without causal)
-                base_mask_full = self._get_mask(L_k, x_k.device)
-                base_mask = base_mask_full[:L_q, :]
+            # Varlen causal fast-path:
+            # For right-padded batches under simple causal attention, we can avoid
+            # constructing a (B, Lq, Lk) boolean mask by slicing each group to its
+            # true length and using is_causal=True.
+            attn_out: Optional[torch.Tensor] = None
+            if (
+                is_simple
+                and bool(self.causal)
+                and (kpm_k is not None)
+                and isinstance(kpm_k, torch.Tensor)
+                and (kpm_k.dim() == 2)
+            ):
+                kpm_b = kpm_k.to(torch.bool)
+                right_padded = True
+                with contextlib.suppress(Exception):
+                    right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
+                if right_padded:
+                    lengths = (~kpm_b).sum(dim=-1).clamp(min=0, max=int(L_q)).to(torch.int64)
+                    y_full = qh.new_zeros((B, H, L_q, Dh))
+                    for l_i in torch.unique(lengths).tolist():
+                        li = int(l_i)
+                        if li <= 0:
+                            continue
+                        idx = (lengths == li).nonzero(as_tuple=False).squeeze(-1)
+                        if idx.numel() == 0:
+                            continue
+                        q_g = qh.index_select(0, idx)[:, :, :li, :]
+                        k_g = kh.index_select(0, idx)[:, :, :li, :]
+                        v_g = vh.index_select(0, idx)[:, :, :li, :]
+                        y_g = F.scaled_dot_product_attention(
+                            q_g,
+                            k_g,
+                            v_g,
+                            attn_mask=None,
+                            dropout_p=dropout_p,
+                            is_causal=True,
+                        )
+                        y_full[idx, :, :li, :] = y_g
+                    attn_out = self.out_proj(
+                        y_full.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+                    )
+                    if q_pad is not None:
+                        attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
+
+            if attn_out is None:
+                # IMPORTANT:
+                # PyTorch SDPA raises if both attn_mask and is_causal are set.
+                # Only use is_causal when there are no additional masking needs.
+                base_mask: Optional[torch.Tensor] = None
                 is_causal = False
 
-            attn_mask: Optional[torch.Tensor] = base_mask
-            if kpm_k is not None:
-                kpm_b = kpm_k.to(torch.bool)
-                # Support either (B, L_k) or (L_k,) masks:
-                if kpm_b.dim() == 1:
-                    key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k) -> broadcast to B and L_q
-                else:
-                    key_mask = kpm_b[:, None, None, :]     # (B,1,1,L_k)
+                if is_simple and bool(self.causal) and (kpm_k is None):
+                    # Safe fast-path: no padding mask, no dilation/window mask.
+                    is_causal = True
+                elif not (is_simple and (not bool(self.causal))):
+                    # Need explicit mask for:
+                    #  - causal + any padding mask
+                    #  - dilation/windowed attention (with or without causal)
+                    base_mask_full = self._get_mask(L_k, x_k.device)
+                    base_mask = base_mask_full[:L_q, :]
+                    is_causal = False
 
-                if attn_mask is None:
-                    attn_mask = key_mask
-                else:
-                    # If the padding mask is batch-constant (shape[0]==1), keep mask at batch=1 and broadcast in SDPA.
-                    if key_mask.shape[0] == 1:
-                        attn_mask = (attn_mask[None, None, :, :] | key_mask)
+                key_mask: Optional[torch.Tensor] = None
+                if kpm_k is not None:
+                    kpm_b = kpm_k.to(torch.bool)
+                    # Support either (B, L_k) or (L_k,) masks:
+                    if kpm_b.dim() == 1:
+                        key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k)
                     else:
-                        attn_b = attn_mask[None, None, :, :].expand(B, 1, L_q, L_k).clone()
-                        attn_b |= key_mask
-                        attn_mask = attn_b
+                        key_mask = kpm_b[:, None, None, :]     # (B,1,1,L_k)
 
-            q_pad: Optional[torch.Tensor] = None
-            if kpm is not None:
-                # Avoid inflating attn_mask with query padding; mask output instead.
-                q_pad = kpm.to(torch.bool)[:, :L_q]
+                # Combine masks with minimal materialization.
+                if base_mask is None:
+                    y = F.scaled_dot_product_attention(
+                        qh,
+                        kh,
+                        vh,
+                        attn_mask=key_mask,
+                        dropout_p=dropout_p,
+                        is_causal=bool(is_causal),
+                    )
+                else:
+                    if key_mask is None:
+                        y = F.scaled_dot_product_attention(
+                            qh,
+                            kh,
+                            vh,
+                            attn_mask=base_mask,
+                            dropout_p=dropout_p,
+                            is_causal=False,
+                        )
+                    elif int(key_mask.shape[0]) == 1:
+                        attn_mask = base_mask[None, None, :, :] | key_mask
+                        y = F.scaled_dot_product_attention(
+                            qh,
+                            kh,
+                            vh,
+                            attn_mask=attn_mask,
+                            dropout_p=dropout_p,
+                            is_causal=False,
+                        )
+                    else:
+                        # Batch-specific padding + base_mask would otherwise force a full (B, Lq, Lk)
+                        # materialization (expand+clone). Micro-batch to reduce peak memory.
+                        env_mb = 0
+                        with contextlib.suppress(Exception):
+                            env_mb = int(os.environ.get("STNET_SDPA_BATCH_MICROBATCH", "0") or 0)
 
-            y = F.scaled_dot_product_attention(
+                        # Heuristic default: microbatch only when mask would be large.
+                        group = int(env_mb)
+                        if group <= 0:
+                            est = int(B) * int(L_q) * int(L_k)
+                            if est >= 64 * 1024 * 1024:
+                                group = 1
+                            elif est >= 16 * 1024 * 1024:
+                                group = 2
+                            elif est >= 4 * 1024 * 1024:
+                                group = 4
+                            else:
+                                group = int(B)
+                        group = max(1, min(int(B), int(group)))
 
-                qh,
-                kh,
-                vh,
-                attn_mask=attn_mask,
-                dropout_p=self.dropout_p if self.training else 0.0,
-                is_causal=bool(is_causal),
-            )
-            attn_out = self.out_proj(
-                y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
-            )
-            if q_pad is not None:
-                attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
+                        base4 = base_mask[None, None, :, :]  # (1,1,Lq,Lk)
+                        out_full = qh.new_empty((B, H, L_q, Dh))
+
+                        last_oom: Optional[RuntimeError] = None
+                        while group >= 1:
+                            try:
+                                for b0 in range(0, B, group):
+                                    b1 = min(B, b0 + group)
+                                    attn_mask_g = base4 | key_mask[b0:b1]
+                                    y_g = F.scaled_dot_product_attention(
+                                        qh[b0:b1],
+                                        kh[b0:b1],
+                                        vh[b0:b1],
+                                        attn_mask=attn_mask_g,
+                                        dropout_p=dropout_p,
+                                        is_causal=False,
+                                    )
+                                    out_full[b0:b1] = y_g
+                                last_oom = None
+                                break
+                            except RuntimeError as e:
+                                msg = str(e)
+                                if "CUDA out of memory" not in msg and "out of memory" not in msg:
+                                    raise
+                                last_oom = e
+                                if x_k.device.type == "cuda":
+                                    with contextlib.suppress(Exception):
+                                        empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
+                                group //= 2
+
+                        if last_oom is not None:
+                            raise last_oom
+                        y = out_full
+
+                attn_out = self.out_proj(
+                    y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+                )
+                if q_pad is not None:
+                    attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
 
         x_out = x + self.dropout(attn_out)
         res2 = x_out

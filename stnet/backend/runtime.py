@@ -32,6 +32,8 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
+from ..data.datatype import env_bool, env_float, env_int, parse_bool
+
 _nvml = None
 _NVML_READY = False
 _NVML_TRIED = False
@@ -57,25 +59,13 @@ _NVML_FAIL_MAX: Optional[int] = None
 def _nvml_disabled() -> bool:
     """Return True if NVML telemetry is explicitly disabled via env vars."""
 
-    def _parse_bool(v: object) -> Optional[bool]:
-        if v is None:
-            return None
-        s = str(v).strip().lower()
-        if not s:
-            return None
-        if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
-            return True
-        if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
-            return False
-        return None
-
     # STNET_NVML_DISABLE=1 disables NVML unconditionally.
-    v = _parse_bool(os.environ.get("STNET_NVML_DISABLE"))
+    v = parse_bool(os.environ.get("STNET_NVML_DISABLE"))
     if v is True:
         return True
 
     # STNET_NVML=0 also disables (mirrors other STNET toggles).
-    v = _parse_bool(os.environ.get("STNET_NVML"))
+    v = parse_bool(os.environ.get("STNET_NVML"))
     if v is False:
         return True
     return False
@@ -218,9 +208,11 @@ def _ensure_nvml() -> bool:
             _nvml = _pynvml
             _nvml.nvmlInit()
             _NVML_READY = True
-        except Exception:
+        except Exception as exc:
             _nvml = None
             _NVML_READY = False
+            if env_bool("STNET_DEBUG", False):
+                logging.getLogger(__name__).debug("NVML init failed: %s", exc, exc_info=True)
     return bool(_NVML_READY)
 try:
     import psutil as _psutil
@@ -271,31 +263,15 @@ _OOM_RETRY_COUNT: Dict[Tuple[int, str, int], int] = {}
 
 
 def _rt_env_flag(name: str, default: bool) -> bool:
-    v = os.environ.get(name)
-    if v is None:
-        return bool(default)
-    s = str(v).strip().lower()
-    if not s:
-        return bool(default)
-    if s in {"1", "true", "yes", "y", "on", "enable", "enabled"}:
-        return True
-    if s in {"0", "false", "no", "n", "off", "disable", "disabled"}:
-        return False
-    return bool(default)
+    return env_bool(name, bool(default))
 
 
 def _rt_env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, str(default)))
-    except Exception:
-        return int(default)
+    return env_int(name, int(default))
 
 
 def _rt_env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, str(default)))
-    except Exception:
-        return float(default)
+    return env_float(name, float(default))
 
 
 def _oom_retry_inc(loader: Any, phase: str, step: int) -> int:
