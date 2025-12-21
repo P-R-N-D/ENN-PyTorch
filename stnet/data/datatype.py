@@ -67,8 +67,16 @@ def env_float(name: str, default: float = 0.0) -> float:
         return float(default)
 
 
-def env_first(keys: Sequence[str]) -> Optional[str]:
-    """Return the first non-empty env value among keys."""
+def env_first(keys: Sequence[str], default: Optional[str] = None) -> Optional[str]:
+    """Return the first non-empty env value among keys.
+
+    Args:
+        keys: environment variable names in priority order.
+        default: value returned when none of the keys are set (or all are empty).
+
+    Notes:
+        This keeps call-sites compact and avoids sprinkling `or <default>` everywhere.
+    """
 
     for k in keys:
         v = os.environ.get(k)
@@ -77,7 +85,7 @@ def env_first(keys: Sequence[str]) -> Optional[str]:
         s = str(v).strip()
         if s:
             return s
-    return None
+    return default
 
 
 def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:

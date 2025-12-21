@@ -63,6 +63,57 @@ def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = Tru
     return batch
 
 
+def _is_accelerator_available() -> bool:
+    """Best-effort check for an available accelerator backend."""
+
+    try:
+        if torch.cuda.is_available():
+            return True
+    except Exception:
+        pass
+
+    try:
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+            return True
+    except Exception:
+        pass
+
+    try:
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _gpu_guard_ok(use_cuda_stream: bool, device: torch.device, guard_bytes: int) -> bool:
+    """Return True if CUDA free-memory guard is satisfied (or guard disabled)."""
+
+    if (not use_cuda_stream) or int(guard_bytes) <= 0:
+        return True
+    try:
+        free_b, _total_b = torch.cuda.mem_get_info(
+            device=device if isinstance(device, torch.device) else None
+        )
+        return bool(int(free_b) >= int(guard_bytes))
+    except Exception:
+        return True
+
+
+def _host_guard_ok(guard_bytes: int) -> bool:
+    """Return True if host available-memory guard is satisfied (or guard disabled)."""
+
+    if int(guard_bytes) <= 0:
+        return True
+    try:
+        return bool(int(Memory.available()) >= int(guard_bytes))
+    except Exception:
+        return True
+
+
 class SamplerScale:
     """Per-session (or per-loader) scaling factor for auto batch sizing.
 
@@ -269,16 +320,6 @@ class Sampler(_Sampler):
         self._mmap_thread_local_max = 0
         self._mmap_thread_local_created = 0
         self._mmap_thread_local_overflow_warned = False
-
-        def _read_int_env(keys, default):
-            for k in keys:
-                try:
-                    v = os.environ.get(k)
-                    if v is not None and str(v).strip():
-                        return int(v)
-                except Exception:
-                    pass
-            return int(default)
 
         # Thread-local mmap handles are optional; default is "auto" for no-GIL builds.
         default_tl = False
@@ -537,7 +578,8 @@ class Sampler(_Sampler):
             s, e = int(idx[0]), int(idx[1])
             return self._slice(s, e)
         if isinstance(idx, torch.Tensor) and idx.dtype in (torch.int64, torch.int32):
-            idx = idx.tolist()
+            # Ensure host indices (GPU indices would implicitly sync and may not index memmaps).
+            idx = idx.detach().cpu().tolist()
         if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
             if len(idx) == 0:
                 return self._slice(0, 0)
@@ -661,7 +703,7 @@ class Sampler(_Sampler):
         if ns > 1:
             order = order[si::ns]
 
-        for b in order.tolist():
+        for b in order:
             bs = start + int(b) * int(block)
             be = min(end, bs + int(block))
             cur = int(bs)
@@ -694,21 +736,6 @@ class Sampler(_Sampler):
         e = int(end)
         n = max(0, e - s)
         features, labels = self._get_mmaps()
-
-        def _is_accelerator_available() -> bool:
-            if torch.cuda.is_available():
-                return True
-            try:
-                if hasattr(torch, "xpu") and torch.xpu.is_available():
-                    return True
-            except Exception:
-                pass
-            try:
-                if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-                    return True
-            except Exception:
-                pass
-            return False
 
         with FxGradient.inference(torch.nn.Module()):
             if n <= 0:
@@ -804,6 +831,7 @@ class Disposable:
 
     def close(self) -> None:
         self.cleanup()
+
 
     def __iter__(self) -> Iterator[Any]:
         return iter(self._keep)
@@ -1246,11 +1274,10 @@ class BufferedLoader(Buffer):
         try:
             while True:
                 try:
-                    item = self.get(timeout=0.1)
+                    item = self.get(timeout=None)
                 except queue.Empty:
-                    if self.is_stopped() and not t.is_alive():
-                        break
-                    continue
+                    # stop signaled and buffer drained
+                    break
 
                 if item is sentinel:
                     break
@@ -1347,9 +1374,73 @@ class Prefetcher(Buffer):
             return out
         return x
 
-    def __iter__(self) -> Iterator[Any]:
+    def _producer_loop(
+        self,
+        it: Iterator[Any],
+        sentinel: object,
+        *,
+        device: torch.device,
+        use_device: bool,
+        use_cuda_stream: bool,
+        gpu_guard_bytes: int,
+        host_guard_bytes: int,
+    ) -> None:
+        """Producer thread body for Prefetcher.
+
+        Kept as a method (instead of a nested closure) to make profiling,
+        testing, and exception-handling behavior easier to reason about.
+        """
+
         import time
         import traceback
+
+        try:
+            if use_cuda_stream and isinstance(device, torch.device):
+                with suppress(Exception):
+                    if device.index is not None:
+                        torch.cuda.set_device(device.index)
+
+            for batch in it:
+                if self.is_stopped():
+                    break
+
+                if self._pin:
+                    batch = self._pin_memory(batch)
+
+                tries = 0
+                if self._backpressure:
+                    while (not self.is_stopped()) and (
+                        (not _host_guard_ok(host_guard_bytes))
+                        or (not _gpu_guard_ok(use_cuda_stream, device, gpu_guard_bytes))
+                    ):
+                        time.sleep(0.001 if tries < 1000 else 0.005)
+                        tries += 1
+
+                if use_device:
+                    if use_cuda_stream and self._gpu_stream is not None:
+                        with torch.cuda.stream(self._gpu_stream):
+                            batch_dev = self._to_device(batch, device)
+                        ev = torch.cuda.Event()
+                        ev.record(self._gpu_stream)
+                        if not self.put((batch_dev, ev)):
+                            break
+                    else:
+                        batch_dev = self._to_device(batch, device)
+                        if not self.put((batch_dev, None)):
+                            break
+                else:
+                    if not self.put((batch, None)):
+                        break
+
+        except BaseException as exc:
+            with suppress(Exception):
+                self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
+        finally:
+            with suppress(Exception):
+                self.put(sentinel)
+
+    def __iter__(self) -> Iterator[Any]:
+        import time
 
         # Return a fresh session per iteration to avoid reusing threads/queues.
         if not bool(self._session):
@@ -1366,24 +1457,8 @@ class Prefetcher(Buffer):
             and torch.cuda.is_available()
         )
         iterable = getattr(self, "_iterable", self._src)
-        def _gpu_mem_ok() -> bool:
-            if not use_cuda_stream or self._gpu_guard_bytes <= 0:
-                return True
-            try:
-                free_b, _total_b = torch.cuda.mem_get_info(
-                    device=device if isinstance(device, torch.device) else None
-                )
-                return bool(free_b >= self._gpu_guard_bytes)
-            except Exception:
-                return True
-
-        def _host_mem_ok() -> bool:
-            if self._host_guard_bytes <= 0:
-                return True
-            try:
-                return bool(Memory.available() >= self._host_guard_bytes)
-            except Exception:
-                return True
+        gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
+        host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
 
         # Inside a DataLoader worker process: keep it simple (no nested threads).
         if info is not None:
@@ -1402,62 +1477,28 @@ class Prefetcher(Buffer):
         sentinel = object()
         it = iter(iterable)
 
-        def _producer() -> None:
-            try:
-                if use_cuda_stream and isinstance(device, torch.device):
-                    with suppress(Exception):
-                        if device.index is not None:
-                            torch.cuda.set_device(device.index)
-
-                for batch in it:
-                    if self.is_stopped():
-                        break
-
-                    if self._pin:
-                        batch = self._pin_memory(batch)
-
-                    tries = 0
-                    if self._backpressure:
-                        while (not self.is_stopped()) and (
-                            (not _host_mem_ok()) or (not _gpu_mem_ok())
-                        ):
-                            time.sleep(0.001 if tries < 1000 else 0.005)
-                            tries += 1
-
-                    if use_device:
-                        if use_cuda_stream and self._gpu_stream is not None:
-                            with torch.cuda.stream(self._gpu_stream):
-                                batch_dev = self._to_device(batch, device)
-                            ev = torch.cuda.Event()
-                            ev.record(self._gpu_stream)
-                            if not self.put((batch_dev, ev)):
-                                break
-                        else:
-                            batch_dev = self._to_device(batch, device)
-                            if not self.put((batch_dev, None)):
-                                break
-                    else:
-                        if not self.put((batch, None)):
-                            break
-
-            except BaseException as exc:
-                with suppress(Exception):
-                    self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
-            finally:
-                with suppress(Exception):
-                    self.put(sentinel)
-
-        t = threading.Thread(target=_producer, name="PrefetcherProducer", daemon=True)
+        t = threading.Thread(
+            target=self._producer_loop,
+            name="PrefetcherProducer",
+            daemon=True,
+            args=(it, sentinel),
+            kwargs={
+                "device": device,
+                "use_device": use_device,
+                "use_cuda_stream": use_cuda_stream,
+                "gpu_guard_bytes": gpu_guard_bytes,
+                "host_guard_bytes": host_guard_bytes,
+            },
+        )
         t.start()
 
         try:
             while True:
                 try:
-                    item = self.get(timeout=0.1)
+                    item = self.get(timeout=None)
                 except queue.Empty:
-                    if self.is_stopped() and not t.is_alive():
-                        break
-                    continue
+                    # stop signaled and buffer drained
+                    break
 
                 if item is sentinel:
                     break

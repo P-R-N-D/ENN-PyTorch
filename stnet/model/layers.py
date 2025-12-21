@@ -890,13 +890,14 @@ class DilatedAttention(nn.Module):
             ):
                 kpm_b = kpm_k.to(torch.bool)
                 right_padded = True
-                with contextlib.suppress(Exception):
+                if int(kpm_b.shape[1]) >= 2:
                     right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
                 if right_padded:
                     lengths = (~kpm_b).sum(dim=-1).clamp(min=0, max=int(L_q)).to(torch.int64)
                     y_full = qh.new_zeros((B, H, L_q, Dh))
-                    for l_i in torch.unique(lengths).tolist():
-                        li = int(l_i)
+                    unique_lengths = torch.unique(lengths.detach().cpu()).tolist()
+                    for li in unique_lengths:
+                        li = int(li)
                         if li <= 0:
                             continue
                         idx = (lengths == li).nonzero(as_tuple=False).squeeze(-1)

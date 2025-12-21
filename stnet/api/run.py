@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import gc
 import json
 import os
 import random
@@ -34,7 +33,6 @@ from ..backend.system import (
     new_dir,
     optimal_start_method,
     set_multiprocessing_env,
-    empty_device_cache,
 )
 from ..data.collections import LazyTensor
 from ..data.datatype import env_bool

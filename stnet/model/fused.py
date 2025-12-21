@@ -20,6 +20,7 @@ from torch import nn
 from ..backend.compat import patch_torch
 from ..backend.system import _log_debug, _log_info, get_device, process_cpu_count
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
+from ..data.datatype import env_first, env_first_int
 
 patch_torch()
 
@@ -569,30 +570,18 @@ class Gradient:
 
         if _inductor_config is not None:
             try:
-                import os
-
-                def _read_int_env(keys, default=None):
-                    for k in keys:
-                        try:
-                            v = os.environ.get(k)
-                            if v is not None and str(v).strip():
-                                return int(v)
-                        except Exception:
-                            pass
-                    return default
-
                 if getattr(_inductor_config, "compile_threads", None) is not None:
-                    override = _read_int_env(
+                    override = env_first(
                         ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
                         None,
                     )
                     if override is None:
-                        override = _read_int_env(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
 
                     if override is not None:
                         _inductor_config.compile_threads = max(1, int(override))
                     else:
-                        local_world = _read_int_env(
+                        local_world = env_first_int(
                             (
                                 "STNET_LOCAL_WORLD_SIZE",
                                 "LOCAL_WORLD_SIZE",

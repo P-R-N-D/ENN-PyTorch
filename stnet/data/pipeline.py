@@ -1831,7 +1831,7 @@ class Dataset(Generic[TExtra]):
         features = _to_tensor(features, dtype=self.feature_dtype).contiguous()
         if features.ndim == 0:
             features = features.reshape(1, 1)
-        if features.ndim == 1:
+        elif features.ndim == 1:
             # Interpret a 1D tensor as a single sample with (1, in_dim)
             # rather than (N, 1). This aligns with the model reference
             # convention: features are shaped (B, in_dim).

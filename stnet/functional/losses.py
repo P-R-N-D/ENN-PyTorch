@@ -141,6 +141,16 @@ def _nufft_nd(
     eps: float = 1e-06,
     **kwargs: Any,
 ) -> torch.Tensor:
+    """Batched N-D NUFFT via cuFINUFFT (CUDA only).
+
+    Optimizations:
+      - Reuse a single plan when `omega` is shared across the batch (omega.ndim == 2).
+      - Attempt a vectorized `n_trans=B` execution path (falls back safely).
+      - When `omega` is per-sample (omega.ndim == 3), attempt to reuse the plan and
+        update points via `setpts()` (falls back to per-sample plans).
+    """
+
+    _ = args, kwargs
     try:
         import cufinufft
     except ImportError as e:
@@ -151,7 +161,6 @@ def _nufft_nd(
 
     B = int(x_cplx.shape[0])
     ndim = len(shape)
-    out_list: List[torch.Tensor] = []
 
     device = x_cplx.device
     if device.type != "cuda":
@@ -160,7 +169,35 @@ def _nufft_nd(
     dtype_str = "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
 
     if omega.dim() == 2:
+        # Shared points for all batch elements: setpts once, reuse plan.
         pts = [omega[i].contiguous() for i in range(ndim)]
+
+        # Best-effort vectorized path (n_trans=B). This reduces Python overhead
+        # and can be substantially faster for moderate B.
+        if B > 1:
+            try:
+                plan = cufinufft.Plan(
+                    nufft_type,
+                    _to_tuple(shape),
+                    n_trans=B,
+                    eps=eps,
+                    dtype=dtype_str,
+                )
+                plan.setpts(*pts)
+                fk = plan.execute(x_cplx.contiguous())
+                out = torch.as_tensor(fk, device=device)
+
+                # cuFINUFFT returns different layouts depending on version; normalize to (B, ...).
+                if out.ndim >= 1 and int(out.shape[0]) != B and int(out.shape[-1]) == B:
+                    out = out.movedim(-1, 0)
+                if out.ndim == 0 or int(out.shape[0]) != B:
+                    raise RuntimeError("unexpected cuFINUFFT output layout for n_trans")
+
+                return out
+            except Exception:
+                # Fall back to n_trans=1 loop below.
+                pass
+
         plan = cufinufft.Plan(
             nufft_type,
             _to_tuple(shape),
@@ -169,12 +206,18 @@ def _nufft_nd(
             dtype=dtype_str,
         )
         plan.setpts(*pts)
-        for b in range(B):
-            fk = plan.execute(x_cplx[b].contiguous())
-            out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
-    elif omega.dim() == 3:
-        for b in range(B):
-            pts = [omega[b, i].contiguous() for i in range(ndim)]
+
+        # Infer output shape from the first execution and preallocate.
+        fk0 = torch.as_tensor(plan.execute(x_cplx[0].contiguous()), device=device)
+        out = fk0.new_empty((B, *fk0.shape))
+        out[0] = fk0
+        for b in range(1, B):
+            out[b] = torch.as_tensor(plan.execute(x_cplx[b].contiguous()), device=device)
+        return out
+
+    if omega.dim() == 3:
+        # Per-sample points. Best-effort: reuse the plan and update setpts per sample.
+        try:
             plan = cufinufft.Plan(
                 nufft_type,
                 _to_tuple(shape),
@@ -182,15 +225,39 @@ def _nufft_nd(
                 eps=eps,
                 dtype=dtype_str,
             )
-            plan.setpts(*pts)
-            fk = plan.execute(x_cplx[b].contiguous())
-            out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
-    else:
-        raise ValueError(
-            f"omega must have shape (ndim, npts) or (B, ndim, npts), got {omega.shape}"
-        )
 
-    return torch.cat(out_list, dim=0)
+            pts0 = [omega[0, i].contiguous() for i in range(ndim)]
+            plan.setpts(*pts0)
+            fk0 = torch.as_tensor(plan.execute(x_cplx[0].contiguous()), device=device)
+            out = fk0.new_empty((B, *fk0.shape))
+            out[0] = fk0
+
+            for b in range(1, B):
+                pts = [omega[b, i].contiguous() for i in range(ndim)]
+                plan.setpts(*pts)
+                out[b] = torch.as_tensor(plan.execute(x_cplx[b].contiguous()), device=device)
+
+            return out
+        except Exception:
+            # Conservative fallback: per-sample plan creation.
+            out_list: List[torch.Tensor] = []
+            for b in range(B):
+                pts = [omega[b, i].contiguous() for i in range(ndim)]
+                plan = cufinufft.Plan(
+                    nufft_type,
+                    _to_tuple(shape),
+                    n_trans=1,
+                    eps=eps,
+                    dtype=dtype_str,
+                )
+                plan.setpts(*pts)
+                fk = plan.execute(x_cplx[b].contiguous())
+                out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
+            return torch.cat(out_list, dim=0)
+
+    raise ValueError(
+        f"omega must have shape (ndim, npts) or (B, ndim, npts), got {omega.shape}"
+    )
 
 
 def expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor:

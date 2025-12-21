@@ -2,13 +2,11 @@
 from __future__ import annotations
 
 import collections.abc as _abc
-import math
 import os
 import contextlib
-import importlib
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -388,63 +386,64 @@ def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
 
 
 class Buffer:
-    """Bounded in-memory buffer with backpressure.
+    """Bounded in-memory buffer with backpressure and stop notification.
 
-    This is a small wrapper around :class:`queue.Queue` that adds:
-      - A stop flag so blocked producers/consumers can be interrupted.
-      - Type-agnostic payloads (Any).
+    This is a lightweight bounded queue used by streaming/prefetch loaders.
 
-    It is intentionally minimal: higher-level coordination (sentinels,
-    producer/consumer threads) lives in BufferedLoader.
+    Key properties:
+      - **Hard inflight cap**: `max_batches` is a strict upper bound (backpressure).
+      - **Stop-aware**: `stop()` wakes blocked producers/consumers without polling.
+      - **Payload-agnostic**: stores `Any`.
+
+    Implementation detail:
+      - We intentionally do *not* use `queue.Queue` here because interrupting a
+        thread blocked in `put()`/`get()` requires polling (or private internals).
+        Using a `Condition` + `deque` lets us `notify_all()` on stop.
     """
 
     def __init__(self, max_batches: int) -> None:
-        import queue
+        import collections
         import threading
 
         self.max_batches = max(1, int(max_batches))
-        self._q: "queue.Queue[Any]" = queue.Queue(maxsize=self.max_batches)
+        self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
+        self._cv = threading.Condition()
 
     def put(self, item: Any, *, timeout: float | None = None) -> bool:
         """Put an item into the buffer.
 
-        Returns True if the item was enqueued, False if the buffer was stopped
-        before the item could be enqueued.
-
-        This method is interruptible even when `timeout` is None (infinite):
-        it uses a small internal timeout loop to periodically check the stop flag.
+        Returns:
+            True if enqueued, False if stopped or timed out.
         """
         import logging
-        import queue
         import time
 
         if self._stop.is_set():
             return False
 
         start = time.monotonic()
-        if timeout is None:
-            while not self._stop.is_set():
-                try:
-                    self._q.put(item, block=True, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
-            else:
+        with self._cv:
+            if self._stop.is_set():
                 return False
-        else:
-            deadline = time.monotonic() + float(timeout)
-            while not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+
+            if timeout is None:
+                while len(self._buf) >= self.max_batches and not self._stop.is_set():
+                    self._cv.wait()
+                if self._stop.is_set():
                     return False
-                try:
-                    self._q.put(item, block=True, timeout=min(0.1, remaining))
-                    break
-                except queue.Full:
-                    continue
             else:
-                return False
+                deadline = time.monotonic() + float(timeout)
+                while len(self._buf) >= self.max_batches and not self._stop.is_set():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cv.wait(timeout=remaining)
+                if self._stop.is_set():
+                    return False
+
+            self._buf.append(item)
+            self._cv.notify_all()
 
         elapsed = time.monotonic() - start
         if elapsed > 0.1:
@@ -461,47 +460,57 @@ class Buffer:
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
         """Get an item from the buffer.
 
-        If the buffer is stopped and empty, this raises queue.Empty.
-
-        Like put(), this method is interruptible even when `timeout` is None.
+        Semantics:
+          - If `block=False` and empty: raises `queue.Empty`.
+          - If stopped and empty: raises `queue.Empty`.
+          - If `timeout` expires: raises `queue.Empty`.
         """
         import queue
         import time
 
         if not bool(block):
-            if self._stop.is_set() and self._q.empty():
-                raise queue.Empty
-            return self._q.get(block=False)
-
-        if timeout is None:
-            while True:
-                if self._stop.is_set() and self._q.empty():
+            with self._cv:
+                if not self._buf:
                     raise queue.Empty
-                try:
-                    return self._q.get(block=True, timeout=0.1)
-                except queue.Empty:
-                    continue
+                item = self._buf.popleft()
+                self._cv.notify_all()
+                return item
 
-        deadline = time.monotonic() + float(timeout)
-        while True:
-            if self._stop.is_set() and self._q.empty():
+        with self._cv:
+            if timeout is None:
+                while not self._buf and not self._stop.is_set():
+                    self._cv.wait()
+                if not self._buf:
+                    raise queue.Empty
+                item = self._buf.popleft()
+                self._cv.notify_all()
+                return item
+
+            deadline = time.monotonic() + float(timeout)
+            while not self._buf and not self._stop.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue.Empty
+                self._cv.wait(timeout=remaining)
+
+            if not self._buf:
                 raise queue.Empty
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise queue.Empty
-            try:
-                return self._q.get(block=True, timeout=min(0.1, remaining))
-            except queue.Empty:
-                continue
+            item = self._buf.popleft()
+            self._cv.notify_all()
+            return item
 
     def empty(self) -> bool:
-        return self._q.empty()
+        with self._cv:
+            return not bool(self._buf)
 
     def size(self) -> int:
-        return self._q.qsize()
+        with self._cv:
+            return int(len(self._buf))
 
     def stop(self) -> None:
         self._stop.set()
+        with self._cv:
+            self._cv.notify_all()
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())

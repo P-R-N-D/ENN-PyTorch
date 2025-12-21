@@ -214,6 +214,169 @@ def _linux_cgroup_cpu_quota() -> Optional[float]:
     except Exception:
         return None
 
+
+def _psutil_process_affinity_cpu_count() -> Optional[int]:
+    """Best-effort process CPU affinity count via psutil.
+
+    psutil supports per-process CPU affinity on Linux and Windows. On platforms where
+    affinity is unsupported (e.g. most macOS builds), this returns None.
+
+    This is used as a portability fallback for CPU counting when os.sched_getaffinity
+    and os.process_cpu_count are unavailable.
+    """
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        proc = psutil.Process()
+    except Exception:
+        return None
+
+    fn = getattr(proc, 'cpu_affinity', None)
+    if not callable(fn):
+        return None
+
+    try:
+        cpus = fn()
+    except Exception:
+        return None
+
+    if not cpus:
+        return None
+
+    try:
+        n = int(len(cpus))
+    except Exception:
+        return None
+
+    return int(n) if n > 0 else None
+
+
+def _windows_process_affinity_cpu_count() -> Optional[int]:
+    """Best-effort process CPU count on Windows respecting affinity / processor groups.
+
+    - Prefer GetProcessAffinityMask when available.
+    - Fall back to processor-group counts for systems with >64 logical processors.
+
+    Note: this is only used when psutil and os.process_cpu_count are unavailable.
+    """
+
+    if platform.system() != 'Windows':
+        return None
+
+    try:
+        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+    # 1) Process affinity mask (covers the current processor group).
+    try:
+        get_proc = getattr(k32, 'GetCurrentProcess', None)
+        get_mask = getattr(k32, 'GetProcessAffinityMask', None)
+        if callable(get_proc) and callable(get_mask):
+            h = get_proc()
+            proc_mask = ctypes.c_size_t(0)
+            sys_mask = ctypes.c_size_t(0)
+            ok = int(get_mask(h, ctypes.byref(proc_mask), ctypes.byref(sys_mask)))
+            if ok:
+                m = int(proc_mask.value)
+                if m:
+                    return int(m.bit_count())
+    except Exception:
+        pass
+
+    # 2) Processor groups (Windows Server / workstations with many cores).
+    try:
+        get_group_cnt = getattr(k32, 'GetActiveProcessorGroupCount', None)
+        get_group_procs = getattr(k32, 'GetActiveProcessorCount', None)
+        if not (callable(get_group_cnt) and callable(get_group_procs)):
+            return None
+
+        group_count = int(get_group_cnt())
+        if group_count <= 0:
+            return None
+
+        # Try to restrict to the groups this process is allowed to run on.
+        groups: list[int] | None = None
+        get_pg_aff = getattr(k32, 'GetProcessGroupAffinity', None)
+        if callable(get_pg_aff):
+            try:
+                h = getattr(k32, 'GetCurrentProcess', lambda: None)()
+                count = ctypes.c_ushort(0)
+                arr = (ctypes.c_ushort * int(group_count))()
+                ok = int(get_pg_aff(h, ctypes.byref(count), arr))
+                if ok:
+                    ng = int(count.value)
+                    if ng > 0:
+                        groups = [int(arr[i]) for i in range(ng)]
+            except Exception:
+                groups = None
+
+        if not groups:
+            groups = list(range(int(group_count)))
+        total = 0
+        for g in groups:
+            c = None
+            with contextlib.suppress(Exception):
+                c = int(get_group_procs(ctypes.c_ushort(int(g))))
+            if not c:
+                with contextlib.suppress(Exception):
+                    c = int(get_group_procs(int(g)))
+            if c:
+                total += int(c)
+
+        return int(total) if total > 0 else None
+    except Exception:
+        return None
+
+
+def _darwin_sysctl_cpu_count() -> Optional[int]:
+    """Best-effort logical CPU count on macOS via sysctl.
+
+    This is a fallback for cases where os.cpu_count() returns None.
+    """
+
+    if platform.system() != 'Darwin':
+        return None
+
+    try:
+        libc = ctypes.CDLL('libc.dylib')
+    except Exception:
+        return None
+
+    sysctlbyname = getattr(libc, 'sysctlbyname', None)
+    if sysctlbyname is None:
+        return None
+
+    try:
+        sysctlbyname.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_size_t),
+            ctypes.c_void_p,
+            ctypes.c_size_t,
+        ]
+        sysctlbyname.restype = ctypes.c_int
+    except Exception:
+        pass
+
+    for name in (b'hw.logicalcpu', b'hw.ncpu'):
+        try:
+            val = ctypes.c_int(0)
+            size = ctypes.c_size_t(ctypes.sizeof(val))
+            ret = int(sysctlbyname(name, ctypes.byref(val), ctypes.byref(size), None, 0))
+            if ret == 0:
+                n = int(val.value)
+                if n > 0:
+                    return int(n)
+        except Exception:
+            continue
+
+    return None
+
 def process_cpu_count() -> int:
     """Best-effort CPU count usable by this process/thread.
 
@@ -276,6 +439,27 @@ def process_cpu_count() -> int:
     if n is None:
         with contextlib.suppress(Exception):
             n = max(1, len(os.sched_getaffinity(0)))
+
+    # Cross-platform affinity (Windows / Linux) via psutil
+    if n is None:
+        with contextlib.suppress(Exception):
+            v = _psutil_process_affinity_cpu_count()
+            if isinstance(v, int) and v > 0:
+                n = int(v)
+
+    # Windows-only affinity / processor-group fallback (no psutil)
+    if n is None and platform.system() == 'Windows':
+        with contextlib.suppress(Exception):
+            v = _windows_process_affinity_cpu_count()
+            if isinstance(v, int) and v > 0:
+                n = int(v)
+
+    # macOS sysctl fallback for rare cases where os.cpu_count() is None
+    if n is None and platform.system() == 'Darwin':
+        with contextlib.suppress(Exception):
+            v = _darwin_sysctl_cpu_count()
+            if isinstance(v, int) and v > 0:
+                n = int(v)
 
     # Last resort
     if n is None:
@@ -363,15 +547,10 @@ class WorkerPolicy:
         dev_type, nacc = cls._detect_accelerator()
         is_accel = bool(nacc and int(nacc) > 0)
 
-        def _read_int_env(keys: Sequence[str], default: int) -> int:
-            return env_first_int(tuple(keys), int(default))
-        def _read_float_env(keys: Sequence[str], default: float) -> float:
-            return env_first_float(tuple(keys), float(default))
-
         local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
         local_world_guess = max(
             1,
-            _read_int_env(
+            env_first_int(
                 ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
                 local_world_guess,
             ),
@@ -409,7 +588,7 @@ class WorkerPolicy:
         # Split the thread budget across *local* processes whenever we have
         # multiple ranks on a node (GPU or CPU DDP). This avoids oversubscription.
         distribute = (int(local_world_guess) > 1)
-        distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute)))
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute)))
         thread_cap = int(node_thread_cap)
         if distribute:
             thread_cap = max(2, int(node_thread_cap) // max(1, int(local_world_guess)))
@@ -424,15 +603,15 @@ class WorkerPolicy:
             hard = int(lp.hard_inflight_batches(dev_type))
             soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
 
-        soft_auto_enabled = bool(_read_int_env(("STNET_SOFT_INFLIGHT_AUTO",), 1))
+        soft_auto_enabled = bool(env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1))
         soft_inflight_max_default = (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
-        soft_inflight_max = max(8, _read_int_env(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
-        soft_inflight_explicit = _read_int_env(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        soft_inflight_max = max(8, env_first_int(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
+        soft_inflight_explicit = env_first_int(("STNET_SOFT_INFLIGHT_CAP",), 0)
         if soft_inflight_explicit > 0:
             soft_inflight = max(1, int(soft_inflight_explicit))
         elif soft_auto_enabled:
-            soft_base = max(0, _read_int_env(("STNET_SOFT_INFLIGHT_BASE",), 2))
-            soft_div = max(1, _read_int_env(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
             auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
             soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
 
@@ -788,7 +967,7 @@ def system_info() -> Tuple[str, str, str, str]:
 
 def cpu_info(max_bytes: Optional[int] = None) -> str:
     names: List[str] = []
-    total = os.cpu_count() or 1
+    total = process_cpu_count()
     brand = ""
     with contextlib.suppress(Exception):
         import cpuinfo
@@ -1254,18 +1433,15 @@ class Thread:
         except Exception:
             self._nogil = False
 
-        def _read_int_env(keys, default):
-            return env_first_int(tuple(keys), int(default))
-
         flush_default = 64 if self._nogil else 1
         sample_default = 8 if self._nogil else 1
         self._flush_every = max(
             1,
-            min(1024, _read_int_env(("STNET_TLB_FLUSH_EVERY", "STNET_TLB_FLUSH"), flush_default)),
+            min(1024, env_first_int(("STNET_TLB_FLUSH_EVERY", "STNET_TLB_FLUSH"), flush_default)),
         )
         self._sample_every = max(
             1,
-            min(1024, _read_int_env(("STNET_TLB_SAMPLE_EVERY", "STNET_TLB_SAMPLE"), sample_default)),
+            min(1024, env_first_int(("STNET_TLB_SAMPLE_EVERY", "STNET_TLB_SAMPLE"), sample_default)),
         )
         self.tune_threads(io_workers, initial=True)
 
@@ -1580,9 +1756,6 @@ class Thread:
                 ),
             )
             self._io_workers = tuned_workers
-            def _read_int_env(keys, default):
-                return env_first_int(tuple(keys), int(default))
-
             cap_mult = 3 if self._nogil else 2
             with contextlib.suppress(Exception):
                 v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
@@ -1595,12 +1768,12 @@ class Thread:
 
             local_world = max(
                 1,
-                _read_int_env(
+                env_first_int(
                     ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
                     1,
                 ),
             )
-            distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
+            distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
             thread_cap = int(node_thread_cap)
             if distribute and local_world > 1:
                 thread_cap = max(2, int(node_thread_cap) // int(local_world))
@@ -1645,9 +1818,6 @@ class Thread:
         cpus = max(1, len(self._allowed_cpus))
         workers = max(1, self._io_workers)
 
-        def _read_int_env(keys, default):
-            return env_first_int(tuple(keys), int(default))
-
         cap_mult = 3 if self._nogil else 2
         with contextlib.suppress(Exception):
             v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
@@ -1660,12 +1830,12 @@ class Thread:
 
         local_world = max(
             1,
-            _read_int_env(
+            env_first_int(
                 ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
                 1,
             ),
         )
-        distribute = bool(_read_int_env(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(local_world > 1)))
         thread_cap = int(node_thread_cap)
         if distribute and local_world > 1:
             thread_cap = max(2, int(node_thread_cap) // int(local_world))
