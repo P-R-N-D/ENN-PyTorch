@@ -85,7 +85,7 @@ from stnet.backend.system import optimize_threads
 
 # 1) Build a config and model
 cfg = ModelConfig(
-    depth=4,
+    d_model=128,
     heads=4,
     device="cuda" if torch.cuda.is_available() else "cpu",
     # AMP dtype negotiation guard band: safety_margin = 2**n (default n=3 -> margin=8)

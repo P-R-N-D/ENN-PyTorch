@@ -162,22 +162,29 @@ def _apply_norm_fp16_safe(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def _graph_break() -> None:
-    with contextlib.suppress(Exception):
-        try:
-            import torch._inductor as _inductor
+    # Only break graphs when we are actually inside a torch.compile() trace.
+    try:
+        import torch._dynamo as _dynamo
 
-            gb = getattr(_inductor, "graph_break", None)
-            if callable(gb):
-                gb()
-                return
-        except Exception:
-            pass
-        try:
-            import torch._dynamo as _dynamo
+        if not _dynamo.is_compiling():
+            return
+    except Exception:
+        return
 
-            _dynamo.graph_break()
-        except Exception:
-            pass
+    try:
+        import torch._inductor as _inductor
+
+        gb = getattr(_inductor, "graph_break", None)
+        if callable(gb):
+            gb()
+            return
+    except Exception:
+        pass
+
+    try:
+        _dynamo.graph_break()
+    except Exception:
+        pass
 
 class PointTransformer(nn.Module):
 
@@ -1004,7 +1011,7 @@ class Subcontext(nn.Module):
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
         self.out_dim = int(math.prod(self.out_shape) if self.out_shape else 1)
-        self.d_model = int(config.depth)
+        self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
         self.modeling_type = _coerce_modeling_types(config.modeling_type)
         self.spatial_tokens = max(1, int(config.spatial_latents))
@@ -1260,6 +1267,44 @@ class Scaler(nn.Module):
         self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
         self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
 
+        # Cache device/dtype-converted stats to avoid per-forward allocations.
+        # These caches are ephemeral and intentionally excluded from state_dict.
+        self._stats_cache_lock = threading.Lock()
+        self._stats_cache_max = 8
+        self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _invalidate_stats_cache(self) -> None:
+        with self._stats_cache_lock:
+            self._x_stats_cache.clear()
+            self._y_stats_cache.clear()
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
+        super()._apply(fn)
+        self._invalidate_stats_cache()
+        return self
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._invalidate_stats_cache()
+
     @torch.no_grad()
     def update_x(self, x: torch.Tensor) -> None:
         if x.numel() == 0:
@@ -1278,6 +1323,7 @@ class Scaler(nn.Module):
             self.x_std.resize_(std.shape)
         self.x_mean.copy_(mean)
         self.x_std.copy_(std)
+        self._invalidate_stats_cache()
 
     @torch.no_grad()
     def update_y(self, y: torch.Tensor) -> None:
@@ -1297,6 +1343,7 @@ class Scaler(nn.Module):
             self.y_std.resize_(std.shape)
         self.y_mean.copy_(mean)
         self.y_std.copy_(std)
+        self._invalidate_stats_cache()
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
@@ -1305,24 +1352,30 @@ class Scaler(nn.Module):
             feat_dim = x.shape[0]
         else:
             feat_dim = x.shape[-1]
-        with torch.no_grad():
-            if self.x_mean.numel() == 1 and feat_dim != 1:
-                self.x_mean.resize_(feat_dim)
-                self.x_std.resize_(feat_dim)
-                self.x_mean.zero_()
-                self.x_std.fill_(1.0)
-            elif self.x_mean.numel() != feat_dim:
-                raise RuntimeError(
-                    "Scaler.normalize_x: feature dimension mismatch: "
-                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
-                )
-        mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
-        std_b = self.x_std.to(device=x.device, dtype=x.dtype)
+        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+            raise RuntimeError(
+                "Scaler.normalize_x: feature dimension mismatch: "
+                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+            )
+
+        key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
+        cached = None
+        with self._stats_cache_lock:
+            cached = self._x_stats_cache.get(key)
+        if cached is None:
+            mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
+            std_b = self.x_std.to(device=x.device, dtype=x.dtype)
+            with self._stats_cache_lock:
+                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+                    self._x_stats_cache.clear()
+                self._x_stats_cache[key] = (mean_b, std_b)
+        else:
+            mean_b, std_b = cached
         if x.dim() == 1:
             return (x - mean_b) / (std_b + self.eps)
         view_shape = [1] * (x.dim() - 1) + [-1]
-        mean = mean_b.view(*view_shape)
-        std = std_b.view(*view_shape)
+        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
         return (x - mean) / (std + self.eps)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
@@ -1332,18 +1385,33 @@ class Scaler(nn.Module):
             feat_dim = x_scaled.shape[0]
         else:
             feat_dim = x_scaled.shape[-1]
-        if self.x_mean.numel() not in (feat_dim, 1):
+        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
             raise RuntimeError(
                 "Scaler.denormalize_x: feature dimension mismatch: "
                 f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
             )
-        mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
-        std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
+        key = (
+            x_scaled.device.type,
+            int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
+            x_scaled.dtype,
+        )
+        cached = None
+        with self._stats_cache_lock:
+            cached = self._x_stats_cache.get(key)
+        if cached is None:
+            mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
+            std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
+            with self._stats_cache_lock:
+                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+                    self._x_stats_cache.clear()
+                self._x_stats_cache[key] = (mean_b, std_b)
+        else:
+            mean_b, std_b = cached
         if x_scaled.dim() == 1:
             return x_scaled * (std_b + self.eps) + mean_b
         view_shape = [1] * (x_scaled.dim() - 1) + [-1]
-        std = std_b.view(*view_shape)
-        mean = mean_b.view(*view_shape)
+        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
         return x_scaled * (std + self.eps) + mean
 
     def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1359,6 +1427,7 @@ class Scaler(nn.Module):
                     self.y_std.resize_(std_flat.shape)
                 self.y_mean.copy_(mean_flat)
                 self.y_std.copy_(std_flat)
+            self._invalidate_stats_cache()
             mean = self.y_mean
             std = self.y_std
         return mean, std
@@ -1375,9 +1444,24 @@ class Scaler(nn.Module):
             y_flat = y.view(y.shape[0], -1)
             batch_first = True
 
-        mean, std = self._y_stats_vector()
-        mean = mean.to(device=y_flat.device, dtype=y_flat.dtype)
-        std = std.to(device=y_flat.device, dtype=y_flat.dtype)
+        mean_vec, std_vec = self._y_stats_vector()
+        key = (
+            y_flat.device.type,
+            int(y_flat.device.index) if y_flat.device.index is not None else -1,
+            y_flat.dtype,
+        )
+        cached = None
+        with self._stats_cache_lock:
+            cached = self._y_stats_cache.get(key)
+        if cached is None:
+            mean = mean_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+            std = std_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+            with self._stats_cache_lock:
+                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+                    self._y_stats_cache.clear()
+                self._y_stats_cache[key] = (mean, std)
+        else:
+            mean, std = cached
 
         if mean.numel() == 1 and std.numel() == 1:
             z_flat = (y_flat - mean) / (std + self.eps)
@@ -1406,9 +1490,24 @@ class Scaler(nn.Module):
             z_flat = z.view(z.shape[0], -1)
             batch_first = True
 
-        mean, std = self._y_stats_vector()
-        mean = mean.to(device=z_flat.device, dtype=z_flat.dtype)
-        std = std.to(device=z_flat.device, dtype=z_flat.dtype)
+        mean_vec, std_vec = self._y_stats_vector()
+        key = (
+            z_flat.device.type,
+            int(z_flat.device.index) if z_flat.device.index is not None else -1,
+            z_flat.dtype,
+        )
+        cached = None
+        with self._stats_cache_lock:
+            cached = self._y_stats_cache.get(key)
+        if cached is None:
+            mean = mean_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+            std = std_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+            with self._stats_cache_lock:
+                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+                    self._y_stats_cache.clear()
+                self._y_stats_cache[key] = (mean, std)
+        else:
+            mean, std = cached
 
         if mean.numel() == 1 and std.numel() == 1:
             y_flat = z_flat * std + mean
@@ -1717,8 +1816,10 @@ class History(nn.Module):
                 tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
                 tz_name = tzinfo.tzname(now) if tzinfo is not None else None
                 tz_env = None
-                with contextlib.suppress(Exception):
+                try:
                     tz_env = _time.tzname[0]
+                except (AttributeError, IndexError, TypeError):
+                    tz_env = None
                 tz = tz_key or tz_name or tz_env or "UTC"
                 self.timezone = str(tz)
             except Exception:
@@ -2056,6 +2157,13 @@ class Root(nn.Module):
                 device_name = "cpu"
             self._device = torch.device(device_name)
         self.scaler = Scaler().to(self._device)
+        # Avoid shape mutation inside forward(): ensure x stats match feature dimension up front.
+        with torch.no_grad():
+            if self.scaler.x_mean.numel() != self.in_dim:
+                self.scaler.x_mean.resize_(self.in_dim)
+                self.scaler.x_std.resize_(self.in_dim)
+                self.scaler.x_mean.zero_()
+                self.scaler.x_std.fill_(1.0)
         self.logger = History()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = (
@@ -2069,7 +2177,7 @@ class Root(nn.Module):
         except Exception:
             bucket = 64
         controller = Context(
-            int(config.depth),
+            int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
             mlp_ratio=float(getattr(config, "mlp_ratio", 4.0)),
@@ -2164,11 +2272,8 @@ class Root(nn.Module):
                     "torch.compile failed for decode head; continuing without compilation",
                     exc_info=True,
                 )
-            with contextlib.suppress(Exception):
-                gc.collect()
-            with contextlib.suppress(Exception):
-                if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
+            if getattr(self._device, "type", None) == "cuda":
+                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
 
             if compile_heavy_submodules:
                 try:
@@ -2189,11 +2294,8 @@ class Root(nn.Module):
                         "torch.compile failed for processor.temporal_net; continuing eagerly",
                         exc_info=True,
                     )
-                with contextlib.suppress(Exception):
-                    gc.collect()
-            with contextlib.suppress(Exception):
-                if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
+            if getattr(self._device, "type", None) == "cuda":
+                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
 
             if compile_heavy_submodules:
                 try:
@@ -2214,11 +2316,8 @@ class Root(nn.Module):
                         "torch.compile failed for processor.perception; continuing eagerly",
                         exc_info=True,
                     )
-                with contextlib.suppress(Exception):
-                    gc.collect()
-            with contextlib.suppress(Exception):
-                if getattr(self._device, "type", None) == "cuda":
-                    empty_device_cache(device=self._device, do_gc=False, min_interval_s=0.0)
+            if getattr(self._device, "type", None) == "cuda":
+                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
 
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
@@ -2283,21 +2382,31 @@ class Root(nn.Module):
             return 64
         b = int(X.shape[0] if X.ndim > 0 else 1)
         hard_max = 64
-        with contextlib.suppress(Exception):
-            hard_max = int(os.environ.get("STNET_MICROBATCH_MAX", hard_max))
+        try:
+            v = os.environ.get("STNET_MICROBATCH_MAX")
+            if v is not None and str(v).strip():
+                hard_max = int(v)
+        except (TypeError, ValueError):
+            pass
         hard_max = max(1, min(hard_max, b))
         per_sample = 0
         env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
-        with contextlib.suppress(Exception):
-            if env_ps:
+        if env_ps:
+            try:
                 per_sample = int(env_ps)
+            except (TypeError, ValueError):
+                per_sample = 0
         if per_sample <= 0:
             one = X[:1]
             bytes_per_sample = int(one.nelement()) * int(one.element_size())
             per_sample = int(bytes_per_sample * 8)
         stage_div = 4
-        with contextlib.suppress(Exception):
-            stage_div = max(1, int(os.environ.get("STNET_MICROBATCH_STAGE_DIV", stage_div)))
+        try:
+            v = os.environ.get("STNET_MICROBATCH_STAGE_DIV")
+            if v is not None and str(v).strip():
+                stage_div = max(1, int(v))
+        except (TypeError, ValueError):
+            stage_div = 4
         per_sample = max(1, int(per_sample // stage_div))
 
         mb_size = _auto_microbatch(
@@ -2332,6 +2441,10 @@ class Root(nn.Module):
                 raise ValueError(f"{stage}: pad_to ({pad_i}) must be >= microbatch ({mb_i})")
 
         out_bufs: Optional[List[torch.Tensor]] = None
+        # Padding buffers can be safely reused only when gradients are disabled.
+        # When autograd is on, reuse may corrupt saved tensors needed for backward.
+        reuse_pad_buffer = not torch.is_grad_enabled()
+        pad_buf: Optional[torch.Tensor] = None
 
         for s in range(0, total_b, mb_i):
             x_slice = inp[s : s + mb_i]
@@ -2342,8 +2455,21 @@ class Root(nn.Module):
             x_in = x_slice
             did_pad = False
             if pad_i is not None and slice_n < pad_i:
-                x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
-                x_in[:slice_n].copy_(x_slice)
+                if reuse_pad_buffer:
+                    want_shape = (pad_i, *x_slice.shape[1:])
+                    if (
+                        pad_buf is None
+                        or pad_buf.shape != want_shape
+                        or pad_buf.dtype != x_slice.dtype
+                        or pad_buf.device != x_slice.device
+                    ):
+                        pad_buf = x_slice.new_empty(want_shape)
+                    pad_buf.zero_()
+                    pad_buf[:slice_n].copy_(x_slice)
+                    x_in = pad_buf
+                else:
+                    x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
+                    x_in[:slice_n].copy_(x_slice)
                 did_pad = True
 
             out = run_fn(x_in)
@@ -2419,9 +2545,15 @@ class Root(nn.Module):
         if return_loss is not None and not isinstance(return_loss, bool):
             raise TypeError("return_loss must be a bool or None")
 
+        grad_enabled = torch.is_grad_enabled()
+        infer_mode = not grad_enabled
+        sanitize_inplace = bool(sanitize_nan and infer_mode)
+
         def _sanitize(t: torch.Tensor) -> torch.Tensor:
             if not sanitize_nan:
                 return t
+            if sanitize_inplace and (torch.is_floating_point(t) or torch.is_complex(t)):
+                return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
             return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
@@ -2461,13 +2593,7 @@ class Root(nn.Module):
             x_raw = x_raw.to(device=device, non_blocking=True)
 
         x_scaled = self.scaler.normalize_x(x_raw)
-        try:
-            import torch._dynamo as _dynamo
-
-            if _dynamo.is_compiling():
-                _dynamo.graph_break()
-        except Exception:
-            pass
+        _graph_break()
 
         meta = None
         try:
@@ -2577,8 +2703,7 @@ class Root(nn.Module):
             or (local_loss is not None)
         )
         has_supervision = labels_flat is not None and has_any_loss
-        is_train_path = bool(self.training and torch.is_grad_enabled() and has_supervision)
-        infer_mode = not is_train_path
+        is_train_path = bool(self.training and grad_enabled and has_supervision)
 
         _did_unshard_processor = False
         _unshard = getattr(self.processor, "unshard", None)
@@ -2619,18 +2744,11 @@ class Root(nn.Module):
                 self._auto_microbatch_pending = False
             mb = max(1, min(int(b), int(self.microbatch) or int(b)))
     
-            if is_train_path:
-                self.processor.train()
-                self.controller.train()
-            else:
-                self.processor.eval()
-                self.controller.eval()
-
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            enc_ctx = Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
+            enc_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
@@ -2693,9 +2811,7 @@ class Root(nn.Module):
             residual_context: torch.Tensor
             # --- Controller stage ---
             _graph_break()
-            controller_ctx = (
-                Gradient.inference(self.controller) if infer_mode else torch.enable_grad()
-            )
+            controller_ctx = Gradient.inference(self.controller) if infer_mode else contextlib.nullcontext()
             with controller_ctx:
 
                 def _run_controller_chunk(chunk: torch.Tensor) -> torch.Tensor:
@@ -2716,13 +2832,11 @@ class Root(nn.Module):
                 )
 
             refined_tokens = _sanitize(refined_tokens)
-            tokens_for_decode = refined_tokens.detach() if infer_mode else refined_tokens
+            tokens_for_decode = refined_tokens
 
             # --- Decode stage ---
             _graph_break()
-            processor_ctx = (
-                Gradient.inference(self.processor) if infer_mode else torch.enable_grad()
-            )
+            processor_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
 
                 dc = getattr(self, "_decode_compiled", None)

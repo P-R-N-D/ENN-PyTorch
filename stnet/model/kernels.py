@@ -122,6 +122,22 @@ def _is_bshd_contiguous(tensor: torch.Tensor) -> bool:
     )
 
 
+def reshape_for_mha(
+    x: torch.Tensor,
+    batch: int,
+    heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Reshape (B, N, H*Dh) into (B, H, N, Dh) for attention kernels."""
+    if x.dim() != 3:
+        raise ValueError(f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}")
+    return (
+        x.reshape(int(batch), -1, int(heads), int(head_dim))
+        .transpose(1, 2)
+        .contiguous()
+    )
+
+
 def _dpa_sequence_length(
     query: torch.Tensor, key: torch.Tensor, batch_first: bool
 ) -> tuple[int, int, int]:

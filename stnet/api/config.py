@@ -119,7 +119,7 @@ class ModelConfig:
     device: Optional[torch.device | str] = None
     dropout: float = 0.1
     normalization_method: str = "layernorm"
-    depth: int = 128
+    d_model: int = 128
     heads: int = 4
     spatial_depth: int = 4
     temporal_depth: int = 4
@@ -238,9 +238,9 @@ def coerce_model_config(
         "normalization_method", getattr(defaults, "normalization_method")
     )
     resolved["normalization_method"] = str(norm_val)
-    resolved["depth"] = _coerce_int(
-        filtered.get("depth", getattr(defaults, "depth")),
-        name="depth",
+    resolved["d_model"] = _coerce_int(
+        filtered.get("d_model", getattr(defaults, "d_model")),
+        name="d_model",
         minimum=1,
     )
     resolved["heads"] = _coerce_int(

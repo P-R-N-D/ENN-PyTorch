@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import gc
 import importlib
+import logging
 from dataclasses import dataclass, replace
 import itertools
 import multiprocessing
@@ -47,6 +48,40 @@ _FP32_PRECISION_LOCK = threading.Lock()
 _EMPTY_CACHE_LOCK = threading.Lock()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: Dict[Tuple[str, int], float] = {}
 
+_LOGGER = logging.getLogger(__name__)
+
+
+def _log_info(logger: Optional[Any], msg: str) -> None:
+    """Best-effort info logging with an optional user-provided logger."""
+    if logger is None:
+        _LOGGER.info(msg)
+        return
+    try:
+        if callable(logger):
+            logger(msg)
+        elif hasattr(logger, "info"):
+            logger.info(msg)
+        else:
+            _LOGGER.info(msg)
+    except Exception:
+        _LOGGER.info(msg)
+
+
+def _log_debug(logger: Optional[Any], msg: str) -> None:
+    """Best-effort debug logging with an optional user-provided logger."""
+    if logger is None:
+        _LOGGER.debug(msg)
+        return
+    try:
+        if callable(logger):
+            logger(msg)
+        elif hasattr(logger, "debug"):
+            logger.debug(msg)
+        else:
+            _LOGGER.debug(msg)
+    except Exception:
+        _LOGGER.debug(msg)
+
 
 def _empty_cache_device_key(
     device: Optional[Union[torch.device, str]] = None,
@@ -59,28 +94,28 @@ def _empty_cache_device_key(
     if device is None:
         return ("all", -1)
 
-    dev: Optional[torch.device] = None
-    with contextlib.suppress(Exception):
+    try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
-    if dev is None:
+    except (TypeError, ValueError, RuntimeError):
         return ("all", -1)
 
-    idx = -1
-    with contextlib.suppress(Exception):
-        if dev.index is not None:
-            idx = int(dev.index)
+    idx = int(dev.index) if dev.index is not None else -1
 
     # Best-effort fill-in for "cuda"/"xpu" when index is omitted.
     if dev.type == "cuda" and idx < 0:
-        with contextlib.suppress(Exception):
+        try:
             if torch.cuda.is_available():
                 idx = int(torch.cuda.current_device())
-    if dev.type == "xpu" and idx < 0:
-        with contextlib.suppress(Exception):
+        except (RuntimeError, TypeError, ValueError):
+            idx = -1
+    elif dev.type == "xpu" and idx < 0:
+        try:
             xpu = getattr(torch, "xpu", None)
             cur = getattr(xpu, "current_device", None) if xpu is not None else None
             if callable(cur):
                 idx = int(cur())
+        except (RuntimeError, TypeError, ValueError):
+            idx = -1
 
     return (str(dev.type), int(idx))
 
