@@ -13,6 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
+from ..data.datatype import env_str
+
 try:
     from torch.nn import StochasticDepth as _TorchStochasticDepth
 except Exception:
@@ -70,6 +72,22 @@ _DILATED_MASK_CACHE_ENTRY_MAX_BYTES = int(
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = int(
     os.environ.get("STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", str(128 * 1024 * 1024))
 )
+
+
+def _stnet_checkpoint_mode() -> str:
+    raw = str(env_str("STNET_CHECKPOINT_MODE") or env_str("STNET_CHECKPOINT") or "ffn").strip().lower()
+    if raw in {"0", "false", "none", "off", "disable", "disabled"}:
+        return "none"
+    if raw in {"ffn", "mlp", "feedforward", "feed_forward"}:
+        return "ffn"
+    if raw in {"attn", "attention"}:
+        return "attn"
+    if raw in {"all", "full"}:
+        return "all"
+    return "ffn"
+
+
+_STNET_CHECKPOINT_MODE = _stnet_checkpoint_mode()
 
 from ..functional.profiler import FLOP_PROFILER
 from ..backend.system import empty_device_cache
@@ -1003,7 +1021,13 @@ class DilatedAttention(nn.Module):
         x_out = x + self.dropout(attn_out)
         res2 = x_out
         x_out = self.norm2(x_out)
-        if self.training and torch.is_grad_enabled():
+
+        do_ckpt_ffn = (
+            self.training
+            and torch.is_grad_enabled()
+            and _STNET_CHECKPOINT_MODE in {"ffn", "all"}
+        )
+        if do_ckpt_ffn:
             try:
                 x_out = _checkpoint(
                     self.ffn,

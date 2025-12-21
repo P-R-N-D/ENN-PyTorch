@@ -15,7 +15,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, Iterator
 
 import torch
 import torch.distributed
@@ -220,7 +220,7 @@ except Exception:
     _psutil = None
 
 from ..api.config import RuntimeConfig, coerce_model_config
-from ..data.collections import Cache, Pool
+from ..data.collections import Cache, Pool, LazyTensor
 from ..data.datatype import to_tensordict, to_torch_tensor
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
@@ -756,123 +756,14 @@ def _set_backend(device: torch.device) -> None:
             os.environ.setdefault("TP_SOCKET_IFNAME", iface)
 
 
-def _iter_source_paths(obj: Any):
-    """Yield memmap directory paths from a (possibly nested) ops.sources object."""
-    if obj is None:
-        return
-    if isinstance(obj, str):
-        yield obj
-        return
-    if isinstance(obj, dict):
-        # common form: {"kind": "memmap", "path": "..."}
-        if obj.get("kind") == "memmap" and isinstance(obj.get("path"), str):
-            yield obj["path"]
-            return
-        # otherwise: recurse values
-        for v in obj.values():
-            yield from _iter_source_paths(v)
-        return
-    if isinstance(obj, (list, tuple)):
-        for v in obj:
-            yield from _iter_source_paths(v)
-        return
-
+def _iter_source_paths(obj: Any) -> Iterator[str]:
+    yield from LazyTensor.iter_source_paths(obj)
 
 def _merge_meta_dicts(metas: list[dict]) -> dict:
-    """Merge multiple meta.json dicts with conservative scale negotiation.
-
-    - feature_dim / label_shape must match.
-    - scale_max_abs is merged by max.
-    - scale_min_value is merged by min (ignoring None).
-    - scale_max_value is merged by max (ignoring None).
-    - scale_min_positive is merged by min (ignoring None).
-    - has_scale / has_nonfinite are merged by OR.
-    - is_negotiable is merged by AND (if present).
-    - underflow_action is merged by strictest: forbid > warn > allow.
-    """
-    if not metas:
-        return {}
-    base = dict(metas[0])
-
-    def _strictest_underflow(a: str | None, b: str | None) -> str | None:
-        order = {"allow": 0, "warn": 1, "forbid": 2}
-        if a is None:
-            return b
-        if b is None:
-            return a
-        return a if order.get(a, 1) >= order.get(b, 1) else b
-
-    # sanity dims
-    feature_dim = base.get("feature_dim")
-    label_shape = base.get("label_shape")
-
-    has_scale = bool(base.get("has_scale", False)) or base.get("scale_max_abs") is not None or base.get("scale_min_value") is not None or base.get("scale_max_value") is not None or base.get("scale_min_positive") is not None
-    has_nonfinite = bool(base.get("has_nonfinite", False))
-    max_abs = base.get("scale_max_abs")
-    min_val = base.get("scale_min_value")
-    max_val = base.get("scale_max_value")
-    min_pos = base.get("scale_min_positive")
-    is_integral = base.get("scale_is_integral")
-    is_negotiable = base.get("is_negotiable")
-    underflow_action = base.get("underflow_action")
-
-    for m in metas[1:]:
-        if feature_dim is not None and m.get("feature_dim") is not None and int(m.get("feature_dim")) != int(feature_dim):
-            raise ValueError(f"feature_dim mismatch across sources: {feature_dim} vs {m.get('feature_dim')}")
-        if label_shape is not None and m.get("label_shape") is not None and tuple(m.get("label_shape")) != tuple(label_shape):
-            raise ValueError(f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}")
-
-        has_scale = has_scale or bool(m.get("has_scale", False)) or m.get("scale_max_abs") is not None or m.get("scale_min_value") is not None or m.get("scale_max_value") is not None or m.get("scale_min_positive") is not None
-        has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
-
-        a = m.get("scale_max_abs")
-        if a is not None:
-            max_abs = a if max_abs is None else max(float(max_abs), float(a))
-
-        mn = m.get("scale_min_value")
-        if mn is not None:
-            try:
-                min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
-            except Exception:
-                min_val = mn if min_val is None else min(float(min_val), float(mn))
-
-        mx = m.get("scale_max_value")
-        if mx is not None:
-            try:
-                max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
-            except Exception:
-                max_val = mx if max_val is None else max(float(max_val), float(mx))
-
-        p = m.get("scale_min_positive")
-        if p is not None:
-            min_pos = p if min_pos is None else min(float(min_pos), float(p))
-
-        i = m.get("scale_is_integral")
-        if i is not None:
-            is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
-
-        n = m.get("is_negotiable")
-        if n is not None:
-            is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
-
-        underflow_action = _strictest_underflow(underflow_action, m.get("underflow_action"))
-
-    base["has_scale"] = has_scale
-    base["has_nonfinite"] = has_nonfinite
-    base["scale_max_abs"] = max_abs
-    base["scale_min_value"] = min_val
-    base["scale_max_value"] = max_val
-    base["scale_min_positive"] = min_pos
-    base["scale_is_integral"] = is_integral
-    base["is_negotiable"] = is_negotiable
-    base["underflow_action"] = underflow_action
-    return base
-
+    return LazyTensor.merge_meta_dicts(metas)
 
 def _from_meta(memmap_dir: str) -> Dict[str, Any]:
-    meta_path = os.path.join(memmap_dir, "meta.json")
-    with open(meta_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return LazyTensor.from_meta(memmap_dir)
 
 
 def _unify_param_dtype(
@@ -916,48 +807,11 @@ def _first_source_path(obj: Any) -> str:
 
 
 def _merge_meta_infos(sources: Any) -> Dict[str, Any]:
-    metas: list[dict] = []
-    for path in _iter_source_paths(sources):
-        try:
-            metas.append(_from_meta(path))
-        except Exception:
-            continue
-    if not metas:
-        return {}
-    return _merge_meta_dicts(metas)
+    return LazyTensor.merge_meta_infos(sources)
 
 
 def _expand(sources: Any) -> Any:
-    def _expand_from_root(spec: Any) -> Tuple[Any, bool]:
-        if not isinstance(spec, dict) or "path" not in spec or "kind" not in spec:
-            return spec, False
-        root = os.fspath(spec.get("path") or "")
-        mn_path = os.path.join(root, "multinode.json")
-        if not os.path.isfile(mn_path):
-            return spec, False
-        with open(mn_path, "r", encoding="utf-8") as _f:
-            _spec = json.load(_f)
-        if isinstance(_spec, dict):
-            resolved = {
-                str(k): {"kind": "memmap", "path": os.path.join(root, str(v))}
-                for k, v in _spec.items()
-            }
-            return resolved, True
-        if isinstance(_spec, list):
-            resolved = [
-                {"kind": "memmap", "path": os.path.join(root, str(v))} for v in _spec
-            ]
-            return resolved, True
-        return spec, False
-
-    expanded, ok = _expand_from_root(sources)
-    if ok:
-        return expanded
-    if isinstance(sources, (list, tuple)) and len(sources) == 1:
-        expanded, ok = _expand_from_root(sources[0])
-        if ok:
-            return expanded
-    return sources
+    return LazyTensor.expand_sources(sources)
 
 
 def _calibrate_per_sample_mem(
@@ -2217,6 +2071,27 @@ def epochs(
                 )
 
         for epoch_idx in range(int(total_epochs)):
+            # Ensure the training sampler uses a different shuffle ordering each epoch.
+            # This mirrors PyTorch's DistributedSampler best practice:
+            # call sampler.set_epoch(epoch) before creating/iterating the DataLoader iterator.
+            #
+            # We attach per-epoch-capable sampler objects to the (wrapped) loader as
+            # `_stnet_epochables` inside stnet.data.pipeline.fetch()/Session.
+            with contextlib.suppress(Exception):
+                epochables = getattr(train_loader, "_stnet_epochables", None)
+                if epochables is not None:
+                    for obj in epochables:
+                        fn = getattr(obj, "set_epoch", None)
+                        if callable(fn):
+                            fn(int(epoch_idx))
+                else:
+                    # Fallbacks for other loader types (e.g. vanilla DataLoader).
+                    fn = getattr(getattr(train_loader, "sampler", None), "set_epoch", None)
+                    if callable(fn):
+                        fn(int(epoch_idx))
+                    fn = getattr(train_loader, "set_epoch", None)
+                    if callable(fn):
+                        fn(int(epoch_idx))
             if is_distributed():
                 target_module = model.module if hasattr(model, "module") else model
                 distributed_sync(target_module, device=device)
@@ -3582,6 +3457,28 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         )
 
     verbose = bool(getattr(ops, "verbose", False))
+
+    # Determinism + seeding are applied *inside* the runtime worker.
+    det = bool(getattr(ops, "deterministic", False))
+    seed_base = int(getattr(ops, "seed", 42))
+    seed_value = int(seed_base) + int(local_rank)
+
+    with contextlib.suppress(Exception):
+        import random as _random
+        _random.seed(seed_value)
+    with contextlib.suppress(Exception):
+        import numpy as _np
+        _np.random.seed(seed_value)
+    with contextlib.suppress(Exception):
+        torch.manual_seed(seed_value)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed_value)
+
+    with contextlib.suppress(Exception):
+        torch.use_deterministic_algorithms(det, warn_only=False)
+    with contextlib.suppress(Exception):
+        torch.backends.cudnn.deterministic = det
+        torch.backends.cudnn.benchmark = not det
     if ops.mode == "train":
         with contextlib.suppress(Exception):
             if torch.cuda.is_available():
@@ -3941,6 +3838,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 non_blocking_copy=non_blocking_copy,
                 sanitize=True,
                 flatten_features=True,
+                train_shuffle=bool(getattr(ops, "shuffle", True)),
+                seed=int(getattr(ops, "seed", 42)),
                 labels_dtype=param_dtype,
             ).open(
                 train_state=(state_train if restore_dl_state else None),
@@ -4188,6 +4087,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             non_blocking_copy=True,
             sanitize=True,
             flatten_features=True,
+            train_shuffle=False,
+            seed=int(getattr(ops, "seed", 42)),
         ).open()
         data_loader = session.training_loader
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)

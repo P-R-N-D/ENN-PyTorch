@@ -8,8 +8,7 @@ import os
 import random
 import shutil
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
-from collections.abc import Mapping as _MappingABC
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -37,283 +36,12 @@ from ..backend.system import (
     set_multiprocessing_env,
     empty_device_cache,
 )
+from ..data.collections import LazyTensor
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..data.nodes import preload_memmap
 from ..model.nn import History, Root
 from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
-
-
-def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:
-    # Match nodes.preload_memmap behavior:
-    # - default float32 when negotiable
-    # - allow forcing float64 via STNET_MEMMAP_FLOAT_DTYPE=torch.float64
-    req = str(os.environ.get("STNET_MEMMAP_FLOAT_DTYPE", "") or "").strip()
-    if req.startswith("torch."):
-        req = req.split(".", 1)[1]
-    req_dtype = getattr(torch, req, None) if req else None
-    if not isinstance(req_dtype, torch.dtype):
-        req_dtype = torch.float32
-    try:
-        if not torch.is_floating_point(torch.empty((), dtype=req_dtype)):
-            req_dtype = torch.float32
-    except Exception:
-        req_dtype = torch.float32
-    # (필수) dtype는 identity(is) 비교 보장 없음 → 값 비교 사용
-    return torch.float32 if (negotiable and req_dtype != torch.float64) else torch.float64
-
-
-class _KeySliceMappingView(_MappingABC):
-    __slots__ = ("_data", "_keys", "_s", "_e")
-
-    def __init__(self, data: Mapping[Any, Any], keys: Sequence[Any], s: int, e: int):
-        self._data = data
-        self._keys = keys
-        self._s = int(s)
-        self._e = int(e)
-
-    def __len__(self) -> int:
-        n = self._e - self._s
-        return n if n > 0 else 0
-
-    def __iter__(self):
-        for i in range(self._s, self._e):
-            yield self._keys[i]
-
-    def __getitem__(self, k):
-        return self._data[k]
-
-
-def _is_feature_label_batch_mapping(obj: Mapping[Any, Any]) -> bool:
-    """True if `obj` looks like a single (features, labels) batch mapping.
-
-    This prevents mis-classifying a batch dict (keys like 'features'/'labels')
-    as a dataset-mapping input (key->label), which in STNet uses tuple keys.
-
-    We intentionally treat *feature-only* dicts (e.g., {'features': ...}) as
-    batch mappings too, because `predict()` supports missing labels.
-    """
-    if not isinstance(obj, Mapping) or not obj:
-        return False
-    for k in ("features", "X", "labels", "Y", "targets", "target"):
-        if k in obj:
-            return True
-    return False
-
-
-def _write_memmap_streaming_two_pass(
-    *,
-    ds: Dataset,
-    out_dir: str,
-    count: int,
-    get_batch: Callable[[int, int], Any],
-    val_frac: float,
-    seed_value: Optional[int],
-    underflow_action: str,
-    default_label_shape: Optional[Tuple[int, ...]] = None,
-    allow_missing_labels: bool = False,
-    chunk_size: int = 32,
-) -> Tuple[int, Tuple[int, ...]]:
-    os.makedirs(out_dir, exist_ok=True)
-    if count <= 0:
-        raise ValueError("count must be > 0")
-
-    chunk = max(1, min(int(chunk_size), int(count)))
-
-    # 중복 제거: 공통 CPU/contiguous 정규화
-    def _to_cpu_contig(t: torch.Tensor) -> torch.Tensor:
-        t = t.detach()
-        if t.device.type != "cpu":
-            t = t.cpu()
-        if not t.is_contiguous():
-            t = t.contiguous()
-        return t
-
-    def _flat2d_cpu_contig(t: torch.Tensor, n: int) -> torch.Tensor:
-        # 핫픽스: view는 비연속 텐서에서 터질 수 있음 → CPU+contig 보장 후 reshape 사용
-        t_cpu = _to_cpu_contig(t)
-        if t_cpu.ndim == 0:
-            # 핫픽스2: 극단 케이스에서도 reshape가 안전하게 되도록
-            t_cpu = t_cpu.reshape(1)
-        return t_cpu.reshape(int(n), -1)
-
-    # 중복 제거: batch 길이 계산을 한 군데로
-    def _batch_n(x: torch.Tensor) -> int:
-        xd = int(getattr(x, "ndim", 0) or 0)
-        return int(x.shape[0]) if xd > 0 else 1
-
-    stats: Dict[str, Any] = {
-        "has_scale": False,
-        "has_nonfinite": False,
-        "scale_max_abs": None,
-        "scale_min_value": None,
-        "scale_max_value": None,
-        "scale_min_positive": None,
-        "scale_is_integral": None,
-    }
-    in_dim: Optional[int] = None
-    label_shape: Optional[Tuple[int, ...]] = None
-
-    for s in range(0, count, chunk):
-        e = min(count, s + chunk)
-        batch = get_batch(s, e)
-        fx, lb, _, _ = ds.preprocess(batch)
-        n = _batch_n(fx)
-        if n <= 0:
-            continue
-        fx_flat = _flat2d_cpu_contig(fx, n)
-        cur_in_dim = int(fx_flat.shape[1])
-        if in_dim is None:
-            in_dim = cur_in_dim
-        elif cur_in_dim != int(in_dim):
-            raise RuntimeError(f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}")
-
-        if lb is None:
-            if not allow_missing_labels:
-                raise RuntimeError("streaming memmap writer requires labels tensor (non-None)")
-            if default_label_shape is None:
-                raise RuntimeError("labels are missing and default_label_shape was not provided")
-            cur_label_shape = tuple(default_label_shape)
-            # For missing labels, treat scale stats as all-zeros (safe, no allocation).
-            l_stats = {
-                "has_scale": True,
-                "has_nonfinite": False,
-                "scale_max_abs": 0.0,
-                "scale_min_value": 0.0,
-                "scale_max_value": 0.0,
-                "scale_min_positive": None,
-                "scale_is_integral": None,
-            }
-        else:
-            cur_label_shape = tuple(lb.shape[1:])
-            lb_flat = _flat2d_cpu_contig(lb, n)
-            l_stats = Dataset.tensor_scale_stats(lb_flat)
-        if label_shape is None:
-            label_shape = cur_label_shape
-        elif tuple(label_shape) != tuple(cur_label_shape):
-            raise RuntimeError(f"label shape mismatch: expected {label_shape}, got {cur_label_shape}")
-
-        f_stats = Dataset.tensor_scale_stats(fx_flat)
-        stats = Dataset.merge_scale_stats(stats, Dataset.merge_scale_stats(f_stats, l_stats))
-
-    if in_dim is None or label_shape is None:
-        raise RuntimeError("Failed to infer in_dim/label_shape from data")
-
-    # decide storage dtype (float32 if negotiable, else float64)
-    negotiable = Dataset.is_fp32_castable(stats, underflow_action=underflow_action, safety_margin=1.0)
-    store_float = _resolve_memmap_store_float(negotiable=bool(negotiable))
-
-    features_path = os.path.join(out_dir, "features.mmt")
-    labels_path = os.path.join(out_dir, "labels.mmt")
-
-    features_mmt = MemoryMappedTensor.empty((count, int(in_dim)), dtype=store_float, filename=features_path, existsok=True)
-    labels_mmt = MemoryMappedTensor.empty((count, *tuple(label_shape)), dtype=store_float, filename=labels_path, existsok=True)
-
-    # (권장1) missing-label 경로에서 chunk마다 zeros를 새로 만들지 말고 재사용
-    zeros_label_buf: Optional[torch.Tensor] = None
-    if allow_missing_labels:
-        # (권장3) device를 명시적으로 torch.device("cpu")로
-        zeros_label_buf = torch.zeros(
-            (chunk, *tuple(label_shape)),
-            dtype=store_float,
-            device=torch.device("cpu"),
-        )
-
-    # ---- pass 2: write chunks
-    written = 0
-    for s in range(0, count, chunk):
-        e = min(count, s + chunk)
-        batch = get_batch(s, e)
-        fx, lb, _, _ = ds.preprocess(batch)
-        n = _batch_n(fx)
-        if n <= 0:
-            continue
-        fx_flat = _flat2d_cpu_contig(fx, n)
-        if int(fx_flat.shape[1]) != int(in_dim):
-            raise RuntimeError(f"feature dim mismatch: expected {in_dim}, got {int(fx_flat.shape[1])}")
-
-        # dtype 변환은 필요할 때만 (미세 최적화)
-        fx_out = fx_flat if fx_flat.dtype == store_float else fx_flat.to(dtype=store_float)
-        if lb is None:
-            if not allow_missing_labels:
-                raise RuntimeError("streaming memmap writer requires labels tensor (non-None)")
-            if zeros_label_buf is None:
-                raise RuntimeError(
-                    "Internal error: zeros_label_buf missing while allow_missing_labels=True"
-                )
-            lb_out = zeros_label_buf[:n]
-        else:
-            if tuple(lb.shape[1:]) != tuple(label_shape):
-                raise RuntimeError(f"label shape mismatch: expected {label_shape}, got {tuple(lb.shape[1:])}")
-            lb_cpu = _to_cpu_contig(lb)
-            lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
-        features_mmt[s : s + n].copy_(fx_out)
-        labels_mmt[s : s + n].copy_(lb_out)
-        written += n
-
-    if written != int(count):
-        raise RuntimeError(f"memmap written={written}, expected={count}")
-
-    # split metadata (no physical shuffle; sampler should shuffle)
-    val_count = max(0, min(count, int(round(count * float(val_frac)))))
-    train_count = max(0, count - val_count)
-    train_start, train_end = 0, train_count
-    val_start, val_end = train_end, train_end + val_count
-
-    meta_json: Dict[str, Any] = {
-        "N": int(count),
-        "feature_dim": int(in_dim),
-        "features_path": "features.mmt",
-        "labels_path": "labels.mmt",
-        "label_shape": list(label_shape),
-        "features_dtype": str(store_float).replace("torch.", ""),
-        "labels_dtype": str(store_float).replace("torch.", ""),
-        "fractions": [float(1.0 - float(val_frac)), float(val_frac)],
-        "shuffled": False,
-        "shuffle_seed": int(seed_value) if seed_value is not None else None,
-        "shuffle_mode": "none",
-        "train_start": int(train_start),
-        "train_end": int(train_end),
-        "val_start": int(val_start),
-        "val_end": int(val_end),
-        # scale negotiation metadata
-        "has_scale": bool(stats.get("has_scale")),
-        "has_nonfinite": bool(stats.get("has_nonfinite")),
-        "scale_max_abs": stats.get("scale_max_abs"),
-        "scale_min_value": stats.get("scale_min_value"),
-        "scale_max_value": stats.get("scale_max_value"),
-        "scale_min_positive": stats.get("scale_min_positive"),
-        "scale_is_integral": stats.get("scale_is_integral"),
-        "is_negotiable": bool(negotiable),
-        "underflow_action": str(underflow_action),
-    }
-    with open(os.path.join(out_dir, "meta.json"), "w", encoding="utf-8") as f:
-        json.dump(meta_json, f)
-
-    return int(in_dim), tuple(label_shape)
-
-
-def _clear_device_caches() -> None:
-    # Centralized + rate-limited cache clearing.
-    empty_device_cache(do_gc=True)
-
-
-def _reset_process_group() -> None:
-    if not torch.distributed.is_available():
-        return
-    if torch.distributed.is_initialized():
-        with contextlib.suppress(Exception):
-            torch.distributed.destroy_process_group()
-
-
-def _preload_state(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _preload_state(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_preload_state(v) for v in value]
-    if isinstance(value, tuple):
-        return tuple(_preload_state(v) for v in value)
-    return value
 
 
 def _resize_scaler_buffers(model: Any, state: Mapping[str, torch.Tensor]) -> None:
@@ -378,7 +106,8 @@ def train(
     *args: Any,
     epochs: int = 5,
     val_frac: float = 0.1,
-    shuffle: bool = False,
+    shuffle: bool = True,
+    deterministic: bool = False,
     base_lr: float = 0.001,
     weight_decay: float = 0.0001,
     warmup_ratio: float = 0.0,
@@ -406,11 +135,7 @@ def train(
 
     underflow_action = normalize_underflow_action(kwargs.pop("underflow_action", None), default=default_underflow_action())
 
-    with contextlib.suppress(Exception):
-        torch.use_deterministic_algorithms(False, warn_only=True)
-    with contextlib.suppress(Exception):
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+    # Determinism settings are applied inside runtime workers.
 
     ds_meta = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
     ds_meta.underflow_action = underflow_action
@@ -443,14 +168,16 @@ def train(
             if count <= 0:
                 raise ValueError("Empty TensorDict provided to train().")
 
-            in_dim, label_shape = _write_memmap_streaming_two_pass(
+            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
                 ds=ds_meta,
                 out_dir=out_dir,
                 count=count,
                 get_batch=lambda s, e: td[s:e],
+                get_by_indices=lambda idx: td[idx],
                 val_frac=float(val_frac),
                 seed_value=seed_value,
                 underflow_action=underflow_action,
+                shuffle=bool(shuffle),
                 allow_missing_labels=False,
                 chunk_size=32,
             )
@@ -462,23 +189,29 @@ def train(
             and not isinstance(d, TensorDictBase)
             and d
             and all(not isinstance(v, _Mapping) for v in d.values())
-            and not _is_feature_label_batch_mapping(d)
+            and not LazyTensor.is_feature_label_batch_mapping(d)
         ):
             keys = list(d.keys())
             count = len(keys)
             if count <= 0:
                 raise ValueError("Empty dataset provided to train().")
             def _get_batch(s: int, e: int):
-                return _KeySliceMappingView(d, keys, s, e)
+                return LazyTensor.KeyIndexMappingView(d, keys[s:e])
 
-            in_dim, label_shape = _write_memmap_streaming_two_pass(
+            def _get_by_indices(idx: torch.Tensor):
+                ii = idx.detach().cpu().tolist()
+                return LazyTensor.KeyIndexMappingView(d, [keys[i] for i in ii])
+
+            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
                 ds=ds_meta,
                 out_dir=out_dir,
                 count=count,
                 get_batch=_get_batch,
+                get_by_indices=_get_by_indices,
                 val_frac=float(val_frac),
                 seed_value=seed_value,
                 underflow_action=underflow_action,
+                shuffle=bool(shuffle),
                 allow_missing_labels=False,
                 chunk_size=32,
             )
@@ -499,7 +232,7 @@ def train(
             memmap_dir=out_dir,
             train_frac=1.0 - float(val_frac),
             val_frac=float(val_frac),
-            shuffle=False,
+            shuffle=bool(shuffle),
             seed=seed_value,
             underflow_action=underflow_action,
         )
@@ -622,6 +355,8 @@ def train(
         default_kwargs = {
             "epochs": epochs,
             "val_frac": val_frac,
+            "shuffle": shuffle,
+            "deterministic": deterministic,
             "base_lr": base_lr,
             "weight_decay": weight_decay,
             "warmup_ratio": warmup_ratio,
@@ -907,6 +642,7 @@ def predict(
         raise ValueError(f"predict: output must be 'tensor' or 'file', got: {output_mode!r}")
 
     lazy_flag = bool(kwargs.pop("lazy", lazy)) if output_mode == "tensor" else False
+    shuffle = bool(kwargs.pop("shuffle", True))
 
     if any((v is None for v in data.values())):
         dummy_shape = tuple(model.out_shape)
@@ -934,14 +670,16 @@ def predict(
         if count <= 0:
             return {}
 
-        in_dim, label_shape = _write_memmap_streaming_two_pass(
+        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=memmap_dir,
             count=count,
             get_batch=lambda s, e: td[s:e],
+            get_by_indices=lambda idx: td[idx],
             val_frac=0.0,
             seed_value=seed_value,
             underflow_action=underflow_action,
+            shuffle=bool(shuffle),
             default_label_shape=default_out_shape,
             allow_missing_labels=True,
             chunk_size=32,
@@ -954,7 +692,7 @@ def predict(
         and not isinstance(data, TensorDictBase)
         and data
         and all(not isinstance(v, _Mapping) for v in data.values())
-        and not _is_feature_label_batch_mapping(data)
+        and not LazyTensor.is_feature_label_batch_mapping(data)
     ):
         keys = list(data.keys())
         count = len(keys)
@@ -962,16 +700,22 @@ def predict(
             return {}
 
         def _get_batch(s: int, e: int):
-            return _KeySliceMappingView(data, keys, s, e)
+            return LazyTensor.KeyIndexMappingView(data, keys[s:e])
 
-        in_dim, label_shape = _write_memmap_streaming_two_pass(
+        def _get_by_indices(idx: torch.Tensor):
+            ii = idx.detach().cpu().tolist()
+            return LazyTensor.KeyIndexMappingView(data, [keys[i] for i in ii])
+
+        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=memmap_dir,
             count=count,
             get_batch=_get_batch,
+            get_by_indices=_get_by_indices,
             val_frac=0.0,
             seed_value=seed_value,
             underflow_action=underflow_action,
+            shuffle=bool(shuffle),
             default_label_shape=default_out_shape,
             allow_missing_labels=True,
             chunk_size=32,
@@ -998,7 +742,7 @@ def predict(
             memmap_dir=memmap_dir,
             train_frac=1.0,
             val_frac=0.0,
-            shuffle=False,
+            shuffle=bool(shuffle),
             seed=seed_value,
             underflow_action=underflow_action,
         )
