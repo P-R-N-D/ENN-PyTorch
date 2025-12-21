@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import contextlib
-import gc
 import logging
 import math
 import os
@@ -1856,27 +1855,19 @@ class History(nn.Module):
         cpu_models: List[str] = []
         arch_norm: List[str] = []
         try:
-            try:
-                import psutil                
-            except Exception:
-                psutil = None                            
+            from ..backend.system import cpu_info, process_cpu_count
 
-            if psutil is not None:
-                n_cores = psutil.cpu_count(logical=True) or 1
-            else:
-                n_cores = 1
+            n_cores = max(1, int(process_cpu_count() or 1))
 
             model_name: Optional[str] = None
-            try:
-                with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-                    for line in f:
-                        if "model name" in line or "Hardware" in line:
-                            parts = line.split(":", 1)
-                            if len(parts) == 2:
-                                model_name = parts[1].strip()
-                            break
-            except Exception:
-                pass
+            # Prefer the shared helper (handles Linux/Windows/macOS).
+            with contextlib.suppress(Exception):
+                info = cpu_info()
+                first = info.split(";", 1)[0]
+                cand = first.split(":", 1)[1] if ":" in first else first
+                cand = str(cand).strip()
+                if cand:
+                    model_name = cand
 
             if not model_name:
                 model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
@@ -1893,14 +1884,11 @@ class History(nn.Module):
         self.arch = arch_norm
 
         try:
-            try:
-                import psutil                
-            except Exception:
-                psutil = None                            
+            from ..backend.system import Memory
 
-            if psutil is not None:
-                total_bytes = psutil.virtual_memory().total
-                self.ram_gb = float(round(total_bytes / (1024.0 ** 3), 2))
+            total_bytes = Memory.total()
+            if total_bytes is not None and int(total_bytes) > 0:
+                self.ram_gb = float(round(float(total_bytes) / (1024.0 ** 3), 2))
             else:
                 self.ram_gb = float(ram_gb)
         except Exception:

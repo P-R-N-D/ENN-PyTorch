@@ -233,14 +233,14 @@ from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                      stochastic_weight_average)
 from ..model.nn import History, Root, resize_scaler_buffer
 from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
-                     torch_compile_safe, torch_no_compile,
+                     torch_compile_safe,
                      torch_safe_distributed)
 from .distributed import (distributed_barrier, distributed_sync,
                           get_world_size, is_distributed, joining, no_sync,
                           to_ddp, to_fsdp)
 from ..functional.profiler import FlopCounter
 from .system import (Memory, Thread, empty_device_cache, get_device, get_tlb,
-                     initialize_python_path, new_dir, posix_time,
+                     initialize_python_path, posix_time,
                      set_float32_precision)
 
 if TYPE_CHECKING:
@@ -370,14 +370,7 @@ MB_DIV = 1024.0 * 1024.0
 
 _device_mem_get_info = Memory.device_mem_get_info
 
-
-try:
-    from torchao.float8 import precompute_float8_dynamic_scale_for_fsdp
-except ImportError:
-
-    def precompute_float8_dynamic_scale_for_fsdp(*args: Any, **kwargs: Any) -> Any:
-        return None
-
+# (optional) torchao float8 helpers were removed here because they were unused.
 
 _DL_STATE_FILE = "dataloader.json"
 
@@ -1407,6 +1400,182 @@ def update_tqdm(
         bar.update(inc)
 
 
+def _pin_tensors_with_cpu_pool(
+    *tensors: torch.Tensor,
+    device: torch.device,
+    cpu_pool: Any,
+    pool_handles: dict[int, object],
+) -> Tuple[torch.Tensor, ...]:
+    """Best-effort pinning via the CPU pool (reduces pinned alloc churn).
+
+    Returns a tuple of tensors (same arity as input). Any newly allocated
+    pinned buffers are tracked in `pool_handles` so they can be released once
+    the async device copy has consumed them.
+    """
+
+    if device.type not in ("cuda", "xpu") or cpu_pool is None:
+        return tensors
+
+    out: List[torch.Tensor] = []
+    for t in tensors:
+        if torch.is_tensor(t) and t.device.type == "cpu":
+            if hasattr(t, "is_pinned") and t.is_pinned():
+                out.append(t)
+                continue
+            buf, h = cpu_pool.get(tuple(t.shape), t.dtype, return_handle=True)
+            buf.copy_(t, non_blocking=False)
+            if h is not None:
+                pool_handles[id(buf)] = h
+            out.append(buf)
+        else:
+            out.append(t)
+    return tuple(out)
+
+
+def _to_device_with_stream_and_pool(
+    tensor: torch.Tensor,
+    *,
+    device: torch.device,
+    cpu_pool: Any,
+    pool_handles: dict[int, object],
+) -> torch.Tensor:
+    """Move a CPU tensor to `device` using non-blocking transfers when possible.
+
+    If `tensor` was allocated from `cpu_pool` we release its handle after the
+    transfer has been consumed by the current device stream.
+    """
+
+    if not torch.is_tensor(tensor):
+        return tensor
+
+    non_blocking_ok = (device.type in ("cuda", "xpu"))
+
+    if device.type in ("cuda", "xpu") and tensor.device.type == "cpu":
+        # If this tensor came from the pinned CPU pool, pop its handle now so we
+        # do not leak on exceptions. We release it back to the pool only when it is safe.
+        h = pool_handles.pop(id(tensor), None)
+
+        try:
+            if not (hasattr(tensor, "is_pinned") and tensor.is_pinned()):
+                pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                pinned.copy_(tensor, non_blocking=False)
+            else:
+                pinned = tensor
+
+            backend = getattr(torch, device.type, None)
+            if backend is None or not hasattr(backend, "current_stream") or not hasattr(backend, "Event"):
+                tensor_dev = pinned.to(device, non_blocking=False)
+                if h is not None and cpu_pool is not None:
+                    with contextlib.suppress(Exception):
+                        cpu_pool.release(h)
+                return tensor_dev
+
+            # Fast path: async H2D with stream-aware lifetime tracking.
+            tensor_dev = pinned.to(device, non_blocking=True)
+            stream = backend.current_stream(device)
+            with contextlib.suppress(Exception):
+                pinned.record_stream(stream)
+
+            if h is not None and cpu_pool is not None:
+                try:
+                    evt = backend.Event()
+                    evt.record(stream)
+                    cpu_pool.release_after(h, evt)
+                except Exception:
+                    # Very rare: if event plumbing fails, fall back to a sync+release to avoid leaks.
+                    with contextlib.suppress(Exception):
+                        sync = getattr(backend, "synchronize", None)
+                        if callable(sync):
+                            try:
+                                sync(device=device)
+                            except TypeError:
+                                sync(device)
+                    with contextlib.suppress(Exception):
+                        cpu_pool.release(h)
+            return tensor_dev
+        except Exception:
+            # Conservative fallback: do a blocking copy, then release the handle immediately.
+            tensor_dev = tensor.to(device, non_blocking=False)
+            if h is not None and cpu_pool is not None:
+                with contextlib.suppress(Exception):
+                    cpu_pool.release(h)
+            return tensor_dev
+
+    return tensor.to(device, non_blocking=non_blocking_ok)
+
+
+def _drain_pool_handles(
+    pool_handles: dict[int, object],
+    *,
+    cpu_pool: Any,
+    device: torch.device,
+) -> None:
+    """Best-effort cleanup for any outstanding cpu_pool handles."""
+
+    if not pool_handles or cpu_pool is None:
+        pool_handles.clear()
+        return
+
+    # Ensure any in-flight transfers consuming pinned buffers have completed before reuse.
+    try:
+        if device.type == "cuda" and hasattr(torch, "cuda"):
+            torch.cuda.synchronize(device=device)
+        elif device.type == "xpu" and hasattr(torch, "xpu"):
+            torch.xpu.synchronize(device=device)
+    except Exception:
+        pass
+
+    for _, h in list(pool_handles.items()):
+        with contextlib.suppress(Exception):
+            cpu_pool.release(h)
+    pool_handles.clear()
+
+
+def _resolve_train_process_group(meta: Any, model: Any) -> Any:
+    """Best-effort process group resolution for training-time reductions."""
+
+    candidates = [
+        (meta, "process_group"),
+        (meta, "distributed_process_group"),
+    ]
+    tm = model.module if hasattr(model, "module") else model
+    candidates.extend(
+        [
+            (tm, "process_group"),
+            (tm, "distributed_process_group"),
+        ]
+    )
+
+    for obj, attr in candidates:
+        try:
+            pg = getattr(obj, attr, None)
+        except Exception:
+            pg = None
+        if pg is not None:
+            return pg
+    return None
+
+
+def _get_ws_for_pg(pg: Any) -> int:
+    try:
+        if pg is None:
+            return max(1, int(get_world_size()))
+        return int(torch.distributed.get_world_size(group=pg))
+    except Exception:
+        return max(1, int(get_world_size()))
+
+
+def _all_reduce_sum_in_pg(t: torch.Tensor, pg: Any) -> None:
+    if pg is None:
+        torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
+    else:
+        torch.distributed.all_reduce(
+            t,
+            op=torch.distributed.ReduceOp.SUM,
+            group=pg,
+        )
+
+
 def epochs(
     model: Root,
     device: torch.device,
@@ -1980,95 +2149,19 @@ def epochs(
 
         with contextlib.suppress(Exception):
             get_tlb().pin_thread()
-        from typing import Dict
-
-        pool_handles: Dict[int, object] = {}
-
-        def _pin_tensor(*tensors: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-            if device.type not in ("cuda", "xpu") or cpu_pool is None:
-                return tensors
-            from typing import List
-            out: List[torch.Tensor] = []
-            for t in tensors:
-                if torch.is_tensor(t) and t.device.type == "cpu":
-                    if hasattr(t, "is_pinned") and t.is_pinned():
-                        out.append(t)
-                        continue
-                    buf, h = cpu_pool.get(tuple(t.shape), t.dtype, return_handle=True)
-                    buf.copy_(t, non_blocking=False)
-                    if h is not None:
-                        pool_handles[id(buf)] = h
-                    out.append(buf)
-                else:
-                    out.append(t)
-            return tuple(out)
-
-        def _to_device_with_stream(tensor: torch.Tensor) -> torch.Tensor:
-            if not torch.is_tensor(tensor):
-                return tensor
-            if device.type in ("cuda", "xpu") and tensor.device.type == "cpu":
-                try:
-                    if not (hasattr(tensor, "is_pinned") and tensor.is_pinned()):
-                        pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
-                        pinned.copy_(tensor, non_blocking=False)
-                    else:
-                        pinned = tensor
-                    backend = getattr(torch, device.type, None)
-                    if backend is None or not hasattr(backend, "current_stream") or not hasattr(backend, "Event"):
-                        tensor_dev = pinned.to(device, non_blocking=False)
-                        h = pool_handles.pop(id(tensor), None)
-                        if h is not None:
-                            with contextlib.suppress(Exception):
-                                cpu_pool.release(h)
-                        return tensor_dev
-                    tensor_dev = pinned.to(device, non_blocking=True)
-                    stream = backend.current_stream(device)
-                    pinned.record_stream(stream)
-                    h = pool_handles.pop(id(tensor), None)
-                    if h is not None:
-                        with contextlib.suppress(Exception):
-                            evt = backend.Event()
-                            evt.record(stream)
-                            cpu_pool.release_after(h, evt)
-                    return tensor_dev
-                except Exception:
-                    return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
-            return tensor.to(device, non_blocking=(device.type in ("cuda", "xpu")))
-
-        def _resolve_train_process_group(meta, model):
-            pg = None
-            with contextlib.suppress(Exception):
-                pg = getattr(meta, "process_group", None)
-            with contextlib.suppress(Exception):
-                if pg is None:
-                    pg = getattr(meta, "distributed_process_group", None)
-            with contextlib.suppress(Exception):
-                if pg is None:
-                    tm = model.module if hasattr(model, "module") else model
-                    pg = getattr(tm, "process_group", None)
-            with contextlib.suppress(Exception):
-                if pg is None:
-                    tm = model.module if hasattr(model, "module") else model
-                    pg = getattr(tm, "distributed_process_group", None)
-            return pg
-
-        def _get_ws_for_pg(pg):
-            try:
-                if pg is None:
-                    return max(1, int(get_world_size()))
-                return int(torch.distributed.get_world_size(group=pg))
-            except Exception:
-                return max(1, int(get_world_size()))
-
-        def _all_reduce_sum_in_pg(t: torch.Tensor, pg):
-            if pg is None:
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
-            else:
-                torch.distributed.all_reduce(
-                    t,
-                    op=torch.distributed.ReduceOp.SUM,
-                    group=pg,
-                )
+        pool_handles: dict[int, object] = {}
+        pin_tensor = partial(
+            _pin_tensors_with_cpu_pool,
+            device=device,
+            cpu_pool=cpu_pool,
+            pool_handles=pool_handles,
+        )
+        to_device_with_stream = partial(
+            _to_device_with_stream_and_pool,
+            device=device,
+            cpu_pool=cpu_pool,
+            pool_handles=pool_handles,
+        )
 
         for epoch_idx in range(int(total_epochs)):
             # Ensure the training sampler uses a different shuffle ordering each epoch.
@@ -2140,7 +2233,7 @@ def epochs(
                                 Y = to_torch_tensor(label)
     
                                 t_ready = time.perf_counter_ns()
-                                X, Y = _pin_tensor(X, Y)
+                                X, Y = pin_tensor(X, Y)
     
                                 if use_timer:
                                     h2d_s_ev, h2d_e_ev = (
@@ -2148,15 +2241,15 @@ def epochs(
                                         torch.Event(device=device, enable_timing=True),
                                     )
                                     h2d_s_ev.record()
-                                    X = _to_device_with_stream(X)
-                                    Y = _to_device_with_stream(Y)
+                                    X = to_device_with_stream(X)
+                                    Y = to_device_with_stream(Y)
                                     h2d_e_ev.record()
                                     h2d_e_ev.synchronize()
                                     h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
                                 else:
                                     t_h2d_s = time.perf_counter_ns()
-                                    X = _to_device_with_stream(X)
-                                    Y = _to_device_with_stream(Y)
+                                    X = to_device_with_stream(X)
+                                    Y = to_device_with_stream(Y)
                                     t_h2d_e = time.perf_counter_ns()
                                     h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
                             X = torch.atleast_2d(X)
@@ -2253,7 +2346,6 @@ def epochs(
                                         )
                                     accum_scale = max(1, grad_accum_steps)
                                     loss_for_backprop = loss_val / float(accum_scale)
-                                    loss_for_backprop = loss_for_backprop.clone()
                                     scaler.scale(loss_for_backprop).backward()
 
                                     if (
@@ -2445,6 +2537,8 @@ def epochs(
                             break
 
                         except RuntimeError as e:
+                            with contextlib.suppress(Exception):
+                                _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
                             msg = str(e).lower()
                             if "out of memory" in msg:
                                 oom_try = _oom_retry_inc(train_loader, "train", step_idx)
@@ -2647,7 +2741,7 @@ def epochs(
                                         Y = to_torch_tensor(label)
 
                                         t_ready = time.perf_counter_ns()
-                                        X, Y = _pin_tensor(X, Y)
+                                        X, Y = pin_tensor(X, Y)
 
                                         if use_timer:
                                             h2d_s_ev, h2d_e_ev = (
@@ -2655,15 +2749,15 @@ def epochs(
                                                 torch.Event(device=device, enable_timing=True),
                                             )
                                             h2d_s_ev.record()
-                                            X = _to_device_with_stream(X)
-                                            Y = _to_device_with_stream(Y)
+                                            X = to_device_with_stream(X)
+                                            Y = to_device_with_stream(Y)
                                             h2d_e_ev.record()
                                             h2d_e_ev.synchronize()
                                             h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
                                         else:
                                             t_h2d_s = time.perf_counter_ns()
-                                            X = _to_device_with_stream(X)
-                                            Y = _to_device_with_stream(Y)
+                                            X = to_device_with_stream(X)
+                                            Y = to_device_with_stream(Y)
                                             t_h2d_e = time.perf_counter_ns()
                                             h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
 
@@ -2798,6 +2892,8 @@ def epochs(
                                     break
 
                                 except RuntimeError as e:
+                                    with contextlib.suppress(Exception):
+                                        _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
                                     msg = str(e).lower()
                                     if "out of memory" in msg:
                                         oom_try = _oom_retry_inc(val_loader, "val", _vstep)
@@ -2926,16 +3022,25 @@ def epochs(
                 torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
                 world = max(1, get_world_size(device))
                 stats /= world
-                comp_time, io_time, flops, io_bytes, train_samples_epoch = [float(x) for x in stats.tolist()]
+                stats_cpu = stats.detach().cpu()
+                comp_time = float(stats_cpu[0].item())
+                io_time = float(stats_cpu[1].item())
+                flops = float(stats_cpu[2].item())
+                io_bytes = float(stats_cpu[3].item())
+                train_samples_epoch = float(stats_cpu[4].item())
                 distributed_barrier(device)
             updated_this_epoch = False
             if swa_enabled and epoch_idx >= swa_start_epoch:
-                with contextlib.suppress(Exception):
+                try:
                     swa_helper.update_weight()
                     updated_this_epoch = True
+                except Exception:
+                    pass
             if not scheduler_step_per_batch:
-                with contextlib.suppress(Exception):
+                try:
                     sched.step()
+                except Exception:
+                    pass
             if updated_this_epoch:
                 swa_has_updated = True
             prev_comp_time += float(comp_time)
@@ -3057,7 +3162,7 @@ def epochs(
             cov_xy = Exy - mean_x * mean_y
 
             eps = float(model_for_scaler.scaler.eps)
-            denom = var_x.clone()
+            denom = var_x
             tiny_mask = denom.abs() < eps
             denom[tiny_mask] = 1.0
 

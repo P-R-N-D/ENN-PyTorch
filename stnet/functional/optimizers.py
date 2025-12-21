@@ -15,7 +15,7 @@ import torch
 from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
-from ..backend.system import _log_debug, _log_info, get_device, optimal_optimizer_params
+from ..backend.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 from ..model.fused import Autocast, ModelPolicy, is_scale_safe
 

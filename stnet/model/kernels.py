@@ -536,7 +536,7 @@ class DotProductAttention(nn.Module):
                     uniq = torch.unique(sampled)
                 except Exception:
                     uniq = torch.tensor([], device=m.device, dtype=m.dtype)
-                if uniq.numel() <= 2 and set(uniq.tolist()).issubset({0, 1}):
+                if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
                     mask_bool = m != 0
                 else:
                     bias_float = m.to(dtype=q_bshd.dtype)
