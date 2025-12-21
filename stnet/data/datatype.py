@@ -27,7 +27,7 @@ def parse_bool(value: object) -> Optional[bool]:
         return None
     if s in _TRUE:
         return True
-    if s in _FALSE:
+    elif s in _FALSE:
         return False
     return None
 

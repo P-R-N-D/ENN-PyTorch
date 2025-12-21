@@ -37,6 +37,7 @@ from ..backend.system import (
     empty_device_cache,
 )
 from ..data.collections import LazyTensor
+from ..data.datatype import env_bool
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..data.nodes import preload_memmap
 from ..model.nn import History, Root, resize_scaler_buffer
@@ -198,7 +199,8 @@ def train(
             return int(in_dim), tuple(label_shape), int(count)
 
         fx, lb, _, lshape = ds_meta.preprocess(d)
-        fx = fx.contiguous()
+        if not fx.is_contiguous():
+            fx = fx.contiguous()
         if lb is None:
             raise ValueError("train() requires labels")
         count = int(fx.shape[0])
@@ -288,16 +290,20 @@ def train(
         init_dir = new_dir("init_dcp")
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
-        save(
-            state_dict={"model": m_sd},
-            storage_writer=FileSystemWriter(
-                init_dir, sync_files=True, overwrite=True
-            ),
-        )
-        torch.save(
-            {k: v.detach().cpu() for k, v in model.state_dict().items()},
-            os.path.join(init_dir, "model.pt"),
-        )
+        save_dcp = env_bool("STNET_SAVE_DCP", True)
+        save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
+        if save_dcp:
+            save(
+                state_dict={"model": m_sd},
+                storage_writer=FileSystemWriter(
+                    init_dir, sync_files=True, overwrite=True
+                ),
+            )
+        if save_pt:
+            torch.save(
+                {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                os.path.join(init_dir, "model.pt"),
+            )
         default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
@@ -592,14 +598,18 @@ def predict(
     mp.allow_connection_pickling()
     opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
     m_sd = get_model_state_dict(model, options=opts)
-    save(
-        state_dict={"model": m_sd},
-        storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
-    )
-    torch.save(
-        {k: v.detach().cpu() for k, v in model.state_dict().items()},
-        os.path.join(dcp_dir, "model.pt"),
-    )
+    save_dcp = env_bool("STNET_SAVE_DCP", True)
+    save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
+    if save_dcp:
+        save(
+            state_dict={"model": m_sd},
+            storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
+        )
+    if save_pt:
+        torch.save(
+            {k: v.detach().cpu() for k, v in model.state_dict().items()},
+            os.path.join(dcp_dir, "model.pt"),
+        )
     cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
@@ -702,13 +712,15 @@ def predict(
 
     else:
         feats, labels, keys, label_shape = ds.preprocess(data)
-        feats = feats.contiguous()
+        if not feats.is_contiguous():
+            feats = feats.contiguous()
         if labels is None:
             out_shape = tuple(getattr(model, "out_shape", ()))
             if not out_shape:
                 out_shape = (1,)
             labels = torch.zeros((int(feats.shape[0]), *tuple(out_shape)), dtype=torch.float64)
-        labels = labels.contiguous()
+        if not labels.is_contiguous():
+            labels = labels.contiguous()
 
         count = int(feats.shape[0])
         if count <= 0:
