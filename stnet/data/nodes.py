@@ -15,15 +15,10 @@ from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
 import torch
 
 from ..backend.compat import ensure_torchdata
-from ..backend.system import Thread, process_cpu_count
+from ..backend.system import Thread, process_cpu_count, Memory
 
 _LOGGER = logging.getLogger(__name__)
 _MMAP_TL_LIMIT_LOCK = threading.Lock()
-
-try:
-    import psutil as _psutil
-except ImportError:
-    _psutil = None
 
 TensorLike = Any
 
@@ -54,7 +49,7 @@ except Exception:
     _Sampler = object
 
 from .datatype import env_bool, env_first_int
-from .collections import LazyTensor
+from .collections import LazyTensor, Buffer, ProducerError, best_effort_close
 
 
 def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = True) -> TensorLike:
@@ -805,27 +800,7 @@ class Disposable:
 
     def cleanup(self) -> None:
         for obj in self._keep:
-            cleaned = False
-            for name in (
-                "cleanup",
-                "close",
-                "shutdown",
-                "stop",
-                "terminate",
-                "join",
-                "disconnect",
-                "release",
-            ):
-                if hasattr(obj, name):
-                    with suppress(Exception):
-                        getattr(obj, name)()
-                    cleaned = True
-                    break
-            if cleaned:
-                continue
-            if callable(obj):
-                with suppress(Exception):
-                    obj()
+            best_effort_close(obj)
 
     def close(self) -> None:
         self.cleanup()
@@ -1184,9 +1159,7 @@ class Loader:
         return 0
 
 
-
-
-class BufferedLoader:
+class BufferedLoader(Buffer):
     """A small in-memory backpressure wrapper for any iterable/loader.
 
     Why this exists:
@@ -1202,8 +1175,9 @@ class BufferedLoader:
       - Exceptions in producer are forwarded to the consumer.
 
     Notes:
-      - This is an *iterable* (not a single iterator). Each __iter__ call starts a new
-        producer thread and a fresh queue, so you can iterate multiple times (epochs).
+      - This is an *iterable* (not a single iterator). Each __iter__ call returns
+        a fresh session object (with its own queue + producer thread), so you can
+        iterate multiple times (epochs) like a regular DataLoader.
     """
 
     def __init__(
@@ -1213,11 +1187,13 @@ class BufferedLoader:
         max_batches: int = 4,
         name: str = "buffer",
         daemon: bool = True,
+        _session: bool = False,
     ) -> None:
+        super().__init__(max_batches=max_batches)
         self._src = iterable
-        self._max_batches = max(1, int(max_batches))
         self._name = str(name or "buffer")
         self._daemon = bool(daemon)
+        self._session = bool(_session)
 
     def __len__(self) -> int:
         try:
@@ -1226,35 +1202,39 @@ class BufferedLoader:
             return 1
 
     def __iter__(self) -> Iterator[Any]:
+        # Return a fresh session per epoch/iteration.
+        if not bool(self._session):
+            return iter(
+                BufferedLoader(
+                    self._src,
+                    max_batches=int(self.max_batches),
+                    name=self._name,
+                    daemon=self._daemon,
+                    _session=True,
+                )
+            )
+        return self._iter_session()
+
+    def _iter_session(self) -> Iterator[Any]:
         import traceback
 
-        from .collections import Buffer
-
-        buf = Buffer(max_batches=self._max_batches)
-        stop = threading.Event()
-        SENTINEL = object()
-
-        class _Err:
-            __slots__ = ("exc", "tb")
-            def __init__(self, exc: BaseException, tb: str) -> None:
-                self.exc = exc
-                self.tb = tb
-
         src_iter = iter(self._src)
+        sentinel = object()
 
         def _producer() -> None:
             try:
                 for item in src_iter:
-                    if stop.is_set() or buf.is_stopped():
+                    if self.is_stopped():
                         break
-                    if not buf.put(item):
+                    if not self.put(item):
                         break
-            except BaseException as e:
-                tb = traceback.format_exc()
-                buf.put(_Err(e, tb))
+            except BaseException as exc:
+                # Forward producer exceptions to the consumer.
+                with suppress(Exception):
+                    self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
             finally:
-                # Always try to send a sentinel so the consumer can terminate cleanly.
-                buf.put(SENTINEL)
+                with suppress(Exception):
+                    self.put(sentinel)
 
         t = threading.Thread(
             target=_producer,
@@ -1266,28 +1246,28 @@ class BufferedLoader:
         try:
             while True:
                 try:
-                    item = buf.get(timeout=0.1)
+                    item = self.get(timeout=0.1)
                 except queue.Empty:
-                    if stop.is_set() and not t.is_alive():
+                    if self.is_stopped() and not t.is_alive():
                         break
                     continue
-                if item is SENTINEL:
+
+                if item is sentinel:
                     break
-                if isinstance(item, _Err):
+
+                if isinstance(item, ProducerError):
                     raise RuntimeError(
                         f"BufferedLoader producer crashed: {item.exc}\n{item.tb}"
                     ) from item.exc
+
                 yield item
         finally:
             # Best-effort early-stop: ask producer to stop and close upstream if possible.
-            stop.set()
-            buf.stop()
-            with suppress(Exception):
-                close = getattr(src_iter, "close", None)
-                if callable(close):
-                    close()
+            self.stop()
+            best_effort_close(src_iter)
+            best_effort_close(t)
 
-class Prefetcher:
+class Prefetcher(Buffer):
     def __init__(
         self,
         iterable: Any,
@@ -1299,29 +1279,46 @@ class Prefetcher:
         memory_backpressure: bool | None = None,
         gpu_guard_bytes: int | None = None,
         host_guard_bytes: int | None = None,
+        _session: bool = False,
         **kwargs: Any,
     ) -> None:
+        super().__init__(max_batches=depth)
         self._src = iterable
         self._device = (
             torch.device(device) if not isinstance(device, torch.device) else device
         )
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
-        if memory_backpressure is not None:
-            oom_safe = bool(memory_backpressure)
-        self._backpressure = bool(oom_safe)
+        self._backpressure = bool(memory_backpressure) if memory_backpressure is not None else bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
-        use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu")
-        self._pin   = bool(kwargs.get("pin_host", use_accel))                             
+        use_accel = (
+            isinstance(self._device, torch.device)
+            and self._device.type in ("cuda", "xpu", "mps")
+        )
+        self._pin = bool(kwargs.get("pin_host", use_accel))
         self._gpu_stream = None
+        self._session = bool(_session)
+
+    def _spawn_session(self) -> "Prefetcher":
+        return Prefetcher(
+            self._src,
+            device=self._device,
+            depth=int(self._depth),
+            non_blocking=bool(self._non_blocking),
+            memory_backpressure=bool(self._backpressure),
+            gpu_guard_bytes=int(self._gpu_guard_bytes),
+            host_guard_bytes=int(self._host_guard_bytes),
+            pin_host=bool(self._pin),
+            _session=True,
+        )
 
     def _to_device(self, x: Any, device: torch.device) -> Any:
         if torch.is_tensor(x):
             return x.to(device, non_blocking=self._non_blocking)
-        if isinstance(x, (list, tuple)):
+        elif isinstance(x, (list, tuple)):
             return type(x)(self._to_device(t, device) for t in x)
-        if isinstance(x, dict):
+        elif isinstance(x, dict):
             out: dict[Any, Any] = {}
             for k, v in x.items():
                 # Keep lightweight metadata on host.
@@ -1337,9 +1334,9 @@ class Prefetcher:
             return x
         if torch.is_tensor(x) and x.device.type == "cpu":
             return x.pin_memory()
-        if isinstance(x, (list, tuple)):
+        elif isinstance(x, (list, tuple)):
             return type(x)(self._pin_memory(t) for t in x)
-        if isinstance(x, dict):
+        elif isinstance(x, dict):
             out: dict[Any, Any] = {}
             for k, v in x.items():
                 # row_ids are small metadata; do NOT pin to avoid unnecessary pinned allocations.
@@ -1354,20 +1351,26 @@ class Prefetcher:
         import time
         import traceback
 
+        # Return a fresh session per iteration to avoid reusing threads/queues.
+        if not bool(self._session):
+            return iter(self._spawn_session())
+
         from torch.utils.data import get_worker_info
 
         info = get_worker_info()
         device = getattr(self, "_device", torch.device("cpu"))
         use_device = (device.type in {"cuda", "mps", "xpu"})
-        use_cuda_stream = (device.type == "cuda" and hasattr(torch, "cuda") and torch.cuda.is_available())
+        use_cuda_stream = (
+            device.type == "cuda"
+            and hasattr(torch, "cuda")
+            and torch.cuda.is_available()
+        )
         iterable = getattr(self, "_iterable", self._src)
-
-                                                      
         def _gpu_mem_ok() -> bool:
             if not use_cuda_stream or self._gpu_guard_bytes <= 0:
                 return True
             try:
-                free_b, total_b = torch.cuda.mem_get_info(
+                free_b, _total_b = torch.cuda.mem_get_info(
                     device=device if isinstance(device, torch.device) else None
                 )
                 return bool(free_b >= self._gpu_guard_bytes)
@@ -1377,113 +1380,103 @@ class Prefetcher:
         def _host_mem_ok() -> bool:
             if self._host_guard_bytes <= 0:
                 return True
-            if _psutil is None:
-                return True
             try:
-                return bool(_psutil.virtual_memory().available >= self._host_guard_bytes)
+                return bool(Memory.available() >= self._host_guard_bytes)
             except Exception:
                 return True
 
+        # Inside a DataLoader worker process: keep it simple (no nested threads).
         if info is not None:
-                                                               
             for batch in iterable:
                 if self._pin:
                     batch = self._pin_memory(batch)
                 yield batch
-                                                                                   
                 if self._backpressure:
                     time.sleep(0)
-        else:
+            return
 
-            if use_cuda_stream and self._gpu_stream is None:
-                self._gpu_stream = torch.cuda.Stream(device=device)
+        # Main process: producer thread + bounded buffer.
+        if use_cuda_stream and self._gpu_stream is None:
+            self._gpu_stream = torch.cuda.Stream(device=device)
 
-            SENTINEL = object()
+        sentinel = object()
+        it = iter(iterable)
 
-            class _Err:
-                def __init__(self, exc: BaseException, tb: str) -> None:
-                    self.exc = exc
-                    self.tb = tb
-
-            q: "queue.Queue[Any]" = queue.Queue(maxsize=int(self._depth))
-            stop = threading.Event()
-            it = iter(iterable)
-
-            def _put(item: Any) -> None:
-                while not stop.is_set():
-                    try:
-                        q.put(item, timeout=0.1)
-                        return
-                    except queue.Full:
-                        continue
-
-            def _producer() -> None:
-                try:
-                    if use_cuda_stream and isinstance(device, torch.device):
-                        with suppress(Exception):
-                            if device.index is not None:
-                                torch.cuda.set_device(device.index)
-                    for batch in it:
-                        if stop.is_set():
-                            break
-                        if self._pin:
-                            batch = self._pin_memory(batch)
-
-                        tries = 0
-                        if self._backpressure:
-                            while (not stop.is_set()) and (
-                                (not _host_mem_ok()) or (not _gpu_mem_ok())
-                            ):
-                                time.sleep(0.001 if tries < 1000 else 0.005)
-                                tries += 1
-
-                        if use_device:
-                            if use_cuda_stream and self._gpu_stream is not None:
-                                with torch.cuda.stream(self._gpu_stream):
-                                    batch_dev = self._to_device(batch, device)
-                                ev = torch.cuda.Event()
-                                ev.record(self._gpu_stream)
-                                _put((batch_dev, ev))
-                            else:
-                                batch_dev = self._to_device(batch, device)
-                                _put((batch_dev, None))
-                        else:
-                            _put((batch, None))
-                except BaseException as exc:
-                    _put(_Err(exc, traceback.format_exc()))
-                finally:
-                    _put(SENTINEL)
-
-            t = threading.Thread(target=_producer, name="PrefetcherProducer", daemon=True)
-            t.start()
-
-            def _maybe_close_upstream() -> None:
-                with suppress(Exception):
-                    close = getattr(it, "close", None)
-                    if callable(close):
-                        close()
-
+        def _producer() -> None:
             try:
-                while True:
-                    item = q.get()
-                    if item is SENTINEL:
+                if use_cuda_stream and isinstance(device, torch.device):
+                    with suppress(Exception):
+                        if device.index is not None:
+                            torch.cuda.set_device(device.index)
+
+                for batch in it:
+                    if self.is_stopped():
                         break
-                    if isinstance(item, _Err):
-                        raise RuntimeError(
-                            f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
-                        ) from item.exc
 
-                    batch, ev = item
-                    if use_cuda_stream and ev is not None:
-                        cs = torch.cuda.current_stream(
-                            device=device if isinstance(device, torch.device) else None
-                        )
-                        with suppress(Exception):
-                            cs.wait_event(ev)
+                    if self._pin:
+                        batch = self._pin_memory(batch)
 
-                    yield batch
-            finally:
-                stop.set()
-                _maybe_close_upstream()
+                    tries = 0
+                    if self._backpressure:
+                        while (not self.is_stopped()) and (
+                            (not _host_mem_ok()) or (not _gpu_mem_ok())
+                        ):
+                            time.sleep(0.001 if tries < 1000 else 0.005)
+                            tries += 1
+
+                    if use_device:
+                        if use_cuda_stream and self._gpu_stream is not None:
+                            with torch.cuda.stream(self._gpu_stream):
+                                batch_dev = self._to_device(batch, device)
+                            ev = torch.cuda.Event()
+                            ev.record(self._gpu_stream)
+                            if not self.put((batch_dev, ev)):
+                                break
+                        else:
+                            batch_dev = self._to_device(batch, device)
+                            if not self.put((batch_dev, None)):
+                                break
+                    else:
+                        if not self.put((batch, None)):
+                            break
+
+            except BaseException as exc:
                 with suppress(Exception):
-                    t.join(timeout=1.0)
+                    self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
+            finally:
+                with suppress(Exception):
+                    self.put(sentinel)
+
+        t = threading.Thread(target=_producer, name="PrefetcherProducer", daemon=True)
+        t.start()
+
+        try:
+            while True:
+                try:
+                    item = self.get(timeout=0.1)
+                except queue.Empty:
+                    if self.is_stopped() and not t.is_alive():
+                        break
+                    continue
+
+                if item is sentinel:
+                    break
+
+                if isinstance(item, ProducerError):
+                    raise RuntimeError(
+                        f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
+                    ) from item.exc
+
+                batch, ev = item
+                if use_cuda_stream and ev is not None:
+                    cs = torch.cuda.current_stream(
+                        device=device if isinstance(device, torch.device) else None
+                    )
+                    with suppress(Exception):
+                        cs.wait_event(ev)
+
+                yield batch
+        finally:
+            self.stop()
+            best_effort_close(it)
+            best_effort_close(t)

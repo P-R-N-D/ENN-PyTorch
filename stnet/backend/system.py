@@ -6,6 +6,7 @@ import ctypes
 import gc
 import importlib
 import logging
+import math
 from dataclasses import dataclass, replace
 import itertools
 import multiprocessing
@@ -49,6 +50,14 @@ _EMPTY_CACHE_LOCK = threading.Lock()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: Dict[Tuple[str, int], float] = {}
 
 _LOGGER = logging.getLogger(__name__)
+
+
+# Torch thread configuration is process-global. In particular,
+# torch.set_num_interop_threads() can only be called once per process.
+_TORCH_THREAD_CFG_LOCK = threading.Lock()
+_TORCH_NUM_THREADS_SET: Optional[int] = None
+_TORCH_INTEROP_THREADS_SET: Optional[int] = None
+_TORCH_INTEROP_LOCKED: bool = False
 
 
 def _log_info(logger: Optional[Any], msg: str) -> None:
@@ -120,30 +129,172 @@ def _empty_cache_device_key(
     return (str(dev.type), int(idx))
 
 
+def _linux_cgroup_cpu_quota() -> Optional[float]:
+    """Return cgroup CPU quota as a float CPU count (Linux only).
+
+    - cgroup v2: reads cpu.max (quota/period)
+    - cgroup v1: reads cpu.cfs_quota_us / cpu.cfs_period_us
+
+    Returns None when no quota is detected (unlimited) or on errors.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return None
+
+    def _read_text(path: str) -> Optional[str]:
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read().strip()
+        except Exception:
+            return None
+
+    def _read_int(path: str) -> Optional[int]:
+        s = _read_text(path)
+        if not s or s == "max":
+            return None
+        try:
+            return int(str(s).strip())
+        except Exception:
+            return None
+
+    # cgroup v2
+    try:
+        root = "/sys/fs/cgroup"
+        if os.path.exists(os.path.join(root, "cgroup.controllers")):
+            rel = "/"
+            with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+                for ln in fh:
+                    parts = ln.strip().split(":")
+                    if len(parts) >= 3 and parts[0] == "0":
+                        rel = parts[2] or "/"
+                        break
+            grp = os.path.join(root, rel.lstrip("/"))
+            raw = _read_text(os.path.join(grp, "cpu.max"))
+            if raw:
+                parts = raw.split()
+                if parts and parts[0] != "max":
+                    quota = int(parts[0])
+                    period = int(parts[1]) if len(parts) >= 2 else 100000
+                    if quota > 0 and period > 0:
+                        return float(quota) / float(period)
+            return None
+    except Exception:
+        pass
+
+    # cgroup v1
+    try:
+        cpu_rel: Optional[str] = None
+        with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
+            for ln in fh:
+                parts = ln.strip().split(":")
+                if len(parts) >= 3:
+                    ctrls = parts[1].split(",") if parts[1] else []
+                    if "cpu" in ctrls:
+                        cpu_rel = parts[2] or "/"
+                        break
+        if cpu_rel is None:
+            return None
+
+        base = None
+        for cand in ("/sys/fs/cgroup/cpu", "/sys/fs/cgroup/cpu,cpuacct", "/sys/fs/cgroup/cpuacct"):
+            if os.path.isdir(cand):
+                base = cand
+                break
+        if base is None:
+            return None
+
+        grp = os.path.join(base, cpu_rel.lstrip("/"))
+        quota = _read_int(os.path.join(grp, "cpu.cfs_quota_us"))
+        period = _read_int(os.path.join(grp, "cpu.cfs_period_us"))
+        if quota is None or period is None:
+            return None
+        if int(quota) <= 0 or int(quota) == -1 or int(period) <= 0:
+            return None
+        return float(quota) / float(period)
+    except Exception:
+        return None
+
 def process_cpu_count() -> int:
     """Best-effort CPU count usable by this process/thread.
 
-    Prefer Python 3.13+'s os.process_cpu_count() when available.
-    Fallback to os.sched_getaffinity(0) and os.cpu_count().
+    Priority order:
+      1) Explicit overrides: STNET_CPU_COUNT / PYTHON_CPU_COUNT / -X cpu_count
+      2) Python 3.13+: os.process_cpu_count() (respects affinity and Python overrides)
+      3) os.sched_getaffinity(0)
+      4) os.cpu_count()
+
+    Linux containers note:
+      - If no explicit override is provided, we additionally clamp the result by the
+        cgroup CPU quota (v1/v2). This prevents severe oversubscription when
+        os.cpu_count() (or affinity) sees the host CPU count while the container has
+        a smaller quota.
+
+    The cgroup clamp uses *floor* semantics (e.g., 1.9 -> 1) and always returns >= 1.
     """
+
+    # Explicit per-project override (highest priority).
+    for key in ("STNET_CPU_COUNT", "STNET_EFFECTIVE_CPU_COUNT"):
+        v = os.environ.get(key)
+        if v is not None and str(v).strip():
+            try:
+                n = int(str(v).strip())
+                if n > 0:
+                    return int(n)
+            except Exception:
+                pass
+
+    # Respect Python overrides (Python 3.13+: os.process_cpu_count() also honors these).
+    v = os.environ.get("PYTHON_CPU_COUNT")
+    if v is not None and str(v).strip():
+        try:
+            n = int(str(v).strip())
+            if n > 0:
+                return int(n)
+        except Exception:
+            pass
+
+    try:
+        xopt = getattr(sys, "_xoptions", {})
+        if isinstance(xopt, dict) and "cpu_count" in xopt:
+            n = int(xopt["cpu_count"])
+            if n > 0:
+                return int(n)
+    except Exception:
+        pass
+
+    n: Optional[int] = None
+
     # Python 3.13+: respects affinity/cgroup and -X cpu_count / PYTHON_CPU_COUNT override.
     with contextlib.suppress(Exception):
         fn = getattr(os, "process_cpu_count", None)
         if callable(fn):
-            n = fn()
-            if isinstance(n, int) and n > 0:
-                return int(n)
+            v = fn()
+            if isinstance(v, int) and v > 0:
+                n = int(v)
 
     # Linux/Unix affinity fallback
-    with contextlib.suppress(Exception):
-        return max(1, len(os.sched_getaffinity(0)))
+    if n is None:
+        with contextlib.suppress(Exception):
+            n = max(1, len(os.sched_getaffinity(0)))
 
     # Last resort
+    if n is None:
+        with contextlib.suppress(Exception):
+            v = os.cpu_count()
+            if isinstance(v, int) and v > 0:
+                n = int(v)
+
+    n = int(n) if isinstance(n, int) and n > 0 else 1
+
+    # Clamp by cgroup CPU quota (Linux) unless the user explicitly overrode.
+    quota = None
     with contextlib.suppress(Exception):
-        n = os.cpu_count()
-        if isinstance(n, int) and n > 0:
-            return int(n)
-    return 1
+        quota = _linux_cgroup_cpu_quota()
+    if quota is not None and quota > 0.0:
+        q = max(1, int(math.floor(float(quota))))
+        n = max(1, min(int(n), int(q)))
+
+    return max(1, int(n))
 
 
 @dataclass(slots=True)
@@ -233,10 +384,19 @@ class WorkerPolicy:
         with contextlib.suppress(Exception):
             _nogil = bool(Thread.nogil_optimizations_enabled())
 
-        # Only default to more oversubscription when the input pipeline is likely
-        # to be the bottleneck (i.e. accelerator training). Users can still
-        # override via STNET_THREAD_CAP_MULTIPLIER.
-        cap_mult = 3 if (_nogil and is_accel) else 2
+        # Oversubscription multiplier (threads ~= cores * cap_mult).
+        #
+        # Default behavior:
+        #  - Accelerator training: allow modest oversubscription to keep the input
+        #    pipeline busy (higher if no-GIL optimizations are enabled).
+        #  - CPU training: avoid oversubscription by default (it tends to hurt CPU-bound work).
+        cap_mult = 3 if (_nogil and is_accel) else (2 if is_accel else 1)
+
+        # Be conservative on small CPU budgets (common in containers / CI).
+        if ncpu_raw <= 4:
+            cap_mult = 1
+        elif ncpu_raw <= 8:
+            cap_mult = min(int(cap_mult), 2)
         with contextlib.suppress(Exception):
             v = os.environ.get("STNET_THREAD_CAP_MULTIPLIER")
             if v is None:
@@ -395,15 +555,39 @@ class WorkerPolicy:
         }
 
     def apply_torch_threads(self) -> None:
-        try:
-            torch.set_num_threads(max(1, int(self.intra_ops)))
-        except Exception:
-            pass
-        if hasattr(torch, "set_num_interop_threads"):
-            try:
-                torch.set_num_interop_threads(max(1, int(self.inter_ops)))
-            except Exception:
-                pass
+        """Apply torch intra/inter-op thread settings (best-effort).
+
+        Notes:
+          - torch.set_num_interop_threads() can only be called once per process.
+          - We keep this method idempotent to avoid repeated overhead and noisy exceptions
+            on no-GIL / high-throughput runs.
+        """
+
+        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
+
+        intra = max(1, int(self.intra_ops))
+        inter = max(1, int(self.inter_ops))
+
+        with _TORCH_THREAD_CFG_LOCK:
+            if _TORCH_NUM_THREADS_SET != int(intra):
+                try:
+                    torch.set_num_threads(int(intra))
+                    _TORCH_NUM_THREADS_SET = int(intra)
+                except Exception:
+                    pass
+
+            if hasattr(torch, "set_num_interop_threads") and not bool(_TORCH_INTEROP_LOCKED):
+                if _TORCH_INTEROP_THREADS_SET is None:
+                    try:
+                        torch.set_num_interop_threads(int(inter))
+                        _TORCH_INTEROP_THREADS_SET = int(inter)
+                    except Exception:
+                        # Once interop threads are locked (by PyTorch or another caller),
+                        # repeated attempts can become expensive in tight loops.
+                        _TORCH_INTEROP_LOCKED = True
+                elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
+                    # Interop threads are already set; keep the first value.
+                    pass
 
 
 def empty_device_cache(

@@ -348,6 +348,45 @@ class Cache:
         return bool(self._err_event.is_set())
 
 
+@dataclass(slots=True)
+class ProducerError:
+    """Payload wrapper used to forward producer exceptions to the consumer."""
+
+    exc: BaseException
+    tb: str
+
+
+def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
+    """Best-effort resource cleanup for common close/stop/join APIs."""
+
+    for name in (
+        "cleanup",
+        "close",
+        "shutdown",
+        "stop",
+        "terminate",
+        "disconnect",
+        "release",
+        "join",
+    ):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            try:
+                if name == "join" and join_timeout is not None:
+                    fn(timeout=float(join_timeout))
+                else:
+                    fn()
+            except Exception:
+                pass
+            return
+
+    if callable(obj):
+        try:
+            obj()
+        except Exception:
+            pass
+
+
 class Buffer:
     """Bounded in-memory buffer with backpressure.
 
@@ -409,9 +448,14 @@ class Buffer:
 
         elapsed = time.monotonic() - start
         if elapsed > 0.1:
-            logging.warning(
-                f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
-            )
+            # Avoid log spam in normal operation; enable explicitly when debugging.
+            warn_flag = os.environ.get("STNET_BUFFER_WARN_BLOCKING")
+            if warn_flag is None:
+                warn_flag = os.environ.get("STNET_DEBUG")
+            if warn_flag is not None and str(warn_flag).strip().lower() not in {"0", "false", "no", "off", "n"}:
+                logging.warning(
+                    f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
+                )
         return True
 
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
