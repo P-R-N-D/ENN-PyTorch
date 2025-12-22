@@ -274,9 +274,25 @@ class Sampler(_Sampler):
         if self._N <= 0:
             raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
         feat_rel = str(self._meta.get("features_path", "features.mmt"))
-        lab_rel = str(self._meta.get("labels_path", "labels.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
-        lab_path = os.path.join(self.dir, lab_rel)
+        # labels_path may be omitted (features-only memmap).
+        lab_rel_raw = self._meta.get("labels_path", "labels.mmt")
+        features_only = bool(self._meta.get("features_only", False))
+        lab_rel = ""
+        lab_path = ""
+        if lab_rel_raw not in (None, "", False):
+            with suppress(Exception):
+                lab_rel = str(lab_rel_raw)
+        if lab_rel.strip().lower() in ("none", "null"):
+            lab_rel = ""
+        if lab_rel:
+            lab_path = os.path.join(self.dir, lab_rel)
+            if not os.path.isfile(lab_path):
+                if features_only:
+                    lab_rel = ""
+                    lab_path = ""
+                else:
+                    raise FileNotFoundError(f"labels.mmt not found under: {lab_path}")
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
         f_dtype = self._dtype_from_name(
@@ -285,7 +301,7 @@ class Sampler(_Sampler):
         l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
         # Keep the raw memmap config so we can optionally open per-thread handles (useful on no-GIL).
         self._feat_path = feat_path
-        self._lab_path = lab_path
+        self._lab_path = lab_path if lab_path else None
         self._feat_dtype = f_dtype
         self._label_dtype = l_dtype
         self._feat_shape = torch.Size([self._N, fdim])
@@ -299,9 +315,11 @@ class Sampler(_Sampler):
         )
         lshape = tuple(lshape_meta) if lshape_meta else tuple()
         self._label_shape_full = torch.Size([self._N] + list(lshape))
-        self._labels = MemoryMappedTensor.from_filename(
-            filename=lab_path, dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
-        )
+        self._labels = None
+        if self._lab_path is not None:
+            self._labels = MemoryMappedTensor.from_filename(
+                filename=str(self._lab_path), dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
+            )
         # Optional: open per-thread MemoryMappedTensor handles. This is
         # conservative by default (auto-enabled only when no-GIL optimizations
         # are active). Override with STNET_MEMMAP_THREAD_LOCAL=0/1.
@@ -461,11 +479,13 @@ class Sampler(_Sampler):
             dtype=self._feat_dtype,
             shape=self._feat_shape,
         )
-        self._labels = MemoryMappedTensor.from_filename(
-            filename=str(self._lab_path),
-            dtype=self._label_dtype,
-            shape=self._label_shape_full,
-        )
+        self._labels = None
+        if getattr(self, "_lab_path", None):
+            self._labels = MemoryMappedTensor.from_filename(
+                filename=str(self._lab_path),
+                dtype=self._label_dtype,
+                shape=self._label_shape_full,
+            )
         self._memmap_features = self._features
         self._memmap_labels = self._labels
         self._X = self._memmap_features
@@ -482,6 +502,8 @@ class Sampler(_Sampler):
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
 
+        has_labels = bool(getattr(self, "_labels", None) is not None and getattr(self, "_lab_path", None))
+
         tls = getattr(self, "_mmap_tls", None)
         if tls is None:
             tls = threading.local()
@@ -489,8 +511,8 @@ class Sampler(_Sampler):
 
         f = getattr(tls, "features", None)
         l = getattr(tls, "labels", None)
-        if f is not None and l is not None:
-            return f, l
+        if f is not None and (not has_labels or l is not None):
+            return f, (l if has_labels else None)
 
         max_pairs = int(getattr(self, "_mmap_thread_local_max", 0) or 0)
         if max_pairs > 0:
@@ -520,18 +542,21 @@ class Sampler(_Sampler):
         with init_lock:
             f = getattr(tls, "features", None)
             l = getattr(tls, "labels", None)
-            if f is None or l is None:
+            if f is None or (has_labels and l is None):
                 try:
                     f = MemoryMappedTensor.from_filename(
                         filename=str(self._feat_path),
                         dtype=self._feat_dtype,
                         shape=self._feat_shape,
                     )
-                    l = MemoryMappedTensor.from_filename(
-                        filename=str(self._lab_path),
-                        dtype=self._label_dtype,
-                        shape=self._label_shape_full,
-                    )
+                    if has_labels:
+                        l = MemoryMappedTensor.from_filename(
+                            filename=str(self._lab_path),
+                            dtype=self._label_dtype,
+                            shape=self._label_shape_full,
+                        )
+                    else:
+                        l = None
                 except Exception:
                     # If creation failed, return shared handles and undo our "created" counter increment.
                     if max_pairs > 0:
@@ -541,9 +566,10 @@ class Sampler(_Sampler):
                     return self._features, self._labels
 
                 setattr(tls, "features", f)
-                setattr(tls, "labels", l)
+                if has_labels:
+                    setattr(tls, "labels", l)
 
-        return f, l
+        return f, (l if has_labels else None)
 
     @property
     def start(self) -> int:
@@ -563,35 +589,36 @@ class Sampler(_Sampler):
         features, labels = self._get_mmaps()
         row_ids = torch.arange(start, end, dtype=torch.int64)
         x = features[start:end]
-        y = labels[start:end]
-        if self._label_shape:
-            y = y.reshape(end - start, *self._label_shape)
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-        yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
-        return {"X": xt, "Y": yt, "row_ids": row_ids}
+        out: Dict[str, torch.Tensor] = {"X": xt, "row_ids": row_ids}
 
-    def __getitem__(
-        self, idx: int | Tuple[int, int] | Sequence[int]
+        if labels is not None:
+            y = labels[start:end]
+            if self._label_shape:
+                y = y.reshape(end - start, *self._label_shape)
+            yt = y if isinstance(y, torch.Tensor) else torch.as_tensor(y)
+            out["Y"] = yt
+
+        return out
+
+    def _gather(
+        self,
+        idx_tensor: torch.Tensor,
+        features: Any,
+        labels: Any,
     ) -> Mapping[str, torch.Tensor]:
-        features, labels = self._get_mmaps()
-        if isinstance(idx, tuple) and len(idx) == 2:
-            s, e = int(idx[0]), int(idx[1])
-            return self._slice(s, e)
-        if isinstance(idx, torch.Tensor) and idx.dtype in (torch.int64, torch.int32):
-            # Ensure host indices (GPU indices would implicitly sync and may not index memmaps).
-            idx = idx.detach().cpu().tolist()
-        if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
-            if len(idx) == 0:
-                return self._slice(0, 0)
-            idx_tensor = torch.as_tensor(list(idx), dtype=torch.long)
-            try:
-                x = features.index_select(0, idx_tensor)
-            except Exception:
-                x = (
-                    features[idx_tensor]
-                    if hasattr(features, "__getitem__")
-                    else torch.as_tensor(features)[idx_tensor]
-                )
+        """Gather rows by index tensor (host indices)."""
+        idx_tensor = idx_tensor.to(dtype=torch.long, copy=False)
+        try:
+            x = features.index_select(0, idx_tensor)
+        except Exception:
+            x = (
+                features[idx_tensor]
+                if hasattr(features, "__getitem__")
+                else torch.as_tensor(features)[idx_tensor]
+            )
+        out: Dict[str, torch.Tensor] = {"X": x, "row_ids": idx_tensor.to(dtype=torch.int64, copy=False)}
+        if labels is not None:
             try:
                 y = labels.index_select(0, idx_tensor)
             except Exception:
@@ -602,23 +629,60 @@ class Sampler(_Sampler):
                 )
             if self._label_shape:
                 y = y.reshape(y.shape[0], *self._label_shape)
-            row_ids = idx_tensor.to(dtype=torch.int64, copy=False)
-            return {"X": x, "Y": y, "row_ids": row_ids}
+            out["Y"] = y
+        return out
+
+    def __getitem__(
+        self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
+        """Index into the memmap dataset.
+
+        Supports:
+          - (start, end) tuple slices
+          - sequence/tensor of indices (gather)
+          - scalar index
+
+        If the memmap was written in features-only mode, the returned mapping
+        omits the "Y" key.
+        """
+        features, labels = self._get_mmaps()
+
+        if isinstance(idx, tuple) and len(idx) == 2:
+            s, e = int(idx[0]), int(idx[1])
+            return self._slice(s, e)
+
+        if isinstance(idx, torch.Tensor):
+            idx_t = idx.detach()
+            if idx_t.device.type != "cpu":
+                idx_t = idx_t.to("cpu")
+            if idx_t.ndim == 0:
+                return self.__getitem__(int(idx_t.item()))
+            idx_tensor = idx_t.to(dtype=torch.long, copy=False).reshape(-1)
+            if idx_tensor.numel() == 0:
+                return self._slice(0, 0)
+            return self._gather(idx_tensor, features, labels)
+
+        if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
+            if len(idx) == 0:
+                return self._slice(0, 0)
+            idx_tensor = torch.as_tensor(idx, dtype=torch.long).reshape(-1)
+            return self._gather(idx_tensor, features, labels)
+
         i = self._start + int(idx)
         out = self._slice(i, i + 1)
         try:
             x = out.get("X", None)
-            y = out.get("Y", None)
             if torch.is_tensor(x):
-                x = x.squeeze(0)
+                out["X"] = x.squeeze(0)
+            y = out.get("Y", None)
             if torch.is_tensor(y):
-                y = y.squeeze(0)
+                out["Y"] = y.squeeze(0)
             r = out.get("row_ids", None)
             if torch.is_tensor(r):
-                r = r.squeeze(0)
-            return {"X": x, "Y": y, "row_ids": r}
+                out["row_ids"] = r.squeeze(0)
         except Exception:
-            return out
+            pass
+        return out
 
     def _shard(self) -> None:
         try:
@@ -740,18 +804,26 @@ class Sampler(_Sampler):
         with FxGradient.inference(torch.nn.Module()):
             if n <= 0:
                 X = features.narrow(0, 0, 0)
-                Y = labels.narrow(0, 0, 0)
-                return {"X": X, "Y": Y}
+                out: Dict[str, Any] = {"X": X}
+                if labels is not None:
+                    out["Y"] = labels.narrow(0, 0, 0)
+                return out
             X = features.narrow(0, s, n)
-            Y = labels.narrow(0, s, n)
-            if self._label_shape:
-                Y = Y.reshape(n, *self._label_shape)
+            out: Dict[str, Any] = {"X": X}
+
+            if labels is not None:
+                Y = labels.narrow(0, s, n)
+                if self._label_shape:
+                    Y = Y.reshape(n, *self._label_shape)
+                out["Y"] = Y
             pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
             if pin_in_dataset and _is_accelerator_available():
                 with suppress(Exception):
-                    X = X.pin_memory()
-                    Y = Y.pin_memory()
-            return {"X": X, "Y": Y}
+                    out["X"] = out["X"].pin_memory()
+                    if out.get("Y") is not None:
+                        out["Y"] = out["Y"].pin_memory()
+
+            return out
 def preload_memmap(
     data: Mapping[str, Any],
     *,
@@ -780,6 +852,7 @@ def preload_memmap(
 
     underflow_action = kwargs.pop("underflow_action", None)
     allow_missing_labels = bool(kwargs.pop("allow_missing_labels", False))
+    features_only = bool(kwargs.pop("features_only", False))
     default_label_shape = kwargs.pop("default_label_shape", None)
 
     # Any unexpected kwargs are ignored for compatibility.
@@ -792,6 +865,7 @@ def preload_memmap(
         underflow_action=underflow_action,
         chunk_size=int(chunk_size),
         allow_missing_labels=bool(allow_missing_labels),
+        features_only=bool(features_only),
         default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
     )
     return None

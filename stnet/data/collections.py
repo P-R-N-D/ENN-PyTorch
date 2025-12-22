@@ -613,16 +613,40 @@ class LazyTensor:
         get_by_indices: Any = None,
         default_label_shape: Any = None,
         allow_missing_labels: bool = False,
+        features_only: bool = False,
         chunk_size: int = 32,
     ) -> Tuple[int, Tuple[int, ...]]:
+        """Write a memmap dataset in two passes.
+
+        Pass 1: infer shapes and collect scale stats (for dtype negotiation).
+        Pass 2: write contiguous memmaps (optionally shuffled).
+
+        When ``features_only=True``, the labels memmap is omitted. ``meta.json``
+        will still contain ``label_shape`` for downstream shape inference.
+        """
+
         from tensordict import MemoryMappedTensor
         from .pipeline import Dataset
+        from .datatype import env_first_int
 
         os.makedirs(out_dir, exist_ok=True)
-        if int(count) <= 0:
+        count = int(count)
+        if count <= 0:
             raise ValueError("count must be > 0")
 
-        chunk = max(1, min(int(chunk_size), int(count)))
+        # Chunk sizing:
+        # - STNET_MEMMAP_CHUNK_SIZE / STNET_MEMMAP_CHUNK override everything.
+        # - chunk_size<=0 enables a conservative auto-tuning heuristic.
+        env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), None)
+        if env_chunk is not None and int(env_chunk) > 0:
+            chunk_size = int(env_chunk)
+
+        req_chunk = int(chunk_size or 0)
+        auto_chunk = req_chunk <= 0
+        chunk_first = max(1, min(count, req_chunk if req_chunk > 0 else min(count, 256)))
+
+        allow_missing = bool(allow_missing_labels) or bool(features_only)
+        default_lshape = tuple(default_label_shape) if default_label_shape is not None else (1,)
 
         stats: Dict[str, Any] = {
             "has_scale": False,
@@ -636,8 +660,9 @@ class LazyTensor:
         in_dim: Optional[int] = None
         label_shape: Optional[Tuple[int, ...]] = None
 
-        for s in range(0, int(count), int(chunk)):
-            e = min(int(count), s + int(chunk))
+        # --- Pass 1: infer shapes + stats ---
+        for s in range(0, count, int(chunk_first)):
+            e = min(count, s + int(chunk_first))
             batch = get_batch(int(s), int(e))
             fx, lb, _, _ = ds.preprocess(batch)
             n = LazyTensor._batch_n(fx)
@@ -648,51 +673,70 @@ class LazyTensor:
             if in_dim is None:
                 in_dim = cur_in_dim
             elif cur_in_dim != int(in_dim):
-                raise RuntimeError(
-                    f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}"
-                )
+                raise RuntimeError(f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}")
 
             if lb is None:
-                if not bool(allow_missing_labels):
+                if not allow_missing:
                     raise RuntimeError("memmap writer requires labels (got None)")
-                if default_label_shape is None:
-                    raise RuntimeError(
-                        "labels are missing and default_label_shape was not provided"
-                    )
-                cur_label_shape = tuple(default_label_shape)
-                l_stats = {
-                    "has_scale": True,
-                    "has_nonfinite": False,
-                    "scale_max_abs": 0.0,
-                    "scale_min_value": 0.0,
-                    "scale_max_value": 0.0,
-                    "scale_min_positive": None,
-                    "scale_is_integral": None,
-                }
+                cur_label_shape = tuple(default_lshape)
+                lb_flat = None
             else:
                 cur_label_shape = tuple(lb.shape[1:])
                 lb_flat = LazyTensor._flat2d_cpu_contig(lb, n)
-                l_stats = Dataset.tensor_scale_stats(lb_flat)
 
             if label_shape is None:
                 label_shape = cur_label_shape
             elif tuple(label_shape) != tuple(cur_label_shape):
-                raise RuntimeError(
-                    f"label shape mismatch: expected {label_shape}, got {cur_label_shape}"
-                )
+                raise RuntimeError(f"label shape mismatch: expected {label_shape}, got {cur_label_shape}")
 
             f_stats = Dataset.tensor_scale_stats(fx_flat)
-            stats = Dataset.merge_scale_stats(
-                stats, Dataset.merge_scale_stats(f_stats, l_stats)
-            )
+            if bool(features_only):
+                stats = Dataset.merge_scale_stats(stats, f_stats)
+            else:
+                if lb_flat is None:
+                    l_stats = {
+                        "has_scale": True,
+                        "has_nonfinite": False,
+                        "scale_max_abs": 0.0,
+                        "scale_min_value": 0.0,
+                        "scale_max_value": 0.0,
+                        "scale_min_positive": None,
+                        "scale_is_integral": None,
+                    }
+                else:
+                    l_stats = Dataset.tensor_scale_stats(lb_flat)
+                stats = Dataset.merge_scale_stats(stats, Dataset.merge_scale_stats(f_stats, l_stats))
 
         if in_dim is None or label_shape is None:
             raise RuntimeError("Failed to infer in_dim/label_shape from data")
 
-        negotiable = Dataset.is_fp32_castable(
-            stats, underflow_action=underflow_action, safety_margin=1.0
-        )
+        negotiable = Dataset.is_fp32_castable(stats, underflow_action=underflow_action, safety_margin=1.0)
         store_float = LazyTensor._resolve_memmap_store_float(negotiable=bool(negotiable))
+
+        # Auto-tune chunk size for the writing pass (bound memory).
+        if auto_chunk:
+            elem_size = int(torch.empty((), dtype=store_float).element_size())
+            label_numel = 0 if bool(features_only) else int(np.prod(label_shape))
+            row_bytes = max(1, (int(in_dim) + int(label_numel)) * int(elem_size))
+
+            target_bytes = env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), None)
+            if target_bytes is None:
+                target_mb = env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64)
+                target_bytes = int(target_mb) * 1024 * 1024
+
+            # Clamp to a small fraction of available RAM when detectable.
+            try:
+                from ..backend.system import Memory
+
+                avail = int(Memory.available() or 0)
+                if avail > 0:
+                    target_bytes = int(min(int(target_bytes), max(8 * 1024 * 1024, avail // 16)))
+            except Exception:
+                pass
+
+            chunk_second = int(max(1, min(count, max(32, target_bytes // row_bytes))))
+        else:
+            chunk_second = int(max(1, min(count, req_chunk)))
 
         features_path = os.path.join(out_dir, "features.mmt")
         labels_path = os.path.join(out_dir, "labels.mmt")
@@ -703,17 +747,20 @@ class LazyTensor:
             filename=features_path,
             existsok=True,
         )
-        labels_mmt = MemoryMappedTensor.empty(
-            (int(count), *tuple(label_shape)),
-            dtype=store_float,
-            filename=labels_path,
-            existsok=True,
-        )
+        write_labels = not bool(features_only)
+        labels_mmt = None
+        if write_labels:
+            labels_mmt = MemoryMappedTensor.empty(
+                (int(count), *tuple(label_shape)),
+                dtype=store_float,
+                filename=labels_path,
+                existsok=True,
+            )
 
         zeros_label_buf: Optional[torch.Tensor] = None
-        if bool(allow_missing_labels):
+        if write_labels and bool(allow_missing_labels):
             zeros_label_buf = torch.zeros(
-                (int(chunk), *tuple(label_shape)),
+                (int(chunk_second), *tuple(label_shape)),
                 dtype=store_float,
                 device=torch.device("cpu"),
             )
@@ -727,8 +774,8 @@ class LazyTensor:
             order = torch.randperm(int(count), generator=g, dtype=torch.int64)
 
         written = 0
-        for s in range(0, int(count), int(chunk)):
-            e = min(int(count), s + int(chunk))
+        for s in range(0, count, int(chunk_second)):
+            e = min(count, s + int(chunk_second))
             if order is None:
                 batch = get_batch(int(s), int(e))
             else:
@@ -747,22 +794,24 @@ class LazyTensor:
 
             fx_out = fx_flat if fx_flat.dtype == store_float else fx_flat.to(dtype=store_float)
 
-            if lb is None:
-                if not bool(allow_missing_labels):
-                    raise RuntimeError("memmap writer requires labels (got None)")
-                if zeros_label_buf is None:
-                    raise RuntimeError("internal error: zeros_label_buf missing")
-                lb_out = zeros_label_buf[:n]
-            else:
-                if tuple(lb.shape[1:]) != tuple(label_shape):
-                    raise RuntimeError(
-                        f"label shape mismatch: expected {label_shape}, got {tuple(lb.shape[1:])}"
-                    )
-                lb_cpu = LazyTensor._to_cpu_contig(lb)
-                lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
-
             features_mmt[int(s) : int(s) + int(n)].copy_(fx_out)
-            labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
+
+            if write_labels:
+                if lb is None:
+                    if not allow_missing:
+                        raise RuntimeError("memmap writer requires labels (got None)")
+                    if zeros_label_buf is None:
+                        raise RuntimeError("internal error: zeros_label_buf missing")
+                    lb_out = zeros_label_buf[:n]
+                else:
+                    if tuple(lb.shape[1:]) != tuple(label_shape):
+                        raise RuntimeError(
+                            f"label shape mismatch: expected {label_shape}, got {tuple(lb.shape[1:])}"
+                        )
+                    lb_cpu = LazyTensor._to_cpu_contig(lb)
+                    lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
+                assert labels_mmt is not None
+                labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
             written += int(n)
 
         if int(written) != int(count):
@@ -777,10 +826,10 @@ class LazyTensor:
             "N": int(count),
             "feature_dim": int(in_dim),
             "features_path": "features.mmt",
-            "labels_path": "labels.mmt",
+            "labels_path": ("labels.mmt" if write_labels else None),
             "label_shape": list(label_shape),
             "features_dtype": str(store_float).replace("torch.", ""),
-            "labels_dtype": str(store_float).replace("torch.", ""),
+            "labels_dtype": (str(store_float).replace("torch.", "") if write_labels else None),
             "fractions": [float(1.0 - float(val_frac)), float(val_frac)],
             "shuffled": bool(shuffle),
             "shuffle_seed": int(seed_value) if seed_value is not None else None,
@@ -798,6 +847,7 @@ class LazyTensor:
             "scale_is_integral": stats.get("scale_is_integral"),
             "is_negotiable": bool(negotiable),
             "underflow_action": str(underflow_action),
+            "features_only": bool(features_only),
         }
 
         meta_path = os.path.join(out_dir, "meta.json")
@@ -819,17 +869,20 @@ class LazyTensor:
         underflow_action: Optional[str] = None,
         chunk_size: int = 4096,
         allow_missing_labels: bool = False,
+        features_only: bool = False,
         default_label_shape: Optional[Tuple[int, ...]] = None,
     ) -> None:
+        """Materialize an in-memory dataset into a memmap directory."""
+
         from .pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
         if not isinstance(data, Mapping):
-            raise TypeError("preload_memmap expects a Mapping with 'features' and 'labels'")
-        if "features" not in data or "labels" not in data:
-            raise ValueError("preload_memmap expects 'features' and 'labels'")
+            raise TypeError("preload_memmap expects a Mapping with at least 'features'")
+        if "features" not in data:
+            raise ValueError("preload_memmap expects 'features'")
 
         raw_X = data["features"]
-        raw_Y = data["labels"]
+        raw_Y = data.get("labels")
 
         def _len0(obj: Any) -> int:
             if isinstance(obj, torch.Tensor):
@@ -843,45 +896,71 @@ class LazyTensor:
         count = _len0(raw_X)
         if count <= 0:
             raise ValueError("cannot create memmap with zero samples")
-        if _len0(raw_Y) != int(count):
-            raise ValueError("features and labels must have the same length")
+        if not bool(features_only):
+            if raw_Y is None:
+                if not bool(allow_missing_labels):
+                    raise ValueError("preload_memmap expects 'labels' unless allow_missing_labels=True")
+            else:
+                if _len0(raw_Y) != int(count):
+                    raise ValueError("features and labels must have the same length")
 
-        ua = normalize_underflow_action(
-            underflow_action,
-            default=default_underflow_action(),
-        )
+        ua = normalize_underflow_action(underflow_action, default=default_underflow_action())
 
-        ds = Dataset.for_device(
-            "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
-        )
+        ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
         ds.underflow_action = ua
 
         def _slice(obj: Any, s: int, e: int) -> Any:
-            if isinstance(obj, torch.Tensor):
-                return obj[s:e]
+            if obj is None:
+                return None
             try:
+                if torch.is_tensor(obj):
+                    return obj[s:e]
                 return obj[s:e]
             except Exception:
-                return [obj[i] for i in range(int(s), int(e))]
+                pass
+            try:
+                return [obj[i] for i in range(s, e)]
+            except Exception:
+                pass
+            return obj
 
         def _gather(obj: Any, idx: torch.Tensor) -> Any:
-            if isinstance(obj, torch.Tensor):
-                return obj.index_select(0, idx)
+            if obj is None:
+                return None
             try:
-                import numpy as _np
-
-                if isinstance(obj, _np.ndarray):
+                if torch.is_tensor(obj) and idx.dtype in (torch.int64, torch.int32):
+                    return obj[idx.detach().cpu()]
+                if hasattr(obj, "__getitem__"):
                     return obj[idx.detach().cpu().numpy()]
             except Exception:
                 pass
-            ii = idx.detach().cpu().tolist()
-            return [obj[i] for i in ii]
+            try:
+                ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
+                return [obj[i] for i in ii]
+            except Exception:
+                pass
+            try:
+                if torch.is_tensor(obj):
+                    return obj[idx]
+            except Exception:
+                pass
+            try:
+                return [obj[i] for i in idx]
+            except Exception:
+                pass
+            return obj
 
         def get_batch(s: int, e: int) -> Mapping[str, Any]:
-            return {"features": _slice(raw_X, s, e), "labels": _slice(raw_Y, s, e)}
+            out: Dict[str, Any] = {"features": _slice(raw_X, s, e)}
+            if raw_Y is not None and not bool(features_only):
+                out["labels"] = _slice(raw_Y, s, e)
+            return out
 
         def get_by_indices(idx: torch.Tensor) -> Mapping[str, Any]:
-            return {"features": _gather(raw_X, idx), "labels": _gather(raw_Y, idx)}
+            out: Dict[str, Any] = {"features": _gather(raw_X, idx)}
+            if raw_Y is not None and not bool(features_only):
+                out["labels"] = _gather(raw_Y, idx)
+            return out
 
         LazyTensor.write_memmap_streaming_two_pass(
             ds=ds,
@@ -894,6 +973,7 @@ class LazyTensor:
             underflow_action=str(ua),
             shuffle=bool(shuffle),
             allow_missing_labels=bool(allow_missing_labels),
+            features_only=bool(features_only),
             default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
             chunk_size=int(chunk_size),
         )

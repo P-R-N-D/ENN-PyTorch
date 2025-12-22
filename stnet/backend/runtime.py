@@ -4119,6 +4119,17 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         model = Root(ops.in_dim, ops.out_shape, config=cfg)
+        # Fail-fast: predict/infer must load a trained checkpoint.
+        if not ops.model_ckpt_dir:
+            raise RuntimeError(
+                'predict/infer requires model_ckpt_dir (checkpoint directory). '
+                'Set RuntimeConfig.model_ckpt_dir to a directory produced by train().'
+            )
+        if not os.path.isdir(ops.model_ckpt_dir):
+            raise RuntimeError(
+                f'predict/infer: model_ckpt_dir does not exist or is not a directory: {ops.model_ckpt_dir!r}'
+            )
+
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
