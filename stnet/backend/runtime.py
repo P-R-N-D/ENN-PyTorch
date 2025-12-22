@@ -15,7 +15,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed
@@ -881,7 +881,7 @@ def _calibrate_per_sample_mem(
 
     def _to_device(obj: Any, dev: torch.device) -> Any:
         if isinstance(obj, torch.Tensor):
-            return obj.to(device=dev, non_blocking=True)
+            return obj.to(device=dev, non_blocking=(dev.type in {"cuda", "xpu"}))
         from tensordict import TensorDictBase
         from collections.abc import Mapping
         if isinstance(obj, TensorDictBase):
@@ -955,7 +955,7 @@ def _calibrate_per_sample_mem(
             X = torch.atleast_2d(X)
 
             if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, "in_dim", X.shape[1])):
-                X = X.to(device=device, non_blocking=True)
+                X = X.to(device=device, non_blocking=(device.type in {"cuda", "xpu"}))
 
                 if with_backward:
                     model.train()
@@ -963,7 +963,7 @@ def _calibrate_per_sample_mem(
                         Y_flat = None
                         if labels is not None:
                             Y = to_torch_tensor(labels)
-                            Y = torch.atleast_2d(Y).to(device=device, non_blocking=True)
+                            Y = torch.atleast_2d(Y).to(device=device, non_blocking=(device.type in {"cuda", "xpu"}))
                             Y_flat = Y.reshape(Y.shape[0], -1)
 
                         y_hat, loss_val = model(
@@ -1532,6 +1532,68 @@ def _drain_pool_handles(
         with contextlib.suppress(Exception):
             cpu_pool.release(h)
     pool_handles.clear()
+
+
+def _preprocess_pin_h2d(
+    meta: Any,
+    raw: Any,
+    *,
+    device: torch.device,
+    pin_tensor: Callable[..., tuple[Any, ...]],
+    to_device: Callable[[torch.Tensor], torch.Tensor],
+    use_timer: bool,
+    require_labels: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None, int, float]:
+    """Common batch path for all backends.
+
+    Flow:
+        preprocess -> pin(pool) -> async H2D(stream)
+
+    Notes:
+      - pin(pool) is only meaningful for CUDA/XPU; it is a no-op elsewhere.
+      - For infer we typically pass use_timer=False to avoid per-batch sync.
+    """
+
+    feat, label, *_ = meta.preprocess(raw)
+    X = to_torch_tensor(feat)
+
+    Y: torch.Tensor | None
+    if label is None:
+        if require_labels:
+            raise RuntimeError("Batch is missing labels.")
+        Y = None
+    else:
+        Y = to_torch_tensor(label)
+
+    # Pin (CUDA/XPU only). For timing consistency, we set t_ready after pinning.
+    if Y is None:
+        (X,) = pin_tensor(X)
+    else:
+        X, Y = pin_tensor(X, Y)
+    t_ready = time.perf_counter_ns()
+
+    # H2D copy. CUDA/XPU can use events; MPS/CPU path falls back to perf_counter.
+    if use_timer:
+        h2d_s_ev, h2d_e_ev = (
+            torch.Event(device=device, enable_timing=True),
+            torch.Event(device=device, enable_timing=True),
+        )
+        h2d_s_ev.record()
+        X = to_device(X)
+        if Y is not None:
+            Y = to_device(Y)
+        h2d_e_ev.record()
+        h2d_e_ev.synchronize()
+        h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+    else:
+        t_h2d_s = time.perf_counter_ns()
+        X = to_device(X)
+        if Y is not None:
+            Y = to_device(Y)
+        t_h2d_e = time.perf_counter_ns()
+        h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+
+    return X, Y, t_ready, h2d_s
 
 
 def _resolve_train_process_group(meta: Any, model: Any) -> Any:
@@ -2231,48 +2293,17 @@ def epochs(
                     train_accum_since_last += 1
                     while True:
                         try:
-                            if device.type in ("cuda", "xpu", "mps"):
-                                t_ready = time.perf_counter_ns()
-                                if use_timer:
-                                    h2d_s_ev, h2d_e_ev = (
-                                        torch.Event(device=device, enable_timing=True),
-                                        torch.Event(device=device, enable_timing=True),
-                                    )
-                                    h2d_s_ev.record()
-                                    X, Y = meta.batch_to_device(_raw, device)
-                                    h2d_e_ev.record()
-                                    h2d_e_ev.synchronize()
-                                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                                else:
-                                    t_h2d_s = time.perf_counter_ns()
-                                    X, Y = meta.batch_to_device(_raw, device)
-                                    t_h2d_e = time.perf_counter_ns()
-                                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                            else:
-                                feat, label, *_ = meta.preprocess(_raw)
-                                X = to_torch_tensor(feat)
-                                Y = to_torch_tensor(label)
-    
-                                t_ready = time.perf_counter_ns()
-                                X, Y = pin_tensor(X, Y)
-    
-                                if use_timer:
-                                    h2d_s_ev, h2d_e_ev = (
-                                        torch.Event(device=device, enable_timing=True),
-                                        torch.Event(device=device, enable_timing=True),
-                                    )
-                                    h2d_s_ev.record()
-                                    X = to_device_with_stream(X)
-                                    Y = to_device_with_stream(Y)
-                                    h2d_e_ev.record()
-                                    h2d_e_ev.synchronize()
-                                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                                else:
-                                    t_h2d_s = time.perf_counter_ns()
-                                    X = to_device_with_stream(X)
-                                    Y = to_device_with_stream(Y)
-                                    t_h2d_e = time.perf_counter_ns()
-                                    h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                            X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(
+                                meta,
+                                _raw,
+                                device=device,
+                                pin_tensor=pin_tensor,
+                                to_device=to_device_with_stream,
+                                use_timer=use_timer,
+                                require_labels=True,
+                            )
+                            assert Y_opt is not None
+                            Y = Y_opt
                             X = torch.atleast_2d(X)
                             if X.dim() != 2:
                                 raise RuntimeError(
@@ -2317,7 +2348,11 @@ def epochs(
                                     with Autocast.float(device):
                                         Y_flat = Y.reshape(Y.shape[0], -1)
                                         if Y_flat.device != device or Y_flat.dtype != param_dtype:
-                                            Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=True)
+                                            Y_flat = Y_flat.to(
+                                                device,
+                                                dtype=param_dtype,
+                                                non_blocking=(device.type in ("cuda", "xpu")),
+                                            )
                                         y_hat, loss_val, loss_top_val, loss_bottom_val = model(
                                             X,
                                             labels_flat=Y_flat,
@@ -2723,48 +2758,17 @@ def epochs(
                         for _vstep, _raw in enumerate(val_loader):
                             while True:
                                 try:
-                                    if device.type in ("cuda", "xpu", "mps"):
-                                        t_ready = time.perf_counter_ns()
-                                        if use_timer:
-                                            h2d_s_ev, h2d_e_ev = (
-                                                torch.Event(device=device, enable_timing=True),
-                                                torch.Event(device=device, enable_timing=True),
-                                            )
-                                            h2d_s_ev.record()
-                                            X, Y = meta.batch_to_device(_raw, device)
-                                            h2d_e_ev.record()
-                                            h2d_e_ev.synchronize()
-                                            h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                                        else:
-                                            t_h2d_s = time.perf_counter_ns()
-                                            X, Y = meta.batch_to_device(_raw, device)
-                                            t_h2d_e = time.perf_counter_ns()
-                                            h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
-                                    else:
-                                        feat, label, *_ = meta.preprocess(_raw)
-                                        X = to_torch_tensor(feat)
-                                        Y = to_torch_tensor(label)
-
-                                        t_ready = time.perf_counter_ns()
-                                        X, Y = pin_tensor(X, Y)
-
-                                        if use_timer:
-                                            h2d_s_ev, h2d_e_ev = (
-                                                torch.Event(device=device, enable_timing=True),
-                                                torch.Event(device=device, enable_timing=True),
-                                            )
-                                            h2d_s_ev.record()
-                                            X = to_device_with_stream(X)
-                                            Y = to_device_with_stream(Y)
-                                            h2d_e_ev.record()
-                                            h2d_e_ev.synchronize()
-                                            h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-                                        else:
-                                            t_h2d_s = time.perf_counter_ns()
-                                            X = to_device_with_stream(X)
-                                            Y = to_device_with_stream(Y)
-                                            t_h2d_e = time.perf_counter_ns()
-                                            h2d_s = (t_h2d_e - t_h2d_s) / 1_000_000_000.0
+                                    X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(
+                                        meta,
+                                        _raw,
+                                        device=device,
+                                        pin_tensor=pin_tensor,
+                                        to_device=to_device_with_stream,
+                                        use_timer=use_timer,
+                                        require_labels=True,
+                                    )
+                                    assert Y_opt is not None
+                                    Y = Y_opt
 
                                     X = torch.atleast_2d(X)
                                     if X.dim() != 2:
@@ -2809,7 +2813,9 @@ def epochs(
                                                 mark_step()
                                         with Autocast.float(device):
                                             Yv_flat = Y.reshape(Y.shape[0], -1).to(
-                                                device, dtype=param_dtype, non_blocking=True
+                                                device,
+                                                dtype=param_dtype,
+                                                non_blocking=(device.type in ("cuda", "xpu")),
                                             )
                                             _y, _loss_val = model(
                                                 X,
@@ -3351,6 +3357,30 @@ def infer(
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=device)
 
+    # Stage inputs through the same preprocess -> pin(pool) -> async H2D path
+    # used by training. For infer we intentionally avoid event timing (which
+    # would introduce per-batch synchronization).
+    cpu_pool: Any | None = None
+    if device.type in {"cuda", "xpu"} and Pool is not None:
+        with contextlib.suppress(Exception):
+            Memory.prefer_local_numa()
+        with contextlib.suppress(Exception):
+            cpu_pool = Pool(capacity=8)
+
+    pool_handles: dict[int, object] = {}
+    pin_tensor = partial(
+        _pin_tensors_with_cpu_pool,
+        device=device,
+        cpu_pool=cpu_pool,
+        pool_handles=pool_handles,
+    )
+    to_device_with_stream = partial(
+        _to_device_with_stream_and_pool,
+        device=device,
+        cpu_pool=cpu_pool,
+        pool_handles=pool_handles,
+    )
+
     status_bar = (
         get_tqdm(
             title="Prediction",
@@ -3534,7 +3564,24 @@ def infer(
                 except Exception:
                     row_ids = None
 
-                X, _Y = dataset.batch_to_device(batch, device=device, non_blocking=True)
+                try:
+                    X, _Y, _t_ready, _h2d_s = _preprocess_pin_h2d(
+                        dataset,
+                        batch,
+                        device=device,
+                        pin_tensor=pin_tensor,
+                        to_device=to_device_with_stream,
+                        use_timer=False,
+                        require_labels=False,
+                    )
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
+                    raise
+                finally:
+                    pool_handles.clear()
+
+                X = torch.atleast_2d(X)
                 bs = int(getattr(X, "shape", [0])[0]) if hasattr(X, "shape") else 0
                 if bs <= 0:
                     if status_bar is not None:
@@ -4276,7 +4323,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 set_model_state_dict(
                     model, m_sd, options=StateDictOptions(strict=False)
                 )
-        model.to(device, non_blocking=True).eval()
+        model.to(device, non_blocking=(device.type in ("cuda", "xpu"))).eval()
         metadata = Dataset.for_device(device)
         model, _, _ = fused.ModelPolicy.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
