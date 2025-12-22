@@ -11,7 +11,9 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import numpy as np
 
-_BOOTSTRAP_DEPTH = 0
+# NOTE: `_BOOTSTRAP_DEPTH` was an unused leftover from an earlier bootstrap
+# experiment. Keeping it around makes grepping and linting noisier without
+# providing any functional value.
 
 class LazyDict(_abc.Mapping):
     def __init__(self, keys: Any, getter: Any, *, name: str = "LazyDict", cache: bool = False) -> None:
@@ -248,9 +250,14 @@ class Cache:
         import queue
         import threading
 
-        self._q = queue.Queue(maxsize=max_queue)
         self._root = root
         os.makedirs(root, exist_ok=True)
+        max_q = int(max_queue)
+        self._sem = threading.Semaphore(max_q) if max_q > 0 else None
+        # `queue.Queue` involves a few extra locks/condition variables.
+        # We keep the backpressure behavior via a semaphore and use
+        # `SimpleQueue` for the fast, unbounded handoff.
+        self._q: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
         self._t = threading.Thread(target=self._run, daemon=True)
         self._err = None
         self._err_event = threading.Event()
@@ -265,7 +272,7 @@ class Cache:
         release_cb: Optional[object] = None,
     ) -> None:
         import contextlib
-        import queue
+        import os
 
         if self._err_event.is_set():
             raise RuntimeError(f"Async writer error: {self._err!r}")
@@ -273,16 +280,28 @@ class Cache:
             if idx is None:
                 raise ValueError("either path or idx required")
             path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
+        # Apply backpressure when a bounded queue was requested. If we cannot
+        # acquire within a small timeout, fall back to synchronous writes.
+        acquired = False
+        if self._sem is not None:
+            acquired = bool(self._sem.acquire(timeout=0.05))
+            if not acquired:
+                if wait_event is not None:
+                    with contextlib.suppress(Exception):
+                        wait_event.synchronize()
+                self._save_tensor(tensor, path)
+                if callable(release_cb):
+                    with contextlib.suppress(Exception):
+                        release_cb()
+                return
+
         try:
-            self._q.put((tensor, path, wait_event, release_cb), timeout=0.05)
-        except queue.Full:
-            if wait_event is not None:
+            self._q.put((tensor, path, wait_event, release_cb))
+        except Exception:
+            if acquired and self._sem is not None:
                 with contextlib.suppress(Exception):
-                    wait_event.synchronize()
-            self._save_tensor(tensor, path)
-            if callable(release_cb):
-                with contextlib.suppress(Exception):
-                    release_cb()
+                    self._sem.release()
+            raise
 
     def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
         import json
@@ -342,6 +361,10 @@ class Cache:
                 self._err = e
                 self._err_event.set()
                 break
+            finally:
+                if self._sem is not None:
+                    with contextlib.suppress(Exception):
+                        self._sem.release()
 
     def had_error(self) -> bool:
         return bool(self._err_event.is_set())
@@ -554,6 +577,63 @@ class LazyTensor:
             return self._data[k]
 
     @staticmethod
+    def key_index_mapping_getters(
+        data: Mapping[Any, Any],
+        *,
+        keys: Optional[Sequence[Any]] = None,
+    ) -> Tuple[Tuple[Any, ...], Any, Any]:
+        """Build (keys, get_batch, get_by_indices) helpers for key-index mappings.
+
+        This is the shared helper used by both `train()` and `predict()` to
+        materialize mapping-style datasets (e.g., `{feature_key: label}`) into
+        memmaps without duplicating selection logic.
+
+        The returned `get_batch(s, e)` yields a mapping view over `data` with the
+        key order slice `[s:e]`.
+
+        The returned `get_by_indices(idx)` yields a mapping view over `data` with
+        keys selected by integer indices (used for physical shuffle).
+        """
+
+        from operator import itemgetter
+
+        if keys is None:
+            keys_t = tuple(data.keys())
+        else:
+            keys_t = tuple(keys)
+        if not keys_t:
+            raise ValueError("Empty mapping: no keys")
+
+        def get_batch(s: int, e: int):
+            return LazyTensor.KeyIndexMappingView(data, keys_t[int(s) : int(e)])
+
+        def get_by_indices(idx: torch.Tensor):
+            if not isinstance(idx, torch.Tensor):
+                idx = torch.as_tensor(idx)
+            if idx.device.type != "cpu":
+                idx = idx.detach().cpu()
+            if idx.dtype not in (torch.int64, torch.int32):
+                idx = idx.to(dtype=torch.int64, copy=False)
+            idx = idx.reshape(-1)
+            if idx.numel() == 0:
+                return LazyTensor.KeyIndexMappingView(data, ())
+            if idx.numel() == 1:
+                k = keys_t[int(idx.item())]
+                return LazyTensor.KeyIndexMappingView(data, (k,))
+
+            ii = idx.tolist()
+            try:
+                sel = itemgetter(*ii)(keys_t)
+            except Exception:
+                # Fallback: robust but slower.
+                sel = [keys_t[int(i)] for i in ii]
+            if not isinstance(sel, tuple):
+                sel = (sel,)
+            return LazyTensor.KeyIndexMappingView(data, sel)
+
+        return keys_t, get_batch, get_by_indices
+
+    @staticmethod
     def is_feature_label_batch_mapping(obj: Any) -> bool:
         if not isinstance(obj, Mapping) or not obj:
             return False
@@ -739,6 +819,14 @@ class LazyTensor:
         else:
             chunk_second = int(max(1, min(count, req_chunk)))
 
+        # Pre-compute split indices. When `shuffle=True`, this refers to the
+        # *written* order (physical shuffle), so training/validation splits are
+        # still contiguous ranges in the memmap.
+        val_count = max(0, min(int(count), int(round(int(count) * float(val_frac)))))
+        train_count = max(0, int(count) - int(val_count))
+        train_start, train_end = 0, int(train_count)
+        val_start, val_end = int(train_end), int(train_end) + int(val_count)
+
         features_path = os.path.join(out_dir, "features.mmt")
         labels_path = os.path.join(out_dir, "labels.mmt")
 
@@ -766,21 +854,132 @@ class LazyTensor:
                 device=torch.device("cpu"),
             )
 
+        # Shuffle indexer (physical shuffle) without materializing a potentially
+        # huge `randperm(count)` tensor.
+        shuffle_indexer = None
+        shuffle_impl = "none"
         order: Optional[torch.Tensor] = None
+        shuffle_seed: Optional[int] = None
         if bool(shuffle):
             if get_by_indices is None:
                 raise ValueError("shuffle=True requires get_by_indices")
-            g = torch.Generator(device="cpu")
-            g.manual_seed(int(seed_value or 0))
-            order = torch.randperm(int(count), generator=g, dtype=torch.int64)
+
+            max_elems = env_first_int(
+                ("STNET_MEMMAP_RANDPERM_MAX_ELEMS", "STNET_MEMMAP_SHUFFLE_MAX_ELEMS"),
+                5_000_000,
+            )
+            use_full = (max_elems is not None) and (int(count) <= int(max_elems))
+            seed_i: Optional[int]
+            if seed_value is None:
+                seed_i = None
+            else:
+                seed_i = int(seed_value) & 0x7FFFFFFFFFFFFFFF
+
+            if use_full:
+                g = None
+                if seed_i is not None:
+                    g = torch.Generator(device="cpu")
+                    g.manual_seed(seed_i)
+                shuffle_seed = seed_i
+                order = torch.randperm(int(count), generator=g, dtype=torch.int64)
+
+                def _idx(s: int, e: int) -> torch.Tensor:
+                    return order[int(s) : int(e)]
+
+                shuffle_indexer = _idx
+                shuffle_impl = "randperm"
+            else:
+                if seed_i is None:
+                    # Use the global torch RNG so the shuffle stays stochastic
+                    # when no explicit seed is provided.
+                    seed_i = int(
+                        torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item()
+                    )
+                shuffle_seed = seed_i
+                # On-the-fly bijective pseudo-permutation over [0, count)
+                # using a small-domain Feistel network + cycle-walking.
+                k = max(1, int(int(count - 1)).bit_length())
+                if (k % 2) == 1:
+                    k += 1
+                half = k // 2
+                mask = (1 << half) - 1
+                domain_mask = (1 << k) - 1 if k < 64 else 0xFFFFFFFFFFFFFFFF
+
+                seed_u = torch.tensor(seed_i & 0xFFFFFFFFFFFFFFFF, dtype=torch.uint64)
+                mask_u = torch.tensor(mask, dtype=torch.uint64)
+                domain_u = torch.tensor(domain_mask, dtype=torch.uint64)
+                count_u = torch.tensor(int(count), dtype=torch.uint64)
+
+                # Per-round keys (derived from the seed).
+                k0 = seed_u ^ torch.tensor(0x9E3779B97F4A7C15, dtype=torch.uint64)
+                k1 = seed_u ^ torch.tensor(0xBF58476D1CE4E5B9, dtype=torch.uint64)
+                k2 = seed_u ^ torch.tensor(0x94D049BB133111EB, dtype=torch.uint64)
+                k3 = seed_u ^ torch.tensor(0xD6E8FEB86659FD93, dtype=torch.uint64)
+                round_keys = (k0, k1, k2, k3)
+
+                _c_mul1 = torch.tensor(0x9E3779B97F4A7C15, dtype=torch.uint64)
+                _c_mul2 = torch.tensor(0xC2B2AE3D27D4EB4F, dtype=torch.uint64)
+
+                def _round_fn(r: torch.Tensor, rk: torch.Tensor) -> torch.Tensor:
+                    x = (r ^ rk) & mask_u
+                    # A couple of cheap mixing steps; output is masked to `half` bits.
+                    x = (x * _c_mul1) & domain_u
+                    x = (x ^ (x >> 33)) & domain_u
+                    x = (x * _c_mul2) & domain_u
+                    x = (x ^ (x >> 29)) & domain_u
+                    return x & mask_u
+
+                def _feistel(x: torch.Tensor) -> torch.Tensor:
+                    x = x & domain_u
+                    l = (x >> half) & mask_u
+                    r = x & mask_u
+                    for rk in round_keys:
+                        f = _round_fn(r, rk)
+                        l, r = r, (l ^ f) & mask_u
+                    return (((l << half) | r) & domain_u)
+
+                def _permute(pos: torch.Tensor) -> torch.Tensor:
+                    # Vectorized cycle-walking to restrict to [0, count).
+                    x = pos.to(dtype=torch.uint64)
+                    y = _feistel(x)
+                    bad = y >= count_u
+                    # Expected <= 2 iterations when domain ~= 2^ceil_log2(count).
+                    for _ in range(4):
+                        if not bool(bad.any()):
+                            break
+                        y_bad = _feistel(y[bad])
+                        y[bad] = y_bad
+                        bad = y >= count_u
+                    return y.to(dtype=torch.int64)
+
+                def _idx(s: int, e: int) -> torch.Tensor:
+                    pos = torch.arange(int(s), int(e), device="cpu", dtype=torch.int64)
+                    return _permute(pos)
+
+                shuffle_indexer = _idx
+                shuffle_impl = "prp"
+
+        # Optional scaler stats (train split only). This replaces the expensive
+        # runtime pass that re-scans the full training loader to compute mean/std.
+        compute_scaler_stats = bool(write_labels) and (not bool(features_only)) and (not bool(allow_missing_labels))
+        x_sum: Optional[torch.Tensor] = None
+        x_sum_sq: Optional[torch.Tensor] = None
+        y_sum: Optional[torch.Tensor] = None
+        y_sum_sq: Optional[torch.Tensor] = None
+        if compute_scaler_stats and int(train_end) > 0:
+            x_sum = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
+            x_sum_sq = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
+            out_dim = int(np.prod(label_shape))
+            y_sum = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
+            y_sum_sq = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
 
         written = 0
         for s in range(0, count, int(chunk_second)):
             e = min(count, s + int(chunk_second))
-            if order is None:
+            if shuffle_indexer is None:
                 batch = get_batch(int(s), int(e))
             else:
-                idx = order[int(s) : int(e)]
+                idx = shuffle_indexer(int(s), int(e))
                 batch = get_by_indices(idx)
 
             fx, lb, _, _ = ds.preprocess(batch)
@@ -794,6 +993,17 @@ class LazyTensor:
                 )
 
             fx_out = fx_flat if fx_flat.dtype == store_float else fx_flat.to(dtype=store_float)
+
+            # Scaler sums for the *train* split in the written order.
+            if x_sum is not None and x_sum_sq is not None:
+                # `n` is expected to equal `(e - s)`, but keep this robust.
+                end_pos = int(s) + int(n)
+                overlap = max(0, min(end_pos, int(train_end)) - int(s))
+                if overlap > 0:
+                    fx_slice = fx_out[:overlap]
+                    fx64 = fx_slice if fx_slice.dtype == torch.float64 else fx_slice.to(dtype=torch.float64)
+                    x_sum += fx64.sum(dim=0)
+                    x_sum_sq += torch.einsum("bn,bn->n", fx64, fx64)
 
             features_mmt[int(s) : int(s) + int(n)].copy_(fx_out)
 
@@ -813,15 +1023,44 @@ class LazyTensor:
                     lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
                 assert labels_mmt is not None
                 labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
+
+                if y_sum is not None and y_sum_sq is not None:
+                    end_pos = int(s) + int(n)
+                    overlap = max(0, min(end_pos, int(train_end)) - int(s))
+                    if overlap > 0:
+                        lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
+                        lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
+                        y_sum += lb64.sum(dim=0)
+                        y_sum_sq += torch.einsum("bn,bn->n", lb64, lb64)
             written += int(n)
 
         if int(written) != int(count):
             raise RuntimeError(f"memmap written={written}, expected={count}")
 
-        val_count = max(0, min(int(count), int(round(int(count) * float(val_frac)))))
-        train_count = max(0, int(count) - int(val_count))
-        train_start, train_end = 0, int(train_count)
-        val_start, val_end = int(train_end), int(train_end) + int(val_count)
+        scaler_stats_path: Optional[str] = None
+        if (
+            compute_scaler_stats
+            and int(train_end) > 0
+            and x_sum is not None
+            and x_sum_sq is not None
+            and y_sum is not None
+            and y_sum_sq is not None
+        ):
+            try:
+                import torch as _torch
+
+                payload = {
+                    "version": 1,
+                    "train_count": int(train_end),
+                    "x_sum": x_sum,
+                    "x_sum_sq": x_sum_sq,
+                    "y_sum": y_sum,
+                    "y_sum_sq": y_sum_sq,
+                }
+                scaler_stats_path = "scaler_stats.pt"
+                _torch.save(payload, os.path.join(out_dir, scaler_stats_path))
+            except Exception:
+                scaler_stats_path = None
 
         meta_json: Dict[str, Any] = {
             "N": int(count),
@@ -833,12 +1072,14 @@ class LazyTensor:
             "labels_dtype": (str(store_float).replace("torch.", "") if write_labels else None),
             "fractions": [float(1.0 - float(val_frac)), float(val_frac)],
             "shuffled": bool(shuffle),
-            "shuffle_seed": int(seed_value) if seed_value is not None else None,
+            "shuffle_seed": int(shuffle_seed) if shuffle_seed is not None else None,
             "shuffle_mode": "physical" if bool(shuffle) else "none",
+            "shuffle_impl": shuffle_impl,
             "train_start": int(train_start),
             "train_end": int(train_end),
             "val_start": int(val_start),
             "val_end": int(val_end),
+            "scaler_stats_path": scaler_stats_path,
             "has_scale": bool(stats.get("has_scale")),
             "has_nonfinite": bool(stats.get("has_nonfinite")),
             "scale_max_abs": stats.get("scale_max_abs"),
@@ -1118,6 +1359,91 @@ class LazyTensor:
         if not metas:
             return {}
         return dict(LazyTensor.merge_meta_dicts(metas))
+
+    @staticmethod
+    def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
+        """Load and aggregate per-source scaler sums/sumsq from memmap metadata.
+
+        Training previously computed feature/label mean+std by re-scanning the
+        full training loader once before the first epoch. When memmaps are built
+        via `write_memmap_streaming_two_pass`, we already touch all samples; so
+        we persist the necessary sufficient statistics (sum/sumsq) into each
+        memmap directory.
+
+        This helper aggregates those stats across (possibly expanded) sources.
+        It returns None when stats are unavailable/incompatible, allowing the
+        caller to fall back to the legacy runtime scan.
+        """
+
+        expanded = LazyTensor.expand_sources(sources)
+        total = 0
+        x_sum: Optional[torch.Tensor] = None
+        x_sum_sq: Optional[torch.Tensor] = None
+        y_sum: Optional[torch.Tensor] = None
+        y_sum_sq: Optional[torch.Tensor] = None
+
+        for path in LazyTensor.iter_source_paths(expanded):
+            try:
+                meta = LazyTensor.from_meta(path)
+            except Exception:
+                return None
+            rel = meta.get("scaler_stats_path")
+            if not rel:
+                return None
+            stats_path = os.path.join(os.fspath(path), os.fspath(rel))
+            if not os.path.isfile(stats_path):
+                return None
+            try:
+                payload = torch.load(stats_path, map_location="cpu")
+            except Exception:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            if int(payload.get("version") or 0) != 1:
+                return None
+            c = int(payload.get("train_count") or 0)
+            if c <= 0:
+                return None
+
+            xs = payload.get("x_sum")
+            xs2 = payload.get("x_sum_sq")
+            ys = payload.get("y_sum")
+            ys2 = payload.get("y_sum_sq")
+            if xs is None or xs2 is None or ys is None or ys2 is None:
+                return None
+
+            xs = xs.detach().to(dtype=torch.float64, device="cpu") if isinstance(xs, torch.Tensor) else torch.as_tensor(xs, dtype=torch.float64)
+            xs2 = xs2.detach().to(dtype=torch.float64, device="cpu") if isinstance(xs2, torch.Tensor) else torch.as_tensor(xs2, dtype=torch.float64)
+            ys = ys.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys, torch.Tensor) else torch.as_tensor(ys, dtype=torch.float64)
+            ys2 = ys2.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys2, torch.Tensor) else torch.as_tensor(ys2, dtype=torch.float64)
+
+            if x_sum is None:
+                x_sum = xs.clone()
+                x_sum_sq = xs2.clone()
+                y_sum = ys.clone()
+                y_sum_sq = ys2.clone()
+            else:
+                if xs.shape != x_sum.shape or xs2.shape != x_sum_sq.shape:
+                    return None
+                if ys.shape != y_sum.shape or ys2.shape != y_sum_sq.shape:
+                    return None
+                x_sum += xs
+                x_sum_sq += xs2
+                y_sum += ys
+                y_sum_sq += ys2
+
+            total += c
+
+        if total <= 0 or x_sum is None or x_sum_sq is None or y_sum is None or y_sum_sq is None:
+            return None
+
+        return {
+            "train_count": int(total),
+            "x_sum": x_sum,
+            "x_sum_sq": x_sum_sq,
+            "y_sum": y_sum,
+            "y_sum_sq": y_sum_sq,
+        }
 
     @staticmethod
     def expand_sources(sources: Any) -> Any:

@@ -264,16 +264,10 @@ def train(
             and all(not isinstance(v, _Mapping) for v in d.values())
             and not LazyTensor.is_feature_label_batch_mapping(d)
         ):
-            keys = list(d.keys())
-            count = len(keys)
+            keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(d)
+            count = len(keys_t)
             if count <= 0:
                 raise ValueError("Empty dataset provided to train().")
-            def _get_batch(s: int, e: int):
-                return LazyTensor.KeyIndexMappingView(d, keys[s:e])
-
-            def _get_by_indices(idx: torch.Tensor):
-                ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
-                return LazyTensor.KeyIndexMappingView(d, [keys[i] for i in ii])
 
             in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
                 ds=ds_meta,
@@ -794,17 +788,11 @@ def predict(
         and all(not isinstance(v, _Mapping) for v in data.values())
         and not LazyTensor.is_feature_label_batch_mapping(data)
     ):
-        keys = list(data.keys())
+        keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(data)
+        keys = list(keys_t)
         count = len(keys)
         if count <= 0:
             return {}
-
-        def _get_batch(s: int, e: int):
-            return LazyTensor.KeyIndexMappingView(data, keys[s:e])
-
-        def _get_by_indices(idx: torch.Tensor):
-            ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
-            return LazyTensor.KeyIndexMappingView(data, [keys[i] for i in ii])
 
         in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
             ds=ds,

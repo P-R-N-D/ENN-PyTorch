@@ -317,7 +317,16 @@ def load_model(
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
-        sd = load_tensors(str(p), device=map_location or "cpu")
+        dev = map_location or "cpu"
+        # Normalize `map_location` to a string for `safetensors.torch.load_file`.
+        # Passing a torch.device is usually accepted, but normalizing avoids
+        # edge-cases across versions.
+        if isinstance(dev, torch.device):
+            dev = str(dev)
+        else:
+            dev = str(dev)
+
+        sd = load_tensors(str(p), device=dev)
         sd = _strip_legacy_wrapped_keys(sd)
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
