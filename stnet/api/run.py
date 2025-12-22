@@ -6,8 +6,8 @@ import json
 import os
 import random
 import shutil
+import tempfile
 import threading
-from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,7 +40,7 @@ from ..data.datatype import env_bool
 from ..data.nodes import preload_memmap
 from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..model.nn import History, Root, resize_scaler_buffer
-from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
+from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
 
 # -----------------------------
@@ -134,9 +134,22 @@ def _preload_state(state: Any) -> Any:
 
     if isinstance(state, _Mapping):
         return {k: _preload_state(v) for k, v in state.items()}
-    if isinstance(state, (list, tuple)):
-        seq = [_preload_state(v) for v in state]
-        return type(state)(seq)
+    if isinstance(state, list):
+        return [_preload_state(v) for v in state]
+    if isinstance(state, tuple):
+        seq = tuple(_preload_state(v) for v in state)
+        if type(state) is tuple:
+            return seq
+        # namedtuple: constructor expects positional args.
+        if hasattr(state, "_fields"):
+            try:
+                return type(state)(*seq)
+            except Exception:
+                return seq
+        try:
+            return type(state)(seq)
+        except Exception:
+            return seq
 
     if isinstance(state, torch.Tensor):
         t = state
@@ -268,6 +281,27 @@ def _mmt_meta_path(mmt_path: str) -> str:
     return str(mmt_path) + ".meta.json"
 
 
+def _atomic_write_json(path: str, payload: Any) -> None:
+    """Atomically write JSON to `path` (best-effort).
+
+    This prevents corrupt sidecar metadata files when multiple processes/threads race or the process
+    is interrupted mid-write.
+    """
+    p = str(path)
+    parent = os.path.dirname(p) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    os.close(fd)
+    try:
+        with open(tmp_name, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.replace(tmp_name, p)
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(tmp_name)
+
+
 def _parse_dtype(dtype_s: Any) -> Optional[torch.dtype]:
     if isinstance(dtype_s, torch.dtype):
         return dtype_s
@@ -309,8 +343,7 @@ def _ensure_pred_memmap_from_pt(pt_path: str, mmt_path: str) -> tuple[str, torch
         MemoryMappedTensor.from_tensor(preds, filename=mmt_path, existsok=True)
 
         meta = {"dtype": str(preds.dtype), "shape": list(preds.shape)}
-        with open(_mmt_meta_path(mmt_path), "w", encoding="utf-8") as f:
-            json.dump(meta, f)
+        _atomic_write_json(_mmt_meta_path(mmt_path), meta)
 
         return mmt_path, preds.dtype, tuple(int(x) for x in preds.shape)
 
@@ -343,7 +376,7 @@ def _iter_datasets(data: Any) -> tuple[list[tuple[str, Any]], Optional[dict[str,
     if isinstance(data, TensorDictBase):
         return [("0", data)], None
 
-    if isinstance(data, _Mapping) and data and all(isinstance(v, _Mapping) for v in data.values()):
+    elif isinstance(data, _Mapping) and data and all(isinstance(v, _Mapping) for v in data.values()):
         man: dict[str, str] = {}
         items: list[tuple[str, Any]] = []
         for k, d in data.items():
@@ -352,7 +385,7 @@ def _iter_datasets(data: Any) -> tuple[list[tuple[str, Any]], Optional[dict[str,
             man[key] = key
         return items, man
 
-    if isinstance(data, Sequence) and data and all(isinstance(d, _Mapping) for d in data):
+    elif isinstance(data, Sequence) and data and all(isinstance(d, _Mapping) for d in data):
         man2: list[str] = []
         items2: list[tuple[str, Any]] = []
         for i, d in enumerate(data):
@@ -362,6 +395,234 @@ def _iter_datasets(data: Any) -> tuple[list[tuple[str, Any]], Optional[dict[str,
         return items2, man2
 
     return [("0", data)], None
+
+
+# -----------------------------
+# train() helpers (kept module-level to avoid nested defs)
+# -----------------------------
+
+
+def _check_shapes(
+    first_in_dim: Optional[int],
+    in_dim: int,
+    first_label_shape: Tuple[int, ...],
+    lshape: Tuple[int, ...],
+) -> Tuple[Optional[int], Tuple[int, ...]]:
+    """Validate that all datasets share the same feature/label shapes."""
+    if first_in_dim is None:
+        return int(in_dim), tuple(lshape)
+    if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
+        raise RuntimeError(
+            f"Shape mismatch across datasets: expected X_dim={first_in_dim}, y_shape={first_label_shape}, "
+            f"got X_dim={in_dim}, y_shape={lshape}"
+        )
+    return first_in_dim, first_label_shape
+
+
+
+def _mat_one(
+    d: Any,
+    out_dir: str,
+    *,
+    ds: Dataset,
+    val_frac: float,
+    seed_value: Optional[int],
+    underflow_action: Any,
+    shuffle: bool,
+) -> Tuple[int, Tuple[int, ...], int]:
+    """Materialize one dataset into the on-disk memmap format used by runtime workers."""
+    from collections.abc import Mapping as _Mapping
+
+    if isinstance(d, TensorDictBase):
+        td = d
+        if td.batch_size is None or len(td.batch_size) == 0:
+            raise ValueError("TensorDict input to train() must have a batch dimension.")
+        count = int(td.batch_size[0])
+        if count <= 0:
+            raise ValueError("Empty TensorDict provided to train().")
+
+        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+            ds=ds,
+            out_dir=out_dir,
+            count=count,
+            get_batch=lambda s, e: td[s:e],
+            get_by_indices=lambda idx: td[idx],
+            val_frac=float(val_frac),
+            seed_value=seed_value,
+            underflow_action=underflow_action,
+            shuffle=bool(shuffle),
+            allow_missing_labels=False,
+            chunk_size=0,
+        )
+        return int(in_dim), tuple(label_shape), int(count)
+
+    if (
+        isinstance(d, _Mapping)
+        and d
+        and all(not isinstance(v, _Mapping) for v in d.values())
+        and not LazyTensor.is_feature_label_batch_mapping(d)
+    ):
+        keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(d)
+        count = len(keys_t)
+        if count <= 0:
+            raise ValueError("Empty dataset provided to train().")
+
+        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+            ds=ds,
+            out_dir=out_dir,
+            count=count,
+            get_batch=_get_batch,
+            get_by_indices=_get_by_indices,
+            val_frac=float(val_frac),
+            seed_value=seed_value,
+            underflow_action=underflow_action,
+            shuffle=bool(shuffle),
+            allow_missing_labels=False,
+            chunk_size=0,
+        )
+        return int(in_dim), tuple(label_shape), int(count)
+
+    fx, lb, _, lshape = ds.preprocess(d)
+    if not fx.is_contiguous():
+        fx = fx.contiguous()
+    if lb is None:
+        raise ValueError("train() requires labels")
+    count = int(fx.shape[0])
+    if count <= 0:
+        raise ValueError("Empty dataset provided to train().")
+    in_dim = int(fx.reshape(count, -1).shape[1])
+
+    preload_memmap(
+        {"features": fx, "labels": lb},
+        memmap_dir=out_dir,
+        train_frac=1.0 - float(val_frac),
+        val_frac=float(val_frac),
+        shuffle=bool(shuffle),
+        seed=seed_value,
+        underflow_action=underflow_action,
+    )
+    del fx, lb
+    return int(in_dim), tuple(lshape), int(count)
+
+
+
+def _aggregate_run_stats(recs: List[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+    """Reduce per-batch statistics into a single aggregate (weighted by batch_size)."""
+    if not isinstance(recs, list) or not recs:
+        return None
+    total_bs = 0
+    sum_x = 0.0
+    sum_x2 = 0.0
+    sum_y = 0.0
+    sum_y2 = 0.0
+    x_min = float("inf")
+    x_max = float("-inf")
+    y_min = float("inf")
+    y_max = float("-inf")
+
+    for r in recs:
+        if not isinstance(r, Mapping):
+            continue
+        bs = int(r.get("batch_size", 0))
+        if bs <= 0:
+            continue
+
+        bxm = float(r.get("batch_x_mean", 0.0))
+        bxv = float(r.get("batch_x_var", 0.0))
+        bym = float(r.get("batch_y_mean", 0.0))
+        byv = float(r.get("batch_y_var", 0.0))
+        bxmin = float(r.get("batch_x_min", float("inf")))
+        bxmax = float(r.get("batch_x_max", float("-inf")))
+        bymin = float(r.get("batch_y_min", float("inf")))
+        bymax = float(r.get("batch_y_max", float("-inf")))
+
+        total_bs += bs
+        sum_x += bxm * bs
+        sum_x2 += (bxv + bxm * bxm) * bs
+        sum_y += bym * bs
+        sum_y2 += (byv + bym * bym) * bs
+
+        x_min = min(x_min, bxmin)
+        x_max = max(x_max, bxmax)
+        y_min = min(y_min, bymin)
+        y_max = max(y_max, bymax)
+
+    if total_bs <= 0:
+        return None
+
+    mean_x = sum_x / total_bs
+    mean_y = sum_y / total_bs
+    var_x = max(sum_x2 / total_bs - mean_x * mean_x, 0.0)
+    var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
+
+    return {
+        "processed_n": float(total_bs),
+        "sampled_x_mean": mean_x,
+        "sampled_x_var": var_x,
+        "sampled_x_min": x_min,
+        "sampled_x_max": x_max,
+        "sampled_y_mean": mean_y,
+        "sampled_y_var": var_y,
+        "sampled_y_min": y_min,
+        "sampled_y_max": y_max,
+    }
+
+
+
+def _update_cum_stats(
+    prev: Optional[Dict[str, float]],
+    n_prev: int,
+    inc: Optional[Dict[str, float]],
+    n_inc: int,
+) -> Optional[Dict[str, float]]:
+    """Combine previous reduced stats with a new run's sampled stats."""
+    if inc is None or n_inc <= 0:
+        return prev
+    if prev is None or n_prev <= 0:
+        out: Dict[str, float] = {}
+        for key, val in inc.items():
+            if key.startswith("sampled_"):
+                out["reduced_" + key[len("sampled_") :]] = float(val)
+        return out
+
+    out: Dict[str, float] = {}
+    for axis in ("x", "y"):
+        m_key = f"{axis}_mean"
+        v_key = f"{axis}_var"
+        lo_key = f"{axis}_min"
+        hi_key = f"{axis}_max"
+
+        m_prev = float(prev.get("reduced_" + m_key, 0.0))
+        v_prev = float(prev.get("reduced_" + v_key, 0.0))
+        lo_prev = float(prev.get("reduced_" + lo_key, float("inf")))
+        hi_prev = float(prev.get("reduced_" + hi_key, float("-inf")))
+
+        m_inc = float(inc.get(f"sampled_{m_key}", 0.0))
+        v_inc = float(inc.get(f"sampled_{v_key}", 0.0))
+        lo_inc = float(inc.get(f"sampled_{lo_key}", float("inf")))
+        hi_inc = float(inc.get(f"sampled_{hi_key}", float("-inf")))
+
+        sum_prev = m_prev * n_prev
+        sum2_prev = (v_prev + m_prev * m_prev) * n_prev
+        sum_inc = m_inc * n_inc
+        sum2_inc = (v_inc + m_inc * m_inc) * n_inc
+
+        n_new = n_prev + n_inc
+        sum_new = sum_prev + sum_inc
+        sum2_new = sum2_prev + sum2_inc
+
+        m_new = sum_new / n_new
+        v_new = max(sum2_new / n_new - m_new * m_new, 0.0)
+
+        lo_new = min(lo_prev, lo_inc)
+        hi_new = max(hi_prev, hi_inc)
+
+        out["reduced_" + m_key] = m_new
+        out["reduced_" + v_key] = v_new
+        out["reduced_" + lo_key] = lo_new
+        out["reduced_" + hi_key] = hi_new
+
+    return out
 
 
 # -----------------------------
@@ -415,95 +676,6 @@ def train(
     ds_meta = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
     ds_meta.underflow_action = underflow_action
 
-    def _check_shapes(
-        first_in_dim: Optional[int],
-        in_dim: int,
-        first_label_shape: Tuple[int, ...],
-        lshape: Tuple[int, ...],
-    ) -> Tuple[Optional[int], Tuple[int, ...]]:
-        if first_in_dim is None:
-            return int(in_dim), tuple(lshape)
-        if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
-            raise RuntimeError(
-                f"Shape mismatch across datasets: expected X_dim={first_in_dim}, y_shape={first_label_shape}, "
-                f"got X_dim={in_dim}, y_shape={lshape}"
-            )
-        return first_in_dim, first_label_shape
-
-    def _mat_one(d: Any, out_dir: str) -> Tuple[int, Tuple[int, ...], int]:
-        from collections.abc import Mapping as _Mapping
-
-        if isinstance(d, TensorDictBase):
-            td = d
-            if td.batch_size is None or len(td.batch_size) == 0:
-                raise ValueError("TensorDict input to train() must have a batch dimension.")
-            count = int(td.batch_size[0])
-            if count <= 0:
-                raise ValueError("Empty TensorDict provided to train().")
-
-            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
-                ds=ds_meta,
-                out_dir=out_dir,
-                count=count,
-                get_batch=lambda s, e: td[s:e],
-                get_by_indices=lambda idx: td[idx],
-                val_frac=float(val_frac),
-                seed_value=seed_value,
-                underflow_action=underflow_action,
-                shuffle=bool(shuffle),
-                allow_missing_labels=False,
-                chunk_size=0,
-            )
-            return int(in_dim), tuple(label_shape), int(count)
-
-        if (
-            isinstance(d, _Mapping)
-            and d
-            and all(not isinstance(v, _Mapping) for v in d.values())
-            and not LazyTensor.is_feature_label_batch_mapping(d)
-        ):
-            keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(d)
-            count = len(keys_t)
-            if count <= 0:
-                raise ValueError("Empty dataset provided to train().")
-
-            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
-                ds=ds_meta,
-                out_dir=out_dir,
-                count=count,
-                get_batch=_get_batch,
-                get_by_indices=_get_by_indices,
-                val_frac=float(val_frac),
-                seed_value=seed_value,
-                underflow_action=underflow_action,
-                shuffle=bool(shuffle),
-                allow_missing_labels=False,
-                chunk_size=0,
-            )
-            return int(in_dim), tuple(label_shape), int(count)
-
-        fx, lb, _, lshape = ds_meta.preprocess(d)
-        if not fx.is_contiguous():
-            fx = fx.contiguous()
-        if lb is None:
-            raise ValueError("train() requires labels")
-        count = int(fx.shape[0])
-        if count <= 0:
-            raise ValueError("Empty dataset provided to train().")
-        in_dim = int(fx.reshape(count, -1).shape[1])
-
-        preload_memmap(
-            {"features": fx, "labels": lb},
-            memmap_dir=out_dir,
-            train_frac=1.0 - float(val_frac),
-            val_frac=float(val_frac),
-            shuffle=bool(shuffle),
-            seed=seed_value,
-            underflow_action=underflow_action,
-        )
-        del fx, lb
-        return int(in_dim), tuple(lshape), int(count)
-
     initialize_python_path()
     mp.allow_connection_pickling()
     set_multiprocessing_env()
@@ -525,7 +697,15 @@ def train(
             sub = memmap_dir if (not multi) else os.path.join(memmap_dir, key)
             if multi:
                 os.makedirs(sub, exist_ok=True)
-            in_dim, lshape, n = _mat_one(d, sub)
+            in_dim, lshape, n = _mat_one(
+                d,
+                sub,
+                ds=ds_meta,
+                val_frac=float(val_frac),
+                seed_value=seed_value,
+                underflow_action=underflow_action,
+                shuffle=bool(shuffle),
+            )
             first_in_dim, label_shape = _check_shapes(first_in_dim, in_dim, label_shape, lshape)
             num_samples_dataset += int(n)
 
@@ -563,7 +743,7 @@ def train(
             cfg_model = coerce_model_config(cfg_obj)
         else:
             cfg_model = ModelConfig()
-        cfg_dict: Dict[str, Any] = asdict(cfg_model)
+        cfg_dict: Dict[str, Any] = model_config_to_dict(cfg_model)
 
         lc = LaunchConfig(
             min_nodes=1,
@@ -652,66 +832,6 @@ def train(
                     if isinstance(meta, dict):
                         setattr(model, "_train_history_meta", dict(meta))
 
-                    def _aggregate_run_stats(recs: List[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
-                        if not isinstance(recs, list) or not recs:
-                            return None
-                        total_bs = 0
-                        sum_x = 0.0
-                        sum_x2 = 0.0
-                        sum_y = 0.0
-                        sum_y2 = 0.0
-                        x_min = float("inf")
-                        x_max = float("-inf")
-                        y_min = float("inf")
-                        y_max = float("-inf")
-
-                        for r in recs:
-                            if not isinstance(r, Mapping):
-                                continue
-                            bs = int(r.get("batch_size", 0))
-                            if bs <= 0:
-                                continue
-
-                            bxm = float(r.get("batch_x_mean", 0.0))
-                            bxv = float(r.get("batch_x_var", 0.0))
-                            bym = float(r.get("batch_y_mean", 0.0))
-                            byv = float(r.get("batch_y_var", 0.0))
-                            bxmin = float(r.get("batch_x_min", float("inf")))
-                            bxmax = float(r.get("batch_x_max", float("-inf")))
-                            bymin = float(r.get("batch_y_min", float("inf")))
-                            bymax = float(r.get("batch_y_max", float("-inf")))
-
-                            total_bs += bs
-                            sum_x += bxm * bs
-                            sum_x2 += (bxv + bxm * bxm) * bs
-                            sum_y += bym * bs
-                            sum_y2 += (byv + bym * bym) * bs
-
-                            x_min = min(x_min, bxmin)
-                            x_max = max(x_max, bxmax)
-                            y_min = min(y_min, bymin)
-                            y_max = max(y_max, bymax)
-
-                        if total_bs <= 0:
-                            return None
-
-                        mean_x = sum_x / total_bs
-                        mean_y = sum_y / total_bs
-                        var_x = max(sum_x2 / total_bs - mean_x * mean_x, 0.0)
-                        var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
-
-                        return {
-                            "processed_n": float(total_bs),
-                            "sampled_x_mean": mean_x,
-                            "sampled_x_var": var_x,
-                            "sampled_x_min": x_min,
-                            "sampled_x_max": x_max,
-                            "sampled_y_mean": mean_y,
-                            "sampled_y_var": var_y,
-                            "sampled_y_min": y_min,
-                            "sampled_y_max": y_max,
-                        }
-
                     run_stats = _aggregate_run_stats(records) if isinstance(records, list) and records else None
 
                     prev_total = int(getattr(model, "_history_total_samples", 0))
@@ -722,60 +842,6 @@ def train(
                     new_total = prev_total + inc_samples
 
                     prev_cum = getattr(model, "_history_cum_stats", None)
-
-                    def _update_cum_stats(
-                        prev: Optional[Dict[str, float]],
-                        n_prev: int,
-                        inc: Optional[Dict[str, float]],
-                        n_inc: int,
-                    ) -> Optional[Dict[str, float]]:
-                        if inc is None or n_inc <= 0:
-                            return prev
-                        if prev is None or n_prev <= 0:
-                            out = {}
-                            for key, val in inc.items():
-                                if key.startswith("sampled_"):
-                                    out["reduced_" + key[len("sampled_") :]] = float(val)
-                            return out
-
-                        out: Dict[str, float] = {}
-                        for axis in ("x", "y"):
-                            m_key = f"{axis}_mean"
-                            v_key = f"{axis}_var"
-                            lo_key = f"{axis}_min"
-                            hi_key = f"{axis}_max"
-
-                            m_prev = float(prev.get("reduced_" + m_key, 0.0))
-                            v_prev = float(prev.get("reduced_" + v_key, 0.0))
-                            lo_prev = float(prev.get("reduced_" + lo_key, float("inf")))
-                            hi_prev = float(prev.get("reduced_" + hi_key, float("-inf")))
-
-                            m_inc = float(inc.get(f"sampled_{m_key}", 0.0))
-                            v_inc = float(inc.get(f"sampled_{v_key}", 0.0))
-                            lo_inc = float(inc.get(f"sampled_{lo_key}", float("inf")))
-                            hi_inc = float(inc.get(f"sampled_{hi_key}", float("-inf")))
-
-                            sum_prev = m_prev * n_prev
-                            sum2_prev = (v_prev + m_prev * m_prev) * n_prev
-                            sum_inc = m_inc * n_inc
-                            sum2_inc = (v_inc + m_inc * m_inc) * n_inc
-
-                            n_new = n_prev + n_inc
-                            sum_new = sum_prev + sum_inc
-                            sum2_new = sum2_prev + sum2_inc
-
-                            m_new = sum_new / n_new
-                            v_new = max(sum2_new / n_new - m_new * m_new, 0.0)
-
-                            lo_new = min(lo_prev, lo_inc)
-                            hi_new = max(hi_prev, hi_inc)
-
-                            out["reduced_" + m_key] = m_new
-                            out["reduced_" + v_key] = v_new
-                            out["reduced_" + lo_key] = lo_new
-                            out["reduced_" + hi_key] = hi_new
-
-                        return out
 
                     cum_stats = _update_cum_stats(prev_cum, prev_total, run_stats, inc_samples)
 
@@ -858,7 +924,7 @@ def predict(
             cfg_model = coerce_model_config(cfg_obj)
         else:
             cfg_model = ModelConfig()
-        cfg_dict = asdict(cfg_model)
+        cfg_dict = model_config_to_dict(cfg_model)
 
         seed_value = _ensure_seed(seed)
         _seed_everything(seed_value)
@@ -1233,7 +1299,6 @@ def get_prediction(
             row_to_off = np.full((nkeys,), -1, dtype=np.int32)
 
             # Store per-part pred file paths.
-            rows_paths: list[Optional[str]] = [None] * len(parts_list)
             pred_pt_paths: list[Optional[str]] = [None] * len(parts_list)
             pred_mmt_paths: list[Optional[str]] = [None] * len(parts_list)
 
@@ -1249,7 +1314,6 @@ def get_prediction(
                 rows_path = os.path.join(chunk_root, rows_name)
                 pred_path = os.path.join(chunk_root, pred_name)
 
-                rows_paths[p_idx] = rows_path
                 pred_pt_paths[p_idx] = pred_path
                 pred_mmt_paths[p_idx] = _derive_mmt_path(pred_path)
 

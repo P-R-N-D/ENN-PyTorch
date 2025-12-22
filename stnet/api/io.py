@@ -7,7 +7,6 @@ import logging
 import os
 import tempfile
 import threading
-from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -38,7 +37,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..model.nn import Root, resize_scaler_buffer
-from .config import ModelConfig, coerce_model_config
+from .config import ModelConfig, coerce_model_config, model_config_to_dict
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -330,11 +329,7 @@ def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     else:
         candidate = None
     try:
-        data = asdict(coerce_model_config(candidate))
-        dev = data.get("device", None)
-        if isinstance(dev, torch.device):
-            data["device"] = str(dev)
-        return data
+        return model_config_to_dict(candidate)
     except Exception:
         return {}
 
