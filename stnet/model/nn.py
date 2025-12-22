@@ -24,11 +24,13 @@ from typing import (
 
 import torch
 import torch.nn as nn
+
 try:
     from tensordict import TensorDictBase
 except ImportError:
     class TensorDictBase:  # type: ignore[no-redef]
         pass
+
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -46,6 +48,54 @@ from .layers import (
     norm_layer,
 )
 
+
+# -------------------------
+# Small internal utilities
+# -------------------------
+
+def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.device:
+    """Best-effort device inference that follows .to() / DDP moves."""
+    try:
+        p0 = next(module.parameters(), None)
+        if p0 is not None:
+            return p0.device
+    except Exception:
+        pass
+    try:
+        b0 = next(module.buffers(), None)
+        if b0 is not None:
+            return b0.device
+    except Exception:
+        pass
+    return fallback
+
+
+def _graph_break() -> None:
+    """Break torch.compile graphs only when tracing (safe no-op otherwise)."""
+    try:
+        import torch._dynamo as _dynamo  # type: ignore
+
+        if not _dynamo.is_compiling():
+            return
+    except Exception:
+        return
+
+    try:
+        import torch._inductor as _inductor  # type: ignore
+
+        gb = getattr(_inductor, "graph_break", None)
+        if callable(gb):
+            gb()
+            return
+    except Exception:
+        pass
+
+    try:
+        _dynamo.graph_break()
+    except Exception:
+        pass
+
+
 @torch.no_grad()
 def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     B, N, C = coords.shape
@@ -58,23 +108,24 @@ def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     x = (coords - mins) / rng
     return x.clamp_(0.0, 1.0 - 1e-7)
 
+
 @torch.no_grad()
 def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     def _expand_bits(v: torch.Tensor) -> torch.Tensor:
         v = (v | (v << 16)) & 0x030000FF
-        v = (v | (v << 8))  & 0x0300F00F
-        v = (v | (v << 4))  & 0x030C30C3
-        v = (v | (v << 2))  & 0x09249249
+        v = (v | (v << 8)) & 0x0300F00F
+        v = (v | (v << 4)) & 0x030C30C3
+        v = (v | (v << 2)) & 0x09249249
         return v
 
-    B, N, _ = coords01.shape
-    maxv = (1 << bits) - 1
+    maxv = (1 << int(bits)) - 1
     xyz = (coords01 * maxv).to(torch.int32)
     x, y, z = xyz.unbind(dim=-1)
     xx = _expand_bits(x)
     yy = _expand_bits(y) << 1
     zz = _expand_bits(z) << 2
     return (xx | yy | zz)
+
 
 @torch.no_grad()
 def _serialize_z_index(
@@ -103,9 +154,11 @@ def _serialize_z_index(
     invperm.scatter_(1, perm, scatter_src)
     return perm, invperm
 
+
 def _block_ranges(N: int, patch: int) -> Iterator[tuple[int, int]]:
-    for s in range(0, N, patch):
-        e = min(s + patch, N)
+    patch_i = max(1, int(patch))
+    for s in range(0, int(N), patch_i):
+        e = min(s + patch_i, int(N))
         yield s, e
 
 
@@ -160,33 +213,125 @@ def _apply_norm_fp16_safe(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
     return y
 
 
-def _graph_break() -> None:
-    # Only break graphs when we are actually inside a torch.compile() trace.
-    try:
-        import torch._dynamo as _dynamo
+def _microbatch_prealloc(
+    inp: torch.Tensor,
+    microbatch: int,
+    run_fn: Callable[[torch.Tensor], Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
+    *,
+    pad_to: Optional[int] = None,
+    out_dtype: Optional[torch.dtype] = None,
+    cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    stage: str = "microbatch",
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
+    """Generic microbatch runner that preallocates output buffers.
 
-        if not _dynamo.is_compiling():
-            return
-    except Exception:
-        return
+    Notes:
+        - When autograd is on, padding buffers are not reused to avoid corrupting saved tensors.
+        - Shapes must remain consistent across slices.
+    """
+    if inp.ndim < 1:
+        raise ValueError(
+            f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}"
+        )
 
-    try:
-        import torch._inductor as _inductor
+    total_b = int(inp.shape[0])
+    mb_i = max(1, min(total_b, int(microbatch) if microbatch else total_b))
+    pad_i = int(pad_to) if pad_to is not None else None
+    if pad_i is not None:
+        pad_i = max(1, pad_i)
+        if pad_i < mb_i:
+            raise ValueError(
+                f"{stage}: pad_to ({pad_i}) must be >= microbatch ({mb_i})"
+            )
 
-        gb = getattr(_inductor, "graph_break", None)
-        if callable(gb):
-            gb()
-            return
-    except Exception:
-        pass
+    out_bufs: Optional[List[torch.Tensor]] = None
+    reuse_pad_buffer = not torch.is_grad_enabled()
+    pad_buf: Optional[torch.Tensor] = None
 
-    try:
-        _dynamo.graph_break()
-    except Exception:
-        pass
+    for s in range(0, total_b, mb_i):
+        x_slice = inp[s : s + mb_i]
+        if cast_slice is not None:
+            x_slice = cast_slice(x_slice)
+
+        slice_n = int(x_slice.shape[0])
+        x_in = x_slice
+        did_pad = False
+        if pad_i is not None and slice_n < pad_i:
+            want_shape = (pad_i, *x_slice.shape[1:])
+            if reuse_pad_buffer:
+                if (
+                    pad_buf is None
+                    or pad_buf.shape != want_shape
+                    or pad_buf.dtype != x_slice.dtype
+                    or pad_buf.device != x_slice.device
+                ):
+                    pad_buf = x_slice.new_empty(want_shape)
+                pad_buf.zero_()
+                pad_buf[:slice_n].copy_(x_slice)
+                x_in = pad_buf
+            else:
+                x_in = x_slice.new_zeros(want_shape)
+                x_in[:slice_n].copy_(x_slice)
+            did_pad = True
+
+        out = run_fn(x_in)
+
+        if torch.is_tensor(out):
+            outs = (out,)
+        else:
+            outs = cast(Tuple[torch.Tensor, ...], out)
+
+        if len(outs) == 0:
+            raise RuntimeError(f"{stage}: run_fn returned an empty tuple at slice s={s}")
+
+        processed: List[torch.Tensor] = []
+        for j, t in enumerate(outs):
+            if not torch.is_tensor(t):
+                raise TypeError(
+                    f"{stage}: run_fn output #{j} is not a Tensor (type={type(t)})"
+                )
+            y = t
+            if did_pad:
+                if y.shape[0] < slice_n:
+                    raise RuntimeError(
+                        f"{stage}: output batch too small after pad-slice: got={int(y.shape[0])}, expected>={slice_n} (s={s})"
+                    )
+                y = y[:slice_n]
+            if int(y.shape[0]) != slice_n:
+                raise RuntimeError(
+                    f"{stage}: output batch mismatch at s={s}: got={int(y.shape[0])}, expected={slice_n}"
+                )
+            if out_dtype is not None and y.dtype != out_dtype:
+                y = y.to(dtype=out_dtype)
+            processed.append(y)
+
+        if out_bufs is None:
+            out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
+        else:
+            if len(out_bufs) != len(processed):
+                raise RuntimeError(
+                    f"{stage}: output arity changed across microbatches: first={len(out_bufs)}, now={len(processed)} (s={s})"
+                )
+            for k, (buf, y) in enumerate(zip(out_bufs, processed)):
+                if buf.shape[1:] != y.shape[1:]:
+                    raise RuntimeError(
+                        f"{stage}: output shape changed for output#{k}: first={tuple(buf.shape)}, now={(total_b, *y.shape[1:])} (s={s})"
+                    )
+
+        for buf, y in zip(out_bufs, processed):
+            buf[s : s + slice_n].copy_(y)
+
+    if out_bufs is None:
+        raise RuntimeError(
+            f"{stage}: produced no outputs (b={total_b}, microbatch={mb_i})"
+        )
+
+    if len(out_bufs) == 1:
+        return out_bufs[0]
+    return tuple(out_bufs)
+
 
 class PointTransformer(nn.Module):
-
     def __init__(
         self,
         d_model: int,
@@ -222,12 +367,14 @@ class PointTransformer(nn.Module):
         if is_meta_or_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
         if is_meta_or_fake_tensor(coords):
-            raise RuntimeError("meta/fake tensor reached PointTransformer.forward (coords)")
+            raise RuntimeError(
+                "meta/fake tensor reached PointTransformer.forward (coords)"
+            )
         if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
             raise ValueError(
                 f"coords must be (B, N, {self.coord_dim}), got {tuple(coords.shape)} vs x {tuple(x.shape)}"
             )
-        N = x.shape[1]
+        N = int(x.shape[1])
         x = x.contiguous()
         coords = coords.contiguous()
         if attn_mask is not None:
@@ -257,20 +404,30 @@ class PointTransformer(nn.Module):
         return x
 
 
+# Canonical modeling types:
+#   ss: spatial-only
+#   tt: temporal-only
+#   st: mixed (spatio-temporal / tempo-spatial treated identically)
 _MODELING_TYPE_ALIASES: dict[str, str] = {
+    # spatial-only
     "ss": "ss",
     "spatial": "ss",
     "sxs": "ss",
+    # temporal-only
     "tt": "tt",
     "temporal": "tt",
     "txt": "tt",
-    "ts": "ts",
-    "txs": "ts",
-    "temporal-spatial": "ts",
-    "temporo-spatial": "ts",
-    "temporospatial": "ts",
+    # mixed (treat all synonyms identically)
     "st": "st",
+    "ts": "st",
     "sxt": "st",
+    "txs": "st",
+    "temporal-spatial": "st",
+    "temporo-spatial": "st",
+    "temporospatial": "st",
+    "tempospatial": "st",
+    "tempo-spatial": "st",
+    "temporalspatial": "st",
     "spatiotemporal": "st",
     "spatio-temporal": "st",
 }
@@ -327,6 +484,11 @@ class SpatialAxis(nn.Module):
         )
         self.norm = norm_layer(norm_type, d_model)
 
+        # Runtime-configurable knobs (avoid getattr(...) all over forward).
+        self.patch_size: int = int(getattr(self, "patch_size", 512) or 512)
+        self.shift_order: bool = bool(getattr(self, "shift_order", True))
+        self.morton_bits: int = int(getattr(self, "morton_bits", 10) or 10)
+
         self.register_buffer(
             "_perm_cache",
             torch.empty(0, dtype=torch.int64),
@@ -340,7 +502,6 @@ class SpatialAxis(nn.Module):
         # Cache is only valid when coords are shared across batch (expanded/stride0 or B==1).
         # Meta also captures coords identity/version to avoid stale permutations when coords change in-place.
         self._perm_cache_meta: Optional[Tuple[int, int, int, int, int, int, int]] = None
-
         self._perm_cache_lock = threading.Lock()
 
     def __getstate__(self):
@@ -353,45 +514,6 @@ class SpatialAxis(nn.Module):
         super().__setstate__(state)
         self._perm_cache_lock = threading.Lock()
 
-    def _compute_per_sample_permutations(
-        self, coords: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute Morton permutations per sample.
-
-        Returns:
-            perm: (depth, B, N)
-            invperm: (depth, B, N)
-
-        Notes:
-            This is intentionally uncached. Per-sample coordinates defeat the
-            shared-template assumption that enables caching.
-        """
-        depth = len(self.blocks)
-        if coords.dim() != 3:
-            raise ValueError(
-                f"SpatialAxis coords must be (B,N,C), got shape {tuple(coords.shape)}"
-            )
-        _, N, _ = coords.shape
-        patch = int(getattr(self, "patch_size", 512))
-        shift = bool(getattr(self, "shift_order", True))
-        bits = int(getattr(self, "morton_bits", 10))
-        perms: List[torch.Tensor] = []
-        invperms: List[torch.Tensor] = []
-        for i in range(depth):
-            perm_i, inv_i = _serialize_z_index(
-                coords,
-                bits=bits,
-                patch=patch,
-                shift_order=shift,
-                block_index=i,
-            )
-            perms.append(perm_i.to(dtype=torch.int64))
-            invperms.append(inv_i.to(dtype=torch.int64))
-        return (
-            torch.stack(perms, dim=0),
-            torch.stack(invperms, dim=0),
-        )
-
     def _ensure_permutation_cache(
         self, coords: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -401,18 +523,25 @@ class SpatialAxis(nn.Module):
                 f"SpatialAxis coords must be (B,N,C), got shape {tuple(coords.shape)}"
             )
         B, N, _ = coords.shape
-        patch = int(getattr(self, "patch_size", 512))
-        shift = bool(getattr(self, "shift_order", True))
-        bits = int(getattr(self, "morton_bits", 10))
+        patch = int(self.patch_size)
+        shift = bool(self.shift_order)
+        bits = int(self.morton_bits)
 
         # Heuristic: expanded coords (stride(0)==0) are identical across batch.
-        # If stride(0)!=0, coords may differ per-sample; compute per-sample permutations to avoid distortion.
         shared_template = (B <= 1) or (coords.stride(0) == 0)
 
         if shared_template:
             coords_ptr = int(coords.data_ptr()) if coords.numel() else 0
             coords_ver = int(getattr(coords, "_version", 0))
-            meta = (int(N), int(patch), int(bits), int(shift), int(depth), coords_ptr, coords_ver)
+            meta = (
+                int(N),
+                int(patch),
+                int(bits),
+                int(shift),
+                int(depth),
+                coords_ptr,
+                coords_ver,
+            )
 
             lock = getattr(self, "_perm_cache_lock", None)
             if lock is None:
@@ -426,8 +555,6 @@ class SpatialAxis(nn.Module):
                     isinstance(perm_cache, torch.Tensor)
                     and isinstance(inv_cache, torch.Tensor)
                     and self._perm_cache_meta == meta
-                    and perm_cache.numel() == depth * N
-                    and inv_cache.numel() == depth * N
                     and perm_cache.shape == (depth, N)
                     and inv_cache.shape == (depth, N)
                     and perm_cache.device == coords.device
@@ -453,15 +580,12 @@ class SpatialAxis(nn.Module):
             inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
 
             with lock:
-                # Double-check: another thread may have filled it while we computed.
                 perm_cache = getattr(self, "_perm_cache", None)
                 inv_cache = getattr(self, "_invperm_cache", None)
                 if (
                     isinstance(perm_cache, torch.Tensor)
                     and isinstance(inv_cache, torch.Tensor)
                     and self._perm_cache_meta == meta
-                    and perm_cache.numel() == depth * N
-                    and inv_cache.numel() == depth * N
                     and perm_cache.shape == (depth, N)
                     and inv_cache.shape == (depth, N)
                     and perm_cache.device == coords.device
@@ -517,27 +641,25 @@ class SpatialAxis(nn.Module):
                 f"tokens={tuple(x.shape)} vs coords={tuple(coords.shape)}"
             )
         x = x.contiguous()
-        # Preserve expanded/shared coordinate templates (stride(0)==0) to keep permutation
-        # caching effective and avoid expensive per-sample Morton permutations.
+
+        # Preserve expanded/shared coordinate templates (stride(0)==0) to keep caching effective.
         Bc = int(coords.size(0))
         if Bc > 1 and coords.stride(0) == 0:
             coords0 = coords[0].contiguous()
-            if coords0.dtype != torch.float32:
-                coords0 = coords0.float()
             coords = coords0.unsqueeze(0).expand(Bc, -1, -1)
         else:
             coords = coords.contiguous()
-            if coords.dtype != torch.float32:
-                coords = coords.float()
+
+        if coords.dtype != torch.float32:
+            coords = coords.float()
 
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
-                raise RuntimeError(
-                    "attn_mask is meta/fake before SpatialAxis.forward"
-                )
+                raise RuntimeError("attn_mask is meta/fake before SpatialAxis.forward")
             attn_mask = attn_mask.contiguous()
+
         perm_cache, inv_cache = self._ensure_permutation_cache(coords)
-        _patch = int(getattr(self, "patch_size", 512))
+        patch = int(self.patch_size)
 
         for i, blk in enumerate(self.blocks):
             B, N, D = x.shape
@@ -552,37 +674,52 @@ class SpatialAxis(nn.Module):
 
             x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
             c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
+
             if torch.is_grad_enabled():
                 out_s = torch.empty_like(x_s)
             else:
                 # Inference / no-grad: reuse buffer to avoid an extra allocation.
                 out_s = x_s
 
-            m_s = None
-            if attn_mask is not None:
-
-                if attn_mask.dim() == 3:
-                    m_s = attn_mask.gather(
-                        1, perm.unsqueeze(-1).expand(B, N, N)
-                    ).gather(
-                        2, perm.unsqueeze(1).expand(B, N, N)
-                    )
-                elif attn_mask.dim() == 4:
-                    if attn_mask.size(1) != 1:
-                        raise ValueError("attn_mask with per-head shape not supported here")
-                    m_s = attn_mask.squeeze(1).gather(
-                        1, perm.unsqueeze(-1).expand(B, N, N)
-                    ).gather(
-                        2, perm.unsqueeze(1).expand(B, N, N)
-                    )
-                else:
-                    raise ValueError("attn_mask must be (B,N,N)")
-            for s, e in _block_ranges(N, _patch):
+            for s, e in _block_ranges(N, patch):
                 xb = x_s[:, s:e, :]
                 cb = c_s[:, s:e, :]
-                mb = None if m_s is None else m_s[:, s:e, s:e]
+
+                mb = None
+                if attn_mask is not None:
+                    # Build attention mask per-block only (avoid allocating (B,N,N)).
+                    if attn_mask.dim() == 0:
+                        mb = attn_mask
+                    else:
+                        idx = perm[:, s:e]  # (B, M)
+                        M = int(idx.shape[1])
+                        if attn_mask.dim() == 3:
+                            # (B,N,N) -> (B,M,N) -> (B,M,M)
+                            rows = attn_mask.gather(
+                                1, idx.unsqueeze(-1).expand(B, M, N)
+                            )
+                            mb = rows.gather(
+                                2, idx.unsqueeze(1).expand(B, M, M)
+                            )
+                        elif attn_mask.dim() == 4:
+                            if attn_mask.size(1) != 1:
+                                raise ValueError(
+                                    "attn_mask with per-head shape not supported here"
+                                )
+                            base = attn_mask.squeeze(1)
+                            rows = base.gather(
+                                1, idx.unsqueeze(-1).expand(B, M, N)
+                            )
+                            mb = rows.gather(
+                                2, idx.unsqueeze(1).expand(B, M, M)
+                            )
+                        else:
+                            raise ValueError("attn_mask must be rank 0, 3, or 4 here")
+
                 out_s[:, s:e, :] = blk(xb, cb, attn_mask=mb)
+
             x = out_s.gather(1, invperm.unsqueeze(-1).expand(B, N, D))
+
         out = self.norm(x)
         if is_meta_or_fake_tensor(out):
             raise RuntimeError("SpatialAxis produced meta/fake tensor")
@@ -590,7 +727,6 @@ class SpatialAxis(nn.Module):
 
 
 class RetNet(nn.Module):
-
     def __init__(
         self,
         d_model: int,
@@ -607,7 +743,6 @@ class RetNet(nn.Module):
         self.nhead = int(nhead)
 
         self.norm1 = norm_layer(norm_type, self.d_model)
-
         self.retention = Retention(self.d_model, self.nhead)
 
         self.dropout = nn.Dropout(dropout)
@@ -688,7 +823,16 @@ class TemporalAxis(nn.Module):
             return x, next_state
         return x
 
+
 class CrossTransformer(nn.Module):
+    """Symmetric cross-axis fusion.
+
+    Important:
+        Mixed modes (ts/st/spatiotemporal/temporospatial/...) are treated identically:
+        - Inputs are always (spatial_tokens, temporal_tokens)
+        - Output token order is always [spatial_part, temporal_part]
+    """
+
     def __init__(
         self,
         d_model: int,
@@ -701,12 +845,8 @@ class CrossTransformer(nn.Module):
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.cross_s = CrossAttention(
-            d_model, nhead, dropout=dropout, norm_type=norm_type
-        )
-        self.cross_t = CrossAttention(
-            d_model, nhead, dropout=dropout, norm_type=norm_type
-        )
+        self.cross_s = CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
+        self.cross_t = CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
         self.mix_norm = norm_layer(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
@@ -714,6 +854,7 @@ class CrossTransformer(nn.Module):
         self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
+        # Optional fixed mode (may be set externally).
         self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
 
     def forward(
@@ -737,79 +878,33 @@ class CrossTransformer(nn.Module):
             raise ValueError(
                 f"CrossTransformer hidden dim mismatch: spatial D={Ds}, temporal D={Dt}"
             )
-        if self._fixed_mode is not None:
-            mode_l = _coerce_modeling_types(self._fixed_mode)
-            match mode_l:
-                case "ss":
-                    return self.cross_s(spatial_tokens, temporal_tokens)
-                case "tt":
-                    return self.cross_t(temporal_tokens, spatial_tokens)
-                case "ts" | "st":
-                    s_context = self.cross_s(spatial_tokens, temporal_tokens)
-                    t_context = self.cross_t(temporal_tokens, spatial_tokens)
-                    if mode_l == "ts":
-                        base = torch.cat(
-                            [
-                                t_context,
-                                s_context.mean(dim=1, keepdim=True).expand_as(t_context),
-                            ],
-                            dim=-1,
-                        )
-                        fused = self.mix(self.mix_norm(base))
-                        return t_context + self.drop_path(self.dropout(fused))
 
-                    base = torch.cat(
-                        [
-                            s_context,
-                            t_context.mean(dim=1, keepdim=True).expand_as(s_context),
-                        ],
-                        dim=-1,
-                    )
-                    fused = self.mix(self.mix_norm(base))
-                    return s_context + self.drop_path(self.dropout(fused))
-                case _:
-                    raise RuntimeError(f"Unhandled modeling type: {mode_l}")
-        requested = mode if mode is not None else "spatiotemporal"
-        return self._forward_dynamically(spatial_tokens, temporal_tokens, requested)
+        requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
+        mode_l = _coerce_modeling_types(requested)
 
-    def _forward_dynamically(
-        self,
-        spatial_tokens: torch.Tensor,
-        temporal_tokens: torch.Tensor,
-        mode: str,
-    ) -> torch.Tensor:
-        mode_l = _coerce_modeling_types(mode)
-        match mode_l:
-            case "ss":
-                return self.cross_s(spatial_tokens, temporal_tokens)
-            case "tt":
-                return self.cross_t(temporal_tokens, spatial_tokens)
-            case "ts" | "st":
-                s_context = self.cross_s(spatial_tokens, temporal_tokens)
-                t_context = self.cross_t(temporal_tokens, spatial_tokens)
+        if mode_l == "ss":
+            return self.cross_s(spatial_tokens, temporal_tokens)
+        if mode_l == "tt":
+            return self.cross_t(temporal_tokens, spatial_tokens)
 
-                if mode_l == "ts":
-                    base = torch.cat(
-                        [
-                            t_context,
-                            s_context.mean(dim=1, keepdim=True).expand_as(t_context),
-                        ],
-                        dim=-1,
-                    )
-                    fused = self.mix(self.mix_norm(base))
-                    return t_context + self.drop_path(self.dropout(fused))
+        # Mixed mode: always compute both and return a stable concatenation.
+        s_context = self.cross_s(spatial_tokens, temporal_tokens)  # (B, Ns, D)
+        t_context = self.cross_t(temporal_tokens, spatial_tokens)  # (B, Nt, D)
 
-                base = torch.cat(
-                    [
-                        s_context,
-                        t_context.mean(dim=1, keepdim=True).expand_as(s_context),
-                    ],
-                    dim=-1,
-                )
-                fused = self.mix(self.mix_norm(base))
-                return s_context + self.drop_path(self.dropout(fused))
-            case _:
-                raise RuntimeError(f"Unhandled mode: {mode_l}")
+        # Spatial enhancement conditioned on temporal summary.
+        t_summary = t_context.mean(dim=1, keepdim=True).expand_as(s_context)
+        base_s = torch.cat([s_context, t_summary], dim=-1)
+        fused_s = self.mix(self.mix_norm(base_s))
+        out_s = s_context + self.drop_path(self.dropout(fused_s))
+
+        # Temporal enhancement conditioned on spatial summary.
+        s_summary = s_context.mean(dim=1, keepdim=True).expand_as(t_context)
+        base_t = torch.cat([t_context, s_summary], dim=-1)
+        fused_t = self.mix(self.mix_norm(base_t))
+        out_t = t_context + self.drop_path(self.dropout(fused_t))
+
+        # Stable order: spatial part first, then temporal part.
+        return torch.cat([out_s, out_t], dim=1)
 
 
 def _auto_microbatch(
@@ -825,6 +920,7 @@ def _auto_microbatch(
     host_free: Optional[int] = None
 
     from ..backend.system import Memory as _Mem
+
     try:
         host_free = int(_Mem.available())
     except Exception:
@@ -898,8 +994,8 @@ class LongNet(nn.Module):
         self._using = "fallback"
         self._impl_batch_first = self.batch_first
         layers: List[nn.Module] = []
-        dilation = base_dilation
-        for _ in range(depth):
+        dilation = int(base_dilation)
+        for _ in range(int(depth)):
             attn = DilatedAttention(
                 embed_dim=embed_dim,
                 num_heads=num_heads,
@@ -953,6 +1049,13 @@ class LongNet(nn.Module):
 
 
 class Context(nn.Module):
+    """Controller backbone wrapper.
+
+    Originally a thin wrapper around LongNet. This module now also owns
+    controller-stage microbatch sizing/execution, so Root.forward doesn't
+    have to manage controller microbatching details.
+    """
+
     def __init__(
         self,
         embed_dim: int,
@@ -984,6 +1087,10 @@ class Context(nn.Module):
             length_bucket_multiple=length_bucket_multiple,
         )
 
+        # Controller-stage microbatch state.
+        self.microbatch: int = 0
+        self._auto_microbatch_pending: bool = True
+
     @property
     def using(self) -> str:
         return self.backbone.using
@@ -1001,11 +1108,59 @@ class Context(nn.Module):
             need_weights=need_weights,
         )
 
+    def run(
+        self,
+        tokens: torch.Tensor,
+        *,
+        device: torch.device,
+        meta: Any,
+        amp_enabled: bool,
+        auto_microbatch_fn: Callable[[torch.Tensor], int],
+        graph_break_fn: Optional[Callable[[], None]] = None,
+    ) -> torch.Tensor:
+        """Run controller stage on tokens with internal microbatching.
+
+        Returns:
+            refined_tokens: Tensor with same shape as tokens
+        """
+        if tokens.ndim != 3:
+            raise ValueError(
+                f"Context.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+            )
+        B = int(tokens.shape[0])
+        if graph_break_fn is not None:
+            graph_break_fn()
+
+        if self._auto_microbatch_pending:
+            try:
+                mb = int(auto_microbatch_fn(tokens))
+                self.microbatch = max(1, min(B, mb))
+            except Exception:
+                self.microbatch = max(1, B)
+            self._auto_microbatch_pending = False
+
+        mb = max(1, min(B, int(self.microbatch) if self.microbatch else B))
+
+        infer_mode = not torch.is_grad_enabled()
+        controller_ctx = (
+            Gradient.inference(self.backbone) if infer_mode else contextlib.nullcontext()
+        )
+
+        def _run_controller_chunk(chunk: torch.Tensor) -> torch.Tensor:
+            with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
+                out, _ = self.backbone(chunk)
+            return out
+
+        with controller_ctx:
+            refined = cast(
+                torch.Tensor,
+                _microbatch_prealloc(tokens, mb, _run_controller_chunk, stage="controller"),
+            )
+        return refined
+
 
 class Subcontext(nn.Module):
-    def __init__(
-        self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
-    ) -> None:
+    def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
@@ -1019,17 +1174,16 @@ class Subcontext(nn.Module):
         self.dropout = float(config.dropout)
         self.drop_path = float(config.drop_path)
         self.norm_type = str(config.normalization_method)
-        self.spatial_tokenizer = nn.Linear(
-            self.in_dim, self.spatial_tokens * self.d_model
-        )
-        self.temporal_tokenizer = nn.Linear(
-            self.in_dim, self.temporal_tokens * self.d_model
-        )
+
+        self.spatial_tokenizer = nn.Linear(self.in_dim, self.spatial_tokens * self.d_model)
+        self.temporal_tokenizer = nn.Linear(self.in_dim, self.temporal_tokens * self.d_model)
+
         self.register_buffer(
             "spatial_coords_template",
             self._get_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
             persistent=False,
         )
+
         self.spatial_net = SpatialAxis(
             self.d_model,
             self.nhead,
@@ -1057,7 +1211,7 @@ class Subcontext(nn.Module):
             mlp_ratio=self.mlp_ratio,
             drop_path=self.drop_path,
         )
-        self._fixed_mode: Optional[str] = getattr(self, "modeling_type", None)
+
         self.norm = norm_layer(self.norm_type, self.d_model)
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
         self.head_hidden_dim = hid
@@ -1083,33 +1237,22 @@ class Subcontext(nn.Module):
             if side == 1:
                 coords.append((0.0, 0.0, 0.0))
             else:
-                coords.append(
-                    (
-                        x / (side - 1 if side > 1 else 1),
-                        y / (side - 1 if side > 1 else 1),
-                        z / (side - 1 if side > 1 else 1),
-                    )
-                )
+                denom = float(side - 1)
+                coords.append((x / denom, y / denom, z / denom))
         return torch.tensor(coords, dtype=torch.float32, device=device)
 
-    def _spatial_coords(
-        self, batch: int, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
+    def _spatial_coords(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         _ = dtype
-        # Spatial coords are constants; keep float32 to avoid autocast-induced
-        # dtype churn and repeated allocations.
+        # Spatial coords are constants; keep float32 to avoid autocast-induced dtype churn.
         coords = self.spatial_coords_template
         if coords.device != device or coords.dtype is not torch.float32:
             coords = coords.to(device=device, dtype=torch.float32)
-        return coords.unsqueeze(0).expand(batch, -1, -1)
+        return coords.unsqueeze(0).expand(int(batch), -1, -1)
 
-    # Subcontext.forward is intentionally kept eager. We selectively torch.compile()
-    # only stable, hot submodules (TemporalAxis / CrossTransformer / head) and keep
-    # orchestration + SpatialAxis calls outside the compiled graph to reduce graph
-    # breaks and compilation fragility.
     @torch_no_compile(reason="Subcontext orchestrates eager + compiled submodules", recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B = x.shape[0]
+        B = int(x.shape[0])
+
         spatial_raw = self.spatial_tokenizer(x)
         expected_spatial = B * self.spatial_tokens * self.d_model
         if spatial_raw.numel() != expected_spatial:
@@ -1117,9 +1260,8 @@ class Subcontext(nn.Module):
                 "spatial tokenizer output has unexpected numel: "
                 f"got {spatial_raw.numel()} vs expected {expected_spatial}"
             )
-        spatial_tokens = spatial_raw.reshape(
-            B, self.spatial_tokens, self.d_model
-        ).contiguous()
+        spatial_tokens = spatial_raw.reshape(B, self.spatial_tokens, self.d_model).contiguous()
+
         temporal_raw = self.temporal_tokenizer(x)
         expected_temporal = B * self.temporal_tokens * self.d_model
         if temporal_raw.numel() != expected_temporal:
@@ -1127,59 +1269,38 @@ class Subcontext(nn.Module):
                 "temporal tokenizer output has unexpected numel: "
                 f"got {temporal_raw.numel()} vs expected {expected_temporal}"
             )
-        temporal_tokens = temporal_raw.reshape(
-            B, self.temporal_tokens, self.d_model
-        ).contiguous()
+        temporal_tokens = temporal_raw.reshape(B, self.temporal_tokens, self.d_model).contiguous()
+
         # Avoid side-effectful bookkeeping inside torch.compile graphs.
         try:
-            import torch._dynamo as _dynamo
+            import torch._dynamo as _dynamo  # type: ignore
 
             if not _dynamo.is_compiling():
                 total_tokens = self.spatial_tokens + self.temporal_tokens
-                fl_tok = (
-                    2.0
-                    * float(B)
-                    * float(self.in_dim)
-                    * float(total_tokens * self.d_model)
-                )
+                fl_tok = 2.0 * float(B) * float(self.in_dim) * float(total_tokens * self.d_model)
                 FLOP_PROFILER.add("Tokenizer", float(fl_tok))
         except Exception:
             pass
+
         coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
         spatial_out = self.spatial_net(spatial_tokens, coords)
         temporal_out = self.temporal_net(temporal_tokens)
-        mode = self._fixed_mode
-        if mode is not None:
-            mode_l = _coerce_modeling_types(mode)
-            match mode_l:
-                case 'ss':
-                    tokens = spatial_out
-                case 'tt':
-                    tokens = temporal_out
-                case 'ts':
-                    if hasattr(self.perception, "_forward_dynamically"):
-                        tokens = self.perception._forward_dynamically(
-                            temporal_out, spatial_out, "ts"
-                        )
-                    else:
-                        tokens = self.perception(temporal_out, spatial_out, mode="ts")
-                case 'st':
-                    if hasattr(self.perception, "_forward_dynamically"):
-                        tokens = self.perception._forward_dynamically(
-                            spatial_out, temporal_out, "st"
-                        )
-                    else:
-                        tokens = self.perception(spatial_out, temporal_out, mode="st")
-                case _:
-                    raise RuntimeError(f"Unhandled modeling type '{mode}'")
+
+        mode_l = _coerce_modeling_types(self.modeling_type)
+        if mode_l == "ss":
+            tokens = spatial_out
+        elif mode_l == "tt":
+            tokens = temporal_out
         else:
-            tokens = self._forward_dynamically(spatial_out, temporal_out)
-        tokens = self.norm(tokens)
-        tokens = tokens.contiguous()
+            # Mixed: always pass (spatial, temporal); CrossTransformer is symmetric and stable.
+            tokens = self.perception(spatial_out, temporal_out, mode="st")
+
+        tokens = self.norm(tokens).contiguous()
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
+
         try:
-            import torch._dynamo as _dynamo
+            import torch._dynamo as _dynamo  # type: ignore
 
             if not _dynamo.is_compiling():
                 hid = int(self.head_hidden_dim)
@@ -1195,28 +1316,7 @@ class Subcontext(nn.Module):
         context = flat.reshape(B, *self.out_shape).contiguous()
         return (tokens, context)
 
-    def _forward_dynamically(
-        self, spatial_out: torch.Tensor, temporal_out: torch.Tensor
-    ) -> torch.Tensor:
-        mode = getattr(self, "modeling_type", None)
-        if mode is None:
-            raise RuntimeError("modeling_type is not set")
-        mode_l = _coerce_modeling_types(mode)
-        match mode_l:
-            case "ss":
-                return spatial_out
-            case "tt":
-                return temporal_out
-            case "ts":
-                return self.perception(temporal_out, spatial_out, mode="ts")
-            case "st":
-                return self.perception(spatial_out, temporal_out, mode="st")
-            case _:
-                raise RuntimeError(f"Unhandled modeling type '{mode_l}'")
-
-    def decode(
-        self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any
-    ) -> torch.Tensor:
+    def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
@@ -1225,7 +1325,6 @@ class Subcontext(nn.Module):
 
 
 class _CompiledDecode(nn.Module):
-
     def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
         super().__init__()
         self._norm = weakref.proxy(norm)
@@ -1267,7 +1366,6 @@ class Scaler(nn.Module):
         self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
 
         # Cache device/dtype-converted stats to avoid per-forward allocations.
-        # These caches are ephemeral and intentionally excluded from state_dict.
         self._stats_cache_lock = threading.Lock()
         self._stats_cache_max = 8
         self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
@@ -1347,10 +1445,7 @@ class Scaler(nn.Module):
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
             return x
-        if x.dim() == 1:
-            feat_dim = x.shape[0]
-        else:
-            feat_dim = x.shape[-1]
+        feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
         if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
             raise RuntimeError(
                 "Scaler.normalize_x: feature dimension mismatch: "
@@ -1358,7 +1453,6 @@ class Scaler(nn.Module):
             )
 
         key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
-        cached = None
         with self._stats_cache_lock:
             cached = self._x_stats_cache.get(key)
         if cached is None:
@@ -1370,8 +1464,10 @@ class Scaler(nn.Module):
                 self._x_stats_cache[key] = (mean_b, std_b)
         else:
             mean_b, std_b = cached
+
         if x.dim() == 1:
             return (x - mean_b) / (std_b + self.eps)
+
         view_shape = [1] * (x.dim() - 1) + [-1]
         mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
         std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
@@ -1380,21 +1476,18 @@ class Scaler(nn.Module):
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
         if x_scaled.numel() == 0:
             return x_scaled
-        if x_scaled.dim() == 1:
-            feat_dim = x_scaled.shape[0]
-        else:
-            feat_dim = x_scaled.shape[-1]
+        feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
         if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
             raise RuntimeError(
                 "Scaler.denormalize_x: feature dimension mismatch: "
                 f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
             )
+
         key = (
             x_scaled.device.type,
             int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
             x_scaled.dtype,
         )
-        cached = None
         with self._stats_cache_lock:
             cached = self._x_stats_cache.get(key)
         if cached is None:
@@ -1406,8 +1499,10 @@ class Scaler(nn.Module):
                 self._x_stats_cache[key] = (mean_b, std_b)
         else:
             mean_b, std_b = cached
+
         if x_scaled.dim() == 1:
             return x_scaled * (std_b + self.eps) + mean_b
+
         view_shape = [1] * (x_scaled.dim() - 1) + [-1]
         std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
         mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
@@ -1449,7 +1544,6 @@ class Scaler(nn.Module):
             int(y_flat.device.index) if y_flat.device.index is not None else -1,
             y_flat.dtype,
         )
-        cached = None
         with self._stats_cache_lock:
             cached = self._y_stats_cache.get(key)
         if cached is None:
@@ -1472,10 +1566,7 @@ class Scaler(nn.Module):
                 )
             z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
 
-        if batch_first:
-            return z_flat.view(orig_shape)
-        else:
-            return z_flat.view(-1)
+        return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
 
     def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
         if z.numel() == 0:
@@ -1495,7 +1586,6 @@ class Scaler(nn.Module):
             int(z_flat.device.index) if z_flat.device.index is not None else -1,
             z_flat.dtype,
         )
-        cached = None
         with self._stats_cache_lock:
             cached = self._y_stats_cache.get(key)
         if cached is None:
@@ -1518,17 +1608,20 @@ class Scaler(nn.Module):
                 )
             y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
 
-        if batch_first:
-            return y_flat.view(orig_shape)
-        else:
-            return y_flat.view(-1)
+        return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
-        if self.calib_mode == "piecewise" and self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
-            return self._piecewise(z_raw)
-        if self.calib_mode in ("affine", "none") and self.affine_a.numel() > 0:
-            return self.affine(z_raw)
-        return z_raw
+        match self.calib_mode:
+            case "piecewise":
+                if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
+                    return self._piecewise(z_raw)
+                return z_raw
+            case "affine" | "none":
+                if self.affine_a.numel() > 0:
+                    return self.affine(z_raw)
+                return z_raw
+            case _:
+                return z_raw
 
     def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
         if self.affine_a.numel() == 0:
@@ -1675,46 +1768,47 @@ class Scaler(nn.Module):
         self.affine_b.zero_()
 
     def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
+        """Piecewise-linear calibration without mutating module buffers.
+
+        Previous code resized/sliced/reassigned self.pw_x/self.pw_y inside forward,
+        which is unsafe under multithreading and can break torch.compile assumptions.
+        This implementation treats saved knots as read-only and uses local views.
+        """
         if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
             return z_raw
-        with torch.no_grad():
-            if self.pw_x.dim() == 2 and self.pw_y.dim() == 2:
-                C_saved, Kx = self.pw_x.shape
-                _, Ky = self.pw_y.shape
-                K = min(Kx, Ky)
-                if Kx != K:
-                    self.pw_x = self.pw_x[:, :K]
-                if Ky != K:
-                    self.pw_y = self.pw_y[:, :K]
-                C_target = int(z_raw.shape[-1]) if z_raw.ndim > 0 else C_saved
-                if C_saved < C_target:
-                    extra_x = self.pw_x[-1:].expand(C_target - C_saved, -1)
-                    extra_y = self.pw_y[-1:].expand(C_target - C_saved, -1)
-                    self.pw_x = torch.cat([self.pw_x, extra_x], dim=0)
-                    self.pw_y = torch.cat([self.pw_y, extra_y], dim=0)
-                elif C_saved > C_target:
-                    self.pw_x = self.pw_x[:C_target]
-                    self.pw_y = self.pw_y[:C_target]
+        if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
+            return z_raw
+
+        pw_x = self.pw_x
+        pw_y = self.pw_y
+        C_saved, Kx = pw_x.shape
+        _, Ky = pw_y.shape
+        K = int(min(Kx, Ky))
+        if K < 2:
+            return z_raw
+
+        # Local views only (do not mutate buffers).
+        pw_x = pw_x[:, :K]
+        pw_y = pw_y[:, :K]
 
         orig_shape = z_raw.shape
-        if z_raw.ndim == 1:
-            z = z_raw.unsqueeze(-1)
-        else:
-            z = z_raw
-        z = z.reshape(-1, z.shape[-1])
+        z = z_raw.unsqueeze(-1) if z_raw.ndim == 1 else z_raw
+        z = z.reshape(-1, int(z.shape[-1]))
 
-        _, C = z.shape
+        _, C_target = z.shape
         device = z.device
         dtype = z.dtype
 
         out = torch.empty_like(z)
-        for j in range(C):
+
+        # If saved calibration has fewer channels, reuse the last channel for extras.
+        last_idx = max(0, int(C_saved) - 1)
+        for j in range(int(C_target)):
+            src_j = j if j < int(C_saved) else last_idx
             xj = z[:, j]
-            knots_x = self.pw_x[j].to(device=device, dtype=dtype)
-            knots_y = self.pw_y[j].to(device=device, dtype=dtype)
-            if knots_x.numel() < 2:
-                out[:, j] = xj
-                continue
+            knots_x = pw_x[src_j].to(device=device, dtype=dtype)
+            knots_y = pw_y[src_j].to(device=device, dtype=dtype)
+
             idx = torch.bucketize(xj, knots_x)
             idx = idx.clamp(1, knots_x.numel() - 1)
             x0 = knots_x[idx - 1]
@@ -1742,7 +1836,7 @@ class History(nn.Module):
         self.kernel: str = ""
         self.cpu: List[str] = []
         self.arch: List[str] = []
-        self.ram_gb: int = 0
+        self.ram_gb: float = 0.0
         self.python: str = ""
         self.backends: List[str] = []
 
@@ -1800,7 +1894,7 @@ class History(nn.Module):
         self._global_step: int = 0
         self._records: List[Dict[str, Any]] = []
         self.max_history_steps: int = 0
-        
+
     @torch.no_grad()
     def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
         self.start.fill_(round(float(start_posix), 6))
@@ -1860,7 +1954,6 @@ class History(nn.Module):
             n_cores = max(1, int(process_cpu_count() or 1))
 
             model_name: Optional[str] = None
-            # Prefer the shared helper (handles Linux/Windows/macOS).
             with contextlib.suppress(Exception):
                 info = cpu_info()
                 first = info.split(";", 1)[0]
@@ -1906,7 +1999,11 @@ class History(nn.Module):
                     backend_devices.append(f"cuda:{idx}, {name}")
 
             mps = getattr(torch.backends, "mps", None)
-            if mps is not None and getattr(mps, "is_available", None) and torch.backends.mps.is_available():                              
+            if (
+                mps is not None
+                and getattr(mps, "is_available", None)
+                and torch.backends.mps.is_available()
+            ):
                 chip_name = platform.processor() or "Apple Silicon"
                 backend_devices.append(f"mps:0, {chip_name}")
 
@@ -1949,14 +2046,15 @@ class History(nn.Module):
         yvar_dev, ym_dev, ymin_dev, ymax_dev = _stats(y_det)
 
         stats_device = self.sampled_x_mean.device
-        xm   = xm_dev.to(device=stats_device, dtype=torch.float64)
+        xm = xm_dev.to(device=stats_device, dtype=torch.float64)
         xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
         xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
         xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
-        ym   = ym_dev.to(device=stats_device, dtype=torch.float64)
+        ym = ym_dev.to(device=stats_device, dtype=torch.float64)
         yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
         ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
         ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
+
         if use_for_sample:
             n = int(self.sampled_n.item())
             n_new = n + 1
@@ -1971,6 +2069,7 @@ class History(nn.Module):
             self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
             self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
             self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
+
         if use_for_reduced:
             n = int(self.reduced_n.item())
             n_new = n + 1
@@ -1985,6 +2084,7 @@ class History(nn.Module):
             self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
             self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
             self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+
         self._append(
             xm=xm,
             xvar=xvar,
@@ -2067,10 +2167,8 @@ class History(nn.Module):
         self._records.clear()
         self._global_step = 0
 
-def resize_scaler_buffer(
-    model: nn.Module,
-    state: Mapping[str, Any],
-) -> None:
+
+def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
     scaler: Optional[Scaler] = None
     for module in model.modules():
         if isinstance(module, Scaler):
@@ -2114,37 +2212,29 @@ def resize_scaler_buffer(
 
 
 class Root(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        out_shape: Sequence[int],
-        config: ModelConfig,
-    ) -> None:
+    def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(x) for x in out_shape))
         self.out_dim = int(math.prod(self.out_shape))
+
         if config.device is not None:
             self._device = torch.device(config.device)
         else:
             if torch.cuda.is_available():
                 device_name = "cuda"
-            elif (
-                getattr(torch.backends, "mps", None)
-                and torch.backends.mps.is_available()
-            ):
+            elif (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
                 device_name = "mps"
-            elif (
-                getattr(torch, "is_vulkan_available", None)
-                and torch.is_vulkan_available()
-            ):
+            elif (getattr(torch, "is_vulkan_available", None) and torch.is_vulkan_available()):
                 device_name = "vulkan"
             elif hasattr(torch, "xpu") and torch.xpu.is_available():
                 device_name = "xpu"
             else:
                 device_name = "cpu"
             self._device = torch.device(device_name)
+
         self.scaler = Scaler().to(self._device)
+
         # Avoid shape mutation inside forward(): ensure x stats match feature dimension up front.
         with torch.no_grad():
             if self.scaler.x_mean.numel() != self.in_dim:
@@ -2152,19 +2242,21 @@ class Root(nn.Module):
                 self.scaler.x_std.resize_(self.in_dim)
                 self.scaler.x_mean.zero_()
                 self.scaler.x_std.fill_(1.0)
-        self.logger = History()
+
+        # Keep History on the same device so Root.forward device inference can't be hijacked by CPU buffers.
+        self.logger = History().to(self._device)
+
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
-        self.linear_branch = (
-            nn.Linear(self.in_dim, self.out_dim).to(self._device)
-            if self.is_norm_linear
-            else None
-        )
+        self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
+
         self.processor = Subcontext(self.in_dim, self.out_shape, config=config).to(self._device)
+
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
-        controller = Context(
+
+        self.controller = Context(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -2173,11 +2265,11 @@ class Root(nn.Module):
             batch_first=True,
             length_bucket_multiple=bucket,
         ).to(self._device)
-        self.controller = controller
-        self.microbatch = 0
-        self.ctrl_microbatch = 0
-        self._auto_microbatch_pending = True
-        self._auto_ctrl_microbatch_pending = True
+
+        # Encoder-stage microbatch.
+        self.microbatch: int = 0
+        self._auto_microbatch_pending: bool = True
+
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -2199,13 +2291,10 @@ class Root(nn.Module):
         compile_enabled = bool(compile_requested and compile_available)
         if compile_requested and not compile_available:
             _LOGGER.warning(
-                "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; "
-                "running eagerly",
+                "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; running eagerly",
                 raw_mode,
             )
-        compile_dynamic = bool(
-            getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead")
-        )
+        compile_dynamic = bool(getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead"))
         compile_cudagraphs = bool(
             getattr(
                 config,
@@ -2216,8 +2305,8 @@ class Root(nn.Module):
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
-        # max-autotune modes are significantly more memory hungry. To avoid hard OOM kills
-        # (SIGKILL -9), default to compiling only the small decode head unless overridden.
+
+        # max-autotune modes are significantly more memory hungry; default to compiling only the small decode head.
         compile_heavy_submodules = bool(
             getattr(
                 config,
@@ -2225,24 +2314,19 @@ class Root(nn.Module):
                 normalized_mode not in {"max-autotune", "max-autotune-no-cudagraphs"},
             )
         )
-        if (
-            compile_enabled
-            and not compile_heavy_submodules
-            and normalized_mode in {"max-autotune", "max-autotune-no-cudagraphs"}
-        ):
+        if compile_enabled and (not compile_heavy_submodules) and normalized_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
             _LOGGER.warning(
                 "max-autotune hotfix: compiling only decode head (skip temporal/perception). "
                 "Set config.compile_heavy_submodules=True to override."
             )
+
         compiled_decode = False
         compiled_temporal = False
         compiled_perception = False
         if compile_enabled:
             try:
                 _raw_head = self.processor.head
-                _decode_mod = _CompiledDecode(
-                    self.processor.norm, _raw_head, self.out_shape
-                ).to(self._device)
+                _decode_mod = _CompiledDecode(self.processor.norm, _raw_head, self.out_shape).to(self._device)
                 _compiled = Gradient.compile(
                     _decode_mod,
                     mode=compile_mode_arg,
@@ -2312,13 +2396,9 @@ class Root(nn.Module):
             "temporal_net": bool(compiled_temporal),
             "perception": bool(compiled_perception),
         }
-        # Only enable microbatch padding if we actually have any compiled submodule.
-        self._pad_compiled_microbatch = bool(
-            compiled_decode or compiled_temporal or compiled_perception
-        )
+        self._pad_compiled_microbatch = bool(compiled_decode or compiled_temporal or compiled_perception)
 
         # AMP negotiation caching (keyed by device + dataset scale stats).
-        # This avoids re-scanning dtypes and scale metadata on every forward.
         self._amp_dtype_cache: Dict[Tuple[Any, ...], torch.dtype] = {}
         self._amp_dtype_cache_last_key: Tuple[Any, ...] | None = None
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
@@ -2351,9 +2431,7 @@ class Root(nn.Module):
         _promote_module(self)
 
     @staticmethod
-    def _cast_graph_safe(
-        x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]
-    ) -> torch.Tensor:
+    def _cast_graph_safe(x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:
         target_dtype = dtype or x.dtype
         if x.device != device:
             return x.to(device=device, dtype=target_dtype, non_blocking=True)
@@ -2377,6 +2455,7 @@ class Root(nn.Module):
         except (TypeError, ValueError):
             pass
         hard_max = max(1, min(hard_max, b))
+
         per_sample = 0
         env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
         if env_ps:
@@ -2388,6 +2467,7 @@ class Root(nn.Module):
             one = X[:1]
             bytes_per_sample = int(one.nelement()) * int(one.element_size())
             per_sample = int(bytes_per_sample * 8)
+
         stage_div = 4
         try:
             v = os.environ.get("STNET_MICROBATCH_STAGE_DIV")
@@ -2397,120 +2477,8 @@ class Root(nn.Module):
             stage_div = 4
         per_sample = max(1, int(per_sample // stage_div))
 
-        mb_size = _auto_microbatch(
-            device=device,
-            hard_max=hard_max,
-            per_sample_bytes=per_sample,
-        )
+        mb_size = _auto_microbatch(device=device, hard_max=hard_max, per_sample_bytes=per_sample)
         return int(mb_size)
-
-    @torch_no_compile(reason="microbatch prealloc helper")
-    def _microbatch_prealloc(
-        self,
-        inp: torch.Tensor,
-        microbatch: int,
-        run_fn: Callable[[torch.Tensor], Union[torch.Tensor, Tuple[torch.Tensor, ...]]],
-        *,
-        pad_to: Optional[int] = None,
-        out_dtype: Optional[torch.dtype] = None,
-        cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-        stage: str = "microbatch",
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-
-        if inp.ndim < 1:
-            raise ValueError(f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}")
-
-        total_b = int(inp.shape[0])
-        mb_i = max(1, min(total_b, int(microbatch) if microbatch else total_b))
-        pad_i = int(pad_to) if pad_to is not None else None
-        if pad_i is not None:
-            pad_i = max(1, pad_i)
-            if pad_i < mb_i:
-                raise ValueError(f"{stage}: pad_to ({pad_i}) must be >= microbatch ({mb_i})")
-
-        out_bufs: Optional[List[torch.Tensor]] = None
-        # Padding buffers can be safely reused only when gradients are disabled.
-        # When autograd is on, reuse may corrupt saved tensors needed for backward.
-        reuse_pad_buffer = not torch.is_grad_enabled()
-        pad_buf: Optional[torch.Tensor] = None
-
-        for s in range(0, total_b, mb_i):
-            x_slice = inp[s : s + mb_i]
-            if cast_slice is not None:
-                x_slice = cast_slice(x_slice)
-
-            slice_n = int(x_slice.shape[0])
-            x_in = x_slice
-            did_pad = False
-            if pad_i is not None and slice_n < pad_i:
-                if reuse_pad_buffer:
-                    want_shape = (pad_i, *x_slice.shape[1:])
-                    if (
-                        pad_buf is None
-                        or pad_buf.shape != want_shape
-                        or pad_buf.dtype != x_slice.dtype
-                        or pad_buf.device != x_slice.device
-                    ):
-                        pad_buf = x_slice.new_empty(want_shape)
-                    pad_buf.zero_()
-                    pad_buf[:slice_n].copy_(x_slice)
-                    x_in = pad_buf
-                else:
-                    x_in = x_slice.new_zeros((pad_i, *x_slice.shape[1:]))
-                    x_in[:slice_n].copy_(x_slice)
-                did_pad = True
-
-            out = run_fn(x_in)
-
-            if torch.is_tensor(out):
-                outs = (out,)
-            else:
-                outs = cast(Tuple[torch.Tensor, ...], out)
-
-            if len(outs) == 0:
-                raise RuntimeError(f"{stage}: run_fn returned an empty tuple at slice s={s}")
-
-            processed: List[torch.Tensor] = []
-            for j, t in enumerate(outs):
-                if not torch.is_tensor(t):
-                    raise TypeError(f"{stage}: run_fn output #{j} is not a Tensor (type={type(t)})")
-                y = t
-                if did_pad:
-                    if y.shape[0] < slice_n:
-                        raise RuntimeError(
-                            f"{stage}: output batch too small after pad-slice: got={int(y.shape[0])}, expected>={slice_n} (s={s})"
-                        )
-                    y = y[:slice_n]
-                if int(y.shape[0]) != slice_n:
-                    raise RuntimeError(
-                        f"{stage}: output batch mismatch at s={s}: got={int(y.shape[0])}, expected={slice_n}"
-                    )
-                if out_dtype is not None and y.dtype != out_dtype:
-                    y = y.to(dtype=out_dtype)
-                processed.append(y)
-
-            if out_bufs is None:
-                out_bufs = [y.new_empty((total_b, *y.shape[1:])) for y in processed]
-            else:
-                if len(out_bufs) != len(processed):
-                    raise RuntimeError(
-                        f"{stage}: output arity changed across microbatches: first={len(out_bufs)}, now={len(processed)} (s={s})"
-                    )
-                for k, (buf, y) in enumerate(zip(out_bufs, processed)):
-                    if buf.shape[1:] != y.shape[1:]:
-                        raise RuntimeError(
-                            f"{stage}: output shape changed for output#{k}: first={tuple(buf.shape)}, now={(total_b, *y.shape[1:])} (s={s})"
-                        )
-
-            for buf, y in zip(out_bufs, processed):
-                buf[s : s + slice_n] = y
-
-        if out_bufs is None:
-            raise RuntimeError(f"{stage}: produced no outputs (b={total_b}, microbatch={mb_i})")
-
-        if len(out_bufs) == 1:
-            return out_bufs[0]
-        return tuple(out_bufs)
 
     def forward(
         self,
@@ -2530,12 +2498,7 @@ class Root(nn.Module):
     ) -> (
         torch.Tensor
         | Tuple[torch.Tensor, Optional[torch.Tensor]]
-        | Tuple[
-            torch.Tensor,
-            Optional[torch.Tensor],
-            Optional[torch.Tensor],
-            Optional[torch.Tensor],
-        ]
+        | Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]
         | TensorDictBase
     ):
         if not isinstance(calibrate_output, bool):
@@ -2559,6 +2522,7 @@ class Root(nn.Module):
             if sanitize_inplace and (torch.is_floating_point(t) or torch.is_complex(t)):
                 return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
             return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
             td_input = features
@@ -2569,6 +2533,7 @@ class Root(nn.Module):
             features = td_features
             if labels_flat is None and td_labels is not None:
                 labels_flat = td_labels
+
             td_net_loss = td_input.get("net_loss", None)
             td_global_loss = td_input.get("global_loss", None)
             td_local_loss = td_input.get("local_loss", None)
@@ -2578,19 +2543,15 @@ class Root(nn.Module):
                 global_loss = td_global_loss
             if local_loss is None and td_local_loss is not None:
                 local_loss = td_local_loss
+
             td_loss_weights = td_input.get("loss_weights", None)
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
 
-        buf0 = next(self.buffers(), None)
-        if buf0 is not None:
-            device = buf0.device
-        else:
-            p0 = next(self.parameters(), None)
-            device = p0.device if p0 is not None else self._device
+        device = _infer_module_device(self.processor, self._device)
 
         x_raw = features
-        if x_raw.ndim == 3 and x_raw.shape[1] == 1:
+        if isinstance(x_raw, torch.Tensor) and x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
 
         if isinstance(x_raw, torch.Tensor) and x_raw.device != device:
@@ -2604,10 +2565,7 @@ class Root(nn.Module):
             meta = Autocast.coerce_metadata(device)
         except Exception:
             meta = None
-            _LOGGER.debug(
-                "Autocast.coerce_metadata failed; falling back to fp32",
-                exc_info=True,
-            )
+            _LOGGER.debug("Autocast.coerce_metadata failed; falling back to fp32", exc_info=True)
 
         amp_candidates: Tuple[torch.dtype, ...] = ()
         if meta is not None:
@@ -2624,10 +2582,8 @@ class Root(nn.Module):
             safety_margin_pow2 = int(getattr(self.__config, "safety_margin_pow2", 3))
         except Exception:
             safety_margin_pow2 = 3
-        if safety_margin_pow2 < 0:
-            safety_margin_pow2 = 0
-        elif safety_margin_pow2 > 30:
-            safety_margin_pow2 = 30
+        safety_margin_pow2 = max(0, min(30, safety_margin_pow2))
+
         dev_index = int(device.index) if getattr(device, "index", None) is not None else -1
         if meta is None:
             cache_key = (device.type, dev_index, amp_candidates, None, int(safety_margin_pow2))
@@ -2657,18 +2613,12 @@ class Root(nn.Module):
                 int(safety_margin_pow2),
             )
 
-        amp_dtype: Optional[torch.dtype] = None
-        cache_lock = getattr(self, "_amp_dtype_cache_lock", None)
-        if cache_lock is None:
-            cache_lock = threading.Lock()
-            setattr(self, "_amp_dtype_cache_lock", cache_lock)
-
-        with cache_lock:
-            last_key = getattr(self, "_amp_dtype_cache_last_key", None)
-            if last_key == cache_key:
-                amp_dtype = getattr(self, "_amp_dtype_cache_last_dtype", None)
-            if amp_dtype is None:
+        with self._amp_dtype_cache_lock:
+            if self._amp_dtype_cache_last_key == cache_key:
+                amp_dtype = self._amp_dtype_cache_last_dtype
+            else:
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
+
         if amp_dtype is None:
             negotiated = Autocast.negotiate(
                 tuple(amp_candidates),
@@ -2680,32 +2630,24 @@ class Root(nn.Module):
                 decision_key=cache_key,
                 safety_margin_pow2=int(safety_margin_pow2),
             )
-            with cache_lock:
-                # Double-check: another thread may have filled it while we negotiated.
+            with self._amp_dtype_cache_lock:
                 amp_dtype = self._amp_dtype_cache.get(cache_key)
                 if amp_dtype is None:
                     amp_dtype = negotiated
-                    if len(self._amp_dtype_cache) >= int(getattr(self, "_amp_dtype_cache_max", 64)):
+                    if len(self._amp_dtype_cache) >= int(self._amp_dtype_cache_max):
                         self._amp_dtype_cache.clear()
                     self._amp_dtype_cache[cache_key] = amp_dtype
                 self._amp_dtype_cache_last_key = cache_key
                 self._amp_dtype_cache_last_dtype = amp_dtype
         else:
-            with cache_lock:
+            with self._amp_dtype_cache_lock:
                 self._amp_dtype_cache_last_key = cache_key
                 self._amp_dtype_cache_last_dtype = amp_dtype
+
         amp_enabled = amp_dtype is not torch.float64
 
-        is_cls_loss = (
-            isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss))
-            if net_loss is not None
-            else False
-        )
-        has_any_loss = (
-            (net_loss is not None)
-            or (global_loss is not None)
-            or (local_loss is not None)
-        )
+        is_cls_loss = isinstance(net_loss, (nn.CrossEntropyLoss, nn.NLLLoss)) if net_loss is not None else False
+        has_any_loss = (net_loss is not None) or (global_loss is not None) or (local_loss is not None)
         has_supervision = labels_flat is not None and has_any_loss
         is_train_path = bool(self.training and grad_enabled and has_supervision)
 
@@ -2724,30 +2666,34 @@ class Root(nn.Module):
                     _did_unshard_processor = False
             except Exception:
                 _did_unshard_processor = False
+
         try:
             requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
             if requested_base is not None:
                 base_dtype = requested_base
             else:
-                base_dtype = (torch.float32 if amp_enabled else amp_dtype)
+                base_dtype = torch.float32 if amp_enabled else amp_dtype
+
             if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
-            features = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
-            if features.ndim != 2 or features.shape[1] != self.in_dim:
+
+            features_t = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
+            if features_t.ndim != 2 or features_t.shape[1] != self.in_dim:
                 raise ValueError(
-                    f"Expected features shaped (B, {self.in_dim}), got {tuple(features.shape)}"
+                    f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
                 )
-            b = int(features.shape[0])
-    
+            b = int(features_t.shape[0])
+
+            # --- Encoder stage ---
             if self._auto_microbatch_pending:
                 try:
-                    mb = self._auto_microbatch(features, device)
-                    self.microbatch = max(1, int(mb))
+                    mb_enc = self._auto_microbatch(features_t, device)
+                    self.microbatch = max(1, int(mb_enc))
                 except Exception:
                     self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
                 self._auto_microbatch_pending = False
             mb = max(1, min(int(b), int(self.microbatch) or int(b)))
-    
+
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
@@ -2756,8 +2702,8 @@ class Root(nn.Module):
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
-                    self._microbatch_prealloc(
-                        features,
+                    _microbatch_prealloc(
+                        features_t,
                         mb,
                         _encode,
                         pad_to=int(mb) if self._pad_compiled_microbatch else None,
@@ -2766,6 +2712,7 @@ class Root(nn.Module):
                         stage="encoder",
                     ),
                 )
+
             tokens = _sanitize(tokens)
             context = _sanitize(context)
 
@@ -2777,86 +2724,47 @@ class Root(nn.Module):
 
             assembled = context.reshape(b, -1)
             if self.is_norm_linear and self.linear_branch is not None:
-                bl = self.linear_branch(
-                    self._cast_graph_safe(features, device, assembled.dtype)
-                )
+                bl = self.linear_branch(self._cast_graph_safe(features_t, device, assembled.dtype))
                 assembled = assembled + bl
-    
+
+            # Center tokens (optionally detach in training path).
             mean_dtype = torch.float32 if amp_enabled else tokens.dtype
             mean = tokens.mean(dim=1, keepdim=True, dtype=mean_dtype)
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
             if is_train_path:
-                # Ensure Context learns residual corrections without pushing
-                # gradients back into the Subcontext token stream.
                 tokens_centered = tokens_centered.detach()
 
-            if self._auto_ctrl_microbatch_pending:
-                try:
-                    mb2 = self._auto_microbatch(tokens_centered, device)
-                    self.ctrl_microbatch = max(1, int(mb2))
-                except Exception:
-                    enc_mb = int(getattr(self, "microbatch", 0) or int(b))
-                    self.ctrl_microbatch = max(1, min(int(b), enc_mb))
-                self._auto_ctrl_microbatch_pending = False
-            try:
-                _raw_ctrl_mb = int(self.ctrl_microbatch) if self.ctrl_microbatch else int(b)
-            except Exception:
-                _raw_ctrl_mb = int(b)
-            ctrl_mb = max(1, min(int(b), int(_raw_ctrl_mb)))
-            if ctrl_mb <= 0 or ctrl_mb > int(b):
-                raise RuntimeError(
-                    "Internal error: invalid controller microbatch size. "
-                    f"ctrl_mb={int(ctrl_mb)}, b={int(b)}, ctrl_microbatch={self.ctrl_microbatch!r}"
-                )
-
-            refined_tokens: torch.Tensor
-            residual_context: torch.Tensor
-            # --- Controller stage ---
-            _graph_break()
-            controller_ctx = Gradient.inference(self.controller) if infer_mode else contextlib.nullcontext()
-            with controller_ctx:
-
-                def _run_controller_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
-                    ):
-                        out, _ = self.controller(chunk)
-                    return out
-
-                refined_tokens = cast(
-                    torch.Tensor,
-                    self._microbatch_prealloc(
-                        tokens_centered,
-                        ctrl_mb,
-                        _run_controller_chunk,
-                        stage="controller",
-                    ),
-                )
-
+            # --- Controller stage (moved into Context.run) ---
+            refined_tokens = self.controller.run(
+                tokens_centered,
+                device=device,
+                meta=meta,
+                amp_enabled=amp_enabled,
+                auto_microbatch_fn=lambda t: self._auto_microbatch(t, device),
+                graph_break_fn=_graph_break,
+            )
             refined_tokens = _sanitize(refined_tokens)
-            tokens_for_decode = refined_tokens
+
+            ctrl_mb = max(1, min(int(b), int(self.controller.microbatch) or int(b)))
 
             # --- Decode stage ---
             _graph_break()
             processor_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
-
                 dc = getattr(self, "_decode_compiled", None)
 
                 def _run_decode_chunk(chunk: torch.Tensor) -> torch.Tensor:
-                    with (
-                        Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)
-                    ):
+                    with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         if dc is not None:
-                            return dc(chunk)
+                            return cast(torch.Tensor, dc(chunk))
                         return self.processor.decode(chunk, apply_norm=True)
 
                 residual_context = cast(
                     torch.Tensor,
-                    self._microbatch_prealloc(
-                        tokens_for_decode,
+                    _microbatch_prealloc(
+                        refined_tokens,
                         ctrl_mb,
                         _run_decode_chunk,
                         pad_to=(int(ctrl_mb) if (dc is not None and self._pad_compiled_microbatch) else None),
@@ -2870,23 +2778,27 @@ class Root(nn.Module):
                 residual = residual.to(dtype=assembled.dtype)
             y_hat = assembled + residual
             y_hat = _sanitize(y_hat)
-    
-            z_pred_raw = y_hat
+
             pred = y_hat.reshape(b, *self.out_shape)
-            y_hat_for_loss = y_hat
+
+            # --- Losses ---
             loss_val: Optional[torch.Tensor] = None
-            z_true: Optional[torch.Tensor] = None
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            if labels_flat is not None:
-                y_true_raw = labels_flat.to(device=y_hat_for_loss.device)
+
+            # Regression-only z_true (avoid touching scaler for classification).
+            z_true: Optional[torch.Tensor] = None
+            if labels_flat is not None and not is_cls_loss:
+                y_true_raw = labels_flat.to(device=y_hat.device)
+                if not y_true_raw.is_floating_point():
+                    y_true_raw = y_true_raw.to(dtype=torch.float32)
                 z_true = self.scaler.normalize_y(y_true_raw)
-    
-            if labels_flat is not None and (
-                global_loss is not None or local_loss is not None
-            ):
-    
-                weights: Tuple[float, float]
+
+            use_global_local = labels_flat is not None and (global_loss is not None or local_loss is not None)
+            use_net = labels_flat is not None and (net_loss is not None) and (not use_global_local)
+
+            if use_global_local:
+                # Weight policy
                 if loss_weights is None:
                     weights = (1.0, 0.0)
                 elif isinstance(loss_weights, (tuple, list)):
@@ -2896,52 +2808,46 @@ class Root(nn.Module):
                     weights = (float(seq[0]), float(seq[1]))
                 else:
                     weights = cast(LossWeightPolicy, loss_weights).weights()
-                tgt = z_true.to(
-                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                )
-                total = y_hat_for_loss.new_tensor(0.0, dtype=y_hat_for_loss.dtype)
-                y_bot = assembled.to(
-                    device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                )
+
+                if z_true is None:
+                    raise RuntimeError("Internal error: z_true missing for regression loss path")
+
+                tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
+                total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
+                y_bot = assembled.to(device=y_hat.device, dtype=y_hat.dtype)
 
                 if global_loss is not None:
                     use_base_detach = bool(
-                        is_train_path
-                        and (local_loss is not None)
-                        and (float(weights[1]) > 1e-12)
+                        is_train_path and (local_loss is not None) and (float(weights[1]) > 1e-12)
                     )
-                    z_top = _sanitize(assembled.detach() + residual) if use_base_detach else _sanitize(z_pred_raw)
-                    top_component = global_loss(z_top, z_true)
+                    z_top = _sanitize(assembled.detach() + residual) if use_base_detach else _sanitize(y_hat)
+                    top_component = cast(torch.Tensor, global_loss(z_top, z_true))
                     total = total + weights[0] * top_component
+
                 if local_loss is not None:
-                    bottom_component = local_loss(y_bot, tgt)
+                    bottom_component = cast(torch.Tensor, local_loss(y_bot, tgt))
                     total = total + weights[1] * bottom_component
+
                 loss_val = total
-            elif net_loss is not None and labels_flat is not None:
+
+            elif use_net:
                 if is_cls_loss:
-                    tgt = labels_flat.to(device=y_hat_for_loss.device).long()
-                    loss_val = net_loss(y_hat_for_loss, tgt)
+                    tgt = labels_flat.to(device=y_hat.device).long()
+                    loss_val = cast(torch.Tensor, net_loss(y_hat, tgt))  # type: ignore[misc]
                 else:
                     if z_true is None:
-                        tgt = self.scaler.normalize_y(
-                            labels_flat.to(device=y_hat_for_loss.device)
-                        )
-                    else:
-                        tgt = z_true.to(
-                            device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                        )
-                    tgt = tgt.to(dtype=y_hat_for_loss.dtype)
-                    loss_val = net_loss(y_hat_for_loss, tgt)
-    
+                        raise RuntimeError("Internal error: z_true missing for regression net_loss path")
+                    tgt = z_true.to(device=y_hat.device, dtype=y_hat.dtype)
+                    loss_val = cast(torch.Tensor, net_loss(y_hat, tgt))  # type: ignore[misc]
+
             if loss_val is not None and not isinstance(loss_val, torch.Tensor):
-                loss_val = torch.as_tensor(
-                    loss_val, device=y_hat_for_loss.device, dtype=y_hat_for_loss.dtype
-                )
-    
-            if infer_mode and calibrate_output:
-                z_cal = self.scaler.calibrate(z_pred_raw)
+                loss_val = torch.as_tensor(loss_val, device=y_hat.device, dtype=y_hat.dtype)
+
+            # --- Inference-time calibration (regression only) ---
+            if infer_mode and calibrate_output and (not is_cls_loss):
+                z_cal = self.scaler.calibrate(y_hat)
                 pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
-    
+
             if td_input is not None:
                 if hasattr(td_input, "copy"):
                     out_td = td_input.copy()
@@ -2950,6 +2856,7 @@ class Root(nn.Module):
                         out_td = td_input.clone(recurse=False)
                     except TypeError:
                         out_td = td_input.clone(False)
+
                 out_td.set("pred", pred)
                 if return_aux:
                     out_td.set("refined_tokens", refined_tokens)
@@ -2959,6 +2866,7 @@ class Root(nn.Module):
                         out_td.del_("refined_tokens")
                     with contextlib.suppress(KeyError):
                         out_td.del_("residual_context")
+
                 if loss_val is not None:
                     loss_td = loss_val
                     if isinstance(loss_td, torch.Tensor) and loss_td.ndim == 0:
@@ -2969,6 +2877,7 @@ class Root(nn.Module):
                 else:
                     with contextlib.suppress(KeyError):
                         out_td.del_("loss_total")
+
                 if top_component is not None:
                     top_td = top_component
                     if isinstance(top_td, torch.Tensor) and top_td.ndim == 0:
@@ -2979,6 +2888,7 @@ class Root(nn.Module):
                 else:
                     with contextlib.suppress(KeyError):
                         out_td.del_("loss_top")
+
                 if bottom_component is not None:
                     bottom_td = bottom_component
                     if isinstance(bottom_td, torch.Tensor) and bottom_td.ndim == 0:
@@ -2989,25 +2899,21 @@ class Root(nn.Module):
                 else:
                     with contextlib.suppress(KeyError):
                         out_td.del_("loss_bottom")
+
                 return out_td
+
             if return_loss is False:
                 return pred
             if return_loss_components:
                 return (pred, loss_val, top_component, bottom_component)
             return (pred, loss_val)
+
         finally:
             if _did_unshard_processor and callable(_reshard):
-                try:
+                with contextlib.suppress(Exception):
                     _reshard()
-                except Exception:
-                    pass
 
-    def predict(
-        self,
-        features: torch.Tensor | TensorDictBase,
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor | TensorDictBase:
+    def predict(self, features: torch.Tensor | TensorDictBase, *args: Any, **kwargs: Any) -> torch.Tensor | TensorDictBase:
         kwargs.setdefault("return_loss", False)
         return self.forward(features, *args, **kwargs)
 
@@ -3015,7 +2921,6 @@ class Root(nn.Module):
         run_hist = getattr(self, "_train_history", None)
         if isinstance(run_hist, list):
             return run_hist
-
         hist = getattr(self, "logger", None)
         if isinstance(hist, History):
             return hist.save()
