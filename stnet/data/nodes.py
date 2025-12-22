@@ -1,88 +1,128 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import logging
 import json
-import os
+import logging
 import math
 import multiprocessing as mp
-import threading
+import os
 import queue
+import threading
 from contextlib import suppress
-from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
-                    Sequence, Tuple, TypedDict)
+from dataclasses import dataclass
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterator,
+    Literal,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypedDict,
+)
 
 import torch
 
 from ..backend.compat import ensure_torchdata
-from ..backend.system import Thread, process_cpu_count, Memory
+from ..backend.system import Memory, Thread, process_cpu_count
+from .collections import Buffer, LazyTensor, ProducerError, best_effort_close
+from .datatype import env_bool, env_first_int
 
 _LOGGER = logging.getLogger(__name__)
-_MMAP_TL_LIMIT_LOCK = threading.Lock()
 
 TensorLike = Any
 
+# ---- torchdata nodes (robust defaults) ---------------------------------------
+
+_TORCHDATA_AVAILABLE = False
+
+
+class _MissingTorchDataBaseNode:
+    """Placeholder type to avoid NameError/TypeError cascades when torchdata is missing."""
+
+
+BaseNode: type = _MissingTorchDataBaseNode  # will be overwritten if torchdata imports
+_Loader: Any = None
+ParallelMapper: Any = None
+
+_Batcher: Any = None
+MultiNodeWeightedSampler: Any = None
+PinMemory: Any = None
+_Prefetcher: Any = None
+SamplerWrapper: Any = None
+_Unbatcher: Any = None
+
 try:
-    from torchdata.nodes import BaseNode
-    from torchdata.nodes import Loader as _Loader
-    from torchdata.nodes import ParallelMapper
+    from torchdata.nodes import BaseNode as _TDBaseNode
+    from torchdata.nodes import Loader as _TDLoader
+    from torchdata.nodes import ParallelMapper as _TDParallelMapper
+
+    BaseNode = _TDBaseNode
+    _Loader = _TDLoader
+    ParallelMapper = _TDParallelMapper
+    _TORCHDATA_AVAILABLE = True
 except Exception as _e:
     ensure_torchdata(err=_e, context="stnet.data.nodes")
+
+try:
+    from torchdata.nodes import Batcher as _TDBatcher
+    from torchdata.nodes import MultiNodeWeightedSampler as _TDMultiNodeWeightedSampler
+    from torchdata.nodes import PinMemory as _TDPinMemory
+    from torchdata.nodes import Prefetcher as _TDPrefetcher
+    from torchdata.nodes import SamplerWrapper as _TDSamplerWrapper
+    from torchdata.nodes import Unbatcher as _TDUnbatcher
+
+    _Batcher = _TDBatcher
+    MultiNodeWeightedSampler = _TDMultiNodeWeightedSampler
+    PinMemory = _TDPinMemory
+    _Prefetcher = _TDPrefetcher
+    SamplerWrapper = _TDSamplerWrapper
+    _Unbatcher = _TDUnbatcher
+except Exception as _e:
+    ensure_torchdata(err=_e, context="stnet.data.nodes")
+
+# ---- tensordict mmap ---------------------------------------------------------
 
 try:
     from tensordict import MemoryMappedTensor
 except ImportError:  # pragma: no cover
     MemoryMappedTensor = None  # type: ignore
 
-try:
-    from torchdata.nodes import Batcher as _Batcher
-    from torchdata.nodes import MultiNodeWeightedSampler, PinMemory
-    from torchdata.nodes import Prefetcher as _Prefetcher
-    from torchdata.nodes import SamplerWrapper
-    from torchdata.nodes import Unbatcher as _Unbatcher
-except Exception as _e:
-    ensure_torchdata(err=_e, context="stnet.data.nodes")
+# ---- torch.utils.data Sampler base ------------------------------------------
 
 try:
     from torch.utils.data import Sampler as _Sampler
-except Exception:
+except Exception:  # pragma: no cover
     _Sampler = object
-
-from .datatype import env_bool, env_first_int
-from .collections import LazyTensor, Buffer, ProducerError, best_effort_close
-
-
-def _to_device(batch: TensorLike, device: torch.device, non_blocking: bool = True) -> TensorLike:
-    if isinstance(batch, torch.Tensor):
-        return batch.to(device, non_blocking=non_blocking)
-    if isinstance(batch, Mapping):
-        return {k: _to_device(v, device, non_blocking) for k, v in batch.items()}
-    if isinstance(batch, (list, tuple)):
-        seq = [_to_device(v, device, non_blocking) for v in batch]
-        return type(batch)(seq) if isinstance(batch, tuple) else seq
-    return batch
 
 
 def _is_accelerator_available() -> bool:
     """Best-effort check for an available accelerator backend."""
-
     try:
         if torch.cuda.is_available():
             return True
     except Exception:
         pass
 
+    # Intel XPU (optional)
     try:
         xpu = getattr(torch, "xpu", None)
-        if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
-            return True
+        if xpu is not None:
+            fn = getattr(xpu, "is_available", None)
+            if callable(fn) and fn():
+                return True
     except Exception:
         pass
 
+    # Apple MPS (optional)
     try:
-        mps_backend = getattr(torch.backends, "mps", None)
-        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
-            return True
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None:
+            fn = getattr(mps, "is_available", None)
+            if callable(fn) and fn():
+                return True
     except Exception:
         pass
 
@@ -91,7 +131,6 @@ def _is_accelerator_available() -> bool:
 
 def _gpu_guard_ok(use_cuda_stream: bool, device: torch.device, guard_bytes: int) -> bool:
     """Return True if CUDA free-memory guard is satisfied (or guard disabled)."""
-
     if (not use_cuda_stream) or int(guard_bytes) <= 0:
         return True
     try:
@@ -100,12 +139,12 @@ def _gpu_guard_ok(use_cuda_stream: bool, device: torch.device, guard_bytes: int)
         )
         return bool(int(free_b) >= int(guard_bytes))
     except Exception:
+        # best-effort: do not block training
         return True
 
 
 def _host_guard_ok(guard_bytes: int) -> bool:
     """Return True if host available-memory guard is satisfied (or guard disabled)."""
-
     if int(guard_bytes) <= 0:
         return True
     try:
@@ -117,18 +156,8 @@ def _host_guard_ok(guard_bytes: int) -> bool:
 class SamplerScale:
     """Per-session (or per-loader) scaling factor for auto batch sizing.
 
-    NOTE:
-      - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
-      - Thread-safe: Value has an internal lock; we also guard bounds carefully.
-
-    Design note (DynamicBatcher responsibility):
-      - We intentionally keep "dynamic batch sizing" out of BufferedLoader.
-      - The Sampler is the correct owner because it is the component that decides
-        sampling granularity (batch size) and is already shared/pickled into worker
-        processes.
-      - Runtime recovery (e.g. OOM) is achieved by calling sampler_scale.request_scale_down(),
-        and the very next sampler batch will reflect the new effective batch size via
-        Sampler._S_B (dynamic property).
+    - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
+    - Thread-safe: Value has an internal lock; we also guard bounds carefully.
     """
 
     __slots__ = ("_v", "_min_scale", "_max_scale")
@@ -136,42 +165,32 @@ class SamplerScale:
     def __init__(self, scale: float = 1.0, *, min_scale: float = 0.5, max_scale: float = 2.0) -> None:
         self._min_scale = float(min_scale)
         self._max_scale = float(max_scale)
-        # Shared double, synchronized (propagates across spawn/fork worker processes).
         self._v = mp.Value("d", 1.0, lock=True)
         self.reset(scale)
 
     def __getstate__(self):
-        # Keep the shared value handle so children see updates.
         return (self._v, float(self._min_scale), float(self._max_scale))
 
     def __setstate__(self, state):
         try:
-            # New format: (mp.Value, min, max)
             v, mn, mx = state
         except Exception:
             v, mn, mx = None, 0.5, 2.0
-        try:
-            self._min_scale = float(mn)
-        except Exception:
-            self._min_scale = 0.5
-        try:
-            self._max_scale = float(mx)
-        except Exception:
-            self._max_scale = 2.0
+
+        self._min_scale = float(mn) if isinstance(mn, (int, float, str)) else 0.5
+        self._max_scale = float(mx) if isinstance(mx, (int, float, str)) else 2.0
+
         if v is None:
             self._v = mp.Value("d", 1.0, lock=True)
         else:
             self._v = v
-        # Backward-compat: if someone pickled old-style (scale,mn,mx), handle it.
+
+        # Backward-compat: handle (scale, mn, mx)
         try:
             if not hasattr(self._v, "get_lock"):
-                # state was actually (scale,mn,mx)
                 scale = float(v)
                 self._v = mp.Value("d", 1.0, lock=True)
                 self.reset(scale)
-            else:
-                # Keep existing value; no implicit reset.
-                pass
         except Exception:
             self._v = mp.Value("d", 1.0, lock=True)
 
@@ -180,11 +199,9 @@ class SamplerScale:
             with self._v.get_lock():
                 return float(self._v.value)
         except Exception:
-            # best-effort fallback
-            try:
+            with suppress(Exception):
                 return float(self._v.value)
-            except Exception:
-                return 1.0
+            return 1.0
 
     def reset(self, value: float = 1.0) -> None:
         try:
@@ -270,14 +287,18 @@ class Sampler(_Sampler):
         # Runtime dynamic-batch cap (computed in pipeline._batch_interval).
         # 0 => unknown/unlimited (will still be clamped by split end).
         self._S_B_cap = 0
+
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
             raise ValueError(f"meta.json under {self.dir} has non-positive N={self._N}")
+
         feat_rel = str(self._meta.get("features_path", "features.mmt"))
         feat_path = os.path.join(self.dir, feat_rel)
+
         # labels_path may be omitted (features-only memmap).
         lab_rel_raw = self._meta.get("labels_path", "labels.mmt")
         features_only = bool(self._meta.get("features_only", False))
+
         lab_rel = ""
         lab_path = ""
         if lab_rel_raw not in (None, "", False):
@@ -293,60 +314,62 @@ class Sampler(_Sampler):
                     lab_path = ""
                 else:
                     raise FileNotFoundError(f"labels.mmt not found under: {lab_path}")
+
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
-        f_dtype = self._dtype_from_name(
-            self._meta.get("features_dtype", "float64"), torch.float64
-        )
+
+        f_dtype = self._dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
         l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
-        # Keep the raw memmap config so we can optionally open per-thread handles (useful on no-GIL).
+
+        # Optional row_ids emission (metadata). Disable to avoid per-batch arange allocations.
+        self._include_row_ids = env_bool("STNET_INCLUDE_ROW_IDS", default=True)
+
+        # Keep raw memmap config for optional per-thread handles (no-GIL).
         self._feat_path = feat_path
         self._lab_path = lab_path if lab_path else None
         self._feat_dtype = f_dtype
         self._label_dtype = l_dtype
         self._feat_shape = torch.Size([self._N, fdim])
+
         if MemoryMappedTensor is None:
             raise ImportError(
                 "tensordict is required for MemoryMappedTensor-backed pipelines. "
                 "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
             )
+
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
+
         lshape = tuple(lshape_meta) if lshape_meta else tuple()
         self._label_shape_full = torch.Size([self._N] + list(lshape))
+
         self._labels = None
         if self._lab_path is not None:
             self._labels = MemoryMappedTensor.from_filename(
-                filename=str(self._lab_path), dtype=l_dtype, shape=torch.Size([self._N] + list(lshape))
+                filename=str(self._lab_path),
+                dtype=l_dtype,
+                shape=torch.Size([self._N] + list(lshape)),
             )
-        # Optional: open per-thread MemoryMappedTensor handles. This is
-        # conservative by default (auto-enabled only when no-GIL optimizations
-        # are active). Override with STNET_MEMMAP_THREAD_LOCAL=0/1.
-        # NOTE: keep the TLS object lazy/optional so the Sampler remains picklable
-        # on platforms that use the "spawn" start method.
+
+        # Thread-local memmap handles are optional; default "auto" for no-GIL builds.
         self._mmap_tls: Optional[threading.local] = None
-        self._mmap_init_lock = threading.Lock()
+        self._mmap_init_lock: Optional[threading.Lock] = threading.Lock()
+
+        # Instance-local limit lock (avoid global contention on no-GIL).
+        self._mmap_limit_lock: Optional[threading.Lock] = threading.Lock()
+
         self._mmap_thread_local = False
-        # Limit the number of thread-local memmap handle pairs. On no-GIL builds,
-        # it's easy to spawn many more threads, and each thread-local mmap consumes
-        # file descriptors / VMAs.
-        #
-        # Override with:
-        #   - STNET_MEMMAP_THREAD_LOCAL_MAX / STNET_MEMMAP_TL_MAX
-        #   - Set <= 0 for "unlimited" (not recommended on large servers).
         self._mmap_thread_local_max = 0
         self._mmap_thread_local_created = 0
         self._mmap_thread_local_overflow_warned = False
 
-        # Thread-local mmap handles are optional; default is "auto" for no-GIL builds.
         default_tl = False
         with suppress(Exception):
             default_tl = bool(Thread.nogil_optimizations_enabled())
         self._mmap_thread_local = env_bool("STNET_MEMMAP_THREAD_LOCAL", default=default_tl)
 
         if self._mmap_thread_local:
-            # Default max: scale with CPU count, cap at 64 to avoid FD blowups.
             cpu = int(process_cpu_count() or 8)
             default_max = max(8, min(64, cpu))
             self._mmap_thread_local_max = env_first_int(
@@ -354,21 +377,29 @@ class Sampler(_Sampler):
                 default=default_max,
             )
             self._mmap_thread_local_max = int(self._mmap_thread_local_max)
+
         self._memmap_features = self._features
         self._memmap_labels = self._labels
         self._X = self._memmap_features
         self._Y = self._memmap_labels
-        # Base batch size is stored separately; _S_B is a dynamic property that applies sampler_scale.
+
+        # Base batch size stored separately; _S_B is a dynamic property that applies sampler_scale.
         self._S_B_base = 1
-        # initialize via setter for compatibility
-        self._S_B = 1
+        self._S_B = 1  # initialize via setter for compatibility
+
         self._S_shuffle = True
         self._S_seed = 0
         self._S_epoch = 0
+
+        # Epoch-local len snapshot (keeps __len__ stable even if sampler_scale changes mid-epoch).
+        self._len_epoch = -1
+        self._len_B_snapshot: Optional[int] = None
+
         self._num_shards = 1
         self._shard_id = 0
         self._key = ""
         self._label_shape: Tuple[int, ...] = tuple(lshape) if lshape else tuple()
+
         train_start = int(self._meta.get("train_start", 0))
         train_end = int(self._meta.get("train_end", self._N))
         val_start = int(self._meta.get("val_start", 0))
@@ -381,9 +412,7 @@ class Sampler(_Sampler):
             train_start, train_end = 0, val_start
 
         if self.split == "val":
-            self._start, self._end = (
-                (val_start, val_end) if val_end > val_start else (0, 0)
-            )
+            self._start, self._end = ((val_start, val_end) if val_end > val_start else (0, 0))
         else:
             self._start, self._end = (train_start, train_end)
 
@@ -400,7 +429,6 @@ class Sampler(_Sampler):
         return max(1, int(b))
 
     def _effective_batch_size(self) -> int:
-        # Base * current scale, clamped by cap when present.
         base = self.base_batch_size
         scale = 1.0
         with suppress(Exception):
@@ -408,7 +436,6 @@ class Sampler(_Sampler):
         if not (scale > 0.0):
             scale = 1.0
 
-        # Use rounding so small scale changes can still take effect for mid/large base.
         eff = int(round(float(base) * float(scale)))
         eff = max(1, int(eff))
 
@@ -419,8 +446,18 @@ class Sampler(_Sampler):
             eff = min(int(eff), int(cap))
         return max(1, int(eff))
 
+    def _len_batch_size(self) -> int:
+        """Epoch-local snapshot for __len__ stability."""
+        epoch = int(getattr(self, "_S_epoch", 0) or 0)
+        snap_epoch = int(getattr(self, "_len_epoch", -1) or -1)
+        snap = getattr(self, "_len_B_snapshot", None)
+        if snap is None or snap_epoch != epoch:
+            snap = max(1, int(self._effective_batch_size()))
+            self._len_B_snapshot = int(snap)
+            self._len_epoch = int(epoch)
+        return max(1, int(snap))
+
     # Backward-compatible dynamic attribute:
-    # Any existing code that reads Sampler._S_B now gets the scaled batch size immediately.
     @property
     def _S_B(self) -> int:  # noqa: N802 (keep legacy internal name)
         return self._effective_batch_size()
@@ -436,15 +473,7 @@ class Sampler(_Sampler):
         setattr(self, "_S_B_base", int(v))
 
     def __getstate__(self):
-        """Make the Sampler picklable.
-
-        TorchData graphs may be pickled when using spawn-based multiprocessing.
-        threading.local / Lock objects are not picklable, and MemoryMappedTensor
-        holds process-local resources (file descriptors / mmaps).
-
-        We drop those objects from the state and re-open the memmaps on unpickle.
-        """
-
+        """Make the Sampler picklable (spawn-based multiprocessing)."""
         state = dict(self.__dict__)
         for key in (
             "_features",
@@ -455,17 +484,19 @@ class Sampler(_Sampler):
             "_Y",
             "_mmap_tls",
             "_mmap_init_lock",
+            "_mmap_limit_lock",
         ):
             state.pop(key, None)
         state["_mmap_tls"] = None
         state["_mmap_init_lock"] = None
+        state["_mmap_limit_lock"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-        # Recreate thread-local holders / locks lazily in the new process.
         self._mmap_tls = None
         self._mmap_init_lock = threading.Lock()
+        self._mmap_limit_lock = threading.Lock()
 
         if MemoryMappedTensor is None:
             raise ImportError(
@@ -473,7 +504,6 @@ class Sampler(_Sampler):
                 "Please install 'tensordict' (or install stnet-pytorch with its default dependencies)."
             )
 
-        # Re-open memmap-backed tensors in the current process.
         self._features = MemoryMappedTensor.from_filename(
             filename=str(self._feat_path),
             dtype=self._feat_dtype,
@@ -492,12 +522,10 @@ class Sampler(_Sampler):
         self._Y = self._memmap_labels
 
     def _get_mmaps(self):
-        """Return (features, labels) MemoryMappedTensor handles for the current thread.
+        """Return (features, labels) handles for the current thread.
 
         On free-threading / no-GIL builds, some extension types may internally rely
-        on per-object state that used to be implicitly protected by the GIL. Using
-        thread-local handles avoids sharing that state across threads while still
-        allowing true parallelism.
+        on per-object state. Thread-local handles avoid sharing that state across threads.
         """
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
@@ -516,11 +544,14 @@ class Sampler(_Sampler):
 
         max_pairs = int(getattr(self, "_mmap_thread_local_max", 0) or 0)
         if max_pairs > 0:
-            # Only limit the number of *created* thread-local pairs per Sampler instance.
-            with _MMAP_TL_LIMIT_LOCK:
+            lock = getattr(self, "_mmap_limit_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                self._mmap_limit_lock = lock
+
+            with lock:
                 created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
                 if created >= max_pairs:
-                    # Overflow: fall back to shared handles.
                     if not bool(getattr(self, "_mmap_thread_local_overflow_warned", False)):
                         setattr(self, "_mmap_thread_local_overflow_warned", True)
                         with suppress(Exception):
@@ -538,7 +569,6 @@ class Sampler(_Sampler):
             init_lock = threading.Lock()
             self._mmap_init_lock = init_lock
 
-        # Only lock around first-time initialization per thread.
         with init_lock:
             f = getattr(tls, "features", None)
             l = getattr(tls, "labels", None)
@@ -558,9 +588,13 @@ class Sampler(_Sampler):
                     else:
                         l = None
                 except Exception:
-                    # If creation failed, return shared handles and undo our "created" counter increment.
+                    # Undo created counter on failure.
                     if max_pairs > 0:
-                        with _MMAP_TL_LIMIT_LOCK:
+                        lock = getattr(self, "_mmap_limit_lock", None)
+                        if lock is None:
+                            lock = threading.Lock()
+                            self._mmap_limit_lock = lock
+                        with lock:
                             created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
                             setattr(self, "_mmap_thread_local_created", max(0, created - 1))
                     return self._features, self._labels
@@ -587,10 +621,13 @@ class Sampler(_Sampler):
         start = int(start)
         end = int(end)
         features, labels = self._get_mmaps()
-        row_ids = torch.arange(start, end, dtype=torch.int64)
+
         x = features[start:end]
         xt = x if isinstance(x, torch.Tensor) else torch.as_tensor(x)
-        out: Dict[str, torch.Tensor] = {"X": xt, "row_ids": row_ids}
+
+        out: Dict[str, torch.Tensor] = {"X": xt}
+        if bool(getattr(self, "_include_row_ids", True)):
+            out["row_ids"] = torch.arange(start, end, dtype=torch.int64)
 
         if labels is not None:
             y = labels[start:end]
@@ -601,88 +638,70 @@ class Sampler(_Sampler):
 
         return out
 
-    def _gather(
-        self,
-        idx_tensor: torch.Tensor,
-        features: Any,
-        labels: Any,
-    ) -> Mapping[str, torch.Tensor]:
+    def _gather(self, idx_tensor: torch.Tensor, features: Any, labels: Any) -> Mapping[str, torch.Tensor]:
         """Gather rows by index tensor (host indices)."""
         idx_tensor = idx_tensor.to(dtype=torch.long, copy=False)
         try:
             x = features.index_select(0, idx_tensor)
         except Exception:
-            x = (
-                features[idx_tensor]
-                if hasattr(features, "__getitem__")
-                else torch.as_tensor(features)[idx_tensor]
-            )
-        out: Dict[str, torch.Tensor] = {"X": x, "row_ids": idx_tensor.to(dtype=torch.int64, copy=False)}
+            x = features[idx_tensor] if hasattr(features, "__getitem__") else torch.as_tensor(features)[idx_tensor]
+
+        out: Dict[str, torch.Tensor] = {"X": x}
+        if bool(getattr(self, "_include_row_ids", True)):
+            out["row_ids"] = idx_tensor.to(dtype=torch.int64, copy=False)
+
         if labels is not None:
             try:
                 y = labels.index_select(0, idx_tensor)
             except Exception:
-                y = (
-                    labels[idx_tensor]
-                    if hasattr(labels, "__getitem__")
-                    else torch.as_tensor(labels)[idx_tensor]
-                )
+                y = labels[idx_tensor] if hasattr(labels, "__getitem__") else torch.as_tensor(labels)[idx_tensor]
             if self._label_shape:
                 y = y.reshape(y.shape[0], *self._label_shape)
             out["Y"] = y
+
         return out
 
-    def __getitem__(
-        self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor
-    ) -> Mapping[str, torch.Tensor]:
-        """Index into the memmap dataset.
-
-        Supports:
-          - (start, end) tuple slices
-          - sequence/tensor of indices (gather)
-          - scalar index
-
-        If the memmap was written in features-only mode, the returned mapping
-        omits the "Y" key.
-        """
+    def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor) -> Mapping[str, torch.Tensor]:
+        """Index into the memmap dataset."""
         features, labels = self._get_mmaps()
 
-        if isinstance(idx, tuple) and len(idx) == 2:
-            s, e = int(idx[0]), int(idx[1])
-            return self._slice(s, e)
+        match idx:
+            case tuple() as t if len(t) == 2:
+                s, e = int(t[0]), int(t[1])
+                return self._slice(s, e)
 
-        if isinstance(idx, torch.Tensor):
-            idx_t = idx.detach()
-            if idx_t.device.type != "cpu":
-                idx_t = idx_t.to("cpu")
-            if idx_t.ndim == 0:
-                return self.__getitem__(int(idx_t.item()))
-            idx_tensor = idx_t.to(dtype=torch.long, copy=False).reshape(-1)
-            if idx_tensor.numel() == 0:
-                return self._slice(0, 0)
-            return self._gather(idx_tensor, features, labels)
+            case torch.Tensor() as t:
+                idx_t = t.detach()
+                if idx_t.device.type != "cpu":
+                    idx_t = idx_t.to("cpu")
+                if idx_t.ndim == 0:
+                    return self.__getitem__(int(idx_t.item()))
+                idx_tensor = idx_t.to(dtype=torch.long, copy=False).reshape(-1)
+                if idx_tensor.numel() == 0:
+                    return self._slice(0, 0)
+                return self._gather(idx_tensor, features, labels)
 
-        if isinstance(idx, Sequence) and not isinstance(idx, (str, bytes, bytearray)):
-            if len(idx) == 0:
-                return self._slice(0, 0)
-            idx_tensor = torch.as_tensor(idx, dtype=torch.long).reshape(-1)
-            return self._gather(idx_tensor, features, labels)
+            case seq if isinstance(seq, Sequence) and not isinstance(seq, (str, bytes, bytearray)):
+                if len(seq) == 0:
+                    return self._slice(0, 0)
+                idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1)
+                return self._gather(idx_tensor, features, labels)
 
-        i = self._start + int(idx)
-        out = self._slice(i, i + 1)
-        try:
-            x = out.get("X", None)
-            if torch.is_tensor(x):
-                out["X"] = x.squeeze(0)
-            y = out.get("Y", None)
-            if torch.is_tensor(y):
-                out["Y"] = y.squeeze(0)
-            r = out.get("row_ids", None)
-            if torch.is_tensor(r):
-                out["row_ids"] = r.squeeze(0)
-        except Exception:
-            pass
-        return out
+            case _:
+                i = self._start + int(idx)  # scalar
+                out = self._slice(i, i + 1)
+                # Squeeze scalars for ergonomic downstream use.
+                with suppress(Exception):
+                    x = out.get("X", None)
+                    if torch.is_tensor(x):
+                        out["X"] = x.squeeze(0)
+                    y = out.get("Y", None)
+                    if torch.is_tensor(y):
+                        out["Y"] = y.squeeze(0)
+                    r = out.get("row_ids", None)
+                    if torch.is_tensor(r):
+                        out["row_ids"] = r.squeeze(0)
+                return out
 
     def _shard(self) -> None:
         try:
@@ -721,13 +740,17 @@ class Sampler(_Sampler):
         key: str = "",
         **kwargs: Any,
     ) -> "BaseNode":
-
-        # Base batch size is stored in _S_B_base via the legacy _S_B setter.
+        # Base batch size stored in _S_B_base via the legacy _S_B setter.
         self._S_B = max(1, int(batch_size))
         self._S_shuffle = bool(shuffle)
         self._S_seed = int(seed)
         self._S_epoch = 0
         self._key = str(key)
+
+        # Initialize epoch-local len snapshot.
+        self._len_epoch = int(self._S_epoch)
+        self._len_B_snapshot = max(1, int(self._effective_batch_size()))
+
         self._shard()
         if SamplerWrapper is None:
             raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
@@ -741,6 +764,11 @@ class Sampler(_Sampler):
 
         # Refresh distributed sharding each epoch/iteration.
         self._shard()
+
+        # Refresh epoch-local len snapshot at the start of iteration.
+        self._len_epoch = int(getattr(self, "_S_epoch", 0) or 0)
+        self._len_B_snapshot = max(1, int(self._effective_batch_size()))
+
         ns = int(getattr(self, "_num_shards", 1) or 1)
         si = int(getattr(self, "_shard_id", 0) or 0)
 
@@ -749,6 +777,7 @@ class Sampler(_Sampler):
         with suppress(Exception):
             max_scale = float(getattr(self._sampler_scale, "_max_scale", 2.0))
         block = max(1, int(math.ceil(float(base) * float(max_scale))))
+
         with suppress(Exception):
             cap = int(getattr(self, "_S_B_cap", 0) or 0)
             if cap > 0:
@@ -772,6 +801,7 @@ class Sampler(_Sampler):
             be = min(end, bs + int(block))
             cur = int(bs)
             while cur < int(be):
+                # Iteration remains dynamic (for OOM recovery), even if __len__ is snapshot-stable.
                 B = int(self._effective_batch_size())
                 nxt = min(int(be), cur + max(1, int(B)))
                 if nxt <= cur:
@@ -782,7 +812,7 @@ class Sampler(_Sampler):
     def __len__(self) -> int:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
-        B = max(1, int(self._effective_batch_size()))
+        B = max(1, int(self._len_batch_size()))
         total = max(0, (end - start + B - 1) // B)
         ns = int(getattr(self, "_num_shards", 1) or 1)
         si = int(getattr(self, "_shard_id", 0) or 0)
@@ -792,6 +822,9 @@ class Sampler(_Sampler):
 
     def set_epoch(self, epoch: int) -> None:
         self._S_epoch = int(epoch)
+        # Update epoch-local len snapshot.
+        self._len_epoch = int(self._S_epoch)
+        self._len_B_snapshot = max(1, int(self._effective_batch_size()))
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
         from ..model.fused import Gradient as FxGradient
@@ -803,11 +836,12 @@ class Sampler(_Sampler):
 
         with FxGradient.inference(torch.nn.Module()):
             if n <= 0:
-                X = features.narrow(0, 0, 0)
-                out: Dict[str, Any] = {"X": X}
+                X0 = features.narrow(0, 0, 0)
+                out0: Dict[str, Any] = {"X": X0}
                 if labels is not None:
-                    out["Y"] = labels.narrow(0, 0, 0)
-                return out
+                    out0["Y"] = labels.narrow(0, 0, 0)
+                return out0
+
             X = features.narrow(0, s, n)
             out: Dict[str, Any] = {"X": X}
 
@@ -816,6 +850,8 @@ class Sampler(_Sampler):
                 if self._label_shape:
                     Y = Y.reshape(n, *self._label_shape)
                 out["Y"] = Y
+
+            # Keep dataset-level pinning opt-in only; prefetcher typically owns pinning.
             pin_in_dataset = env_bool("STNET_PIN_IN_DATASET", default=False)
             if pin_in_dataset and _is_accelerator_available():
                 with suppress(Exception):
@@ -824,6 +860,8 @@ class Sampler(_Sampler):
                         out["Y"] = out["Y"].pin_memory()
 
             return out
+
+
 def preload_memmap(
     data: Mapping[str, Any],
     *,
@@ -836,14 +874,12 @@ def preload_memmap(
 ) -> None:
     """Create a memory-mapped dataset on disk.
 
-    This function is kept for backwards compatibility but the implementation is
-    centralized in :class:`stnet.data.collections.LazyTensor`.
+    Backwards-compat shim; implementation centralized in stnet.data.collections.LazyTensor.
 
     Notes:
       - `shuffle=True` performs *physical* shuffle at write time (no perm file).
       - `train_frac` is currently metadata-only; the split is driven by `val_frac`.
     """
-    # Preserve old kwargs but route into the unified implementation.
     chunk_size = int(kwargs.pop("chunk_size", 4096) or 4096)
     with suppress(Exception):
         env_cs = int(env_first_int(("STNET_MEMMAP_CHUNK_SIZE",), default=0) or 0)
@@ -855,7 +891,6 @@ def preload_memmap(
     features_only = bool(kwargs.pop("features_only", False))
     default_label_shape = kwargs.pop("default_label_shape", None)
 
-    # Any unexpected kwargs are ignored for compatibility.
     LazyTensor.preload_memmap(
         data,
         memmap_dir=os.fspath(memmap_dir),
@@ -869,6 +904,7 @@ def preload_memmap(
         default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
     )
     return None
+
 
 SourceType = Literal["memmap"]
 
@@ -906,7 +942,6 @@ class Disposable:
     def close(self) -> None:
         self.cleanup()
 
-
     def __iter__(self) -> Iterator[Any]:
         return iter(self._keep)
 
@@ -924,26 +959,11 @@ class Wrapper:
         self.weights = dict(weights) if isinstance(weights, Mapping) else None
         self.seed = int(seed)
         self._epoch = 0
-        # Holds a reference to the composed MultiNodeWeightedSampler (if used).
-        # This allows set_epoch() to update the sampler's epoch/seed.
         self._node: Optional[Any] = None
         self._source_keys: list[str] = []
 
     def set_epoch(self, epoch: int) -> None:
-        """Per-epoch reseed for multi-source mixing.
-
-        torchdata.nodes.MultiNodeWeightedSampler stores an epoch counter in its state dict
-        (EPOCH_KEY), and uses it (together with the base seed) to initialize its RNG.
-        To reliably change the mixing order each epoch, we set EPOCH_KEY and clear the
-        cached weighted-sampler RNG state, while resetting bookkeeping/exhaustion flags.
-
-        Stability notes:
-        - Avoid mutating an arbitrary existing state dict (can contain stale child-node states
-          and can vary across torchdata versions).
-        - Prefer reset(initial_state) with a minimal, consistent state dict built from the
-          node's documented state keys.
-        """
-
+        """Per-epoch reseed for multi-source mixing (torchdata MultiNodeWeightedSampler)."""
         self._epoch = int(epoch)
         node = getattr(self, "_node", None)
         if node is None:
@@ -957,7 +977,6 @@ class Wrapper:
             k = getattr(node, attr, None) or getattr(type(node), attr, None)
             return k if isinstance(k, str) else fallback
 
-        # State keys (prefer node's constants; fall back to common names).
         epoch_key = _key("EPOCH_KEY", "epoch")
         ws_key = _key("WEIGHTED_SAMPLER_STATE_KEY", "weighted_sampler_state")
         ny_key = _key("NUM_YIELDED_KEY", "num_yielded")
@@ -965,14 +984,8 @@ class Wrapper:
         dns_key = _key("DATASET_NODE_STATES_KEY", "dataset_node_states")
 
         keys = list(getattr(self, "_source_keys", []) or [])
-        initial_state: Dict[str, Any] = {
-            epoch_key: int(self._epoch),
-            ny_key: 0,
-            ws_key: None,
-        }
+        initial_state: Dict[str, Any] = {epoch_key: int(self._epoch), ny_key: 0, ws_key: None}
         if keys:
-            # Child nodes: pass None so each source resets cleanly, and per-dataset epoch hooks
-            # can apply independently.
             initial_state[ex_key] = {k: False for k in keys}
             initial_state[dns_key] = {k: None for k in keys}
 
@@ -982,17 +995,12 @@ class Wrapper:
         except Exception:
             pass
 
-        # Fallback: perturb seed and reset to start. This keeps training running even if
-        # torchdata internals differ, while still varying the RNG each epoch.
         with suppress(Exception):
             setattr(node, "seed", int(self.seed) + int(self._epoch))
         with suppress(Exception):
             reset(None)
 
-    def compose(
-        self,
-        sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode",
-    ) -> "BaseNode":
+    def compose(self, sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode") -> "BaseNode":
         if isinstance(sources, BaseNode):
             return sources
         if isinstance(sources, (list, tuple)):
@@ -1004,23 +1012,26 @@ class Wrapper:
             if len(sources_map) == 1:
                 return next(iter(sources_map.values()))
         else:
-            raise TypeError(
-                "sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]"
-            )
+            raise TypeError("sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]")
+
         if MultiNodeWeightedSampler is None:
-            raise RuntimeError(
-                "torchdata.nodes.MultiNodeWeightedSampler is required for multi-source mixing"
-            )
+            raise RuntimeError("torchdata.nodes.MultiNodeWeightedSampler is required for multi-source mixing")
+
         w = self.weights or {k: 1.0 for k in sources_map}
         self._source_keys = list(sources_map.keys())
-        node = MultiNodeWeightedSampler(
-            sources_map,
-            w,
-            stop_criteria=self.stop_criteria,
-            seed=int(self.seed),
-        )
+        node = MultiNodeWeightedSampler(sources_map, w, stop_criteria=self.stop_criteria, seed=int(self.seed))
         self._node = node
         return node
+
+
+@dataclass(frozen=True)
+class _MapBatch:
+    """Picklable adapter for prebatch mapping (avoid nested closures)."""
+
+    fn: Callable[[Any], Any]
+
+    def __call__(self, x: Any) -> Any:
+        return self.fn(x)
 
 
 class Connector:
@@ -1042,42 +1053,32 @@ class Connector:
         wp = WorkerPolicy.autotune()
         wp.apply_torch_threads()
 
-        self.io_workers = (
-            int(io_workers) if io_workers is not None else int(getattr(wp, "num_workers", 1))
-        )
+        self.io_workers = int(io_workers) if io_workers is not None else int(getattr(wp, "num_workers", 1))
         self.io_workers = max(1, self.io_workers)
 
         self.prebatch = (
-            int(prebatch)
-            if prebatch is not None
-            else int(getattr(wp, "prebatch", max(1, self.io_workers * 2)))
+            int(prebatch) if prebatch is not None else int(getattr(wp, "prebatch", max(1, self.io_workers * 2)))
         )
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
 
-        pf = (
-            int(prefetch_factor)
-            if prefetch_factor is not None
-            else int(getattr(wp, "prefetch_factor", 1))
-        )
+        pf = int(prefetch_factor) if prefetch_factor is not None else int(getattr(wp, "prefetch_factor", 1))
         with suppress(Exception):
             pf = max(1, int(pf))
         self._prefetch_factor = pf
         self.prefetch_factor = self._prefetch_factor
-        self.device = (
-            device if isinstance(device, torch.device) else torch.device(device)
-        )
+
+        self.device = device if isinstance(device, torch.device) else torch.device(device)
         self.non_blocking = bool(non_blocking)
-        pin = (
-            bool(pin_memory)
-            if pin_memory is not None
-            else (getattr(self.device, "type", "cpu") in {"cuda", "xpu"})
-        )
+
+        pin = bool(pin_memory) if pin_memory is not None else (getattr(self.device, "type", "cpu") in {"cuda", "xpu"})
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
+
         self.max_concurrency = max(1, int(self.io_workers))
         try:
             from ..backend.system import get_tlb
+
             get_tlb(io_workers=self.io_workers)
         except Exception:
             pass
@@ -1087,18 +1088,18 @@ class Connector:
 
         if ParallelMapper is None:
             raise RuntimeError("torchdata.nodes.ParallelMapper is required")
+
         node: BaseNode = source
         mapper = self.map_fn
+
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             if _Batcher is None or _Unbatcher is None:
                 raise RuntimeError("torchdata.nodes Batcher/Unbatcher are required for prebatch>1")
+
             B = max(1, int(self.prebatch))
             node = _Batcher(node, batch_size=B, drop_last=False)
 
-            def iterate(ranges: Sequence[Any]) -> Sequence[Any]:
-                return mapper(ranges)
-
-            pm_map_fn = wrap_with_tlb(iterate)
+            pm_map_fn = wrap_with_tlb(_MapBatch(mapper))
         else:
             pm_map_fn = wrap_with_tlb(mapper)
 
@@ -1110,9 +1111,28 @@ class Connector:
             method="thread",
             max_concurrent=int(self.max_concurrency),
         )
+
         if (self.prebatch or 0) and int(self.prebatch) > 1:
             node = _Unbatcher(node)
+
         return node
+
+
+def _normalize_device_spec(device: torch.device | str | Sequence[torch.device | str]) -> torch.device | list[torch.device]:
+    if isinstance(device, torch.device):
+        return device
+    if isinstance(device, str):
+        return torch.device(device)
+    if isinstance(device, Sequence) and not isinstance(device, (str, bytes, bytearray)):
+        devs: list[torch.device] = []
+        for d in device:
+            devs.append(d if isinstance(d, torch.device) else torch.device(str(d)))
+        return devs if devs else torch.device("cpu")
+    return torch.device(device)  # type: ignore[arg-type]
+
+
+def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.device:
+    return device_spec[0] if isinstance(device_spec, list) and device_spec else device_spec
 
 
 class Loader:
@@ -1120,54 +1140,92 @@ class Loader:
     def compose(
         source: "BaseNode",
         *args: Any,
-        device: torch.device,
+        device: torch.device | str | Sequence[torch.device | str],
         prefetch_factor: int = 2,
         non_blocking: bool = True,
         length: Optional[int] = None,
         pin_memory: Optional[bool] = None,
         **kwargs: Any,
     ) -> "Loader":
+        if not _TORCHDATA_AVAILABLE or _Loader is None:
+            raise RuntimeError("torchdata is required to compose a Loader (torchdata.nodes.Loader).")
+        if not isinstance(source, BaseNode):
+            raise TypeError("Loader.compose expects a torchdata.nodes.BaseNode source.")
 
-        dev = device if isinstance(device, torch.device) else torch.device(device)
-        node = source
-        pf = max(1, int(prefetch_factor))
-        node = _Prefetcher(node, prefetch_factor=pf)
-        do_pin = bool(pin_memory) if pin_memory is not None else (getattr(dev, 'type', 'cpu') in {'cuda','xpu','mps'})
-        if do_pin:
-            node = PinMemory(node, pin_memory_device=dev.type)
         return Loader(
-            dev,
-            node=node,
-            prefetch_factor=pf,
+            device=device,
+            node=source,
+            prefetch_factor=int(prefetch_factor),
             non_blocking=bool(non_blocking),
             length=length,
+            pin_memory=pin_memory,
         )
 
     def __init__(
         self,
-        device: torch.device,
+        device: torch.device | str | Sequence[torch.device | str],
         *args: Any,
         node: BaseNode | None = None,
         dataset: BaseNode | None = None,
         prefetch_factor: int = 2,
         non_blocking: bool = True,
         length: Optional[int] = None,
+        pin_memory: Optional[bool] = None,
         **kwargs: Any,
     ) -> None:
+        if not _TORCHDATA_AVAILABLE or _Loader is None:
+            raise RuntimeError("torchdata is required to construct Loader (torchdata.nodes.Loader).")
+
         node_obj = node or dataset
         if not isinstance(node_obj, BaseNode):
             raise TypeError("Loader supports only torchdata.nodes.BaseNode instances.")
-        self._device = (
-            device if isinstance(device, torch.device) else torch.device(device)
-        )
-        self._prefetch_factor = max(1, int(prefetch_factor))
+
+        self._device = _normalize_device_spec(device)
         self._non_blocking = bool(non_blocking)
         self._length = int(length) if length is not None else None
-        self._thread2dev: Dict[int, torch.device] = {}
+
+        # Interpret prefetch_factor as a bounded device-transfer prefetch depth (compat-friendly).
+        depth = max(1, int(prefetch_factor))
+        with suppress(Exception):
+            depth_env = int(env_first_int(("STNET_PREFETCH_DEPTH",), default=0) or 0)
+            if depth_env > 0:
+                depth = int(depth_env)
+        self._prefetch_depth = max(1, min(32, int(depth)))
+
+        # Pin host only where it meaningfully helps async H2D.
+        prim = _primary_device(self._device)
+        dev_t = getattr(prim, "type", "cpu")
+        default_pin = dev_t in {"cuda", "xpu"}
+        self._pin_host = bool(pin_memory) if pin_memory is not None else bool(default_pin)
+
+        # Memory guards: defaults are conservative.
+        if dev_t == "cuda" and self._non_blocking:
+            gpu_guard_mb = 2048
+        elif dev_t in {"xpu"} and self._non_blocking:
+            gpu_guard_mb = 512
+        else:
+            gpu_guard_mb = 0
+        host_guard_mb = 1024 if self._non_blocking else 0
+
+        with suppress(Exception):
+            gpu_guard_mb = int(env_first_int(("STNET_GPU_GUARD_MB",), default=gpu_guard_mb) or gpu_guard_mb)
+        with suppress(Exception):
+            host_guard_mb = int(env_first_int(("STNET_HOST_GUARD_MB",), default=host_guard_mb) or host_guard_mb)
+
+        self._gpu_guard_bytes = int(max(0, gpu_guard_mb) * (1 << 20))
+        self._host_guard_bytes = int(max(0, host_guard_mb) * (1 << 20))
+
+        # Base iterable: torchdata Loader wrapper.
         self._node = node_obj
-        self._threads_hint = (
-            self._infer_mapper_threads(node_obj) if node_obj is not None else 1
-        )
+        self._base_iterable = node_obj if isinstance(node_obj, _Loader) else _Loader(node_obj)
+
+        # Multi-device mapping (thread-local)
+        self._thread2dev: Dict[int, torch.device] = {}
+
+        # Best-effort thread hint for sharding heuristics.
+        self._threads_hint = self._infer_mapper_threads(node_obj) if node_obj is not None else 1
+
+        # Sharding hints (used by upstream graphs occasionally)
         self._num_shards = 1
         self._shard_id = 0
         try:
@@ -1180,41 +1238,32 @@ class Loader:
             self._shard_id = max(0, min(self._num_shards - 1, int(dev_idx * thr)))
         except Exception:
             pass
-        base = node_obj if isinstance(node_obj, _Loader) else _Loader(node_obj)
-        dev_t = getattr(self._device, "type", "cpu")
-        if dev_t in {"cuda", "mps", "xpu"} and self._non_blocking:
-            try:
-                gpu_guard_default = "2048" if dev_t == "cuda" else "512"
-                gpu_guard_mb = int(gpu_guard_default)
-            except Exception:
-                gpu_guard_mb = 2048 if dev_t == "cuda" else 512
-            try:
-                host_guard_mb = 1024
-            except Exception:
-                host_guard_mb = 1024
-            self._iterable = Prefetcher(
-                base,
-                device=self._device,
-                depth=4,
-                non_blocking=True,
-                memory_backpressure=True,
-                gpu_guard_bytes=gpu_guard_mb * (1 << 20),
-                host_guard_bytes=host_guard_mb * (1 << 20),
-            )
-        else:
-            self._iterable = base
 
     def __iter__(self) -> Iterator[Any]:
-        return iter(self._iterable)
+        dev = self._device_for_current_thread()
+        dev_t = getattr(dev, "type", "cpu")
+        use_accel = dev_t in {"cuda", "xpu", "mps"}
+        use_prefetch = bool(use_accel and self._non_blocking)
+
+        iterable: Any = self._base_iterable
+        if use_prefetch:
+            iterable = Prefetcher(
+                iterable,
+                device=dev,
+                depth=int(self._prefetch_depth),
+                non_blocking=True,
+                memory_backpressure=True,
+                gpu_guard_bytes=int(self._gpu_guard_bytes),
+                host_guard_bytes=int(self._host_guard_bytes),
+                pin_host=bool(self._pin_host and dev_t in {"cuda", "xpu"}),
+            )
+        return iter(iterable)
 
     def __len__(self) -> int:
         if self._length is not None:
             return int(self._length)
-        iterable = getattr(self, "_iterable", None)
-        if iterable is None:
-            return 1
         try:
-            return int(len(iterable))
+            return int(len(self._base_iterable))
         except Exception:
             return 1
 
@@ -1233,10 +1282,8 @@ class Loader:
         if node is None:
             return 1
         if hasattr(node, "num_workers"):
-            try:
+            with suppress(Exception):
                 return int(getattr(node, "num_workers"))
-            except Exception:
-                pass
         for key in ("child", "source", "node", "_node"):
             sub = getattr(node, key, None)
             if sub is not None:
@@ -1250,37 +1297,17 @@ class Loader:
             if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
                 return int(torch.cuda.current_device())
             xpu = getattr(torch, "xpu", None)
-            if (
-                xpu is not None
-                and callable(getattr(xpu, "is_available", None))
-                and xpu.is_available()
-            ):
-                return int(xpu.current_device())
+            if xpu is not None:
+                fn = getattr(xpu, "is_available", None)
+                if callable(fn) and fn():
+                    return int(xpu.current_device())
         except Exception:
             pass
         return 0
 
 
 class BufferedLoader(Buffer):
-    """A small in-memory backpressure wrapper for any iterable/loader.
-
-    Why this exists:
-      - Many loader graphs already prefetch internally (workers/prefetch_factor/etc).
-      - This wrapper provides an explicit, *small* inflight cap so upstream cannot
-        outrun the consumer and blow up host RAM.
-
-    Behavior:
-      - Iterating this object starts a daemon producer thread that pulls from the
-        source iterable and enqueues items.
-      - The consumer yields items by dequeuing.
-      - When the queue reaches max_batches, producer blocks (backpressure).
-      - Exceptions in producer are forwarded to the consumer.
-
-    Notes:
-      - This is an *iterable* (not a single iterator). Each __iter__ call returns
-        a fresh session object (with its own queue + producer thread), so you can
-        iterate multiple times (epochs) like a regular DataLoader.
-    """
+    """Small in-memory backpressure wrapper for any iterable/loader (session-based)."""
 
     def __init__(
         self,
@@ -1297,6 +1324,11 @@ class BufferedLoader(Buffer):
         self._daemon = bool(daemon)
         self._session = bool(_session)
 
+        self._join_timeout_s = 0.5
+        with suppress(Exception):
+            jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
+            self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
+
     def __len__(self) -> int:
         try:
             return int(len(self._src))  # type: ignore[arg-type]
@@ -1304,7 +1336,6 @@ class BufferedLoader(Buffer):
             return 1
 
     def __iter__(self) -> Iterator[Any]:
-        # Return a fresh session per epoch/iteration.
         if not bool(self._session):
             return iter(
                 BufferedLoader(
@@ -1331,7 +1362,6 @@ class BufferedLoader(Buffer):
                     if not self.put(item):
                         break
             except BaseException as exc:
-                # Forward producer exceptions to the consumer.
                 with suppress(Exception):
                     self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
             finally:
@@ -1350,23 +1380,23 @@ class BufferedLoader(Buffer):
                 try:
                     item = self.get(timeout=None)
                 except queue.Empty:
-                    # stop signaled and buffer drained
                     break
 
                 if item is sentinel:
                     break
 
                 if isinstance(item, ProducerError):
-                    raise RuntimeError(
-                        f"BufferedLoader producer crashed: {item.exc}\n{item.tb}"
-                    ) from item.exc
+                    raise RuntimeError(f"BufferedLoader producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 yield item
         finally:
-            # Best-effort early-stop: ask producer to stop and close upstream if possible.
             self.stop()
             best_effort_close(src_iter)
+            with suppress(Exception):
+                if t.is_alive():
+                    t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
             best_effort_close(t)
+
 
 class Prefetcher(Buffer):
     def __init__(
@@ -1385,21 +1415,30 @@ class Prefetcher(Buffer):
     ) -> None:
         super().__init__(max_batches=depth)
         self._src = iterable
-        self._device = (
-            torch.device(device) if not isinstance(device, torch.device) else device
-        )
+        self._device = torch.device(device) if not isinstance(device, torch.device) else device
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
+
         self._backpressure = bool(memory_backpressure) if memory_backpressure is not None else bool(oom_safe)
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
-        use_accel = (
-            isinstance(self._device, torch.device)
-            and self._device.type in ("cuda", "xpu", "mps")
-        )
+
+        use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu", "mps")
         self._pin = bool(kwargs.get("pin_host", use_accel))
-        self._gpu_stream = None
+
+        self._gpu_stream: Optional[torch.cuda.Stream] = None
+        self._gpu_event_pool: Optional[queue.SimpleQueue] = None
+
         self._session = bool(_session)
+
+        # Guard-check caching (avoid per-batch driver / syscalls).
+        ttl_ms = int(env_first_int(("STNET_PREFETCH_GUARD_TTL_MS",), default=10) or 10)
+        self._guard_ttl_s = max(0.0, float(ttl_ms) / 1000.0)
+
+        self._join_timeout_s = 0.5
+        with suppress(Exception):
+            jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
+            self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
     def _spawn_session(self) -> "Prefetcher":
         return Prefetcher(
@@ -1417,12 +1456,11 @@ class Prefetcher(Buffer):
     def _to_device(self, x: Any, device: torch.device) -> Any:
         if torch.is_tensor(x):
             return x.to(device, non_blocking=self._non_blocking)
-        elif isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple)):
             return type(x)(self._to_device(t, device) for t in x)
-        elif isinstance(x, dict):
+        if isinstance(x, dict):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                # Keep lightweight metadata on host.
                 if k == "row_ids":
                     out[k] = v
                 else:
@@ -1435,12 +1473,11 @@ class Prefetcher(Buffer):
             return x
         if torch.is_tensor(x) and x.device.type == "cpu":
             return x.pin_memory()
-        elif isinstance(x, (list, tuple)):
+        if isinstance(x, (list, tuple)):
             return type(x)(self._pin_memory(t) for t in x)
-        elif isinstance(x, dict):
+        if isinstance(x, dict):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                # row_ids are small metadata; do NOT pin to avoid unnecessary pinned allocations.
                 if k == "row_ids":
                     out[k] = v
                 else:
@@ -1459,14 +1496,27 @@ class Prefetcher(Buffer):
         gpu_guard_bytes: int,
         host_guard_bytes: int,
     ) -> None:
-        """Producer thread body for Prefetcher.
-
-        Kept as a method (instead of a nested closure) to make profiling,
-        testing, and exception-handling behavior easier to reason about.
-        """
-
         import time
         import traceback
+
+        last_check_t = 0.0
+        last_guards_ok = True
+        ttl_s = float(getattr(self, "_guard_ttl_s", 0.0) or 0.0)
+
+        def guards_ok(force: bool = False) -> bool:
+            nonlocal last_check_t, last_guards_ok
+            if not self._backpressure:
+                return True
+            if (not force) and ttl_s > 0.0:
+                now = time.monotonic()
+                if (now - last_check_t) < ttl_s:
+                    return bool(last_guards_ok)
+
+            last_check_t = time.monotonic()
+            host_ok = _host_guard_ok(host_guard_bytes)
+            gpu_ok = _gpu_guard_ok(use_cuda_stream, device, gpu_guard_bytes)
+            last_guards_ok = bool(host_ok and gpu_ok)
+            return bool(last_guards_ok)
 
         try:
             if use_cuda_stream and isinstance(device, torch.device):
@@ -1481,23 +1531,38 @@ class Prefetcher(Buffer):
                 if self._pin:
                     batch = self._pin_memory(batch)
 
-                tries = 0
                 if self._backpressure:
-                    while (not self.is_stopped()) and (
-                        (not _host_guard_ok(host_guard_bytes))
-                        or (not _gpu_guard_ok(use_cuda_stream, device, gpu_guard_bytes))
-                    ):
+                    tries = 0
+                    ok = guards_ok(force=True)
+                    while (not self.is_stopped()) and (not ok):
                         time.sleep(0.001 if tries < 1000 else 0.005)
                         tries += 1
+                        ok = guards_ok(force=False)
 
                 if use_device:
                     if use_cuda_stream and self._gpu_stream is not None:
-                        with torch.cuda.stream(self._gpu_stream):
-                            batch_dev = self._to_device(batch, device)
-                        ev = torch.cuda.Event()
-                        ev.record(self._gpu_stream)
-                        if not self.put((batch_dev, ev)):
-                            break
+                        ev = None
+                        pool = self._gpu_event_pool
+                        if pool is not None:
+                            with suppress(Exception):
+                                ev = pool.get()
+
+                        try:
+                            with torch.cuda.stream(self._gpu_stream):
+                                batch_dev = self._to_device(batch, device)
+                                if ev is not None:
+                                    ev.record(self._gpu_stream)
+
+                            if not self.put((batch_dev, ev)):
+                                if ev is not None and pool is not None:
+                                    with suppress(Exception):
+                                        pool.put(ev)
+                                break
+                        except Exception:
+                            if ev is not None and pool is not None:
+                                with suppress(Exception):
+                                    pool.put(ev)
+                            raise
                     else:
                         batch_dev = self._to_device(batch, device)
                         if not self.put((batch_dev, None)):
@@ -1514,39 +1579,31 @@ class Prefetcher(Buffer):
                 self.put(sentinel)
 
     def __iter__(self) -> Iterator[Any]:
-        import time
-
         # Return a fresh session per iteration to avoid reusing threads/queues.
         if not bool(self._session):
             return iter(self._spawn_session())
 
-        from torch.utils.data import get_worker_info
-
-        info = get_worker_info()
         device = getattr(self, "_device", torch.device("cpu"))
-        use_device = (device.type in {"cuda", "mps", "xpu"})
-        use_cuda_stream = (
-            device.type == "cuda"
-            and hasattr(torch, "cuda")
-            and torch.cuda.is_available()
-        )
+        use_device = device.type in {"cuda", "mps", "xpu"}
+        use_cuda_stream = device.type == "cuda" and hasattr(torch, "cuda") and torch.cuda.is_available()
+
         iterable = getattr(self, "_iterable", self._src)
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
         host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
 
-        # Inside a DataLoader worker process: keep it simple (no nested threads).
-        if info is not None:
-            for batch in iterable:
-                if self._pin:
-                    batch = self._pin_memory(batch)
-                yield batch
-                if self._backpressure:
-                    time.sleep(0)
-            return
-
         # Main process: producer thread + bounded buffer.
         if use_cuda_stream and self._gpu_stream is None:
             self._gpu_stream = torch.cuda.Stream(device=device)
+
+        # Event pool (no per-batch allocation; safe reuse via producer/consumer handshake).
+        if use_cuda_stream:
+            pool: queue.SimpleQueue = queue.SimpleQueue()
+            for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
+                with suppress(Exception):
+                    pool.put(torch.cuda.Event(enable_timing=False))
+            self._gpu_event_pool = pool
+        else:
+            self._gpu_event_pool = None
 
         sentinel = object()
         it = iter(iterable)
@@ -1571,27 +1628,29 @@ class Prefetcher(Buffer):
                 try:
                     item = self.get(timeout=None)
                 except queue.Empty:
-                    # stop signaled and buffer drained
                     break
 
                 if item is sentinel:
                     break
 
                 if isinstance(item, ProducerError):
-                    raise RuntimeError(
-                        f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
-                    ) from item.exc
+                    raise RuntimeError(f"Prefetcher producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 batch, ev = item
                 if use_cuda_stream and ev is not None:
-                    cs = torch.cuda.current_stream(
-                        device=device if isinstance(device, torch.device) else None
-                    )
+                    cs = torch.cuda.current_stream(device=device if isinstance(device, torch.device) else None)
                     with suppress(Exception):
                         cs.wait_event(ev)
+                    pool = self._gpu_event_pool
+                    if pool is not None:
+                        with suppress(Exception):
+                            pool.put(ev)
 
                 yield batch
         finally:
             self.stop()
             best_effort_close(it)
+            with suppress(Exception):
+                if t.is_alive():
+                    t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
             best_effort_close(t)
