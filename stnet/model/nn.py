@@ -35,7 +35,12 @@ except ImportError:
 _LOGGER = logging.getLogger(__name__)
 
 from ..api.config import ModelConfig
-from ..backend.compat import graph_break, is_meta_or_fake_tensor, torch_no_compile
+from ..backend.compat import (
+    StochasticDepth,
+    graph_break,
+    is_meta_or_fake_tensor,
+    torch_no_compile,
+)
 from ..backend.system import empty_device_cache
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
@@ -44,7 +49,6 @@ from .layers import (
     DilatedAttention,
     PatchAttention,
     Retention,
-    StochasticDepth,
     norm_layer,
 )
 

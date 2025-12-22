@@ -13,33 +13,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
+from ..backend.compat import StochasticDepth
 from ..data.datatype import env_str
-
-try:
-    from torch.nn import StochasticDepth as _TorchStochasticDepth
-except Exception:
-
-    class StochasticDepth(nn.Module):
-        def __init__(self, p: float = 0.0, mode: str = "row") -> None:
-            super().__init__()
-            self.p = float(p)
-            self.mode = str(mode)
-
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            if (not self.training) or self.p <= 0.0:
-                return x
-            keep = 1.0 - self.p
-            if keep <= 0.0:
-                return torch.zeros_like(x)
-            if self.mode == "row" and x.dim() >= 2:
-                noise_shape = (x.shape[0], *([1] * (x.dim() - 1)))
-                noise = x.new_empty(noise_shape).bernoulli_(keep).div_(keep)
-            else:
-                noise = x.new_empty(x.shape).bernoulli_(keep).div_(keep)
-            return x * noise
-
-else:
-    StochasticDepth = _TorchStochasticDepth
 
 _Norm = nn.LayerNorm
 
