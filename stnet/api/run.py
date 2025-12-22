@@ -281,6 +281,89 @@ def _mmt_meta_path(mmt_path: str) -> str:
     return str(mmt_path) + ".meta.json"
 
 
+def _mmt_lock_path(mmt_path: str) -> str:
+    return str(mmt_path) + ".lock"
+
+
+@contextlib.contextmanager
+def _process_file_lock(lock_path: str) -> Any:
+    """Best-effort cross-process exclusive lock.
+
+    Uses:
+    - POSIX: fcntl.flock
+    - Windows: msvcrt.locking
+    - Fallback: atomic mkdir spin-lock (only if neither file-lock API is available)
+    """
+    path = str(lock_path)
+    parent = os.path.dirname(path) or "."
+    with contextlib.suppress(Exception):
+        os.makedirs(parent, exist_ok=True)
+
+    # 1) POSIX: fcntl.flock
+    try:
+        import fcntl  # type: ignore
+
+        f = open(path, "a+b")
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                f.close()
+        return
+    except Exception:
+        pass
+
+    # 2) Windows: msvcrt.locking
+    try:
+        import msvcrt  # type: ignore
+
+        f = open(path, "a+b")
+        try:
+            # Ensure file has at least 1 byte; msvcrt.locking requires a positive length.
+            with contextlib.suppress(Exception):
+                f.seek(0, os.SEEK_END)
+                if f.tell() < 1:
+                    f.write(b"0")
+                    f.flush()
+            with contextlib.suppress(Exception):
+                f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+            yield
+        finally:
+            with contextlib.suppress(Exception):
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            with contextlib.suppress(Exception):
+                f.close()
+        return
+    except Exception:
+        pass
+
+    # 3) Fallback: mkdir spin lock (best-effort).
+    import time
+
+    lock_dir = path + ".d"
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+        except Exception:
+            # If we cannot lock, proceed unlocked rather than hanging forever.
+            yield
+            return
+
+    try:
+        yield
+    finally:
+        with contextlib.suppress(Exception):
+            os.rmdir(lock_dir)
+
+
 def _atomic_write_json(path: str, payload: Any) -> None:
     """Atomically write JSON to `path` (best-effort).
 
@@ -319,33 +402,56 @@ def _parse_dtype(dtype_s: Any) -> Optional[torch.dtype]:
 
 
 def _ensure_pred_memmap_from_pt(pt_path: str, mmt_path: str) -> tuple[str, torch.dtype, Tuple[int, ...]]:
-    """Create a MemoryMappedTensor file from a .pt Tensor if needed (best-effort, thread-safe)."""
+    """Create a MemoryMappedTensor file from a .pt Tensor if needed.
+
+    - Thread-safe within a process.
+    - Cross-process safe via a best-effort file lock.
+    - Writes the sidecar meta.json atomically.
+    - Writes the .mmt via a temp file + atomic replace to avoid half-written files.
+    """
     lock = _pred_memmap_lock_for(mmt_path)
     with lock:
-        if os.path.isfile(mmt_path) and os.path.isfile(_mmt_meta_path(mmt_path)):
+        # Cross-process lock around conversion + sidecar writes.
+        with _process_file_lock(_mmt_lock_path(mmt_path)):
+            meta_path = _mmt_meta_path(mmt_path)
+
+            if os.path.isfile(mmt_path) and os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        meta = json.load(f) or {}
+                    dtype = _parse_dtype(meta.get("dtype")) or torch.float32
+                    shape = tuple(int(x) for x in (meta.get("shape") or ()))
+                    if shape:
+                        return mmt_path, dtype, shape
+                except Exception:
+                    # Fall through to re-create metadata if needed.
+                    pass
+
+            preds = _torch_load_cpu(pt_path, weights_only=True)
+            if not isinstance(preds, torch.Tensor):
+                preds = torch.as_tensor(preds)
+            preds = preds.detach().cpu().contiguous()
+
+            parent = os.path.dirname(str(mmt_path)) or "."
+            os.makedirs(parent, exist_ok=True)
+
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=os.path.basename(str(mmt_path)) + ".",
+                suffix=".tmp",
+                dir=parent,
+            )
+            os.close(fd)
             try:
-                with open(_mmt_meta_path(mmt_path), "r", encoding="utf-8") as f:
-                    meta = json.load(f) or {}
-                dtype = _parse_dtype(meta.get("dtype")) or torch.float32
-                shape = tuple(int(x) for x in (meta.get("shape") or ()))
-                if shape:
-                    return mmt_path, dtype, shape
-            except Exception:
-                # Fall through to re-create metadata if needed.
-                pass
+                MemoryMappedTensor.from_tensor(preds, filename=tmp_name, existsok=True)
+                os.replace(tmp_name, str(mmt_path))
+            finally:
+                with contextlib.suppress(Exception):
+                    os.remove(tmp_name)
 
-        preds = _torch_load_cpu(pt_path, weights_only=True)
-        if not isinstance(preds, torch.Tensor):
-            preds = torch.as_tensor(preds)
-        preds = preds.detach().cpu().contiguous()
+            meta = {"dtype": str(preds.dtype), "shape": list(preds.shape)}
+            _atomic_write_json(meta_path, meta)
 
-        # Create / overwrite memmap file.
-        MemoryMappedTensor.from_tensor(preds, filename=mmt_path, existsok=True)
-
-        meta = {"dtype": str(preds.dtype), "shape": list(preds.shape)}
-        _atomic_write_json(_mmt_meta_path(mmt_path), meta)
-
-        return mmt_path, preds.dtype, tuple(int(x) for x in preds.shape)
+            return mmt_path, preds.dtype, tuple(int(x) for x in preds.shape)
 
 
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
@@ -363,6 +469,119 @@ def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
         return MemoryMappedTensor.from_filename(filename=mmt_path, dtype=dtype, shape=torch.Size(shape))
     except Exception:
         return None
+
+
+
+
+
+def _parse_size_bytes(value: Any) -> Optional[int]:
+    """Parse a human-friendly byte size from an env var.
+
+    Accepts:
+      - plain integers (bytes)
+      - suffixes: K, M, G, T (binary multiples, 1024^n)
+        and also KB/MB/GB/TB (same)
+      - underscores are ignored (e.g., 1_073_741_824)
+
+    Returns None if the value is empty or cannot be parsed.
+    """
+    if value is None:
+        return None
+    s = str(value).strip().lower().replace("_", "")
+    if not s:
+        return None
+
+    mult = 1
+    for suf, m in (
+        ("tb", 1024**4),
+        ("t", 1024**4),
+        ("gb", 1024**3),
+        ("g", 1024**3),
+        ("mb", 1024**2),
+        ("m", 1024**2),
+        ("kb", 1024**1),
+        ("k", 1024**1),
+        ("b", 1),
+    ):
+        if s.endswith(suf):
+            mult = m
+            s = s[: -len(suf)]
+            break
+
+    try:
+        base = int(s)
+    except Exception:
+        return None
+    if base < 0:
+        return None
+    try:
+        return int(base * mult)
+    except Exception:
+        return None
+
+def _alloc_row_map_arrays(nkeys: int, *, chunk_root: str) -> tuple[np.ndarray, np.ndarray]:
+    """Allocate row->(part,offset) mapping arrays for get_prediction(lazy=True).
+
+    Default: in-RAM int32 arrays (fastest).
+
+    Optional sparse/out-of-core mode via env vars:
+      - STNET_PRED_LAZY_ROW_MAP:
+          * "sparse" | "memmap" | "disk" | "file" | "1" | "true" | ... -> force np.memmap-backed arrays on disk
+          * "dense"  | "0" | "false" | "off" -> force in-RAM arrays (may OOM)
+          * "auto" (default when unset) -> choose based on STNET_PRED_LAZY_ROW_MAP_MAX_BYTES, if provided
+
+      - STNET_PRED_LAZY_ROW_MAP_MAX_BYTES:
+          * only used when STNET_PRED_LAZY_ROW_MAP is "auto"/unset
+          * if estimated bytes for (row_to_part,row_to_off) exceed this threshold -> use memmap
+          * supports plain integers (bytes) or suffixes K/M/G/T (binary, 1024^n), e.g. "512M", "2G"
+
+    Location for memmap row maps:
+      - STNET_PRED_LAZY_ROW_MAP_DIR (directory). Defaults to chunk_root; falls back to system temp.
+    """
+    mode = str(os.environ.get("STNET_PRED_LAZY_ROW_MAP", "")).strip().lower()
+    if not mode:
+        mode = "auto"
+
+    force_dense = mode in {"dense", "0", "false", "no", "n", "off"}
+    want_sparse = (not force_dense) and mode in {"sparse", "memmap", "disk", "file", "1", "true", "yes", "y", "on"}
+
+    if (not force_dense) and (not want_sparse) and mode in {"auto"}:
+        max_bytes = _parse_size_bytes(os.environ.get("STNET_PRED_LAZY_ROW_MAP_MAX_BYTES", ""))
+        if max_bytes is not None:
+            need_bytes = int(2) * int(nkeys) * int(np.dtype(np.int32).itemsize)
+            if need_bytes > int(max_bytes):
+                want_sparse = True
+
+    if not want_sparse:
+        try:
+            return (
+                np.full((nkeys,), -1, dtype=np.int32),
+                np.full((nkeys,), -1, dtype=np.int32),
+            )
+        except MemoryError:
+            if force_dense:
+                raise
+            want_sparse = True
+
+    # Disk-backed (np.memmap): avoids large contiguous heap allocations.
+    dir_env = str(os.environ.get("STNET_PRED_LAZY_ROW_MAP_DIR", "")).strip()
+    base_dir = dir_env if dir_env else str(chunk_root)
+    try:
+        os.makedirs(base_dir, exist_ok=True)
+    except Exception:
+        base_dir = tempfile.gettempdir()
+
+    prefix = f"stnet_rowmap_{os.getpid()}_{threading.get_ident()}_"
+    fd1, part_path = tempfile.mkstemp(prefix=prefix + "part_", suffix=".i32", dir=base_dir)
+    os.close(fd1)
+    fd2, off_path = tempfile.mkstemp(prefix=prefix + "off_", suffix=".i32", dir=base_dir)
+    os.close(fd2)
+
+    row_to_part = np.memmap(part_path, dtype=np.int32, mode="w+", shape=(nkeys,))
+    row_to_off = np.memmap(off_path, dtype=np.int32, mode="w+", shape=(nkeys,))
+    row_to_part.fill(-1)
+    row_to_off.fill(-1)
+    return row_to_part, row_to_off
 
 
 # -----------------------------
@@ -1295,8 +1514,7 @@ def get_prediction(
         if lazy:
             from ..data.collections import LazyDict
 
-            row_to_part = np.full((nkeys,), -1, dtype=np.int32)
-            row_to_off = np.full((nkeys,), -1, dtype=np.int32)
+            row_to_part, row_to_off = _alloc_row_map_arrays(nkeys, chunk_root=chunk_root)
 
             # Store per-part pred file paths.
             pred_pt_paths: list[Optional[str]] = [None] * len(parts_list)
@@ -1396,6 +1614,10 @@ def get_prediction(
 
         # Non-lazy path: materialize into a dict (can be large).
         out: Dict[Tuple[Any, ...], torch.Tensor] = {}
+        out_set = out.__setitem__
+        keys_is_range = isinstance(keys, range)
+        fk = fixed_keys
+        int_ = int
         for part in parts_list:
             rows_name = (part or {}).get("rows")
             pred_name = (part or {}).get("pred")
@@ -1428,10 +1650,19 @@ def get_prediction(
                 )
 
             rows_np = rows.numpy()
-            for j, rid in enumerate(rows_np):
-                rid_i = int(rid)
-                k = (rid_i,) if isinstance(keys, range) else (fixed_keys[rid_i] if fixed_keys is not None else (rid_i,))
-                out[k] = preds[j]
+            preds_get = preds.__getitem__
+
+            if keys_is_range:
+                for j, rid in enumerate(rows_np):
+                    rid_i = int_(rid)
+                    out_set((rid_i,), preds_get(j))
+            elif fk is not None:
+                for j, rid in enumerate(rows_np):
+                    out_set(fk[int_(rid)], preds_get(j))
+            else:
+                for j, rid in enumerate(rows_np):
+                    rid_i = int_(rid)
+                    out_set((rid_i,), preds_get(j))
         return out
 
     # Legacy flat chunks path.
@@ -1440,8 +1671,10 @@ def get_prediction(
 
     pred_tensor = Root.unflatten_y(flat, out_shape)
     out_legacy: Dict[Tuple[Any, ...], torch.Tensor] = {}
+    out_set = out_legacy.__setitem__
+    n_out = int(pred_tensor.shape[0])
     for i, k in enumerate(key_seq):
-        if i >= int(pred_tensor.shape[0]):
+        if i >= n_out:
             break
-        out_legacy[k] = pred_tensor[i].detach().cpu().to(dtype=torch.float64)
+        out_set(k, pred_tensor[i].detach().cpu().to(dtype=torch.float64))
     return out_legacy
