@@ -1082,8 +1082,11 @@ class StudentsTLoss(DistributionLoss):
         except Exception:
             df_scalar = None
 
+        df_requires_grad = torch.is_tensor(self.df) and self.df.requires_grad
+
         if (
             df_scalar is not None
+            and not df_requires_grad
             and self._cached_t_threshold_f64 is not None
             and self._cached_t_df == df_scalar
             and self._cached_t_q == float(q)
@@ -1108,7 +1111,7 @@ class StudentsTLoss(DistributionLoss):
             thr = 0.5 * (lo + hi)
 
         # Cache only when df is a fixed scalar.
-        if df_scalar is not None and thr.numel() == 1:
+        if df_scalar is not None and not df_requires_grad and thr.numel() == 1:
             try:
                 self._cached_t_threshold_f64 = float(thr.detach().double().cpu().item())
                 self._cached_t_df = float(df_scalar)
