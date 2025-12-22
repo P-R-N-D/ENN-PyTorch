@@ -30,6 +30,32 @@ try:
 except Exception:
     _TORCH_DYNAMO = None
 
+
+def graph_break() -> None:
+    """Break torch.compile graphs only when tracing (safe no-op otherwise)."""
+
+    try:
+        if _TORCH_DYNAMO is None or not _TORCH_DYNAMO.is_compiling():
+            return
+    except Exception:
+        return
+
+    try:
+        import torch._inductor as _inductor  # type: ignore
+
+        gb = getattr(_inductor, "graph_break", None)
+        if callable(gb):
+            gb()
+            return
+    except Exception:
+        pass
+
+    try:
+        _TORCH_DYNAMO.graph_break()
+    except Exception:
+        pass
+
+
 _TORCH_COMPILE_DISABLE = None
 if _TORCH_COMPILER is not None:
     _TORCH_COMPILE_DISABLE = getattr(_TORCH_COMPILER, "disable", None)

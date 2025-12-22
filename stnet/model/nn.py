@@ -35,7 +35,7 @@ except ImportError:
 _LOGGER = logging.getLogger(__name__)
 
 from ..api.config import ModelConfig
-from ..backend.compat import is_meta_or_fake_tensor, torch_no_compile
+from ..backend.compat import graph_break, is_meta_or_fake_tensor, torch_no_compile
 from ..backend.system import empty_device_cache
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
@@ -68,32 +68,6 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
     except Exception:
         pass
     return fallback
-
-
-def _graph_break() -> None:
-    """Break torch.compile graphs only when tracing (safe no-op otherwise)."""
-    try:
-        import torch._dynamo as _dynamo  # type: ignore
-
-        if not _dynamo.is_compiling():
-            return
-    except Exception:
-        return
-
-    try:
-        import torch._inductor as _inductor  # type: ignore
-
-        gb = getattr(_inductor, "graph_break", None)
-        if callable(gb):
-            gb()
-            return
-    except Exception:
-        pass
-
-    try:
-        _dynamo.graph_break()
-    except Exception:
-        pass
 
 
 @torch.no_grad()
@@ -2562,7 +2536,7 @@ class Root(nn.Module):
             x_raw = x_raw.to(device=device, non_blocking=True)
 
         x_scaled = self.scaler.normalize_x(x_raw)
-        _graph_break()
+        graph_break()
 
         meta = None
         try:
@@ -2747,14 +2721,14 @@ class Root(nn.Module):
                 meta=meta,
                 amp_enabled=amp_enabled,
                 auto_microbatch_fn=lambda t: self._auto_microbatch(t, device),
-                graph_break_fn=_graph_break,
+                graph_break_fn=graph_break,
             )
             refined_tokens = _sanitize(refined_tokens)
 
             ctrl_mb = max(1, min(int(b), int(self.controller.microbatch) or int(b)))
 
             # --- Decode stage ---
-            _graph_break()
+            graph_break()
             processor_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
