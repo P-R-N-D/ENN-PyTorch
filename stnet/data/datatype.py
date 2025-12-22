@@ -311,8 +311,11 @@ def _is_numpy_non_numeric(x: np.ndarray | np.generic) -> bool:
     dt = getattr(x, "dtype", None)
     if dt is None:
         return False
-    # object / string arrays shouldn't be forced into tensors here
-    return dt.kind in {"O", "U", "S"}
+    # Skip dtype kinds that are not safely convertible to tensors
+    # - object / string: "O", "U", "S"
+    # - datetime / timedelta: "M", "m"
+    # - void / structured: "V"
+    return dt.kind in {"O", "U", "S", "M", "m", "V"}
 
 
 def to_tensordict(
