@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Un
 import torch
 import torch.distributed
 import torch.nn as nn
-from tensordict import TensorDictBase
+from tensordict import MemoryMappedTensor, TensorDictBase
 from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
                                           load, save)
 from torch.distributed.checkpoint.api import CheckpointException
@@ -254,6 +254,27 @@ else:
 _LOGGER = logging.getLogger(__name__)
 
 torch_safe_distributed()
+def _torch_load_cpu(path: str, *, weights_only: Optional[bool] = None) -> Any:
+    """torch.load wrapper with CPU map + best-effort weights_only support.
+
+    - On newer PyTorch versions, weights_only=True is recommended for loading pure weights/state_dicts.
+    - On older versions, passing weights_only raises TypeError; we fall back to plain torch.load.
+    """
+    if weights_only is not None:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=bool(weights_only))
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+        except Exception:
+            if bool(weights_only):
+                # Some files are not compatible with weights_only=True (e.g., pickled Python objects).
+                try:
+                    return torch.load(path, map_location="cpu", weights_only=False)
+                except Exception:
+                    pass
+            raise
+    return torch.load(path, map_location="cpu")
+
 
 _SAMPLER_SCALE_LOG_LOCK = threading.Lock()
 _SAMPLER_SCALE_LOG_LAST_S: Dict[Tuple[int, str], float] = {}
@@ -3354,10 +3375,41 @@ def infer(
     chunk_idx = 0
     row_cursor = 0
     first_tail: Optional[Tuple[int, ...]] = None
+    pending_tail: Optional[Tuple[int, ...]] = None
     variable_shape = False
 
+    def _pred_mmt_meta_path(path: str) -> str:
+        return str(path) + ".meta.json"
+
+    def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
+        """Write preds as MemoryMappedTensor (.mmt) plus a small sidecar meta JSON.
+
+        This enables truly lazy/random access on the reader side without loading
+        the full tensor into RAM.
+        """
+        if not isinstance(preds_cpu, torch.Tensor):
+            preds_cpu = torch.as_tensor(preds_cpu)
+        if preds_cpu.device.type != "cpu":
+            preds_cpu = preds_cpu.to(device="cpu")
+        preds_cpu = preds_cpu.contiguous()
+
+        # Overwrite ok: chunk dirs are per-run.
+        MemoryMappedTensor.from_tensor(preds_cpu, filename=path, existsok=True)
+
+        meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
+        meta_path = _pred_mmt_meta_path(path)
+        tmp = meta_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            os.replace(tmp, meta_path)
+        finally:
+            with contextlib.suppress(Exception):
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
     def _flush() -> None:
-        nonlocal chunk_idx, pending_count, buf_fill
+        nonlocal chunk_idx, pending_count, buf_fill, pending_tail
         if use_buffer:
             if buf_fill <= 0:
                 return
@@ -3374,21 +3426,34 @@ def infer(
                 .contiguous()
             )
             preds = torch.cat(pending_preds, dim=0).contiguous()
+
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
-        pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
+
+        # B approach:
+        # - Fixed-shape path (use_buffer=True): write preds as .mmt
+        # - Variable-shape path (use_buffer=False): keep .pt for safety/compat
+        if use_buffer:
+            pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.mmt")
+        else:
+            pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
+
         cache.submit(rows, path=rows_path)
-        cache.submit(preds, path=pred_path)
+        if use_buffer:
+            _write_pred_memmap(preds, pred_path)
+        else:
+            cache.submit(preds, path=pred_path)
+
         chunk_idx += 1
         if not use_buffer:
             pending_rows.clear()
             pending_preds.clear()
             pending_count = 0
-
+            pending_tail = None
 
         del rows, preds
 
     def _append(rows_cpu: torch.Tensor, preds_cpu: torch.Tensor) -> None:
-        nonlocal use_buffer, rows_buf, pred_buf, buf_fill, pending_count, first_tail, variable_shape
+        nonlocal use_buffer, rows_buf, pred_buf, buf_fill, pending_count, first_tail, variable_shape, pending_tail
 
         if preds_cpu.ndim < 1:
             return
@@ -3397,6 +3462,8 @@ def infer(
             return
 
         rows_cpu = rows_cpu.reshape(-1).to(dtype=torch.int64, copy=False)
+        if rows_cpu.numel() != b:
+            raise RuntimeError(f"infer: rows/preds batch mismatch rows={rows_cpu.numel()} preds={b}")
 
         tail = tuple(int(x) for x in preds_cpu.shape[1:])
         if first_tail is None:
@@ -3404,10 +3471,19 @@ def infer(
         elif tail != first_tail:
             variable_shape = True
             if use_buffer:
+                # Flush current fixed-shape buffer as .mmt, then switch to variable-shape path.
                 _flush()
                 use_buffer = False
+                pending_tail = None
 
         if not use_buffer:
+            # Ensure pending chunks are homogeneous in tail shape; otherwise, flush.
+            if pending_tail is None:
+                pending_tail = tail
+            elif tail != pending_tail:
+                _flush()
+                pending_tail = tail
+
             pending_rows.append(rows_cpu)
             pending_preds.append(preds_cpu)
             pending_count += b
@@ -3415,10 +3491,17 @@ def infer(
                 _flush()
             return
 
+        # Fixed-shape buffer path.
         if rows_buf is None:
             rows_buf = torch.empty((target_rows,), dtype=torch.int64)
+
         if pred_buf is None:
             pred_buf = torch.empty((target_rows, *tail), dtype=preds_cpu.dtype)
+        else:
+            if pred_buf.dtype != preds_cpu.dtype or tuple(int(x) for x in pred_buf.shape[1:]) != tail:
+                if buf_fill > 0:
+                    _flush()
+                pred_buf = torch.empty((target_rows, *tail), dtype=preds_cpu.dtype)
 
         start = 0
         while start < b:
@@ -3433,6 +3516,7 @@ def infer(
             start += n
             if buf_fill >= target_rows:
                 _flush()
+
 
     try:
         with Gradient.inference(run_model), Autocast.float(device):
@@ -3542,10 +3626,21 @@ def infer(
             parts: list[dict[str, str]] = []
             for rows_path in sorted(glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))):
                 base = rows_path[: -len("-rows.pt")]
-                pred_path = base + "-pred.pt"
-                if not os.path.exists(pred_path):
-                    # Fail fast: missing paired pred means incomplete output.
-                    raise RuntimeError(f"infer: missing pred file for rows part: {rows_path} -> {pred_path}")
+                pred_mmt = base + "-pred.mmt"
+                pred_pt = base + "-pred.pt"
+
+                if os.path.exists(pred_mmt):
+                    pred_path = pred_mmt
+                    meta_path = pred_mmt + ".meta.json"
+                    if not os.path.exists(meta_path):
+                        raise RuntimeError(f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}")
+                elif os.path.exists(pred_pt):
+                    pred_path = pred_pt
+                else:
+                    raise RuntimeError(
+                        f"infer: missing pred file for rows part: {rows_path} -> ({pred_mmt} or {pred_pt})"
+                    )
+
                 parts.append({"rows": os.path.basename(rows_path), "pred": os.path.basename(pred_path)})
 
             if not parts:
@@ -3632,7 +3727,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
-                cpu_state = torch.load(fallback_init, map_location="cpu")
+                cpu_state = _torch_load_cpu(fallback_init, weights_only=True)
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
@@ -4162,7 +4257,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
-                cpu_state = torch.load(fallback_model, map_location="cpu")
+                cpu_state = _torch_load_cpu(fallback_model, weights_only=True)
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
