@@ -240,6 +240,14 @@ def _to_nvidia_mask(
     **kwargs: Any,
 ) -> Optional[torch.Tensor]:
 
+    # NOTE (mask semantics):
+    # - This project uses "mask-out" boolean masks at module boundaries:
+    #     True  => masked / disallowed
+    #     False => allowed
+    # - NVIDIA TE also uses mask-out masks.
+    # - PyTorch SDPA (scaled_dot_product_attention) uses a keep-mask for boolean masks
+    #   (True = allowed), so our DotProductAttention wrapper will invert bool masks for SDPA.
+
     if attn_mask is None and key_padding_mask is None:
         return None
 
@@ -516,6 +524,10 @@ class DotProductAttention(nn.Module):
         B, H, L, D = q_bshd.shape
         S = k_bshd.shape[2]
 
+        # NOTE: Boundary semantics for this project:
+        #   bool attn_mask: True = masked-out (disallowed), False = allowed
+        #   float attn_mask: additive bias
+
         mask_bool: torch.Tensor | None = None
         bias_float: torch.Tensor | None = None
         if attn_mask is not None:
@@ -537,86 +549,127 @@ class DotProductAttention(nn.Module):
                 except Exception:
                     uniq = torch.tensor([], device=m.device, dtype=m.dtype)
                 if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
-                    mask_bool = m != 0
+                    # Treat 0/1 integer masks as boolean *mask-out* masks:
+                    #   1 => masked, 0 => allowed
+                    mask_bool = (m != 0)
                 else:
                     bias_float = m.to(dtype=q_bshd.dtype)
             else:
                 mask_bool = m.to(torch.bool)
 
-            def _flatten_mask(
-                mask: torch.Tensor,
-            ) -> tuple[torch.Tensor, int, int]:
-                if mask.dim() == 0:
-                    shaped = mask.to(device=q_bshd.device).view(1, 1, 1, 1)
-                    shaped = shaped.expand(1, 1, L, S)
-                    return shaped.contiguous(), 1, 1
-                if mask.dim() < 2:
-                    raise RuntimeError(
-                        f"attn_mask rank {mask.dim()} not supported; expected at least 2 dimensions"
-                    )
-                if mask.shape[-2:] != (L, S):
-                    raise RuntimeError(
-                        "attn_mask trailing dims {} do not match expected (L={}, S={})".format(
-                            tuple(mask.shape[-2:]), L, S
-                        )
-                    )
-                mask = mask.to(device=q_bshd.device).contiguous()
-                while True:
-                    leading = mask.shape[:-2]
-                    if not leading:
-                        return mask.view(1, 1, L, S).contiguous(), 1, 1
-                    batch_dim = leading[0]
-                    if batch_dim in (B, 1):
-                        head_dims = leading[1:]
-                        break
-                    if batch_dim == H:
-                        mask = mask.unsqueeze(0)
-                        continue
-                    raise RuntimeError(
-                        f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
-                    )
-                head_dims = tuple(head_dims)
-                head_count = 1 if not head_dims else math.prod(head_dims)
-                mask = mask.view(batch_dim, head_count, L, S)
-                if head_count not in (1, H):
-                    raise RuntimeError(
-                        "attn_mask head dims {} collapse to {} which is not compatible with num_heads {}".format(
-                            head_dims, head_count, H
-                        )
-                    )
-                return mask.contiguous(), int(batch_dim), int(head_count)
+        def _flatten_mask(mask: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
+            """
+            Normalize a mask/bias into a compact 4D (B?, H?, L?, S) tensor.
 
-            # Keep masks in compact (batch_dim, head_count, L, S) form.
-            # This avoids materializing full (B, H, L, S) masks (memory), and keeps Flash/Efficient
-            # SDPA eligible when a boolean mask is supplied.
-            if mask_bool is not None:
-                mask_bool, _, _ = _flatten_mask(mask_bool)
-            if bias_float is not None:
-                bias_float, _, _ = _flatten_mask(bias_float.to(dtype=q_bshd.dtype))
+            Supports broadcast on batch/head and *query length* (L? can be 1 or L).
+            Returns (mask4, batch_dim, head_dim, q_dim).
+            """
+            if mask.dim() == 0:
+                # Scalar mask: broadcast to all positions (rare; keep it simple).
+                m = mask.to(device=q_bshd.device).view(1, 1, 1, 1)
+                m = m.expand(1, 1, 1, S)
+                return m, 1, 1, 1
 
-            def _expand_bhls(
-                x: torch.Tensor | None, *, dtype: torch.dtype | None = None
-            ) -> torch.Tensor | None:
-                if x is None:
-                    return None
-                batch_dim, head_count, _, _ = x.shape
-                if batch_dim not in (1, B):
+            # Rank-1: key-only mask (S,)
+            if mask.dim() == 1:
+                if int(mask.shape[0]) != int(S):
                     raise RuntimeError(
-                        f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
+                        f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={S}"
                     )
-                if head_count not in (1, H):
+                m = mask.to(device=q_bshd.device).view(1, 1, 1, S)
+                return m, 1, 1, 1
+
+            if mask.dim() == 2:
+                a, b = int(mask.shape[0]), int(mask.shape[1])
+                if b != int(S):
                     raise RuntimeError(
-                        f"attn_mask head count {head_count} incompatible with num_heads {H}"
+                        f"attn_mask trailing dim {b} does not match expected S={S}"
                     )
-                out = x
-                if batch_dim != B:
-                    out = out.expand(B, head_count, L, S)
-                    batch_dim = B
-                if head_count == 1 and H != 1:
-                    out = out.expand(batch_dim, H, L, S)
-                if dtype is not None and out.dtype != dtype:
-                    out = out.to(dtype=dtype)
-                return out.contiguous()
+                if a == int(L):
+                    m = mask.to(device=q_bshd.device).view(1, 1, L, S)
+                    return m, 1, 1, int(L)
+                if a == 1:
+                    # (1,S) -> key-only
+                    m = mask.to(device=q_bshd.device).view(1, 1, 1, S)
+                    return m, 1, 1, 1
+                if a == int(B):
+                    # (B,S) -> per-batch key-only
+                    m = mask.to(device=q_bshd.device).view(B, 1, 1, S)
+                    return m, int(B), 1, 1
+                raise RuntimeError(
+                    f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={B}, L={L}, S={S})"
+                )
+
+            if mask.dim() == 3:
+                a, b, c = int(mask.shape[0]), int(mask.shape[1]), int(mask.shape[2])
+                if c != int(S):
+                    raise RuntimeError(
+                        f"attn_mask trailing dim {c} does not match expected S={S}"
+                    )
+                if (a == int(B)) and (b == int(L)):
+                    m = mask.to(device=q_bshd.device).view(B, 1, L, S)
+                    return m, int(B), 1, int(L)
+                if (a == int(B)) and (b == 1):
+                    # (B,1,S) -> per-batch key-only
+                    m = mask.to(device=q_bshd.device).view(B, 1, 1, S)
+                    return m, int(B), 1, 1
+                if (a == int(H)) and (b == int(L)):
+                    # (H,L,S) -> head-specific, broadcast batch
+                    m = mask.to(device=q_bshd.device).view(1, H, L, S)
+                    return m, 1, int(H), int(L)
+                if (a == int(B)) and (b == int(H)):
+                    # (B,H,S) -> per-(B,H) key-only
+                    m = mask.to(device=q_bshd.device).view(B, H, 1, S)
+                    return m, int(B), int(H), 1
+                raise RuntimeError(
+                    f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={B}, H={H}, L={L}, S={S})"
+                )
+
+            if mask.dim() == 4:
+                b0, h0, l0, s0 = map(int, mask.shape)
+                if s0 != int(S):
+                    raise RuntimeError(
+                        f"attn_mask trailing dim {s0} does not match expected S={S}"
+                    )
+                if b0 not in (1, int(B)):
+                    raise RuntimeError(
+                        f"attn_mask batch dim {b0} incompatible with B={B}"
+                    )
+                if h0 not in (1, int(H)):
+                    raise RuntimeError(
+                        f"attn_mask head dim {h0} incompatible with H={H}"
+                    )
+                if l0 not in (1, int(L)):
+                    raise RuntimeError(
+                        f"attn_mask query dim {l0} incompatible with L={L} (broadcast 1 or L allowed)"
+                    )
+                m = mask.to(device=q_bshd.device)
+                return m, b0, h0, l0
+
+            raise RuntimeError(f"attn_mask rank {mask.dim()} not supported")
+
+        # Normalize to compact 4D forms. Note: mask_bool remains *mask-out* here.
+        mb = mh = mL = 0
+        bb = bh = bL = 0
+        if mask_bool is not None:
+            mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
+            mask_bool, mb, mh, mL = _flatten_mask(mask_bool)
+            # If the mask is broadcast across query length via expand (stride 0 on q dim),
+            # compress to q_dim=1 to:
+            #  - keep SDPA mask small
+            #  - enable TE "padding" path where applicable
+            #
+            # This catches common patterns like mask.expand(B,1,L,S) used for key-only padding.
+            if int(mh) == 1 and int(mL) == int(L):
+                try:
+                    if int(mask_bool.stride(-2)) == 0:
+                        mask_bool = mask_bool[..., :1, :]
+                        mL = 1
+                except Exception:
+                    pass
+        if bias_float is not None:
+            bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
+            bias_float, bb, bh, bL = _flatten_mask(bias_float)
 
         try:
             is_compiling = torch._dynamo.is_compiling()
@@ -632,35 +685,48 @@ class DotProductAttention(nn.Module):
             and q_bshd.is_cuda
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
         )
+
+        # Re-tune TE boundary:
+        # - TE path only for: no_mask / causal / padding(/padding_causal) key-only masks.
+        # - Any per-(q,k) arbitrary mask or any float bias -> prefer PyTorch SDPA.
         te_mask: torch.Tensor | None = None
-        te_bias: torch.Tensor | None = None
+        te_mask_type: str | None = None
         if use_te:
-            # Transformer Engine support for masks/bias varies by version.
-            # Convert boolean masks into an additive bias only when necessary.
-            if mask_bool is not None:
-                if self._te_supports_mask:
-                    te_mask = _expand_bhls(mask_bool, dtype=torch.bool)
-                elif self._te_supports_core_bias:
-                    finfo = torch.finfo(q_bshd.dtype)
-                    zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                    neg_inf = torch.full(
-                        (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
-                    )
-                    mask_te = _expand_bhls(mask_bool, dtype=torch.bool)
-                    mask_bias = torch.where(mask_te, neg_inf, zero)
-                    if bias_float is not None:
-                        bias_te = _expand_bhls(bias_float, dtype=q_bshd.dtype)
-                        te_bias = mask_bias + bias_te
-                    else:
-                        te_bias = mask_bias
+            if bias_float is not None:
+                use_te = False
+            elif mask_bool is None:
+                te_mask_type = "causal" if bool(is_causal) else "no_mask"
+            else:
+                # "padding-like" means: key-only / no head dependence / query-broadcastable.
+                # We accept:
+                #   (1,1,1,S), (B,1,1,S), (B,1,L,S) with stride(q)=0 (already compressed above),
+                #   (B,S), (S,) etc (handled by _flatten_mask).
+                is_padding_like = (int(mh) == 1) and (int(mL) == 1)
+                if not is_padding_like:
+                    use_te = False
                 else:
+                    # TE expects mask-out bool masks; ours are already mask-out.
+                    # Ensure shape is (B,1,1,S) contiguous (small + stable).
+                    te_mask = mask_bool
+                    if int(mb) != int(B):
+                        te_mask = te_mask.expand(int(B), 1, 1, int(S))
+                    te_mask = te_mask.contiguous()
+                    te_mask_type = "padding_causal" if bool(is_causal) else "padding"
+
+            # Hard boundary: if we need padding mask, require TE to support mask_type explicitly.
+            # Without mask_type, TE may interpret as "arbitrary" and lose fused benefits (or differ by version).
+            if use_te and (te_mask is not None):
+                if not self._te_supports_mask:
+                    use_te = False
+                elif te_mask_type is not None and te_mask_type.startswith("padding"):
+                    if not (self._te_supports_mask_type and (self._te_mask_type_param is not None)):
+                        use_te = False
+
+            # For causal-only with no mask: require either mask_type or is_causal support.
+            if use_te and (te_mask is None) and bool(is_causal):
+                if not (self._te_supports_mask_type or self._te_supports_is_causal):
                     use_te = False
 
-            if use_te and bias_float is not None and te_bias is None:
-                if self._te_supports_core_bias:
-                    te_bias = _expand_bhls(bias_float, dtype=q_bshd.dtype)
-                else:
-                    use_te = False
         if use_te:
             q_te = q_bshd.transpose(1, 2).contiguous()
             k_te = k_bshd.transpose(1, 2).contiguous()
@@ -668,18 +734,19 @@ class DotProductAttention(nn.Module):
             te_kwargs: dict[str, Any] = {}
             if self._te_supports_attention_dropout:
                 te_kwargs["attention_dropout"] = dropout_val
-            if self._te_supports_is_causal:
+            # Prefer mask_type when available; otherwise fall back to is_causal flag.
+            if (
+                self._te_supports_mask_type
+                and self._te_mask_type_param is not None
+                and te_mask_type is not None
+            ):
+                te_kwargs[self._te_mask_type_param] = te_mask_type
+            elif self._te_supports_is_causal:
                 te_kwargs["is_causal"] = bool(is_causal)
             if self._te_supports_training:
                 te_kwargs["training"] = training
-            if te_mask is not None and self._te_mask_param:
+            if te_mask is not None and self._te_supports_mask and self._te_mask_param:
                 te_kwargs[self._te_mask_param] = te_mask
-                if self._te_supports_mask_type and self._te_mask_type_param:
-                    te_kwargs[self._te_mask_type_param] = "arbitrary"
-            if te_bias is not None and self._te_core_bias_param:
-                te_kwargs[self._te_core_bias_param] = te_bias
-                if self._te_supports_core_bias_type and self._te_core_bias_type_param:
-                    te_kwargs[self._te_core_bias_type_param] = "post_scale_bias"
             try:
                 out_te = self._te_attn(q_te, k_te, v_te, **te_kwargs)
             except Exception:
@@ -696,42 +763,36 @@ class DotProductAttention(nn.Module):
                     pass
                 return out_te
 
-        # SDPA path: keep boolean masks as boolean when possible.
-        # Converting masks to additive biases forces materialization of large (B,H,L,S) tensors and
-        # can prevent Flash/Efficient SDPA kernels from being used.
+        # SDPA path:
+        # - bool masks must be converted from mask-out -> keep-mask for PyTorch SDPA
+        # - float masks are additive biases as-is
         final_mask: torch.Tensor | None = None
+        sdpa_is_causal = bool(is_causal)
         if bias_float is None:
-            final_mask = mask_bool
+            if mask_bool is None:
+                final_mask = None
+            else:
+                # Convert mask-out => keep-mask for SDPA.
+                # NOTE: mask_bool may be compact (B,1,1,S) for key-only padding.
+                # Keep it compact; SDPA broadcast handles it.
+                final_mask = (~mask_bool)
+                sdpa_is_causal = False
         else:
-            if mask_bool is not None:
+            # additive bias
+            if mask_bool is None:
+                final_mask = bias_float
+            else:
                 finfo = torch.finfo(q_bshd.dtype)
                 zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                neg_inf = torch.full(
-                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
-                )
+                neg_inf = torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device)
+                # mask_bool is mask-out: True => -inf
                 mask_bias = torch.where(mask_bool, neg_inf, zero)
-                mb, mh, _, _ = mask_bias.shape
-                bb, bh, _, _ = bias_float.shape
-                tgt_b = B if (mb == B or bb == B) else 1
-                tgt_h = H if (mh == H or bh == H) else 1
-                if mb != tgt_b:
-                    mask_bias = mask_bias.expand(tgt_b, mh, L, S)
-                    mb = tgt_b
-                if mh != tgt_h:
-                    mask_bias = mask_bias.expand(mb, tgt_h, L, S)
-                bias_b = bias_float
-                if bb != tgt_b:
-                    bias_b = bias_b.expand(tgt_b, bh, L, S)
-                    bb = tgt_b
-                if bh != tgt_h:
-                    bias_b = bias_b.expand(bb, tgt_h, L, S)
-                final_mask = (mask_bias + bias_b).contiguous()
-            else:
-                final_mask = bias_float
+                final_mask = (mask_bias + bias_float).contiguous()
+            sdpa_is_causal = False
         sdpa_kwargs = {
             "attn_mask": final_mask,
             "dropout_p": dropout_val,
-            "is_causal": bool(is_causal),
+            "is_causal": bool(sdpa_is_causal),
         }
         q_bhsd = q_bshd.contiguous()
         k_bhsd = k_bshd.contiguous()
@@ -745,7 +806,7 @@ class DotProductAttention(nn.Module):
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
 
-            fm, batch_dim, head_count = _flatten_mask(fm)
+            fm, batch_dim, head_count, _qdim = _flatten_mask(fm)
             if batch_dim not in (1, B):
                 raise RuntimeError(
                     f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
@@ -1307,6 +1368,32 @@ class _MultiHeadAttentionNvidia(nn.Module):
         )
         self._te_mha = self._nvidia_mha(embed_dim, num_heads, dropout, kwargs)
         self._force_pt: bool = self._te_mha is None
+        # Cache TE MHA forward signature info for stable kw passing.
+        self._te_forward_signature: inspect.Signature | None = None
+        self._te_mask_param: str | None = None
+        self._te_mask_type_param: str | None = None
+        self._te_supports_is_causal: bool = False
+        self._te_supports_training: bool = False
+        self._te_supports_tuple_mask: bool = True
+        if self._te_mha is not None:
+            _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
+            with torch.no_grad():
+                if _fwd is not None:
+                    try:
+                        self._te_forward_signature = inspect.signature(_fwd)
+                    except (TypeError, ValueError):
+                        self._te_forward_signature = None
+            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
+            if "attention_mask" in params:
+                self._te_mask_param = "attention_mask"
+            elif "attn_mask" in params:
+                self._te_mask_param = "attn_mask"
+            if "attn_mask_type" in params:
+                self._te_mask_type_param = "attn_mask_type"
+            elif "attention_mask_type" in params:
+                self._te_mask_type_param = "attention_mask_type"
+            self._te_supports_is_causal = "is_causal" in params
+            self._te_supports_training = "training" in params
         if self._force_pt:
             warnings.warn(
                 "Unable to use Transformer Engine multi-head attention; falling back to torch.nn.MultiheadAttention.",
@@ -1389,68 +1476,101 @@ class _MultiHeadAttentionNvidia(nn.Module):
             )
         if self._force_pt or (self._te_mha is None):
             return _call_fallback()
-        te_attn_mask = attn_mask
-        if attn_mask is not None or key_padding_mask is not None:
-            te_attn_mask = _to_nvidia_mask(
-                query,
-                key,
-                attn_mask,
-                key_padding_mask,
-                num_heads=self.num_heads,
-                batch_first=self.batch_first,
-            )
-            if te_attn_mask is None:
-                self._force_pt = True
+
+        # Re-tune TE boundary (MHA):
+        # - Only use TE for: no_mask / causal / (self-attn) padding(/padding_causal)
+        # - Any arbitrary attn_mask (2D/3D) => prefer PyTorch
+        if need_weights:
+            return _call_fallback()
+        if attn_mask is not None:
+            return _call_fallback()
+        if (not query.is_cuda) or (query.dtype not in (torch.float16, torch.bfloat16)):
+            return _call_fallback()
+        try:
+            if torch._dynamo.is_compiling():
                 return _call_fallback()
+        except Exception:
+            pass
+
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
-            _q, _k, _v = (
-                query.transpose(0, 1),
-                key.transpose(0, 1),
-                value.transpose(0, 1),
-            )
-        for variant in (
-            dict(
-                query=_q,
-                key=_k,
-                value=_v,
-                attn_mask=te_attn_mask,
-                need_weights=need_weights,
-                is_causal=is_causal,
-            ),
-            dict(query=_q, attn_mask=te_attn_mask, need_weights=need_weights),
-            dict(
-                query=_q,
-                key=_k,
-                value=_v,
-                attention_mask=te_attn_mask,
-                need_weights=need_weights,
-            ),
-        ):
-            try:
-                out = self._te_mha(**variant)
-                if isinstance(out, tuple) and len(out) >= 1:
-                    y, w = out[0], (out[1] if need_weights and len(out) > 1 else None)
-                else:
-                    y, w = out, None
-                if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
-                    y = y.transpose(0, 1)
-                _add_mha_flops(
-                    query,
-                    key,
-                    num_heads=self.num_heads,
-                    embed_dim=embed_dim,
-                    batch_first=self.batch_first,
-                    include_projections=True,
-                )
-                return y, w
-            except TypeError:
-                continue
-            except Exception:
-                continue
-        self._force_pt = True
-        return _call_fallback()
+            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+
+        te_kwargs: dict[str, Any] = {}
+        te_mask: Any = None
+        mask_type: str | None = None
+        # Support padding in TE MHA:
+        # - self-attn: attention_mask = (B,1,1,L)
+        # - cross-attn: if TE supports tuple masks, try (q_mask, kv_mask) once.
+        if key_padding_mask is not None:
+            B0 = int(_q.shape[0])
+            Lq = int(_q.shape[1])
+            Lk = int(_k.shape[1])
+            if key_padding_mask.shape != (B0, Lk):
+                return _call_fallback()
+            kpm = key_padding_mask
+            if kpm.dtype is not torch.bool:
+                kpm = kpm.to(torch.bool)
+            kpm = kpm.to(device=_q.device, non_blocking=True).contiguous()
+            # TE expects mask-out: True => masked/padded
+            kv_mask = kpm.view(B0, 1, 1, Lk)
+            if Lq == Lk:
+                te_mask = kv_mask
+            else:
+                # cross-attn: attempt tuple mask if supported; otherwise fall back.
+                if not self._te_supports_tuple_mask:
+                    return _call_fallback()
+                q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
+                te_mask = (q_mask, kv_mask)
+            mask_type = "padding_causal" if bool(is_causal) else "padding"
+        else:
+            mask_type = "causal" if bool(is_causal) else "no_mask"
+
+        # If providing a padding mask, require TE to support mask_type (avoid arbitrary fallbacks).
+        if te_mask is not None and mask_type is not None and mask_type.startswith("padding"):
+            if self._te_mask_type_param is None:
+                return _call_fallback()
+
+        if te_mask is not None:
+            if self._te_mask_param is None:
+                return _call_fallback()
+            te_kwargs[self._te_mask_param] = te_mask
+        if (mask_type is not None) and (self._te_mask_type_param is not None):
+            te_kwargs[self._te_mask_type_param] = mask_type
+        elif self._te_supports_is_causal and (is_causal is not None):
+            te_kwargs["is_causal"] = bool(is_causal)
+        if self._te_supports_training:
+            te_kwargs["training"] = bool(self.training)
+
+        try:
+            out = self._te_mha(_q, _k, _v, **te_kwargs)
+        except TypeError:
+            # If this failure was due to tuple masks (cross-attn padding), disable tuple attempt only.
+            if isinstance(te_mask, tuple):
+                self._te_supports_tuple_mask = False
+                return _call_fallback()
+            self._force_pt = True
+            return _call_fallback()
+        except Exception:
+            self._force_pt = True
+            return _call_fallback()
+
+        if isinstance(out, tuple) and len(out) >= 1:
+            y, w = out[0], None
+        else:
+            y, w = out, None
+        if not bf and isinstance(y, torch.Tensor) and y.dim() >= 2:
+            y = y.transpose(0, 1)
+        _add_mha_flops(
+            query,
+            key,
+            num_heads=self.num_heads,
+            embed_dim=embed_dim,
+            batch_first=self.batch_first,
+            include_projections=True,
+        )
+        return y, w
 
 
 class MultiHeadAttention(nn.Module):

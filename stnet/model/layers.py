@@ -184,7 +184,8 @@ class PatchAttention(nn.Module):
                             )
 
                         def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            return ~m[qi, kj]
+                            # flex_attention expects keep-mask: True = allowed
+                            return m[qi, kj]
 
                     case 3:
                         if m.shape != (B, N, N):
@@ -193,7 +194,7 @@ class PatchAttention(nn.Module):
                             )
 
                         def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            return ~m[b, qi, kj]
+                            return m[b, qi, kj]
 
                     case 4:
                         b0, hm, s1, s2 = m.shape
@@ -204,7 +205,7 @@ class PatchAttention(nn.Module):
                         if hm == 1:
 
                             def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return ~m[b, 0, qi, kj]
+                                return m[b, 0, qi, kj]
 
                         elif hm != self.nhead:
                             raise ValueError(
@@ -213,7 +214,7 @@ class PatchAttention(nn.Module):
                         else:
 
                             def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return ~m[b, h, qi, kj]
+                                return m[b, h, qi, kj]
 
                     case _:
                         raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
@@ -363,7 +364,8 @@ def _get_dilated_mask(
     )
     not_future = (j <= i) if causal else torch.ones_like(congruent, dtype=torch.bool)
     allowed = congruent & within & not_future
-    return (~allowed).contiguous()
+    # PyTorch SDPA semantics: bool mask True = allowed (keep)
+    return allowed.contiguous()
 
 
 class DilatedAttention(nn.Module):
@@ -418,6 +420,46 @@ class DilatedAttention(nn.Module):
             nn.Linear(hidden, self.embed_dim, bias=True),
         )
         self.length_bucket_multiple: int = 64
+
+        # Use project-local attention wrapper instead of calling F.scaled_dot_product_attention directly.
+        # (DotProductAttention lives in stnet/model/kernels.py)
+        self._dot_attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        # Cache supported kwarg names to avoid per-forward inspect overhead (signature varies by version).
+        self._dot_attn_mask_kw: str | None = "attn_mask"
+        self._dot_attn_dropout_kw: str | None = None
+        self._dot_attn_training_kw: str | None = "training"
+        self._dot_attn_causal_kw: str | None = None
+        with contextlib.suppress(Exception):
+            import inspect
+
+            params = inspect.signature(self._dot_attn.forward).parameters
+            if "attn_mask" in params:
+                self._dot_attn_mask_kw = "attn_mask"
+            elif "mask" in params:
+                self._dot_attn_mask_kw = "mask"
+            elif "attention_mask" in params:
+                self._dot_attn_mask_kw = "attention_mask"
+            else:
+                self._dot_attn_mask_kw = None
+
+            if "training" in params:
+                self._dot_attn_training_kw = "training"
+            else:
+                self._dot_attn_training_kw = None
+
+            if "dropout_p" in params:
+                self._dot_attn_dropout_kw = "dropout_p"
+            elif "dropout" in params:
+                self._dot_attn_dropout_kw = "dropout"
+            else:
+                self._dot_attn_dropout_kw = None
+
+            if "is_causal" in params:
+                self._dot_attn_causal_kw = "is_causal"
+            elif "causal" in params:
+                self._dot_attn_causal_kw = "causal"
+            else:
+                self._dot_attn_causal_kw = None
 
         # Thread-safe bounded caches (important for free-threaded / no-GIL Python).
         # NOTE: these are best-effort runtime caches (not part of state_dict).
@@ -611,6 +653,49 @@ class DilatedAttention(nn.Module):
             except Exception:
                 pass
         return block_mask
+
+
+    def _call_dot_attn(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        *,
+        attn_mask: Optional[torch.Tensor],
+        dropout_p: float,
+        is_causal: bool,
+    ) -> torch.Tensor:
+        """
+        Call DotProductAttention with best-effort kwarg compatibility.
+        """
+        attn = getattr(self, "_dot_attn", None)
+        if attn is None:
+            attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+            self._dot_attn = attn
+
+        kwargs: dict[str, Any] = {}
+
+        mask_kw = getattr(self, "_dot_attn_mask_kw", "attn_mask")
+        if attn_mask is not None:
+            if mask_kw is not None:
+                kwargs[str(mask_kw)] = attn_mask
+            else:
+                # Best-effort: some wrappers accept **kwargs even if signature doesn't expose it.
+                kwargs["attn_mask"] = attn_mask
+
+        train_kw = getattr(self, "_dot_attn_training_kw", None)
+        if train_kw is not None:
+            kwargs[str(train_kw)] = bool(self.training)
+
+        drop_kw = getattr(self, "_dot_attn_dropout_kw", None)
+        if drop_kw is not None:
+            kwargs[str(drop_kw)] = float(dropout_p)
+
+        causal_kw = getattr(self, "_dot_attn_causal_kw", None)
+        if causal_kw is not None:
+            kwargs[str(causal_kw)] = bool(is_causal)
+
+        return attn(q, k, v, **kwargs)
 
 
     def forward(
@@ -906,7 +991,7 @@ class DilatedAttention(nn.Module):
                         q_g = qh.index_select(0, idx)[:, :, :li, :]
                         k_g = kh.index_select(0, idx)[:, :, :li, :]
                         v_g = vh.index_select(0, idx)[:, :, :li, :]
-                        y_g = F.scaled_dot_product_attention(
+                        y_g = self._call_dot_attn(
                             q_g,
                             k_g,
                             v_g,
@@ -944,13 +1029,14 @@ class DilatedAttention(nn.Module):
                     kpm_b = kpm_k.to(torch.bool)
                     # Support either (B, L_k) or (L_k,) masks:
                     if kpm_b.dim() == 1:
-                        key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k)
+                        # SDPA bool mask is keep-mask: True = allowed
+                        key_mask = (~kpm_b)[None, None, None, :]  # (1,1,1,L_k)
                     else:
-                        key_mask = kpm_b[:, None, None, :]     # (B,1,1,L_k)
+                        key_mask = (~kpm_b)[:, None, None, :]     # (B,1,1,L_k)
 
                 # Combine masks with minimal materialization.
                 if base_mask is None:
-                    y = F.scaled_dot_product_attention(
+                    y = self._call_dot_attn(
                         qh,
                         kh,
                         vh,
@@ -960,7 +1046,7 @@ class DilatedAttention(nn.Module):
                     )
                 else:
                     if key_mask is None:
-                        y = F.scaled_dot_product_attention(
+                        y = self._call_dot_attn(
                             qh,
                             kh,
                             vh,
@@ -969,8 +1055,9 @@ class DilatedAttention(nn.Module):
                             is_causal=False,
                         )
                     elif int(key_mask.shape[0]) == 1:
-                        attn_mask = base_mask[None, None, :, :] | key_mask
-                        y = F.scaled_dot_product_attention(
+                        # keep-mask 결합은 AND
+                        attn_mask = base_mask[None, None, :, :] & key_mask
+                        y = self._call_dot_attn(
                             qh,
                             kh,
                             vh,
@@ -1007,8 +1094,8 @@ class DilatedAttention(nn.Module):
                             try:
                                 for b0 in range(0, B, group):
                                     b1 = min(B, b0 + group)
-                                    attn_mask_g = base4 | key_mask[b0:b1]
-                                    y_g = F.scaled_dot_product_attention(
+                                    attn_mask_g = base4 & key_mask[b0:b1]
+                                    y_g = self._call_dot_attn(
                                         qh[b0:b1],
                                         kh[b0:b1],
                                         vh[b0:b1],

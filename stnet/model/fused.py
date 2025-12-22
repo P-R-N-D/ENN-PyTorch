@@ -5,12 +5,12 @@ import contextlib
 import importlib
 import json
 import logging
+import math
 import threading
 # json is used for structured AMP negotiation logs.
-import math
 from collections import OrderedDict
-from dataclasses import dataclass
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple, Union
 
@@ -38,6 +38,27 @@ _LOGGER = logging.getLogger(__name__)
 _NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _NEGO_LOGGED_MAX: int = 256
 _NEGO_LOGGED_LOCK = threading.Lock()
+
+# torch._inductor config is process-global; guard concurrent mutation.
+_INDUCTOR_CONFIG_LOCK = threading.Lock()
+
+
+def _invalidate_model_introspection_caches(model: Optional[nn.Module]) -> None:
+    """Invalidate cached runtime-introspection hints on `model`.
+
+    We cache a few expensive checks (TorchScript/compile/AOT/TE probing).
+    Any time we swap modules (TE, QAT wrappers) or quantize weights, these
+    hints can become stale.
+    """
+    if not isinstance(model, nn.Module):
+        return
+    for attr in (
+        "__stnet_cached_is_compiled_for_inference__",
+        "__stnet_cached_is_aot_autograd_enabled__",
+        "__stnet_cached_is_nvidia_te_available__",
+    ):
+        with contextlib.suppress(Exception):
+            delattr(model, attr)
 
 
 def _log_negotiate_once(
@@ -98,13 +119,11 @@ def _is_ptq_unavailable(
     return (model, False, "PTQ backend unavailable")
 
 
-class _QATUnavailable:
-    @staticmethod
-    def initialize(*args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError("QAT backend unavailable")
-
-
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
+    if isinstance(cached, bool):
+        return cached
+
     compile_attrs = (
         "_is_compiled_for_inference",
         "__is_compiled_for_inference__",
@@ -113,6 +132,10 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
         "_is_serialized_for_serving",
     )
     if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
+        try:
+            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+        except Exception:
+            pass
         return True
 
     jit = getattr(torch, "jit", None)
@@ -132,6 +155,10 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
                     script_like_types.append(typ)
 
     if any(isinstance(model, typ) for typ in script_like_types):
+        try:
+            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+        except Exception:
+            pass
         return True
 
     try:
@@ -146,10 +173,18 @@ def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
             return True
         if any(isinstance(module, typ) for typ in script_like_types):
             return True
+    try:
+        setattr(model, "__stnet_cached_is_compiled_for_inference__", False)
+    except Exception:
+        pass
     return False
 
 
 def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_aot_autograd_enabled__", None)
+    if isinstance(cached, bool):
+        return cached
+
     indicator_attrs = (
         "_aot_autograd_graph",
         "_aot_autograd_cache",
@@ -159,6 +194,10 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         "__compiled_with_aot_autograd__",
     )
     if any(getattr(model, attr, None) for attr in indicator_attrs):
+        try:
+            setattr(model, "__stnet_cached_is_aot_autograd_enabled__", True)
+        except Exception:
+            pass
         return True
 
     try:
@@ -175,6 +214,10 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
         module_name = getattr(module.__class__, "__module__", "")
         if "AOTAutograd" in class_name or "aot_autograd" in module_name:
             return True
+    try:
+        setattr(model, "__stnet_cached_is_aot_autograd_enabled__", False)
+    except Exception:
+        pass
     return False
 def _dtype_short(dtype: Any) -> str:
     if isinstance(dtype, torch.dtype):
@@ -328,18 +371,34 @@ def _scale_safety_check(
 
 
 def is_nvidia_te_available(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_nvidia_te_available__", None)
+    if isinstance(cached, bool):
+        return cached
+
     te_flags = (
         getattr(model, "__fp8_inference_te__", False),
         getattr(model, "__fp8_training_te__", False),
         getattr(model, "__te_fp8_default__", False),
     )
     if any(te_flags):
+        try:
+            setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+        except Exception:
+            pass
         return True
 
     for module in model.modules():
         mod_name = getattr(module.__class__, "__module__", "")
         if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+            try:
+                setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+            except Exception:
+                pass
             return True
+    try:
+        setattr(model, "__stnet_cached_is_nvidia_te_available__", False)
+    except Exception:
+        pass
     return False
 
 
@@ -569,35 +628,38 @@ class Gradient:
             _inductor_config = None
 
         if _inductor_config is not None:
-            try:
-                if getattr(_inductor_config, "compile_threads", None) is not None:
-                    override = env_first(
-                        ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
-                        None,
-                    )
-                    if override is None:
-                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
-
-                    if override is not None:
-                        _inductor_config.compile_threads = max(1, int(override))
-                    else:
-                        local_world = env_first_int(
-                            (
-                                "STNET_LOCAL_WORLD_SIZE",
-                                "LOCAL_WORLD_SIZE",
-                                "SLURM_NTASKS_PER_NODE",
-                            ),
-                            1,
+            with _INDUCTOR_CONFIG_LOCK:
+                try:
+                    if getattr(_inductor_config, "compile_threads", None) is not None:
+                        override = env_first(
+                            ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
+                            None,
                         )
-                        if int(local_world) > 1:
-                            # Pick a small per-rank compile thread count. Too many threads
-                            # across multiple ranks oversubscribes the node and hurts both
-                            # compilation latency and the data pipeline.
-                            cpu_count = int(process_cpu_count() or 1)
-                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
-                            _inductor_config.compile_threads = max(1, min(4, int(per_rank) // 2))
-            except Exception:
-                pass
+                        if override is None:
+                            override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+
+                        if override is not None:
+                            _inductor_config.compile_threads = max(1, int(override))
+                        else:
+                            local_world = env_first_int(
+                                (
+                                    "STNET_LOCAL_WORLD_SIZE",
+                                    "LOCAL_WORLD_SIZE",
+                                    "SLURM_NTASKS_PER_NODE",
+                                ),
+                                1,
+                            )
+                            if int(local_world) > 1:
+                                # Pick a small per-rank compile thread count. Too many threads
+                                # across multiple ranks oversubscribes the node and hurts both
+                                # compilation latency and the data pipeline.
+                                cpu_count = int(process_cpu_count() or 1)
+                                per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                                _inductor_config.compile_threads = max(
+                                    1, min(4, int(per_rank) // 2)
+                                )
+                except Exception:
+                    pass
         if canonical_mode == "max-autotune" and not _is_for_cuda(module):
             canonical_mode = "max-autotune-no-cudagraphs"
         if canonical_mode == "max-autotune-no-cudagraphs":
@@ -614,62 +676,63 @@ class Gradient:
                 _inductor_config = None
 
             if _inductor_config is not None:
-                try:
-                    _inductor_config.autotune_in_subproc = True
-                except Exception:
-                    pass
+                with _INDUCTOR_CONFIG_LOCK:
+                    try:
+                        _inductor_config.autotune_in_subproc = True
+                    except Exception:
+                        pass
 
-                try:
-                    _inductor_config.autotune_local_cache = True
-                except Exception:
-                    pass
-                try:
-                    _inductor_config.autotune_remote_cache = None
-                except Exception:
-                    pass
+                    try:
+                        _inductor_config.autotune_local_cache = True
+                    except Exception:
+                        pass
+                    try:
+                        _inductor_config.autotune_remote_cache = None
+                    except Exception:
+                        pass
 
-                try:
-                    if getattr(_inductor_config, "max_autotune_gemm_search_space", None) is not None:
-                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
-                except Exception:
-                    pass
+                    try:
+                        if getattr(_inductor_config, "max_autotune_gemm_search_space", None) is not None:
+                            _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
+                    except Exception:
+                        pass
 
-                try:
-                    if getattr(_inductor_config, "compile_threads", None) is not None:
-                        import os
-                        # max-autotune can be very memory hungry; default to serial compilation
-                        # unless the user explicitly overrides the thread count.
-                        override = None
-                        for _k in (
-                            "STNET_INDUCTOR_COMPILE_THREADS",
-                            "STNET_COMPILE_THREADS",
-                            "TORCHINDUCTOR_COMPILE_THREADS",
-                        ):
-                            try:
-                                _v = os.environ.get(_k)
-                                if _v is not None and str(_v).strip():
-                                    override = int(_v)
-                                    break
-                            except Exception:
-                                continue
+                    try:
+                        if getattr(_inductor_config, "compile_threads", None) is not None:
+                            import os
+                            # max-autotune can be very memory hungry; default to serial compilation
+                            # unless the user explicitly overrides the thread count.
+                            override = None
+                            for _k in (
+                                "STNET_INDUCTOR_COMPILE_THREADS",
+                                "STNET_COMPILE_THREADS",
+                                "TORCHINDUCTOR_COMPILE_THREADS",
+                            ):
+                                try:
+                                    _v = os.environ.get(_k)
+                                    if _v is not None and str(_v).strip():
+                                        override = int(_v)
+                                        break
+                                except Exception:
+                                    continue
 
-                        if override is None:
-                            _inductor_config.compile_threads = 1
-                except Exception:
-                    pass
+                            if override is None:
+                                _inductor_config.compile_threads = 1
+                    except Exception:
+                        pass
 
-                # max-autotune is extremely memory hungry. Keep GEMM tuning but disable
-                # pointwise autotune by default to reduce peak memory (RAM/VRAM).
-                try:
-                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
-                        _inductor_config.max_autotune_pointwise = False
-                except Exception:
-                    pass
-                try:
-                    if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
-                        _inductor_config.max_autotune_gemm = True
-                except Exception:
-                    pass
+                    # max-autotune is extremely memory hungry. Keep GEMM tuning but disable
+                    # pointwise autotune by default to reduce peak memory (RAM/VRAM).
+                    try:
+                        if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
+                            _inductor_config.max_autotune_pointwise = False
+                    except Exception:
+                        pass
+                    try:
+                        if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
+                            _inductor_config.max_autotune_gemm = True
+                    except Exception:
+                        pass
 
         backend_value = backend
         mode_value: Optional[str] = None
@@ -723,61 +786,23 @@ class Autocast:
     _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _metadata: Optional[Dataset[Any]] = None
-
-    # Deduplicate verbose negotiation logs. Keys are best-effort and bounded.
-    _logged_negotiate_keys: "OrderedDict[Any, None]" = OrderedDict()
-    _logged_negotiate_max: int = 256
+    _metadata: Optional[Dataset[Any]] = None  # best-effort legacy snapshot
+    _metadata_tls = threading.local()  # per-thread metadata to avoid cross-thread mutation
 
     @classmethod
-    def _should_log_once(cls: object, key: Any) -> bool:
-        """Return True if a decision key has not been logged recently."""
-        if key is None:
-            return True
-        try:
-            od = cls._logged_negotiate_keys
-        except Exception:
-            return True
-        if key in od:
-            try:
-                od.move_to_end(key)
-            except Exception:
-                pass
-            return False
-        od[key] = None
-        try:
-            if len(od) > int(getattr(cls, "_logged_negotiate_max", 256)):
-                od.popitem(last=False)
-        except Exception:
-            pass
-        return True
+    def _get_tls_metadata(cls) -> Optional[Dataset[Any]]:
+        return getattr(cls._metadata_tls, "meta", None)
 
-    @staticmethod
-    def _default_negotiate_key(
-        *,
-        context: str,
-        device: Optional[torch.device],
-        candidates: Tuple[torch.dtype, ...],
-        fallback: torch.dtype,
-        meta: Optional[Dataset[Any]],
-    ) -> Any:
-        """Construct a stable-ish key for log de-duplication."""
-        dev_index = int(getattr(device, "index", -1)) if device is not None else -1
-        dev_type = str(getattr(device, "type", "")) if device is not None else ""
-        scale = _meta_scale_summary(meta)
-        # Keep key hashable and reasonably small.
-        scale_key = (
-            scale.get("has_scale"),
-            scale.get("has_nonfinite"),
-            scale.get("scale_max_abs"),
-            scale.get("scale_min_positive"),
-            scale.get("scale_min_value"),
-            scale.get("scale_max_value"),
-            scale.get("scale_is_integral"),
-            scale.get("underflow_action"),
-            scale.get("int_quant_bits"),
-        )
-        return ("negotiate", str(context), dev_type, dev_index, tuple(candidates), fallback, scale_key)
+    @classmethod
+    def _set_tls_metadata(cls, meta: Optional[Dataset[Any]]) -> None:
+        setattr(cls._metadata_tls, "meta", meta)
+        # Keep a best-effort snapshot for any legacy access paths.
+        cls._set_tls_metadata(meta)
+
+    @classmethod
+    def metadata(cls) -> Optional[Dataset[Any]]:
+        """Thread-local metadata accessor (preferred over `Autocast._metadata`)."""
+        return cls._get_tls_metadata()
 
     @staticmethod
     def _device(
@@ -892,7 +917,7 @@ class Autocast:
         metadata: Optional[Dataset[Any]] = None,
         **kwargs: Any,
     ) -> Dataset[Any]:
-        meta = metadata or cls._metadata
+        meta = metadata or cls._get_tls_metadata()
         device_hint: Optional[Union[torch.device, str]] = device
         if device_hint is None and meta is not None:
             with contextlib.suppress(Exception):
@@ -915,7 +940,7 @@ class Autocast:
             meta.refresh()
         else:
             meta.ensure_device_info()
-        cls._metadata = meta
+        cls._set_tls_metadata(meta)
         return meta
 
     @classmethod
@@ -930,7 +955,7 @@ class Autocast:
 
     @staticmethod
     def float8_formats() -> Tuple[torch.dtype, ...]:
-        meta = Autocast._metadata
+        meta = Autocast._get_tls_metadata()
         if meta is not None and getattr(meta, "float8_dtypes", None):
             return tuple(meta.float8_dtypes)
         names = (
@@ -1022,7 +1047,16 @@ class Autocast:
                 raw_underflow, default=default_underflow_action()
             )
 
-        checks: List[Dict[str, Any]] = []
+        # Avoid per-call allocations when logging is disabled.
+        collect_checks = False
+        if logger is not None:
+            try:
+                collect_checks = logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.INFO)
+            except Exception:
+                # Best-effort: if probing fails, err on the side of collecting.
+                collect_checks = True
+
+        checks: List[Dict[str, Any]] = [] if collect_checks else []
         selected: Optional[torch.dtype] = None
         selected_from: str = "candidate"
 
@@ -1030,7 +1064,8 @@ class Autocast:
             ok, why = _scale_safety_check(
                 dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
             )
-            checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
+            if collect_checks:
+                checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
             if ok:
                 selected = dtype
                 break
@@ -1052,7 +1087,8 @@ class Autocast:
                 ok, why = _scale_safety_check(
                     dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
                 )
-                checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
+                if collect_checks:
+                    checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
                 if ok:
                     selected = dtype
                     break
@@ -1062,6 +1098,16 @@ class Autocast:
 
         # Best-effort structured log, deduped.
         if logger is not None:
+            level = "info" if selected_from != "candidate" else "debug"
+            lvl = logging.INFO if level == "info" else logging.DEBUG
+            should_log = True
+            try:
+                should_log = logger.isEnabledFor(lvl)
+            except Exception:
+                should_log = True
+            if not should_log:
+                return selected
+
             scale_key = (
                 bool(getattr(meta, "has_scale", False)) if meta is not None else False,
                 bool(getattr(meta, "has_nonfinite", False)) if meta is not None else False,
@@ -1093,7 +1139,7 @@ class Autocast:
                 "fallback": _dtype_short(fallback),
                 "candidates": [_dtype_short(x) for x in candidates],
                 "fallback_order": ([_dtype_short(x) for x in fallback_order] if fallback_order else []),
-                "checks": checks,
+                "checks": (checks if collect_checks else []),
                 "safety_margin": safety_margin,
                 "safety_margin_pow2": safety_margin_pow2,
                 "underflow_action_override": underflow_override,
@@ -1108,8 +1154,6 @@ class Autocast:
                     "int_quant_bits": getattr(meta, "int_quant_bits", None) if meta is not None else None,
                 },
             }
-            # Promote to info only when we didn't take the first safe candidate.
-            level = "info" if selected_from != "candidate" else "debug"
             _log_negotiate_once(logger, decision_key, payload, level=level)
 
         return selected
@@ -1117,8 +1161,8 @@ class Autocast:
     @classmethod
     def _nvidia_float8(
         cls: object, device: torch.device, enabled: bool
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
+    ) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
         if not enabled:
             return contexts
         try:
@@ -1137,8 +1181,8 @@ class Autocast:
     @classmethod
     def _torchao_float8(
         cls: object, enabled: bool
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
+    ) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
         if not enabled:
             return contexts
         try:
@@ -1159,8 +1203,8 @@ class Autocast:
         cls: object,
         device: torch.device,
         enabled: bool,
-    ) -> List[contextlib.AbstractContextManager[None]]:
-        contexts: List[contextlib.AbstractContextManager[None]] = []
+    ) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
         if not enabled:
             return contexts
         backend = cls._preferred_int_backend
@@ -1195,12 +1239,12 @@ class Autocast:
         cls: object,
         device: torch.device,
         enabled: bool,
-    ) -> List[contextlib.AbstractContextManager[None]]:
+    ) -> List[AbstractContextManager[None]]:
         """Best-effort INT4 autocast/quant context (torchao-only).
 
         TorchAO APIs may differ by version; we probe a small set of known names.
         """
-        contexts: List[contextlib.AbstractContextManager[None]] = []
+        contexts: List[AbstractContextManager[None]] = []
         if not enabled:
             return contexts
         try:
@@ -1281,7 +1325,7 @@ class Autocast:
             if tensor is not None:
                 device = tensor.device
         meta = cls.coerce_metadata(device, metadata=meta)
-        cls._metadata = meta
+        cls._set_tls_metadata(meta)
 
     @classmethod
     def resolve_float_dtype(
@@ -1295,7 +1339,7 @@ class Autocast:
         Returns None when autocast is disabled by metadata.
         """
         dev = cls._device(device)
-        meta = cls.coerce_metadata(metadata, device=dev)
+        meta = cls.coerce_metadata(device=dev, metadata=metadata)
         disable = bool(meta.is_disabled()) if meta is not None else False
         if disable:
             return None
@@ -1464,7 +1508,7 @@ class Autocast:
                 cls._last_float_dtype = requested_dtype
             else:
                 cls._last_float_dtype = requested_dtype
-        cls._metadata = meta
+        cls._set_tls_metadata(meta)
 
         if debug:
             try:
@@ -1571,7 +1615,7 @@ class Autocast:
             for ctx in contexts:
                 stack.enter_context(ctx)
             cls._last_int_dtype = int_dtype
-            cls._metadata = meta
+            cls._set_tls_metadata(meta)
             if debug:
                 try:
                     _LOGGER.debug(
@@ -1603,24 +1647,73 @@ _Int8DynamicActivationInt8WeightConfig: Any | None
 _Int8WeightOnlyConfig: Any | None
 _quantize: Any | None
 _ptq_impl: Callable[..., tuple[nn.Module, bool, str]] | None
-QAT: Any | None
+QATConfig = None
+QATStep = None
+
+_IntxFakeQuantizeConfig: Any | None = None
+_FakeQuantizedLinear: Any | None = None
+_FakeQuantizedEmbedding: Any | None = None
 
 try:
-    from torchao.quantization import \
-        Int8DynamicActivationInt8WeightConfig as \
-        _Int8DynamicActivationInt8WeightConfig
-    from torchao.quantization import \
-        Int8WeightOnlyConfig as _Int8WeightOnlyConfig
+    from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization import Int8WeightOnlyConfig as _Int8WeightOnlyConfig
     from torchao.quantization import quantize_ as _quantize
-
-    _ptq_impl = getattr(_quantize, "ptq", None)
 except ImportError:
     _quantize = None
     _Int8DynamicActivationInt8WeightConfig = None
     _Int8WeightOnlyConfig = None
-    _ptq_impl = None
-QATConfig = None
-QATStep = None
+
+
+def _torchao_int8_ptq_impl(
+    model: nn.Module,
+    *args: Any,
+    mode: str = "int8",
+    dynamic_activations: bool,
+    group_size: int = 128,
+    logger: Optional[Callable[[str], None]] = None,
+    **kwargs: Any,
+) -> tuple[nn.Module, bool, str]:
+    """TorchAO 0.14+ PTQ impl using quantize_ + config objects.
+
+    TorchAO does not expose quantize_.ptq; PTQ is applying a PTQ config via quantize_().
+    """
+    if not callable(_quantize):
+        return (model, False, "torchao.quantization not installed")
+    if str(mode).lower() not in {"int8", "w8", "w8a8", "int8wo"}:
+        return (model, False, f"Unsupported PTQ mode: {mode}")
+
+    cfg_cls = _Int8DynamicActivationInt8WeightConfig if dynamic_activations else _Int8WeightOnlyConfig
+    if cfg_cls is None:
+        return (model, False, "Quantization config unavailable")
+
+    try:
+        if dynamic_activations:
+            cfg = cfg_cls()
+        else:
+            # Int8WeightOnlyConfig supports group_size (optional). Use it when sane.
+            gs = int(group_size) if group_size is not None else None
+            if gs is not None and gs <= 0:
+                gs = None
+            try:
+                cfg = cfg_cls(group_size=gs)
+            except TypeError:
+                cfg = cfg_cls()
+    except Exception as exc:
+        return (model, False, f"Failed to initialize quantization config: {exc}")
+
+    try:
+        _quantize(model, cfg)
+    except Exception as exc:
+        return (model, False, f"AO failed: {exc}")
+
+    if logger is not None:
+        logger(f"[INT8][AO] applied {cfg.__class__.__name__}")
+    return (model, True, "torchao")
+
+
+_ptq_impl = _torchao_int8_ptq_impl if callable(_quantize) else _is_ptq_unavailable
+
+
 try:
     from torchao.quantization.qat import QATConfig, QATStep
 except Exception:
@@ -1670,18 +1763,16 @@ except Exception:
                 CONVERT = "convert"
 
             QATConfig, QATStep = (_NullQATConfig, _NullQATStep)
+
+
 try:
-    from torchao.quantization import qat as _qat_module
-
-    QAT = _qat_module if hasattr(_qat_module, "initialize") else None
+    from torchao.quantization.qat import IntxFakeQuantizeConfig as _IntxFakeQuantizeConfig
+    from torchao.quantization.qat import FakeQuantizedLinear as _FakeQuantizedLinear
+    from torchao.quantization.qat import FakeQuantizedEmbedding as _FakeQuantizedEmbedding
 except Exception:
-    QAT = None
-if _ptq_impl is None:
-    _ptq_impl = _is_ptq_unavailable
-
-
-if QAT is None:
-    QAT = _QATUnavailable()
+    _IntxFakeQuantizeConfig = None
+    _FakeQuantizedLinear = None
+    _FakeQuantizedEmbedding = None
 
 
 class Quantization:
@@ -1690,9 +1781,11 @@ class Quantization:
         _Int8DynamicActivationInt8WeightConfig
     )
     Int8WeightOnlyConfig: Optional[type] = _Int8WeightOnlyConfig
-    QAT: Any = QAT
     QATConfig: Any = QATConfig
     QATStep: Any = QATStep
+    IntxFakeQuantizeConfig: Any = _IntxFakeQuantizeConfig
+    FakeQuantizedLinear: Any = _FakeQuantizedLinear
+    FakeQuantizedEmbedding: Any = _FakeQuantizedEmbedding
     ptq: Callable[..., tuple[nn.Module, bool, str]] = staticmethod(_ptq_impl)
 
     @classmethod
@@ -1701,12 +1794,94 @@ class Quantization:
 
     @classmethod
     def is_qat_available(cls: object) -> bool:
-        initialize = getattr(cls.QAT, "initialize", None)
-        return callable(initialize)
+        # We implement INT8 QAT via FakeQuantized* + IntxFakeQuantizeConfig to avoid
+        # base_config limitations and embedding restrictions.
+        return (
+            callable(cls.quantize)
+            and (cls.IntxFakeQuantizeConfig is not None)
+            and (cls.FakeQuantizedLinear is not None)
+            and (cls.FakeQuantizedEmbedding is not None)
+        )
 
     @classmethod
     def is_ptq_available(cls: object) -> bool:
-        return callable(cls.ptq) and cls.ptq is not _is_ptq_unavailable
+        return callable(cls.quantize) and (
+            cls.Int8DynamicActivationInt8WeightConfig is not None
+            or cls.Int8WeightOnlyConfig is not None
+        )
+
+    @classmethod
+    def _qat_has_wrappers(cls: object, model: nn.Module) -> bool:
+        fq_lin = cls.FakeQuantizedLinear
+        fq_emb = cls.FakeQuantizedEmbedding
+        for m in model.modules():
+            try:
+                if fq_lin is not None and isinstance(m, fq_lin):
+                    return True
+                if fq_emb is not None and isinstance(m, fq_emb):
+                    return True
+            except Exception:
+                # Fallback: module name-based detection
+                mod = getattr(m.__class__, "__module__", "")
+                if isinstance(mod, str) and "torchao.quantization.qat" in mod:
+                    return True
+        return False
+
+    @classmethod
+    def _qat_convert_inplace(
+        cls: object,
+        model: nn.Module,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        """Convert FakeQuantized* wrappers back to nn modules (best-effort)."""
+        if not cls._qat_has_wrappers(model):
+            return
+        fq_lin = cls.FakeQuantizedLinear
+        fq_emb = cls.FakeQuantizedEmbedding
+
+        def _rec(parent: nn.Module) -> None:
+            for name, child in list(parent.named_children()):
+                new_child = child
+                try:
+                    if fq_lin is not None and isinstance(child, fq_lin):
+                        new_child = child.to_linear()
+                    elif fq_emb is not None and isinstance(child, fq_emb):
+                        new_child = child.to_embedding()
+                    else:
+                        _rec(child)
+                except Exception:
+                    # keep best-effort; don't hard-fail conversions
+                    _rec(child)
+                if new_child is not child:
+                    setattr(parent, name, new_child)
+
+        _rec(model)
+        _invalidate_model_introspection_caches(model)
+        _log_debug(logger, "[QAT] converted fake-quant wrappers back to fp modules")
+
+    @classmethod
+    def _build_int8_cfg(
+        cls: object,
+        *,
+        dynamic_activations: bool,
+        group_size: int = 128,
+    ) -> Any:
+        cfg_cls = (
+            cls.Int8DynamicActivationInt8WeightConfig
+            if dynamic_activations
+            else cls.Int8WeightOnlyConfig
+        )
+        if cfg_cls is None:
+            raise RuntimeError("Quantization config unavailable")
+        if dynamic_activations:
+            return cfg_cls()
+        gs = int(group_size) if group_size is not None else None
+        if gs is not None and gs <= 0:
+            gs = None
+        try:
+            return cfg_cls(group_size=gs)
+        except TypeError:
+            return cfg_cls()
 
     @classmethod
     def _prepare_qat(
@@ -1720,13 +1895,71 @@ class Quantization:
     ) -> Any:
         if not cls.is_qat_available():
             raise RuntimeError("QAT backend unavailable")
-        return cls.QAT.initialize(
-            model,
-            mode="qat-int8",
-            dynamic_activations=dynamic_activations,
-            group_size=group_size,
-            logger=logger,
+        # If model was already QAT-prepared, unwrap first to avoid stacking wrappers.
+        cls._qat_convert_inplace(model, logger=logger)
+
+        fq_cfg = cls.IntxFakeQuantizeConfig
+        fq_lin = cls.FakeQuantizedLinear
+        fq_emb = cls.FakeQuantizedEmbedding
+        if fq_cfg is None or fq_lin is None or fq_emb is None:
+            raise RuntimeError("TorchAO QAT primitives unavailable")
+
+        gs: Optional[int]
+        try:
+            gs = int(group_size) if group_size is not None else None
+        except Exception:
+            gs = None
+        if gs is not None and gs <= 0:
+            gs = None
+
+        # NOTE:
+        # - activation fake-quant is NOT supported for embeddings (TorchAO raises) :contentReference[oaicite:2]{index=2}
+        # - symmetric per-token activation fake-quant is not supported :contentReference[oaicite:3]{index=3}
+        act_cfg = None
+        if dynamic_activations:
+            act_cfg = fq_cfg(dtype=torch.int8, granularity="per_token", is_symmetric=False)
+
+        replaced_linear = 0
+        replaced_embed = 0
+
+        def _swap(parent: nn.Module) -> None:
+            nonlocal replaced_linear, replaced_embed
+            for name, child in list(parent.named_children()):
+                new_child = child
+                if isinstance(child, nn.Linear):
+                    # Per-layer group_size fallback when divisibility doesn't hold.
+                    w_gs = None
+                    if gs is not None:
+                        with contextlib.suppress(Exception):
+                            if int(child.in_features) % int(gs) == 0:
+                                w_gs = gs
+                    w_cfg = fq_cfg(dtype=torch.int8, group_size=w_gs, is_symmetric=True)
+                    new_child = fq_lin.from_linear(child, act_cfg, w_cfg)
+                    replaced_linear += 1
+                elif isinstance(child, nn.Embedding):
+                    # Embedding: activation fake-quant must be None.
+                    emb_dim = int(getattr(child, "embedding_dim", 0) or 0)
+                    w_gs = None
+                    if gs is not None and emb_dim > 0:
+                        with contextlib.suppress(Exception):
+                            if emb_dim % int(gs) == 0:
+                                w_gs = gs
+                    w_cfg = fq_cfg(dtype=torch.int8, group_size=w_gs, is_symmetric=True)
+                    new_child = fq_emb.from_embedding(child, w_cfg)
+                    replaced_embed += 1
+                else:
+                    _swap(child)
+
+                if new_child is not child:
+                    setattr(parent, name, new_child)
+
+        _swap(model)
+        _invalidate_model_introspection_caches(model)
+        _log_info(
+            logger,
+            f"[INT8][QAT] prepared (linear={replaced_linear}, embedding={replaced_embed}, act={'on' if act_cfg is not None else 'off'}, group_size={gs})",
         )
+        return {"linear": replaced_linear, "embedding": replaced_embed, "group_size": gs, "act": bool(act_cfg is not None)}
 
     @classmethod
     def _apply_ptq(
@@ -1740,13 +1973,18 @@ class Quantization:
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_ptq_available():
             return (model, False, "PTQ backend unavailable")
-        return cls.ptq(
+        cls._qat_convert_inplace(model, logger=logger)
+        # PTQ is applying a PTQ config via quantize_.
+        m2, ok, why = cls.ptq(
             model,
             mode="int8",
             dynamic_activations=dynamic_activations,
             group_size=group_size,
             logger=logger,
         )
+        if ok:
+            _invalidate_model_introspection_caches(m2)
+        return (m2, ok, why)
 
     @classmethod
     def _enable_ptq(
@@ -1759,15 +1997,10 @@ class Quantization:
     ) -> tuple[nn.Module, bool, str]:
         if not cls.is_available():
             return (model, False, "torchao.quantization not installed (INT8 disabled)")
-        cfg_cls = (
-            cls.Int8DynamicActivationInt8WeightConfig
-            if dynamic_activations
-            else cls.Int8WeightOnlyConfig
-        )
-        if cfg_cls is None:
-            return (model, False, "Quantization config unavailable")
+        cls._qat_convert_inplace(model, logger=logger)
+        group_size = int(kwargs.pop("group_size", 128) or 128)
         try:
-            cfg = cfg_cls()
+            cfg = cls._build_int8_cfg(dynamic_activations=dynamic_activations, group_size=group_size)
         except Exception as exc:
             return (model, False, f"Failed to initialize quantization config: {exc}")
         try:
@@ -1777,6 +2010,7 @@ class Quantization:
         if logger is not None:
             logger(f"[INT8][AO] applied {cfg.__class__.__name__}")
         setattr(model, "__int8_inference_ao__", True)
+        _invalidate_model_introspection_caches(model)
         return (model, True, "torchao")
 
     @classmethod
@@ -1803,10 +2037,6 @@ class Quantization:
                     logger=logger,
                 )
                 setattr(model, "__int8_training_qat__", True)
-                _log_info(
-                    logger,
-                    f"[INT8][QAT] prepared with base {base_cfg.__class__.__name__}",
-                )
                 return (model, True, "QAT-prepare")
             except Exception as exc:
                 last_err = exc
@@ -1837,23 +2067,24 @@ class ModelPolicy:
     ) -> torch.dtype:
         dev = torch.device(device) if device is not None else get_device()
         candidates: List[torch.dtype] = []
-        if dev.type == "cuda":
-            try:
-                if Dataset.is_cuda_bf16_supported(dev):
+        match dev.type:
+            case "cuda":
+                try:
+                    if Dataset.is_cuda_bf16_supported(dev):
+                        candidates.append(torch.bfloat16)
+                except Exception:
+                    pass
+                candidates.extend((torch.float16, torch.float32))
+            case "cpu":
+                if Dataset.is_cpu_bf16_supported():
                     candidates.append(torch.bfloat16)
-            except Exception:
-                pass
-            candidates.extend((torch.float16, torch.float32))
-        elif dev.type == "cpu":
-            if Dataset.is_cpu_bf16_supported():
-                candidates.append(torch.bfloat16)
-            candidates.extend((torch.float32, torch.float64))
-        elif dev.type == "xpu":
-            candidates.extend((torch.bfloat16, torch.float32))
-        elif dev.type == "mps":
-            candidates.extend((torch.float16, torch.float32))
-        else:
-            candidates.append(torch.float32)
+                candidates.extend((torch.float32, torch.float64))
+            case "xpu":
+                candidates.extend((torch.bfloat16, torch.float32))
+            case "mps":
+                candidates.extend((torch.float16, torch.float32))
+            case _:
+                candidates.append(torch.float32)
         for dtype in candidates:
             if is_scale_safe(dtype, metadata):
                 return dtype
@@ -1874,7 +2105,7 @@ class ModelPolicy:
         model: nn.Module, metadata: Optional[Dataset[Any]] = None
     ) -> Dataset[Any]:
         Autocast.configure(model, metadata=metadata)
-        meta = Autocast._metadata
+        meta = Autocast._get_tls_metadata()
         if meta is None:
             ref = ModelPolicy._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
@@ -1904,19 +2135,29 @@ class ModelPolicy:
             state = src.state_dict()
         except (RuntimeError, AttributeError):
             return
+        # Prefer direct load_state_dict to avoid building a full converted copy.
+        try:
+            dst.load_state_dict(state, strict=False)
+            return
+        except Exception:
+            pass
+
+        # Fallback: selective conversion only when needed.
         ref = ModelPolicy._peek_layer(dst)
         device = ref.device if ref is not None else None
-        converted = {}
+        converted: Dict[str, Any] = {}
         for key, value in state.items():
-            if isinstance(value, torch.Tensor):
-                tensor = value.detach()
-                if params_dtype is not None and tensor.is_floating_point():
-                    tensor = tensor.to(dtype=params_dtype)
-                if device is not None:
-                    tensor = tensor.to(device=device)
-                converted[key] = tensor
-            else:
+            if not isinstance(value, torch.Tensor):
                 converted[key] = value
+                continue
+            tensor = value.detach()
+            if params_dtype is not None and tensor.is_floating_point() and tensor.dtype != params_dtype:
+                with contextlib.suppress(Exception):
+                    tensor = tensor.to(dtype=params_dtype)
+            if device is not None and getattr(tensor, "device", None) is not None and tensor.device != device:
+                with contextlib.suppress(Exception):
+                    tensor = tensor.to(device=device)
+            converted[key] = tensor
         with contextlib.suppress(Exception):
             dst.load_state_dict(converted, strict=False)
 
@@ -2034,6 +2275,8 @@ class ModelPolicy:
             return converted
 
         count = _convert(model)
+        if count:
+            _invalidate_model_introspection_caches(model)
         return (model, count)
 
     @staticmethod
@@ -2051,6 +2294,8 @@ class ModelPolicy:
                 if not getattr(module, "te_first", False):
                     module.te_first = True
                 swapped += 1
+        if swapped:
+            _invalidate_model_introspection_caches(model)
         return (model, swapped)
 
     @staticmethod
@@ -2186,6 +2431,7 @@ class ModelPolicy:
         )
         if te_present:
             setattr(model, "__fp8_inference_te__", True)
+            _invalidate_model_introspection_caches(model)
             if logger:
                 logger("[FP8][TE] te.* already present; using te.fp8_autocast")
             return (model, True, "TE present")
