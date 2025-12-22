@@ -701,28 +701,53 @@ class DilatedAttention(nn.Module):
         need_weights: bool = False,
         average_attn_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # Canonical internal layout: (B, L, D)
         transposed = False
         if not self.batch_first:
+            if x.dim() != 3:
+                raise ValueError(
+                    f"DilatedAttention expects a 3D tensor, got shape {tuple(x.shape)}"
+                )
+            L0, B0, _ = x.shape
             x = x.transpose(0, 1)
             if key_padding_mask is not None:
-                key_padding_mask = key_padding_mask.transpose(0, 1)
+                if key_padding_mask.dim() != 2:
+                    raise ValueError(
+                        f"key_padding_mask must be 2D, got rank {key_padding_mask.dim()}"
+                    )
+                # Accept either (B, L) or (L, B) when batch_first=False.
+                if key_padding_mask.shape == (B0, L0):
+                    pass
+                elif key_padding_mask.shape == (L0, B0):
+                    key_padding_mask = key_padding_mask.transpose(0, 1)
+                else:
+                    raise ValueError(
+                        "key_padding_mask shape mismatch for batch_first=False: "
+                        f"expected (B,L)=({B0},{L0}) or (L,B)=({L0},{B0}), got {tuple(key_padding_mask.shape)}"
+                    )
             transposed = True
+
+        if x.dim() != 3:
+            raise ValueError(
+                f"DilatedAttention expects a 3D tensor (B,L,D), got shape {tuple(x.shape)}"
+            )
 
         B, L, D = x.shape
         if D != self.embed_dim:
             raise ValueError(f"x.shape[-1]={D} must match embed_dim={self.embed_dim}")
 
+        want_weights = bool(need_weights)
+        avg_weights = bool(average_attn_weights) if want_weights else False
+
         kpm: Optional[torch.Tensor] = None
         if key_padding_mask is not None:
-            if key_padding_mask.shape[0] != B or key_padding_mask.shape[1] != L:
+            if key_padding_mask.shape != (B, L):
                 raise ValueError(
                     f"key_padding_mask must be (B, L)=({B},{L}), got {tuple(key_padding_mask.shape)}"
                 )
             kpm = key_padding_mask
             if kpm.dtype is not torch.bool:
                 kpm = kpm.to(torch.bool)
-            # SDPA/flex_attention require masks on the same device as inputs.
-            # In practice kpm is often constructed on CPU and passed to CUDA tensors.
             if kpm.device != x.device:
                 with contextlib.suppress(Exception):
                     kpm = kpm.to(device=x.device, non_blocking=True)
@@ -732,24 +757,32 @@ class DilatedAttention(nn.Module):
         q_pad: Optional[torch.Tensor] = None
         if kpm is not None:
             # Avoid inflating attention masks with query padding; mask output instead.
-            q_pad = kpm[:, :L]
+            q_pad = kpm
             with contextlib.suppress(Exception):
                 q_pad = q_pad.contiguous()
 
-        # Flex attention can support per-batch padding via a block mask.
-        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda)
+        # Flex attention can support per-batch padding via a block mask, but it cannot return
+        # attention weights. When need_weights=True, we prefer a direct "math" path that
+        # computes both output and weights in one pass.
+        use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (not want_weights))
 
-        base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
-        if L <= 512:
-            mult = base_mult
-        elif L <= 2048:
-            mult = base_mult * 2
+        # Length bucketing reduces fragmentation/overhead for the fast paths, but when we must
+        # return weights it's pure overhead (it increases L_k and therefore the weights tensor).
+        if want_weights:
+            L_k = int(L)
+            pad_len = 0
         else:
-            mult = base_mult * 4
-        mult = max(mult, 1)
+            base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
+            if L <= 512:
+                mult = base_mult
+            elif L <= 2048:
+                mult = base_mult * 2
+            else:
+                mult = base_mult * 4
+            mult = max(mult, 1)
 
-        L_k = int(((L + mult - 1) // mult) * mult)
-        pad_len = L_k - L
+            L_k = int(((L + mult - 1) // mult) * mult)
+            pad_len = L_k - L
 
         x_k = x
         kpm_k: Optional[torch.Tensor] = kpm
@@ -775,25 +808,156 @@ class DilatedAttention(nn.Module):
 
         x_k = self.norm1(x_k)
 
+        # Projections + reshape once, shared by all paths.
+        qkv = self.qkv(x_k)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        H = self.num_heads
+        Dh = self.head_dim
+        L_q = int(L)
+
+        qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
+        kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
+        vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
+
+        training = bool(self.training)
+        dropout_p = float(self.dropout_p) if training else 0.0
+
         attn_w: Optional[torch.Tensor] = None
 
-        L_q = L
+        def _masked_softmax(scores: torch.Tensor) -> torch.Tensor:
+            # scores: float32, may contain -inf. This implementation avoids NaNs for fully masked rows
+            # by defining softmax(-inf, ..., -inf) := 0.
+            maxv = scores.max(dim=-1, keepdim=True).values
+            maxv = torch.where(torch.isfinite(maxv), maxv, torch.zeros_like(maxv))
+            exp = torch.exp(scores - maxv)
+            denom = exp.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+            return exp / denom
 
-        if use_flex:
-            qkv = self.qkv(x_k)
-            q, k, v = qkv.chunk(3, dim=-1)
+        if want_weights:
+            # Compute output + attention weights efficiently without materializing extra large masks.
+            is_simple = (int(self.dilation) == 1) and (self.window_size is None)
 
-            H = self.num_heads
-            Dh = self.head_dim
+            base_mask_keep: Optional[torch.Tensor] = None
+            is_causal = False
 
-            training = bool(self.training)
-            scale = 1.0 / math.sqrt(float(Dh))
-            dropout_p = float(self.dropout_p) if training else 0.0
+            if is_simple and bool(self.causal) and (kpm_k is None):
+                # Causal-only, no padding: use a simple triangular mask.
+                is_causal = True
+            elif not (is_simple and (not bool(self.causal))):
+                # Need explicit keep-mask for:
+                #  - causal + any padding mask
+                #  - dilation/windowed attention (with or without causal)
+                base_mask_full = self._get_mask(L_k, x_k.device)
+                base_mask_keep = base_mask_full[:L_q, :]
 
-            qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
-            kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
-            vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
+            key_mask: Optional[torch.Tensor] = None
+            if kpm_k is not None:
+                kpm_b = kpm_k.to(torch.bool)
+                if kpm_b.dim() == 1:
+                    key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k)
+                else:
+                    key_mask = kpm_b[:, None, None, :]  # (B,1,1,L_k)
 
+            base_mask_out4: Optional[torch.Tensor] = None
+            if base_mask_keep is not None:
+                base_mask_out4 = (~base_mask_keep).to(torch.bool)[None, None, :, :]  # (1,1,Lq,Lk)
+
+            causal_mask: Optional[torch.Tensor] = None
+            if is_causal:
+                causal_mask = torch.ones((L_q, L_k), device=qh.device, dtype=torch.bool).triu(diagonal=1)
+                causal_mask = causal_mask[None, None, :, :]
+
+            # Heuristic batch microbatching to reduce peak memory when computing scores/probs.
+            env_mb = 0
+            with contextlib.suppress(Exception):
+                env_mb = int(os.environ.get("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", "0") or 0)
+
+            est = int(B) * int(H) * int(L_q) * int(L_k)
+            if env_mb > 0:
+                group = max(1, min(int(B), int(env_mb)))
+            else:
+                if est >= 64 * 1024 * 1024:
+                    group = 1
+                elif est >= 32 * 1024 * 1024:
+                    group = 2
+                elif est >= 16 * 1024 * 1024:
+                    group = 4
+                elif est >= 8 * 1024 * 1024:
+                    group = 8
+                else:
+                    group = int(B)
+                group = max(1, min(int(B), int(group)))
+
+            # Pre-allocate outputs to avoid repeated cat/alloc.
+            out_full = qh.new_empty((B, L_q, self.embed_dim))
+            if avg_weights:
+                attn_w_full = qh.new_empty((B, L_q, L_k))
+            else:
+                attn_w_full = qh.new_empty((B, H, L_q, L_k))
+
+            last_oom: Optional[RuntimeError] = None
+            while group >= 1:
+                try:
+                    for b0 in range(0, B, group):
+                        b1 = min(B, b0 + group)
+                        qg = qh[b0:b1]
+                        kg = kh[b0:b1]
+                        vg = vh[b0:b1]
+
+                        # (B_g,H,Lq,Dh) @ (B_g,H,Dh,Lk) -> (B_g,H,Lq,Lk)
+                        scores = torch.matmul(qg, kg.transpose(-2, -1))
+                        scores = scores * (1.0 / math.sqrt(float(Dh)))
+                        scores = scores.to(torch.float32)
+
+                        if causal_mask is not None:
+                            scores.masked_fill_(causal_mask, float("-inf"))
+                        if base_mask_out4 is not None:
+                            scores.masked_fill_(base_mask_out4, float("-inf"))
+
+                        if key_mask is not None:
+                            km = key_mask if key_mask.shape[0] == 1 else key_mask[b0:b1]
+                            scores.masked_fill_(km, float("-inf"))
+
+                        probs = _masked_softmax(scores)
+                        if dropout_p > 0.0:
+                            probs = F.dropout(probs, p=dropout_p, training=True)
+
+                        # Write weights first (optionally averaged) in the module dtype to save memory.
+                        if avg_weights:
+                            attn_w_full[b0:b1] = probs.mean(dim=1).to(dtype=qh.dtype)
+                        else:
+                            attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
+
+                        # Compute attention output using the (possibly dropped) probabilities.
+                        probs_out = probs.to(dtype=vg.dtype)
+                        yg = torch.matmul(probs_out, vg)  # (B_g,H,Lq,Dh)
+                        attn_out_g = self.out_proj(
+                            yg.transpose(1, 2).contiguous().view((b1 - b0), L_q, self.embed_dim)
+                        )
+                        if q_pad is not None:
+                            attn_out_g = attn_out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
+
+                        out_full[b0:b1] = attn_out_g
+
+                    last_oom = None
+                    break
+                except RuntimeError as e:
+                    msg = str(e)
+                    if "CUDA out of memory" not in msg and "out of memory" not in msg:
+                        raise
+                    last_oom = e
+                    if x_k.device.type == "cuda":
+                        with contextlib.suppress(Exception):
+                            empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
+                    group //= 2
+
+            if last_oom is not None:
+                raise last_oom
+
+            attn_out = out_full
+            attn_w = attn_w_full
+        elif use_flex:
             win = int(self.window_size) if self.window_size is not None else None
 
             if L_k <= 2048:
@@ -802,6 +966,8 @@ class DilatedAttention(nn.Module):
                 _block_size = 256
             else:
                 _block_size = 512
+
+            scale = 1.0 / math.sqrt(float(Dh))
 
             max_group = int(getattr(self, "flex_batch_microbatch", 0) or B)
             max_group = max(1, min(B, max_group))
@@ -820,7 +986,7 @@ class DilatedAttention(nn.Module):
 
                     kpm_g: Optional[torch.Tensor] = None
                     if kpm_k is not None:
-                        kpm_g = kpm_k[b0:b1]
+                        kpm_g = kpm_k[b0:b1] if kpm_k.dim() == 2 else None
 
                     if kpm_g is None:
                         block_mask_g = self._get_flex_block_mask(
@@ -853,10 +1019,8 @@ class DilatedAttention(nn.Module):
                             if self.dilation > 1:
                                 keep &= ((dq % self.dilation) == 0)
 
-                            if kpm_g is not None:
-                                # Mask only keys; query padding is handled by zeroing the output.
-                                keep = keep & (~kpm_g[b, kv_idx])
-
+                            # Mask only keys; query padding is handled by zeroing the output.
+                            keep = keep & (~kpm_g[b, kv_idx])
                             return keep
 
                         block_mask_g = create_block_mask(
@@ -1159,7 +1323,7 @@ class DilatedAttention(nn.Module):
         if transposed:
             x_out = x_out.transpose(0, 1)
 
-        if need_weights:
+        if want_weights:
             return x_out, attn_w
         return x_out, None
 
