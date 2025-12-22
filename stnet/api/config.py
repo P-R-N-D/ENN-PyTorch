@@ -46,6 +46,22 @@ def _shallow_dataclass_dict(obj: Any) -> Dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj.__class__)}
 
 
+def _shallow_copy_if_container(value: Any) -> Any:
+    """Shallow-copy common containers (no deep recursion).
+
+    This keeps the "no deepcopy" design goal, while avoiding surprising aliasing when a config
+    field happens to contain a mutable container (e.g. list).
+    """
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, set):
+        return set(value)
+    return value
+
+
+
 def _field_name_set(cls: type) -> frozenset[str]:
     return frozenset(f.name for f in fields(cls))
 
@@ -429,6 +445,33 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         compile_mode=compile_mode,
         safety_margin_pow2=safety_margin_pow2,
     )
+
+
+def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[str, Any]:
+    """Convert PatchConfig/dict/None into a JSON-friendly dict without dataclasses.asdict()."""
+    cfg = coerce_patch_config(config)
+    data = _shallow_dataclass_dict(cfg)
+    # Copy list/dict/set containers one level deep (no recursion).
+    return {k: _shallow_copy_if_container(v) for k, v in data.items()}
+
+
+def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[str, Any]:
+    """Convert ModelConfig/dict/None into a JSON-friendly dict without dataclasses.asdict().
+
+    Notes:
+    - Shallow conversion only (no recursion / deepcopy).
+    - Ensures `patch` is a plain dict.
+    - Ensures `device` is serializable (string) when it's a torch.device.
+    """
+    cfg = coerce_model_config(config)
+    data = _shallow_dataclass_dict(cfg)
+    data["patch"] = patch_config_to_dict(cfg.patch)
+
+    dev = data.get("device")
+    if isinstance(dev, torch.device):
+        data["device"] = str(dev)
+
+    return {k: _shallow_copy_if_container(v) for k, v in data.items()}
 
 
 def patch_config(base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any) -> PatchConfig:
