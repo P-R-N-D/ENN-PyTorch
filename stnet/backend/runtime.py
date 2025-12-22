@@ -221,7 +221,7 @@ except Exception:
 
 from ..api.config import RuntimeConfig, coerce_model_config
 from ..data.collections import Cache, Pool, LazyTensor
-from ..data.datatype import to_tensordict, to_torch_tensor
+from ..data.datatype import to_torch_tensor
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
 from ..model import fused
@@ -928,7 +928,6 @@ def _calibrate_per_sample_mem(
         try:
             from ..model.fused import Autocast
             from ..model.fused import Gradient
-            from tensordict import TensorDictBase
 
             feats, labels, *_rest = meta.preprocess(batch)
             X = to_torch_tensor(feats)
@@ -938,58 +937,41 @@ def _calibrate_per_sample_mem(
                 X = X.to(device=device, non_blocking=True)
 
                 if with_backward:
-                    td = to_tensordict({"features": X})
-                    if labels is not None:
-                        Y = to_torch_tensor(labels)
-                        Y = torch.atleast_2d(Y).to(device=device, non_blocking=True)
-                        Y_flat = Y.reshape(Y.shape[0], -1)
-                        td["labels_flat"] = Y_flat
-
                     model.train()
                     with Autocast.float(device):
-                        out = model(
-                            td,
+                        Y_flat = None
+                        if labels is not None:
+                            Y = to_torch_tensor(labels)
+                            Y = torch.atleast_2d(Y).to(device=device, non_blocking=True)
+                            Y_flat = Y.reshape(Y.shape[0], -1)
+
+                        y_hat, loss_val = model(
+                            X,
+                            labels_flat=Y_flat,
                             global_loss=global_loss,
                             local_loss=local_loss,
                             loss_weights=loss_weights,
                             calibrate_output=False,
                         )
-
                     target: Optional[torch.Tensor] = None
-                    if isinstance(out, TensorDictBase):
-                        target = out.get("loss_total", None)
-                        if target is None:
-                            pred = out.get("pred", None)
-                            if isinstance(pred, torch.Tensor):
-                                target = pred
-                    elif isinstance(out, torch.Tensor):
-                        target = out
-                    elif isinstance(out, (list, tuple)) and len(out) > 0:
-                        for v in out:
-                            if isinstance(v, torch.Tensor):
-                                target = v
-                                break
-                    elif isinstance(out, dict):
-                        for v in out.values():
-                            if isinstance(v, torch.Tensor):
-                                target = v
-                                break
+                    if isinstance(loss_val, torch.Tensor):
+                        target = loss_val
+                    elif isinstance(y_hat, torch.Tensor):
+                        target = y_hat
 
-                    if isinstance(target, torch.Tensor):
-                        loss = target
-                        if loss.ndim != 0:
-                            loss = loss.mean()
+                    if target is not None:
+                        loss = target if target.ndim == 0 else target.mean()
                         loss.backward()
                         forward_ran = True
                 else:
-                    td = to_tensordict({"features": X})
                     with Gradient.inference(model), Autocast.float(device):
                         _ = model(
-                            td,
+                            X,
                             global_loss=None,
                             local_loss=None,
                             loss_weights=None,
                             calibrate_output=True,
+                            return_loss=False,
                         )
                     forward_ran = True
         except Exception:
@@ -2028,6 +2010,7 @@ def epochs(
     scaler_x_device = model_for_scaler.scaler.x_mean.device
     scaler_y_device = model_for_scaler.scaler.y_mean.device
     with torch.no_grad():
+        used_memmap_stats = False
         x_count: int = 0
         x_sum: Optional[torch.Tensor] = None
         x_sum_sq: Optional[torch.Tensor] = None
@@ -2035,59 +2018,76 @@ def epochs(
         y_sum: Optional[torch.Tensor] = None
         y_sum_sq: Optional[torch.Tensor] = None
 
-        for batch in train_loader:
-            feats = batch["features"]
-            labs = batch["labels"]
-            if feats.ndim == 3 and feats.shape[1] == 1:
-                feats = feats.reshape(feats.shape[0], -1)
+        # Prefer persisted scaler stats from memmap metadata when available.
+        # This avoids an expensive pre-epoch full scan of the training loader.
+        scaler_stats: Optional[dict] = None
+        with contextlib.suppress(Exception):
+            scaler_stats = LazyTensor.load_scaler_stats(ops.sources)
+        if scaler_stats is not None:
+            used_memmap_stats = True
+            x_count = int(scaler_stats.get("train_count") or 0)
+            y_count = int(x_count)
+            x_sum = scaler_stats["x_sum"].to(device=scaler_x_device)
+            x_sum_sq = scaler_stats["x_sum_sq"].to(device=scaler_x_device)
+            y_sum = scaler_stats["y_sum"].to(device=scaler_y_device)
+            y_sum_sq = scaler_stats["y_sum_sq"].to(device=scaler_y_device)
+        else:
+            for batch in train_loader:
+                feats = batch["features"]
+                labs = batch["labels"]
+                if feats.ndim == 3 and feats.shape[1] == 1:
+                    feats = feats.reshape(feats.shape[0], -1)
 
-            xf = feats.to(device=scaler_x_device, dtype=torch.float64)
-            n_x = xf.shape[0]
-            if n_x > 0:
-                x_count += n_x
-                sx = xf.sum(dim=0)
-                sx2 = (xf * xf).sum(dim=0)
-                if x_sum is None:
-                    x_sum = sx
-                    x_sum_sq = sx2
-                else:
-                    x_sum += sx
-                    x_sum_sq += sx2
+                xf = feats.to(device=scaler_x_device, dtype=torch.float64)
+                n_x = xf.shape[0]
+                if n_x > 0:
+                    x_count += n_x
+                    sx = xf.sum(dim=0)
+                    sx2 = (xf * xf).sum(dim=0)
+                    if x_sum is None:
+                        x_sum = sx
+                        x_sum_sq = sx2
+                    else:
+                        x_sum += sx
+                        x_sum_sq += sx2
 
-            yf = labs.to(device=scaler_y_device, dtype=torch.float64)
-            if yf.ndim >= 2:
-                yf = yf.reshape(yf.shape[0], -1)
-            n_y = yf.shape[0]
-            if n_y > 0:
-                y_count += n_y
-                sy = yf.sum(dim=0)
-                sy2 = (yf * yf).sum(dim=0)
-                if y_sum is None:
-                    y_sum = sy
-                    y_sum_sq = sy2
-                else:
-                    y_sum += sy
-                    y_sum_sq += sy2
-        if is_distributed():
-            x_count_t = torch.tensor(
-                float(x_count), device=scaler_x_device, dtype=torch.float64
-            )
-            torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
-            x_count = int(x_count_t.item())
-            if x_sum is not None:
-                torch.distributed.all_reduce(x_sum, op=torch.distributed.ReduceOp.SUM)
-            if x_sum_sq is not None:
-                torch.distributed.all_reduce(x_sum_sq, op=torch.distributed.ReduceOp.SUM)
+                yf = labs.to(device=scaler_y_device, dtype=torch.float64)
+                if yf.ndim >= 2:
+                    yf = yf.reshape(yf.shape[0], -1)
+                n_y = yf.shape[0]
+                if n_y > 0:
+                    y_count += n_y
+                    sy = yf.sum(dim=0)
+                    sy2 = (yf * yf).sum(dim=0)
+                    if y_sum is None:
+                        y_sum = sy
+                        y_sum_sq = sy2
+                    else:
+                        y_sum += sy
+                        y_sum_sq += sy2
 
-            y_count_t = torch.tensor(
-                float(y_count), device=scaler_y_device, dtype=torch.float64
-            )
-            torch.distributed.all_reduce(y_count_t, op=torch.distributed.ReduceOp.SUM)
-            y_count = int(y_count_t.item())
-            if y_sum is not None:
-                torch.distributed.all_reduce(y_sum, op=torch.distributed.ReduceOp.SUM)
-            if y_sum_sq is not None:
-                torch.distributed.all_reduce(y_sum_sq, op=torch.distributed.ReduceOp.SUM)
+            # Only reduce across ranks when stats were computed locally.
+            # (When loaded from memmaps, every rank sees the same aggregated stats.)
+            if is_distributed() and not used_memmap_stats:
+                x_count_t = torch.tensor(
+                    float(x_count), device=scaler_x_device, dtype=torch.float64
+                )
+                torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
+                x_count = int(x_count_t.item())
+                if x_sum is not None:
+                    torch.distributed.all_reduce(x_sum, op=torch.distributed.ReduceOp.SUM)
+                if x_sum_sq is not None:
+                    torch.distributed.all_reduce(x_sum_sq, op=torch.distributed.ReduceOp.SUM)
+
+                y_count_t = torch.tensor(
+                    float(y_count), device=scaler_y_device, dtype=torch.float64
+                )
+                torch.distributed.all_reduce(y_count_t, op=torch.distributed.ReduceOp.SUM)
+                y_count = int(y_count_t.item())
+                if y_sum is not None:
+                    torch.distributed.all_reduce(y_sum, op=torch.distributed.ReduceOp.SUM)
+                if y_sum_sq is not None:
+                    torch.distributed.all_reduce(y_sum_sq, op=torch.distributed.ReduceOp.SUM)
 
         eps = float(model_for_scaler.scaler.eps)
         if x_count > 0 and x_sum is not None and x_sum_sq is not None:
@@ -2297,40 +2297,24 @@ def epochs(
                                         Y_flat = Y.reshape(Y.shape[0], -1)
                                         if Y_flat.device != device or Y_flat.dtype != param_dtype:
                                             Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=True)
-                                        td = to_tensordict(
-                                            {"features": X, "labels_flat": Y_flat}
-                                        )
-                                        model_out = model(
-                                            td,
+                                        y_hat, loss_val, loss_top_val, loss_bottom_val = model(
+                                            X,
+                                            labels_flat=Y_flat,
                                             global_loss=top_loss,
                                             local_loss=bottom_loss,
                                             loss_weights=loss_controller.weights(),
+                                            calibrate_output=False,
+                                            return_loss_components=True,
                                         )
-                                    if isinstance(model_out, TensorDictBase):
-                                        td = model_out
-                                        y_hat = td.get("pred")
-                                        loss_val = td.get("loss_total", None)
-                                        loss_top_val = td.get("loss_top", None)
-                                        loss_bottom_val = td.get("loss_bottom", None)
-                                        if (
-                                            isinstance(loss_val, torch.Tensor)
-                                            and loss_val.ndim > 0
-                                        ):
-                                            loss_val = loss_val.mean()
-                                        if (
-                                            isinstance(loss_top_val, torch.Tensor)
-                                            and loss_top_val.ndim > 0
-                                        ):
-                                            loss_top_val = loss_top_val.mean()
-                                        if (
-                                            isinstance(loss_bottom_val, torch.Tensor)
-                                            and loss_bottom_val.ndim > 0
-                                        ):
-                                            loss_bottom_val = loss_bottom_val.mean()
-                                    else:
-                                        loss_top_val = None
-                                        loss_bottom_val = None
-                                        y_hat, loss_val = model_out
+                                    if isinstance(loss_val, torch.Tensor) and loss_val.ndim > 0:
+                                        loss_val = loss_val.mean()
+                                    if isinstance(loss_top_val, torch.Tensor) and loss_top_val.ndim > 0:
+                                        loss_top_val = loss_top_val.mean()
+                                    if (
+                                        isinstance(loss_bottom_val, torch.Tensor)
+                                        and loss_bottom_val.ndim > 0
+                                    ):
+                                        loss_bottom_val = loss_bottom_val.mean()
                                     if loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during training. "
@@ -2802,29 +2786,20 @@ def epochs(
                                             )
                                             if callable(mark_step):
                                                 mark_step()
-                                        Yv_flat = Y.reshape(Y.shape[0], -1).to(
-                                            device, dtype=param_dtype, non_blocking=True
-                                        )
-                                        tdv = to_tensordict(
-                                            {"features": X, "labels_flat": Yv_flat}
-                                        )
-                                        model_out_val = model(
-                                            tdv,
-                                            global_loss=top_loss,
-                                            local_loss=bottom_loss,
-                                            loss_weights=loss_controller.weights(),
-                                        )
-                                        if isinstance(model_out_val, TensorDictBase):
-                                            tdv = model_out_val
-                                            _y = tdv.get("pred")
-                                            _loss_val = tdv.get("loss_total", None)
-                                            if (
-                                                isinstance(_loss_val, torch.Tensor)
-                                                and _loss_val.ndim > 0
-                                            ):
-                                                _loss_val = _loss_val.mean()
-                                        else:
-                                            _y, _loss_val = model_out_val
+                                        with Autocast.float(device):
+                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(
+                                                device, dtype=param_dtype, non_blocking=True
+                                            )
+                                            _y, _loss_val = model(
+                                                X,
+                                                labels_flat=Yv_flat,
+                                                global_loss=top_loss,
+                                                local_loss=bottom_loss,
+                                                loss_weights=loss_controller.weights(),
+                                                calibrate_output=False,
+                                            )
+                                        if isinstance(_loss_val, torch.Tensor) and _loss_val.ndim > 0:
+                                            _loss_val = _loss_val.mean()
                                     if _loss_val is None:
                                         raise RuntimeError(
                                             "Model returned no loss value during validation. "
@@ -3365,6 +3340,14 @@ def infer(
         if local_rank == 0
         else None
     )
+    # Fast path: stage into preallocated chunk buffers to avoid repeated
+    # concatenations and reduce allocator churn.
+    use_buffer = True
+    rows_buf: Optional[torch.Tensor] = None
+    pred_buf: Optional[torch.Tensor] = None
+    buf_fill = 0
+
+    # Fallback path for variable-shaped outputs.
     pending_rows: list[torch.Tensor] = []
     pending_preds: list[torch.Tensor] = []
     pending_count = 0
@@ -3374,24 +3357,82 @@ def infer(
     variable_shape = False
 
     def _flush() -> None:
-        nonlocal chunk_idx, pending_count
-        if pending_count <= 0:
-            return
-
-        rows = torch.cat(pending_rows, dim=0).to(dtype=torch.int64, copy=False).contiguous()
-        preds = torch.cat(pending_preds, dim=0).contiguous()
+        nonlocal chunk_idx, pending_count, buf_fill
+        if use_buffer:
+            if buf_fill <= 0:
+                return
+            assert rows_buf is not None and pred_buf is not None
+            rows = rows_buf[:buf_fill].contiguous()
+            preds = pred_buf[:buf_fill].contiguous()
+            buf_fill = 0
+        else:
+            if pending_count <= 0:
+                return
+            rows = (
+                torch.cat(pending_rows, dim=0)
+                .to(dtype=torch.int64, copy=False)
+                .contiguous()
+            )
+            preds = torch.cat(pending_preds, dim=0).contiguous()
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
         pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
         cache.submit(rows, path=rows_path)
         cache.submit(preds, path=pred_path)
         chunk_idx += 1
-        pending_rows.clear()
-        pending_preds.clear()
-        pending_count = 0
+        if not use_buffer:
+            pending_rows.clear()
+            pending_preds.clear()
+            pending_count = 0
 
 
         del rows, preds
-        gc.collect()
+
+    def _append(rows_cpu: torch.Tensor, preds_cpu: torch.Tensor) -> None:
+        nonlocal use_buffer, rows_buf, pred_buf, buf_fill, pending_count, first_tail, variable_shape
+
+        if preds_cpu.ndim < 1:
+            return
+        b = int(preds_cpu.shape[0])
+        if b <= 0:
+            return
+
+        rows_cpu = rows_cpu.reshape(-1).to(dtype=torch.int64, copy=False)
+
+        tail = tuple(int(x) for x in preds_cpu.shape[1:])
+        if first_tail is None:
+            first_tail = tail
+        elif tail != first_tail:
+            variable_shape = True
+            if use_buffer:
+                _flush()
+                use_buffer = False
+
+        if not use_buffer:
+            pending_rows.append(rows_cpu)
+            pending_preds.append(preds_cpu)
+            pending_count += b
+            if pending_count >= target_rows:
+                _flush()
+            return
+
+        if rows_buf is None:
+            rows_buf = torch.empty((target_rows,), dtype=torch.int64)
+        if pred_buf is None:
+            pred_buf = torch.empty((target_rows, *tail), dtype=preds_cpu.dtype)
+
+        start = 0
+        while start < b:
+            space = target_rows - buf_fill
+            if space <= 0:
+                _flush()
+                space = target_rows
+            n = min(space, b - start)
+            rows_buf[buf_fill : buf_fill + n].copy_(rows_cpu[start : start + n])
+            pred_buf[buf_fill : buf_fill + n].copy_(preds_cpu[start : start + n])
+            buf_fill += n
+            start += n
+            if buf_fill >= target_rows:
+                _flush()
 
     try:
         with Gradient.inference(run_model), Autocast.float(device):
@@ -3443,10 +3484,11 @@ def infer(
 
                     Xi = X[sl]
                     rows_i = row_ids[sl]
-                    tdp = to_tensordict({"features": Xi}, device=device)
 
                     try:
-                        out = run_model(tdp, calibrate_output=True)
+                        # Request tensor output to keep inference memory use
+                        # predictable (no TensorDict copies / aux tensors).
+                        out = run_model(Xi, calibrate_output=True, return_loss=False)
                     except RuntimeError as e:
                         msg = str(e).lower()
                         if "out of memory" in msg and mb > 1:
@@ -3458,37 +3500,24 @@ def infer(
                             except Exception:
                                 pass
                             with contextlib.suppress(Exception):
-                                del Xi, tdp
-                            gc.collect()
+                                del Xi
                             continue  
                         raise
 
-                    y_hat: Optional[torch.Tensor] = None
-                    if isinstance(out, TensorDictBase):
-                        y_hat = out.get("pred", None)
-                    if y_hat is None and isinstance(tdp, TensorDictBase):
-                        y_hat = tdp.get("pred", None)
-                    if y_hat is None:
-                        raise RuntimeError("infer: model output missing 'pred'")
+                    if isinstance(out, tuple):
+                        # Backward-compat: some wrappers may still return (pred, loss).
+                        y_hat = out[0]
+                    else:
+                        y_hat = out
 
-                    y_hat = y_hat.detach()
-                    tail = tuple(int(x) for x in y_hat.shape[1:])
-                    if first_tail is None:
-                        first_tail = tail
-                    elif tail != first_tail:
-                        variable_shape = True
+                    if not isinstance(y_hat, torch.Tensor):
+                        raise RuntimeError("infer: unexpected model output type")
 
-                    y_cpu = y_hat.to(device="cpu")
-                    rows_cpu = (rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")).to(dtype=torch.int64)
+                    y_cpu = y_hat.detach().to(device="cpu")
+                    rows_cpu = rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")
+                    _append(rows_cpu, y_cpu)
 
-                    pending_rows.append(rows_cpu.reshape(-1))
-                    pending_preds.append(y_cpu)
-                    pending_count += int(y_cpu.shape[0])
-
-                    if pending_count >= target_rows:
-                        _flush()
-
-                    del Xi, rows_i, tdp, out, y_hat, y_cpu, rows_cpu
+                    del Xi, rows_i, out, y_hat, y_cpu, rows_cpu
                     start = end
 
                 if status_bar is not None:

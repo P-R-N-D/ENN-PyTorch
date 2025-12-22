@@ -2524,14 +2524,30 @@ class Root(nn.Module):
         calibrate_output: bool = True,
         sanitize_nan: bool = True,
         return_loss: Optional[bool] = None,
+        return_loss_components: bool = False,
+        return_aux: bool = True,
         **kwargs: Any,
-    ) -> torch.Tensor | Tuple[torch.Tensor, Optional[torch.Tensor]] | TensorDictBase:
+    ) -> (
+        torch.Tensor
+        | Tuple[torch.Tensor, Optional[torch.Tensor]]
+        | Tuple[
+            torch.Tensor,
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+            Optional[torch.Tensor],
+        ]
+        | TensorDictBase
+    ):
         if not isinstance(calibrate_output, bool):
             raise TypeError("calibrate_output must be a bool")
         if not isinstance(sanitize_nan, bool):
             raise TypeError("sanitize_nan must be a bool")
         if return_loss is not None and not isinstance(return_loss, bool):
             raise TypeError("return_loss must be a bool or None")
+        if not isinstance(return_loss_components, bool):
+            raise TypeError("return_loss_components must be a bool")
+        if not isinstance(return_aux, bool):
+            raise TypeError("return_aux must be a bool")
 
         grad_enabled = torch.is_grad_enabled()
         infer_mode = not grad_enabled
@@ -2935,8 +2951,14 @@ class Root(nn.Module):
                     except TypeError:
                         out_td = td_input.clone(False)
                 out_td.set("pred", pred)
-                out_td.set("refined_tokens", refined_tokens)
-                out_td.set("residual_context", residual_context)
+                if return_aux:
+                    out_td.set("refined_tokens", refined_tokens)
+                    out_td.set("residual_context", residual_context)
+                else:
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("refined_tokens")
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("residual_context")
                 if loss_val is not None:
                     loss_td = loss_val
                     if isinstance(loss_td, torch.Tensor) and loss_td.ndim == 0:
@@ -2970,6 +2992,8 @@ class Root(nn.Module):
                 return out_td
             if return_loss is False:
                 return pred
+            if return_loss_components:
+                return (pred, loss_val, top_component, bottom_component)
             return (pred, loss_val)
         finally:
             if _did_unshard_processor and callable(_reshard):
