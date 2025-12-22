@@ -1,19 +1,19 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple, Union
-
 import os
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from typing import Any
 
 import numpy as np
 import torch
 from tensordict import TensorDict, TensorDictBase
 
-_TRUE = {"1", "true", "yes", "y", "on", "enable", "enabled"}
-_FALSE = {"0", "false", "no", "n", "off", "disable", "disabled"}
+_TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
+_FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 
 
-def parse_bool(value: object) -> Optional[bool]:
+def parse_bool(value: object) -> bool | None:
     """Parse common boolean env tokens.
 
     Returns:
@@ -27,17 +27,31 @@ def parse_bool(value: object) -> Optional[bool]:
         return None
     if s in _TRUE:
         return True
-    elif s in _FALSE:
+    if s in _FALSE:
         return False
     return None
 
 
-def env_str(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.environ.get(name)
-    if v is None:
+def _env_clean(value: object | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def env_str(name: str, default: str | None = None) -> str | None:
+    s = _env_clean(os.getenv(name))
+    return s if s is not None else default
+
+
+def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
+    s = env_str(name)
+    if s is None:
         return default
-    s = str(v).strip()
-    return s if s else default
+    try:
+        return cast(s)
+    except (ValueError, TypeError):
+        return default
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -48,26 +62,14 @@ def env_bool(name: str, default: bool = False) -> bool:
 
 
 def env_int(name: str, default: int = 0) -> int:
-    s = env_str(name)
-    if s is None:
-        return int(default)
-    try:
-        return int(s)
-    except Exception:
-        return int(default)
+    return int(_env_cast(name, int, int(default)))
 
 
 def env_float(name: str, default: float = 0.0) -> float:
-    s = env_str(name)
-    if s is None:
-        return float(default)
-    try:
-        return float(s)
-    except Exception:
-        return float(default)
+    return float(_env_cast(name, float, float(default)))
 
 
-def env_first(keys: Sequence[str], default: Optional[str] = None) -> Optional[str]:
+def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
     """Return the first non-empty env value among keys.
 
     Args:
@@ -79,11 +81,8 @@ def env_first(keys: Sequence[str], default: Optional[str] = None) -> Optional[st
     """
 
     for k in keys:
-        v = os.environ.get(k)
-        if v is None:
-            continue
-        s = str(v).strip()
-        if s:
+        s = _env_clean(os.getenv(k))
+        if s is not None:
             return s
     return default
 
@@ -101,7 +100,7 @@ def env_first_int(keys: Sequence[str], default: int = 0) -> int:
         return int(default)
     try:
         return int(v)
-    except Exception:
+    except (ValueError, TypeError):
         return int(default)
 
 
@@ -111,10 +110,10 @@ def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
         return float(default)
     try:
         return float(v)
-    except Exception:
+    except (ValueError, TypeError):
         return float(default)
 
-_CANONICAL_DTYPES: Dict[str, Dict[str, Any]] = {
+_CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
         "torch": torch.float64,
         "numpy": np.float64,
@@ -167,7 +166,7 @@ _CANONICAL_DTYPES: Dict[str, Dict[str, Any]] = {
     },
 }
 
-_DTYPE_ALIASES = {
+_DTYPE_ALIASES: dict[str, str] = {
     "float": "float32",
     "float_": "float32",
     "double": "float64",
@@ -191,7 +190,7 @@ _DTYPE_ALIASES = {
     "u8": "uint8",
 }
 
-_PLATFORM_ALIASES = {
+_PLATFORM_ALIASES: dict[str, str] = {
     "torch": "torch",
     "pytorch": "torch",
     "numpy": "numpy",
@@ -202,7 +201,7 @@ _PLATFORM_ALIASES = {
     "canonical": "name",
 }
 
-BatchLike = Union[Mapping[str, Any], TensorDictBase]
+BatchLike = Mapping[str, Any] | TensorDictBase
 
 
 def _canonical_dtype(src: Any) -> str:
@@ -224,6 +223,11 @@ def _canonical_dtype(src: Any) -> str:
         key = key.split(".", 1)[1]
     if key.startswith("numpy."):
         key = key.split(".", 1)[1]
+    # Handle representations like dtype('float32') or dtype(float32)
+    if key.startswith("dtype(") and key.endswith(")"):
+        inner = key[5:].strip("()").strip().strip("'\"")
+        if inner:
+            key = inner
     key = key.lstrip("<>|=")
     canonical = _DTYPE_ALIASES.get(key, key)
     if canonical not in _CANONICAL_DTYPES:
@@ -240,9 +244,12 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
     if normalized == "name":
         return canonical
     mapping = _CANONICAL_DTYPES.get(canonical)
-    if mapping is None or normalized not in mapping:
+    if mapping is None:
         raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}")
-    return mapping[normalized]
+    try:
+        return mapping[normalized]
+    except KeyError as e:
+        raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
 
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
@@ -251,68 +258,115 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
     for attr in ("to_torch_tensor", "to_torch", "to_tensor", "as_tensor"):
         method = getattr(obj, attr, None)
         if callable(method):
-            with torch.no_grad():
+            try:
                 out = method()
+            except TypeError:
+                # exists but requires args / incompatible signature
+                continue
+            except Exception:
+                # best-effort: ignore custom conversion failures
+                continue
             if isinstance(out, torch.Tensor):
                 return out
             try:
                 return torch.as_tensor(out)
             except Exception:
                 continue
-    return torch.as_tensor(obj)
+    try:
+        return torch.as_tensor(obj)
+    except Exception as e:
+        raise TypeError(f"cannot convert to torch.Tensor: {type(obj)}") from e
 
 
-def _get_batch_size(d: Mapping[str, Any]) -> list[int] | list:
+def _infer_batch_size(d: Mapping[str, Any]) -> list[int]:
     for value in d.values():
+        if isinstance(value, TensorDictBase):
+            bs = list(value.batch_size)
+            if bs:
+                return bs
         if torch.is_tensor(value) and value.ndim >= 1:
-            return [value.shape[0]]
+            return [int(value.shape[0])]
+        if isinstance(value, np.ndarray) and value.ndim >= 1:
+            return [int(value.shape[0])]
     return []
+
+
+def _maybe_to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # Avoid accidental moves when device index is unspecified (e.g., "cuda")
+    if device.index is None:
+        return t if t.device.type == device.type else t.to(device)
+    return t if t.device == device else t.to(device)
+
+
+def _maybe_td_to_device(td: TensorDictBase, device: torch.device) -> TensorDictBase:
+    td_dev = getattr(td, "device", None)
+    if td_dev is None:
+        return td.to(device)
+    if device.index is None:
+        return td if td_dev.type == device.type else td.to(device)
+    return td if td_dev == device else td.to(device)
+
+
+def _is_numpy_non_numeric(x: np.ndarray | np.generic) -> bool:
+    dt = getattr(x, "dtype", None)
+    if dt is None:
+        return False
+    # Skip dtype kinds that are not safely convertible to tensors
+    # - object / string: "O", "U", "S"
+    # - datetime / timedelta: "M", "m"
+    # - void / structured: "V"
+    return dt.kind in {"O", "U", "S", "M", "m", "V"}
 
 
 def to_tensordict(
     batch: BatchLike,
-    *args: Any,
-    device: Optional[torch.device] = None,
-    batch_size: Optional[Iterable[int]] = None,
-    **kwargs: Any,
+    *_args: Any,
+    device: torch.device | str | None = None,
+    batch_size: Iterable[int] | None = None,
+    **_kwargs: Any,
 ) -> TensorDict:
+    resolved_device = torch.device(device) if device is not None else None
     if isinstance(batch, TensorDictBase):
-        return batch.to(device) if device is not None else batch                              
+        return _maybe_td_to_device(batch, resolved_device) if resolved_device is not None else batch
     if not isinstance(batch, Mapping):
         raise TypeError(f"Unexpected batch type: {type(batch)}")
 
-    resolved_batch = list(batch_size) if batch_size is not None else _get_batch_size(batch)
-    td = TensorDict({}, batch_size=resolved_batch, device=device)
+    resolved_batch = list(batch_size) if batch_size is not None else _infer_batch_size(batch)
+    td = TensorDict({}, batch_size=resolved_batch, device=resolved_device)
 
     for key, value in batch.items():
         if torch.is_tensor(value):
             tensor = value
-            if device is not None:
-                tensor = tensor.to(device)
+            if resolved_device is not None:
+                tensor = _maybe_to_device(tensor, resolved_device)
             td.set(key, tensor)
         elif isinstance(value, TensorDictBase):
-            nested = value.to(device) if device is not None else value
+            nested = _maybe_td_to_device(value, resolved_device) if resolved_device is not None else value
             td.set(key, nested)
+        elif isinstance(value, (np.ndarray, np.generic)) and not _is_numpy_non_numeric(value):
+            tensor = torch.as_tensor(value)
+            if resolved_device is not None:
+                tensor = _maybe_to_device(tensor, resolved_device)
+            td.set(key, tensor)
         else:
             td.set_non_tensor(key, value)
     return td
 
 
-@torch.no_grad()
 def to_dict(
-    td_or_dict: Union[TensorDictBase, Mapping[str, Any]],
-    *args: Any,
+    td_or_dict: TensorDictBase | Mapping[str, Any],
+    *_args: Any,
     detach: bool = True,
     cpu: bool = True,
-    keys: Optional[Iterable[str]] = None,
-    **kwargs: Any,
-) -> Dict[str, Any]:
+    keys: Iterable[str] | None = None,
+    **_kwargs: Any,
+) -> dict[str, Any]:
     if isinstance(td_or_dict, TensorDictBase):
         td = td_or_dict
-        key_iter = keys or td.keys()
-        items = ((key, td.get(key)) for key in list(key_iter))
-        out: Dict[str, Any] = {}
-        for key, value in items:
+        key_iter = td.keys() if keys is None else keys
+        out: dict[str, Any] = {}
+        for key in key_iter:
+            value = td.get(key)
             if torch.is_tensor(value):
                 tensor = value.detach() if detach else value
                 if cpu and tensor.is_cuda:
@@ -326,23 +380,25 @@ def to_dict(
     if not isinstance(td_or_dict, Mapping):
         raise TypeError(f"to_dict expects TensorDictBase or Mapping, got: {type(td_or_dict)}")
 
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     for key, value in td_or_dict.items():
         if torch.is_tensor(value):
             tensor = value.detach() if detach else value
             tensor = tensor.cpu() if cpu and tensor.is_cuda else tensor
             out[key] = tensor
+        elif isinstance(value, TensorDictBase):
+            out[key] = to_dict(value, detach=detach, cpu=cpu)
         else:
             out[key] = value
     return out
 
 
-def to_tuple(x: Any) -> Tuple:
+def to_tuple(x: Any) -> tuple:
     if isinstance(x, tuple):
         return x
     elif isinstance(x, list):
         return tuple(x)
-    elif isinstance(x, torch.Tensor):
+    elif torch.is_tensor(x):
         return tuple(x.flatten().detach().cpu().tolist())
     elif hasattr(x, "tolist"):
         values = x.tolist()
