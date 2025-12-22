@@ -7,7 +7,6 @@ import json
 import logging
 import math
 import threading
-# json is used for structured AMP negotiation logs.
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -112,6 +111,7 @@ def _log_negotiate_once(
     except Exception:
         # Best-effort logging: never fail negotiation because logging broke.
         pass
+
 
 def _is_ptq_unavailable(
     model: nn.Module, *args: Any, **kwargs: Any
@@ -219,6 +219,8 @@ def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
     except Exception:
         pass
     return False
+
+
 def _dtype_short(dtype: Any) -> str:
     if isinstance(dtype, torch.dtype):
         return str(dtype).split(".")[-1]
@@ -471,7 +473,9 @@ class PrecisionPolicy:
                 meta.device = dev
                 meta.refresh()
 
-        action = normalize_underflow_action(getattr(meta, "underflow_action", None), default=default_underflow_action())
+        action = normalize_underflow_action(
+            getattr(meta, "underflow_action", None), default=default_underflow_action()
+        )
         with contextlib.suppress(Exception):
             meta.underflow_action = action
 
@@ -519,7 +523,9 @@ class PrecisionPolicy:
         amp: Optional[torch.dtype] = None
         for d in cleaned:
             if d in (torch.float16, torch.bfloat16):
-                if is_scale_safe(d, meta, safety_margin=safety_margin, underflow_action=action):
+                if is_scale_safe(
+                    d, meta, safety_margin=safety_margin, underflow_action=action
+                ):
                     amp = d
                     break
         reduce_dtype = amp if amp is not None else master
@@ -654,7 +660,9 @@ class Gradient:
                                 # across multiple ranks oversubscribes the node and hurts both
                                 # compilation latency and the data pipeline.
                                 cpu_count = int(process_cpu_count() or 1)
-                                per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                                per_rank = max(
+                                    1, int(cpu_count) // max(1, int(local_world))
+                                )
                                 _inductor_config.compile_threads = max(
                                     1, min(4, int(per_rank) // 2)
                                 )
@@ -692,7 +700,14 @@ class Gradient:
                         pass
 
                     try:
-                        if getattr(_inductor_config, "max_autotune_gemm_search_space", None) is not None:
+                        if (
+                            getattr(
+                                _inductor_config,
+                                "max_autotune_gemm_search_space",
+                                None,
+                            )
+                            is not None
+                        ):
                             _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
                     except Exception:
                         pass
@@ -700,6 +715,7 @@ class Gradient:
                     try:
                         if getattr(_inductor_config, "compile_threads", None) is not None:
                             import os
+
                             # max-autotune can be very memory hungry; default to serial compilation
                             # unless the user explicitly overrides the thread count.
                             override = None
@@ -1051,7 +1067,9 @@ class Autocast:
         collect_checks = False
         if logger is not None:
             try:
-                collect_checks = logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.INFO)
+                collect_checks = logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(
+                    logging.INFO
+                )
             except Exception:
                 # Best-effort: if probing fails, err on the side of collecting.
                 collect_checks = True
@@ -1062,16 +1080,25 @@ class Autocast:
 
         for dtype in candidates:
             ok, why = _scale_safety_check(
-                dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
+                dtype,
+                meta,
+                safety_margin=safety_margin,
+                underflow_action=underflow_override,
             )
             if collect_checks:
-                checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
+                checks.append(
+                    {"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)}
+                )
             if ok:
                 selected = dtype
                 break
 
         dev_type = str(getattr(device, "type", "")) if device is not None else ""
-        dev_index = int(getattr(device, "index", -1)) if (device is not None and getattr(device, "index", None) is not None) else -1
+        dev_index = (
+            int(getattr(device, "index", -1))
+            if (device is not None and getattr(device, "index", None) is not None)
+            else -1
+        )
         device_str = f"{dev_type}:{dev_index}" if dev_type else ""
 
         # Resolve fallbacks when candidates are not safe.
@@ -1085,10 +1112,15 @@ class Autocast:
                 fallback_order = (fallback, torch.int64, torch.float32, torch.float64)
             for dtype in fallback_order:
                 ok, why = _scale_safety_check(
-                    dtype, meta, safety_margin=safety_margin, underflow_action=underflow_override
+                    dtype,
+                    meta,
+                    safety_margin=safety_margin,
+                    underflow_action=underflow_override,
                 )
                 if collect_checks:
-                    checks.append({"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)})
+                    checks.append(
+                        {"dtype": _dtype_short(dtype), "ok": bool(ok), "reason": str(why)}
+                    )
                 if ok:
                     selected = dtype
                     break
@@ -1138,20 +1170,32 @@ class Autocast:
                 "selected_from": selected_from,
                 "fallback": _dtype_short(fallback),
                 "candidates": [_dtype_short(x) for x in candidates],
-                "fallback_order": ([_dtype_short(x) for x in fallback_order] if fallback_order else []),
+                "fallback_order": (
+                    ([_dtype_short(x) for x in fallback_order] if fallback_order else [])
+                ),
                 "checks": (checks if collect_checks else []),
                 "safety_margin": safety_margin,
                 "safety_margin_pow2": safety_margin_pow2,
                 "underflow_action_override": underflow_override,
                 "scale": {
-                    "has_scale": bool(getattr(meta, "has_scale", False)) if meta is not None else False,
-                    "has_nonfinite": bool(getattr(meta, "has_nonfinite", False)) if meta is not None else False,
+                    "has_scale": bool(getattr(meta, "has_scale", False))
+                    if meta is not None
+                    else False,
+                    "has_nonfinite": bool(getattr(meta, "has_nonfinite", False))
+                    if meta is not None
+                    else False,
                     "max_abs": getattr(meta, "scale_max_abs", None) if meta is not None else None,
-                    "min_positive": getattr(meta, "scale_min_positive", None) if meta is not None else None,
+                    "min_positive": getattr(meta, "scale_min_positive", None)
+                    if meta is not None
+                    else None,
                     "min_value": getattr(meta, "scale_min_value", None) if meta is not None else None,
                     "max_value": getattr(meta, "scale_max_value", None) if meta is not None else None,
-                    "underflow_action": str(getattr(meta, "underflow_action", "")) if meta is not None else "",
-                    "int_quant_bits": getattr(meta, "int_quant_bits", None) if meta is not None else None,
+                    "underflow_action": str(getattr(meta, "underflow_action", ""))
+                    if meta is not None
+                    else "",
+                    "int_quant_bits": getattr(meta, "int_quant_bits", None)
+                    if meta is not None
+                    else None,
                 },
             }
             _log_negotiate_once(logger, decision_key, payload, level=level)
@@ -1655,7 +1699,9 @@ _FakeQuantizedLinear: Any | None = None
 _FakeQuantizedEmbedding: Any | None = None
 
 try:
-    from torchao.quantization import Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization import (
+        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+    )
     from torchao.quantization import Int8WeightOnlyConfig as _Int8WeightOnlyConfig
     from torchao.quantization import quantize_ as _quantize
 except ImportError:
@@ -1682,7 +1728,11 @@ def _torchao_int8_ptq_impl(
     if str(mode).lower() not in {"int8", "w8", "w8a8", "int8wo"}:
         return (model, False, f"Unsupported PTQ mode: {mode}")
 
-    cfg_cls = _Int8DynamicActivationInt8WeightConfig if dynamic_activations else _Int8WeightOnlyConfig
+    cfg_cls = (
+        _Int8DynamicActivationInt8WeightConfig
+        if dynamic_activations
+        else _Int8WeightOnlyConfig
+    )
     if cfg_cls is None:
         return (model, False, "Quantization config unavailable")
 
@@ -1723,7 +1773,8 @@ except Exception:
         try:
             from torchao.quantization.qat import (
                 FromIntXQuantizationAwareTrainingConfig,
-                IntXQuantizationAwareTrainingConfig)
+                IntXQuantizationAwareTrainingConfig,
+            )
 
             class _ShimQATStep:
                 PREPARE = "prepare"
@@ -1766,7 +1817,9 @@ except Exception:
 
 
 try:
-    from torchao.quantization.qat import IntxFakeQuantizeConfig as _IntxFakeQuantizeConfig
+    from torchao.quantization.qat import (
+        IntxFakeQuantizeConfig as _IntxFakeQuantizeConfig,
+    )
     from torchao.quantization.qat import FakeQuantizedLinear as _FakeQuantizedLinear
     from torchao.quantization.qat import FakeQuantizedEmbedding as _FakeQuantizedEmbedding
 except Exception:
@@ -1913,8 +1966,8 @@ class Quantization:
             gs = None
 
         # NOTE:
-        # - activation fake-quant is NOT supported for embeddings (TorchAO raises) :contentReference[oaicite:2]{index=2}
-        # - symmetric per-token activation fake-quant is not supported :contentReference[oaicite:3]{index=3}
+        # - activation fake-quant is NOT supported for embeddings (TorchAO raises)
+        # - symmetric per-token activation fake-quant is not supported
         act_cfg = None
         if dynamic_activations:
             act_cfg = fq_cfg(dtype=torch.int8, granularity="per_token", is_symmetric=False)
@@ -2000,7 +2053,9 @@ class Quantization:
         cls._qat_convert_inplace(model, logger=logger)
         group_size = int(kwargs.pop("group_size", 128) or 128)
         try:
-            cfg = cls._build_int8_cfg(dynamic_activations=dynamic_activations, group_size=group_size)
+            cfg = cls._build_int8_cfg(
+                dynamic_activations=dynamic_activations, group_size=group_size
+            )
         except Exception as exc:
             return (model, False, f"Failed to initialize quantization config: {exc}")
         try:
@@ -2151,10 +2206,18 @@ class ModelPolicy:
                 converted[key] = value
                 continue
             tensor = value.detach()
-            if params_dtype is not None and tensor.is_floating_point() and tensor.dtype != params_dtype:
+            if (
+                params_dtype is not None
+                and tensor.is_floating_point()
+                and tensor.dtype != params_dtype
+            ):
                 with contextlib.suppress(Exception):
                     tensor = tensor.to(dtype=params_dtype)
-            if device is not None and getattr(tensor, "device", None) is not None and tensor.device != device:
+            if (
+                device is not None
+                and getattr(tensor, "device", None) is not None
+                and tensor.device != device
+            ):
                 with contextlib.suppress(Exception):
                     tensor = tensor.to(device=device)
             converted[key] = tensor
@@ -2446,7 +2509,9 @@ class ModelPolicy:
         try:
             from torchao.quantization import (
                 Float8DynamicActivationFloat8WeightConfig,
-                Float8WeightOnlyConfig, quantize_)
+                Float8WeightOnlyConfig,
+                quantize_,
+            )
 
             cfg = (
                 Float8DynamicActivationFloat8WeightConfig()
@@ -2591,6 +2656,7 @@ class ModelPolicy:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
+
 
 @lru_cache(maxsize=1)
 def _dot_product_attention_cls() -> Any:
