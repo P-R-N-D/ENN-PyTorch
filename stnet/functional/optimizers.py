@@ -7,6 +7,7 @@ import inspect
 import json
 import logging
 import threading
+from functools import lru_cache
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
@@ -129,21 +130,51 @@ def _log_opt_decision_once(
         _LOGGER.info(msg)
 
 
-def _filter_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Filter kwargs to match ctor signature (best-effort)."""
-    if not kwargs:
-        return {}
+@lru_cache(maxsize=256)
+def _ctor_allowed_keys(ctor: Any) -> Optional[frozenset[str]]:
+    """Return allowed kwarg keys for `ctor`, or None when filtering is unnecessary.
+
+    - Returns None when `ctor` accepts **kwargs or when introspection fails.
+    - Cached to avoid repeated `inspect.signature()` overhead during optimizer backend probing.
+    """
     try:
         sig = inspect.signature(ctor)
     except (TypeError, ValueError):
-        return dict(kwargs)
+        return None
 
-    # If ctor accepts **kwargs, no filtering needed.
     for p in sig.parameters.values():
         if p.kind == inspect.Parameter.VAR_KEYWORD:
+            return None
+
+    return frozenset(sig.parameters.keys())
+
+
+def _filter_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Filter kwargs to match ctor signature (best-effort, cached)."""
+    if not kwargs:
+        return {}
+
+    allowed: Optional[frozenset[str]] = None
+    try:
+        allowed = _ctor_allowed_keys(ctor)
+    except TypeError:
+        # Some callables may be unhashable; fall back to direct inspection.
+        allowed = None
+
+    if allowed is None:
+        # Either **kwargs is accepted, introspection failed, or ctor was unhashable.
+        # In the unhashable case, do a one-off filtering attempt.
+        try:
+            sig = inspect.signature(ctor)
+        except (TypeError, ValueError):
             return dict(kwargs)
 
-    allowed = set(sig.parameters.keys())
+        for p in sig.parameters.values():
+            if p.kind == inspect.Parameter.VAR_KEYWORD:
+                return dict(kwargs)
+
+        allowed = frozenset(sig.parameters.keys())
+
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
@@ -151,18 +182,85 @@ def _resolve_device_and_metadata(
     model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
     metadata: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.device, "Dataset[Any]"]:
+    """Resolve (device, metadata) from model/params + optional Dataset metadata.
+
+    Notes:
+      - When `metadata` is provided, it wins.
+      - For non-module inputs, we only "peek" the first param when the container is indexable
+        (to avoid consuming one-shot iterators).
+    """
     ref_tensor: Optional[torch.Tensor] = None
+
     if isinstance(model_or_params, nn.Module):
         ref_tensor = ModelPolicy._peek_layer(model_or_params)
+    elif metadata is None:
+        # Best-effort param peek without consuming iterators.
+        try:
+            if isinstance(model_or_params, Sequence) and model_or_params:
+                first = model_or_params[0]
+                if isinstance(first, dict):
+                    for group in model_or_params:
+                        if not isinstance(group, dict):
+                            continue
+                        ps = group.get("params", None)
+                        if isinstance(ps, Sequence) and ps:
+                            p0 = ps[0]
+                            if torch.is_tensor(p0):
+                                ref_tensor = p0
+                                break
+                else:
+                    if torch.is_tensor(first):
+                        ref_tensor = first
+        except Exception:
+            ref_tensor = None
+
     if metadata is not None:
         dev = torch.device(metadata.device)
     elif ref_tensor is not None:
         dev = ref_tensor.device
     else:
         dev = get_device()
+
     meta = Autocast.coerce_metadata(dev, metadata=metadata)
     dev = torch.device(meta.device)
     return dev, meta
+
+
+def _coerce_params(
+    model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]]
+) -> Union[List[nn.Parameter], List[Dict[str, Any]]]:
+    """Materialize `model_or_params` to a re-iterable container.
+
+    Motivation:
+      - Some optimizer backends (or our probing logic) may iterate parameters multiple times.
+      - Generators / one-shot iterators would be exhausted, leading to missing params.
+
+    Returns:
+      - List[nn.Parameter] when given a Module or iterable of parameters.
+      - List[Dict[str, Any]] when given param groups.
+    """
+    if isinstance(model_or_params, nn.Module):
+        return list(model_or_params.parameters())
+
+    # Param groups (common Torch optimizer API form)
+    if (
+        isinstance(model_or_params, (list, tuple))
+        and model_or_params
+        and isinstance(model_or_params[0], dict)
+    ):
+        groups: List[Dict[str, Any]] = []
+        for g in model_or_params:
+            if not isinstance(g, dict):
+                continue
+            gg = dict(g)
+            ps = gg.get("params", [])
+            # Generator / iterator safety: always materialize.
+            gg["params"] = list(ps)
+            groups.append(gg)
+        return groups
+
+    # Plain iterable of params
+    return list(model_or_params)
 
 
 def _master_cpu_dtypes(
@@ -198,12 +296,17 @@ def _cpu_master_tensor(
     master_float: torch.dtype,
     master_int: torch.dtype,
     pin_memory: bool = False,
+    non_blocking: Optional[bool] = None,
 ) -> torch.Tensor:
     """Detach and copy tensor to CPU in master dtype.
 
     - Floating tensors -> master_float
     - Complex tensors -> complex64/complex128 derived from master_float
     - All other tensors -> master_int (int64)
+
+    Implementation notes:
+      - Avoid a redundant CPU->CPU clone for non-CPU sources (GPU->CPU already creates a copy).
+      - When `pin_memory=True`, allocate pinned CPU storage directly (avoids `.pin_memory()` extra copy).
     """
     if not torch.is_tensor(t):
         raise TypeError("Expected a torch.Tensor")
@@ -215,15 +318,66 @@ def _cpu_master_tensor(
     else:
         target_dtype = master_int
 
-    out = t.detach()
-    # Ensure CPU + desired dtype. clone() to avoid aliasing.
-    if out.device.type != "cpu" or out.dtype != target_dtype:
-        out = out.to(device="cpu", dtype=target_dtype)
-    out = out.clone()
+    nb = bool(non_blocking) if non_blocking is not None else bool(pin_memory)
+
+    src = t.detach()
+
+    # Cast on the source device first when needed (avoids a CPU-side cast after transfer).
+    if src.dtype != target_dtype:
+        with contextlib.suppress(Exception):
+            src = src.to(dtype=target_dtype)
+
+    if src.device.type == "cpu":
+        # Must break aliasing with a fresh storage.
+        if pin_memory:
+            with contextlib.suppress(Exception):
+                out = torch.empty(src.shape, device="cpu", dtype=target_dtype, pin_memory=True)
+                out.copy_(src)
+                return out
+            with contextlib.suppress(Exception):
+                return src.clone().pin_memory()
+        return src.clone()
+
+    # Non-CPU source: transfer creates a new CPU tensor (already non-aliasing).
     if pin_memory:
         with contextlib.suppress(Exception):
-            out = out.pin_memory()
-    return out
+            out = torch.empty(src.shape, device="cpu", dtype=target_dtype, pin_memory=True)
+            out.copy_(src, non_blocking=nb)
+            return out
+
+    return src.to(device="cpu", dtype=target_dtype)
+
+
+def _to_cpu_detached(
+    t: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    pin_memory: bool,
+    non_blocking: bool,
+) -> torch.Tensor:
+    """Detach `t` and return a CPU tensor in `dtype` (best-effort).
+
+    When `pin_memory=True` and the source is CUDA, this attempts a pinned CPU destination
+    plus `copy_(non_blocking=...)` to reduce synchronization overhead.
+    """
+    if not torch.is_tensor(t):
+        raise TypeError("Expected a torch.Tensor")
+
+    src = t.detach()
+    if src.dtype != dtype:
+        with contextlib.suppress(Exception):
+            src = src.to(dtype=dtype)
+
+    if src.device.type == "cpu":
+        return src
+
+    if pin_memory:
+        with contextlib.suppress(Exception):
+            out = torch.empty(src.shape, device="cpu", dtype=dtype, pin_memory=True)
+            out.copy_(src, non_blocking=bool(non_blocking))
+            return out
+
+    return src.to(device="cpu", dtype=dtype)
 
 
 def _copy_tensor_into_(dst: torch.Tensor, src: torch.Tensor) -> None:
@@ -265,7 +419,9 @@ def _optimizer_state_to_param_device_(optimizer: optim.Optimizer) -> None:
                         continue
                     try:
                         # Heuristic: states matching param shape should match param dtype for in-place ops.
-                        target_dtype = p.dtype if getattr(p, "is_floating_point", False) and v.is_floating_point() and v.shape == p.shape else v.dtype
+                        p_is_float = bool(p.is_floating_point())
+                        v_is_float = bool(v.is_floating_point())
+                        target_dtype = p.dtype if (p_is_float and v_is_float and v.shape == p.shape) else v.dtype
                         p_state[k] = v.to(device=p.device, dtype=target_dtype)
                     except Exception:
                         try:
@@ -276,7 +432,7 @@ def _optimizer_state_to_param_device_(optimizer: optim.Optimizer) -> None:
         return
 
 
-class ExponentialMovingAverage:
+class ExponentialMovingAverage(nn.Module):
     """EMA for model (and optional optimizer state) with CPU master offload.
 
     Key guarantees:
@@ -292,17 +448,24 @@ class ExponentialMovingAverage:
         *,
         metadata: Optional["Dataset[Any]"] = None,
         pin_memory: bool = False,
+        update_every: int = 1,
+        non_blocking: Optional[bool] = None,
     ) -> None:
+        super().__init__()
         if not 0.0 < float(decay) < 1.0:
             raise ValueError("EMA decay must be in (0, 1)")
         self.decay = float(decay)
         self.pin_memory = bool(pin_memory)
+        self.update_every = max(1, int(update_every))
+        # When pin_memory=True, GPU->CPU copies can optionally use non_blocking.
+        self.non_blocking = (bool(non_blocking) if non_blocking is not None else bool(self.pin_memory))
+        self._step: int = 0
 
-        # Determine CPU master dtypes (fp32/fp64, int64) using fused PrecisionPolicy if available.
-        ref = ModelPolicy._peek_layer(model)
-        dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
-        meta = Autocast.coerce_metadata(dev, metadata=metadata)
-        self.master_float, self.master_int = _master_cpu_dtypes(torch.device(meta.device), meta)
+        self.metadata = metadata
+        self.master_float, self.master_int = _master_cpu_dtypes(
+            torch.device(Autocast.coerce_metadata(get_device(), metadata=metadata).device),
+            metadata,
+        )
 
         # CPU master shadow for model state.
         self.shadow: Dict[str, torch.Tensor] = {}
@@ -314,6 +477,7 @@ class ExponentialMovingAverage:
                         master_float=self.master_float,
                         master_int=self.master_int,
                         pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
                     )
 
         # Temporary stores for swap-style apply/restore.
@@ -330,6 +494,11 @@ class ExponentialMovingAverage:
         decay = self.decay
         one_m = 1.0 - decay
 
+        self._step += 1
+        do_update = (self.update_every <= 1) or (self._step % self.update_every == 0)
+        if not do_update:
+            return
+
         # --- Model EMA (CPU master) ---
         # Note: this offloads model tensors to CPU to update shadow. This is correct
         # but can be expensive for very large GPU models; callers may want to update
@@ -345,14 +514,18 @@ class ExponentialMovingAverage:
                     master_float=self.master_float,
                     master_int=self.master_int,
                     pin_memory=self.pin_memory,
+                    non_blocking=self.non_blocking,
                 )
                 continue
 
             if tensor.is_floating_point():
                 try:
-                    t_cpu = tensor.detach()
-                    if t_cpu.device.type != "cpu" or t_cpu.dtype != s.dtype:
-                        t_cpu = t_cpu.to(device="cpu", dtype=s.dtype)
+                    t_cpu = _to_cpu_detached(
+                        tensor,
+                        dtype=s.dtype,
+                        pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
+                    )
                     # EMA update on CPU
                     s.mul_(decay).add_(t_cpu, alpha=one_m)
                 except Exception:
@@ -362,13 +535,17 @@ class ExponentialMovingAverage:
                         master_float=self.master_float,
                         master_int=self.master_int,
                         pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
                     )
             else:
                 # Always copy non-float buffers (no aliasing).
                 try:
-                    t_cpu = tensor.detach()
-                    if t_cpu.device.type != "cpu" or t_cpu.dtype != s.dtype:
-                        t_cpu = t_cpu.to(device="cpu", dtype=s.dtype)
+                    t_cpu = _to_cpu_detached(
+                        tensor,
+                        dtype=s.dtype,
+                        pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
+                    )
                     s.copy_(t_cpu)
                 except Exception:
                     self.shadow[name] = _cpu_master_tensor(
@@ -376,6 +553,7 @@ class ExponentialMovingAverage:
                         master_float=self.master_float,
                         master_int=self.master_int,
                         pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
                     )
 
         if optimizer is None:
@@ -401,6 +579,7 @@ class ExponentialMovingAverage:
                                     master_float=self.master_float,
                                     master_int=self.master_int,
                                     pin_memory=self.pin_memory,
+                                    non_blocking=self.non_blocking,
                                 )
                             else:
                                 s_slot[sk] = copy.deepcopy(sv)
@@ -436,9 +615,12 @@ class ExponentialMovingAverage:
                             prev = s_slot.get(sk)
                             if torch.is_tensor(prev) and prev.is_floating_point() and prev.shape == sv.shape:
                                 try:
-                                    sv_cpu = sv.detach()
-                                    if sv_cpu.device.type != "cpu" or sv_cpu.dtype != prev.dtype:
-                                        sv_cpu = sv_cpu.to(device="cpu", dtype=prev.dtype)
+                                    sv_cpu = _to_cpu_detached(
+                                        sv,
+                                        dtype=prev.dtype,
+                                        pin_memory=self.pin_memory,
+                                        non_blocking=self.non_blocking,
+                                    )
                                     prev.mul_(decay).add_(sv_cpu, alpha=one_m)
                                     continue
                                 except Exception:
@@ -448,6 +630,7 @@ class ExponentialMovingAverage:
                                 master_float=self.master_float,
                                 master_int=self.master_int,
                                 pin_memory=self.pin_memory,
+                                non_blocking=self.non_blocking,
                             )
                         else:
                             # Non-float tensors: always overwrite with CPU master copy.
@@ -456,6 +639,7 @@ class ExponentialMovingAverage:
                                 master_float=self.master_float,
                                 master_int=self.master_int,
                                 pin_memory=self.pin_memory,
+                                non_blocking=self.non_blocking,
                             )
                     else:
                         s_slot[sk] = copy.deepcopy(sv)
@@ -493,6 +677,7 @@ class ExponentialMovingAverage:
                         master_float=self.master_float,
                         master_int=self.master_int,
                         pin_memory=self.pin_memory,
+                        non_blocking=self.non_blocking,
                     )
         self.collected = collected
 
@@ -513,6 +698,7 @@ class ExponentialMovingAverage:
                                     master_float=self.master_float,
                                     master_int=self.master_int,
                                     pin_memory=self.pin_memory,
+                                    non_blocking=self.non_blocking,
                                 )
                             else:
                                 s2[sk] = copy.deepcopy(sv)
@@ -578,8 +764,8 @@ class AdamW:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
-        params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-        dev, meta = _resolve_device_and_metadata(model_or_params, metadata)
+        params = _coerce_params(model_or_params)
+        dev, meta = _resolve_device_and_metadata(model_or_params if isinstance(model_or_params, nn.Module) else params, metadata)
 
         dev_index = int(getattr(dev, "index", -1)) if getattr(dev, "index", None) is not None else -1
         scale_key = (
@@ -751,8 +937,8 @@ class AdamW:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> optim.Optimizer:
-        params = model_or_params.parameters() if hasattr(model_or_params, "parameters") else model_or_params
-        dev, meta = _resolve_device_and_metadata(model_or_params, metadata)
+        params = _coerce_params(model_or_params)
+        dev, meta = _resolve_device_and_metadata(model_or_params if isinstance(model_or_params, nn.Module) else params, metadata)
 
         dev_index = int(getattr(dev, "index", -1)) if getattr(dev, "index", None) is not None else -1
         scale_key = (

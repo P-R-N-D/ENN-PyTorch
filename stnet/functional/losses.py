@@ -530,8 +530,12 @@ class CRPSLoss(nn.Module):
             z0 = torch.randn((pair_k, *z_obs.shape), device=device, dtype=dtype)
             z1 = torch.randn((pair_k, *z_obs.shape), device=device, dtype=dtype)
             z_pair = delta.unsqueeze(0) * z0.abs() + tail.unsqueeze(0) * z1
-            diff_pair = (z_pair.unsqueeze(1) - z_pair.unsqueeze(0)).abs()
-            e2 = 0.5 * diff_pair.mean(dim=(0, 1))
+            # Avoid O(pair_k^2) materialization: sample random pairs instead.
+            m_pairs = min(int(pair_k * (pair_k - 1)), 64)
+            idx_i = torch.randint(0, pair_k, (m_pairs,), device=device)
+            idx_j = (idx_i + torch.randint(1, pair_k, (m_pairs,), device=device)) % pair_k
+            diff = (z_pair[idx_i] - z_pair[idx_j]).abs()
+            e2 = 0.5 * diff.mean(dim=0)
         else:
             e2 = torch.zeros_like(e1)
 
@@ -959,10 +963,15 @@ class StandardNormalLoss(DistributionLoss):
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StandardNormalLoss: {self.metric}")
         self._std_normal = Normal(loc=0.0, scale=1.0)
+        # Cache scalar z-threshold once (device/dtype independent).
+        q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
+        try:
+            self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q, dtype=torch.float64)).item())
+        except Exception:
+            self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q)).item())
 
     def _z_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
-        q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
-        return self._std_normal.icdf(torch.tensor(q, device=device, dtype=dtype))
+        return torch.tensor(self._z_threshold_f64, device=device, dtype=dtype)
 
     def _compute_margin(
         self,
@@ -1055,25 +1064,63 @@ class StudentsTLoss(DistributionLoss):
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StudentsTLoss: {self.metric}")
 
+        # Cache scalar t-threshold for fixed df (avoids repeated icdf/bisection in forward).
+        self._cached_t_threshold_f64: Optional[float] = None
+        self._cached_t_df: Optional[float] = None
+        self._cached_t_q: Optional[float] = None
+
     def _t_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
+
+        df_scalar: Optional[float] = None
+        try:
+            if torch.is_tensor(self.df):
+                if int(self.df.numel()) == 1:
+                    df_scalar = float(self.df.detach().cpu().item())
+            else:
+                df_scalar = float(self.df)
+        except Exception:
+            df_scalar = None
+
+        df_requires_grad = torch.is_tensor(self.df) and self.df.requires_grad
+
+        if (
+            df_scalar is not None
+            and not df_requires_grad
+            and self._cached_t_threshold_f64 is not None
+            and self._cached_t_df == df_scalar
+            and self._cached_t_q == float(q)
+        ):
+            return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
+
         df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
         try:
             dist = StudentT(df=df)
-            return dist.icdf(torch.tensor(q, device=device, dtype=dtype))
+            thr = dist.icdf(torch.tensor(q, device=device, dtype=dtype))
         except NotImplementedError:
             target = torch.full_like(df, float(q), dtype=dtype, device=device)
             loc = torch.zeros_like(df, dtype=dtype, device=device)
             scale = torch.ones_like(df, dtype=dtype, device=device)
             lo = torch.full_like(df, -50.0, dtype=dtype, device=device)
             hi = torch.full_like(df, 50.0, dtype=dtype, device=device)
-            for _ in range(32):
-                mid = (lo + hi) / 2.0
-                cdf_mid = _students_t_cdf(mid, df, loc, scale)
-                mask = cdf_mid < target
-                lo = torch.where(mask, mid, lo)
-                hi = torch.where(mask, hi, mid)
-            return hi
+            for _ in range(64):
+                mid = 0.5 * (lo + hi)
+                c = _students_t_cdf(mid, df=df, loc=loc, scale=scale)
+                hi = torch.where(c >= target, mid, hi)
+                lo = torch.where(c < target, mid, lo)
+            thr = 0.5 * (lo + hi)
+
+        # Cache only when df is a fixed scalar.
+        if df_scalar is not None and not df_requires_grad and thr.numel() == 1:
+            try:
+                self._cached_t_threshold_f64 = float(thr.detach().double().cpu().item())
+                self._cached_t_df = float(df_scalar)
+                self._cached_t_q = float(q)
+                return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
+            except Exception:
+                pass
+
+        return thr
 
     def _compute_margin(
         self,
@@ -1309,6 +1356,24 @@ class LinearCombinationLoss(nn.Module):
 
 
 class TiledLoss(nn.Module):
+    """Apply a base loss in tiles to reduce peak memory.
+
+    This wrapper supports masking and produces a *globally correct* reduction
+    even when the base loss returns a reduced scalar (e.g., reduction='mean').
+
+    Args:
+        base: loss module taking (pred, target) -> loss tensor (elementwise or reduced).
+        mask_mode: 'none' | 'finite' | 'neq'
+        mask_value: for 'neq' mode
+        tile_dim: dimension to tile along (default: no tiling)
+        tile_size: tile length (default: no tiling)
+        reduction: 'mean' | 'sum' | 'none' (wrapper reduction)
+        base_reduction: 'auto' | 'none' | 'mean' | 'sum'
+            - 'auto' uses `base.reduction` if present, otherwise:
+              * elementwise if base output shape matches tile shape
+              * 'mean' if base output is scalar
+    """
+
     def __init__(
         self,
         base: nn.Module,
@@ -1318,6 +1383,7 @@ class TiledLoss(nn.Module):
         tile_dim: Optional[int] = None,
         tile_size: Optional[int] = None,
         reduction: str = "mean",
+        base_reduction: str = "auto",
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -1327,10 +1393,18 @@ class TiledLoss(nn.Module):
         self.mask_value = mask_value
         self.tile_dim = tile_dim
         self.tile_size = int(tile_size) if tile_size is not None else None
+
         reduction_v = str(reduction).lower()
         if reduction_v not in ("mean", "sum", "none"):
             raise ValueError(f"reduction must be one of ('mean', 'sum', 'none'), got {reduction!r}")
         self.reduction = reduction_v
+
+        base_red = str(base_reduction).lower()
+        if base_red not in ("auto", "none", "mean", "sum"):
+            raise ValueError(
+                f"base_reduction must be one of ('auto', 'none', 'mean', 'sum'), got {base_reduction!r}"
+            )
+        self.base_reduction = base_red
 
     def _mask(self, pred: torch.Tensor, target: torch.Tensor) -> Optional[torch.Tensor]:
         match self.mask_mode:
@@ -1364,6 +1438,18 @@ class TiledLoss(nn.Module):
             return x
         return x
 
+    def _infer_base_reduction(self, loss: torch.Tensor, tile_pred: torch.Tensor) -> str:
+        if self.base_reduction != "auto":
+            return self.base_reduction
+        red = getattr(self.base, "reduction", None)
+        if isinstance(red, str) and red.lower() in ("mean", "sum", "none"):
+            return red.lower()
+        if loss.shape == tile_pred.shape:
+            return "none"
+        if loss.numel() == 1 or loss.ndim == 0:
+            return "mean"
+        return "none"
+
     def reduce(self, x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
         x2 = self._masked_select_safe(x, mask)
         match self.reduction:
@@ -1378,16 +1464,52 @@ class TiledLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         mask = self._mask(pred, target)
 
+        # Fast path: no tiling (still handle scalar base reductions correctly).
         if self.tile_dim is None or self.tile_size is None:
             v = self.base(pred, target)
-            return self.reduce(v, mask)
+            base_red = self._infer_base_reduction(v, pred)
 
+            if self.reduction == "none":
+                return self._masked_select_safe(v, mask)
+
+            if base_red == "none" or v.shape == pred.shape:
+                return self.reduce(v, mask)
+
+            # Reduced output: compute global sum/mean consistently.
+            if mask is not None and mask.shape == pred.shape:
+                pv = pred[mask]
+                tv = target[mask]
+                n = int(pv.numel())
+                if n == 0:
+                    return pred.new_zeros(())
+                v = self.base(pv, tv)
+            else:
+                n = int(pred.numel())
+
+            if v.numel() == 1:
+                v_scalar = v.reshape(())
+                if base_red == "sum":
+                    total_sum = v_scalar
+                else:  # assume mean
+                    total_sum = v_scalar * float(n)
+                if self.reduction == "sum":
+                    return total_sum
+                return total_sum / float(max(n, 1))
+
+            # Fallback: treat as elementwise-ish.
+            if self.reduction == "sum":
+                return v.sum()
+            return v.mean()
+
+        # --- Tiled path ---
         nd = int(pred.ndim)
         td = int(self.tile_dim) + nd if int(self.tile_dim) < 0 else int(self.tile_dim)
         td = max(0, min(td, nd - 1))
         N = int(pred.shape[td])
 
-        total_sum = pred.new_tensor(0.0)
+        # Accumulate in fp32 when inputs are low precision.
+        acc_dtype = torch.float32 if pred.dtype in (torch.float16, torch.bfloat16) else pred.dtype
+        total_sum = pred.new_tensor(0.0, dtype=acc_dtype)
         total_count: int = 0
         parts: List[torch.Tensor] = []
 
@@ -1396,11 +1518,11 @@ class TiledLoss(nn.Module):
             end = min(N, start + int(self.tile_size))
             sl = [slice(None)] * nd
             sl[td] = slice(start, end)
-            idx = tuple(sl)
+            sl_tuple = tuple(sl)
 
-            pv = pred[idx]
-            tv = target[idx]
-            mv = mask[idx] if mask is not None else None
+            pv = pred[sl_tuple]
+            tv = target[sl_tuple]
+            mv = mask[sl_tuple] if mask is not None else None
 
             elem = self.base(pv, tv)
 
@@ -1409,7 +1531,13 @@ class TiledLoss(nn.Module):
                 if mv is not None and elem.shape == mv.shape:
                     flat = flat[mv.reshape(-1)]
                 parts.append(flat)
-            else:
+                start = end
+                continue
+
+            base_red = self._infer_base_reduction(elem, pv)
+
+            # Elementwise loss: can be masked on the output.
+            if base_red == "none" or elem.shape == pv.shape:
                 if mv is not None and elem.shape == mv.shape:
                     selected = elem.masked_select(mv)
                     total_sum = total_sum + selected.sum()
@@ -1417,6 +1545,32 @@ class TiledLoss(nn.Module):
                 else:
                     total_sum = total_sum + elem.sum()
                     total_count += int(elem.numel())
+                start = end
+                continue
+
+            # Reduced loss (typically scalar). For correctness under masking, recompute on masked selection.
+            if mv is not None and mv.shape == pv.shape:
+                pv2 = pv[mv]
+                tv2 = tv[mv]
+                n = int(pv2.numel())
+                if n == 0:
+                    start = end
+                    continue
+                elem2 = self.base(pv2, tv2)
+            else:
+                n = int(pv.numel())
+                elem2 = elem
+
+            if elem2.numel() == 1:
+                v_scalar = elem2.reshape(())
+                if base_red == "sum":
+                    total_sum = total_sum + v_scalar
+                else:  # assume mean
+                    total_sum = total_sum + v_scalar * float(n)
+                total_count += int(n)
+            else:
+                total_sum = total_sum + elem2.sum()
+                total_count += int(elem2.numel())
 
             start = end
 
