@@ -184,8 +184,9 @@ class PatchAttention(nn.Module):
                             )
 
                         def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            # flex_attention expects keep-mask: True = allowed
-                            return m[qi, kj]
+                            # Project boundary: mask-out (True=masked).
+                            # flex_attention expects keep-mask (True=allowed) -> invert.
+                            return ~m[qi, kj]
 
                     case 3:
                         if m.shape != (B, N, N):
@@ -194,7 +195,7 @@ class PatchAttention(nn.Module):
                             )
 
                         def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            return m[b, qi, kj]
+                            return ~m[b, qi, kj]
 
                     case 4:
                         b0, hm, s1, s2 = m.shape
@@ -205,7 +206,7 @@ class PatchAttention(nn.Module):
                         if hm == 1:
 
                             def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return m[b, 0, qi, kj]
+                                return ~m[b, 0, qi, kj]
 
                         elif hm != self.nhead:
                             raise ValueError(
@@ -214,7 +215,7 @@ class PatchAttention(nn.Module):
                         else:
 
                             def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return m[b, h, qi, kj]
+                                return ~m[b, h, qi, kj]
 
                     case _:
                         raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
@@ -492,7 +493,6 @@ class DilatedAttention(nn.Module):
         self._mask_cache = OrderedDict()
         self._flex_block_mask_cache = OrderedDict()
 
-
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
         if int(L) > _DILATED_MASK_CACHE_MAX_L:
             return _get_dilated_mask(
@@ -556,8 +556,6 @@ class DilatedAttention(nn.Module):
             except Exception:
                 pass
         return mask
-
-
 
     def _get_flex_block_mask(
         self,
@@ -654,7 +652,6 @@ class DilatedAttention(nn.Module):
                 pass
         return block_mask
 
-
     def _call_dot_attn(
         self,
         q: torch.Tensor,
@@ -696,7 +693,6 @@ class DilatedAttention(nn.Module):
             kwargs[str(causal_kw)] = bool(is_causal)
 
         return attn(q, k, v, **kwargs)
-
 
     def forward(
         self,
@@ -1029,10 +1025,10 @@ class DilatedAttention(nn.Module):
                     kpm_b = kpm_k.to(torch.bool)
                     # Support either (B, L_k) or (L_k,) masks:
                     if kpm_b.dim() == 1:
-                        # DotProductAttention bool mask is mask-out: True = disallowed
-                        key_mask = (~kpm_b)[None, None, None, :]  # (1,1,1,L_k)
+                        # DotProductAttention bool mask is mask-out: True = disallowed (padding).
+                        key_mask = kpm_b[None, None, None, :]  # (1,1,1,L_k)
                     else:
-                        key_mask = (~kpm_b)[:, None, None, :]     # (B,1,1,L_k)
+                        key_mask = kpm_b[:, None, None, :]     # (B,1,1,L_k)
 
                 base_mask: Optional[torch.Tensor] = None
                 if base_mask_keep is not None:
@@ -1099,7 +1095,7 @@ class DilatedAttention(nn.Module):
                             try:
                                 for b0 in range(0, B, group):
                                     b1 = min(B, b0 + group)
-                                    attn_mask_g = base4 & key_mask[b0:b1]
+                                    attn_mask_g = base4 | key_mask[b0:b1]
                                     y_g = self._call_dot_attn(
                                         qh[b0:b1],
                                         kh[b0:b1],
@@ -1166,6 +1162,7 @@ class DilatedAttention(nn.Module):
         if need_weights:
             return x_out, attn_w
         return x_out, None
+
 
 class CrossAttention(nn.Module):
     def __init__(
