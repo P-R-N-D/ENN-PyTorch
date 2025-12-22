@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
 import torch
+import numpy as np
 
 _BOOTSTRAP_DEPTH = 0
 
