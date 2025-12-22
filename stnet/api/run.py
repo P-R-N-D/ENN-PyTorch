@@ -6,26 +6,27 @@ import json
 import os
 import random
 import shutil
+import threading
 from dataclasses import asdict
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from tensordict import MemoryMappedTensor, TensorDictBase
 import torch.multiprocessing as mp
-from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
-                                          load, save)
-from torch.distributed.checkpoint.state_dict import (StateDictOptions,
-                                                     get_model_state_dict,
-                                                     set_model_state_dict)
+from tensordict import MemoryMappedTensor, TensorDictBase
+from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
 
 try:
     from torch.distributed.run import LaunchConfig, elastic_launch
-except ImportError:
+except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from ..backend.distributed import (get_available_host, get_preferred_ip,
-                                   initialize_master_addr)
+from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
 from ..backend.runtime import _trim_dcp_keys, main
 from ..backend.system import (
     WorkerPolicy,
@@ -36,12 +37,15 @@ from ..backend.system import (
 )
 from ..data.collections import LazyTensor
 from ..data.datatype import env_bool
-from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..data.nodes import preload_memmap
+from ..data.pipeline import Dataset, default_underflow_action, normalize_underflow_action
 from ..model.nn import History, Root, resize_scaler_buffer
-from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
-                     runtime_config)
+from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
 
+
+# -----------------------------
+# Process / device housekeeping
+# -----------------------------
 
 def _reset_process_group() -> None:
     """Best-effort cleanup for a potentially initialized process group.
@@ -51,13 +55,10 @@ def _reset_process_group() -> None:
 
     This function is intentionally conservative: it never raises.
     """
-
     try:
         import torch.distributed as _dist
 
         if _dist.is_available() and _dist.is_initialized():
-            # A barrier is best-effort. Some backends can hang if ranks are
-            # inconsistent, so keep it suppressed.
             with contextlib.suppress(Exception):
                 _dist.barrier()
             with contextlib.suppress(Exception):
@@ -68,7 +69,6 @@ def _reset_process_group() -> None:
 
 def _clear_device_caches() -> None:
     """Release best-effort accelerator caches (CUDA/XPU/MPS) and run GC."""
-
     with contextlib.suppress(Exception):
         import gc
 
@@ -89,14 +89,35 @@ def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
         xpu = getattr(torch, "xpu", None)
         if xpu is not None and callable(getattr(xpu, "empty_cache", None)):
-            # Some builds expose xpu.empty_cache without xpu.is_available.
-            if not callable(getattr(xpu, "is_available", None)) or bool(xpu.is_available()):
+            if (not callable(getattr(xpu, "is_available", None))) or bool(xpu.is_available()):
                 xpu.empty_cache()
 
     with contextlib.suppress(Exception):
         mps = getattr(torch, "mps", None)
         if mps is not None and callable(getattr(mps, "empty_cache", None)):
             mps.empty_cache()
+
+
+# -----------------------------
+# Safer / more compatible loads
+# -----------------------------
+
+def _torch_load_cpu(path: str, *, weights_only: Optional[bool] = None) -> Any:
+    """torch.load wrapper with CPU map + best-effort weights_only support."""
+    # weights_only exists on modern PyTorch and is recommended for loading weights-only artifacts.
+    # On older versions, passing the kwarg raises TypeError.
+    if weights_only is not None:
+        try:
+            return torch.load(path, map_location="cpu", weights_only=bool(weights_only))
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+        except Exception:
+            # Some files are not compatible with weights_only=True (e.g., keys lists).
+            if weights_only:
+                with contextlib.suppress(Exception):
+                    return torch.load(path, map_location="cpu", weights_only=False)
+            raise
+    return torch.load(path, map_location="cpu")
 
 
 def _preload_state(state: Any) -> Any:
@@ -109,7 +130,6 @@ def _preload_state(state: Any) -> Any:
     This is useful when user code provides a state dict (or torch.load result)
     that may contain non-standard tensor types.
     """
-
     from collections.abc import Mapping as _Mapping
 
     if isinstance(state, _Mapping):
@@ -137,6 +157,10 @@ def _preload_state(state: Any) -> Any:
 
     return state
 
+
+# -----------------------------
+# Seeding
+# -----------------------------
 
 def _ensure_seed(seed: Optional[int]) -> Optional[int]:
     if seed is None:
@@ -169,6 +193,181 @@ def _seed_everything(seed_value: Optional[int]) -> None:
         pass
 
 
+# -----------------------------
+# Checkpoint helpers (DCP + PT)
+# -----------------------------
+
+def _maybe_save_model_checkpoint(
+    model: Root,
+    out_dir: str,
+    *,
+    save_dcp: bool,
+    save_pt: bool,
+    overwrite: bool = True,
+) -> Optional[Dict[str, Any]]:
+    """Materialize model weights on disk for worker loading.
+
+    Returns the (possibly computed) DCP state_dict for reuse.
+    """
+    m_sd: Optional[Dict[str, Any]] = None
+
+    if not (save_dcp or save_pt):
+        return None
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Only build the expensive full state_dict when required.
+    if save_dcp:
+        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        m_sd = get_model_state_dict(model, options=opts)
+
+    if save_dcp and m_sd is not None:
+        save(
+            state_dict={"model": m_sd},
+            storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)),
+        )
+
+    if save_pt:
+        if m_sd is not None:
+            pt_state: Dict[str, Any] = dict(m_sd)
+            _trim_dcp_keys(pt_state)
+        else:
+            # Keep this best-effort and CPU-only.
+            pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+        torch.save(pt_state, os.path.join(out_dir, "model.pt"))
+
+    return m_sd
+
+
+# -----------------------------
+# Prediction part memmap (B approach)
+# -----------------------------
+
+_PRED_MEMMAP_LOCK = threading.Lock()
+_PRED_MEMMAP_PATH_LOCKS: dict[str, threading.Lock] = {}
+
+def _pred_memmap_lock_for(path: str) -> threading.Lock:
+    with _PRED_MEMMAP_LOCK:
+        lk = _PRED_MEMMAP_PATH_LOCKS.get(path)
+        if lk is None:
+            lk = threading.Lock()
+            _PRED_MEMMAP_PATH_LOCKS[path] = lk
+        return lk
+
+
+def _derive_mmt_path(pred_path: str) -> str:
+    p = str(pred_path)
+    if p.endswith(".mmt"):
+        return p
+    if p.endswith(".pt"):
+        return p[:-3] + ".mmt"
+    return p + ".mmt"
+
+
+def _mmt_meta_path(mmt_path: str) -> str:
+    return str(mmt_path) + ".meta.json"
+
+
+def _parse_dtype(dtype_s: Any) -> Optional[torch.dtype]:
+    if isinstance(dtype_s, torch.dtype):
+        return dtype_s
+    s = str(dtype_s or "").strip()
+    if not s:
+        return None
+    if s.startswith("torch."):
+        s = s.split(".", 1)[1]
+    # Common aliases
+    if s == "float":
+        s = "float32"
+    if s == "half":
+        s = "float16"
+    return getattr(torch, s, None)
+
+
+def _ensure_pred_memmap_from_pt(pt_path: str, mmt_path: str) -> tuple[str, torch.dtype, Tuple[int, ...]]:
+    """Create a MemoryMappedTensor file from a .pt Tensor if needed (best-effort, thread-safe)."""
+    lock = _pred_memmap_lock_for(mmt_path)
+    with lock:
+        if os.path.isfile(mmt_path) and os.path.isfile(_mmt_meta_path(mmt_path)):
+            try:
+                with open(_mmt_meta_path(mmt_path), "r", encoding="utf-8") as f:
+                    meta = json.load(f) or {}
+                dtype = _parse_dtype(meta.get("dtype")) or torch.float32
+                shape = tuple(int(x) for x in (meta.get("shape") or ()))
+                if shape:
+                    return mmt_path, dtype, shape
+            except Exception:
+                # Fall through to re-create metadata if needed.
+                pass
+
+        preds = _torch_load_cpu(pt_path, weights_only=True)
+        if not isinstance(preds, torch.Tensor):
+            preds = torch.as_tensor(preds)
+        preds = preds.detach().cpu().contiguous()
+
+        # Create / overwrite memmap file.
+        MemoryMappedTensor.from_tensor(preds, filename=mmt_path, existsok=True)
+
+        meta = {"dtype": str(preds.dtype), "shape": list(preds.shape)}
+        with open(_mmt_meta_path(mmt_path), "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+        return mmt_path, preds.dtype, tuple(int(x) for x in preds.shape)
+
+
+def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
+    """Open an existing MemoryMappedTensor using the sidecar meta file."""
+    meta_path = _mmt_meta_path(mmt_path)
+    if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
+        return None
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f) or {}
+        dtype = _parse_dtype(meta.get("dtype"))
+        shape = tuple(int(x) for x in (meta.get("shape") or ()))
+        if dtype is None or not shape:
+            return None
+        return MemoryMappedTensor.from_filename(filename=mmt_path, dtype=dtype, shape=torch.Size(shape))
+    except Exception:
+        return None
+
+
+# -----------------------------
+# Data normalization helpers
+# -----------------------------
+
+def _iter_datasets(data: Any) -> tuple[list[tuple[str, Any]], Optional[dict[str, str] | list[str]]]:
+    """Normalize data input into an iterable of (key, dataset_obj) plus optional manifest."""
+    from collections.abc import Mapping as _Mapping
+
+    if isinstance(data, TensorDictBase):
+        return [("0", data)], None
+
+    if isinstance(data, _Mapping) and data and all(isinstance(v, _Mapping) for v in data.values()):
+        man: dict[str, str] = {}
+        items: list[tuple[str, Any]] = []
+        for k, d in data.items():
+            key = str(k)
+            items.append((key, d))
+            man[key] = key
+        return items, man
+
+    if isinstance(data, Sequence) and data and all(isinstance(d, _Mapping) for d in data):
+        man2: list[str] = []
+        items2: list[tuple[str, Any]] = []
+        for i, d in enumerate(data):
+            key = str(i)
+            items2.append((key, d))
+            man2.append(key)
+        return items2, man2
+
+    return [("0", data)], None
+
+
+# -----------------------------
+# Public API
+# -----------------------------
+
 def train(
     model: Root,
     data: (
@@ -197,6 +396,7 @@ def train(
     **kwargs: Any,
 ) -> Root:
     _reset_process_group()
+
     try:
         val_frac = float(val_frac)
         val_frac = 0.0 if val_frac < 0.0 else (1.0 if val_frac > 1.0 else val_frac)
@@ -206,10 +406,12 @@ def train(
     seed_value = _ensure_seed(seed)
     _seed_everything(seed_value)
 
-    underflow_action = normalize_underflow_action(kwargs.pop("underflow_action", None), default=default_underflow_action())
+    underflow_action = normalize_underflow_action(
+        kwargs.pop("underflow_action", None),
+        default=default_underflow_action(),
+    )
 
     # Determinism settings are applied inside runtime workers.
-
     ds_meta = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
     ds_meta.underflow_action = underflow_action
 
@@ -229,14 +431,12 @@ def train(
         return first_in_dim, first_label_shape
 
     def _mat_one(d: Any, out_dir: str) -> Tuple[int, Tuple[int, ...], int]:
-
         from collections.abc import Mapping as _Mapping
 
         if isinstance(d, TensorDictBase):
             td = d
             if td.batch_size is None or len(td.batch_size) == 0:
                 raise ValueError("TensorDict input to train() must have a batch dimension.")
-
             count = int(td.batch_size[0])
             if count <= 0:
                 raise ValueError("Empty TensorDict provided to train().")
@@ -254,12 +454,10 @@ def train(
                 allow_missing_labels=False,
                 chunk_size=0,
             )
-
             return int(in_dim), tuple(label_shape), int(count)
 
         if (
             isinstance(d, _Mapping)
-            and not isinstance(d, TensorDictBase)
             and d
             and all(not isinstance(v, _Mapping) for v in d.values())
             and not LazyTensor.is_feature_label_batch_mapping(d)
@@ -282,7 +480,6 @@ def train(
                 allow_missing_labels=False,
                 chunk_size=0,
             )
-
             return int(in_dim), tuple(label_shape), int(count)
 
         fx, lb, _, lshape = ds_meta.preprocess(d)
@@ -313,8 +510,7 @@ def train(
 
     memmap_dir = new_dir("memmap_ds")
 
-    num_samples = 0
-
+    num_samples_dataset = 0
     first_in_dim: Optional[int] = None
     label_shape: Tuple[int, ...] = ()
     manifest: Optional[Dict[str, str] | Sequence[str]] = None
@@ -322,103 +518,53 @@ def train(
     init_dir: Optional[str] = None
 
     try:
-        if isinstance(data, TensorDictBase):
-            in_dim, lshape, n = _mat_one(data, memmap_dir)
-            first_in_dim, label_shape = _check_shapes(
-                first_in_dim, in_dim, label_shape, lshape
-            )
-            num_samples += n
-        elif (
-            isinstance(data, Mapping)
-            and data
-            and all(isinstance(v, Mapping) for v in data.values())
-        ):
-            manifest = {}
-            for k, d in data.items():
-                sub = os.path.join(memmap_dir, str(k))
+        datasets, manifest = _iter_datasets(data)
+        multi = manifest is not None
+
+        for key, d in datasets:
+            sub = memmap_dir if (not multi) else os.path.join(memmap_dir, key)
+            if multi:
                 os.makedirs(sub, exist_ok=True)
-                in_dim, lshape, n = _mat_one(d, sub)
-                first_in_dim, label_shape = _check_shapes(
-                    first_in_dim, in_dim, label_shape, lshape
-                )
-                num_samples += n
-                manifest[str(k)] = str(k)
-        elif (
-            isinstance(data, Sequence)
-            and data
-            and all(isinstance(d, Mapping) for d in data)
-        ):
-            manifest = []
-            for i, d in enumerate(data):
-                key = str(i)
-                sub = os.path.join(memmap_dir, key)
-                os.makedirs(sub, exist_ok=True)
-                in_dim, lshape, n = _mat_one(d, sub)
-                first_in_dim, label_shape = _check_shapes(
-                    first_in_dim, in_dim, label_shape, lshape
-                )
-                num_samples += n
-                manifest.append(key)
-        else:
-            in_dim, lshape, n = _mat_one(data, memmap_dir)
-            first_in_dim, label_shape = in_dim, tuple(lshape)
-            num_samples += n
+            in_dim, lshape, n = _mat_one(d, sub)
+            first_in_dim, label_shape = _check_shapes(first_in_dim, in_dim, label_shape, lshape)
+            num_samples_dataset += int(n)
 
         if first_in_dim is None or not label_shape:
             raise RuntimeError("no training data provided to train()")
 
         if manifest is not None:
-            with open(
-                os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8"
-            ) as f:
+            with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
                 payload = manifest if isinstance(manifest, dict) else list(manifest)
                 json.dump(payload, f)
+
         ckpt_dir = new_dir("ckpt_dcp")
-        init_dir: Optional[str] = None
+
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
-        # Workers must be able to load an initial checkpoint from disk.
-        # If a user disables both save flags, force model.pt.
         if not (save_dcp or save_pt):
             save_pt = True
+
         m_sd: Optional[Dict[str, Any]] = None
         if save_dcp or save_pt:
             init_dir = new_dir("init_dcp")
-            os.makedirs(init_dir, exist_ok=True)
+            m_sd = _maybe_save_model_checkpoint(model, init_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True)
 
-            # Only build the expensive full state_dict when required.
-            if save_dcp:
-                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-                m_sd = get_model_state_dict(model, options=opts)
-
-            if save_dcp and m_sd is not None:
-                save(
-                    state_dict={"model": m_sd},
-                    storage_writer=FileSystemWriter(
-                        init_dir, sync_files=True, overwrite=True
-                    ),
-                )
-
-            if save_pt:
-                if m_sd is not None:
-                    pt_state: Dict[str, Any] = dict(m_sd)
-                    _trim_dcp_keys(pt_state)
-                else:
-                    pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-                torch.save(pt_state, os.path.join(init_dir, "model.pt"))
         default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
         master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
+
         _wp = WorkerPolicy.autotune()
         _wp.apply_torch_threads()
         nprocs = int(_wp.nproc_per_node)
+
         cfg_obj = getattr(model, "_Root__config", None)
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
         else:
             cfg_model = ModelConfig()
         cfg_dict: Dict[str, Any] = asdict(cfg_model)
+
         lc = LaunchConfig(
             min_nodes=1,
             max_nodes=max_nodes,
@@ -431,6 +577,7 @@ def train(
             start_method=optimal_start_method(),
             local_addr=master_addr,
         )
+
         base = dict(
             sources={"kind": "memmap", "path": memmap_dir},
             ckpt_dir=ckpt_dir,
@@ -440,6 +587,7 @@ def train(
         )
         if init_dir is not None:
             base["init_ckpt_dir"] = init_dir
+
         default_kwargs = {
             "epochs": epochs,
             "val_frac": val_frac,
@@ -456,26 +604,23 @@ def train(
             "loss_mask_value": loss_mask_value,
         }
 
-        num_samples = int(num_samples)
-        this_run_samples = int(num_samples)
         positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
         for key in list(default_kwargs):
             if key in positional_names or key in kwargs:
                 default_kwargs.pop(key, None)
-        ops = runtime_config(
-            "train",
-            base,
-            *args,
-            **default_kwargs,
-            **kwargs,
-        )
+
+        ops = runtime_config("train", base, *args, **default_kwargs, **kwargs)
+
         with contextlib.suppress(Exception):
             model.to("cpu")
         _clear_device_caches()
+
         elastic_launch(lc, main)(ops)
+
+        # Load final model weights back into this process.
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
-            cpu_state = torch.load(fallback, map_location="cpu")
+            cpu_state = _torch_load_cpu(fallback, weights_only=True)
             cpu_state = _preload_state(cpu_state)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
@@ -483,15 +628,11 @@ def train(
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             m_sd = get_model_state_dict(model, options=opts)
             m_sd = _trim_dcp_keys(m_sd)
-            load(
-                state_dict={"model": m_sd},
-                storage_reader=FileSystemReader(ckpt_dir),
-            )
+            load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ckpt_dir))
             resize_scaler_buffer(model, m_sd)
-            set_model_state_dict(
-                model, m_sd, options=StateDictOptions(strict=False)
-            )
+            set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
 
+        # Attach training history (best-effort).
         try:
             if ckpt_dir is not None:
                 history_path = os.path.join(ckpt_dir, "history.json")
@@ -511,10 +652,8 @@ def train(
                     if isinstance(meta, dict):
                         setattr(model, "_train_history_meta", dict(meta))
 
-                    def _aggregate_run_stats(
-                        recs: List[Mapping[str, Any]],
-                    ) -> Optional[Dict[str, float]]:
-                        if not isinstance(recs, list) or len(recs) == 0:
+                    def _aggregate_run_stats(recs: List[Mapping[str, Any]]) -> Optional[Dict[str, float]]:
+                        if not isinstance(recs, list) or not recs:
                             return None
                         total_bs = 0
                         sum_x = 0.0
@@ -525,12 +664,14 @@ def train(
                         x_max = float("-inf")
                         y_min = float("inf")
                         y_max = float("-inf")
+
                         for r in recs:
                             if not isinstance(r, Mapping):
                                 continue
                             bs = int(r.get("batch_size", 0))
                             if bs <= 0:
                                 continue
+
                             bxm = float(r.get("batch_x_mean", 0.0))
                             bxv = float(r.get("batch_x_var", 0.0))
                             bym = float(r.get("batch_y_mean", 0.0))
@@ -560,6 +701,7 @@ def train(
                         var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
 
                         return {
+                            "processed_n": float(total_bs),
                             "sampled_x_mean": mean_x,
                             "sampled_x_var": var_x,
                             "sampled_x_min": x_min,
@@ -570,13 +712,13 @@ def train(
                             "sampled_y_max": y_max,
                         }
 
-                    if isinstance(records, list) and len(records) > 0:
-                        run_stats = _aggregate_run_stats(records)
-                    else:
-                        run_stats = None
+                    run_stats = _aggregate_run_stats(records) if isinstance(records, list) and records else None
 
                     prev_total = int(getattr(model, "_history_total_samples", 0))
-                    inc_samples = this_run_samples
+                    # Prefer recorded processed sample count; fall back to dataset size for compatibility.
+                    inc_samples = int(run_stats.get("processed_n", 0)) if run_stats else int(num_samples_dataset)
+                    if inc_samples <= 0:
+                        inc_samples = int(num_samples_dataset)
                     new_total = prev_total + inc_samples
 
                     prev_cum = getattr(model, "_history_cum_stats", None)
@@ -638,6 +780,7 @@ def train(
                     cum_stats = _update_cum_stats(prev_cum, prev_total, run_stats, inc_samples)
 
                     setattr(model, "_history_total_samples", new_total)
+                    setattr(model, "_history_dataset_n", int(num_samples_dataset))
                     if cum_stats is not None:
                         setattr(model, "_history_cum_stats", cum_stats)
 
@@ -646,21 +789,21 @@ def train(
 
                     run_record: Dict[str, Any] = {
                         "run_index": run_index,
-                        "sampled_n": inc_samples,
+                        "dataset_n": int(num_samples_dataset),
+                        "processed_n": int(inc_samples),
                         "reduced_n": new_total,
                     }
                     if run_stats is not None:
-                        run_record.update(run_stats)
+                        # do not duplicate processed_n twice
+                        for k, v in run_stats.items():
+                            if k != "processed_n":
+                                run_record[k] = v
                     if cum_stats is not None:
                         run_record.update(cum_stats)
                     if isinstance(meta, dict) and meta:
                         run_record["env"] = dict(meta)
 
-                    if isinstance(run_hist_prev, list):
-                        new_run_hist = run_hist_prev + [run_record]
-                    else:
-                        new_run_hist = [run_record]
-
+                    new_run_hist = (run_hist_prev + [run_record]) if isinstance(run_hist_prev, list) else [run_record]
                     setattr(model, "_train_history", new_run_hist)
 
                     if isinstance(logger, History):
@@ -689,236 +832,228 @@ def predict(
     lazy: bool = False,
     **kwargs: Any,
 ) -> Any:
-
     _reset_process_group()
     initialize_python_path()
     set_multiprocessing_env()
+
     tmp_dir = new_dir("infer")
     dcp_dir: Optional[str] = None
     memmap_dir = os.path.join(tmp_dir, "memmap")
     ckpt_dir = os.path.join(tmp_dir, "pred_ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
     mp.allow_connection_pickling()
+
     save_dcp = env_bool("STNET_SAVE_DCP", True)
     save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
-    # Predict/infer workers must be able to load weights from disk.
-    # If a user disables both save flags, force model.pt.
     if not (save_dcp or save_pt):
         save_pt = True
-    m_sd: Optional[Dict[str, Any]] = None
-    if save_dcp or save_pt:
-        dcp_dir = os.path.join(tmp_dir, "dcp")
-        os.makedirs(dcp_dir, exist_ok=True)
 
-        if save_dcp:
-            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-            m_sd = get_model_state_dict(model, options=opts)
-            save(
-                state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
-            )
-
-        if save_pt:
-            if m_sd is not None:
-                pt_state: Dict[str, Any] = dict(m_sd)
-                _trim_dcp_keys(pt_state)
-            else:
-                pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            torch.save(pt_state, os.path.join(dcp_dir, "model.pt"))
-    cfg_obj = getattr(model, "_Root__config", None)
-    if isinstance(cfg_obj, (ModelConfig, dict)):
-        cfg_model = coerce_model_config(cfg_obj)
-    else:
-        cfg_model = ModelConfig()
-    cfg_dict = asdict(cfg_model)
-    seed_value = _ensure_seed(seed)
-    _seed_everything(seed_value)
-    underflow_action = normalize_underflow_action(
-        kwargs.pop("underflow_action", None),
-        default=default_underflow_action(),
-    )
-
-    ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
-    ds.underflow_action = underflow_action
-
-    output_mode = str(kwargs.pop("output", output) or "tensor").strip().lower()
-    if output_mode not in {"tensor", "file"}:
-        raise ValueError(f"predict: output must be 'tensor' or 'file', got: {output_mode!r}")
-
-    lazy_flag = bool(kwargs.pop("lazy", lazy)) if output_mode == "tensor" else False
-    shuffle = bool(kwargs.pop("shuffle", True))
-
-    from collections.abc import Mapping as _Mapping
-
-    default_out_shape = tuple(getattr(model, "out_shape", ()))
-    if not default_out_shape:
-        default_out_shape = (1,)
-
-    if isinstance(data, TensorDictBase):
-        td = data
-        if td.batch_size is None or len(td.batch_size) == 0:
-            raise ValueError("TensorDict input to predict() must have a batch dimension.")
-
-        count = int(td.batch_size[0])
-        if count <= 0:
-            return {}
-
-        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
-            ds=ds,
-            out_dir=memmap_dir,
-            count=count,
-            get_batch=lambda s, e: td[s:e],
-            get_by_indices=lambda idx: td[idx],
-            val_frac=0.0,
-            seed_value=seed_value,
-            underflow_action=underflow_action,
-            shuffle=bool(shuffle),
-            default_label_shape=default_out_shape,
-            allow_missing_labels=True,
-            features_only=True,
-            chunk_size=0,
-        )
-
-        keys = range(count)
-
-    elif (
-        isinstance(data, _Mapping)
-        and not isinstance(data, TensorDictBase)
-        and data
-        and all(not isinstance(v, _Mapping) for v in data.values())
-        and not LazyTensor.is_feature_label_batch_mapping(data)
-    ):
-        keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(data)
-        keys = list(keys_t)
-        count = len(keys)
-        if count <= 0:
-            return {}
-
-        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
-            ds=ds,
-            out_dir=memmap_dir,
-            count=count,
-            get_batch=_get_batch,
-            get_by_indices=_get_by_indices,
-            val_frac=0.0,
-            seed_value=seed_value,
-            underflow_action=underflow_action,
-            shuffle=bool(shuffle),
-            default_label_shape=default_out_shape,
-            allow_missing_labels=True,
-            features_only=True,
-            chunk_size=0,
-        )
-
-    else:
-        feats, labels, keys, label_shape = ds.preprocess(data)
-        if not feats.is_contiguous():
-            feats = feats.contiguous()
-
-        count = int(feats.shape[0])
-        if count <= 0:
-            return {}
-
-        in_dim = int(feats.reshape(count, -1).shape[1])
-
-        # Prediction/inference does not require labels; write a features-only memmap.
-        preload_memmap(
-            {"features": feats, "labels": labels},
-            memmap_dir=memmap_dir,
-            train_frac=1.0,
-            val_frac=0.0,
-            shuffle=bool(shuffle),
-            seed=seed_value,
-            underflow_action=underflow_action,
-            allow_missing_labels=True,
-            default_label_shape=default_out_shape,
-            features_only=True,
-        )
-        if keys is None:
-            keys = range(count)
-        if not label_shape:
-            label_shape = tuple(default_out_shape)
-    base = dict(
-        sources={"kind": "memmap", "path": memmap_dir},
-        in_dim=int(in_dim),
-        out_shape=tuple(label_shape),
-        cfg_dict=cfg_dict,
-        ckpt_dir=ckpt_dir,
-    )
-    if dcp_dir is not None:
-        base["model_ckpt_dir"] = dcp_dir
-    mode = mode if mode in ("predict", "infer") else "predict"
-    default_kwargs = {"seed": seed}
-    positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
-    for key in list(default_kwargs):
-        if key in positional_names or key in kwargs:
-            default_kwargs.pop(key, None)
-    ops = runtime_config(
-        mode,
-        base,
-        *args,
-        **default_kwargs,
-        **kwargs,
-    )
-    with contextlib.suppress(Exception):
-        model.to("cpu")
-    _clear_device_caches()
-    default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
-    rdzv_endpoint = get_available_host(default_rdzv_host)
-    master_addr, _ = initialize_master_addr(rdzv_endpoint)
-    _wp = WorkerPolicy.autotune()
-    _wp.apply_torch_threads()
-    nprocs = int(_wp.nproc_per_node)
-    resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
-    resolved_rdzv_backend = rdzv_backend or "c10d"
-    lc = LaunchConfig(
-        min_nodes=1,
-        max_nodes=resolved_max_nodes,
-        nproc_per_node=nprocs,
-        rdzv_backend=resolved_rdzv_backend,
-        rdzv_endpoint=rdzv_endpoint,
-        run_id="predict",
-        max_restarts=0,
-        monitor_interval=5,
-        start_method=optimal_start_method(),
-        local_addr=master_addr,
-    )
-    elastic_launch(lc, main)(ops)
     try:
-        chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
-        if os.path.isdir(chunks_dir):
-            import logging
+        if save_dcp or save_pt:
+            dcp_dir = os.path.join(tmp_dir, "dcp")
+            _maybe_save_model_checkpoint(model, dcp_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True)
 
-            log = logging.getLogger(__name__)
-            nkeys = 0
-            with contextlib.suppress(Exception):
-                nkeys = int(len(keys))
+        cfg_obj = getattr(model, "_Root__config", None)
+        if isinstance(cfg_obj, (ModelConfig, dict)):
+            cfg_model = coerce_model_config(cfg_obj)
+        else:
+            cfg_model = ModelConfig()
+        cfg_dict = asdict(cfg_model)
 
-            keys_kind = "range" if isinstance(keys, range) else "list"
-            keys_meta_path = os.path.join(chunks_dir, "keys.meta.json")
-            try:
-                meta = {"N": int(nkeys), "kind": keys_kind}
-                if isinstance(keys, range):
-                    meta.update({"start": int(keys.start), "stop": int(keys.stop), "step": int(keys.step)})
-                with open(keys_meta_path, "w", encoding="utf-8") as f:
-                    json.dump(meta, f)
-            except Exception as e:
-                log.warning("predict: failed to write keys.meta.json (ignored): %r", e, exc_info=True)
+        seed_value = _ensure_seed(seed)
+        _seed_everything(seed_value)
 
-            if not isinstance(keys, range):
-                try:
-                    torch.save(keys, os.path.join(chunks_dir, "keys.pt"))
-                except Exception as e:
-                    log.warning("predict: failed to write keys.pt (ignored): %r", e, exc_info=True)
-            final_dir = new_dir("predictions")
-            moved_dir = shutil.move(chunks_dir, final_dir)
-            chunk_root = moved_dir if os.path.isdir(moved_dir) else os.path.join(
-                final_dir, os.path.basename(chunks_dir)
+        underflow_action = normalize_underflow_action(
+            kwargs.pop("underflow_action", None),
+            default=default_underflow_action(),
+        )
+
+        ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
+        ds.underflow_action = underflow_action
+
+        output_mode = str(kwargs.pop("output", output) or "tensor").strip().lower()
+        if output_mode not in {"tensor", "file"}:
+            raise ValueError(f"predict: output must be 'tensor' or 'file', got: {output_mode!r}")
+
+        lazy_flag = bool(kwargs.pop("lazy", lazy)) if output_mode == "tensor" else False
+        shuffle = bool(kwargs.pop("shuffle", True))
+
+        from collections.abc import Mapping as _Mapping
+
+        default_out_shape = tuple(getattr(model, "out_shape", ()))
+        if not default_out_shape:
+            default_out_shape = (1,)
+
+        if isinstance(data, TensorDictBase):
+            td = data
+            if td.batch_size is None or len(td.batch_size) == 0:
+                raise ValueError("TensorDict input to predict() must have a batch dimension.")
+
+            count = int(td.batch_size[0])
+            if count <= 0:
+                return {}
+
+            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+                ds=ds,
+                out_dir=memmap_dir,
+                count=count,
+                get_batch=lambda s, e: td[s:e],
+                get_by_indices=lambda idx: td[idx],
+                val_frac=0.0,
+                seed_value=seed_value,
+                underflow_action=underflow_action,
+                shuffle=bool(shuffle),
+                default_label_shape=default_out_shape,
+                allow_missing_labels=True,
+                features_only=True,
+                chunk_size=0,
             )
-            return get_prediction(chunk_root, output=output_mode, lazy=lazy_flag)
+            keys = range(count)
 
-        return {}
+        elif (
+            isinstance(data, _Mapping)
+            and data
+            and all(not isinstance(v, _Mapping) for v in data.values())
+            and not LazyTensor.is_feature_label_batch_mapping(data)
+        ):
+            keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(data)
+            keys = list(keys_t)
+            count = len(keys)
+            if count <= 0:
+                return {}
+
+            in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+                ds=ds,
+                out_dir=memmap_dir,
+                count=count,
+                get_batch=_get_batch,
+                get_by_indices=_get_by_indices,
+                val_frac=0.0,
+                seed_value=seed_value,
+                underflow_action=underflow_action,
+                shuffle=bool(shuffle),
+                default_label_shape=default_out_shape,
+                allow_missing_labels=True,
+                features_only=True,
+                chunk_size=0,
+            )
+
+        else:
+            feats, labels, keys, label_shape = ds.preprocess(data)
+            if not feats.is_contiguous():
+                feats = feats.contiguous()
+
+            count = int(feats.shape[0])
+            if count <= 0:
+                return {}
+
+            in_dim = int(feats.reshape(count, -1).shape[1])
+
+            preload_memmap(
+                {"features": feats, "labels": labels},
+                memmap_dir=memmap_dir,
+                train_frac=1.0,
+                val_frac=0.0,
+                shuffle=bool(shuffle),
+                seed=seed_value,
+                underflow_action=underflow_action,
+                allow_missing_labels=True,
+                default_label_shape=default_out_shape,
+                features_only=True,
+            )
+            if keys is None:
+                keys = range(count)
+            if not label_shape:
+                label_shape = tuple(default_out_shape)
+
+        base = dict(
+            sources={"kind": "memmap", "path": memmap_dir},
+            in_dim=int(in_dim),
+            out_shape=tuple(label_shape),
+            cfg_dict=cfg_dict,
+            ckpt_dir=ckpt_dir,
+        )
+        if dcp_dir is not None:
+            base["model_ckpt_dir"] = dcp_dir
+
+        mode = mode if mode in ("predict", "infer") else "predict"
+
+        default_kwargs = {"seed": seed}
+        positional_names = RuntimeConfig.PRED_POS_ORDER[: len(args)]
+        for key in list(default_kwargs):
+            if key in positional_names or key in kwargs:
+                default_kwargs.pop(key, None)
+
+        ops = runtime_config(mode, base, *args, **default_kwargs, **kwargs)
+
+        with contextlib.suppress(Exception):
+            model.to("cpu")
+        _clear_device_caches()
+
+        default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
+        rdzv_endpoint = get_available_host(default_rdzv_host)
+        master_addr, _ = initialize_master_addr(rdzv_endpoint)
+
+        _wp = WorkerPolicy.autotune()
+        _wp.apply_torch_threads()
+        nprocs = int(_wp.nproc_per_node)
+
+        resolved_max_nodes = int(max_nodes) if max_nodes is not None else 1
+        resolved_rdzv_backend = rdzv_backend or "c10d"
+
+        lc = LaunchConfig(
+            min_nodes=1,
+            max_nodes=resolved_max_nodes,
+            nproc_per_node=nprocs,
+            rdzv_backend=resolved_rdzv_backend,
+            rdzv_endpoint=rdzv_endpoint,
+            run_id="predict",
+            max_restarts=0,
+            monitor_interval=5,
+            start_method=optimal_start_method(),
+            local_addr=master_addr,
+        )
+
+        elastic_launch(lc, main)(ops)
+
+        try:
+            chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
+            if os.path.isdir(chunks_dir):
+                log = __import__("logging").getLogger(__name__)
+
+                nkeys = 0
+                with contextlib.suppress(Exception):
+                    nkeys = int(len(keys))
+
+                keys_kind = "range" if isinstance(keys, range) else "list"
+                keys_meta_path = os.path.join(chunks_dir, "keys.meta.json")
+                try:
+                    meta = {"N": int(nkeys), "kind": keys_kind}
+                    if isinstance(keys, range):
+                        meta.update({"start": int(keys.start), "stop": int(keys.stop), "step": int(keys.step)})
+                    with open(keys_meta_path, "w", encoding="utf-8") as f:
+                        json.dump(meta, f)
+                except Exception as e:
+                    log.warning("predict: failed to write keys.meta.json (ignored): %r", e, exc_info=True)
+
+                if not isinstance(keys, range):
+                    try:
+                        # keys is list-like python object => weights_only must be False on modern torch
+                        torch.save(keys, os.path.join(chunks_dir, "keys.pt"))
+                    except Exception as e:
+                        log.warning("predict: failed to write keys.pt (ignored): %r", e, exc_info=True)
+
+                final_dir = new_dir("predictions")
+                moved_dir = shutil.move(chunks_dir, final_dir)
+                chunk_root = moved_dir if os.path.isdir(moved_dir) else os.path.join(final_dir, os.path.basename(chunks_dir))
+                return get_prediction(chunk_root, output=output_mode, lazy=lazy_flag)
+
+            return {}
+        finally:
+            with contextlib.suppress(Exception):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
     finally:
+        # If we early-returned with moved predictions, tmp_dir may already be gone.
         with contextlib.suppress(Exception):
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -935,19 +1070,22 @@ def _load_legacy_flat(
         tensor = None
         if os.path.exists(base_mmt):
             try:
+                # NOTE: legacy path has no stored dtype/shape metadata; MemoryMappedTensor encodes it in the file name.
                 tensor = MemoryMappedTensor.from_filename(base_mmt)
             except Exception:
                 with contextlib.suppress(Exception):
-                    tensor = torch.load(base_mmt, map_location="cpu")
+                    tensor = _torch_load_cpu(base_mmt, weights_only=True)
         else:
             alt_pt = os.path.join(chunk_root, f"chunk_{idx:06d}.pt")
             if os.path.exists(alt_pt):
-                tensor = torch.load(alt_pt, map_location="cpu")
+                tensor = _torch_load_cpu(alt_pt, weights_only=True)
+
         if tensor is not None:
             chunks.append(tensor if isinstance(tensor, torch.Tensor) else torch.as_tensor(tensor))
 
     if chunks:
         return torch.cat(chunks, dim=0)
+
     tail = tuple(out_shape[1:]) if len(out_shape) > 1 else ()
     return torch.empty((0, *tail), dtype=torch.float64)
 
@@ -1012,7 +1150,8 @@ def get_prediction(
         keys_pt = os.path.join(chunk_root, "keys.pt")
         if not os.path.isfile(keys_pt):
             raise FileNotFoundError(f"get_prediction: missing keys.pt for kind=list: {keys_pt}")
-        keys = torch.load(keys_pt, map_location="cpu")
+        # keys.pt is a python object => weights_only must be False.
+        keys = _torch_load_cpu(keys_pt, weights_only=False)
         if not isinstance(keys, list):
             try:
                 keys = list(keys)
@@ -1035,17 +1174,23 @@ def get_prediction(
     key_to_row: Optional[dict[Tuple[Any, ...], int]] = None
 
     if isinstance(keys, range):
+
         class _TupleKeyRange:
             __slots__ = ("_r",)
+
             def __init__(self, r: range) -> None:
                 self._r = r
+
             def __len__(self) -> int:
                 return int(len(self._r))
+
             def __iter__(self):
                 for i in self._r:
                     yield (int(i),)
+
             def __getitem__(self, idx: int):
                 return (int(self._r[idx]),)
+
         key_seq: Any = _TupleKeyRange(keys)
 
         def _row_for_key(k: Any) -> int:
@@ -1055,6 +1200,7 @@ def get_prediction(
             if rid < 0 or rid >= nkeys:
                 raise KeyError(k)
             return rid
+
     else:
         fixed_keys = []
         key_to_row = {}
@@ -1078,12 +1224,18 @@ def get_prediction(
 
     if has_parts:
         parts_list = parts
+
+        # Lazy path: build a fast row->(part,offset) map and use memmap-backed part access.
         if lazy:
             from ..data.collections import LazyDict
 
             row_to_part = np.full((nkeys,), -1, dtype=np.int32)
             row_to_off = np.full((nkeys,), -1, dtype=np.int32)
-            pred_paths: list[Optional[str]] = [None] * len(parts_list)
+
+            # Store per-part pred file paths.
+            rows_paths: list[Optional[str]] = [None] * len(parts_list)
+            pred_pt_paths: list[Optional[str]] = [None] * len(parts_list)
+            pred_mmt_paths: list[Optional[str]] = [None] * len(parts_list)
 
             _dup_env = str(os.environ.get("STNET_PRED_CHECK_ROWIDS_DUP", "")).strip().lower()
             check_dups = _dup_env in {"1", "true", "yes", "y", "on"}
@@ -1093,10 +1245,15 @@ def get_prediction(
                 pred_name = (part or {}).get("pred")
                 if not rows_name or not pred_name:
                     continue
-                rows_path = os.path.join(chunk_root, rows_name)
-                pred_paths[p_idx] = os.path.join(chunk_root, pred_name)
 
-                rows = torch.load(rows_path, map_location="cpu")
+                rows_path = os.path.join(chunk_root, rows_name)
+                pred_path = os.path.join(chunk_root, pred_name)
+
+                rows_paths[p_idx] = rows_path
+                pred_pt_paths[p_idx] = pred_path
+                pred_mmt_paths[p_idx] = _derive_mmt_path(pred_path)
+
+                rows = _torch_load_cpu(rows_path, weights_only=True)
                 if not isinstance(rows, torch.Tensor):
                     rows = torch.as_tensor(rows)
                 rows = rows.to(dtype=torch.int64).reshape(-1).contiguous()
@@ -1122,29 +1279,50 @@ def get_prediction(
                 missing = int(np.sum(row_to_part < 0))
                 raise RuntimeError(f"get_prediction: missing predictions for {missing}/{nkeys} rows")
 
-            import threading
+            _tls = threading.local()
 
-            _cache_part: Dict[str, Any] = {"idx": -1, "pred": None}
-            _cache_lock = threading.Lock()
+            def _open_part_pred(p: int):
+                # Thread-local last-part cache to avoid locks on no-GIL builds.
+                cache = getattr(_tls, "pred_cache", None)
+                if cache is not None and cache[0] == p and cache[1] is not None:
+                    return cache[1]
+
+                pt_path = pred_pt_paths[p]
+                mmt_path = pred_mmt_paths[p]
+
+                pred_obj: Any = None
+                # Prefer memmap if available, or convert .pt -> .mmt once (B approach).
+                if mmt_path is not None:
+                    pred_obj = _open_pred_memmap(mmt_path)
+                    if pred_obj is None and pt_path is not None and os.path.isfile(pt_path):
+                        try:
+                            _ensure_pred_memmap_from_pt(pt_path, mmt_path)
+                            pred_obj = _open_pred_memmap(mmt_path)
+                        except Exception:
+                            pred_obj = None
+
+                if pred_obj is None:
+                    if pt_path is None:
+                        raise FileNotFoundError(f"get_prediction: missing pred file for part idx={p}")
+                    pred_obj = _torch_load_cpu(pt_path, weights_only=True)
+                    if not isinstance(pred_obj, torch.Tensor):
+                        pred_obj = torch.as_tensor(pred_obj)
+
+                _tls.pred_cache = (p, pred_obj)
+                return pred_obj
 
             def _pred_for_row(row_id: int) -> torch.Tensor:
                 p = int(row_to_part[int(row_id)])
                 if p < 0:
                     raise KeyError(row_id)
                 off = int(row_to_off[int(row_id)])
-                pred = _cache_part.get("pred")
-                if int(_cache_part.get("idx", -1)) != p or pred is None:
-                    # Thread-safe cache fill (important for free-threaded builds).
-                    with _cache_lock:
-                        pred = _cache_part.get("pred")
-                        if int(_cache_part.get("idx", -1)) != p or pred is None:
-                            path = pred_paths[p]
-                            if not path:
-                                raise KeyError(p)
-                            pred = torch.load(path, map_location="cpu")
-                            _cache_part["pred"] = pred
-                            _cache_part["idx"] = p
-                return pred[off].detach()
+                pred = _open_part_pred(p)
+                try:
+                    return pred[off].detach()
+                except Exception:
+                    # Safety: if pred is not indexable, coerce.
+                    t = pred if isinstance(pred, torch.Tensor) else torch.as_tensor(pred)
+                    return t[off].detach()
 
             def _getter(key: Any) -> torch.Tensor:
                 rid = _row_for_key(key)
@@ -1152,6 +1330,7 @@ def get_prediction(
 
             return LazyDict(key_seq, _getter, name="predictions", cache=False)
 
+        # Non-lazy path: materialize into a dict (can be large).
         out: Dict[Tuple[Any, ...], torch.Tensor] = {}
         for part in parts_list:
             rows_name = (part or {}).get("rows")
@@ -1160,24 +1339,38 @@ def get_prediction(
                 continue
             rows_path = os.path.join(chunk_root, rows_name)
             pred_path = os.path.join(chunk_root, pred_name)
-            rows = torch.load(rows_path, map_location="cpu")
-            preds = torch.load(pred_path, map_location="cpu")
+
+            rows = _torch_load_cpu(rows_path, weights_only=True)
             if not isinstance(rows, torch.Tensor):
                 rows = torch.as_tensor(rows)
+            rows = rows.to(dtype=torch.int64).reshape(-1).contiguous()
+
+            preds: Any
+            if pred_path.endswith(".mmt"):
+                mm = _open_pred_memmap(pred_path)
+                if mm is None:
+                    raise FileNotFoundError(f"get_prediction: missing/invalid memmap meta for {pred_path}")
+                preds = mm
+            else:
+                preds = _torch_load_cpu(pred_path, weights_only=True)
+
             if not isinstance(preds, torch.Tensor):
                 preds = torch.as_tensor(preds)
-            rows = rows.to(dtype=torch.int64).reshape(-1).contiguous()
+            preds = preds.detach()
+
             if int(preds.shape[0]) != int(rows.shape[0]):
                 raise RuntimeError(
                     f"get_prediction: part size mismatch rows={int(rows.shape[0])} preds={int(preds.shape[0])} ({rows_name},{pred_name})"
                 )
+
             rows_np = rows.numpy()
             for j, rid in enumerate(rows_np):
                 rid_i = int(rid)
                 k = (rid_i,) if isinstance(keys, range) else (fixed_keys[rid_i] if fixed_keys is not None else (rid_i,))
-                out[k] = preds[j].detach()
+                out[k] = preds[j]
         return out
 
+    # Legacy flat chunks path.
     num_chunks = int(manifest.get("num_chunks", 0) or 0)
     flat = _load_legacy_flat(chunk_root, num_chunks=num_chunks, out_shape=out_shape)
 
