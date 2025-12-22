@@ -8,16 +8,19 @@ import shutil
 import subprocess
 import sys
 import warnings
+from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
+
 try:
     from tensordict import TensorDictBase
 except ImportError:  # pragma: no cover
     class TensorDictBase:  # type: ignore
         pass
+
 from torch import nn
 
 from ..api.io import Format
@@ -31,9 +34,13 @@ def _in_console(cmd: Sequence[str], desc: str) -> None:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
 
-def _prepare_serving_model(model: nn.Module) -> nn.Module:
+@contextlib.contextmanager
+def _serving_model(model: nn.Module) -> Any:
+    """Temporarily strip training-only attributes and History objects.
 
-    model.eval()
+    This context manager *does not permanently mutate* the model instance.
+    """
+    was_training = bool(getattr(model, "training", False))
     candidate_attrs = (
         "optimizer",
         "optimizer_state",
@@ -44,27 +51,106 @@ def _prepare_serving_model(model: nn.Module) -> nn.Module:
         "metrics",
         "_training_history",
     )
+
+    removed_top: Dict[str, Any] = {}
+    removed_sub: list[tuple[nn.Module, str, Any]] = []
+
+    # Switch to eval for export; restore at exit.
+    model.eval()
+
+    # Remove top-level attrs
     for name in candidate_attrs:
         if hasattr(model, name):
-            with contextlib.suppress(Exception):
+            try:
+                removed_top[name] = getattr(model, name)
                 delattr(model, name)
+            except Exception:
+                # Keep export robust even if deletion fails.
+                pass
+
+    # Remove History-based attrs from modules
     with contextlib.suppress(Exception):
         for module in model.modules():
-            if hasattr(module, "logger") and isinstance(getattr(module, "logger"), History):
-                delattr(module, "logger")
-            elif hasattr(module, "history") and isinstance(
-                getattr(module, "history"), History
-            ):
-                delattr(module, "history")
-    return model
+            for attr in ("logger", "history"):
+                if hasattr(module, attr):
+                    try:
+                        v = getattr(module, attr)
+                    except Exception:
+                        continue
+                    if isinstance(v, History):
+                        try:
+                            removed_sub.append((module, attr, v))
+                            delattr(module, attr)
+                        except Exception:
+                            pass
+
+    try:
+        yield model
+    finally:
+        # Restore module state
+        for module, attr, v in removed_sub:
+            with contextlib.suppress(Exception):
+                setattr(module, attr, v)
+        for name, v in removed_top.items():
+            with contextlib.suppress(Exception):
+                setattr(model, name, v)
+        # Restore training mode
+        if was_training:
+            with contextlib.suppress(Exception):
+                model.train(True)
 
 
-def _get_tensor_shape(
-    model: nn.Module, sample_input: Optional[torch.Tensor]
-) -> Tuple[int, Tuple[int, ...]]:
+def _extract_pred_tensor(out: Any) -> torch.Tensor:
+    if isinstance(out, TensorDictBase):
+        y = out.get("pred", None)
+        if not isinstance(y, torch.Tensor):
+            y = next((v for v in out.values() if isinstance(v, torch.Tensor)), None)
+        if isinstance(y, torch.Tensor):
+            return y
+        raise RuntimeError("Failed to extract tensor from TensorDict output.")
+    if isinstance(out, torch.Tensor):
+        return out
+    if isinstance(out, (tuple, list)) and out:
+        if isinstance(out[0], torch.Tensor):
+            return out[0]
+        for v in out:
+            if isinstance(v, torch.Tensor):
+                return v
+    raise RuntimeError("Model forward did not return a tensor output.")
 
+
+@lru_cache(maxsize=256)
+def _forward_param_names(model_cls: type) -> Optional[set[str]]:
+    try:
+        sig = inspect.signature(model_cls.forward)  # type: ignore[misc]
+    except Exception:
+        return None
+    names = set(sig.parameters.keys())
+    return names
+
+
+def _forward_model(model: nn.Module, x: torch.Tensor) -> Any:
+    """Call model(x, ...) in a signature-aware way for compatibility."""
+    names = _forward_param_names(type(model))
+    if names is None:
+        return model(x)
+    # If forward accepts **kwargs, we can always pass these.
+    accepts_kwargs = any(
+        getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD
+        for p in inspect.signature(type(model).forward).parameters.values()  # type: ignore[misc]
+    )
+    kwargs: Dict[str, Any] = {}
+    if accepts_kwargs or "labels_flat" in names:
+        kwargs["labels_flat"] = None
+    if accepts_kwargs or "net_loss" in names:
+        kwargs["net_loss"] = None
+    return model(x, **kwargs) if kwargs else model(x)
+
+
+def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) -> Tuple[int, Tuple[int, ...]]:
     in_dim: Optional[int] = None
     out_shape: Optional[Tuple[int, ...]] = None
+
     if hasattr(model, "in_dim"):
         try:
             in_dim = int(getattr(model, "in_dim"))
@@ -76,50 +162,30 @@ def _get_tensor_shape(
             out_shape = tuple(int(x) for x in _shape)
         except (TypeError, ValueError):
             out_shape = None
+
     if (in_dim is None or out_shape is None) and sample_input is not None:
         from ..model.fused import Gradient
 
-        dev = next(
-            (p.device for p in model.parameters() if p is not None), torch.device("cpu")
-        )
+        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
-        model.eval()
-        with Gradient.inference(model):
+        with Gradient.inference(model.eval()):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
-            model_out = model(sample, labels_flat=None, net_loss=None)
-            if isinstance(model_out, TensorDictBase):
-                y_flat = model_out.get("pred", None)
-                if not isinstance(y_flat, torch.Tensor):
-                    y_flat = next(
-                        (
-                            v
-                            for v in model_out.values()
-                            if isinstance(v, torch.Tensor)
-                        ),
-                        None,
-                    )
-            elif isinstance(model_out, (tuple, list)):
-                y_flat = model_out[0]
-            else:
-                y_flat = model_out
-        if not isinstance(y_flat, torch.Tensor):
-            raise RuntimeError(
-                "Failed to infer output shape: model did not return a tensor output"
-            )
+            y_flat = _extract_pred_tensor(_forward_model(model, sample))
+
         if in_dim is None:
             in_dim = int(sample.numel() // int(sample.shape[0]))
         if out_shape is None:
             out_shape = tuple(int(x) for x in y_flat.shape[1:])
             if len(out_shape) == 1:
                 out_shape = (out_shape[0],)
+
     if in_dim is None or out_shape is None:
         raise RuntimeError("Failed to infer input and output shapes.")
     return int(in_dim), tuple(out_shape)
 
 
 def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch.Tensor:
-
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
@@ -132,7 +198,6 @@ def _pad_sample(model: nn.Module, sample_input: Optional[torch.Tensor]) -> torch
 
 
 def _onnx_options(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
-
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": int(kwargs.get("opset_version", 18)),
@@ -141,7 +206,6 @@ def _onnx_options(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _resolve_onnx_path(dst: Path, kwargs: Mapping[str, Any]) -> Path:
-
     override = kwargs.get("onnx_path")
     if override:
         return Path(override)
@@ -162,408 +226,359 @@ class _CompatLayer(nn.Module):
         self.net = net
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = self.net(x, labels_flat=None, net_loss=None)
-        if isinstance(out, TensorDictBase):
-            y_flat = out.get("pred", None)
-            if not isinstance(y_flat, torch.Tensor):
-                y_flat = next(
-                    (v for v in out.values() if isinstance(v, torch.Tensor)), None
-                )
-        elif isinstance(out, (tuple, list)):
-            y_flat = out[0]
-        else:
-            y_flat = out
-        if not isinstance(y_flat, torch.Tensor):
-            raise RuntimeError(
-                "Compat layer expected tensor output from model forward pass"
-            )
-        return y_flat
-
+        return _extract_pred_tensor(_forward_model(self.net, x))
 
 
 class Onnx(Format):
     name = "onnx"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        out = OnnxIO._OnnxLayer.export(serving_model, dst, **_onnx_options(kwargs))
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving:
+            out = OnnxIO._OnnxLayer.export(serving, dst, **_onnx_options(kwargs))
         return (out,)
 
 
 class Ort(Format):
     name = "ort"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        onnx_path = OnnxIO._OnnxLayer.coerce(
-            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
-        )
-        ort_path, optimized = OnnxIO._OrtLayer.to_ort(
-            onnx_path,
-            dst,
-            optimization_level=str(kwargs.get("optimization_level", "all")),
-            optimization_style=str(kwargs.get("optimization_style", "fixed")),
-            target_platform=kwargs.get("target_platform"),
-            save_optimized_onnx_model=bool(
-                kwargs.get("save_optimized_onnx_model", False)
-            ),
-        )
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving:
+            onnx_path = OnnxIO._OnnxLayer.coerce(
+                serving, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            )
+            ort_path, optimized = OnnxIO._OrtLayer.to_ort(
+                onnx_path,
+                dst,
+                optimization_level=str(kwargs.get("optimization_level", "all")),
+                optimization_style=str(kwargs.get("optimization_style", "fixed")),
+                target_platform=kwargs.get("target_platform"),
+                save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
+            )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
 
 class TensorRT(Format):
     name = "tensorrt"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        onnx_path = OnnxIO._OnnxLayer.coerce(
-            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
-        )
-        try:
-            import tensorrt as trt
-        except ImportError as exc:
-            raise ImportError("TensorRT is required for this export.") from exc
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving_model:
+            onnx_path = OnnxIO._OnnxLayer.coerce(
+                serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            )
+            try:
+                import tensorrt as trt
+            except ImportError as exc:
+                raise ImportError("TensorRT is required for this export.") from exc
 
-        trt_logger = trt.Logger(trt.Logger.WARNING)
-        explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-        with (
-            trt.Builder(trt_logger) as builder,
-            builder.create_network(explicit_batch) as network,
-            trt.OnnxParser(network, trt_logger) as parser,
-            builder.create_builder_config() as config,
-        ):
-            workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
-            if hasattr(config, "set_memory_pool_limit"):
-                config.set_memory_pool_limit(
-                    trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
-                )
-            else:
-                config.max_workspace_size = workspace_size_bytes
-            with open(onnx_path, "rb") as handle:
-                if not parser.parse(handle.read()):
-                    for i in range(parser.num_errors):
-                        print(parser.get_error(i))
-                    raise RuntimeError("TensorRT could not parse the ONNX model.")
-            use_fp16 = bool(kwargs.get("fp16", True))
-            use_int8 = bool(kwargs.get("int8", False))
-
-            if use_fp16 and builder.platform_has_fast_fp16:
-                config.set_flag(trt.BuilderFlag.FP16)
-            if use_int8:
-                if not builder.platform_has_fast_int8:
-                    warnings.warn(
-                        "INT8 precision is not supported on this platform; ignoring request."
-                    )
+            trt_logger = trt.Logger(trt.Logger.WARNING)
+            explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+            with (
+                trt.Builder(trt_logger) as builder,
+                builder.create_network(explicit_batch) as network,
+                trt.OnnxParser(network, trt_logger) as parser,
+                builder.create_builder_config() as config,
+            ):
+                workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
+                if hasattr(config, "set_memory_pool_limit"):
+                    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
                 else:
-                    calibrator = kwargs.get("calibrator")
-                    if calibrator is not None:
-                        config.set_int8_calibrator(calibrator)
-                    config.set_flag(trt.BuilderFlag.INT8)
-            input_tensor = network.get_input(0)
-            sample = _pad_sample(model, kwargs.get("sample_input"))
-            shape = tuple(int(x) for x in sample.shape)
-            min_shape = (1, *shape[1:])
-            opt_shape = (int(kwargs.get("opt_batch", shape[0])), *shape[1:])
-            max_shape = (int(kwargs.get("max_batch", 8)), *shape[1:])
-            profile = builder.create_optimization_profile()
-            profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
-            config.add_optimization_profile(profile)
-            engine_bytes = builder.build_serialized_network(network, config)
-            if engine_bytes is None:
-                raise RuntimeError("Failed to build the TensorRT engine.")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with open(dst, "wb") as handle:
-                handle.write(engine_bytes)
+                    config.max_workspace_size = workspace_size_bytes
+
+                with open(onnx_path, "rb") as handle:
+                    if not parser.parse(handle.read()):
+                        for i in range(parser.num_errors):
+                            print(parser.get_error(i))
+                        raise RuntimeError("TensorRT could not parse the ONNX model.")
+
+                use_fp16 = bool(kwargs.get("fp16", True))
+                use_int8 = bool(kwargs.get("int8", False))
+
+                if use_fp16 and builder.platform_has_fast_fp16:
+                    config.set_flag(trt.BuilderFlag.FP16)
+                if use_int8:
+                    if not builder.platform_has_fast_int8:
+                        warnings.warn("INT8 precision is not supported on this platform; ignoring request.")
+                    else:
+                        calibrator = kwargs.get("calibrator")
+                        if calibrator is not None:
+                            config.set_int8_calibrator(calibrator)
+                        config.set_flag(trt.BuilderFlag.INT8)
+
+                input_tensor = network.get_input(0)
+                sample = _pad_sample(serving_model, kwargs.get("sample_input"))
+                shape = tuple(int(x) for x in sample.shape)
+                min_shape = (1, *shape[1:])
+                opt_shape = (int(kwargs.get("opt_batch", shape[0])), *shape[1:])
+                max_shape = (int(kwargs.get("max_batch", 8)), *shape[1:])
+                profile = builder.create_optimization_profile()
+                profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
+                config.add_optimization_profile(profile)
+
+                engine_bytes = builder.build_serialized_network(network, config)
+                if engine_bytes is None:
+                    raise RuntimeError("Failed to build the TensorRT engine.")
+
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with open(dst, "wb") as handle:
+                    handle.write(engine_bytes)
+
         return (dst,)
 
 
 class Nnef(Format):
     name = "nnef"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        onnx_path = OnnxIO._OnnxLayer.coerce(
-            serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
-        )
-        try:
-            import importlib
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving_model:
+            onnx_path = OnnxIO._OnnxLayer.coerce(
+                serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            )
+            try:
+                import importlib
 
-            importlib.import_module("nnef_tools.convert")
-        except ImportError as exc:
-            raise ImportError("nnef-tools[onnx] is required for this export.") from exc
-        input_shapes = kwargs.get("input_shapes")
-        if input_shapes is None:
-            sample = _pad_sample(model, kwargs.get("sample_input"))
-            input_shapes = {"features": tuple(int(x) for x in sample.shape)}
-        cmd = [
-            sys.executable,
-            "-m",
-            "nnef_tools.convert",
-            "--input-format",
-            "onnx",
-            "--output-format",
-            "nnef",
-            "--input-model",
-            str(onnx_path),
-            "--output-model",
-            str(dst),
-            "--input-shapes",
-            json.dumps(input_shapes),
-        ]
-        toggles = (
-            ("keep_io_names", "--keep-io-names", True),
-            ("io_transpose", "--io-transpose", False),
-            ("fold_constants", "--fold-constants", True),
-            ("optimize", "--optimize", True),
-            ("compress", "--compress", True),
-        )
-        for key, flag, default in toggles:
-            if bool(kwargs.get(key, default)):
-                cmd.append(flag)
-        _in_console(cmd, "nnef convert")
+                importlib.import_module("nnef_tools.convert")
+            except ImportError as exc:
+                raise ImportError("nnef-tools[onnx] is required for this export.") from exc
+
+            input_shapes = kwargs.get("input_shapes")
+            if input_shapes is None:
+                sample = _pad_sample(serving_model, kwargs.get("sample_input"))
+                input_shapes = {"features": tuple(int(x) for x in sample.shape)}
+
+            cmd = [
+                sys.executable,
+                "-m",
+                "nnef_tools.convert",
+                "--input-format",
+                "onnx",
+                "--output-format",
+                "nnef",
+                "--input-model",
+                str(onnx_path),
+                "--output-model",
+                str(dst),
+                "--input-shapes",
+                json.dumps(input_shapes),
+            ]
+            toggles = (
+                ("keep_io_names", "--keep-io-names", True),
+                ("io_transpose", "--io-transpose", False),
+                ("fold_constants", "--fold-constants", True),
+                ("optimize", "--optimize", True),
+                ("compress", "--compress", True),
+            )
+            for key, flag, default in toggles:
+                if bool(kwargs.get(key, default)):
+                    cmd.append(flag)
+            _in_console(cmd, "nnef convert")
         return (dst,)
 
 
 class CoreML(Format):
     name = "coreml"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
         is_required("coremltools", "pip install coremltools")
-        serving_model = _prepare_serving_model(model)
         import coremltools as ct
-
         from ..model.fused import Gradient
 
-        sample = _pad_sample(model, kwargs.get("sample_input"))
-        wrapper = _CompatLayer(serving_model).eval()
-        with Gradient.inference(wrapper):
-            scripted = torch.jit.trace(wrapper, sample)
-        cu_map = {
-            "ALL": getattr(ct.ComputeUnit, "ALL", None),
-            "CPU_ONLY": getattr(ct.ComputeUnit, "CPU_ONLY", None),
-            "CPU_AND_GPU": getattr(ct.ComputeUnit, "CPU_AND_GPU", None),
-            "CPU_AND_NE": getattr(ct.ComputeUnit, "CPU_AND_NE", None),
-        }
-        convert_to = str(kwargs.get("convert_to", "mlprogram"))
-        compute_units = cu_map.get(
-            str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"]
-        )
-        kwargs_dict: Dict[str, Any] = {
-            "inputs": [ct.TensorType(shape=tuple(int(x) for x in sample.shape))],
-            "convert_to": convert_to,
-            "compute_units": compute_units,
-        }
-        deployment_target = kwargs.get("minimum_deployment_target")
-        if deployment_target:
-            target = getattr(ct.target, deployment_target, None)
-            if target is not None:
-                kwargs_dict["minimum_deployment_target"] = target
-        mlmodel = ct.convert(scripted, **kwargs_dict)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        mlmodel.save(str(dst))
+        with _serving_model(model) as serving_model:
+            sample = _pad_sample(serving_model, kwargs.get("sample_input"))
+            wrapper = _CompatLayer(serving_model).eval()
+            with Gradient.inference(wrapper):
+                scripted = torch.jit.trace(wrapper, sample)
+
+            cu_map = {
+                "ALL": getattr(ct.ComputeUnit, "ALL", None),
+                "CPU_ONLY": getattr(ct.ComputeUnit, "CPU_ONLY", None),
+                "CPU_AND_GPU": getattr(ct.ComputeUnit, "CPU_AND_GPU", None),
+                "CPU_AND_NE": getattr(ct.ComputeUnit, "CPU_AND_NE", None),
+            }
+            convert_to = str(kwargs.get("convert_to", "mlprogram"))
+            compute_units = cu_map.get(str(kwargs.get("compute_units", "ALL")).upper(), cu_map["ALL"])
+
+            kwargs_dict: Dict[str, Any] = {
+                "inputs": [ct.TensorType(shape=tuple(int(x) for x in sample.shape))],
+                "convert_to": convert_to,
+                "compute_units": compute_units,
+            }
+            deployment_target = kwargs.get("minimum_deployment_target")
+            if deployment_target:
+                target = getattr(ct.target, deployment_target, None)
+                if target is not None:
+                    kwargs_dict["minimum_deployment_target"] = target
+
+            mlmodel = ct.convert(scripted, **kwargs_dict)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            mlmodel.save(str(dst))
         return (dst,)
 
 
 class LiteRT(Format):
     name = "litert"
 
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        onnx_path = OnnxIO._OnnxLayer.coerce(
-            serving_model,
-            _resolve_onnx_path(dst, kwargs),
-            **_onnx_options(kwargs),
-        )
-        if bool(kwargs.get("prefer_onnx2tf", True)):
-            try:
-                out_dir = dst.with_suffix("")
-                out_dir.mkdir(parents=True, exist_ok=True)
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "onnx2tf",
-                    "-i",
-                    str(onnx_path),
-                    "-o",
-                    str(out_dir),
-                    "--copy_onnx_input_output_names_to_tflite",
-                ]
-                _in_console(cmd, "onnx2tf")
-                tflites = list(out_dir.glob("*.tflite"))
-                if not tflites:
-                    raise RuntimeError("onnx2tf did not produce a TFLite model.")
-                shutil.copyfile(tflites[0], dst)
-                return (dst,)
-            except Exception as exc:
-                warnings.warn(
-                    f"Falling back to the onnx-tf export path because onnx2tf failed: {exc}."
-                )
-        is_required("onnx", "pip install onnx")
-        is_required("onnx-tf", "pip install onnx-tf")
-        import onnx
-        import tensorflow as tf
-        from onnx_tf.backend import prepare
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving_model:
+            onnx_path = OnnxIO._OnnxLayer.coerce(
+                serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            )
 
-        model_onnx = onnx.load(str(onnx_path))
-
-        with TemporaryDirectory() as tmpd:
-            saved_model_dir = Path(tmpd) / "saved_model"
-            prepare(model_onnx).export_graph(str(saved_model_dir))
-            converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
-            if bool(kwargs.get("allow_fp16", False)):
-                converter.target_spec.supported_types = [tf.float16]
-                converter.optimizations = [tf.lite.Optimize.DEFAULT]
-            if bool(kwargs.get("int8_quantize", False)):
-                rep_ds = kwargs.get("representative_dataset")
-                if rep_ds is None:
-                    raise ValueError(
-                        "A representative_dataset is required for INT8 quantization."
+            if bool(kwargs.get("prefer_onnx2tf", True)):
+                try:
+                    out_dir = dst.with_suffix("")
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    cmd = [
+                        sys.executable,
+                        "-m",
+                        "onnx2tf",
+                        "-i",
+                        str(onnx_path),
+                        "-o",
+                        str(out_dir),
+                        "--copy_onnx_input_output_names_to_tflite",
+                    ]
+                    _in_console(cmd, "onnx2tf")
+                    tflites = list(out_dir.glob("*.tflite"))
+                    if not tflites:
+                        raise RuntimeError("onnx2tf did not produce a TFLite model.")
+                    shutil.copyfile(tflites[0], dst)
+                    return (dst,)
+                except Exception as exc:
+                    warnings.warn(
+                        f"Falling back to the onnx-tf export path because onnx2tf failed: {exc}."
                     )
-                converter.optimizations = [tf.lite.Optimize.DEFAULT]
-                converter.representative_dataset = rep_ds
-                converter.target_spec.supported_ops = [
-                    tf.lite.OpsSet.TFLITE_BUILTINS_INT8
-                ]
-                converter.inference_input_type = tf.int8
-                converter.inference_output_type = tf.int8
-            tflite_model = converter.convert()
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            with open(dst, "wb") as handle:
-                handle.write(tflite_model)
-        return (dst,)
 
+            is_required("onnx", "pip install onnx")
+            is_required("onnx-tf", "pip install onnx-tf")
+            import onnx
+            import tensorflow as tf
+            from onnx_tf.backend import prepare
+
+            model_onnx = onnx.load(str(onnx_path))
+
+            with TemporaryDirectory() as tmpd:
+                saved_model_dir = Path(tmpd) / "saved_model"
+                prepare(model_onnx).export_graph(str(saved_model_dir))
+                converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
+                if bool(kwargs.get("allow_fp16", False)):
+                    converter.target_spec.supported_types = [tf.float16]
+                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+                if bool(kwargs.get("int8_quantize", False)):
+                    rep_ds = kwargs.get("representative_dataset")
+                    if rep_ds is None:
+                        raise ValueError("A representative_dataset is required for INT8 quantization.")
+                    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+                    converter.representative_dataset = rep_ds
+                    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+                    converter.inference_input_type = tf.int8
+                    converter.inference_output_type = tf.int8
+
+                tflite_model = converter.convert()
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                with open(dst, "wb") as handle:
+                    handle.write(tflite_model)
+        return (dst,)
 
 
 class TorchScript(Format):
     name = "torchscript"
 
-    def save(
-        self,
-        model: nn.Module,
-        dst: Path,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Tuple[Path, ...]:
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
         method = str(kwargs.get("method", "script")).lower()
-        sample = kwargs.get("sample_input")
-        serving_model = _prepare_serving_model(model)
-        wrapper = _CompatLayer(serving_model).eval()
         from ..model.fused import Gradient
 
-        if method == "trace":
-            if sample is None:
-                sample = _pad_sample(model, None)
-            with Gradient.inference(wrapper):
-                scripted = torch.jit.trace(wrapper, sample)
-        else:
-            with Gradient.inference(wrapper):
-                scripted = torch.jit.script(wrapper)
+        with _serving_model(model) as serving_model:
+            sample = kwargs.get("sample_input")
+            wrapper = _CompatLayer(serving_model).eval()
 
-        if bool(kwargs.get("optimize_for_mobile", False)):
-            try:
-                from torch.utils.mobile_optimizer import optimize_for_mobile
-            except ImportError as exc:
-                raise ImportError(
-                    "torch.utils.mobile_optimizer is required for optimize_for_mobile=True"
-                ) from exc
-            backend = str(kwargs.get("mobile_backend", "cpu")).lower()
-            try:
-                scripted = optimize_for_mobile(scripted, backend=backend)
-            except TypeError:
-                scripted = optimize_for_mobile(scripted)
+            if method == "trace":
+                if sample is None:
+                    sample = _pad_sample(serving_model, None)
+                with Gradient.inference(wrapper):
+                    scripted = torch.jit.trace(wrapper, sample)
+            else:
+                with Gradient.inference(wrapper):
+                    scripted = torch.jit.script(wrapper)
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        scripted.save(str(dst))
+            if bool(kwargs.get("optimize_for_mobile", False)):
+                try:
+                    from torch.utils.mobile_optimizer import optimize_for_mobile
+                except ImportError as exc:
+                    raise ImportError(
+                        "torch.utils.mobile_optimizer is required for optimize_for_mobile=True"
+                    ) from exc
+                backend = str(kwargs.get("mobile_backend", "cpu")).lower()
+                try:
+                    scripted = optimize_for_mobile(scripted, backend=backend)
+                except TypeError:
+                    scripted = optimize_for_mobile(scripted)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            scripted.save(str(dst))
         return (dst,)
-
 
 
 class ExecuTorch(Format):
     name = "executorch"
 
-    def save(
-        self,
-        model: nn.Module,
-        dst: Path,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Tuple[Path, ...]:
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
         is_required("executorch", "pip install executorch")
         try:
             from torch.export import export as torch_export
         except ImportError as exc:
-            raise ImportError(
-                "torch.export is required for ExecuTorch export (PyTorch 2.0+)."
-            ) from exc
+            raise ImportError("torch.export is required for ExecuTorch export (PyTorch 2.0+).") from exc
 
         import executorch.exir as exir
-
-        serving_model = _prepare_serving_model(model)
-        sample = kwargs.get("sample_input")
-        sample = _pad_sample(serving_model, sample)
-        wrapper = _CompatLayer(serving_model).eval()
-
         from ..model.fused import Gradient
 
-        with Gradient.inference(wrapper):
-            exported = torch_export(wrapper, (sample,))
+        with _serving_model(model) as serving_model:
+            sample = kwargs.get("sample_input")
+            sample = _pad_sample(serving_model, sample)
+            wrapper = _CompatLayer(serving_model).eval()
 
-        edge = exir.to_edge(exported)
-        exec_prog = exir.to_executorch(edge)
+            with Gradient.inference(wrapper):
+                exported = torch_export(wrapper, (sample,))
 
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with open(dst, "wb") as fh:
-            exec_prog.write_to_file(fh)
+            edge = exir.to_edge(exported)
+            exec_prog = exir.to_executorch(edge)
+
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            with open(dst, "wb") as fh:
+                exec_prog.write_to_file(fh)
         return (dst,)
-
 
 
 class TensorFlow(Format):
     name = "tensorflow"
 
-    def save(
-        self,
-        model: nn.Module,
-        dst: Path,
-        *args: Any,
-        **kwargs: Any,
-    ) -> Tuple[Path, ...]:
-        serving_model = _prepare_serving_model(model)
-        onnx_path = OnnxIO._OnnxLayer.coerce(
-            serving_model,
-            _resolve_onnx_path(dst, kwargs),
-            **_onnx_options(kwargs),
-        )
-        is_required("onnx", "pip install onnx")
-        is_required("onnx-tf", "pip install onnx-tf")
-        import onnx
-        from onnx_tf.backend import prepare
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]:
+        with _serving_model(model) as serving_model:
+            onnx_path = OnnxIO._OnnxLayer.coerce(
+                serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
+            )
 
-        model_onnx = onnx.load(str(onnx_path))
-        if dst.suffix:
-            saved_model_dir = dst.with_suffix("")
-        else:
-            saved_model_dir = dst
-        saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
-        prepare(model_onnx).export_graph(str(saved_model_dir))
+            is_required("onnx", "pip install onnx")
+            is_required("onnx-tf", "pip install onnx-tf")
+            import onnx
+            from onnx_tf.backend import prepare
+
+            model_onnx = onnx.load(str(onnx_path))
+            saved_model_dir = dst.with_suffix("") if dst.suffix else dst
+            saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
+            prepare(model_onnx).export_graph(str(saved_model_dir))
         return (saved_model_dir,)
 
 
 class OnnxIO:
     _by_name: Dict[str, Format] = {}
     _ext_map: Dict[str, str] = {}
+
+    @lru_cache(maxsize=1)
+    def _export_sig() -> Optional[inspect.Signature]:
+        try:
+            return inspect.signature(torch.onnx.export)
+        except Exception:
+            return None
 
     class _OnnxLayer:
         @staticmethod
@@ -581,17 +596,11 @@ class OnnxIO:
             sample = _pad_sample(model, sample_input)
             input_names = ["features"]
             output_names = ["preds_flat"]
-            dynamic_axes = (
-                {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
-                if dynamic_batch
-                else None
-            )
+            dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}} if dynamic_batch else None
+
             export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
-            fallback_errors = (
-                (RuntimeError,)
-                if export_error is RuntimeError
-                else (RuntimeError, export_error)
-            )
+            fallback_errors = (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
+
             common_kwargs = {
                 "export_params": True,
                 "opset_version": opset_version,
@@ -602,48 +611,26 @@ class OnnxIO:
             }
             onnx_path.parent.mkdir(parents=True, exist_ok=True)
 
-            export_sig = None
-            with contextlib.suppress(Exception):
-                export_sig = inspect.signature(torch.onnx.export)
+            sig = OnnxIO._export_sig()
+            if sig is None:
+                torch.onnx.export(wrapper, sample, str(onnx_path), **common_kwargs)
+                return onnx_path
 
-            def _filter_kwargs(kws: Mapping[str, Any]) -> Dict[str, Any]:
-                if export_sig is None:
-                    return dict(kws)
-                return {k: v for k, v in kws.items() if k in export_sig.parameters}
-
-            base_kwargs = _filter_kwargs(common_kwargs)
-            supports_dynamo = export_sig is not None and "dynamo" in export_sig.parameters
+            params = sig.parameters
+            base_kwargs = {k: v for k, v in common_kwargs.items() if k in params}
+            supports_dynamo = "dynamo" in params
 
             if supports_dynamo:
                 try:
-                    torch.onnx.export(
-                        wrapper,
-                        sample,
-                        str(onnx_path),
-                        dynamo=True,
-                        **base_kwargs,
-                    )
+                    torch.onnx.export(wrapper, sample, str(onnx_path), dynamo=True, **base_kwargs)
                 except fallback_errors:
-                    torch.onnx.export(
-                        wrapper,
-                        sample,
-                        str(onnx_path),
-                        dynamo=False,
-                        **base_kwargs,
-                    )
+                    torch.onnx.export(wrapper, sample, str(onnx_path), dynamo=False, **base_kwargs)
             else:
-                torch.onnx.export(
-                    wrapper,
-                    sample,
-                    str(onnx_path),
-                    **base_kwargs,
-                )
+                torch.onnx.export(wrapper, sample, str(onnx_path), **base_kwargs)
             return onnx_path
 
         @staticmethod
-        def coerce(
-            model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any
-        ) -> Path:
+        def coerce(model: nn.Module, onnx_path: Path, *args: Any, **kwargs: Any) -> Path:
             if not onnx_path.exists():
                 return OnnxIO._OnnxLayer.export(model, onnx_path, **kwargs)
             return onnx_path
@@ -669,16 +656,15 @@ class OnnxIO:
                 "extended": ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED,
                 "all": ort.GraphOptimizationLevel.ORT_ENABLE_ALL,
             }
-            level = opt_map.get(
-                optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
+            level = opt_map.get(optimization_level.lower(), ort.GraphOptimizationLevel.ORT_ENABLE_ALL)
             platform = (target_platform or "").lower()
+
             disabled_optimizers = (
                 ["NchwcTransformer"]
-                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-                and platform not in {"", "amd64"}
+                if level == ort.GraphOptimizationLevel.ORT_ENABLE_ALL and platform not in {"", "amd64"}
                 else None
             )
+
             optimized_onnx_path: Optional[Path] = None
             if save_optimized_onnx_model:
                 optimized_onnx_path = ort_path.with_suffix(".optimized.onnx")
@@ -686,23 +672,21 @@ class OnnxIO:
                 so_onnx.optimized_model_filepath = str(optimized_onnx_path)
                 so_onnx.graph_optimization_level = level
                 if optimization_style.lower() == "runtime":
-                    so_onnx.add_session_config_entry(
-                        "optimization.minimal_build_optimizations", "apply"
-                    )
+                    so_onnx.add_session_config_entry("optimization.minimal_build_optimizations", "apply")
                 ort.InferenceSession(
                     str(onnx_path),
                     sess_options=so_onnx,
                     providers=["CPUExecutionProvider"],
                     disabled_optimizers=disabled_optimizers,
                 )
+
             so = ort.SessionOptions()
             so.optimized_model_filepath = str(ort_path)
             so.graph_optimization_level = level
             so.add_session_config_entry("session.save_model_format", "ORT")
             if optimization_style.lower() == "runtime":
-                so.add_session_config_entry(
-                    "optimization.minimal_build_optimizations", "save"
-                )
+                so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
+
             ort.InferenceSession(
                 str(onnx_path),
                 sess_options=so,
@@ -731,8 +715,4 @@ OnnxIO.register("coreml", (".mlmodel",), CoreML())
 OnnxIO.register("litert", (".tflite",), LiteRT())
 OnnxIO.register("torchscript", (".ts", ".torchscript"), TorchScript())
 OnnxIO.register("executorch", (".pte",), ExecuTorch())
-OnnxIO.register(
-    "tensorflow",
-    (".savedmodel", ".pb", ".tf"),
-    TensorFlow(),
-)
+OnnxIO.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
