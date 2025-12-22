@@ -1308,33 +1308,46 @@ class _MultiHeadAttentionCompat(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
+        average_attn_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
+        if need_weights:
+            # PyTorch's MultiheadAttention defaults average_attn_weights=True, but this project
+            # uses average_attn_weights=False by default to avoid an extra reduction.
+            kwargs["average_attn_weights"] = bool(average_attn_weights)
 
         def _call_mha(
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
         ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+            # Try the most-featureful signature first (is_causal + average_attn_weights),
+            # then progressively drop kwargs for older PyTorch builds.
+            call_kwargs = dict(kwargs)
+            if attn_mask is not None:
+                call_kwargs["attn_mask"] = attn_mask
+
+            if is_causal is not None:
+                try:
+                    return self.mha(q, k, v, is_causal=is_causal, **call_kwargs)
+                except TypeError:
+                    # If only average_attn_weights is unsupported, retry without it.
+                    if "average_attn_weights" in call_kwargs:
+                        call_kwargs2 = dict(call_kwargs)
+                        call_kwargs2.pop("average_attn_weights", None)
+                        try:
+                            return self.mha(q, k, v, is_causal=is_causal, **call_kwargs2)
+                        except TypeError:
+                            pass
+
             try:
-                if is_causal is not None:
-                    return self.mha(
-                        q,
-                        k,
-                        v,
-                        attn_mask=attn_mask,
-                        is_causal=is_causal,
-                        **kwargs,
-                    )
+                return self.mha(q, k, v, **call_kwargs)
             except TypeError:
-                pass
-            return self.mha(
-                q,
-                k,
-                v,
-                attn_mask=attn_mask,
-                **kwargs,
-            )
+                if "average_attn_weights" in call_kwargs:
+                    call_kwargs2 = dict(call_kwargs)
+                    call_kwargs2.pop("average_attn_weights", None)
+                    return self.mha(q, k, v, **call_kwargs2)
+                raise
 
         out, w = _call_mha(query, key, value)
         _add_mha_flops(
@@ -1448,6 +1461,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
+        average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         embed_dim = int(query.shape[-1])
 
@@ -1467,6 +1481,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
                         attn_mask=attn_mask,
                         key_padding_mask=key_padding_mask,
                         need_weights=need_weights,
+                        average_attn_weights=average_attn_weights,
                         is_causal=is_causal,
                     )
             return self._fallback(
@@ -1476,6 +1491,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 attn_mask=attn_mask,
                 key_padding_mask=key_padding_mask,
                 need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
                 is_causal=is_causal,
             )
         if self._force_pt or (self._te_mha is None):
@@ -1658,6 +1674,7 @@ class MultiHeadAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         is_causal: Optional[bool] = None,
+        average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         return self.impl(
             query,
@@ -1666,5 +1683,6 @@ class MultiHeadAttention(nn.Module):
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
             need_weights=need_weights,
+            average_attn_weights=average_attn_weights,
             is_causal=is_causal,
         )

@@ -1025,6 +1025,7 @@ class LongNet(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        average_attn_weights: bool = False,
         **_: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         attn_w: Optional[torch.Tensor] = None
@@ -1041,6 +1042,7 @@ class LongNet(nn.Module):
                 out,
                 key_padding_mask=key_padding_mask,
                 need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
             )
         out = self.norm(out)
         if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
@@ -1100,12 +1102,14 @@ class Context(nn.Module):
         x: torch.Tensor,
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
+        average_attn_weights: bool = False,
         **_: Any,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         return self.backbone(
             x,
             key_padding_mask=key_padding_mask,
             need_weights=need_weights,
+            average_attn_weights=average_attn_weights,
         )
 
     def run(
