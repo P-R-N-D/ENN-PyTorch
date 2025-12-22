@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
-import json
 import tempfile
+import threading
 from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
@@ -17,9 +18,11 @@ from torch import nn
 
 try:
     from torch.serialization import add_safe_globals as _add_safe_globals
-except ImportError:
+except ImportError:  # pragma: no cover
     _add_safe_globals = None
 
+# Best-effort: allowlist TorchVersion for weights_only loads when available.
+# Keep this non-fatal; older torch won't have these modules or APIs.
 if _add_safe_globals is not None:
     with contextlib.suppress(Exception):
         import torch.torch_version as _torch_version
@@ -28,15 +31,21 @@ if _add_safe_globals is not None:
 
 from torch.distributed.checkpoint import FileSystemReader
 from torch.distributed.checkpoint import load as dcp_load
-from torch.distributed.checkpoint.state_dict import (StateDictOptions,
-                                                     get_model_state_dict,
-                                                     set_model_state_dict)
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
 
 from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config
 
-
 _LOGGER = logging.getLogger(__name__)
+
+# Serialize/save operations should not overlap within a process.
+# This does not stop training by itself, but prevents concurrent saves and is
+# a good hook point if the training loop cooperates.
+_SAVE_LOCK = threading.RLock()
 
 
 class Format(Protocol):
@@ -59,36 +68,74 @@ def _is_required(module: str, pip_hint: str | None = None) -> None:
 
 
 def _to_cpu(value: Any) -> Any:
+    """Detach tensors and move them to CPU recursively.
+
+    This is used for formats that require CPU tensors (e.g. safetensors).
+    It is defensive about tuple subclasses (e.g. namedtuple).
+    """
     if isinstance(value, torch.Tensor):
-        return value.detach().to(device="cpu")
+        return value.detach().to("cpu")
     if isinstance(value, dict):
-        return {k: _to_cpu(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        seq = [_to_cpu(v) for v in value]
-        return type(value)(seq) if isinstance(value, tuple) else seq
+        return type(value)((k, _to_cpu(v)) for k, v in value.items())
+    if isinstance(value, list):
+        return [_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        seq = tuple(_to_cpu(v) for v in value)
+        if type(value) is tuple:
+            return seq
+        # namedtuple: constructor expects positional args.
+        if hasattr(value, "_fields"):
+            try:
+                return type(value)(*seq)
+            except Exception:
+                return seq
+        try:
+            return type(value)(seq)
+        except Exception:
+            return seq
     return value
 
 
 def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
-    def _is_wrapped_key(key: str) -> bool:
-        parts = key.split(".")
-        return len(parts) >= 3 and parts[0] == "m" and parts[1].isdigit() and parts[2] == "module"
+    """Strip legacy keys like `m.0.module.<real_key>` -> `<real_key>`.
 
-    if not any(_is_wrapped_key(k) for k in sd.keys()):
+    This is done lazily: we only allocate a new dict if we actually change a key.
+    """
+    new_sd: Optional[Dict[str, Any]] = None
+    prefix = ("m",)  # explicit marker for clarity
+
+    for k, v in sd.items():
+        # Fast checks before split:
+        if not (k.startswith("m.") and ".module." in k):
+            nk = k
+        else:
+            parts = k.split(".")
+            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and parts[2] == "module":
+                nk = ".".join(parts[3:])
+            else:
+                nk = k
+
+        if nk != k and new_sd is None:
+            new_sd = type(sd)()
+            # Accumulate already processed entries: we must not copy `sd` blindly to keep O(n)
+            # work bounded and to preserve dict subclass types if possible.
+            # We'll rebuild from scratch in the second pass below.
+            break
+
+    if new_sd is None:
         return sd
 
-    new_sd = sd.__class__() if hasattr(sd, "__class__") else {}
+    # Rebuild with the same rule (single pass).
     for k, v in sd.items():
-        if _is_wrapped_key(k):
-            parts = k.split(".")
-            try:
-                module_idx = parts.index("module")
-                new_key = ".".join(parts[module_idx + 1 :])
-            except ValueError:
-                new_key = k
+        if not (k.startswith("m.") and ".module." in k):
+            nk = k
         else:
-            new_key = k
-        new_sd[new_key] = v
+            parts = k.split(".")
+            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and parts[2] == "module":
+                nk = ".".join(parts[3:])
+            else:
+                nk = k
+        new_sd[nk] = v
 
     return new_sd
 
@@ -96,11 +143,7 @@ def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
 def _json_sanitize(obj: Any) -> Any:
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
-    if isinstance(obj, torch.device):
-        return str(obj)
-    if isinstance(obj, Path):
-        return str(obj)
-    if isinstance(obj, torch.dtype):
+    if isinstance(obj, (torch.device, Path, torch.dtype)):
         return str(obj)
     if isinstance(obj, torch.Tensor):
         return {
@@ -120,15 +163,78 @@ def _json_default(obj: Any) -> Any:
     return _json_sanitize(obj)
 
 
-def _is_rank0() -> bool:
+def _get_dist():
     try:
-        import torch.distributed as dist
+        import torch.distributed as dist  # type: ignore
+    except Exception:
+        return None
+    return dist
 
+
+def _is_dist_initialized() -> bool:
+    dist = _get_dist()
+    if dist is None:
+        return False
+    try:
+        return bool(dist.is_available() and dist.is_initialized())
+    except Exception:
+        return False
+
+
+def _is_rank0_global() -> bool:
+    dist = _get_dist()
+    if dist is None:
+        return True
+    try:
         if dist.is_available() and dist.is_initialized():
             return int(dist.get_rank()) == 0
     except Exception:
         pass
     return True
+
+
+def _local_rank_from_env() -> Optional[int]:
+    # Common launchers:
+    for key in ("LOCAL_RANK", "SLURM_LOCALID", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK"):
+        v = os.environ.get(key)
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _is_rank0_local() -> bool:
+    # Prefer local rank env vars when present; fallback to global rank.
+    lr = _local_rank_from_env()
+    if lr is not None:
+        return lr == 0
+    return _is_rank0_global()
+
+
+def _dist_barrier() -> None:
+    dist = _get_dist()
+    if dist is None:
+        return
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        # Never fail saving because barrier isn't available/healthy.
+        pass
+
+
+@contextlib.contextmanager
+def _save_sync() -> Any:
+    """Synchronize saves within a process (lock) and across ranks (barrier)."""
+    with _SAVE_LOCK:
+        _dist_barrier()
+        try:
+            yield
+        finally:
+            _dist_barrier()
 
 
 def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
@@ -149,7 +255,7 @@ def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
 
 
 def _atomic_torch_save(obj: Any, path: Path, **opts: Any) -> None:
-    """Atomically write a torch checkpoint.
+    """Atomically write a torch checkpoint file.
 
     Writes to a temporary file in the same directory and then renames into place.
     This avoids corrupting checkpoints if the process is interrupted mid-write.
@@ -183,7 +289,9 @@ def _torch_load_checkpoint(
     """
     try:
         return torch.load(
-            str(path), map_location=map_location or "cpu", weights_only=bool(weights_only)
+            str(path),
+            map_location=map_location or "cpu",
+            weights_only=bool(weights_only),
         )
     except TypeError:
         # Older PyTorch: no weights_only support.
@@ -204,9 +312,7 @@ def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
     try:
         return json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise RuntimeError(
-            f"Failed to parse checkpoint metadata at {str(meta_path)!r}"
-        ) from exc
+        raise RuntimeError(f"Failed to parse checkpoint metadata at {str(meta_path)!r}") from exc
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
@@ -253,6 +359,8 @@ def load_model(
 ) -> nn.Module:
     p = Path(checkpoint_path)
     load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
+
+    # 1) Distributed Checkpoint directory
     if p.is_dir():
         meta: Dict[str, Any] = _read_checkpoint_dir_meta(p)
 
@@ -261,7 +369,6 @@ def load_model(
         use_out_shape = tuple(int(x) for x in out_shape_meta) if out_shape_meta else ()
 
         user_provided_config = config is not None
-
         raw_cfg = config if user_provided_config else meta.get("config")
         use_config = coerce_model_config(raw_cfg)
         if not user_provided_config:
@@ -286,27 +393,26 @@ def load_model(
     if not p.exists():
         raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
 
-    if p.suffix.lower() == ".safetensors":
+    suffix = p.suffix.lower()
+
+    # 2) safetensors + sidecar json
+    if suffix == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError(
-                "Missing sidecar JSON file for the safetensors checkpoint."
-            )
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
-        out_shape_meta = (
-            out_shape if out_shape is not None else meta.get("out_shape") or ()
-        )
-        use_out_shape = tuple(int(x) for x in out_shape_meta)
-        user_provided_config = config is not None
 
-        use_config = coerce_model_config(
-            config if user_provided_config else meta.get("config")
-        )
+        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
+        out_shape_meta = out_shape if out_shape is not None else (meta.get("out_shape") or ())
+        use_out_shape = tuple(int(x) for x in out_shape_meta) if out_shape_meta else ()
+
+        user_provided_config = config is not None
+        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
             use_config.device = load_dev
+
         if use_in_dim <= 0 or not use_out_shape:
             raise RuntimeError(
                 f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: "
@@ -314,17 +420,17 @@ def load_model(
             )
 
         model = new_model(use_in_dim, use_out_shape, use_config)
+
         _is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
 
-        dev = map_location or "cpu"
-        # Normalize `map_location` to a string for `safetensors.torch.load_file`.
-        # Passing a torch.device is usually accepted, but normalizing avoids
-        # edge-cases across versions.
-        if isinstance(dev, torch.device):
-            dev = str(dev)
+        dev: str
+        if map_location is None:
+            dev = "cpu"
+        elif isinstance(map_location, torch.device):
+            dev = str(map_location)
         else:
-            dev = str(dev)
+            dev = str(map_location)
 
         sd = load_tensors(str(p), device=dev)
         sd = _strip_legacy_wrapped_keys(sd)
@@ -332,6 +438,7 @@ def load_model(
         model.load_state_dict(sd, strict=False)
         return model
 
+    # 3) torch.save checkpoints (.pt/.pth or any other file)
     obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
@@ -345,12 +452,11 @@ def load_model(
         sd = obj
 
     use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
-    out_shape_meta = out_shape if out_shape is not None else meta_out_shape or ()
+    out_shape_meta = out_shape if out_shape is not None else (meta_out_shape or ())
     use_out_shape = tuple(int(x) for x in out_shape_meta)
     user_provided_config = config is not None
 
     use_config = coerce_model_config(config if user_provided_config else meta_cfg)
-
     if not user_provided_config:
         use_config.device = load_dev
     elif map_location is not None and use_config.device is None:
@@ -363,8 +469,11 @@ def load_model(
         )
 
     model = new_model(use_in_dim, use_out_shape, use_config)
-    sd = _strip_legacy_wrapped_keys(sd)
-    model.load_state_dict(sd, strict=False)
+    sd = _strip_legacy_wrapped_keys(sd) if isinstance(sd, dict) else sd
+    # Keep buffer sizing consistent across formats.
+    with contextlib.suppress(Exception):
+        resize_scaler_buffer(model, sd)  # type: ignore[arg-type]
+    model.load_state_dict(sd, strict=False)  # type: ignore[arg-type]
     return model
 
 
@@ -380,37 +489,35 @@ def save_model(
 ) -> str:
     p = Path(path)
 
+    # Native torch checkpoint path (rank0-local only for single-file outputs).
     if TorchIO.is_native_target(p):
+        if args:
+            # Native path does not accept positional args (kept only for export converters).
+            raise TypeError(
+                "Positional args are only supported for export converters; "
+                "use keyword arguments for TorchIO.save()."
+            )
+
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             try:
                 merged_extra["ema_averager_state"] = ema_averager.state_dict()
             except Exception:
-                _LOGGER.debug(
-                    "Failed to serialize ema_averager_state; skipping",
-                    exc_info=True,
-                )
+                _LOGGER.debug("Failed to serialize ema_averager_state; skipping", exc_info=True)
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             try:
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
             except Exception:
-                _LOGGER.debug(
-                    "Failed to serialize swa_averager_state; skipping",
-                    exc_info=True,
-                )
-        out = TorchIO.save(
-            model,
-            p,
-            optimizer=optimizer,
-            extra=merged_extra or None,
-            **kwargs,
-        )
+                _LOGGER.debug("Failed to serialize swa_averager_state; skipping", exc_info=True)
+
+        out = TorchIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
         return str(out)
 
+    # Export converter path (positional args supported here only).
     conv = _export_backend().OnnxIO.for_export(p.suffix)
     if conv is None:
         raise ValueError(f"Unknown export format for path '{path}'.")
-    conv.save(model, p, **kwargs)
+    conv.save(model, p, *args, **kwargs)
     return str(p)
 
 
@@ -421,9 +528,7 @@ class TorchIO:
     def is_native_target(path: str | Path) -> bool:
         p = Path(path)
         suffix = p.suffix.lower()
-        if not suffix:
-            return True
-        return suffix in TorchIO.NATIVE_EXTS
+        return (not suffix) or (suffix in TorchIO.NATIVE_EXTS)
 
     @staticmethod
     def save(
@@ -436,29 +541,38 @@ class TorchIO:
         p = Path(path)
         suffix = p.suffix.lower()
 
+        # Distributed checkpoint directory case:
+        # - All ranks participate in dcp_save
+        # - Only local-rank0 writes meta.json
         if not suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
 
-            opts_sd = StateDictOptions(full_state_dict=True)
-            m_sd = get_model_state_dict(model, options=opts_sd)
-            dcp_save(
-                state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(str(p)),
-            )
-            meta = {
-                "version": 1,
-                "format": "dcp-dir-v1",
-                "in_dim": int(getattr(model, "in_dim", 0)),
-                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-                "config": _load_model_config(model),
-                "pytorch_version": torch.__version__,
-                "extra": _json_sanitize(extra or {}),
-            }
-            meta_path = p / "meta.json"
-            if _is_rank0():
-                meta_text = json.dumps(meta, indent=2, default=_json_default)
-                _atomic_write_text(meta_path, meta_text, encoding="utf-8")
+            with _save_sync():
+                opts_sd = StateDictOptions(full_state_dict=True)
+                m_sd = get_model_state_dict(model, options=opts_sd)
+                dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
+
+                meta = {
+                    "version": 1,
+                    "format": "dcp-dir-v1",
+                    "in_dim": int(getattr(model, "in_dim", 0)),
+                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                    "config": _load_model_config(model),
+                    "pytorch_version": torch.__version__,
+                    "extra": _json_sanitize(extra or {}),
+                }
+                meta_path = p / "meta.json"
+                if _is_rank0_local():
+                    meta_text = json.dumps(meta, indent=2, default=_json_default)
+                    _atomic_write_text(meta_path, meta_text, encoding="utf-8")
+            return p
+
+        # Single-file targets are local-rank0 only.
+        if not _is_rank0_local():
+            # Return the resolved destination path without writing.
+            if not suffix:
+                return p.with_suffix(".pt")
             return p
 
         if not suffix:
@@ -467,60 +581,60 @@ class TorchIO:
 
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        if suffix == ".safetensors":
-            _is_required("safetensors", "pip install safetensors")
-            from safetensors.torch import save_file as save_tensors
+        with _save_sync():
+            # safetensors: CPU tensors only; include sidecar json.
+            if suffix == ".safetensors":
+                _is_required("safetensors", "pip install safetensors")
+                from safetensors.torch import save_file as save_tensors
 
-            sd = model.state_dict()
-            cpu_sd = {k: _to_cpu(v) for k, v in sd.items()}
-            # Write safetensors atomically to avoid partial files.
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
-            )
-            os.close(fd)
-            tmp_path = Path(tmp_name)
-            try:
-                save_tensors(
-                    cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"}
+                sd = model.state_dict()
+                cpu_sd = {k: _to_cpu(v) for k, v in sd.items()}
+
+                fd, tmp_name = tempfile.mkstemp(
+                    prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
                 )
-                tmp_path.replace(p)
-            finally:
-                with contextlib.suppress(Exception):
-                    if tmp_path.exists():
-                        tmp_path.unlink()
-            meta = {
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    save_tensors(cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"})
+                    tmp_path.replace(p)
+                finally:
+                    with contextlib.suppress(Exception):
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+
+                meta = {
+                    "version": 1,
+                    "in_dim": int(getattr(model, "in_dim", 0)),
+                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                    "config": _load_model_config(model),
+                    "pytorch_version": torch.__version__,
+                    "extra": _json_sanitize(extra or {}),
+                }
+                meta_path = p.with_suffix(".json")
+                meta_text = json.dumps(meta, indent=2, default=_json_default)
+                _atomic_write_text(meta_path, meta_text, encoding="utf-8")
+                return p
+
+            # torch.save payload: always sanitize extra for weights_only-friendly loads.
+            payload: Dict[str, Any] = {
                 "version": 1,
                 "in_dim": int(getattr(model, "in_dim", 0)),
                 "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
                 "config": _load_model_config(model),
+                "state_dict": model.state_dict(),
                 "pytorch_version": torch.__version__,
-                "extra": _json_sanitize(extra or {}),
             }
-            meta_path = p.with_suffix(".json")
-            meta_text = json.dumps(meta, indent=2, default=_json_default)
-            _atomic_write_text(meta_path, meta_text, encoding="utf-8")
-            return p
+            if optimizer is not None and hasattr(optimizer, "state_dict"):
+                try:
+                    payload["optimizer_state_dict"] = optimizer.state_dict()
+                except Exception:
+                    _LOGGER.debug("Failed to serialize optimizer_state_dict; skipping", exc_info=True)
+            if extra is not None:
+                payload["extra"] = _json_sanitize(extra)
 
-        payload: Dict[str, Any] = {
-            "version": 1,
-            "in_dim": int(getattr(model, "in_dim", 0)),
-            "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-            "config": _load_model_config(model),
-            "state_dict": model.state_dict(),
-            "pytorch_version": torch.__version__,
-        }
-        if optimizer is not None and hasattr(optimizer, "state_dict"):
-            try:
-                payload["optimizer_state_dict"] = optimizer.state_dict()
-            except Exception:
-                _LOGGER.debug(
-                    "Failed to serialize optimizer_state_dict; skipping",
-                    exc_info=True,
-                )
-        if extra:
-            payload["extra"] = extra
-        _atomic_torch_save(payload, p, **opts)
-        return p
+            _atomic_torch_save(payload, p, **opts)
+            return p
 
 
 def __getattr__(name: str) -> Any:
