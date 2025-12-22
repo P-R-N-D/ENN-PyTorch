@@ -1197,13 +1197,3 @@ class CrossAttention(nn.Module):
         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
         ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
-
-
-__all__ = [
-    "CrossAttention",
-    "DilatedAttention",
-    "PatchAttention",
-    "Retention",
-    "StochasticDepth",
-    "norm_layer",
-]
