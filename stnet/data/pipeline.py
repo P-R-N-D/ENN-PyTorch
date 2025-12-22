@@ -1046,7 +1046,7 @@ def fetch(
     pf_depth_fixed = max(1, min(8, int(pf_depth_fixed)))
     pf_depth = int(pf_depth_fixed)
 
-    map_fn = partial(
+    collate_fn = partial(
         collate,
         labels_dtype=labels_dtype,
         sanitize=sanitize,
@@ -1151,7 +1151,9 @@ def fetch(
         except Exception:
             return int(_pf)
 
-    def _make_iterate(_datasets: Mapping[str, Sampler]) -> Callable[[Any], Any]:
+    def _make_iterate(
+        _datasets: Mapping[str, Sampler], _collate: Callable[[Any], Any]
+    ) -> Callable[[Any], Any]:
         def iterate(sample: Any) -> Any:
             if isinstance(sample, tuple) and len(sample) == 2:
                 k, span = sample
@@ -1159,8 +1161,9 @@ def fetch(
                 if ds is None:
                     return None
                 s, e = int(span[0]), int(span[1])
-                return ds.get(s, e)
-            return sample
+                batch = ds.get(s, e)
+                return _collate(batch) if batch is not None else None
+            return _collate(sample)
 
         return iterate
 
@@ -1218,7 +1221,7 @@ def fetch(
         raise RuntimeError("No non-empty training sources provided.")
 
     train_length: Optional[int] = int(sum(lengths.values())) if lengths else None
-    iterate_train = _make_iterate(datasets_train)
+    iterate_train = _make_iterate(datasets_train, collate_fn)
     _, mapped_train, _ = compose(
         sampler_nodes,
         device=device_obj,
@@ -1266,7 +1269,7 @@ def fetch(
             raise RuntimeError("No non-empty validation sources provided.")
 
         val_length: Optional[int] = int(sum(lengths_val.values())) if lengths_val else None
-        iterate_val = _make_iterate(datasets_val)
+        iterate_val = _make_iterate(datasets_val, collate_fn)
         _, mapped_val, _ = compose(
             sampler_nodes_val,
             device=device_obj,
