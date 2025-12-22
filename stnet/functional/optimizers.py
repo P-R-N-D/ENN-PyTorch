@@ -20,10 +20,9 @@ from ..data.pipeline import Dataset
 from ..model.fused import Autocast, ModelPolicy, is_scale_safe
 
 try:
-    # Optional: fused.py provides PrecisionPolicy which selects master float dtype (fp32/fp64).
     from ..model.fused import PrecisionPolicy
-except Exception:  # pragma: no cover
-    PrecisionPolicy = None  # type: ignore
+except Exception: 
+    PrecisionPolicy = None
 
 try:
     from torch.optim.swa_utils import SWALR
