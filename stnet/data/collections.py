@@ -1021,17 +1021,17 @@ class LazyTensor:
                         )
                     lb_cpu = LazyTensor._to_cpu_contig(lb)
                     lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
-            assert labels_mmt is not None
-            labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
+                assert labels_mmt is not None
+                labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
 
-            if y_sum is not None and y_sum_sq is not None:
-                end_pos = int(s) + int(n)
-                overlap = max(0, min(end_pos, int(train_end)) - int(s))
-                if overlap > 0:
-                    lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
-                    lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
-                    y_sum += lb64.sum(dim=0)
-                    y_sum_sq += torch.einsum("bn,bn->n", lb64, lb64)
+                if y_sum is not None and y_sum_sq is not None:
+                    end_pos = int(s) + int(n)
+                    overlap = max(0, min(end_pos, int(train_end)) - int(s))
+                    if overlap > 0:
+                        lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
+                        lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
+                        y_sum += lb64.sum(dim=0)
+                        y_sum_sq += torch.einsum("bn,bn->n", lb64, lb64)
             written += int(n)
 
         if int(written) != int(count):
