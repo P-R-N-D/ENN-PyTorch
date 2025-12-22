@@ -12,32 +12,12 @@ from typing import Any, Dict, Optional, Tuple, Protocol, runtime_checkable
 import numpy as np
 import torch
 
+from .datatype import env_flag as _env_flag
+
 
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
-
-_FALSE_STRINGS = {"0", "false", "no", "off", "n"}
-_TRUE_STRINGS = {"1", "true", "yes", "on", "y"}
-
-
-def _env_flag(*keys: str, default: bool = False) -> bool:
-    """Parse a boolean-ish environment flag.
-
-    Accepts typical truthy/falsey strings; any other non-empty value is treated
-    as True.
-    """
-    for k in keys:
-        v = os.environ.get(k)
-        if v is None:
-            continue
-        s = str(v).strip().lower()
-        if s in _FALSE_STRINGS:
-            return False
-        if s in _TRUE_STRINGS:
-            return True
-        return bool(s)
-    return bool(default)
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -647,30 +627,27 @@ class Buffer:
         if self._stop.is_set():
             return False
 
-        start = time.monotonic()
+        t0 = time.monotonic()
+        deadline = None if timeout is None else (t0 + float(timeout))
         with self._cv:
             if self._stop.is_set():
                 return False
 
-            if timeout is None:
-                while len(self._buf) >= self.max_batches and not self._stop.is_set():
+            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+                if deadline is None:
                     self._cv.wait()
-                if self._stop.is_set():
-                    return False
-            else:
-                deadline = time.monotonic() + float(timeout)
-                while len(self._buf) >= self.max_batches and not self._stop.is_set():
+                else:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
                     self._cv.wait(timeout=remaining)
-                if self._stop.is_set():
-                    return False
+            if self._stop.is_set():
+                return False
 
             self._buf.append(item)
             self._cv.notify()
 
-        elapsed = time.monotonic() - start
+        elapsed = time.monotonic() - t0
         if self._warn_blocking and elapsed > 0.1:
             logging.warning(
                 "Buffer.put blocked for %.3f s (max_batches=%d)",
@@ -692,22 +669,18 @@ class Buffer:
                 self._cv.notify()
                 return item
 
-        with self._cv:
-            if timeout is None:
-                while not self._buf and not self._stop.is_set():
-                    self._cv.wait()
-                if not self._buf:
-                    raise queue.Empty
-                item = self._buf.popleft()
-                self._cv.notify()
-                return item
+        t0 = time.monotonic()
+        deadline = None if timeout is None else (t0 + float(timeout))
 
-            deadline = time.monotonic() + float(timeout)
+        with self._cv:
             while not self._buf and not self._stop.is_set():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise queue.Empty
-                self._cv.wait(timeout=remaining)
+                if deadline is None:
+                    self._cv.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Empty
+                    self._cv.wait(timeout=remaining)
 
             if not self._buf:
                 raise queue.Empty
@@ -799,10 +772,7 @@ class LazyTensor:
     def is_feature_label_batch_mapping(obj: Any) -> bool:
         if not isinstance(obj, Mapping) or not obj:
             return False
-        for k in ("features", "X", "labels", "Y", "targets", "target"):
-            if k in obj:
-                return True
-        return False
+        return any(k in obj for k in ("features", "X", "labels", "Y", "targets", "target"))
 
     @staticmethod
     def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:
@@ -935,6 +905,11 @@ class LazyTensor:
             n = LazyTensor._batch_n(fx)
             if n <= 0:
                 continue
+            expected = int(e) - int(s)
+            if n != expected:
+                raise RuntimeError(
+                    f"Pass1 batch size mismatch for {prefix}: expected {expected}, got {n} (s={s}, e={e})."
+                )
 
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
             cur_in_dim = int(fx_flat.shape[1])
@@ -1187,6 +1162,11 @@ class LazyTensor:
             n = LazyTensor._batch_n(fx)
             if n <= 0:
                 continue
+            expected = int(e) - int(s)
+            if n != expected:
+                raise RuntimeError(
+                    f"Pass2 batch size mismatch for {prefix}: expected {expected}, got {n} (s={s}, e={e})."
+                )
 
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
             if int(fx_flat.shape[1]) != int(in_dim):

@@ -7,6 +7,8 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import sys
+import sysconfig
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
@@ -27,7 +29,7 @@ import torch
 
 from ..backend.compat import ensure_torchdata
 from ..backend.system import Memory, Thread, process_cpu_count
-from .collections import Buffer, LazyTensor, ProducerError, best_effort_close
+from .collections import Buffer, LazyTensor, Pool, ProducerError, best_effort_close
 from .datatype import env_bool, env_first_int
 
 _LOGGER = logging.getLogger(__name__)
@@ -151,6 +153,24 @@ def _host_guard_ok(guard_bytes: int) -> bool:
         return bool(int(Memory.available()) >= int(guard_bytes))
     except Exception:
         return True
+
+
+def _nogil_runtime_enabled() -> bool:
+    """True if running on a free-threaded build *and* the GIL is disabled at runtime."""
+    try:
+        ft_build = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+    except Exception:
+        ft_build = False
+    if not ft_build:
+        return False
+    is_gil_enabled = True
+    f = getattr(sys, "_is_gil_enabled", None)
+    if callable(f):
+        try:
+            is_gil_enabled = bool(f())
+        except Exception:
+            is_gil_enabled = True
+    return bool(not is_gil_enabled)
 
 
 class SamplerScale:
@@ -367,7 +387,10 @@ class Sampler(_Sampler):
         default_tl = False
         with suppress(Exception):
             default_tl = bool(Thread.nogil_optimizations_enabled())
-        self._mmap_thread_local = env_bool("STNET_MEMMAP_THREAD_LOCAL", default=default_tl)
+        default_tl = bool(default_tl or _nogil_runtime_enabled())
+        self._mmap_thread_local = env_bool(
+            ("STNET_MEMMAP_THREAD_LOCAL_HANDLES", "STNET_NOGIL"), default=default_tl
+        )
 
         if self._mmap_thread_local:
             cpu = int(process_cpu_count() or 8)
@@ -664,11 +687,12 @@ class Sampler(_Sampler):
     def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor) -> Mapping[str, torch.Tensor]:
         """Index into the memmap dataset."""
         features, labels = self._get_mmaps()
+        base = int(self._start)
 
         match idx:
             case tuple() as t if len(t) == 2:
                 s, e = int(t[0]), int(t[1])
-                return self._slice(s, e)
+                return self._slice(base + s, base + e)
 
             case torch.Tensor() as t:
                 idx_t = t.detach()
@@ -678,17 +702,18 @@ class Sampler(_Sampler):
                     return self.__getitem__(int(idx_t.item()))
                 idx_tensor = idx_t.to(dtype=torch.long, copy=False).reshape(-1)
                 if idx_tensor.numel() == 0:
-                    return self._slice(0, 0)
+                    return self._slice(base, base)
+                idx_tensor = idx_tensor + base
                 return self._gather(idx_tensor, features, labels)
 
             case seq if isinstance(seq, Sequence) and not isinstance(seq, (str, bytes, bytearray)):
                 if len(seq) == 0:
-                    return self._slice(0, 0)
-                idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1)
+                    return self._slice(base, base)
+                idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1) + base
                 return self._gather(idx_tensor, features, labels)
 
             case _:
-                i = self._start + int(idx)  # scalar
+                i = base + int(idx)  # scalar
                 out = self._slice(i, i + 1)
                 # Squeeze scalars for ergonomic downstream use.
                 with suppress(Exception):
@@ -1426,6 +1451,22 @@ class Prefetcher(Buffer):
         use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu", "mps")
         self._pin = bool(kwargs.get("pin_host", use_accel))
 
+        # Optional pinned staging pool (CUDA-only): reduces repeated pinned allocations
+        self._pin_pool = False
+        self._host_pool: Optional[Pool] = None
+        if (
+            self._pin
+            and self._non_blocking
+            and self._device.type == "cuda"
+            and torch.cuda.is_available()
+        ):
+            use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
+            cap_default = min(8, max(2, int(self._depth) * 2))
+            cap = env_first_int(("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default)
+            if use_pool and int(cap) > 0:
+                self._host_pool = Pool(capacity=int(cap), pin_memory=True)
+                self._pin_pool = True
+
         self._gpu_stream: Optional[torch.cuda.Stream] = None
         self._gpu_event_pool: Optional[queue.SimpleQueue] = None
 
@@ -1485,6 +1526,41 @@ class Prefetcher(Buffer):
             return out
         return x
 
+    def _pin_batch(self, x: Any) -> tuple[Any, list[Optional[Pool.Token]]]:
+        """Pin/stage tensors in `x` and return (pinned_x, pool_tokens)."""
+        if not self._pin:
+            return x, []
+
+        pool = self._host_pool
+        if pool is None:
+            return self._pin_memory(x), []
+
+        tokens: list[Optional[Pool.Token]] = []
+
+        def stage(obj: Any) -> Any:
+            if torch.is_tensor(obj) and getattr(obj, "device", None) is not None:
+                if obj.device.type != "cpu":
+                    return obj
+                try:
+                    if hasattr(obj, "is_pinned") and bool(obj.is_pinned()):
+                        return obj
+                except Exception:
+                    pass
+                buf, tok = pool.get_like(obj, return_handle=True, block=False)
+                buf.copy_(obj, non_blocking=False)
+                tokens.append(tok)
+                return buf
+            if isinstance(obj, (list, tuple)):
+                return type(obj)(stage(t) for t in obj)
+            if isinstance(obj, dict):
+                out: dict[Any, Any] = {}
+                for k, v in obj.items():
+                    out[k] = v if k == "row_ids" else stage(v)
+                return out
+            return obj
+
+        return stage(x), tokens
+
     def _producer_loop(
         self,
         it: Iterator[Any],
@@ -1528,15 +1604,13 @@ class Prefetcher(Buffer):
                 if self.is_stopped():
                     break
 
-                if self._pin:
-                    batch = self._pin_memory(batch)
+                batch, pool_tokens = self._pin_batch(batch)
 
                 if self._backpressure:
-                    tries = 0
                     ok = guards_ok(force=True)
                     while (not self.is_stopped()) and (not ok):
-                        time.sleep(0.001 if tries < 1000 else 0.005)
-                        tries += 1
+                        # Exponential backoff with a small ceiling to reduce CPU churn
+                        time.sleep(0.001)
                         ok = guards_ok(force=False)
 
                 if use_device:
@@ -1552,6 +1626,10 @@ class Prefetcher(Buffer):
                                 batch_dev = self._to_device(batch, device)
                                 if ev is not None:
                                     ev.record(self._gpu_stream)
+
+                            if self._host_pool is not None and pool_tokens and ev is not None:
+                                for tok in pool_tokens:
+                                    self._host_pool.release_after(tok, ev)
 
                             if not self.put((batch_dev, ev)):
                                 if ev is not None and pool is not None:
