@@ -2,26 +2,98 @@
 from __future__ import annotations
 
 import collections.abc as _abc
-import os
 import contextlib
+import math
+import os
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Protocol, runtime_checkable
 
-import torch
 import numpy as np
+import torch
 
-# NOTE: `_BOOTSTRAP_DEPTH` was an unused leftover from an earlier bootstrap
-# experiment. Keeping it around makes grepping and linting noisier without
-# providing any functional value.
+
+# -----------------------------------------------------------------------------
+# Small helpers
+# -----------------------------------------------------------------------------
+
+_FALSE_STRINGS = {"0", "false", "no", "off", "n"}
+_TRUE_STRINGS = {"1", "true", "yes", "on", "y"}
+
+
+def _env_flag(*keys: str, default: bool = False) -> bool:
+    """Parse a boolean-ish environment flag.
+
+    Accepts typical truthy/falsey strings; any other non-empty value is treated
+    as True.
+    """
+    for k in keys:
+        v = os.environ.get(k)
+        if v is None:
+            continue
+        s = str(v).strip().lower()
+        if s in _FALSE_STRINGS:
+            return False
+        if s in _TRUE_STRINGS:
+            return True
+        return bool(s)
+    return bool(default)
+
+
+def _prod_int(shape: Sequence[int]) -> int:
+    try:
+        n = int(math.prod(int(s) for s in shape))
+    except Exception:
+        n = 1
+        for s in shape:
+            n *= int(s)
+    return int(max(1, n))
+
+
+@runtime_checkable
+class _QueryEvent(Protocol):
+    def query(self) -> bool: ...
+
+
+@runtime_checkable
+class _SyncEvent(Protocol):
+    def synchronize(self) -> Any: ...
+
+
+@runtime_checkable
+class _WaitEvent(Protocol):
+    def wait(self, timeout: float | None = None) -> Any: ...
+
+
+# -----------------------------------------------------------------------------
+# LazyDict
+# -----------------------------------------------------------------------------
 
 class LazyDict(_abc.Mapping):
-    def __init__(self, keys: Any, getter: Any, *, name: str = "LazyDict", cache: bool = False) -> None:
+    """Mapping wrapper that lazily computes values via `getter(key)`.
+
+    Optionally caches computed values.
+    """
+
+    __slots__ = ("_keys", "_getter", "_name", "_cache_enabled", "_cache")
+
+    def __init__(
+        self,
+        keys: Any,
+        getter: Any,
+        *,
+        name: str = "LazyDict",
+        cache: bool = False,
+    ) -> None:
         self._keys = keys
         self._getter = getter
         self._name = str(name or "LazyDict")
         self._cache_enabled = bool(cache)
         self._cache: Optional[dict[Any, Any]] = {} if self._cache_enabled else None
+
+    def __repr__(self) -> str:  # pragma: no cover
+        cache = "on" if self._cache is not None else "off"
+        return f"{self._name}(len={len(self)}, cache={cache})"
 
     def __len__(self) -> int:
         return int(len(self._keys))
@@ -30,11 +102,15 @@ class LazyDict(_abc.Mapping):
         return iter(self._keys)
 
     def __getitem__(self, key: Any) -> Any:
-        if self._cache is not None and key in self._cache:
-            return self._cache[key]
+        cache = self._cache
+        if cache is not None:
+            try:
+                return cache[key]
+            except KeyError:
+                pass
         v = self._getter(key)
-        if self._cache is not None:
-            self._cache[key] = v
+        if cache is not None:
+            cache[key] = v
         return v
 
     def __contains__(self, key: object) -> bool:
@@ -65,159 +141,252 @@ class LazyDict(_abc.Mapping):
         return self.collect()
 
 
+# -----------------------------------------------------------------------------
+# Pinned CPU page + pool
+# -----------------------------------------------------------------------------
+
 class Page:
+    """Resizable pinned (or regular) CPU buffer used for staging."""
 
-    __slots__ = ("_buf", "_numel", "_dtype")
+    __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
-    def __init__(self, numel: int, dtype: "torch.dtype") -> None:
-        import torch
-
-        self._numel = int(max(1, numel))
+    def __init__(self, numel: int, dtype: torch.dtype, *, pin_memory: bool = True) -> None:
+        self._numel = int(max(1, int(numel)))
         self._dtype = dtype
+        self._pinned = bool(pin_memory)
         self._buf = torch.empty(
-            self._numel, dtype=self._dtype, device="cpu", pin_memory=True
+            self._numel,
+            dtype=self._dtype,
+            device="cpu",
+            pin_memory=bool(self._pinned),
         )
 
     @property
     def numel(self) -> int:
-        return self._numel
+        return int(self._numel)
 
     @property
-    def dtype(self) -> "torch.dtype":
+    def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def view(self, *shape: int) -> "torch.Tensor":
-        import torch
+    @property
+    def pinned(self) -> bool:
+        return bool(self._pinned)
 
-        needed = 1
-        for s in shape:
-            needed *= int(s)
-        if needed > self._numel:
-            self._numel = int(needed)
-            self._buf = torch.empty(
-                self._numel, dtype=self._dtype, device="cpu", pin_memory=True
-            )
-        return self._buf[:needed].view(*shape)
+    def ensure(self, numel: int) -> None:
+        need = int(max(1, int(numel)))
+        if need <= int(self._numel):
+            return
+        self._numel = need
+        self._buf = torch.empty(
+            self._numel,
+            dtype=self._dtype,
+            device="cpu",
+            pin_memory=bool(self._pinned),
+        )
+
+    def view(self, *shape: int) -> torch.Tensor:
+        need = _prod_int(shape)
+        self.ensure(need)
+        return self._buf[:need].view(*shape)
 
 
 class Pool:
+    """Small reusable CPU staging pool.
 
+    - Reuses pinned CPU buffers for fast H2D.
+    - Avoids unbounded pinned allocations under contention by falling back to
+      one-off **unpinned** buffers when capacity is exhausted (unless block=True).
+    """
+
+    @dataclass(slots=True)
     class Token:
-        __slots__ = ("i", "g")
+        i: int
+        g: int
 
-        def __init__(self, i: int, g: int) -> None:
-            self.i = i
-            self.g = g
-
+    @dataclass(slots=True)
     class _Entry:
-        __slots__ = ("page", "busy", "fence", "gen")
+        page: Page
+        busy: bool = False
+        fence: object | None = None
+        gen: int = 0
 
-        def __init__(self, page: "Page") -> None:
-            self.page = page
-            self.busy = False
-            self.fence = None
-            self.gen = 0
-
-    def __init__(self, capacity: int = 4) -> None:
+    def __init__(self, capacity: int = 4, *, pin_memory: bool = True) -> None:
         import threading
 
         self._cap = max(1, int(capacity))
+        self._pin = bool(pin_memory)
         self._pages: list[Pool._Entry] = []
         self._rr = 0
-        self._lock = threading.Lock()
+        self._cv = threading.Condition()
 
     @property
     def capacity(self) -> int:
-        return self._cap
+        return int(self._cap)
 
-    def _evt_done(self, evt: object) -> bool:
+    def _evt_done(self, evt: object | None) -> bool:
         if evt is None:
             return True
-        try:
-            q = getattr(evt, "query", None)
-            if callable(q):
-                return bool(q())
-        except Exception:
-            return False
+        if isinstance(evt, _QueryEvent):
+            try:
+                return bool(evt.query())
+            except Exception:
+                return False
+        is_set = getattr(evt, "is_set", None)
+        if callable(is_set):
+            try:
+                return bool(is_set())
+            except Exception:
+                return False
         return False
 
-    def _scavenge(self) -> None:
+    def _scavenge_locked(self) -> int:
+        freed = 0
         for e in self._pages:
             if e.busy and e.fence is not None and self._evt_done(e.fence):
                 e.busy = False
                 e.fence = None
-
-    def _ensure_view(
-        self, e: "Pool._Entry", shape: "Tuple[int, ...]", dtype: "torch.dtype"
-    ) -> "torch.Tensor":
-        need = 1
-        for s in shape:
-            need *= int(s)
-        if (e.page.dtype != dtype) or (e.page.numel < need):
-            e.page = Page(numel=need, dtype=dtype)
-            e.gen += 1
-        return e.page.view(*shape)
+                freed += 1
+        return freed
 
     def get(
         self,
-        shape: "Tuple[int, ...]",
-        dtype: "torch.dtype",
+        shape: Tuple[int, ...],
+        dtype: torch.dtype,
         *,
         return_handle: bool = False,
-    ) -> "torch.Tensor" | "tuple[torch.Tensor, Pool.Token | None]":
-        with self._lock:
-            self._scavenge()
-            n = len(self._pages)
-            if n:
-                start = self._rr
-                for k in range(n):
-                    idx = (start + k) % n
+        block: bool = False,
+        timeout: float | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
+        """Get a CPU staging tensor.
+
+        If the pool is exhausted:
+          - block=False (default): return an untracked **unpinned** tensor.
+          - block=True: wait for a page to become available (with periodic fence checks).
+
+        Returns:
+          - tensor (default)
+          - (tensor, Token|None) when return_handle=True
+        """
+        import time
+
+        shape_t = tuple(int(s) for s in shape)
+        dtype_t = dtype
+        need = _prod_int(shape_t)
+
+        deadline: float | None = None
+        if timeout is not None:
+            deadline = time.monotonic() + float(timeout)
+
+        # Periodic fence checks when blocking (CUDA events cannot notify us).
+        check_interval = 0.01
+
+        while True:
+            # Phase 1: select an entry or decide to grow/wait/overflow.
+            idx: int | None = None
+            need_new_page = False
+            want_grow = False
+
+            with self._cv:
+                self._scavenge_locked()
+                n = len(self._pages)
+
+                if n:
+                    start = self._rr % n
+                    for k in range(n):
+                        j = (start + k) % n
+                        e = self._pages[j]
+                        if not e.busy:
+                            e.busy = True
+                            e.fence = None
+                            idx = j
+                            self._rr = (j + 1) % max(1, n)
+                            # Decide if we must replace the page (dtype/size/pin mismatch).
+                            if (e.page.dtype != dtype_t) or (e.page.numel < need) or (e.page.pinned != self._pin):
+                                need_new_page = True
+                            break
+
+                if idx is None:
+                    if n < self._cap:
+                        want_grow = True
+                    else:
+                        if block:
+                            if deadline is not None:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0:
+                                    want_grow = False
+                                    break
+                                self._cv.wait(timeout=min(check_interval, remaining))
+                            else:
+                                self._cv.wait(timeout=check_interval)
+                            continue
+                        break
+
+            # Phase 2: materialize (possibly allocate) outside the lock.
+            if idx is not None:
+                new_page: Page | None = None
+                if need_new_page:
+                    new_page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
+
+                with self._cv:
+                    # Entry is still busy and reserved for us.
                     e = self._pages[idx]
-                    if not e.busy:
-                        e.busy = True
-                        e.fence = None
-                        self._rr = (idx + 1) % max(1, n)
-                        view = self._ensure_view(e, shape, dtype)
-                        if return_handle:
-                            return view, Pool.Token(idx, e.gen)
-                        return view
-            need = 1
-            for s in shape:
-                need *= int(s)
-            new = Pool._Entry(Page(numel=need, dtype=dtype))
-            new.busy = True
-            if len(self._pages) < self._cap:
-                self._pages.append(new)
-                idx = len(self._pages) - 1
-                self._rr = (idx + 1) % self._cap
-                view = new.page.view(*shape)
+                    if need_new_page and new_page is not None:
+                        e.page = new_page
+                        e.gen += 1
+                    gen = int(e.gen)
+
+                view = e.page.view(*shape_t)
                 if return_handle:
-                    return view, Pool.Token(idx, new.gen)
+                    return view, Pool.Token(int(idx), gen)
                 return view
-            start = self._rr
-            for k in range(self._cap):
-                idx = (start + k) % self._cap
-                if not self._pages[idx].busy:
-                    self._pages[idx] = new
-                    self._rr = (idx + 1) % self._cap
-                    view = new.page.view(*shape)
-                    if return_handle:
-                        return view, Pool.Token(idx, new.gen)
-                    return view
-            view = new.page.view(*shape)
-            if return_handle:
-                return view, None
-            return view
+
+            if want_grow:
+                # Allocate new page outside lock.
+                page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
+                entry = Pool._Entry(page=page, busy=True, fence=None, gen=0)
+
+                with self._cv:
+                    if len(self._pages) < self._cap:
+                        self._pages.append(entry)
+                        idx2 = len(self._pages) - 1
+                        self._rr = (idx2 + 1) % self._cap
+                        view = entry.page.view(*shape_t)
+                        if return_handle:
+                            return view, Pool.Token(int(idx2), int(entry.gen))
+                        return view
+                # Lost the race to grow; retry.
+                continue
+
+            # Overflow or timeout.
+            break
+
+        # Overflow: allocate one-off **unpinned** tensor (untracked).
+        view = torch.empty(need, dtype=dtype_t, device="cpu", pin_memory=False).view(*shape_t)
+        if return_handle:
+            return view, None
+        return view
 
     def get_like(
-        self, t: "torch.Tensor", *args: Any, return_handle: bool = False
-    ) -> "torch.Tensor" | "tuple[torch.Tensor, Pool.Token | None]":
-        return self.get(tuple(t.shape), t.dtype, return_handle=return_handle)
+        self,
+        t: torch.Tensor,
+        *args: Any,
+        return_handle: bool = False,
+        block: bool = False,
+        timeout: float | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
+        return self.get(
+            tuple(int(s) for s in t.shape),
+            t.dtype,
+            return_handle=return_handle,
+            block=block,
+            timeout=timeout,
+        )
 
-    def release_after(self, token: "Pool.Token", wait_event: object | None) -> None:
+    def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
         if token is None:
             return
-        with self._lock:
+        with self._cv:
             i = int(getattr(token, "i", -1))
             g = int(getattr(token, "g", -1))
             if 0 <= i < len(self._pages):
@@ -225,11 +394,12 @@ class Pool:
                 if e.gen == g:
                     e.busy = True
                     e.fence = wait_event
+                    self._cv.notify()
 
-    def release(self, token: "Pool.Token") -> None:
+    def release(self, token: Pool.Token | None) -> None:
         if token is None:
             return
-        with self._lock:
+        with self._cv:
             i = int(getattr(token, "i", -1))
             g = int(getattr(token, "g", -1))
             if 0 <= i < len(self._pages):
@@ -237,58 +407,71 @@ class Pool:
                 if e.gen == g:
                     e.busy = False
                     e.fence = None
+                    self._cv.notify()
 
     def collect(self) -> None:
-        with self._lock:
-            self._scavenge()
+        with self._cv:
+            freed = self._scavenge_locked()
+            if freed:
+                self._cv.notify_all()
 
+
+# -----------------------------------------------------------------------------
+# Async on-disk cache writer
+# -----------------------------------------------------------------------------
 
 class Cache:
+    """Asynchronous tensor writer with bounded backpressure."""
 
     def __init__(self, root: str, max_queue: int = 8) -> None:
-        import os
         import queue
         import threading
 
-        self._root = root
-        os.makedirs(root, exist_ok=True)
+        self._root = os.fspath(root)
+        os.makedirs(self._root, exist_ok=True)
+
         max_q = int(max_queue)
         self._sem = threading.Semaphore(max_q) if max_q > 0 else None
-        # `queue.Queue` involves a few extra locks/condition variables.
-        # We keep the backpressure behavior via a semaphore and use
-        # `SimpleQueue` for the fast, unbounded handoff.
-        self._q: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
+        self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = queue.SimpleQueue()
+
         self._t = threading.Thread(target=self._run, daemon=True)
-        self._err = None
+        self._err: BaseException | None = None
         self._err_event = threading.Event()
+        self._closed = threading.Event()
         self._t.start()
 
     def submit(
         self,
-        tensor: "torch.Tensor",
+        tensor: torch.Tensor,
         path: Optional[str] = None,
         idx: Optional[int] = None,
         wait_event: Optional[object] = None,
         release_cb: Optional[object] = None,
     ) -> None:
-        import contextlib
-        import os
+        """Submit a tensor for async saving.
+
+        If a bounded queue is configured and backpressure acquisition times out,
+        falls back to synchronous saving in the caller thread.
+        """
+        import os as _os
 
         if self._err_event.is_set():
             raise RuntimeError(f"Async writer error: {self._err!r}")
+        if self._closed.is_set():
+            raise RuntimeError("Cache is closed")
+
         if path is None:
             if idx is None:
                 raise ValueError("either path or idx required")
-            path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
-        # Apply backpressure when a bounded queue was requested. If we cannot
-        # acquire within a small timeout, fall back to synchronous writes.
+            path = _os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
+        path = _os.fspath(path)
+
         acquired = False
         if self._sem is not None:
             acquired = bool(self._sem.acquire(timeout=0.05))
             if not acquired:
-                if wait_event is not None:
-                    with contextlib.suppress(Exception):
-                        wait_event.synchronize()
+                # Synchronous fallback: preserve correctness over throughput.
+                self._wait(wait_event)
                 self._save_tensor(tensor, path)
                 if callable(release_cb):
                     with contextlib.suppress(Exception):
@@ -303,56 +486,87 @@ class Cache:
                     self._sem.release()
             raise
 
-    def _save_tensor(self, tensor: "torch.Tensor", path: str) -> None:
-        import json
-        import os
-
-        import torch
-
+    def _wait(self, evt: object | None) -> None:
+        if evt is None:
+            return
         try:
-            if path.endswith(".mmt"):
-                from tensordict import MemoryMappedTensor
-
-                buf = tensor
-                if hasattr(tensor, "is_pinned") and tensor.is_pinned():
-                    buf = torch.empty_like(tensor, device="cpu", pin_memory=False)
-                    buf.copy_(tensor, non_blocking=False)
-                MemoryMappedTensor.from_tensor(buf.contiguous(), filename=path)
-                meta = {"shape": list(buf.shape), "dtype": str(buf.dtype).replace("torch.", "")}
-                with open(path + ".json", "w", encoding="utf-8") as f:
-                    json.dump(meta, f)
+            if isinstance(evt, _SyncEvent):
+                evt.synchronize()
+                return
+        except Exception:
+            pass
+        try:
+            if isinstance(evt, _WaitEvent):
+                evt.wait()
                 return
         except Exception:
             pass
 
-        if hasattr(tensor, "is_pinned") and tensor.is_pinned():
-            buf = torch.empty_like(tensor, device="cpu", pin_memory=False)
-            buf.copy_(tensor, non_blocking=False)
-        else:
-            buf = tensor.contiguous()
+    def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
+        import json
+        import os as _os
+
+        if not torch.is_tensor(tensor):
+            tensor = torch.as_tensor(tensor)
+
+        buf = tensor.detach()
+        if buf.device.type != "cpu":
+            buf = buf.to(device="cpu", non_blocking=False)
+
+        if hasattr(buf, "is_pinned") and callable(getattr(buf, "is_pinned")) and bool(buf.is_pinned()):
+            tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
+            tmp.copy_(buf, non_blocking=False)
+            buf = tmp
+
+        buf = buf.contiguous()
+
+        if str(path).endswith(".mmt"):
+            from tensordict import MemoryMappedTensor
+
+            MemoryMappedTensor.from_tensor(buf, filename=path)
+            meta = {
+                "shape": list(buf.shape),
+                "dtype": str(buf.dtype).replace("torch.", ""),
+            }
+            tmp_json = path + ".json.tmp"
+            final_json = path + ".json"
+            with open(tmp_json, "w", encoding="utf-8") as f:
+                json.dump(meta, f)
+            _os.replace(tmp_json, final_json)
+            return
+
         torch.save(buf, path)
 
     def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
         self._q.put((None, None, None, None))
         self._t.join()
 
-    def _run(self) -> None:
-        import contextlib
+    def __enter__(self):  # pragma: no cover
+        return self
 
+    def __exit__(self, exc_type, exc, tb):  # pragma: no cover
+        self.close()
+        return False
+
+    def _run(self) -> None:
         while True:
             item = self._q.get()
-            if isinstance(item, tuple) and len(item) == 4:
-                tensor, path, evt, rel = item
-            else:
-                tensor, path = item
-                evt = None
-                rel = None
+            match item:
+                case (tensor, path, evt, rel):
+                    pass
+                case _:
+                    self._err = RuntimeError(f"Invalid cache queue item: {type(item)!r}")
+                    self._err_event.set()
+                    break
+
             if tensor is None:
                 break
+
             try:
-                if evt is not None:
-                    with contextlib.suppress(Exception):
-                        evt.synchronize()
+                self._wait(evt)
                 self._save_tensor(tensor, path)
                 if callable(rel):
                     with contextlib.suppress(Exception):
@@ -380,7 +594,6 @@ class ProducerError:
 
 def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
     """Best-effort resource cleanup for common close/stop/join APIs."""
-
     for name in (
         "cleanup",
         "close",
@@ -409,21 +622,12 @@ def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
             pass
 
 
+# -----------------------------------------------------------------------------
+# Buffer: bounded in-memory buffer with stop notification
+# -----------------------------------------------------------------------------
+
 class Buffer:
-    """Bounded in-memory buffer with backpressure and stop notification.
-
-    This is a lightweight bounded queue used by streaming/prefetch loaders.
-
-    Key properties:
-      - **Hard inflight cap**: `max_batches` is a strict upper bound (backpressure).
-      - **Stop-aware**: `stop()` wakes blocked producers/consumers without polling.
-      - **Payload-agnostic**: stores `Any`.
-
-    Implementation detail:
-      - We intentionally do *not* use `queue.Queue` here because interrupting a
-        thread blocked in `put()`/`get()` requires polling (or private internals).
-        Using a `Condition` + `deque` lets us `notify_all()` on stop.
-    """
+    """Bounded in-memory buffer with backpressure and stop notification."""
 
     def __init__(self, max_batches: int) -> None:
         import collections
@@ -433,13 +637,10 @@ class Buffer:
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
+        self._warn_blocking = _env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
 
     def put(self, item: Any, *, timeout: float | None = None) -> bool:
-        """Put an item into the buffer.
-
-        Returns:
-            True if enqueued, False if stopped or timed out.
-        """
+        """Put an item into the buffer."""
         import logging
         import time
 
@@ -467,28 +668,19 @@ class Buffer:
                     return False
 
             self._buf.append(item)
-            self._cv.notify_all()
+            self._cv.notify()
 
         elapsed = time.monotonic() - start
-        if elapsed > 0.1:
-            # Avoid log spam in normal operation; enable explicitly when debugging.
-            warn_flag = os.environ.get("STNET_BUFFER_WARN_BLOCKING")
-            if warn_flag is None:
-                warn_flag = os.environ.get("STNET_DEBUG")
-            if warn_flag is not None and str(warn_flag).strip().lower() not in {"0", "false", "no", "off", "n"}:
-                logging.warning(
-                    f"Buffer.put blocked for {elapsed:.3f} s (max_batches={self.max_batches})"
-                )
+        if self._warn_blocking and elapsed > 0.1:
+            logging.warning(
+                "Buffer.put blocked for %.3f s (max_batches=%d)",
+                float(elapsed),
+                int(self.max_batches),
+            )
         return True
 
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
-        """Get an item from the buffer.
-
-        Semantics:
-          - If `block=False` and empty: raises `queue.Empty`.
-          - If stopped and empty: raises `queue.Empty`.
-          - If `timeout` expires: raises `queue.Empty`.
-        """
+        """Get an item from the buffer."""
         import queue
         import time
 
@@ -497,7 +689,7 @@ class Buffer:
                 if not self._buf:
                     raise queue.Empty
                 item = self._buf.popleft()
-                self._cv.notify_all()
+                self._cv.notify()
                 return item
 
         with self._cv:
@@ -507,7 +699,7 @@ class Buffer:
                 if not self._buf:
                     raise queue.Empty
                 item = self._buf.popleft()
-                self._cv.notify_all()
+                self._cv.notify()
                 return item
 
             deadline = time.monotonic() + float(timeout)
@@ -520,7 +712,7 @@ class Buffer:
             if not self._buf:
                 raise queue.Empty
             item = self._buf.popleft()
-            self._cv.notify_all()
+            self._cv.notify()
             return item
 
     def empty(self) -> bool:
@@ -539,6 +731,8 @@ class Buffer:
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
 
+    def __len__(self) -> int:  # pragma: no cover
+        return self.size()
 
 
 # -----------------------------------------------------------------------------
@@ -546,17 +740,7 @@ class Buffer:
 # -----------------------------------------------------------------------------
 
 class LazyTensor:
-    """Centralized memmap/streaming/chunking utilities.
-
-    This is intentionally located under stnet.data.collections so both runtime
-    (backend) and user-facing APIs (stnet.api.run) can share the same logic with
-    minimal duplication.
-
-    Key goals:
-      - Streaming two-pass materialization (dim inference + scale stats, then write).
-      - Optional *physical* shuffle at write time (no runtime perm indirection).
-      - Meta helpers (expand multinode sources + merge meta.json safely).
-    """
+    """Centralized memmap/streaming/chunking utilities."""
 
     class KeyIndexMappingView(_abc.Mapping):
         """A mapping-view over `data` that iterates in the provided `keys` order."""
@@ -582,25 +766,10 @@ class LazyTensor:
         *,
         keys: Optional[Sequence[Any]] = None,
     ) -> Tuple[Tuple[Any, ...], Any, Any]:
-        """Build (keys, get_batch, get_by_indices) helpers for key-index mappings.
-
-        This is the shared helper used by both `train()` and `predict()` to
-        materialize mapping-style datasets (e.g., `{feature_key: label}`) into
-        memmaps without duplicating selection logic.
-
-        The returned `get_batch(s, e)` yields a mapping view over `data` with the
-        key order slice `[s:e]`.
-
-        The returned `get_by_indices(idx)` yields a mapping view over `data` with
-        keys selected by integer indices (used for physical shuffle).
-        """
-
+        """Build (keys, get_batch, get_by_indices) helpers for key-index mappings."""
         from operator import itemgetter
 
-        if keys is None:
-            keys_t = tuple(data.keys())
-        else:
-            keys_t = tuple(keys)
+        keys_t = tuple(data.keys()) if keys is None else tuple(keys)
         if not keys_t:
             raise ValueError("Empty mapping: no keys")
 
@@ -608,13 +777,7 @@ class LazyTensor:
             return LazyTensor.KeyIndexMappingView(data, keys_t[int(s) : int(e)])
 
         def get_by_indices(idx: torch.Tensor):
-            if not isinstance(idx, torch.Tensor):
-                idx = torch.as_tensor(idx)
-            if idx.device.type != "cpu":
-                idx = idx.detach().cpu()
-            if idx.dtype not in (torch.int64, torch.int32):
-                idx = idx.to(dtype=torch.int64, copy=False)
-            idx = idx.reshape(-1)
+            idx = LazyTensor._idx_to_cpu_int64(idx)
             if idx.numel() == 0:
                 return LazyTensor.KeyIndexMappingView(data, ())
             if idx.numel() == 1:
@@ -625,7 +788,6 @@ class LazyTensor:
             try:
                 sel = itemgetter(*ii)(keys_t)
             except Exception:
-                # Fallback: robust but slower.
                 sel = [keys_t[int(i)] for i in ii]
             if not isinstance(sel, tuple):
                 sel = (sel,)
@@ -681,6 +843,35 @@ class LazyTensor:
         return int(x.shape[0]) if xd > 0 else 1
 
     @staticmethod
+    def _idx_to_cpu_int64(idx: Any) -> torch.Tensor:
+        if not isinstance(idx, torch.Tensor):
+            idx = torch.as_tensor(idx)
+        if idx.device.type != "cpu":
+            idx = idx.detach().cpu()
+        if idx.dtype not in (torch.int64, torch.int32):
+            idx = idx.to(dtype=torch.int64, copy=False)
+        idx = idx.reshape(-1)
+        return idx.to(dtype=torch.int64, copy=False)
+
+    @staticmethod
+    def _atomic_write_json(path: str, payload: dict, *, indent: int = 2) -> None:
+        import json as _json
+        import os as _os
+
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(payload, f, indent=int(indent))
+        _os.replace(tmp, path)
+
+    @staticmethod
+    def _atomic_torch_save(path: str, payload: Any) -> None:
+        import os as _os
+
+        tmp = path + ".tmp"
+        torch.save(payload, tmp)
+        _os.replace(tmp, path)
+
+    @staticmethod
     def write_memmap_streaming_two_pass(
         *,
         ds: Any,
@@ -701,30 +892,25 @@ class LazyTensor:
 
         Pass 1: infer shapes and collect scale stats (for dtype negotiation).
         Pass 2: write contiguous memmaps (optionally shuffled).
-
-        When ``features_only=True``, the labels memmap is omitted. ``meta.json``
-        will still contain ``label_shape`` for downstream shape inference.
         """
-
         from tensordict import MemoryMappedTensor
         from .pipeline import Dataset
         from .datatype import env_first_int
 
+        out_dir = os.fspath(out_dir)
         os.makedirs(out_dir, exist_ok=True)
-        count = int(count)
-        if count <= 0:
+
+        count_i = int(count)
+        if count_i <= 0:
             raise ValueError("count must be > 0")
 
-        # Chunk sizing:
-        # - STNET_MEMMAP_CHUNK_SIZE / STNET_MEMMAP_CHUNK override everything.
-        # - chunk_size<=0 enables a conservative auto-tuning heuristic.
         env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), None)
         if env_chunk is not None and int(env_chunk) > 0:
             chunk_size = int(env_chunk)
 
         req_chunk = int(chunk_size or 0)
         auto_chunk = req_chunk <= 0
-        chunk_first = max(1, min(count, req_chunk if req_chunk > 0 else min(count, 256)))
+        chunk_first = max(1, min(count_i, req_chunk if req_chunk > 0 else min(count_i, 256)))
 
         allow_missing = bool(allow_missing_labels) or bool(features_only)
         default_lshape = tuple(default_label_shape) if default_label_shape is not None else (1,)
@@ -742,13 +928,14 @@ class LazyTensor:
         label_shape: Optional[Tuple[int, ...]] = None
 
         # --- Pass 1: infer shapes + stats ---
-        for s in range(0, count, int(chunk_first)):
-            e = min(count, s + int(chunk_first))
+        for s in range(0, count_i, int(chunk_first)):
+            e = min(count_i, s + int(chunk_first))
             batch = get_batch(int(s), int(e))
             fx, lb, _, _ = ds.preprocess(batch)
             n = LazyTensor._batch_n(fx)
             if n <= 0:
                 continue
+
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
             cur_in_dim = int(fx_flat.shape[1])
             if in_dim is None:
@@ -791,10 +978,14 @@ class LazyTensor:
         if in_dim is None or label_shape is None:
             raise RuntimeError("Failed to infer in_dim/label_shape from data")
 
-        negotiable = Dataset.is_fp32_castable(stats, underflow_action=underflow_action, safety_margin=1.0)
+        negotiable = Dataset.is_fp32_castable(
+            stats,
+            underflow_action=underflow_action,
+            safety_margin=1.0,
+        )
         store_float = LazyTensor._resolve_memmap_store_float(negotiable=bool(negotiable))
 
-        # Auto-tune chunk size for the writing pass (bound memory).
+        # Auto-tune chunk size for pass 2 (bound memory).
         if auto_chunk:
             elem_size = int(torch.empty((), dtype=store_float).element_size())
             label_numel = 0 if bool(features_only) else int(np.prod(label_shape))
@@ -805,7 +996,6 @@ class LazyTensor:
                 target_mb = env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64)
                 target_bytes = int(target_mb) * 1024 * 1024
 
-            # Clamp to a small fraction of available RAM when detectable.
             try:
                 from ..backend.system import Memory
 
@@ -815,15 +1005,12 @@ class LazyTensor:
             except Exception:
                 pass
 
-            chunk_second = int(max(1, min(count, max(32, target_bytes // row_bytes))))
+            chunk_second = int(max(1, min(count_i, max(32, int(target_bytes) // int(row_bytes)))))
         else:
-            chunk_second = int(max(1, min(count, req_chunk)))
+            chunk_second = int(max(1, min(count_i, req_chunk)))
 
-        # Pre-compute split indices. When `shuffle=True`, this refers to the
-        # *written* order (physical shuffle), so training/validation splits are
-        # still contiguous ranges in the memmap.
-        val_count = max(0, min(int(count), int(round(int(count) * float(val_frac)))))
-        train_count = max(0, int(count) - int(val_count))
+        val_count = max(0, min(count_i, int(round(count_i * float(val_frac)))))
+        train_count = max(0, count_i - val_count)
         train_start, train_end = 0, int(train_count)
         val_start, val_end = int(train_end), int(train_end) + int(val_count)
 
@@ -831,16 +1018,17 @@ class LazyTensor:
         labels_path = os.path.join(out_dir, "labels.mmt")
 
         features_mmt = MemoryMappedTensor.empty(
-            (int(count), int(in_dim)),
+            (count_i, int(in_dim)),
             dtype=store_float,
             filename=features_path,
             existsok=True,
         )
+
         write_labels = not bool(features_only)
         labels_mmt = None
         if write_labels:
             labels_mmt = MemoryMappedTensor.empty(
-                (int(count), *tuple(label_shape)),
+                (count_i, *tuple(label_shape)),
                 dtype=store_float,
                 filename=labels_path,
                 existsok=True,
@@ -854,12 +1042,12 @@ class LazyTensor:
                 device=torch.device("cpu"),
             )
 
-        # Shuffle indexer (physical shuffle) without materializing a potentially
-        # huge `randperm(count)` tensor.
+        # Shuffle indexer
         shuffle_indexer = None
         shuffle_impl = "none"
         order: Optional[torch.Tensor] = None
         shuffle_seed: Optional[int] = None
+
         if bool(shuffle):
             if get_by_indices is None:
                 raise ValueError("shuffle=True requires get_by_indices")
@@ -868,12 +1056,8 @@ class LazyTensor:
                 ("STNET_MEMMAP_RANDPERM_MAX_ELEMS", "STNET_MEMMAP_SHUFFLE_MAX_ELEMS"),
                 5_000_000,
             )
-            use_full = (max_elems is not None) and (int(count) <= int(max_elems))
-            seed_i: Optional[int]
-            if seed_value is None:
-                seed_i = None
-            else:
-                seed_i = int(seed_value) & 0x7FFFFFFFFFFFFFFF
+            use_full = (max_elems is not None) and (count_i <= int(max_elems))
+            seed_i = None if seed_value is None else (int(seed_value) & 0x7FFFFFFFFFFFFFFF)
 
             if use_full:
                 g = None
@@ -881,24 +1065,21 @@ class LazyTensor:
                     g = torch.Generator(device="cpu")
                     g.manual_seed(seed_i)
                 shuffle_seed = seed_i
-                order = torch.randperm(int(count), generator=g, dtype=torch.int64)
+                order = torch.randperm(count_i, generator=g, dtype=torch.int64)
 
                 def _idx(s: int, e: int) -> torch.Tensor:
+                    assert order is not None
                     return order[int(s) : int(e)]
 
                 shuffle_indexer = _idx
                 shuffle_impl = "randperm"
             else:
                 if seed_i is None:
-                    # Use the global torch RNG so the shuffle stays stochastic
-                    # when no explicit seed is provided.
-                    seed_i = int(
-                        torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item()
-                    )
+                    seed_i = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
                 shuffle_seed = seed_i
-                # On-the-fly bijective pseudo-permutation over [0, count)
-                # using a small-domain Feistel network + cycle-walking.
-                k = max(1, int(int(count - 1)).bit_length())
+
+                # Feistel PRP on 2^k domain + cycle-walking into [0, count).
+                k = max(1, int((count_i - 1)).bit_length())
                 if (k % 2) == 1:
                     k += 1
                 half = k // 2
@@ -908,9 +1089,8 @@ class LazyTensor:
                 seed_u = torch.tensor(seed_i & 0xFFFFFFFFFFFFFFFF, dtype=torch.uint64)
                 mask_u = torch.tensor(mask, dtype=torch.uint64)
                 domain_u = torch.tensor(domain_mask, dtype=torch.uint64)
-                count_u = torch.tensor(int(count), dtype=torch.uint64)
+                count_u = torch.tensor(count_i, dtype=torch.uint64)
 
-                # Per-round keys (derived from the seed).
                 k0 = seed_u ^ torch.tensor(0x9E3779B97F4A7C15, dtype=torch.uint64)
                 k1 = seed_u ^ torch.tensor(0xBF58476D1CE4E5B9, dtype=torch.uint64)
                 k2 = seed_u ^ torch.tensor(0x94D049BB133111EB, dtype=torch.uint64)
@@ -922,7 +1102,6 @@ class LazyTensor:
 
                 def _round_fn(r: torch.Tensor, rk: torch.Tensor) -> torch.Tensor:
                     x = (r ^ rk) & mask_u
-                    # A couple of cheap mixing steps; output is masked to `half` bits.
                     x = (x * _c_mul1) & domain_u
                     x = (x ^ (x >> 33)) & domain_u
                     x = (x * _c_mul2) & domain_u
@@ -938,15 +1117,37 @@ class LazyTensor:
                         l, r = r, (l ^ f) & mask_u
                     return (((l << half) | r) & domain_u)
 
+                # Deterministic fallback permutation (affine mod count) in case
+                # cycle-walking doesn't converge quickly for some domain/seed.
+                def _gcd(a: int, b: int) -> int:
+                    while b:
+                        a, b = b, a % b
+                    return abs(int(a))
+
+                a0 = (seed_i | 1) % count_i
+                if a0 == 0:
+                    a0 = 1
+                while _gcd(a0, count_i) != 1:
+                    a0 = (a0 + 2) % count_i
+                    if a0 == 0:
+                        a0 = 1
+                b0 = seed_i % count_i
+
+                def _affine(pos: torch.Tensor) -> torch.Tensor:
+                    p = pos.to(dtype=torch.int64)
+                    return ((p * int(a0) + int(b0)) % int(count_i)).to(dtype=torch.int64)
+
                 def _permute(pos: torch.Tensor) -> torch.Tensor:
-                    # Vectorized cycle-walking to restrict to [0, count).
                     x = pos.to(dtype=torch.uint64)
                     y = _feistel(x)
                     bad = y >= count_u
-                    # Expected <= 2 iterations when domain ~= 2^ceil_log2(count).
-                    for _ in range(4):
-                        if not bool(bad.any()):
-                            break
+
+                    max_iter = 64
+                    it = 0
+                    while bool(bad.any()):
+                        it += 1
+                        if it > max_iter:
+                            return _affine(pos)
                         y_bad = _feistel(y[bad])
                         y[bad] = y_bad
                         bad = y >= count_u
@@ -959,13 +1160,13 @@ class LazyTensor:
                 shuffle_indexer = _idx
                 shuffle_impl = "prp"
 
-        # Optional scaler stats (train split only). This replaces the expensive
-        # runtime pass that re-scans the full training loader to compute mean/std.
-        compute_scaler_stats = bool(write_labels) and (not bool(features_only)) and (not bool(allow_missing_labels))
+        # Optional scaler stats (train split only).
+        compute_scaler_stats = bool(write_labels) and (not bool(allow_missing_labels))
         x_sum: Optional[torch.Tensor] = None
         x_sum_sq: Optional[torch.Tensor] = None
         y_sum: Optional[torch.Tensor] = None
         y_sum_sq: Optional[torch.Tensor] = None
+
         if compute_scaler_stats and int(train_end) > 0:
             x_sum = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
             x_sum_sq = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
@@ -974,8 +1175,8 @@ class LazyTensor:
             y_sum_sq = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
 
         written = 0
-        for s in range(0, count, int(chunk_second)):
-            e = min(count, s + int(chunk_second))
+        for s in range(0, count_i, int(chunk_second)):
+            e = min(count_i, s + int(chunk_second))
             if shuffle_indexer is None:
                 batch = get_batch(int(s), int(e))
             else:
@@ -986,6 +1187,7 @@ class LazyTensor:
             n = LazyTensor._batch_n(fx)
             if n <= 0:
                 continue
+
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
             if int(fx_flat.shape[1]) != int(in_dim):
                 raise RuntimeError(
@@ -994,16 +1196,14 @@ class LazyTensor:
 
             fx_out = fx_flat if fx_flat.dtype == store_float else fx_flat.to(dtype=store_float)
 
-            # Scaler sums for the *train* split in the written order.
             if x_sum is not None and x_sum_sq is not None:
-                # `n` is expected to equal `(e - s)`, but keep this robust.
                 end_pos = int(s) + int(n)
                 overlap = max(0, min(end_pos, int(train_end)) - int(s))
                 if overlap > 0:
                     fx_slice = fx_out[:overlap]
                     fx64 = fx_slice if fx_slice.dtype == torch.float64 else fx_slice.to(dtype=torch.float64)
                     x_sum += fx64.sum(dim=0)
-                    x_sum_sq += torch.einsum("bn,bn->n", fx64, fx64)
+                    x_sum_sq += fx64.square().sum(dim=0)
 
             features_mmt[int(s) : int(s) + int(n)].copy_(fx_out)
 
@@ -1021,6 +1221,7 @@ class LazyTensor:
                         )
                     lb_cpu = LazyTensor._to_cpu_contig(lb)
                     lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
+
                 assert labels_mmt is not None
                 labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
 
@@ -1031,11 +1232,12 @@ class LazyTensor:
                         lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
                         lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
                         y_sum += lb64.sum(dim=0)
-                        y_sum_sq += torch.einsum("bn,bn->n", lb64, lb64)
+                        y_sum_sq += lb64.square().sum(dim=0)
+
             written += int(n)
 
-        if int(written) != int(count):
-            raise RuntimeError(f"memmap written={written}, expected={count}")
+        if int(written) != int(count_i):
+            raise RuntimeError(f"memmap written={written}, expected={count_i}")
 
         scaler_stats_path: Optional[str] = None
         if (
@@ -1046,24 +1248,22 @@ class LazyTensor:
             and y_sum is not None
             and y_sum_sq is not None
         ):
+            payload = {
+                "version": 1,
+                "train_count": int(train_end),
+                "x_sum": x_sum,
+                "x_sum_sq": x_sum_sq,
+                "y_sum": y_sum,
+                "y_sum_sq": y_sum_sq,
+            }
+            scaler_stats_path = "scaler_stats.pt"
             try:
-                import torch as _torch
-
-                payload = {
-                    "version": 1,
-                    "train_count": int(train_end),
-                    "x_sum": x_sum,
-                    "x_sum_sq": x_sum_sq,
-                    "y_sum": y_sum,
-                    "y_sum_sq": y_sum_sq,
-                }
-                scaler_stats_path = "scaler_stats.pt"
-                _torch.save(payload, os.path.join(out_dir, scaler_stats_path))
+                LazyTensor._atomic_torch_save(os.path.join(out_dir, scaler_stats_path), payload)
             except Exception:
                 scaler_stats_path = None
 
         meta_json: Dict[str, Any] = {
-            "N": int(count),
+            "N": int(count_i),
             "feature_dim": int(in_dim),
             "features_path": "features.mmt",
             "labels_path": ("labels.mmt" if write_labels else None),
@@ -1092,12 +1292,7 @@ class LazyTensor:
             "features_only": bool(features_only),
         }
 
-        meta_path = os.path.join(out_dir, "meta.json")
-        with open(meta_path, "w", encoding="utf-8") as f:
-            import json as _json
-
-            _json.dump(meta_json, f, indent=2)
-
+        LazyTensor._atomic_write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
         return int(in_dim), tuple(label_shape)
 
     @staticmethod
@@ -1115,7 +1310,6 @@ class LazyTensor:
         default_label_shape: Optional[Tuple[int, ...]] = None,
     ) -> None:
         """Materialize an in-memory dataset into a memmap directory."""
-
         from .pipeline import Dataset, default_underflow_action, normalize_underflow_action
 
         if not isinstance(data, Mapping):
@@ -1151,57 +1345,49 @@ class LazyTensor:
         ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
         ds.underflow_action = ua
 
-        def _slice(obj: Any, s: int, e: int) -> Any:
+        def _slice_any(obj: Any, s: int, e: int, *, name: str) -> Any:
             if obj is None:
                 return None
+            if torch.is_tensor(obj):
+                return obj[int(s) : int(e)]
+            if isinstance(obj, np.ndarray):
+                return obj[int(s) : int(e)]
             try:
-                if torch.is_tensor(obj):
-                    return obj[s:e]
-                return obj[s:e]
+                return obj[int(s) : int(e)]
             except Exception:
                 pass
             try:
-                return [obj[i] for i in range(s, e)]
-            except Exception:
-                pass
-            return obj
+                return [obj[i] for i in range(int(s), int(e))]
+            except Exception as ex:
+                raise TypeError(f"Object {name} does not support slicing [{s}:{e}]") from ex
 
-        def _gather(obj: Any, idx: torch.Tensor) -> Any:
+        def _gather_any(obj: Any, idx: torch.Tensor, *, name: str) -> Any:
             if obj is None:
                 return None
+            idx_cpu = LazyTensor._idx_to_cpu_int64(idx)
+            if torch.is_tensor(obj):
+                return obj[idx_cpu]
+            if isinstance(obj, np.ndarray):
+                return obj[idx_cpu.numpy()]
             try:
-                if torch.is_tensor(obj) and idx.dtype in (torch.int64, torch.int32):
-                    return obj[idx.detach().cpu()]
-                if hasattr(obj, "__getitem__"):
-                    return obj[idx.detach().cpu().numpy()]
+                return obj[idx_cpu.numpy()]
             except Exception:
                 pass
             try:
-                ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
-                return [obj[i] for i in ii]
-            except Exception:
-                pass
-            try:
-                if torch.is_tensor(obj):
-                    return obj[idx]
-            except Exception:
-                pass
-            try:
-                return [obj[i] for i in idx]
-            except Exception:
-                pass
-            return obj
+                return [obj[int(i)] for i in idx_cpu.tolist()]
+            except Exception as ex:
+                raise TypeError(f"Object {name} does not support gather by indices") from ex
 
         def get_batch(s: int, e: int) -> Mapping[str, Any]:
-            out: Dict[str, Any] = {"features": _slice(raw_X, s, e)}
+            out: Dict[str, Any] = {"features": _slice_any(raw_X, s, e, name="features")}
             if raw_Y is not None and not bool(features_only):
-                out["labels"] = _slice(raw_Y, s, e)
+                out["labels"] = _slice_any(raw_Y, s, e, name="labels")
             return out
 
         def get_by_indices(idx: torch.Tensor) -> Mapping[str, Any]:
-            out: Dict[str, Any] = {"features": _gather(raw_X, idx)}
+            out: Dict[str, Any] = {"features": _gather_any(raw_X, idx, name="features")}
             if raw_Y is not None and not bool(features_only):
-                out["labels"] = _gather(raw_Y, idx)
+                out["labels"] = _gather_any(raw_Y, idx, name="labels")
             return out
 
         LazyTensor.write_memmap_streaming_two_pass(
@@ -1227,18 +1413,15 @@ class LazyTensor:
             return
         if isinstance(obj, str):
             yield obj
-            return
-        if isinstance(obj, dict):
+        elif isinstance(obj, dict):
             if obj.get("kind") == "memmap" and isinstance(obj.get("path"), str):
                 yield obj["path"]
-                return
-            for v in obj.values():
-                yield from LazyTensor.iter_source_paths(v)
-            return
-        if isinstance(obj, (list, tuple)):
+            else:
+                for v in obj.values():
+                    yield from LazyTensor.iter_source_paths(v)
+        elif isinstance(obj, (list, tuple)):
             for v in obj:
                 yield from LazyTensor.iter_source_paths(v)
-            return
 
     @staticmethod
     def from_meta(memmap_dir: str) -> Dict[str, Any]:
@@ -1350,6 +1533,7 @@ class LazyTensor:
 
     @staticmethod
     def merge_meta_infos(sources: Any) -> Dict[str, Any]:
+        sources = LazyTensor.expand_sources(sources)
         metas: list[dict] = []
         for path in LazyTensor.iter_source_paths(sources):
             try:
@@ -1362,19 +1546,6 @@ class LazyTensor:
 
     @staticmethod
     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
-        """Load and aggregate per-source scaler sums/sumsq from memmap metadata.
-
-        Training previously computed feature/label mean+std by re-scanning the
-        full training loader once before the first epoch. When memmaps are built
-        via `write_memmap_streaming_two_pass`, we already touch all samples; so
-        we persist the necessary sufficient statistics (sum/sumsq) into each
-        memmap directory.
-
-        This helper aggregates those stats across (possibly expanded) sources.
-        It returns None when stats are unavailable/incompatible, allowing the
-        caller to fall back to the legacy runtime scan.
-        """
-
         expanded = LazyTensor.expand_sources(sources)
         total = 0
         x_sum: Optional[torch.Tensor] = None
@@ -1465,9 +1636,7 @@ class LazyTensor:
                 }
                 return resolved, True
             if isinstance(payload, list):
-                resolved = [
-                    {"kind": "memmap", "path": os.path.join(root, str(v))} for v in payload
-                ]
+                resolved = [{"kind": "memmap", "path": os.path.join(root, str(v))} for v in payload]
                 return resolved, True
             return spec, False
 
@@ -1479,5 +1648,3 @@ class LazyTensor:
             if ok:
                 return expanded
         return sources
-
-
