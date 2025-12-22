@@ -1010,7 +1010,7 @@ class DilatedAttention(nn.Module):
                 # IMPORTANT:
                 # PyTorch SDPA raises if both attn_mask and is_causal are set.
                 # Only use is_causal when there are no additional masking needs.
-                base_mask: Optional[torch.Tensor] = None
+                base_mask_keep: Optional[torch.Tensor] = None
                 is_causal = False
 
                 if is_simple and bool(self.causal) and (kpm_k is None):
@@ -1021,7 +1021,7 @@ class DilatedAttention(nn.Module):
                     #  - causal + any padding mask
                     #  - dilation/windowed attention (with or without causal)
                     base_mask_full = self._get_mask(L_k, x_k.device)
-                    base_mask = base_mask_full[:L_q, :]
+                    base_mask_keep = base_mask_full[:L_q, :]
                     is_causal = False
 
                 key_mask: Optional[torch.Tensor] = None
@@ -1029,10 +1029,15 @@ class DilatedAttention(nn.Module):
                     kpm_b = kpm_k.to(torch.bool)
                     # Support either (B, L_k) or (L_k,) masks:
                     if kpm_b.dim() == 1:
-                        # SDPA bool mask is keep-mask: True = allowed
+                        # DotProductAttention bool mask is mask-out: True = disallowed
                         key_mask = (~kpm_b)[None, None, None, :]  # (1,1,1,L_k)
                     else:
                         key_mask = (~kpm_b)[:, None, None, :]     # (B,1,1,L_k)
+
+                base_mask: Optional[torch.Tensor] = None
+                if base_mask_keep is not None:
+                    # Convert keep-mask to mask-out semantics expected by DotProductAttention.
+                    base_mask = (~base_mask_keep).to(torch.bool)
 
                 # Combine masks with minimal materialization.
                 if base_mask is None:
@@ -1055,8 +1060,8 @@ class DilatedAttention(nn.Module):
                             is_causal=False,
                         )
                     elif int(key_mask.shape[0]) == 1:
-                        # keep-mask 결합은 AND
-                        attn_mask = base_mask[None, None, :, :] & key_mask
+                        # Mask-out combination uses OR semantics.
+                        attn_mask = base_mask[None, None, :, :] | key_mask
                         y = self._call_dot_attn(
                             qh,
                             kh,

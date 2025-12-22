@@ -797,7 +797,7 @@ class Autocast:
     def _set_tls_metadata(cls, meta: Optional[Dataset[Any]]) -> None:
         setattr(cls._metadata_tls, "meta", meta)
         # Keep a best-effort snapshot for any legacy access paths.
-        cls._set_tls_metadata(meta)
+        cls._metadata = meta
 
     @classmethod
     def metadata(cls) -> Optional[Dataset[Any]]:
