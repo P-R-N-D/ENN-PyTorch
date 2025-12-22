@@ -43,6 +43,101 @@ from .config import (ModelConfig, OpsMode, RuntimeConfig, coerce_model_config,
                      runtime_config)
 
 
+def _reset_process_group() -> None:
+    """Best-effort cleanup for a potentially initialized process group.
+
+    In interactive/iterative workflows it is easy to end up with an initialized
+    process group from a previous run. That can break subsequent elastic runs.
+
+    This function is intentionally conservative: it never raises.
+    """
+
+    try:
+        import torch.distributed as _dist
+
+        if _dist.is_available() and _dist.is_initialized():
+            # A barrier is best-effort. Some backends can hang if ranks are
+            # inconsistent, so keep it suppressed.
+            with contextlib.suppress(Exception):
+                _dist.barrier()
+            with contextlib.suppress(Exception):
+                _dist.destroy_process_group()
+    except Exception:
+        pass
+
+
+def _clear_device_caches() -> None:
+    """Release best-effort accelerator caches (CUDA/XPU/MPS) and run GC."""
+
+    with contextlib.suppress(Exception):
+        import gc
+
+        gc.collect()
+
+    # Prefer the project helper when available (rate-limited).
+    with contextlib.suppress(Exception):
+        from ..backend.system import empty_device_cache, get_device
+
+        empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
+
+    with contextlib.suppress(Exception):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            with contextlib.suppress(Exception):
+                torch.cuda.ipc_collect()
+
+    with contextlib.suppress(Exception):
+        xpu = getattr(torch, "xpu", None)
+        if xpu is not None and callable(getattr(xpu, "empty_cache", None)):
+            # Some builds expose xpu.empty_cache without xpu.is_available.
+            if not callable(getattr(xpu, "is_available", None)) or bool(xpu.is_available()):
+                xpu.empty_cache()
+
+    with contextlib.suppress(Exception):
+        mps = getattr(torch, "mps", None)
+        if mps is not None and callable(getattr(mps, "empty_cache", None)):
+            mps.empty_cache()
+
+
+def _preload_state(state: Any) -> Any:
+    """Normalize a loaded state_dict for safe CPU-side use.
+
+    - Ensures tensors are detached and resident on CPU.
+    - Converts meta/fake tensors to real CPU tensors when encountered.
+    - Makes tensors contiguous when possible.
+
+    This is useful when user code provides a state dict (or torch.load result)
+    that may contain non-standard tensor types.
+    """
+
+    from collections.abc import Mapping as _Mapping
+
+    if isinstance(state, _Mapping):
+        return {k: _preload_state(v) for k, v in state.items()}
+    if isinstance(state, (list, tuple)):
+        seq = [_preload_state(v) for v in state]
+        return type(state)(seq)
+
+    if isinstance(state, torch.Tensor):
+        t = state
+        with contextlib.suppress(Exception):
+            from ..backend.compat import is_meta_or_fake_tensor
+
+            if is_meta_or_fake_tensor(t):
+                t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
+
+        if t.device.type != "cpu":
+            t = t.detach().to(device="cpu")
+        else:
+            t = t.detach()
+
+        with contextlib.suppress(Exception):
+            t = t.contiguous()
+        return t
+
+    return state
+
+
 def _ensure_seed(seed: Optional[int]) -> Optional[int]:
     if seed is None:
         return None
@@ -157,7 +252,7 @@ def train(
                 underflow_action=underflow_action,
                 shuffle=bool(shuffle),
                 allow_missing_labels=False,
-                chunk_size=32,
+                chunk_size=0,
             )
 
             return int(in_dim), tuple(label_shape), int(count)
@@ -177,7 +272,7 @@ def train(
                 return LazyTensor.KeyIndexMappingView(d, keys[s:e])
 
             def _get_by_indices(idx: torch.Tensor):
-                ii = idx.detach().cpu().tolist()
+                ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
                 return LazyTensor.KeyIndexMappingView(d, [keys[i] for i in ii])
 
             in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
@@ -191,7 +286,7 @@ def train(
                 underflow_action=underflow_action,
                 shuffle=bool(shuffle),
                 allow_missing_labels=False,
-                chunk_size=32,
+                chunk_size=0,
             )
 
             return int(in_dim), tuple(label_shape), int(count)
@@ -285,25 +380,38 @@ def train(
                 payload = manifest if isinstance(manifest, dict) else list(manifest)
                 json.dump(payload, f)
         ckpt_dir = new_dir("ckpt_dcp")
-        init_dir = None
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        m_sd = get_model_state_dict(model, options=opts)
+        init_dir: Optional[str] = None
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
+        # Workers must be able to load an initial checkpoint from disk.
+        # If a user disables both save flags, force model.pt.
+        if not (save_dcp or save_pt):
+            save_pt = True
+        m_sd: Optional[Dict[str, Any]] = None
         if save_dcp or save_pt:
             init_dir = new_dir("init_dcp")
+            os.makedirs(init_dir, exist_ok=True)
+
+            # Only build the expensive full state_dict when required.
             if save_dcp:
+                opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+                m_sd = get_model_state_dict(model, options=opts)
+
+            if save_dcp and m_sd is not None:
                 save(
                     state_dict={"model": m_sd},
                     storage_writer=FileSystemWriter(
                         init_dir, sync_files=True, overwrite=True
                     ),
                 )
+
             if save_pt:
-                torch.save(
-                    {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                    os.path.join(init_dir, "model.pt"),
-                )
+                if m_sd is not None:
+                    pt_state: Dict[str, Any] = dict(m_sd)
+                    _trim_dcp_keys(pt_state)
+                else:
+                    pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+                torch.save(pt_state, os.path.join(init_dir, "model.pt"))
         default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
@@ -597,22 +705,32 @@ def predict(
     ckpt_dir = os.path.join(tmp_dir, "pred_ckpt")
     os.makedirs(ckpt_dir, exist_ok=True)
     mp.allow_connection_pickling()
-    opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-    m_sd = get_model_state_dict(model, options=opts)
     save_dcp = env_bool("STNET_SAVE_DCP", True)
     save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
+    # Predict/infer workers must be able to load weights from disk.
+    # If a user disables both save flags, force model.pt.
+    if not (save_dcp or save_pt):
+        save_pt = True
+    m_sd: Optional[Dict[str, Any]] = None
     if save_dcp or save_pt:
         dcp_dir = os.path.join(tmp_dir, "dcp")
+        os.makedirs(dcp_dir, exist_ok=True)
+
         if save_dcp:
+            opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+            m_sd = get_model_state_dict(model, options=opts)
             save(
                 state_dict={"model": m_sd},
                 storage_writer=FileSystemWriter(dcp_dir, sync_files=True, overwrite=True),
             )
+
         if save_pt:
-            torch.save(
-                {k: v.detach().cpu() for k, v in model.state_dict().items()},
-                os.path.join(dcp_dir, "model.pt"),
-            )
+            if m_sd is not None:
+                pt_state: Dict[str, Any] = dict(m_sd)
+                _trim_dcp_keys(pt_state)
+            else:
+                pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+            torch.save(pt_state, os.path.join(dcp_dir, "model.pt"))
     cfg_obj = getattr(model, "_Root__config", None)
     if isinstance(cfg_obj, (ModelConfig, dict)):
         cfg_model = coerce_model_config(cfg_obj)
@@ -635,17 +753,6 @@ def predict(
 
     lazy_flag = bool(kwargs.pop("lazy", lazy)) if output_mode == "tensor" else False
     shuffle = bool(kwargs.pop("shuffle", True))
-
-    if any((v is None for v in data.values())):
-        dummy_shape = tuple(model.out_shape)
-        data = {
-            k: (
-                torch.zeros(dummy_shape)
-                if v is None
-                else torch.as_tensor(v).view(*dummy_shape)
-            )
-            for k, v in data.items()
-        }
 
     from collections.abc import Mapping as _Mapping
 
@@ -674,10 +781,11 @@ def predict(
             shuffle=bool(shuffle),
             default_label_shape=default_out_shape,
             allow_missing_labels=True,
-            chunk_size=32,
+            features_only=True,
+            chunk_size=0,
         )
 
-        keys = list(range(count))
+        keys = range(count)
 
     elif (
         isinstance(data, _Mapping)
@@ -695,7 +803,7 @@ def predict(
             return LazyTensor.KeyIndexMappingView(data, keys[s:e])
 
         def _get_by_indices(idx: torch.Tensor):
-            ii = idx.detach().cpu().tolist()
+            ii = idx.tolist() if idx.device.type == "cpu" else idx.detach().cpu().tolist()
             return LazyTensor.KeyIndexMappingView(data, [keys[i] for i in ii])
 
         in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
@@ -710,20 +818,14 @@ def predict(
             shuffle=bool(shuffle),
             default_label_shape=default_out_shape,
             allow_missing_labels=True,
-            chunk_size=32,
+            features_only=True,
+            chunk_size=0,
         )
 
     else:
         feats, labels, keys, label_shape = ds.preprocess(data)
         if not feats.is_contiguous():
             feats = feats.contiguous()
-        if labels is None:
-            out_shape = tuple(getattr(model, "out_shape", ()))
-            if not out_shape:
-                out_shape = (1,)
-            labels = torch.zeros((int(feats.shape[0]), *tuple(out_shape)), dtype=torch.float64)
-        if not labels.is_contiguous():
-            labels = labels.contiguous()
 
         count = int(feats.shape[0])
         if count <= 0:
@@ -731,6 +833,7 @@ def predict(
 
         in_dim = int(feats.reshape(count, -1).shape[1])
 
+        # Prediction/inference does not require labels; write a features-only memmap.
         preload_memmap(
             {"features": feats, "labels": labels},
             memmap_dir=memmap_dir,
@@ -739,15 +842,19 @@ def predict(
             shuffle=bool(shuffle),
             seed=seed_value,
             underflow_action=underflow_action,
+            allow_missing_labels=True,
+            default_label_shape=default_out_shape,
+            features_only=True,
         )
         if keys is None:
-            keys = list(range(count))
+            keys = range(count)
+        if not label_shape:
+            label_shape = tuple(default_out_shape)
     base = dict(
         sources={"kind": "memmap", "path": memmap_dir},
         in_dim=int(in_dim),
         out_shape=tuple(label_shape),
         cfg_dict=cfg_dict,
-        keys=list(keys),
         ckpt_dir=ckpt_dir,
     )
     if dcp_dir is not None:
@@ -1027,20 +1134,29 @@ def get_prediction(
                 missing = int(np.sum(row_to_part < 0))
                 raise RuntimeError(f"get_prediction: missing predictions for {missing}/{nkeys} rows")
 
-            _cache_part = {"idx": -1, "pred": None}
+            import threading
+
+            _cache_part: Dict[str, Any] = {"idx": -1, "pred": None}
+            _cache_lock = threading.Lock()
 
             def _pred_for_row(row_id: int) -> torch.Tensor:
                 p = int(row_to_part[int(row_id)])
                 if p < 0:
                     raise KeyError(row_id)
                 off = int(row_to_off[int(row_id)])
-                if _cache_part["idx"] != p or _cache_part["pred"] is None:
-                    path = pred_paths[p]
-                    if not path:
-                        raise KeyError(p)
-                    _cache_part["pred"] = torch.load(path, map_location="cpu")
-                    _cache_part["idx"] = p
-                return _cache_part["pred"][off].detach()
+                pred = _cache_part.get("pred")
+                if int(_cache_part.get("idx", -1)) != p or pred is None:
+                    # Thread-safe cache fill (important for free-threaded builds).
+                    with _cache_lock:
+                        pred = _cache_part.get("pred")
+                        if int(_cache_part.get("idx", -1)) != p or pred is None:
+                            path = pred_paths[p]
+                            if not path:
+                                raise KeyError(p)
+                            pred = torch.load(path, map_location="cpu")
+                            _cache_part["pred"] = pred
+                            _cache_part["idx"] = p
+                return pred[off].detach()
 
             def _getter(key: Any) -> torch.Tensor:
                 rid = _row_for_key(key)

@@ -952,7 +952,7 @@ def compose(
     source = sampler.compose(node_or_nodes)
     # If multi-source mixing is active, register the Wrapper for per-epoch reseeding.
     if epochables is not None and getattr(sampler, "_node", None) is not None:
-        with suppress(Exception):
+        with contextlib.suppress(Exception):
             # Put it first so it runs before per-dataset epoch hooks.
             epochables.insert(0, sampler)
     mapper = Connector(
@@ -1808,16 +1808,23 @@ class Dataset(Generic[TExtra]):
                         ksize0 = _key_feature_size(keys[0])
                         if ksize0 is not None and 1 < int(ksize0) <= 64:
                             if all(_key_feature_size(k) == ksize0 for k in keys):
+                                # Fast-path: interpret mapping keys as feature vectors.
+                                # When values contain None (common for prediction), treat labels as missing.
+                                has_missing_labels = any((v is None for v in values))
                                 try:
                                     feat_list = [
                                         _to_tensor(k, dtype=self.feature_dtype).reshape(-1) for k in keys
                                     ]
-                                    label_list = [
-                                        _to_tensor(v, dtype=self.label_float_dtype) for v in values
-                                    ]
                                     features = torch.stack(feat_list, dim=0) if feat_list else None
-                                    labels = torch.stack(label_list, dim=0) if label_list else None
-                                    parsed = features is not None and labels is not None
+                                    if has_missing_labels:
+                                        labels = None
+                                        parsed = features is not None
+                                    else:
+                                        label_list = [
+                                            _to_tensor(v, dtype=self.label_float_dtype) for v in values
+                                        ]
+                                        labels = torch.stack(label_list, dim=0) if label_list else None
+                                        parsed = features is not None and labels is not None
                                 except Exception:
                                     parsed = False
 

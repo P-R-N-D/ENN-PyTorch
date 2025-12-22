@@ -376,7 +376,9 @@ class RuntimeConfig:
     swa_start_epoch: Optional[int] = None
     swa_update_batch_norm: bool = False
     model_ckpt_dir: Optional[str] = None
-    keys: Optional[List[Tuple[Any, ...]]] = None
+    # Optional original sample keys for predict/infer.
+    # Avoid eager list materialization (can be huge); keep as any sequence/range.
+    keys: Optional[Sequence[Any]] = None
     loss_skew: bool = True
     TRAIN_POS_ORDER: ClassVar[Tuple[str, ...]] = (
         "epochs",
@@ -480,15 +482,15 @@ class RuntimeConfig:
                 swa_update_batch_norm=bool(kwargs.get("swa_update_batch_norm", False)),
                 loss_skew=bool(kwargs.get("loss_skew", True)),
             )
-        for k in ("sources", "keys"):
+        for k in ("sources", "ckpt_dir"):
             if k not in kwargs or kwargs[k] is None:
                 raise ValueError(f"RuntimeConfig({mode}) missing required key: {k}")
         allowed = common_keys | {
             "sources",
+            "ckpt_dir",
             "keys",
             "model_ckpt_dir",
             "seed",
-            "ckpt_dir",
             "loss_skew",
         }
         unsupported = set(kwargs) - allowed
@@ -504,7 +506,7 @@ class RuntimeConfig:
             sources=kwargs["sources"],
             ckpt_dir=kwargs.get("ckpt_dir"),
             model_ckpt_dir=kwargs.get("model_ckpt_dir"),
-            keys=list(kwargs["keys"]),
+            keys=kwargs.get("keys"),
             seed=int(kwargs.get("seed", 7)),
             loss_skew=bool(kwargs.get("loss_skew", True)),
         )
@@ -531,11 +533,6 @@ def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConf
     mode = str(mode_value).lower()
     if mode not in ("train", "predict", "infer"):
         raise ValueError(f"invalid runtime mode: {mode_value}")
-    if "keys" in data and data["keys"] is not None:
-        try:
-            data["keys"] = list(data["keys"])
-        except Exception as exc:
-            raise TypeError("RuntimeConfig.keys must be list-like") from exc
     return RuntimeConfig.from_partial(mode=mode, **data)
 
 
