@@ -6,7 +6,7 @@ import contextvars
 import logging
 import os
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from types import TracebackType
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -355,6 +355,24 @@ _ACT_COEFF: Dict[type, float] = {
     nn.Hardsigmoid: 4.0,
 }
 
+_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
+
+
+@lru_cache(maxsize=128)
+def _act_coeff_for_type(t: type) -> Optional[float]:
+    """Fast activation FLOPs coefficient lookup by module type."""
+    coeff = _ACT_COEFF.get(t)
+    if coeff is not None:
+        return float(coeff)
+    # Handle subclasses (rare, but possible).
+    for cls, c in _ACT_COEFF.items():
+        try:
+            if issubclass(t, cls):
+                return float(c)
+        except Exception:
+            continue
+    return None
+
 
 def _is_te_module(mod: nn.Module) -> bool:
     return "transformer_engine" in getattr(type(mod), "__module__", "")
@@ -405,14 +423,10 @@ def _register_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: 
 def _register_activation(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not cfg.count_activations:
         return
-    coeff = None
-    for cls, c in _ACT_COEFF.items():
-        if isinstance(mod, cls):
-            coeff = c
-            break
+    coeff = _act_coeff_for_type(type(mod))
     if coeff is None:
         return
-    val = _flops_elementwise(out, coeff=coeff, effective_bwd=cfg.effective_bwd)
+    val = _flops_elementwise(out, coeff=float(coeff), effective_bwd=cfg.effective_bwd)
     if val > 0.0:
         profiler.add(type(mod).__name__, val)
 
@@ -1894,23 +1908,6 @@ class _FxGraphFlopEstimator:
 
         return self._eltwise(out, 1.0)
 
-    def _eltwise(self, out: Any, coeff: float) -> float:
-        n = self._out_numel(out)
-        if n <= 0:
-            return 0.0
-        fwd = float(n) * float(coeff)
-        return float(fwd * (1.0 + max(0.0, self._effective_bwd)))
-
-    def _out_numel(self, out: Any) -> int:
-        y = self._as_tensor(out)
-        if y is None:
-            return 0
-        try:
-            numel = getattr(y, "numel", None)
-            return int(numel()) if callable(numel) else int(numel)
-        except Exception:
-            return 0
-
 
 def _to_real_tensor(x: Any) -> torch.Tensor:
     if isinstance(x, torch.Tensor):
@@ -2183,7 +2180,7 @@ class _FlopProfiler:
                 hook = module.register_forward_hook(partial(_register_dropout, profiler=self, cfg=cfg))
             elif cfg.count_embedding and isinstance(module, nn.Embedding):
                 hook = module.register_forward_hook(partial(_register_embedding, profiler=self, cfg=cfg))
-            elif cfg.count_activations and any(isinstance(module, t) for t in _ACT_COEFF.keys()):
+            elif cfg.count_activations and isinstance(module, _ACT_CLASSES):
                 hook = module.register_forward_hook(partial(_register_activation, profiler=self, cfg=cfg))
             elif isinstance(module, nn.MultiheadAttention):
                 hook = module.register_forward_hook(partial(_register_mha, profiler=self, cfg=cfg))
@@ -2279,10 +2276,8 @@ class _FlopProfiler:
 
                 # Union-ish total:
                 base = float(max(self.torch_total, self.nvtx_total))
-                te_extra = float(sum(v for k, v in self.manual_breakdown.items() if str(k).startswith("TE.") or str(k) == "TE"))
-                manual_non_te = max(0.0, float(self.manual_total) - te_extra)
-                best_non_te = float(max(base, manual_non_te))
-                self.total = (best_non_te + te_extra) if (best_non_te > 0.0 or te_extra > 0.0) else 0.0
+                manual_total = float(self.manual_total)
+                self.total = float(max(base, manual_total, 0.0))
 
                 profiler.deactivate()
                 return False
