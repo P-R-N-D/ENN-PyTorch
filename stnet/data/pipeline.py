@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import contextlib
@@ -924,12 +925,15 @@ def collate(
             row_ids = None
             try:
                 rids = [elem.get("row_ids") for elem in batch]
-                if all(r is not None for r in rids):
-                    parts = []
-                    for r in rids:
-                        rt = r if isinstance(r, torch.Tensor) else torch.as_tensor(r)
-                        parts.append(rt.reshape(-1))
-                    row_ids = torch.cat(parts, dim=0)
+                if rids and all(r is not None for r in rids):
+                    if all(isinstance(r, torch.Tensor) for r in rids):
+                        parts = [r.reshape(-1) for r in rids]
+                    else:
+                        parts = [
+                            (r if isinstance(r, torch.Tensor) else torch.as_tensor(r)).reshape(-1)
+                            for r in rids
+                        ]
+                    row_ids = torch.cat(parts, dim=0) if parts else None
             except Exception:
                 row_ids = None
 
@@ -1058,30 +1062,35 @@ def fetch(
     _device_obj = device_obj
     _auto_bs_candidates: list[int] = []
 
-    def _stream_batch(_ds: Sampler) -> Tuple[int, float]:
+    def _stream_batch(_ds: Sampler, *, pf: int) -> Tuple[int, float]:
         try:
             return _batch_interval(
                 _ds,
                 _device_obj,
-                prefetch_factor=pf_depth,
+                prefetch_factor=int(pf),
                 num_workers=io_workers,
                 prebatch=prebatch,
                 worker_policy=_wp,
             )
         except Exception:
-            return (int(batch_size) if batch_size is not None else 0, 0.0)
+            return (0, 0.0)
 
-    def _rescale_batch(_datasets: Mapping[str, Sampler], _bs: int) -> int:
+    def _auto_batch_size(
+        _datasets: Mapping[str, Sampler], *, pf: int, fallback: int
+    ) -> int:
         _auto_bs_candidates.clear()
         for _ds in _datasets.values():
-            B_i, _ = _stream_batch(_ds)
+            B_i, _ = _stream_batch(_ds, pf=pf)
             if B_i > 0:
                 _auto_bs_candidates.append(int(B_i))
         if not _auto_bs_candidates:
-            return int(_bs)
-        cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-        cand_max = max(_auto_bs_candidates)
+            return max(1, int(fallback))
+        cand_mean = int(sum(_auto_bs_candidates) // max(1, len(_auto_bs_candidates)))
+        cand_max = int(max(_auto_bs_candidates))
         return int(max(1, min(cand_max, cand_mean)))
+
+    def _rescale_batch(_datasets: Mapping[str, Sampler], _bs: int, *, pf: int) -> int:
+        return _auto_batch_size(_datasets, pf=pf, fallback=int(_bs))
 
     def _cap_pf_depth(_datasets: Mapping[str, Sampler], _pf: int, _bs: int) -> int:
         """Cap prefetch depth based on host/device memory and inflight policy."""
@@ -1144,406 +1153,138 @@ def fetch(
 
     def _make_iterate(_datasets: Mapping[str, Sampler]) -> Callable[[Any], Any]:
         def iterate(sample: Any) -> Any:
-            def _one(smpl: Any) -> Any:
-                if (
-                    isinstance(smpl, (list, tuple))
-                    and len(smpl) == 2
-                    and isinstance(smpl[0], str)
-                ):
-                    k, rng = smpl
-                    s, e = int(rng[0]), int(rng[1])
-                    ds = _datasets.get(k)
-                    if ds is None:
-                        raise KeyError(f"Unknown dataset key: {k}")
-                    batch = ds.get(s, e)
-                    return map_fn(batch)
-                return map_fn(smpl)
-
-            if isinstance(sample, list):
-                return [_one(smpl) for smpl in sample]
-            return _one(sample)
+            if isinstance(sample, tuple) and len(sample) == 2:
+                k, span = sample
+                ds = _datasets.get(str(k))
+                if ds is None:
+                    return None
+                s, e = int(span[0]), int(span[1])
+                return ds.get(s, e)
+            return sample
 
         return iterate
 
-    # ---- Training
-    train_length: Optional[int] = None
-    datasets_train: Dict[str, Sampler] = {}
+    def _normalize_sources(_sources: Any) -> Dict[str, Source]:
+        if isinstance(_sources, Mapping) and (not _is_source_spec(_sources)):
+            return {str(k): v for k, v in _sources.items()}
+        if isinstance(_sources, (list, tuple)):
+            return {str(i): v for i, v in enumerate(_sources)}
+        return {"0": _sources}
 
-    if isinstance(sources, Mapping) and not _is_source_spec(sources):
-        for key, spec in sources.items():
-            ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
+    def _build_datasets(
+        _specs: Mapping[str, Source], *, split: str, collect_epochables: bool
+    ) -> Dict[str, Sampler]:
+        out: Dict[str, Sampler] = {}
+        for k, spec in _specs.items():
+            ds = dataset(spec, split=split, val_frac=val_frac, sampler_scale=scale_ctl)
             allocated.add(ds)
-            train_epochables.append(ds)
-            datasets_train[str(key)] = ds
+            out[str(k)] = ds
+            if collect_epochables:
+                train_epochables.append(ds)
+        return out
 
-        if batch_size is None or int(batch_size) <= 0:
-            for _ds in datasets_train.values():
-                B_i, _ = _stream_batch(_ds)
-                if B_i > 0:
-                    _auto_bs_candidates.append(int(B_i))
-            if _auto_bs_candidates:
-                cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-                cand_max = max(_auto_bs_candidates)
-                batch_size = max(1, min(cand_max, cand_mean))
-            else:
-                batch_size = 1
-
-        pf_depth = _cap_pf_depth(datasets_train, pf_depth_fixed, int(batch_size))
-        pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
-        if pf_depth != pf_depth_fixed:
-            batch_size = _rescale_batch(datasets_train, int(batch_size))
-
-        sampler_nodes: Dict[str, BaseNode] = {}
+    def _build_sampler_nodes(
+        _datasets: Mapping[str, Sampler], *, bs: int, shuffle: bool
+    ) -> Tuple[Dict[str, BaseNode], Dict[str, int]]:
+        nodes: Dict[str, BaseNode] = {}
         lengths: Dict[str, int] = {}
-        for key, ds in datasets_train.items():
-            sn = ds.compose(
-                batch_size=int(batch_size),
-                shuffle=bool(train_shuffle),
-                seed=int(seed),
-                key=str(key),
-            )
+        for k, ds in _datasets.items():
+            sn = ds.compose(batch_size=int(bs), shuffle=bool(shuffle), seed=seed, key=str(k))
             if len(ds) > 0:
-                sampler_nodes[str(key)] = sn
-                lengths[str(key)] = len(ds)
+                nodes[str(k)] = sn
+                lengths[str(k)] = int(len(ds))
+        return nodes, lengths
 
-        if isinstance(train_weights, Mapping):
-            train_weights = {k: v for k, v in dict(train_weights).items() if k in sampler_nodes}
+    specs = _normalize_sources(sources)
 
-        if not sampler_nodes:
-            raise RuntimeError("No non-empty training sources provided")
+    # ------------------- Train split -------------------
+    datasets_train = _build_datasets(specs, split="train", collect_epochables=True)
+    if batch_size is None or batch_size <= 0:
+        batch_size = int(_auto_batch_size(datasets_train, pf=int(pf_depth_fixed), fallback=1))
 
-        iterate_train = _make_iterate(datasets_train)
-        _, mapped, _ = compose(
-            sampler_nodes,
-            device=device_obj,
-            map_fn=iterate_train,
-            prefetch_factor=int(pf_depth),
-            non_blocking_copy=bool(non_blocking_copy),
-            io_workers=io_workers,
-            prebatch=prebatch,
-            weights=train_weights,
-            seed=int(seed),
-            epochables=train_epochables,
-        )
-        train_length = sum(lengths.values()) if lengths else None
+    pf_depth = int(_cap_pf_depth(datasets_train, int(pf_depth_fixed), int(batch_size)))
+    pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
+    if pf_depth != int(pf_depth_fixed):
+        batch_size = int(_rescale_batch(datasets_train, int(batch_size), pf=int(pf_depth)))
 
-    elif isinstance(sources, (list, tuple)):
-        for i, spec in enumerate(sources):
-            key = str(i)
-            ds = dataset(spec, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
-            allocated.add(ds)
-            train_epochables.append(ds)
-            datasets_train[key] = ds
+    sampler_nodes, lengths = _build_sampler_nodes(
+        datasets_train, bs=int(batch_size), shuffle=bool(train_shuffle)
+    )
+    if isinstance(train_weights, Mapping):
+        train_weights = {
+            str(k): float(v) for k, v in dict(train_weights).items() if str(k) in sampler_nodes
+        }
+    if not sampler_nodes:
+        raise RuntimeError("No non-empty training sources provided.")
 
-        if batch_size is None or int(batch_size) <= 0:
-            for _ds in datasets_train.values():
-                B_i, _ = _stream_batch(_ds)
-                if B_i > 0:
-                    _auto_bs_candidates.append(int(B_i))
-            if _auto_bs_candidates:
-                cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-                cand_max = max(_auto_bs_candidates)
-                batch_size = max(1, min(cand_max, cand_mean))
-            else:
-                batch_size = 1
-
-        pf_depth = _cap_pf_depth(datasets_train, pf_depth_fixed, int(batch_size))
-        pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
-        if pf_depth != pf_depth_fixed:
-            batch_size = _rescale_batch(datasets_train, int(batch_size))
-
-        sampler_list: list[BaseNode] = []
-        lengths: list[int] = []
-        for key, ds in datasets_train.items():
-            sn = ds.compose(
-                batch_size=int(batch_size),
-                shuffle=bool(train_shuffle),
-                seed=int(seed),
-                key=str(key),
-            )
-            if len(ds) > 0:
-                sampler_list.append(sn)
-                lengths.append(len(ds))
-
-        if not sampler_list:
-            raise RuntimeError("No non-empty training sources provided")
-
-        iterate_train = _make_iterate(datasets_train)
-        _, mapped, _ = compose(
-            sampler_list,
-            device=device_obj,
-            map_fn=iterate_train,
-            prefetch_factor=int(pf_depth),
-            non_blocking_copy=bool(non_blocking_copy),
-            io_workers=io_workers,
-            prebatch=prebatch,
-            weights=train_weights,
-            seed=int(seed),
-            epochables=train_epochables,
-        )
-        train_length = sum(lengths) if lengths else None
-
-    else:
-        ds = dataset(sources, split="train", val_frac=float(val_frac), sampler_scale=scale_ctl)
-        allocated.add(ds)
-        train_epochables.append(ds)
-        datasets_train = {"0": ds}
-
-        if batch_size is None or int(batch_size) <= 0:
-            B_i, _ = _stream_batch(ds)
-            batch_size = max(1, int(B_i) if B_i > 0 else 1)
-
-        pf_depth = _cap_pf_depth(datasets_train, pf_depth_fixed, int(batch_size))
-        pf_depth = int(max(1, min(int(pf_depth), int(pf_depth_fixed))))
-        if pf_depth != pf_depth_fixed:
-            batch_size = _rescale_batch(datasets_train, int(batch_size))
-
-        sampler_node = ds.compose(
-            batch_size=int(batch_size),
-            shuffle=bool(train_shuffle),
-            seed=int(seed),
-            key="0",
-        )
-
-        iterate_train = _make_iterate(datasets_train)
-        _, mapped, _ = compose(
-            sampler_node,
-            device=device_obj,
-            map_fn=iterate_train,
-            prefetch_factor=int(pf_depth),
-            non_blocking_copy=bool(non_blocking_copy),
-            io_workers=io_workers,
-            prebatch=prebatch,
-            weights=train_weights,
-            seed=int(seed),
-        )
-        train_length = len(ds)
-
+    train_length: Optional[int] = int(sum(lengths.values())) if lengths else None
+    iterate_train = _make_iterate(datasets_train)
+    _, mapped_train, _ = compose(
+        sampler_nodes,
+        device=device_obj,
+        map_fn=iterate_train,
+        prefetch_factor=int(pf_depth),
+        non_blocking_copy=non_blocking_copy,
+        io_workers=io_workers,
+        prebatch=prebatch,
+        weights=train_weights,
+        seed=seed,
+        epochables=train_epochables,
+    )
     train_loader = Loader.compose(
-        mapped,
+        mapped_train,
         device=device_obj,
         prefetch_factor=int(pf_depth),
         non_blocking=bool(non_blocking_copy),
         length=train_length,
     )
 
-    # ---- Validation (mirrors training with shuffle=False)
+    # ------------------- Val split -------------------
     val_loader = None
-    if float(val_frac) > 0.0:
-        datasets_val: Dict[str, Sampler] = {}
-        batch_size_val: Optional[int] = None
-        pf_depth_val = int(pf_depth_fixed)
+    if val_frac and val_frac > 0:
+        datasets_val = _build_datasets(specs, split="val", collect_epochables=False)
 
-        def _stream_batch_val(_ds: Sampler) -> Tuple[int, float]:
-            try:
-                return _batch_interval(
-                    _ds,
-                    _device_obj,
-                    prefetch_factor=pf_depth_val,
-                    num_workers=io_workers,
-                    prebatch=prebatch,
-                    worker_policy=_wp,
-                )
-            except Exception:
-                return (int(batch_size_val) if batch_size_val is not None else 0, 0.0)
+        batch_size_val = batch_size
+        if batch_size_val is None or batch_size_val <= 0:
+            batch_size_val = int(_auto_batch_size(datasets_val, pf=int(pf_depth_fixed), fallback=1))
 
-        def _rescale_batch_val(_datasets: Mapping[str, Sampler], _bs: int) -> int:
-            _auto_bs_candidates.clear()
-            for _ds in _datasets.values():
-                B_i, _ = _stream_batch_val(_ds)
-                if B_i > 0:
-                    _auto_bs_candidates.append(int(B_i))
-            if not _auto_bs_candidates:
-                return int(_bs)
-            cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-            cand_max = max(_auto_bs_candidates)
-            return int(max(1, min(cand_max, cand_mean)))
-
-        def _make_iterate_val(_datasets: Mapping[str, Sampler]) -> Callable[[Any], Any]:
-            def iterate(sample: Any) -> Any:
-                def _one(smpl: Any) -> Any:
-                    if (
-                        isinstance(smpl, (list, tuple))
-                        and len(smpl) == 2
-                        and isinstance(smpl[0], str)
-                    ):
-                        k, rng = smpl
-                        s, e = int(rng[0]), int(rng[1])
-                        ds_ = _datasets.get(k)
-                        if ds_ is None:
-                            raise KeyError(f"Unknown dataset key: {k}")
-                        batch = ds_.get(s, e)
-                        return map_fn(batch)
-                    return map_fn(smpl)
-
-                if isinstance(sample, list):
-                    return [_one(smpl) for smpl in sample]
-                return _one(sample)
-
-            return iterate
-
-        if isinstance(sources, Mapping) and not _is_source_spec(sources):
-            for key, spec in sources.items():
-                ds = dataset(spec, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
-                allocated.add(ds)
-                datasets_val[str(key)] = ds
-
-            if batch_size_val is None or int(batch_size_val) <= 0:
-                _auto_bs_candidates.clear()
-                for _ds in datasets_val.values():
-                    B_i, _ = _stream_batch_val(_ds)
-                    if B_i > 0:
-                        _auto_bs_candidates.append(int(B_i))
-                if _auto_bs_candidates:
-                    cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-                    cand_max = max(_auto_bs_candidates)
-                    batch_size_val = max(1, min(cand_max, cand_mean))
-                else:
-                    batch_size_val = 1
-
-            pf_depth_val = _cap_pf_depth(datasets_val, pf_depth_fixed, int(batch_size_val))
-            pf_depth_val = int(max(1, min(int(pf_depth_val), int(pf_depth_fixed))))
-            if pf_depth_val != pf_depth_fixed:
-                batch_size_val = _rescale_batch_val(datasets_val, int(batch_size_val))
-
-            sampler_nodes: Dict[str, BaseNode] = {}
-            lengths: Dict[str, int] = {}
-            for key, ds in datasets_val.items():
-                sn = ds.compose(
-                    batch_size=int(batch_size_val),
-                    shuffle=False,
-                    seed=int(seed),
-                    key=str(key),
-                )
-                if len(ds) > 0:
-                    sampler_nodes[str(key)] = sn
-                    lengths[str(key)] = len(ds)
-
-            if isinstance(val_weights, Mapping):
-                val_weights = {k: v for k, v in dict(val_weights).items() if k in sampler_nodes}
-            if not sampler_nodes:
-                raise RuntimeError("No non-empty validation sources provided")
-
-            iterate_val = _make_iterate_val(datasets_val)
-            _, mapped_val, _ = compose(
-                sampler_nodes,
-                device=device_obj,
-                map_fn=iterate_val,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking_copy=bool(non_blocking_copy),
-                io_workers=io_workers,
-                prebatch=prebatch,
-                weights=val_weights,
-                seed=int(seed),
-            )
-            val_loader = Loader.compose(
-                mapped_val,
-                device=device_obj,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking=bool(non_blocking_copy),
-                length=sum(lengths.values()) if lengths else None,
+        pf_depth_val = int(_cap_pf_depth(datasets_val, int(pf_depth_fixed), int(batch_size_val)))
+        pf_depth_val = int(max(1, min(int(pf_depth_val), int(pf_depth_fixed))))
+        if pf_depth_val != int(pf_depth_fixed):
+            batch_size_val = int(
+                _rescale_batch(datasets_val, int(batch_size_val), pf=int(pf_depth_val))
             )
 
-        elif isinstance(sources, (list, tuple)):
-            for i, spec in enumerate(sources):
-                k = str(i)
-                ds = dataset(spec, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
-                allocated.add(ds)
-                datasets_val[k] = ds
+        sampler_nodes_val, lengths_val = _build_sampler_nodes(
+            datasets_val, bs=int(batch_size_val), shuffle=False
+        )
+        if isinstance(val_weights, Mapping):
+            val_weights = {
+                str(k): float(v) for k, v in dict(val_weights).items() if str(k) in sampler_nodes_val
+            }
+        if not sampler_nodes_val:
+            raise RuntimeError("No non-empty validation sources provided.")
 
-            if batch_size_val is None or int(batch_size_val) <= 0:
-                _auto_bs_candidates.clear()
-                for _ds in datasets_val.values():
-                    B_i, _ = _stream_batch_val(_ds)
-                    if B_i > 0:
-                        _auto_bs_candidates.append(int(B_i))
-                if _auto_bs_candidates:
-                    cand_mean = int(sum(_auto_bs_candidates) // len(_auto_bs_candidates))
-                    cand_max = max(_auto_bs_candidates)
-                    batch_size_val = max(1, min(cand_max, cand_mean))
-                else:
-                    batch_size_val = 1
-
-            pf_depth_val = _cap_pf_depth(datasets_val, pf_depth_fixed, int(batch_size_val))
-            pf_depth_val = int(max(1, min(int(pf_depth_val), int(pf_depth_fixed))))
-            if pf_depth_val != pf_depth_fixed:
-                batch_size_val = _rescale_batch_val(datasets_val, int(batch_size_val))
-
-            sampler_list: list[BaseNode] = []
-            lengths: list[int] = []
-            for k, ds in datasets_val.items():
-                sn = ds.compose(
-                    batch_size=int(batch_size_val),
-                    shuffle=False,
-                    seed=int(seed),
-                    key=str(k),
-                )
-                if len(ds) > 0:
-                    sampler_list.append(sn)
-                    lengths.append(len(ds))
-            if not sampler_list:
-                raise RuntimeError("No non-empty validation sources provided")
-
-            iterate_val = _make_iterate_val(datasets_val)
-            _, mapped_val, _ = compose(
-                sampler_list,
-                device=device_obj,
-                map_fn=iterate_val,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking_copy=bool(non_blocking_copy),
-                io_workers=io_workers,
-                prebatch=prebatch,
-                weights=val_weights,
-                seed=int(seed),
-            )
-            val_loader = Loader.compose(
-                mapped_val,
-                device=device_obj,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking=bool(non_blocking_copy),
-                length=sum(lengths) if lengths else None,
-            )
-
-        else:
-            ds = dataset(sources, split="val", val_frac=float(val_frac), sampler_scale=scale_ctl)
-            allocated.add(ds)
-            datasets_val = {"0": ds}
-
-            if batch_size_val is None or int(batch_size_val) <= 0:
-                B_i, _ = _stream_batch_val(ds)
-                batch_size_val = max(1, int(B_i) if B_i > 0 else 1)
-
-            pf_depth_val = _cap_pf_depth(datasets_val, pf_depth_fixed, int(batch_size_val))
-            pf_depth_val = int(max(1, min(int(pf_depth_val), int(pf_depth_fixed))))
-            if pf_depth_val != pf_depth_fixed:
-                batch_size_val = _rescale_batch_val(datasets_val, int(batch_size_val))
-
-            sampler_node = ds.compose(
-                batch_size=int(batch_size_val),
-                shuffle=False,
-                seed=int(seed),
-                key="0",
-            )
-
-            iterate_val = _make_iterate_val(datasets_val)
-            _, mapped_val, _ = compose(
-                sampler_node,
-                device=device_obj,
-                map_fn=iterate_val,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking_copy=bool(non_blocking_copy),
-                io_workers=io_workers,
-                prebatch=prebatch,
-                weights=val_weights,
-                seed=int(seed),
-            )
-            val_loader = Loader.compose(
-                mapped_val,
-                device=device_obj,
-                prefetch_factor=int(pf_depth_val),
-                non_blocking=bool(non_blocking_copy),
-                length=len(ds),
-            )
+        val_length: Optional[int] = int(sum(lengths_val.values())) if lengths_val else None
+        iterate_val = _make_iterate(datasets_val)
+        _, mapped_val, _ = compose(
+            sampler_nodes_val,
+            device=device_obj,
+            map_fn=iterate_val,
+            prefetch_factor=int(pf_depth_val),
+            non_blocking_copy=non_blocking_copy,
+            io_workers=io_workers,
+            prebatch=prebatch,
+            weights=val_weights,
+            seed=seed,
+        )
+        val_loader = Loader.compose(
+            mapped_val,
+            device=device_obj,
+            prefetch_factor=int(pf_depth_val),
+            non_blocking=bool(non_blocking_copy),
+            length=val_length,
+        )
 
     with contextlib.suppress(Exception):
         if train_loader is not None:

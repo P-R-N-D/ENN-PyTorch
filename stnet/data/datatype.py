@@ -54,8 +54,14 @@ def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
         return default
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    v = parse_bool(os.environ.get(name))
+def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
+    raw: object | None
+    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
+        raw = env_first(list(name), default=None)
+    else:
+        raw = os.environ.get(str(name))
+
+    v = parse_bool(raw)
     if v is None:
         return bool(default)
     return bool(v)
@@ -85,6 +91,27 @@ def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
         if s is not None:
             return s
     return default
+
+
+def env_flag(*keys: str, default: bool = False) -> bool:
+    """Parse a boolean-ish environment flag across multiple keys.
+
+    - Recognized boolean tokens follow `parse_bool()`
+    - Any other non-empty value is treated as True (legacy-compatible behavior)
+    """
+    if not keys:
+        return bool(default)
+
+    raw = env_first(keys)
+    v = parse_bool(raw)
+    if v is not None:
+        return bool(v)
+
+    if raw is None:
+        return bool(default)
+
+    # Legacy behavior: any non-empty string => True
+    return bool(str(raw).strip())
 
 
 def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
