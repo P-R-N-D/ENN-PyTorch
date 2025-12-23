@@ -2250,9 +2250,9 @@ def epochs(
                         torch.sum(xf, dim=0, out=sx_tmp)
                         x_sum.add_(sx_tmp)
 
-                        # In-place square to avoid allocating (xf * xf).
-                        xf.mul_(xf)
-                        torch.sum(xf, dim=0, out=sx2_tmp)
+                        # Avoid mutating the original batch (feats may share storage).
+                        xf_sq = xf * xf
+                        torch.sum(xf_sq, dim=0, out=sx2_tmp)
                         x_sum_sq.add_(sx2_tmp)
 
                     yf = labs.to(device=scaler_y_device, dtype=torch.float64)
@@ -2274,8 +2274,8 @@ def epochs(
                         torch.sum(yf, dim=0, out=sy_tmp)
                         y_sum.add_(sy_tmp)
 
-                        yf.mul_(yf)
-                        torch.sum(yf, dim=0, out=sy2_tmp)
+                        yf_sq = yf * yf
+                        torch.sum(yf_sq, dim=0, out=sy2_tmp)
                         y_sum_sq.add_(sy2_tmp)
 
             # Only reduce across ranks when stats were computed locally.
