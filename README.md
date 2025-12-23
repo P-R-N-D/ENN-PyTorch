@@ -136,17 +136,26 @@ model3 = load_model("ckpt_dir", map_location="cpu")
 
 Prediction outputs:
 ```python
-from stnet.api.run import predict, get_prediction
+from stnet.api.run import predict
 
-# Write streaming prediction chunks to disk without holding tensors in memory
-file_info = predict(model, data=my_data, output="file")
+# Eager: returns an in-memory TensorDict with keys {"X", "Y"}
+td = predict(model, data=my_data, lazy=False)
+print(td[0]["X"], td[0]["Y"])
 
-# Later (or on another machine), reopen chunks as a mapping
-lazy_preds = get_prediction(file_info, output="tensor", lazy=True)
-for key, tensor in lazy_preds.items():
-    ...
+# Lazy (default): returns a memmap-backed TensorDict (MemoryMappedTensor leaves)
+td_lazy = predict(model, data=my_data)  # same as lazy=True, path=None
+print(td_lazy[0]["X"], td_lazy[0]["Y"])
+
+# Persistent: writes an HDF5 PersistentTensorDict to `path` and returns it
+td_persistent = predict(model, data=my_data, path="predictions.h5")  # lazy defaults to True
+print(td_persistent[0]["X"], td_persistent[0]["Y"])
+
+# IMPORTANT: PersistentTensorDict does not auto-close. Close it when you're done.
+td_persistent.close()
 ```
-`output="file"` streams per-rank parts to `chunks_dir` with stable key metadata; use `get_prediction` to reload eagerly or lazily without rematerializing keys.
+
+When `lazy=True` and `path` is provided, results are streamed to disk and returned as a `PersistentTensorDict`.
+When `lazy=True` and `path` is `None`/invalid, results are returned as a `memmap-backed TensorDict` with underlying `MemoryMappedTensor` files stored in an auto-created run directory.
 
 Notebook demo:
 - Open `notebook.ipynb` for an end-to-end workflow using `raw_data.xlsx`.

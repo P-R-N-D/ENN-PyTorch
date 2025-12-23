@@ -45,81 +45,6 @@ class _WaitEvent(Protocol):
     def wait(self, timeout: float | None = None) -> Any: ...
 
 
-# -----------------------------------------------------------------------------
-# LazyDict
-# -----------------------------------------------------------------------------
-
-class LazyDict(_abc.Mapping):
-    """Mapping wrapper that lazily computes values via `getter(key)`.
-
-    Optionally caches computed values.
-    """
-
-    __slots__ = ("_keys", "_getter", "_name", "_cache_enabled", "_cache")
-
-    def __init__(
-        self,
-        keys: Any,
-        getter: Any,
-        *,
-        name: str = "LazyDict",
-        cache: bool = False,
-    ) -> None:
-        self._keys = keys
-        self._getter = getter
-        self._name = str(name or "LazyDict")
-        self._cache_enabled = bool(cache)
-        self._cache: Optional[dict[Any, Any]] = {} if self._cache_enabled else None
-
-    def __repr__(self) -> str:  # pragma: no cover
-        cache = "on" if self._cache is not None else "off"
-        return f"{self._name}(len={len(self)}, cache={cache})"
-
-    def __len__(self) -> int:
-        return int(len(self._keys))
-
-    def __iter__(self):
-        return iter(self._keys)
-
-    def __getitem__(self, key: Any) -> Any:
-        cache = self._cache
-        if cache is not None:
-            try:
-                return cache[key]
-            except KeyError:
-                pass
-        v = self._getter(key)
-        if cache is not None:
-            cache[key] = v
-        return v
-
-    def __contains__(self, key: object) -> bool:
-        try:
-            return key in self._keys
-        except Exception:
-            return False
-
-    def keys(self):
-        return self._keys
-
-    def values(self):
-        return (self[k] for k in self._keys)
-
-    def items(self):
-        return ((k, self[k]) for k in self._keys)
-
-    def get(self, key: Any, default: Any = None) -> Any:
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def collect(self) -> dict[Any, Any]:
-        return {k: self[k] for k in self._keys}
-
-    def materialize(self) -> dict[Any, Any]:
-        return self.collect()
-
 
 # -----------------------------------------------------------------------------
 # Pinned CPU page + pool
@@ -770,9 +695,44 @@ class LazyTensor:
 
     @staticmethod
     def is_feature_label_batch_mapping(obj: Any) -> bool:
+        """True if the object looks like a {features, labels} style batch mapping.
+
+        The project historically accepted a mix of key names (e.g. X/Y, features/labels).
+        We now treat feature/label column names case-insensitively and recognize:
+
+        - features: x, feature, features, input, inputs, in
+        - labels:   y, label, labels, output, outputs, out
+
+        If the mapping uses non-string keys (e.g. {tuple_feature: label}), this returns False
+        so it can fall back to the compact-dataset heuristic.
+        """
         if not isinstance(obj, Mapping) or not obj:
             return False
-        return any(k in obj for k in ("features", "X", "labels", "Y", "targets", "target"))
+        
+        feature_aliases = {
+            "x",
+            "feature",
+            "features",
+            "input",
+            "inputs",
+            "in",
+        }
+        label_aliases = {
+            "y",
+            "label",
+            "labels",
+            "output",
+            "outputs",
+            "out",
+        }
+
+        for k in obj.keys():
+            if not isinstance(k, str):
+                continue
+            ck = k.casefold()
+            if ck in feature_aliases or ck in label_aliases:
+                return True
+        return False
 
     @staticmethod
     def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:

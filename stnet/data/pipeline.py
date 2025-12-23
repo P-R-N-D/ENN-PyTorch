@@ -29,14 +29,149 @@ TensorLike = Any
 TExtra = TypeVar("TExtra")
 
 try:
-    from tensordict import TensorDict, TensorDictBase, stack
+    from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase
 except Exception:
     TensorDict = None  # type: ignore[assignment]
     stack = None  # type: ignore[assignment]
+    MemoryMappedTensor = None  # type: ignore[assignment]
 
     class TensorDictBase:  # type: ignore[no-redef]
         pass
 
+
+# -----------------------------------------------------------------------------
+# Feature/label key resolution (TensorDict-first contract)
+# -----------------------------------------------------------------------------
+
+# Keys are matched case-insensitively (via casefold).
+_FEATURE_KEY_ALIASES = frozenset({"x", "feature", "features", "input", "inputs", "in"})
+_LABEL_KEY_ALIASES = frozenset({"y", "label", "labels", "output", "outputs", "out"})
+
+
+def _casefold_str(x: Any) -> Optional[str]:
+    if isinstance(x, str):
+        return x.casefold()
+    return None
+
+
+def _is_lazy_tensor(x: Any) -> bool:
+    """Return True if x is a lazy/streaming tensor (e.g., MemoryMappedTensor)."""
+    if MemoryMappedTensor is None:
+        return False
+    try:
+        return isinstance(x, MemoryMappedTensor)
+    except Exception:
+        return False
+
+
+def resolve_feature_key(data: Any) -> str:
+    """Resolve the (unique) feature key in a mapping/TensorDict.
+
+    Accepted aliases (case-insensitive):
+      x, feature, features, input, inputs, in
+    """
+    if not isinstance(data, (Mapping, TensorDictBase)):
+        raise TypeError("resolve_feature_key expects a Mapping or TensorDict")
+
+    matches: list[str] = []
+    for k in data.keys():
+        ck = _casefold_str(k)
+        if ck is not None and ck in _FEATURE_KEY_ALIASES:
+            matches.append(str(k))
+
+    if len(matches) != 1:
+        raise KeyError(
+            f"Expected exactly one feature key among {sorted(_FEATURE_KEY_ALIASES)}; "
+            f"found {len(matches)}: {matches}."
+        )
+    return matches[0]
+
+
+def resolve_label_key(data: Any, *, required: bool = False) -> Optional[str]:
+    """Resolve the (unique) label key in a mapping/TensorDict.
+
+    Accepted aliases (case-insensitive):
+      y, label, labels, output, outputs, out
+
+    If required=False, returns None when no label key is present.
+    """
+    if not isinstance(data, (Mapping, TensorDictBase)):
+        raise TypeError("resolve_label_key expects a Mapping or TensorDict")
+
+    matches: list[str] = []
+    for k in data.keys():
+        ck = _casefold_str(k)
+        if ck is not None and ck in _LABEL_KEY_ALIASES:
+            matches.append(str(k))
+
+    if not matches:
+        if required:
+            raise KeyError(
+                f"Missing label key. Expected one of: {sorted(_LABEL_KEY_ALIASES)}."
+            )
+        return None
+    if len(matches) != 1:
+        raise KeyError(
+            f"Expected exactly one label key among {sorted(_LABEL_KEY_ALIASES)}; "
+            f"found {len(matches)}: {matches}."
+        )
+    return matches[0]
+
+
+def extract_xy(
+    data: Any,
+    *,
+    labels_required: bool = False,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Extract (X, Y) tensors from a mapping/TensorDict using alias resolution."""
+    fkey = resolve_feature_key(data)
+    lkey = resolve_label_key(data, required=labels_required)
+    x = data[fkey]
+    y = data[lkey] if (lkey is not None) else None
+    return x, y
+
+
+def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
+    try:
+        td.set(key, value)
+    except Exception:
+        td[key] = value
+
+
+def _td_del(td: TensorDictBase, key: str) -> None:
+    try:
+        td.del_(key)
+    except Exception:
+        with contextlib.suppress(Exception):
+            del td[key]
+
+
+def canonicalize_xy_keys_(
+    td: TensorDictBase,
+    *,
+    x_key: str = "X",
+    y_key: str = "Y",
+    allow_missing_labels: bool = True,
+) -> TensorDictBase:
+    """Rename feature/label keys in-place to a canonical (X, Y) pair.
+
+    This enforces the "exactly one" rule for feature/label keys and prevents
+    duplicate alias keys from existing simultaneously.
+    """
+    if not isinstance(td, TensorDictBase):
+        raise TypeError("canonicalize_xy_keys_ expects a TensorDict")
+
+    fkey = resolve_feature_key(td)
+    if fkey != x_key:
+        _td_set(td, x_key, td[fkey])
+        _td_del(td, fkey)
+
+    lkey = resolve_label_key(td, required=not bool(allow_missing_labels))
+    if lkey is not None and lkey != y_key:
+        _td_set(td, y_key, td[lkey])
+        _td_del(td, lkey)
+
+    return td
 
 from ..backend.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
 from ..backend.system import Memory, WorkerPolicy, get_tlb
@@ -474,8 +609,8 @@ def _batch_interval(
     sbytes_cached = int(getattr(_ds, "_S_sample_bytes", 0) or 0)
 
     probe = _ds.get(0, min(8, len(_ds)))
-    x_cpu = probe["X"]
-    y_cpu = probe.get("Y", None)
+    # Support both dict and TensorDict batches with case-insensitive aliases.
+    x_cpu, y_cpu = extract_xy(probe, labels_required=False)
 
     if not isinstance(x_cpu, torch.Tensor):
         x_cpu = torch.as_tensor(x_cpu)
@@ -832,15 +967,25 @@ def dataset(
 
 
 def _process(
-    batch: Mapping[str, Any],
+    batch: Any,
     *args: Any,
     flatten_features: bool,
     labels_dtype: Optional[torch.dtype],
     sanitize: bool,
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    features = batch.get("X")
-    labels = batch.get("Y", None)
+    features: Any = None
+    labels: Any = None
+
+    # Prefer the TensorDict contract: locate the unique feature/label keys
+    # case-insensitively. Fall back to legacy {"X","Y"} if needed.
+    if isinstance(batch, (Mapping, TensorDictBase)):
+        with contextlib.suppress(Exception):
+            features, labels = extract_xy(batch, labels_required=False)
+
+    if features is None and isinstance(batch, Mapping):
+        features = batch.get("X")
+        labels = batch.get("Y", None)
 
     if (
         flatten_features
@@ -855,9 +1000,13 @@ def _process(
     if sanitize and isinstance(labels, torch.Tensor) and labels.is_floating_point():
         torch.nan_to_num(labels, nan=0.0, posinf=0.0, neginf=0.0, out=labels)
 
-    out: Dict[str, Any] = {"X": features, "Y": labels}
-    if isinstance(batch, Mapping) and "row_ids" in batch:
-        out["row_ids"] = batch.get("row_ids")
+    out: Dict[str, Any] = {"X": features}
+    if labels is not None:
+        out["Y"] = labels
+    if isinstance(batch, (Mapping, TensorDictBase)):
+        with contextlib.suppress(Exception):
+            if "row_ids" in batch:
+                out["row_ids"] = batch.get("row_ids")
     return out
 
 
@@ -886,65 +1035,111 @@ def collate(
             return batch
 
         if all(isinstance(elem, TensorDictBase) for elem in batch):
-            stacked = stack(list(batch), dim=0)
+            stacked = torch.stack(list(batch), dim=0)
+            with contextlib.suppress(Exception):
+                canonicalize_xy_keys_(stacked, allow_missing_labels=True)
             try:
                 conv = converter(stacked)
             except Exception:
                 return stacked
             stacked["X"] = conv["X"]
             stacked["Y"] = conv["Y"]
-            stacked["features"] = conv["X"]
-            stacked["labels"] = conv["Y"]
             if "row_ids" in conv:
                 stacked["row_ids"] = conv["row_ids"]
             return stacked
 
         if all(isinstance(elem, Mapping) for elem in batch):
-            Xs = [elem.get("X") for elem in batch]
-            Ys = [elem.get("Y") for elem in batch]
+            if TensorDict is not None:
+                samples = []
+                for elem in batch:
+                    try:
+                        x_i, y_i = extract_xy(elem, labels_required=False)
+                    except Exception:
+                        x_i = elem.get("X")
+                        if x_i is None:
+                            x_i = elem.get("x")
+                        y_i = elem.get("Y", None)
+                        if y_i is None and "y" in elem:
+                            y_i = elem.get("y")
 
-            try:
-                if all(isinstance(x, torch.Tensor) for x in Xs):
-                    Xs = torch.stack(Xs, dim=0)
-            except Exception:
-                pass
-            try:
-                if all(isinstance(y, torch.Tensor) for y in Ys):
-                    Ys = torch.stack(Ys, dim=0)
-            except Exception:
-                pass
+                    x_t = _to_tensor_safe(x_i)
+                    y_t = _to_tensor_safe(y_i)
 
-            try:
-                conv = converter({"X": Xs, "Y": Ys})
-            except Exception:
-                conv = {"X": Xs, "Y": Ys}
+                    sample_dict = {"X": x_t}
+                    if y_t is not None:
+                        sample_dict["Y"] = y_t
 
-            Xs = conv.get("X", Xs)
-            Ys = conv.get("Y", Ys)
+                    try:
+                        rid = elem.get("row_ids", None)
+                        if rid is not None:
+                            rid_t = rid if isinstance(rid, torch.Tensor) else torch.as_tensor(rid)
+                            sample_dict["row_ids"] = rid_t.reshape(())
+                    except Exception:
+                        pass
 
-            row_ids = None
+                    samples.append(TensorDict(sample_dict, batch_size=[]))
+
+                stacked = torch.stack(samples, dim=0)
+
+                canonicalize_xy_keys_(stacked)
+
+                try:
+                    out = converter(stacked)
+                except Exception:
+                    out = stacked
+
+                if isinstance(out, Mapping):
+                    if "X" in out:
+                        stacked.set("X", out["X"])
+                    if "Y" in out:
+                        stacked.set("Y", out["Y"])
+                    if "row_ids" in out and out["row_ids"] is not None:
+                        stacked.set("row_ids", out["row_ids"])
+
+                return stacked
+
+            Xs: list[Any] = []
+            Ys: list[Any] = []
+            for elem in batch:
+                try:
+                    x_i, y_i = extract_xy(elem, labels_required=False)
+                except Exception:
+                    x_i = elem.get("X")
+                    y_i = elem.get("Y", None)
+                Xs.append(x_i)
+                Ys.append(y_i)
+
+            Xs = [_to_tensor_safe(x) for x in Xs]
+            Ys = [_to_tensor_safe(y) for y in Ys]
+
+            if all(isinstance(x, torch.Tensor) for x in Xs):
+                X = torch.stack(Xs, dim=0)
+            else:
+                X = Xs
+
+            if all(isinstance(y, torch.Tensor) for y in Ys):
+                Y = torch.stack(Ys, dim=0)
+            else:
+                Y = Ys
+
+            data = {"X": X}
+            if isinstance(Y, torch.Tensor):
+                data["Y"] = Y
+
             try:
                 rids = [elem.get("row_ids") for elem in batch]
                 if rids and all(r is not None for r in rids):
-                    if all(isinstance(r, torch.Tensor) for r in rids):
-                        parts = [r.reshape(-1) for r in rids]
-                    else:
-                        parts = [
-                            (r if isinstance(r, torch.Tensor) else torch.as_tensor(r)).reshape(-1)
-                            for r in rids
-                        ]
+                    parts = [
+                        (r if isinstance(r, torch.Tensor) else torch.as_tensor(r)).reshape(-1)
+                        for r in rids
+                    ]
                     row_ids = torch.cat(parts, dim=0) if parts else None
+                    if row_ids is not None:
+                        data["row_ids"] = row_ids
             except Exception:
-                row_ids = None
+                pass
 
-            data = {"X": Xs, "Y": Ys, "features": Xs, "labels": Ys}
-            if row_ids is not None:
-                data["row_ids"] = row_ids
-
-            if TensorDict is None:
-                return data
-
-            return TensorDict(data, batch_size=_td_batch_size_from_X(Xs))
+            return data
 
         return batch
 
@@ -953,10 +1148,19 @@ def collate(
             conv = converter(batch)
         except Exception:
             conv = batch
-        X = conv.get("X", batch.get("X"))
-        Y = conv.get("Y", batch.get("Y"))
+        X = conv.get("X", None)
+        Y = conv.get("Y", None)
+        if X is None:
+            with contextlib.suppress(Exception):
+                X, Y = extract_xy(batch, labels_required=False)
+        if X is None:
+            X = batch.get("X")
+        if Y is None:
+            Y = batch.get("Y")
         row_ids = conv.get("row_ids", batch.get("row_ids"))
-        data = {"X": X, "Y": Y, "features": X, "labels": Y}
+        data = {"X": X}
+        if isinstance(Y, torch.Tensor):
+            data["Y"] = Y
         if row_ids is not None:
             data["row_ids"] = row_ids
         if TensorDict is None:
@@ -1530,19 +1734,31 @@ class Dataset(Generic[TExtra]):
         keys: Sequence[Any] = ()
 
         if isinstance(data, TensorDictBase):
-            features = _pick_first(data, ("features", "X"))
-            labels = _pick_first(data, ("labels", "Y", "targets", "target"))
-            keys = _pick_first(data, ("row_ids", "keys")) or ()
-            if features is None:
-                for v in data.values():
-                    if isinstance(v, torch.Tensor):
-                        features = v
-                        break
+            # Strict, case-insensitive alias resolution. Enforces "exactly one".
+            fkey = resolve_feature_key(data)
+            features = data.get(fkey, None)
+            lkey = resolve_label_key(data, required=False)
+            labels = data.get(lkey, None) if lkey is not None else None
+            keys = data.get("row_ids", None) or data.get("keys", None) or ()
         elif isinstance(data, Mapping):
-            if ("X" in data) or ("features" in data):
-                features = _pick_first(data, ("X", "features"))
-                labels = _pick_first(data, ("Y", "labels", "targets", "target"))
-                keys = _pick_first(data, ("row_ids", "keys")) or ()
+            # If the mapping explicitly contains feature/label columns, use the strict
+            # alias contract. Otherwise, fall back to the {key: label} / {key: (x,y)}
+            # heuristic used for compact datasets.
+            has_column_keys = False
+            for k in data.keys():
+                ck = _casefold_str(k)
+                if ck is None:
+                    continue
+                if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
+                    has_column_keys = True
+                    break
+
+            if has_column_keys:
+                fkey = resolve_feature_key(data)
+                features = data.get(fkey, None)
+                lkey = resolve_label_key(data, required=False)
+                labels = data.get(lkey, None) if lkey is not None else None
+                keys = data.get("row_ids", None) or data.get("keys", None) or ()
             else:
                 # Heuristic: mapping may be {key: (feature, label)} or {feature: label}.
                 items = list(data.items())
@@ -1599,7 +1815,7 @@ class Dataset(Generic[TExtra]):
             features = features.reshape(1, 1)
         elif features.ndim == 1:
             features = features.reshape(1, -1)
-        if not bool(features.is_contiguous()):
+        if not bool(features.is_contiguous()) and not _is_lazy_tensor(features):
             features = features.contiguous()
 
         if labels is not None:
@@ -1608,7 +1824,7 @@ class Dataset(Generic[TExtra]):
                 labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
                 labels = labels.reshape(features.shape[0], -1)
-            if not bool(labels.is_contiguous()):
+            if not bool(labels.is_contiguous()) and not _is_lazy_tensor(labels):
                 labels = labels.contiguous()
             label_shape = tuple(labels.shape[1:])
         else:
