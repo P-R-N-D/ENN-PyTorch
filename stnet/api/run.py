@@ -378,10 +378,12 @@ def read_json(path: str) -> Any:
     """Read and parse JSON payload from ``path``.
 
     This thin wrapper exists for symmetry with ``write_json_atomic`` and to avoid
-    sprinkling ``json.load`` calls throughout prediction assembly helpers.
+    sprinkling ``json.load`` calls throughout prediction assembly helpers. Using
+    ``utf-8-sig`` tolerates BOM-prefixed files (common on Windows) when manifests
+    are created or edited outside Python.
     """
 
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
 
 
