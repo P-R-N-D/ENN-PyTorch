@@ -42,6 +42,7 @@ from ..backend.compat import (
     torch_no_compile,
 )
 from ..backend.system import empty_device_cache
+from ..data.pipeline import resolve_feature_key, resolve_label_key
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
 from .layers import (
@@ -2402,7 +2403,13 @@ class Root(nn.Module):
 
     def _auto_microbatch(self, features: torch.Tensor | TensorDictBase, device: torch.device) -> int:
         if isinstance(features, TensorDictBase):
-            X = features.get("features")
+            X = None
+            with contextlib.suppress(Exception):
+                fkey = resolve_feature_key(features)
+                X = features.get(fkey, None)
+            if X is None:
+                # Backward-compatible fallback (should be rare once callers follow the alias contract)
+                X = features.get("features", None) or features.get("X", None)
         else:
             X = features
         if not isinstance(X, torch.Tensor):
@@ -2487,13 +2494,32 @@ class Root(nn.Module):
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
             td_input = features
-            td_labels = td_input.get("labels_flat", None)
-            td_features = td_input.get("features")
+            td_labels_flat = td_input.get("labels_flat", None)
+
+            # Feature / label extraction is case-insensitive and enforces "exactly one"
+            # column per role.
+            fkey = resolve_feature_key(td_input)
+            td_features = td_input.get(fkey, None)
             if td_features is None:
-                raise KeyError("TensorDict input requires a 'features' key")
+                raise KeyError(f"TensorDict input requires a feature column (got key={fkey!r} but value is None)")
             features = td_features
-            if labels_flat is None and td_labels is not None:
-                labels_flat = td_labels
+
+            if labels_flat is None:
+                # Prefer pre-flattened labels if provided.
+                if isinstance(td_labels_flat, torch.Tensor):
+                    labels_flat = td_labels_flat
+                else:
+                    # Otherwise, try the alias-based label column and flatten it.
+                    lkey = resolve_label_key(td_input, required=False)
+                    if lkey is not None:
+                        with contextlib.suppress(Exception):
+                            raw = td_input.get(lkey, None)
+                            if isinstance(raw, torch.Tensor):
+                                if raw.ndim == 0:
+                                    raw = raw.reshape(1, 1)
+                                elif raw.ndim == 1:
+                                    raw = raw.reshape(-1, 1)
+                                labels_flat = raw.reshape(raw.shape[0], -1)
 
             td_net_loss = td_input.get("net_loss", None)
             td_global_loss = td_input.get("global_loss", None)

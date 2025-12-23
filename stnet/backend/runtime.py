@@ -33,6 +33,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..data.datatype import env_bool, env_float, env_int, parse_bool
+from ..data.pipeline import extract_xy
 
 _nvml = None
 _NVML_READY = False
@@ -2224,8 +2225,7 @@ def epochs(
             sy2_tmp: Optional[torch.Tensor] = None
 
             for batch in train_loader:
-                feats = batch["features"]
-                labs = batch["labels"]
+                feats, labs = extract_xy(batch, labels_required=True)
 
                 if feats.ndim > 2:
                     feats = feats.reshape(feats.shape[0], -1)
@@ -3216,8 +3216,9 @@ def epochs(
         total_n: int = 0
 
         for batch in train_loader:
-            x_raw = batch["features"].to(device)
-            y_raw = batch["labels"].to(scaler_y_device)
+            x_b, y_b = extract_xy(batch, labels_required=True)
+            x_raw = x_b.to(device)
+            y_raw = y_b.to(scaler_y_device)
             if y_raw.ndim >= 2:
                 y_flat = y_raw.reshape(y_raw.shape[0], -1)
             else:
