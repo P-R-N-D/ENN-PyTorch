@@ -170,16 +170,6 @@ def _get_dist():
     return dist
 
 
-def _is_dist_initialized() -> bool:
-    dist = _get_dist()
-    if dist is None:
-        return False
-    try:
-        return bool(dist.is_available() and dist.is_initialized())
-    except Exception:
-        return False
-
-
 def _is_rank0_global() -> bool:
     dist = _get_dist()
     if dist is None:

@@ -295,6 +295,117 @@ def _rt_env_float(name: str, default: float) -> float:
     return env_float(name, float(default))
 
 
+def _rt_maybe_torch_profiler(
+    *,
+    enabled: bool,
+    tag: str,
+    device: torch.device,
+    out_dir: Optional[str],
+    rank: int = 0,
+) -> Optional[Any]:
+    """Create a torch.profiler profile object (not started) when enabled.
+
+    Controls (environment variables):
+      - STNET_TORCH_PROFILE / STNET_TORCH_PROFILE_TRAIN / STNET_TORCH_PROFILE_INFER
+      - STNET_TORCH_PROFILE_DIR
+      - STNET_TORCH_PROFILE_WAIT / WARMUP / ACTIVE / REPEAT
+      - STNET_TORCH_PROFILE_RECORD_SHAPES / PROFILE_MEMORY / WITH_STACK / WITH_FLOPS
+      - STNET_TORCH_PROFILE_GROUP_BY_SHAPE / TOPK
+    """
+    if not bool(enabled):
+        return None
+
+    try:
+        import torch.profiler as _tp  # local import to keep default overhead at ~0
+    except Exception:
+        return None
+
+    activities = [_tp.ProfilerActivity.CPU]
+    if device.type == "cuda":
+        with contextlib.suppress(Exception):
+            activities.append(_tp.ProfilerActivity.CUDA)
+    elif device.type == "xpu":
+        with contextlib.suppress(Exception):
+            activities.append(getattr(_tp.ProfilerActivity, "XPU"))
+
+    wait = max(0, int(_rt_env_int("STNET_TORCH_PROFILE_WAIT", 0)))
+    warmup = max(0, int(_rt_env_int("STNET_TORCH_PROFILE_WARMUP", 2)))
+    active = max(1, int(_rt_env_int("STNET_TORCH_PROFILE_ACTIVE", _rt_env_int("STNET_TORCH_PROFILE_STEPS", 8))))
+    repeat = max(1, int(_rt_env_int("STNET_TORCH_PROFILE_REPEAT", 1)))
+
+    record_shapes = bool(_rt_env_flag("STNET_TORCH_PROFILE_RECORD_SHAPES", False))
+    profile_memory = bool(_rt_env_flag("STNET_TORCH_PROFILE_PROFILE_MEMORY", True))
+    with_stack = bool(_rt_env_flag("STNET_TORCH_PROFILE_WITH_STACK", False))
+    with_flops = bool(_rt_env_flag("STNET_TORCH_PROFILE_WITH_FLOPS", False))
+    group_by_shape = bool(_rt_env_flag("STNET_TORCH_PROFILE_GROUP_BY_SHAPE", False))
+    row_limit = max(5, int(_rt_env_int("STNET_TORCH_PROFILE_TOPK", 40)))
+
+    if not out_dir:
+        out_dir = os.path.join(os.getcwd(), "torch_profiler")
+    out_dir = os.path.abspath(str(out_dir))
+    with contextlib.suppress(Exception):
+        os.makedirs(out_dir, exist_ok=True)
+
+    worker_name = f"{str(tag)}-rank{int(rank)}"
+    try:
+        schedule = _tp.schedule(wait=wait, warmup=warmup, active=active, repeat=repeat)
+        on_trace = _tp.tensorboard_trace_handler(out_dir, worker_name=worker_name)
+        prof = _tp.profile(
+            activities=activities,
+            schedule=schedule,
+            on_trace_ready=on_trace,
+            record_shapes=record_shapes,
+            profile_memory=profile_memory,
+            with_stack=with_stack,
+            with_flops=with_flops,
+        )
+        setattr(prof, "_stnet_row_limit", int(row_limit))
+        setattr(prof, "_stnet_group_by_shape", bool(group_by_shape))
+        setattr(prof, "_stnet_out_dir", str(out_dir))
+        setattr(prof, "_stnet_tag", str(tag))
+        return prof
+    except Exception:
+        return None
+
+
+def _rt_log_torch_profiler_summary(
+    prof: Any, *, device: torch.device, logger: logging.Logger, header: str
+) -> None:
+    if prof is None:
+        return
+
+    row_limit = int(getattr(prof, "_stnet_row_limit", 40) or 40)
+    group_by_shape = bool(getattr(prof, "_stnet_group_by_shape", False))
+    out_dir = str(getattr(prof, "_stnet_out_dir", ""))
+    tag = str(getattr(prof, "_stnet_tag", header))
+
+    try:
+        ka = prof.key_averages(group_by_input_shape=group_by_shape)
+    except Exception:
+        with contextlib.suppress(Exception):
+            ka = prof.key_averages()
+        if "ka" not in locals():
+            return
+
+    table: Optional[str] = None
+    for sk in ("self_cuda_time_total", "self_xpu_time_total", "self_cpu_time_total"):
+        with contextlib.suppress(Exception):
+            table = ka.table(sort_by=str(sk), row_limit=row_limit)
+            if table:
+                break
+
+    if table:
+        logger.info(
+            "[torch.profiler] %s (trace dir: %s, tag: %s)\n%s",
+            str(header),
+            str(out_dir),
+            str(tag),
+            str(table),
+        )
+
+
+
+
 def _oom_retry_inc(loader: Any, phase: str, step: int) -> int:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
@@ -768,17 +879,6 @@ def _set_backend(device: torch.device) -> None:
         if iface:
             os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
             os.environ.setdefault("TP_SOCKET_IFNAME", iface)
-
-
-def _iter_source_paths(obj: Any) -> Iterator[str]:
-    yield from LazyTensor.iter_source_paths(obj)
-
-def _merge_meta_dicts(metas: list[dict]) -> dict:
-    return LazyTensor.merge_meta_dicts(metas)
-
-def _from_meta(memmap_dir: str) -> Dict[str, Any]:
-    return LazyTensor.from_meta(memmap_dir)
-
 
 def _unify_param_dtype(
     model: Any, prefer: Optional[torch.dtype] = None
@@ -1695,7 +1795,8 @@ def epochs(
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         try:
-            cpu_pool = Pool(capacity=8)
+            cpu_pool_cap = max(2, int(_rt_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
+            cpu_pool = Pool(capacity=cpu_pool_cap)
             pool_capacity = int(getattr(cpu_pool, "capacity", 8))
         except Exception:
             cpu_pool = None
@@ -2115,39 +2216,67 @@ def epochs(
             y_sum = scaler_stats["y_sum"].to(device=scaler_y_device)
             y_sum_sq = scaler_stats["y_sum_sq"].to(device=scaler_y_device)
         else:
+            # Fallback: compute scaler stats by scanning the training loader once.
+            # Hot path: avoid per-batch temporary allocations and large intermediates.
+            sx_tmp: Optional[torch.Tensor] = None
+            sx2_tmp: Optional[torch.Tensor] = None
+            sy_tmp: Optional[torch.Tensor] = None
+            sy2_tmp: Optional[torch.Tensor] = None
+
             for batch in train_loader:
                 feats = batch["features"]
                 labs = batch["labels"]
-                if feats.ndim == 3 and feats.shape[1] == 1:
+
+                if feats.ndim > 2:
                     feats = feats.reshape(feats.shape[0], -1)
 
-                xf = feats.to(device=scaler_x_device, dtype=torch.float64)
-                n_x = xf.shape[0]
-                if n_x > 0:
-                    x_count += n_x
-                    sx = xf.sum(dim=0)
-                    sx2 = (xf * xf).sum(dim=0)
-                    if x_sum is None:
-                        x_sum = sx
-                        x_sum_sq = sx2
-                    else:
-                        x_sum += sx
-                        x_sum_sq += sx2
+                with torch.inference_mode():
+                    xf = feats.to(device=scaler_x_device, dtype=torch.float64)
+                    if xf.ndim > 2:
+                        xf = xf.reshape(xf.shape[0], -1)
+                    n_x = int(xf.shape[0])
+                    if n_x > 0:
+                        x_count += n_x
+                        if x_sum is None:
+                            x_sum = torch.zeros(
+                                xf.shape[1], device=scaler_x_device, dtype=torch.float64
+                            )
+                            x_sum_sq = torch.zeros_like(x_sum)
+                            sx_tmp = torch.empty_like(x_sum)
+                            sx2_tmp = torch.empty_like(x_sum)
+                        assert x_sum is not None and x_sum_sq is not None
+                        assert sx_tmp is not None and sx2_tmp is not None
 
-                yf = labs.to(device=scaler_y_device, dtype=torch.float64)
-                if yf.ndim >= 2:
-                    yf = yf.reshape(yf.shape[0], -1)
-                n_y = yf.shape[0]
-                if n_y > 0:
-                    y_count += n_y
-                    sy = yf.sum(dim=0)
-                    sy2 = (yf * yf).sum(dim=0)
-                    if y_sum is None:
-                        y_sum = sy
-                        y_sum_sq = sy2
-                    else:
-                        y_sum += sy
-                        y_sum_sq += sy2
+                        torch.sum(xf, dim=0, out=sx_tmp)
+                        x_sum.add_(sx_tmp)
+
+                        # In-place square to avoid allocating (xf * xf).
+                        xf.mul_(xf)
+                        torch.sum(xf, dim=0, out=sx2_tmp)
+                        x_sum_sq.add_(sx2_tmp)
+
+                    yf = labs.to(device=scaler_y_device, dtype=torch.float64)
+                    if yf.ndim > 2:
+                        yf = yf.reshape(yf.shape[0], -1)
+                    n_y = int(yf.shape[0])
+                    if n_y > 0:
+                        y_count += n_y
+                        if y_sum is None:
+                            y_sum = torch.zeros(
+                                yf.shape[1], device=scaler_y_device, dtype=torch.float64
+                            )
+                            y_sum_sq = torch.zeros_like(y_sum)
+                            sy_tmp = torch.empty_like(y_sum)
+                            sy2_tmp = torch.empty_like(y_sum)
+                        assert y_sum is not None and y_sum_sq is not None
+                        assert sy_tmp is not None and sy2_tmp is not None
+
+                        torch.sum(yf, dim=0, out=sy_tmp)
+                        y_sum.add_(sy_tmp)
+
+                        yf.mul_(yf)
+                        torch.sum(yf, dim=0, out=sy2_tmp)
+                        y_sum_sq.add_(sy2_tmp)
 
             # Only reduce across ranks when stats were computed locally.
             # (When loaded from memmaps, every rank sees the same aggregated stats.)
@@ -2245,6 +2374,28 @@ def epochs(
             cpu_pool=cpu_pool,
             pool_handles=pool_handles,
         )
+
+        # Optional torch.profiler instrumentation (disabled by default).
+        torch_prof: Optional[Any] = None
+        prof_enabled = _rt_env_flag(
+            "STNET_TORCH_PROFILE_TRAIN", _rt_env_flag("STNET_TORCH_PROFILE", False)
+        )
+        prof_all_ranks = _rt_env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
+        prof_rank = int(torch.distributed.get_rank()) if is_distributed() else 0
+        if prof_enabled and (prof_all_ranks or prof_rank == 0):
+            prof_dir = os.environ.get("STNET_TORCH_PROFILE_DIR", None)
+            if not prof_dir:
+                prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
+            torch_prof = _rt_maybe_torch_profiler(
+                enabled=True,
+                tag=f"train-{str(run_id)}",
+                device=device,
+                out_dir=str(prof_dir),
+                rank=prof_rank,
+            )
+            if torch_prof is not None:
+                with contextlib.suppress(Exception):
+                    torch_prof.start()
 
         for epoch_idx in range(int(total_epochs)):
             # Ensure the training sampler uses a different shuffle ordering each epoch.
@@ -2566,6 +2717,8 @@ def epochs(
                                         hist.record_batch(X, Y)
                                 except Exception:
                                     pass
+                            if torch_prof is not None:
+                                torch_prof.step()
                             t_fetch_start = time.perf_counter_ns()
                             if cpu_pool is not None and ((step_idx + 1) & 255) == 0:
                                 with contextlib.suppress(Exception):
@@ -2883,6 +3036,9 @@ def epochs(
                                             tflops=tflops_cur,
                                         )
 
+                                    if torch_prof is not None:
+                                        torch_prof.step()
+
                                     t_fetch_start = time.perf_counter_ns()
                                     if cpu_pool is not None and ((_vstep + 1) & 255) == 0:
                                         with contextlib.suppress(Exception):
@@ -3175,6 +3331,13 @@ def epochs(
 
             model_for_scaler.scaler.set_affine(a, b)
 
+    if torch_prof is not None:
+        with contextlib.suppress(Exception):
+            torch_prof.stop()
+        _rt_log_torch_profiler_summary(
+            torch_prof, device=device, logger=_LOGGER, header="train/val"
+        )
+
     if local_rank == 0 and status_bar is not None:
         mbps = prev_io_bytes / max(prev_io_time, 1e-06) / MB_DIV
         tflops = prev_flops / max(prev_comp_time, 1e-06) / 1_000_000_000_000.0
@@ -3333,6 +3496,26 @@ def infer(
     rank = torch.distributed.get_rank() if is_distributed() else 0
     world_size = get_world_size(device) if is_distributed() else 1
 
+    torch_prof: Optional[Any] = None
+    prof_enabled = _rt_env_flag(
+        "STNET_TORCH_PROFILE_INFER", _rt_env_flag("STNET_TORCH_PROFILE", False)
+    )
+    prof_all_ranks = _rt_env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
+    if prof_enabled and (prof_all_ranks or int(rank) == 0):
+        prof_dir = os.environ.get("STNET_TORCH_PROFILE_DIR", None)
+        if not prof_dir:
+            prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
+        torch_prof = _rt_maybe_torch_profiler(
+            enabled=True,
+            tag="infer",
+            device=device,
+            out_dir=str(prof_dir),
+            rank=int(rank),
+        )
+        if torch_prof is not None:
+            with contextlib.suppress(Exception):
+                torch_prof.start()
+
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
     distributed_barrier(device)
@@ -3365,7 +3548,8 @@ def infer(
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         with contextlib.suppress(Exception):
-            cpu_pool = Pool(capacity=8)
+            cpu_pool_cap = max(2, int(_rt_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
+            cpu_pool = Pool(capacity=cpu_pool_cap)
 
     pool_handles: dict[int, object] = {}
     pin_tensor = partial(
@@ -3421,7 +3605,8 @@ def infer(
             preds_cpu = torch.as_tensor(preds_cpu)
         if preds_cpu.device.type != "cpu":
             preds_cpu = preds_cpu.to(device="cpu")
-        preds_cpu = preds_cpu.contiguous()
+        if not bool(preds_cpu.is_contiguous()):
+            preds_cpu = preds_cpu.contiguous()
 
         # Overwrite ok: chunk dirs are per-run.
         MemoryMappedTensor.from_tensor(preds_cpu, filename=path, existsok=True)
@@ -3444,18 +3629,18 @@ def infer(
             if buf_fill <= 0:
                 return
             assert rows_buf is not None and pred_buf is not None
-            rows = rows_buf[:buf_fill].contiguous()
-            preds = pred_buf[:buf_fill].contiguous()
+            rows = rows_buf[:buf_fill]
+            preds = pred_buf[:buf_fill]
             buf_fill = 0
         else:
             if pending_count <= 0:
                 return
-            rows = (
-                torch.cat(pending_rows, dim=0)
-                .to(dtype=torch.int64, copy=False)
-                .contiguous()
-            )
-            preds = torch.cat(pending_preds, dim=0).contiguous()
+            rows = torch.cat(pending_rows, dim=0).to(dtype=torch.int64, copy=False)
+            if not bool(rows.is_contiguous()):
+                rows = rows.contiguous()
+            preds = torch.cat(pending_preds, dim=0)
+            if not bool(preds.is_contiguous()):
+                preds = preds.contiguous()
 
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
 
@@ -3514,7 +3699,7 @@ def infer(
                 _flush()
                 pending_tail = tail
 
-            pending_rows.append(rows_cpu)
+            pending_rows.append(rows_cpu.clone())
             pending_preds.append(preds_cpu)
             pending_count += b
             if pending_count >= target_rows:
@@ -3550,6 +3735,7 @@ def infer(
 
     try:
         with Gradient.inference(run_model), Autocast.float(device):
+            row_ids_buf: Optional[torch.Tensor] = None
             for batch in data_loader:
                 if batch is None:
                     if status_bar is not None:
@@ -3589,9 +3775,18 @@ def infer(
                     continue
 
                 if row_ids is None:
-                    row_ids = torch.arange(
-                        row_cursor, row_cursor + bs, dtype=torch.int64
+                    # Reuse a CPU buffer to avoid per-batch arange allocations.
+                    if row_ids_buf is None or int(row_ids_buf.numel()) < bs:
+                        row_ids_buf = torch.empty((bs,), device="cpu", dtype=torch.int64)
+                    view = row_ids_buf[:bs]
+                    torch.arange(
+                        int(row_cursor),
+                        int(row_cursor) + int(bs),
+                        dtype=torch.int64,
+                        device=view.device,
+                        out=view,
                     )
+                    row_ids = view
                 elif not isinstance(row_ids, torch.Tensor):
                     row_ids = torch.as_tensor(row_ids, dtype=torch.int64)
                 else:
@@ -3651,6 +3846,9 @@ def infer(
                     del Xi, rows_i, out, y_hat, y_cpu, rows_cpu
                     start = end
 
+                if torch_prof is not None:
+                    torch_prof.step()
+
                 if status_bar is not None:
                     status_bar.update(1)
 
@@ -3658,6 +3856,12 @@ def infer(
 
     finally:
         _flush()
+        if torch_prof is not None:
+            with contextlib.suppress(Exception):
+                torch_prof.stop()
+            _rt_log_torch_profiler_summary(
+                torch_prof, device=device, logger=_LOGGER, header="infer"
+            )
         cache.close()
         exc_type, _, _ = sys.exc_info()
         if exc_type is None:

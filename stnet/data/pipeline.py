@@ -1424,6 +1424,42 @@ class Session:
         self.close()
 
 
+
+def _pick_first(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
+    """Return the first non-None value for any of `keys` present in `mapping`."""
+    for k in keys:
+        with contextlib.suppress(Exception):
+            v = mapping.get(k, None)
+            if v is not None:
+                return v
+    return None
+
+
+def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype]) -> torch.Tensor:
+    """Convert `obj` to a tensor and (best-effort) cast dtype only when needed."""
+    t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
+    if dtype is not None and isinstance(t, torch.Tensor):
+        with contextlib.suppress(Exception):
+            if t.dtype != dtype:
+                t = t.to(dtype=dtype)
+    return t
+
+
+def _feature_size_hint(obj: Any) -> Optional[int]:
+    """Best-effort feature-size heuristic for nested mapping inputs."""
+    if isinstance(obj, torch.Tensor):
+        if obj.ndim == 0:
+            return 1
+        with contextlib.suppress(Exception):
+            return int(obj.numel())
+        return None
+    if isinstance(obj, (tuple, list)):
+        with contextlib.suppress(Exception):
+            return int(len(obj))
+        return None
+    return None
+
+
 @dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
@@ -1489,103 +1525,91 @@ class Dataset(Generic[TExtra]):
     def preprocess(
         self, data: Any
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[Any], Tuple[int, ...]]:
-        def _to_tensor(obj: Any, *, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
-            t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
-            if dtype is not None:
-                with contextlib.suppress(Exception):
-                    t = t.to(dtype=dtype)
-            return t
-
         features: Optional[torch.Tensor] = None
         labels: Optional[torch.Tensor] = None
         keys: Sequence[Any] = ()
 
-        def _pick(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
-            for k in keys:
-                value = mapping.get(k, None)
-                if value is not None:
-                    return value
-            return None
-
         if isinstance(data, TensorDictBase):
-            features = _pick(data, ("features", "X"))
-            labels = _pick(data, ("labels", "Y", "targets", "target"))
-            keys = _pick(data, ("row_ids", "keys")) or ()
+            features = _pick_first(data, ("features", "X"))
+            labels = _pick_first(data, ("labels", "Y", "targets", "target"))
+            keys = _pick_first(data, ("row_ids", "keys")) or ()
             if features is None:
                 for v in data.values():
                     if isinstance(v, torch.Tensor):
                         features = v
                         break
         elif isinstance(data, Mapping):
-            if "X" in data or "features" in data:
-                features = _pick(data, ("X", "features"))
-                labels = _pick(data, ("Y", "labels", "targets", "target"))
-                keys = _pick(data, ("row_ids", "keys")) or ()
+            if ("X" in data) or ("features" in data):
+                features = _pick_first(data, ("X", "features"))
+                labels = _pick_first(data, ("Y", "labels", "targets", "target"))
+                keys = _pick_first(data, ("row_ids", "keys")) or ()
             else:
+                # Heuristic: mapping may be {key: (feature, label)} or {feature: label}.
                 items = list(data.items())
                 keys = [k for (k, _v) in items]
                 values = [_v for (_k, _v) in items]
 
                 if values and isinstance(values[0], (list, tuple)) and len(values[0]) >= 2:
-                    feat_list = [_to_tensor(v[0], dtype=self.feature_dtype) for v in values]
-                    label_list = [_to_tensor(v[1], dtype=self.label_float_dtype) for v in values]
-                    features = torch.stack(feat_list) if feat_list else None
-                    labels = torch.stack(label_list) if label_list else None
+                    feat_list = [_to_tensor_safe(v[0], self.feature_dtype) for v in values]
+                    label_list = [_to_tensor_safe(v[1], self.label_float_dtype) for v in values]
+                    features = torch.stack(feat_list, dim=0) if feat_list else None
+                    labels = torch.stack(label_list, dim=0) if label_list else None
                 else:
                     parsed = False
-
-                    def _key_feature_size(obj: Any) -> Optional[int]:
-                        if isinstance(obj, torch.Tensor):
-                            if obj.ndim == 0:
-                                return 1
-                            try:
-                                return int(obj.numel())
-                            except Exception:
-                                return None
-                        if isinstance(obj, (tuple, list)):
-                            try:
-                                return int(len(obj))
-                            except Exception:
-                                return None
-                        return None
-
                     if keys and values:
-                        ksize0 = _key_feature_size(keys[0])
+                        ksize0 = _feature_size_hint(keys[0])
                         if ksize0 is not None and 1 < int(ksize0) <= 64:
-                            if all(_key_feature_size(k) == ksize0 for k in keys):
+                            if all(_feature_size_hint(k) == ksize0 for k in keys):
                                 has_missing_labels = any((v is None for v in values))
                                 try:
-                                    feat_list = [_to_tensor(k, dtype=self.feature_dtype).reshape(-1) for k in keys]
+                                    feat_list = [
+                                        _to_tensor_safe(k, self.feature_dtype).reshape(-1) for k in keys
+                                    ]
                                     features = torch.stack(feat_list, dim=0) if feat_list else None
                                     if has_missing_labels:
                                         labels = None
                                         parsed = features is not None
                                     else:
-                                        label_list = [_to_tensor(v, dtype=self.label_float_dtype) for v in values]
-                                        labels = torch.stack(label_list, dim=0) if label_list else None
+                                        label_list = [
+                                            _to_tensor_safe(v, self.label_float_dtype) for v in values
+                                        ]
+                                        labels = (
+                                            torch.stack(label_list, dim=0) if label_list else None
+                                        )
                                         parsed = features is not None and labels is not None
                                 except Exception:
                                     parsed = False
 
                     if not parsed:
-                        features = torch.stack([_to_tensor(v, dtype=self.feature_dtype) for v in values])
+                        features = (
+                            torch.stack(
+                                [_to_tensor_safe(v, self.feature_dtype) for v in values],
+                                dim=0,
+                            )
+                            if values
+                            else None
+                        )
                         labels = None
 
         if features is None:
             raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
 
-        features = _to_tensor(features, dtype=self.feature_dtype).contiguous()
+        features = _to_tensor_safe(features, self.feature_dtype)
         if features.ndim == 0:
             features = features.reshape(1, 1)
         elif features.ndim == 1:
             features = features.reshape(1, -1)
+        if not bool(features.is_contiguous()):
+            features = features.contiguous()
 
         if labels is not None:
-            labels = _to_tensor(labels, dtype=self.label_float_dtype).contiguous()
+            labels = _to_tensor_safe(labels, self.label_float_dtype)
             if labels.ndim == 0:
                 labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
                 labels = labels.reshape(features.shape[0], -1)
+            if not bool(labels.is_contiguous()):
+                labels = labels.contiguous()
             label_shape = tuple(labels.shape[1:])
         else:
             label_shape = tuple()
@@ -1637,8 +1661,50 @@ class Dataset(Generic[TExtra]):
         if t.is_floating_point():
             x = t.detach()
             finite = torch.isfinite(x)
-            has_nonfinite = bool((~finite).any().item())
-            if finite.any().item():
+            all_finite = bool(finite.all().item())
+            has_nonfinite = not all_finite
+
+            if all_finite:
+                # Fast path (common): all values are finite, so we can avoid boolean indexing
+                # that would materialize a full-size copy.
+                try:
+                    min_val = float(x.min().item())
+                    max_val = float(x.max().item())
+                except Exception:
+                    min_val, max_val = (None, None)
+
+                if min_val is None or max_val is None:
+                    max_abs = float("nan")
+                    min_pos = None
+                else:
+                    max_abs = float(max(abs(min_val), abs(max_val)))
+
+                    # Compute smallest strictly-positive magnitude without allocating abs(x).
+                    min_pos = None
+                    with contextlib.suppress(Exception):
+                        pos = x > 0
+                        if bool(pos.any().item()):
+                            min_pos = float(x[pos].min().item())
+                    with contextlib.suppress(Exception):
+                        neg = x < 0
+                        if bool(neg.any().item()):
+                            # Among negatives, the one closest to zero is the maximum negative.
+                            max_neg = float(x[neg].max().item())
+                            cand = float(-max_neg)
+                            if cand > 0.0:
+                                min_pos = cand if (min_pos is None or cand < min_pos) else min_pos
+
+                return {
+                    "has_scale": True,
+                    "has_nonfinite": bool(has_nonfinite),
+                    "scale_max_abs": max_abs,
+                    "scale_min_value": min_val,
+                    "scale_max_value": max_val,
+                    "scale_min_positive": min_pos,
+                    "scale_is_integral": None,
+                }
+
+            if bool(finite.any().item()):
                 xf = x[finite]
                 try:
                     min_val = float(xf.min().item()) if xf.numel() else None
@@ -1646,13 +1712,23 @@ class Dataset(Generic[TExtra]):
                 except Exception:
                     min_val, max_val = (None, None)
 
-                absf = xf.abs()
-                max_abs = float(absf.max().item()) if absf.numel() else 0.0
-                nonzero = absf > 0
-                if nonzero.any().item():
-                    min_pos = float(absf[nonzero].min().item())
+                if min_val is None or max_val is None:
+                    max_abs = float("nan")
                 else:
-                    min_pos = None
+                    max_abs = float(max(abs(min_val), abs(max_val)))
+
+                min_pos = None
+                with contextlib.suppress(Exception):
+                    pos = xf > 0
+                    if bool(pos.any().item()):
+                        min_pos = float(xf[pos].min().item())
+                with contextlib.suppress(Exception):
+                    neg = xf < 0
+                    if bool(neg.any().item()):
+                        max_neg = float(xf[neg].max().item())
+                        cand = float(-max_neg)
+                        if cand > 0.0:
+                            min_pos = cand if (min_pos is None or cand < min_pos) else min_pos
             else:
                 max_abs = float("nan")
                 min_val = None
@@ -1660,14 +1736,13 @@ class Dataset(Generic[TExtra]):
                 min_pos = None
             return {
                 "has_scale": True,
-                "has_nonfinite": has_nonfinite,
+                "has_nonfinite": bool(has_nonfinite),
                 "scale_max_abs": max_abs,
                 "scale_min_value": min_val,
                 "scale_max_value": max_val,
                 "scale_min_positive": min_pos,
                 "scale_is_integral": None,
             }
-
         x = t.detach()
         if x.dtype == torch.bool:
             x_i64 = x.to(dtype=torch.int64)

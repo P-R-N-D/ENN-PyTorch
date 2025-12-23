@@ -9,7 +9,6 @@ import logging
 import threading
 from functools import lru_cache
 from collections import OrderedDict
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch

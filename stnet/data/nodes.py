@@ -8,7 +8,6 @@ import multiprocessing as mp
 import os
 import queue
 import sys
-import sysconfig
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
@@ -155,24 +154,6 @@ def _host_guard_ok(guard_bytes: int) -> bool:
         return True
 
 
-def _nogil_runtime_enabled() -> bool:
-    """True if running on a free-threaded build *and* the GIL is disabled at runtime."""
-    try:
-        ft_build = bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
-    except Exception:
-        ft_build = False
-    if not ft_build:
-        return False
-    is_gil_enabled = True
-    f = getattr(sys, "_is_gil_enabled", None)
-    if callable(f):
-        try:
-            is_gil_enabled = bool(f())
-        except Exception:
-            is_gil_enabled = True
-    return bool(not is_gil_enabled)
-
-
 class SamplerScale:
     """Per-session (or per-loader) scaling factor for auto batch sizing.
 
@@ -215,13 +196,44 @@ class SamplerScale:
             self._v = mp.Value("d", 1.0, lock=True)
 
     def get(self) -> float:
+        """Return the current scaling factor.
+
+        This is a hot-path call (can happen once per batch). Acquiring the
+        multiprocessing.Value lock on every read adds measurable overhead.
+
+        We therefore use a lock-free fast path and fall back to a locked read
+        only if the observed value looks invalid/out-of-bounds.
+        """
+        mn = float(self._min_scale)
+        mx = float(self._max_scale)
+
+        try:
+            v = float(self._v.value)
+        except Exception:
+            v = float('nan')
+
+        # Fast path: in normal operation the writer always stores a finite,
+        # clamped value, so we can avoid the lock.
+        if math.isfinite(v) and (v > 0.0) and (mn <= v <= mx):
+            return float(v)
+
+        # Slow path: take the lock and re-read, then clamp defensively.
         try:
             with self._v.get_lock():
-                return float(self._v.value)
+                v = float(self._v.value)
         except Exception:
             with suppress(Exception):
-                return float(self._v.value)
-            return 1.0
+                v = float(self._v.value)
+            if not isinstance(v, (int, float)):
+                v = 1.0
+
+        if (not math.isfinite(v)) or (not (v > 0.0)):
+            v = 1.0
+        if v < mn:
+            v = mn
+        elif v > mx:
+            v = mx
+        return float(v)
 
     def reset(self, value: float = 1.0) -> None:
         try:
@@ -387,7 +399,6 @@ class Sampler(_Sampler):
         default_tl = False
         with suppress(Exception):
             default_tl = bool(Thread.nogil_optimizations_enabled())
-        default_tl = bool(default_tl or _nogil_runtime_enabled())
         self._mmap_thread_local = env_bool(
             ("STNET_MEMMAP_THREAD_LOCAL_HANDLES", "STNET_NOGIL"), default=default_tl
         )
@@ -1461,7 +1472,7 @@ class Prefetcher(Buffer):
             and torch.cuda.is_available()
         ):
             use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
-            cap_default = min(8, max(2, int(self._depth) * 2))
+            cap_default = max(8, max(2, int(self._depth) * 2))
             cap = env_first_int(("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default)
             if use_pool and int(cap) > 0:
                 self._host_pool = Pool(capacity=int(cap), pin_memory=True)
@@ -1496,6 +1507,8 @@ class Prefetcher(Buffer):
 
     def _to_device(self, x: Any, device: torch.device) -> Any:
         if torch.is_tensor(x):
+            if x.device == device:
+                return x
             return x.to(device, non_blocking=self._non_blocking)
         if isinstance(x, (list, tuple)):
             return type(x)(self._to_device(t, device) for t in x)
@@ -1513,6 +1526,9 @@ class Prefetcher(Buffer):
         if not self._pin:
             return x
         if torch.is_tensor(x) and x.device.type == "cpu":
+            with suppress(Exception):
+                if hasattr(x, "is_pinned") and bool(x.is_pinned()):
+                    return x
             return x.pin_memory()
         if isinstance(x, (list, tuple)):
             return type(x)(self._pin_memory(t) for t in x)

@@ -500,5 +500,6 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
             runtime_module = importlib.import_module("stnet.backend.runtime")
 
     if runtime_module is not None:
-        torch_disable_compile(runtime_module, "push_metrics", reason="metric aggregation – eager")
-        torch_disable_compile(runtime_module, "_reduce_metrics", reason="distributed collectives – eager")
+        # NOTE: Runtime metric aggregation helpers used to live in stnet.backend.runtime.
+        # They were removed/merged; keep the hook here to avoid stale attribute references.
+        pass
