@@ -44,7 +44,31 @@ _LOGGER = logging.getLogger(__name__)
 # Serialize/save operations should not overlap within a process.
 # This does not stop training by itself, but prevents concurrent saves and is
 # a good hook point if the training loop cooperates.
-_SAVE_LOCK = threading.RLock()
+_SAVE_LOCK_GUARD = threading.Lock()
+_SAVE_PATH_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _save_lock_for(path: str | Path | None) -> threading.RLock:
+    """Return a stable per-target lock (within-process).
+
+    Saving is IO-heavy and can be triggered concurrently (e.g. training thread +
+    evaluation thread). A single global lock is safe but unnecessarily serializes
+    saves to unrelated files. A per-path lock reduces contention, especially on
+    no-GIL builds.
+    """
+    if path is None:
+        key = "__global__"
+    else:
+        try:
+            key = str(Path(path).expanduser().resolve())
+        except Exception:
+            key = str(path)
+    with _SAVE_LOCK_GUARD:
+        lk = _SAVE_PATH_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _SAVE_PATH_LOCKS[key] = lk
+        return lk
 
 
 class Format(Protocol):
@@ -216,9 +240,9 @@ def _dist_barrier() -> None:
 
 
 @contextlib.contextmanager
-def _save_sync() -> Any:
+def _save_sync(path: str | Path | None = None) -> Any:
     """Synchronize saves within a process (lock) and across ranks (barrier)."""
-    with _SAVE_LOCK:
+    with _save_lock_for(path):
         _dist_barrier()
         try:
             yield
@@ -533,7 +557,7 @@ class TorchIO:
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
 
-            with _save_sync():
+            with _save_sync(p):
                 opts_sd = StateDictOptions(full_state_dict=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
                 dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
@@ -566,7 +590,7 @@ class TorchIO:
 
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        with _save_sync():
+        with _save_sync(p):
             # safetensors: CPU tensors only; include sidecar json.
             if suffix == ".safetensors":
                 _is_required("safetensors", "pip install safetensors")

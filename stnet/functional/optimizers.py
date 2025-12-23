@@ -413,7 +413,7 @@ def _optimizer_state_to_param_device_(optimizer: optim.Optimizer) -> None:
                 p_state = state.get(p)
                 if not isinstance(p_state, dict):
                     continue
-                for k, v in list(p_state.items()):
+                for k, v in p_state.items():
                     if not torch.is_tensor(v):
                         continue
                     try:

@@ -5,6 +5,7 @@ import collections.abc as _abc
 import contextlib
 import math
 import os
+import tempfile
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Protocol, runtime_checkable
@@ -13,6 +14,29 @@ import numpy as np
 import torch
 
 from .datatype import env_flag as _env_flag
+
+
+_FEATURE_KEY_ALIASES = frozenset(
+    {
+        "x",
+        "feature",
+        "features",
+        "input",
+        "inputs",
+        "in",
+    }
+)
+
+_LABEL_KEY_ALIASES = frozenset(
+    {
+        "y",
+        "label",
+        "labels",
+        "output",
+        "outputs",
+        "out",
+    }
+)
 
 
 # -----------------------------------------------------------------------------
@@ -708,29 +732,12 @@ class LazyTensor:
         """
         if not isinstance(obj, Mapping) or not obj:
             return False
-        
-        feature_aliases = {
-            "x",
-            "feature",
-            "features",
-            "input",
-            "inputs",
-            "in",
-        }
-        label_aliases = {
-            "y",
-            "label",
-            "labels",
-            "output",
-            "outputs",
-            "out",
-        }
 
         for k in obj.keys():
             if not isinstance(k, str):
                 continue
             ck = k.casefold()
-            if ck in feature_aliases or ck in label_aliases:
+            if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
                 return True
         return False
 
@@ -786,20 +793,35 @@ class LazyTensor:
     @staticmethod
     def _atomic_write_json(path: str, payload: dict, *, indent: int = 2) -> None:
         import json as _json
-        import os as _os
+        
+        p = os.fspath(path)
+        parent = os.path.dirname(p) or "."
+        os.makedirs(parent, exist_ok=True)
 
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump(payload, f, indent=int(indent))
-        _os.replace(tmp, path)
+        fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+        os.close(fd)
+        try:
+            with open(tmp_name, "w", encoding="utf-8") as f:
+                _json.dump(payload, f, indent=int(indent))
+            os.replace(tmp_name, p)
+        finally:
+            with contextlib.suppress(Exception):
+                os.remove(tmp_name)
 
     @staticmethod
     def _atomic_torch_save(path: str, payload: Any) -> None:
-        import os as _os
+        p = os.fspath(path)
+        parent = os.path.dirname(p) or "."
+        os.makedirs(parent, exist_ok=True)
 
-        tmp = path + ".tmp"
-        torch.save(payload, tmp)
-        _os.replace(tmp, path)
+        fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+        os.close(fd)
+        try:
+            torch.save(payload, tmp_name)
+            os.replace(tmp_name, p)
+        finally:
+            with contextlib.suppress(Exception):
+                os.remove(tmp_name)
 
     @staticmethod
     def write_memmap_streaming_two_pass(
@@ -868,7 +890,7 @@ class LazyTensor:
             expected = int(e) - int(s)
             if n != expected:
                 raise RuntimeError(
-                    f"Pass1 batch size mismatch for {prefix}: expected {expected}, got {n} (s={s}, e={e})."
+                    f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
 
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
@@ -1125,7 +1147,7 @@ class LazyTensor:
             expected = int(e) - int(s)
             if n != expected:
                 raise RuntimeError(
-                    f"Pass2 batch size mismatch for {prefix}: expected {expected}, got {n} (s={s}, e={e})."
+                    f"Pass2 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
 
             fx_flat = LazyTensor._flat2d_cpu_contig(fx, n)
