@@ -16,10 +16,13 @@ classifiers = [
   "Intended Audience :: Science/Research",
   "License :: Other/Proprietary License",
   "Programming Language :: Python",
+  "Programming Language :: Python :: Free Threading",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3 :: Free Threading"
   "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.13t",
+  "Programming Language :: Python :: 3.13 :: Free Threading"
+,
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
