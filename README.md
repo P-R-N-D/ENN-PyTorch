@@ -17,7 +17,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
   - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
 - **PyTorch**: >= 2.9.1
-- **torchao**: >= 0.11.0
+- **torchao**: >= 0.14.0
 
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
