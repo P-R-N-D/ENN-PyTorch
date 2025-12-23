@@ -1626,19 +1626,6 @@ class Session:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
-
-
-
-def _pick_first(mapping: Mapping[str, Any], keys: Sequence[str]) -> Any:
-    """Return the first non-None value for any of `keys` present in `mapping`."""
-    for k in keys:
-        with contextlib.suppress(Exception):
-            v = mapping.get(k, None)
-            if v is not None:
-                return v
-    return None
-
-
 def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype]) -> torch.Tensor:
     """Convert `obj` to a tensor and (best-effort) cast dtype only when needed."""
     t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)

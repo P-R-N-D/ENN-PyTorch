@@ -10,6 +10,7 @@ import os
 import platform
 import sys
 import threading
+import tempfile
 import time
 import warnings
 from collections.abc import Mapping
@@ -34,6 +35,66 @@ from tqdm.auto import tqdm
 
 from ..data.datatype import env_bool, env_float, env_int, parse_bool
 from ..data.pipeline import extract_xy
+
+
+def _atomic_write_json(path: str, payload: Any, *, indent: int | None = None) -> None:
+    """Atomically write JSON (best-effort).
+
+    Used for small sidecar metadata files that must not be left half-written
+    under multi-process or abrupt-interrupt scenarios.
+    """
+    p = os.fspath(path)
+    parent = os.path.dirname(p) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    os.close(fd)
+    try:
+        with open(tmp_name, "w", encoding="utf-8") as f:
+            if indent is None:
+                json.dump(payload, f)
+            else:
+                json.dump(payload, f, indent=int(indent))
+        os.replace(tmp_name, p)
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(tmp_name)
+
+
+def _mmt_meta_path(mmt_path: str) -> str:
+    return str(mmt_path) + ".meta.json"
+
+
+def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
+    """Write preds as MemoryMappedTensor (.mmt) plus a small sidecar meta JSON.
+
+    This enables truly lazy/random access on the reader side without loading
+    the full tensor into RAM.
+    """
+    if not isinstance(preds_cpu, torch.Tensor):
+        preds_cpu = torch.as_tensor(preds_cpu)
+    if preds_cpu.device.type != "cpu":
+        preds_cpu = preds_cpu.to(device="cpu")
+    preds_cpu = preds_cpu.detach()
+    if not bool(preds_cpu.is_contiguous()):
+        preds_cpu = preds_cpu.contiguous()
+
+    p = os.fspath(path)
+    parent = os.path.dirname(p) or "."
+    os.makedirs(parent, exist_ok=True)
+
+    # Best-effort atomic replace to avoid half-written .mmt files.
+    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    os.close(fd)
+    try:
+        MemoryMappedTensor.from_tensor(preds_cpu, filename=tmp_name, existsok=True)
+        os.replace(tmp_name, p)
+    finally:
+        with contextlib.suppress(Exception):
+            os.remove(tmp_name)
+
+    meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
+    _atomic_write_json(_mmt_meta_path(p), meta)
 
 _nvml = None
 _NVML_READY = False
@@ -639,7 +700,7 @@ def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
 
             params = getattr(mod, "_parameters", None)
             if params:
-                for name, p in list(params.items()):
+                for name, p in params.items():
                     if p is None or not isinstance(p, torch.Tensor):
                         continue
                     if (not p.is_floating_point()) or p.dtype == dtype:
@@ -649,7 +710,7 @@ def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
                     )
             bufs = getattr(mod, "_buffers", None)
             if bufs:
-                for name, b in list(bufs.items()):
+                for name, b in bufs.items():
                     if b is None or not isinstance(b, torch.Tensor):
                         continue
                     if (not b.is_floating_point()) or b.dtype == dtype:
@@ -789,7 +850,7 @@ def _assert_unified_layer_dtype(model: torch.nn.Module, device: torch.device) ->
 def _trim_dcp_keys(state: Any) -> Any:
     if isinstance(state, dict):
         keys = []
-        for key, value in list(state.items()):
+        for key, value in state.items():
             key_str = str(key)
             if (
                 key_str.endswith("._extra_state")
@@ -899,7 +960,7 @@ def _unify_param_dtype(
         params = getattr(mod, "_parameters", None)
         if not params:
             continue
-        for name, p in list(params.items()):
+        for name, p in params.items():
             if p is None or p.dtype == tgt:
                 continue
             new_p = torch.nn.Parameter(
@@ -1629,7 +1690,7 @@ def _drain_pool_handles(
     except Exception:
         pass
 
-    for _, h in list(pool_handles.items()):
+    for h in tuple(pool_handles.values()):
         with contextlib.suppress(Exception):
             cpu_pool.release(h)
     pool_handles.clear()
@@ -3592,37 +3653,6 @@ def infer(
     first_tail: Optional[Tuple[int, ...]] = None
     pending_tail: Optional[Tuple[int, ...]] = None
     variable_shape = False
-
-    def _pred_mmt_meta_path(path: str) -> str:
-        return str(path) + ".meta.json"
-
-    def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
-        """Write preds as MemoryMappedTensor (.mmt) plus a small sidecar meta JSON.
-
-        This enables truly lazy/random access on the reader side without loading
-        the full tensor into RAM.
-        """
-        if not isinstance(preds_cpu, torch.Tensor):
-            preds_cpu = torch.as_tensor(preds_cpu)
-        if preds_cpu.device.type != "cpu":
-            preds_cpu = preds_cpu.to(device="cpu")
-        if not bool(preds_cpu.is_contiguous()):
-            preds_cpu = preds_cpu.contiguous()
-
-        # Overwrite ok: chunk dirs are per-run.
-        MemoryMappedTensor.from_tensor(preds_cpu, filename=path, existsok=True)
-
-        meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
-        meta_path = _pred_mmt_meta_path(path)
-        tmp = meta_path + ".tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(meta, f)
-            os.replace(tmp, meta_path)
-        finally:
-            with contextlib.suppress(Exception):
-                if os.path.exists(tmp):
-                    os.remove(tmp)
 
     def _flush() -> None:
         nonlocal chunk_idx, pending_count, buf_fill, pending_tail

@@ -400,7 +400,15 @@ class Sampler(_Sampler):
         with suppress(Exception):
             default_tl = bool(Thread.nogil_optimizations_enabled())
         self._mmap_thread_local = env_bool(
-            ("STNET_MEMMAP_THREAD_LOCAL_HANDLES", "STNET_NOGIL"), default=default_tl
+            (
+                # Primary (code):
+                "STNET_MEMMAP_THREAD_LOCAL_HANDLES",
+                # Alias (README/backward-compat):
+                "STNET_MEMMAP_THREAD_LOCAL",
+                # Legacy: treat no-GIL toggle as opt-in.
+                "STNET_NOGIL",
+            ),
+            default=default_tl,
         )
 
         if self._mmap_thread_local:
