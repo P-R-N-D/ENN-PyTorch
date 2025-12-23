@@ -8,7 +8,7 @@ import os
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
 from types import TracebackType
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn

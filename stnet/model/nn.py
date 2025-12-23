@@ -1664,9 +1664,12 @@ class Scaler(nn.Module):
         denom = (x_centered * x_centered).sum(dim=0)
         num = (x_centered * y_centered).sum(dim=0)
 
-        denom_safe = denom.clone()
-        tiny_mask = denom_safe.abs() < self.eps
-        denom_safe[tiny_mask] = 1.0
+        tiny_mask = denom.abs() < self.eps
+        if bool(tiny_mask.any().item()):
+            denom_safe = denom.clone()
+            denom_safe[tiny_mask] = 1.0
+        else:
+            denom_safe = denom
 
         a64 = num / denom_safe
         b64 = y_mean - a64 * x_mean
@@ -2387,30 +2390,6 @@ class Root(nn.Module):
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = threading.Lock()
         self.__config = config
-
-    def _promote_float32_params(self) -> None:
-        def _promote_module(mod: Optional[nn.Module]) -> None:
-            if mod is None:
-                return
-            for name, param in list(mod.named_parameters(recurse=False)):
-                if torch.is_floating_point(param) and param.dtype == torch.float32:
-                    promoted = nn.Parameter(
-                        param.detach().to(dtype=torch.float64),
-                        requires_grad=param.requires_grad,
-                    )
-                    mod._parameters[name] = promoted
-            non_persistent = getattr(mod, "_non_persistent_buffers_set", set())
-            for name, buf in list(mod.named_buffers(recurse=False)):
-                if torch.is_floating_point(buf) and buf.dtype == torch.float32:
-                    mod.register_buffer(
-                        name,
-                        buf.to(dtype=torch.float64),
-                        persistent=name not in non_persistent,
-                    )
-            for child in mod.children():
-                _promote_module(child)
-
-        _promote_module(self)
 
     @staticmethod
     def _cast_graph_safe(x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:

@@ -16,7 +16,7 @@ import sysconfig
 import threading
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone, tzinfo
+from datetime import timezone, tzinfo
 from pathlib import Path
 from threading import Lock
 from types import ModuleType, SimpleNamespace
@@ -1030,14 +1030,6 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
         if len(encoded) > max_bytes:
             result = encoded[:max_bytes].decode("utf-8", "ignore")
     return result
-
-
-def _num_cuda_devices() -> int:
-    if not torch.cuda.is_available():
-        return 0
-    with contextlib.suppress(Exception):
-        return max(0, int(torch.cuda.device_count()))
-    return 0
 
 
 def get_runtime_config() -> SimpleNamespace:

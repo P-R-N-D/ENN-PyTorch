@@ -27,7 +27,7 @@ except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
-from ..backend.runtime import _trim_dcp_keys, main
+from ..backend.runtime import _torch_load_cpu, _trim_dcp_keys, main
 from ..backend.system import (
     WorkerPolicy,
     initialize_python_path,
@@ -99,27 +99,6 @@ def _clear_device_caches() -> None:
 
 
 # -----------------------------
-# Safer / more compatible loads
-# -----------------------------
-
-def _torch_load_cpu(path: str, *, weights_only: Optional[bool] = None) -> Any:
-    """torch.load wrapper with CPU map + best-effort weights_only support."""
-    # weights_only exists on modern PyTorch and is recommended for loading weights-only artifacts.
-    # On older versions, passing the kwarg raises TypeError.
-    if weights_only is not None:
-        try:
-            return torch.load(path, map_location="cpu", weights_only=bool(weights_only))
-        except TypeError:
-            return torch.load(path, map_location="cpu")
-        except Exception:
-            # Some files are not compatible with weights_only=True (e.g., keys lists).
-            if weights_only:
-                with contextlib.suppress(Exception):
-                    return torch.load(path, map_location="cpu", weights_only=False)
-            raise
-    return torch.load(path, map_location="cpu")
-
-
 def _preload_state(state: Any) -> Any:
     """Normalize a loaded state_dict for safe CPU-side use.
 
@@ -165,7 +144,8 @@ def _preload_state(state: Any) -> Any:
             t = t.detach()
 
         with contextlib.suppress(Exception):
-            t = t.contiguous()
+            if hasattr(t, "is_contiguous") and not bool(t.is_contiguous()):
+                t = t.contiguous()
         return t
 
     return state

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import inspect
-import math
 import warnings
 import os
 from typing import Any, Optional, Tuple
@@ -138,80 +137,6 @@ def reshape_for_mha(
     )
 
 
-def _dpa_sequence_length(
-    query: torch.Tensor, key: torch.Tensor, batch_first: bool
-) -> tuple[int, int, int]:
-
-    if batch_first:
-        if query.dim() < 2 or key.dim() < 2:
-            raise ValueError(
-                "expected query/key tensors with at least 2 dims when batch_first=True"
-            )
-        batch = int(query.shape[0])
-        seq_q = int(query.shape[1])
-        seq_k = int(key.shape[1])
-    else:
-        if query.dim() < 2 or key.dim() < 2:
-            raise ValueError(
-                "expected query/key tensors with at least 2 dims when batch_first=False"
-            )
-        batch = int(query.shape[1])
-        seq_q = int(query.shape[0])
-        seq_k = int(key.shape[0])
-    return batch, seq_q, seq_k
-
-
-def _expand_for_mha(
-    mask: torch.Tensor,
-    *args: Any,
-    batch: int,
-    heads: int,
-    seq_q: int,
-    seq_k: int,
-    device: torch.device,
-    **kwargs: Any,
-) -> torch.Tensor:
-
-    if mask.dtype is not torch.bool:
-        raise TypeError("expected boolean mask")
-    if mask.dim() == 2:
-        if mask.shape != (seq_q, seq_k):
-            raise ValueError(
-                f"mask shape {tuple(mask.shape)} incompatible with ({seq_q}, {seq_k})"
-            )
-        expanded = mask.view(1, 1, seq_q, seq_k).expand(batch, heads, seq_q, seq_k)
-    elif mask.dim() == 3:
-        if mask.shape == (batch, seq_q, seq_k):
-            expanded = mask.view(batch, 1, seq_q, seq_k).expand(
-                batch, heads, seq_q, seq_k
-            )
-        else:
-            raise ValueError(f"unsupported 3D mask shape {tuple(mask.shape)}")
-    elif mask.dim() == 4:
-        b, h, sq, sk = mask.shape
-        if b != batch or sq != seq_q or sk != seq_k:
-            raise ValueError(
-                f"mask shape {tuple(mask.shape)} incompatible with (batch={batch}, seq_q={seq_q}, seq_k={seq_k})"
-            )
-        if h == 1:
-            expanded = mask.expand(batch, heads, seq_q, seq_k)
-        elif h == heads:
-            expanded = mask
-        else:
-            raise ValueError(
-                f"mask head dimension {h} does not match expected heads {heads}"
-            )
-    else:
-        raise ValueError(f"unsupported mask rank {mask.dim()}")
-    return expanded.to(device=device, dtype=torch.bool, non_blocking=True)
-
-
-def _negative_inf(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    if not torch.is_floating_point(torch.empty((), dtype=dtype)):
-        dtype = torch.float32
-    return torch.tensor(float("-inf"), dtype=dtype, device=device)
-
-
 def _is_nvidia_te_supported() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -228,106 +153,6 @@ def _is_nvidia_te_supported() -> bool:
         pass
     return True
 
-
-def _to_nvidia_mask(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    attn_mask: Optional[torch.Tensor],
-    key_padding_mask: Optional[torch.Tensor],
-    *args: Any,
-    num_heads: int,
-    batch_first: bool,
-    **kwargs: Any,
-) -> Optional[torch.Tensor]:
-
-    # NOTE (mask semantics):
-    # - This project uses "mask-out" boolean masks at module boundaries:
-    #     True  => masked / disallowed
-    #     False => allowed
-    # - NVIDIA TE also uses mask-out masks.
-    # - PyTorch SDPA (scaled_dot_product_attention) uses a keep-mask for boolean masks
-    #   (True = allowed), so our DotProductAttention wrapper will invert bool masks for SDPA.
-
-    if attn_mask is None and key_padding_mask is None:
-        return None
-
-    batch, seq_q, seq_k = _dpa_sequence_length(query, key, batch_first)
-    device = query.device
-    dtype = query.dtype
-    heads = int(num_heads)
-    neg_inf = _negative_inf(dtype, device)
-    mask_dtype = neg_inf.dtype
-    zero_scalar = torch.zeros((), dtype=mask_dtype, device=device)
-    float_mask: Optional[torch.Tensor] = None
-
-    try:
-        if attn_mask is not None:
-            if attn_mask.dtype is torch.bool:
-                expanded = _expand_for_mha(
-                    attn_mask,
-                    batch=batch,
-                    heads=heads,
-                    seq_q=seq_q,
-                    seq_k=seq_k,
-                    device=device,
-                )
-                float_mask = torch.where(expanded, neg_inf, zero_scalar)
-            elif torch.is_floating_point(attn_mask):
-                am = attn_mask.to(device=device, dtype=mask_dtype, non_blocking=True)
-                if am.dim() == 2:
-                    if am.shape != (seq_q, seq_k):
-                        return None
-                    float_mask = (
-                        am.view(1, 1, seq_q, seq_k)
-                        .expand(batch, heads, seq_q, seq_k)
-                        .clone()
-                    )
-                elif am.dim() == 3:
-                    if am.shape != (batch, seq_q, seq_k):
-                        return None
-                    float_mask = (
-                        am.view(batch, 1, seq_q, seq_k)
-                        .expand(batch, heads, seq_q, seq_k)
-                        .clone()
-                    )
-                elif am.dim() == 4:
-                    if (
-                        am.shape[0] != batch
-                        or am.shape[2] != seq_q
-                        or am.shape[3] != seq_k
-                    ):
-                        return None
-                    if am.shape[1] == 1:
-                        float_mask = am.expand(batch, heads, seq_q, seq_k).clone()
-                    elif am.shape[1] == heads:
-                        float_mask = am.clone()
-                    else:
-                        return None
-                else:
-                    return None
-            else:
-                return None
-
-        if key_padding_mask is not None:
-            if key_padding_mask.dtype is not torch.bool:
-                key_padding_mask = key_padding_mask.to(
-                    device=device, dtype=torch.bool, non_blocking=True
-                )
-            else:
-                key_padding_mask = key_padding_mask.to(device=device, non_blocking=True)
-            if key_padding_mask.dim() != 2 or key_padding_mask.shape != (batch, seq_k):
-                return None
-            padding = key_padding_mask.view(batch, 1, 1, seq_k)
-            pad_values = torch.where(
-                padding.expand(batch, heads, seq_q, seq_k),
-                neg_inf,
-                zero_scalar,
-            )
-            float_mask = pad_values if float_mask is None else float_mask + pad_values
-
-        return float_mask.contiguous() if float_mask is not None else None
-    except Exception:
-        return None
 
 
 _HAS_TE: bool
