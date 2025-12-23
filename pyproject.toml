@@ -19,9 +19,7 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.13t",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
@@ -43,7 +41,7 @@ safetensors = ["safetensors>=0.4.0"]
 pandas = ["pandas>=2.2.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
 pandas_on_spark = ["pyspark[pandas_on_spark]>=4.0.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
 polars = ["polars>=1.30.0", "openpyxl>=3.1.5", "fastexcel>=0.14.0", "xlsxwriter>=3.2.0"]
-torchao = ["torchao>=0.11.0"]
+torchao = ["torchao>=0.14.0"]
 nvidia_te_cu12 = ["transformer-engine-cu12>=2.2.0", "transformer-engine-torch>=2.2.0"]
 nvidia_te_cu13 = ["transformer-engine-cu13>=2.2.0", "transformer-engine-torch>=2.2.0"]
 intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
