@@ -374,6 +374,23 @@ def _atomic_write_json(path: str, payload: Any) -> None:
             os.remove(tmp_name)
 
 
+def read_json(path: str) -> Any:
+    """Read and parse JSON payload from ``path``.
+
+    This thin wrapper exists for symmetry with ``write_json_atomic`` and to avoid
+    sprinkling ``json.load`` calls throughout prediction assembly helpers.
+    """
+
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json_atomic(path: str, payload: Any) -> None:
+    """Atomically write JSON using :func:`_atomic_write_json`."""
+
+    _atomic_write_json(path, payload)
+
+
 def _parse_dtype(dtype_s: Any) -> Optional[torch.dtype]:
     if isinstance(dtype_s, torch.dtype):
         return dtype_s
@@ -1526,7 +1543,7 @@ def predict(
 
     if TensorDictBase is not None and isinstance(data, TensorDictBase):
         try:
-            X_raw, _Y_raw = extract_xy(data, allow_missing_labels=True)
+            X_raw, _Y_raw = extract_xy(data, labels_required=False)
             if X_raw is None or not hasattr(X_raw, "shape"):
                 raise ValueError("TensorDict input must contain a feature column ('X'/'x' etc).")
             count = int(X_raw.shape[0])
