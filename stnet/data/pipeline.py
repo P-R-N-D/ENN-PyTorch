@@ -1626,13 +1626,20 @@ class Session:
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         self.close()
-def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype]) -> torch.Tensor:
-    """Convert `obj` to a tensor and (best-effort) cast dtype only when needed."""
+
+def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype] = None) -> Optional[torch.Tensor]:
+    """Convert `obj` to a tensor and (best-effort) cast dtype only when needed.
+
+    Returns None when obj is None (used for optional labels).
+    """
+    if obj is None:
+        return None
+
     t = obj if isinstance(obj, torch.Tensor) else torch.as_tensor(obj)
     if dtype is not None and isinstance(t, torch.Tensor):
         with contextlib.suppress(Exception):
             if t.dtype != dtype:
-                t = t.to(dtype=dtype)
+                t = t.to(dtype=dtype, copy=False)
     return t
 
 

@@ -16,29 +16,6 @@ import torch
 from .datatype import env_flag as _env_flag
 
 
-_FEATURE_KEY_ALIASES = frozenset(
-    {
-        "x",
-        "feature",
-        "features",
-        "input",
-        "inputs",
-        "in",
-    }
-)
-
-_LABEL_KEY_ALIASES = frozenset(
-    {
-        "y",
-        "label",
-        "labels",
-        "output",
-        "outputs",
-        "out",
-    }
-)
-
-
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
@@ -687,35 +664,71 @@ class LazyTensor:
         data: Mapping[Any, Any],
         *,
         keys: Optional[Sequence[Any]] = None,
-    ) -> Tuple[Tuple[Any, ...], Any, Any]:
-        """Build (keys, get_batch, get_by_indices) helpers for key-index mappings."""
-        from operator import itemgetter
+    ) -> Tuple[int, Any]:
+        """Build (count, get_batch) helpers for key-index mappings.
 
-        keys_t = tuple(data.keys()) if keys is None else tuple(keys)
-        if not keys_t:
+        IMPORTANT: This intentionally does *not* provide random access or writer-side shuffling.
+        Shuffling should be handled by the sampler at read time.
+
+        The returned get_batch() is optimized for sequential access patterns:
+        - expects monotonically increasing (s, e) windows within a pass
+        - supports automatic reset when s==0 (used by two-pass writers)
+        """
+
+        if keys is None:
+            count = int(len(data))
+
+            def _iter_keys() -> Any:
+                return iter(data.keys())
+
+        else:
+            count = int(len(keys))
+
+            def _iter_keys() -> Any:
+                return iter(keys)
+
+        if count <= 0:
             raise ValueError("Empty mapping: no keys")
 
+        it = _iter_keys()
+        pos = 0
+
         def get_batch(s: int, e: int):
-            return LazyTensor.KeyIndexMappingView(data, keys_t[int(s) : int(e)])
+            nonlocal it, pos
+            s_i = int(s)
+            e_i = int(e)
+            if s_i < 0 or e_i < s_i:
+                raise ValueError(f"invalid batch slice: s={s_i}, e={e_i}")
 
-        def get_by_indices(idx: torch.Tensor):
-            idx = LazyTensor._idx_to_cpu_int64(idx)
-            if idx.numel() == 0:
+            # Two-pass writer resets to s==0 on the second pass.
+            if s_i == 0 and pos != 0:
+                it = _iter_keys()
+                pos = 0
+
+            # Sequential-only contract: avoids O(N^2) islice-based skipping.
+            if s_i != pos:
+                raise RuntimeError(
+                    "key_index_mapping_getters: non-sequential access requested "
+                    f"(expected s={pos}, got s={s_i}). "
+                    "Disable writer-side shuffle; let the sampler handle shuffling."
+                )
+
+            need = e_i - s_i
+            if need <= 0:
                 return LazyTensor.KeyIndexMappingView(data, ())
-            if idx.numel() == 1:
-                k = keys_t[int(idx.item())]
-                return LazyTensor.KeyIndexMappingView(data, (k,))
 
-            ii = idx.tolist()
-            try:
-                sel = itemgetter(*ii)(keys_t)
-            except Exception:
-                sel = [keys_t[int(i)] for i in ii]
-            if not isinstance(sel, tuple):
-                sel = (sel,)
-            return LazyTensor.KeyIndexMappingView(data, sel)
+            batch_keys: list[Any] = []
+            for _ in range(int(need)):
+                try:
+                    k = next(it)
+                except StopIteration:
+                    break
+                batch_keys.append(k)
 
-        return keys_t, get_batch, get_by_indices
+            pos += int(len(batch_keys))
+            return LazyTensor.KeyIndexMappingView(data, batch_keys)
+
+        return count, get_batch
 
     @staticmethod
     def is_feature_label_batch_mapping(obj: Any) -> bool:
@@ -732,6 +745,9 @@ class LazyTensor:
         """
         if not isinstance(obj, Mapping) or not obj:
             return False
+
+        # Centralized alias sets live in pipeline.py.
+        from .pipeline import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES
 
         for k in obj.keys():
             if not isinstance(k, str):
@@ -791,9 +807,20 @@ class LazyTensor:
         return idx.to(dtype=torch.int64, copy=False)
 
     @staticmethod
-    def _atomic_write_json(path: str, payload: dict, *, indent: int = 2) -> None:
+    def mmt_meta_path(mmt_path: str) -> str:
+        """Sidecar metadata path for a MemoryMappedTensor file."""
+        return str(mmt_path) + ".meta.json"
+
+    @staticmethod
+    def atomic_write_json(path: str, payload: Any, *, indent: int | None = 2) -> None:
+        """Atomically write JSON (best-effort).
+
+        Used for small sidecar metadata files that must not be left half-written
+        under multi-process or abrupt-interrupt scenarios.
+        """
+
         import json as _json
-        
+
         p = os.fspath(path)
         parent = os.path.dirname(p) or "."
         os.makedirs(parent, exist_ok=True)
@@ -802,11 +829,19 @@ class LazyTensor:
         os.close(fd)
         try:
             with open(tmp_name, "w", encoding="utf-8") as f:
-                _json.dump(payload, f, indent=int(indent))
+                if indent is None:
+                    _json.dump(payload, f)
+                else:
+                    _json.dump(payload, f, indent=int(indent))
             os.replace(tmp_name, p)
         finally:
             with contextlib.suppress(Exception):
                 os.remove(tmp_name)
+
+    # Backward-compatible alias (internal call sites)
+    @staticmethod
+    def _atomic_write_json(path: str, payload: Any, *, indent: int = 2) -> None:
+        LazyTensor.atomic_write_json(path, payload, indent=int(indent))
 
     @staticmethod
     def _atomic_torch_save(path: str, payload: Any) -> None:

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -197,11 +198,14 @@ _DTYPE_ALIASES: dict[str, str] = {
     "float": "float32",
     "float_": "float32",
     "double": "float64",
+    "fp64": "float64",
     "float32": "float32",
+    "fp32": "float32",
     "float64": "float64",
     "float16": "float16",
     "half": "float16",
     "halffloat": "float16",
+    "fp16": "float16",
     "boolean": "bool",
     "bool_": "bool",
     "bool": "bool",
@@ -210,6 +214,12 @@ _DTYPE_ALIASES: dict[str, str] = {
     "f16": "float16",
     "f32": "float32",
     "f64": "float64",
+    # ints
+    "long": "int64",
+    "int": "int32",
+    "short": "int16",
+    "char": "int8",
+    "byte": "uint8",
     "i8": "int8",
     "i16": "int16",
     "i32": "int32",
@@ -277,6 +287,50 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
         return mapping[normalized]
     except KeyError as e:
         raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
+
+
+def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
+    """Best-effort torch dtype parser.
+
+    Accepts:
+      - torch.dtype
+      - strings like "float32", "torch.float32", "fp32", "long", ...
+      - numpy dtypes / dtype-like objects
+
+    Returns None when parsing fails (caller can fall back to a default).
+    """
+
+    if src is None:
+        return None
+    if isinstance(src, torch.dtype):
+        return src
+    try:
+        return to_platform_dtype(src, "torch")
+    except Exception:
+        pass
+
+    # Fallback: torch.<name> attribute lookup.
+    try:
+        key = str(src).strip()
+    except Exception:
+        return None
+
+    if not key:
+        return None
+    if key.startswith("torch."):
+        key = key.split(".", 1)[1]
+    with contextlib.suppress(Exception):
+        dt = getattr(torch, key)
+        if isinstance(dt, torch.dtype):
+            return dt
+    return None
+
+
+def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
+    """Parse a torch dtype from a name-like input; fall back to `default`."""
+
+    dt = parse_torch_dtype(name)
+    return dt if isinstance(dt, torch.dtype) else default
 
 
 def to_torch_tensor(obj: Any) -> torch.Tensor:
