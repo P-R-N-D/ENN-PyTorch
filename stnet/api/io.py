@@ -7,6 +7,7 @@ import logging
 import os
 import tempfile
 import threading
+import weakref
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
@@ -36,6 +37,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
+from ..data.collections import LazyTensor
 from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config, model_config_to_dict
 
@@ -45,7 +47,7 @@ _LOGGER = logging.getLogger(__name__)
 # This does not stop training by itself, but prevents concurrent saves and is
 # a good hook point if the training loop cooperates.
 _SAVE_LOCK_GUARD = threading.Lock()
-_SAVE_PATH_LOCKS: dict[str, threading.RLock] = {}
+_SAVE_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
 
 
 def _save_lock_for(path: str | Path | None) -> threading.RLock:
@@ -182,10 +184,6 @@ def _json_sanitize(obj: Any) -> Any:
     return str(obj)
 
 
-def _json_default(obj: Any) -> Any:
-    return _json_sanitize(obj)
-
-
 def _get_dist():
     try:
         import torch.distributed as dist  # type: ignore
@@ -204,27 +202,6 @@ def _is_rank0_global() -> bool:
     except Exception:
         pass
     return True
-
-
-def _local_rank_from_env() -> Optional[int]:
-    # Common launchers:
-    for key in ("LOCAL_RANK", "SLURM_LOCALID", "MPI_LOCALRANKID", "OMPI_COMM_WORLD_LOCAL_RANK"):
-        v = os.environ.get(key)
-        if v is None:
-            continue
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _is_rank0_local() -> bool:
-    # Prefer local rank env vars when present; fallback to global rank.
-    lr = _local_rank_from_env()
-    if lr is not None:
-        return lr == 0
-    return _is_rank0_global()
 
 
 def _dist_barrier() -> None:
@@ -248,45 +225,6 @@ def _save_sync(path: str | Path | None = None) -> Any:
             yield
         finally:
             _dist_barrier()
-
-
-def _atomic_write_text(path: Path, text: str, encoding: str = "utf-8") -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=path.suffix + ".tmp", dir=str(path.parent)
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        tmp_path.write_text(text, encoding=encoding)
-        tmp_path.replace(path)
-    finally:
-        with contextlib.suppress(Exception):
-            if tmp_path.exists():
-                tmp_path.unlink()
-
-
-def _atomic_torch_save(obj: Any, path: Path, **opts: Any) -> None:
-    """Atomically write a torch checkpoint file.
-
-    Writes to a temporary file in the same directory and then renames into place.
-    This avoids corrupting checkpoints if the process is interrupted mid-write.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=path.name + ".", suffix=path.suffix + ".tmp", dir=str(path.parent)
-    )
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    try:
-        torch.save(obj, str(tmp_path), **opts)
-        tmp_path.replace(path)
-    finally:
-        with contextlib.suppress(Exception):
-            if tmp_path.exists():
-                tmp_path.unlink()
 
 
 def _torch_load_checkpoint(
@@ -498,7 +436,7 @@ def save_model(
 ) -> str:
     p = Path(path)
 
-    # Native torch checkpoint path (rank0-local only for single-file outputs).
+    # Native torch checkpoint path (global-rank0 only for single-file outputs).
     if TorchIO.is_native_target(p):
         if args:
             # Native path does not accept positional args (kept only for export converters).
@@ -552,7 +490,7 @@ class TorchIO:
 
         # Distributed checkpoint directory case:
         # - All ranks participate in dcp_save
-        # - Only local-rank0 writes meta.json
+        # - Only global-rank0 writes meta.json
         if not suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
@@ -572,18 +510,12 @@ class TorchIO:
                     "extra": _json_sanitize(extra or {}),
                 }
                 meta_path = p / "meta.json"
-                if _is_rank0_local():
-                    meta_text = json.dumps(meta, indent=2, default=_json_default)
-                    _atomic_write_text(meta_path, meta_text, encoding="utf-8")
+                if _is_rank0_global():
+                    # Ensure JSON-serializable payload (Path/device/dtype, etc.).
+                    LazyTensor.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
             return p
 
-        # Single-file targets are local-rank0 only.
-        if not _is_rank0_local():
-            # Return the resolved destination path without writing.
-            if not suffix:
-                return p.with_suffix(".pt")
-            return p
-
+        # Normalize extension for single-file targets.
         if not suffix:
             p = p.with_suffix(".pt")
             suffix = ".pt"
@@ -591,6 +523,9 @@ class TorchIO:
         p.parent.mkdir(parents=True, exist_ok=True)
 
         with _save_sync(p):
+            if not _is_rank0_global():
+                return p
+
             # safetensors: CPU tensors only; include sidecar json.
             if suffix == ".safetensors":
                 _is_required("safetensors", "pip install safetensors")
@@ -621,8 +556,7 @@ class TorchIO:
                     "extra": _json_sanitize(extra or {}),
                 }
                 meta_path = p.with_suffix(".json")
-                meta_text = json.dumps(meta, indent=2, default=_json_default)
-                _atomic_write_text(meta_path, meta_text, encoding="utf-8")
+                LazyTensor.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
                 return p
 
             # torch.save payload: always sanitize extra for weights_only-friendly loads.
@@ -642,7 +576,7 @@ class TorchIO:
             if extra is not None:
                 payload["extra"] = _json_sanitize(extra)
 
-            _atomic_torch_save(payload, p, **opts)
+            LazyTensor.atomic_torch_save(p, payload, **opts)
             return p
 
 

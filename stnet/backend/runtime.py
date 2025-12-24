@@ -16,7 +16,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -1302,7 +1302,7 @@ def _scheduler(
 
 
 def _initialize_group(backend: str, device: torch.device, local_rank: int) -> None:
-    dev_id: Optional[Union[int, torch.device]] = None
+    dev_id: Optional[int | torch.device] = None
     dev_type = getattr(device, "type", "cpu")
     if dev_type in ("cuda", "xpu", "mps"):
         index = (
@@ -3470,7 +3470,7 @@ def epochs(
                 world = max(1, get_world_size(device)) if is_distributed() else 1
                 hist.end_session(end_sec, peers=world)
 
-                if ops.ckpt_dir and int(local_rank) == 0:
+                if ops.ckpt_dir and (not is_distributed() or int(torch.distributed.get_rank()) == 0):
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
                     records = hist.save()
 
@@ -3494,9 +3494,7 @@ def epochs(
                         "meta": meta,
                         "records": records,
                     }
-
-                    with open(history_path, "w", encoding="utf-8") as f:
-                        json.dump(payload, f)
+                    LazyTensor.atomic_write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:

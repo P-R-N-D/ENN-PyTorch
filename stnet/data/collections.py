@@ -844,7 +844,14 @@ class LazyTensor:
         LazyTensor.atomic_write_json(path, payload, indent=int(indent))
 
     @staticmethod
-    def _atomic_torch_save(path: str, payload: Any) -> None:
+    def atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
+        """Atomically write a torch checkpoint file.
+
+        Writes to a temporary file in the same directory and then replaces
+        it into place. This avoids corrupting checkpoints if interrupted
+        mid-write.
+        """
+
         p = os.fspath(path)
         parent = os.path.dirname(p) or "."
         os.makedirs(parent, exist_ok=True)
@@ -852,11 +859,16 @@ class LazyTensor:
         fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
         os.close(fd)
         try:
-            torch.save(payload, tmp_name)
+            torch.save(payload, tmp_name, **opts)
             os.replace(tmp_name, p)
         finally:
             with contextlib.suppress(Exception):
                 os.remove(tmp_name)
+
+    # Backward-compatible alias (internal call sites)
+    @staticmethod
+    def _atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
+        LazyTensor.atomic_torch_save(path, payload, **opts)
 
     @staticmethod
     def write_memmap_streaming_two_pass(
@@ -1024,14 +1036,6 @@ class LazyTensor:
                 dtype=store_float,
                 filename=labels_path,
                 existsok=True,
-            )
-
-        zeros_label_buf: Optional[torch.Tensor] = None
-        if write_labels and bool(allow_missing_labels):
-            zeros_label_buf = torch.zeros(
-                (int(chunk_second), *tuple(label_shape)),
-                dtype=store_float,
-                device=torch.device("cpu"),
             )
 
         # Shuffle indexer
@@ -1205,12 +1209,12 @@ class LazyTensor:
             features_mmt[int(s) : int(s) + int(n)].copy_(fx_out)
 
             if write_labels:
+                assert labels_mmt is not None
                 if lb is None:
                     if not allow_missing:
                         raise RuntimeError("memmap writer requires labels (got None)")
-                    if zeros_label_buf is None:
-                        raise RuntimeError("internal error: zeros_label_buf missing")
-                    lb_out = zeros_label_buf[:n]
+                    # Avoid large pre-allocated zero buffers: write zeros directly.
+                    labels_mmt[int(s) : int(s) + int(n)].zero_()
                 else:
                     if tuple(lb.shape[1:]) != tuple(label_shape):
                         raise RuntimeError(
@@ -1219,17 +1223,16 @@ class LazyTensor:
                     lb_cpu = LazyTensor._to_cpu_contig(lb)
                     lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
 
-                assert labels_mmt is not None
-                labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
+                    labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
 
-                if y_sum is not None and y_sum_sq is not None:
-                    end_pos = int(s) + int(n)
-                    overlap = max(0, min(end_pos, int(train_end)) - int(s))
-                    if overlap > 0:
-                        lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
-                        lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
-                        y_sum += lb64.sum(dim=0)
-                        y_sum_sq += lb64.square().sum(dim=0)
+                    if y_sum is not None and y_sum_sq is not None:
+                        end_pos = int(s) + int(n)
+                        overlap = max(0, min(end_pos, int(train_end)) - int(s))
+                        if overlap > 0:
+                            lb_slice = lb_out[:overlap].reshape(int(overlap), -1)
+                            lb64 = lb_slice if lb_slice.dtype == torch.float64 else lb_slice.to(dtype=torch.float64)
+                            y_sum += lb64.sum(dim=0)
+                            y_sum_sq += lb64.square().sum(dim=0)
 
             written += int(n)
 
