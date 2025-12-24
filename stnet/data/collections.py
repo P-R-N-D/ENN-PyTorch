@@ -4,9 +4,9 @@ from __future__ import annotations
 import contextlib
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple, Protocol, runtime_checkable
+from typing import Any, Optional, Tuple, Protocol, runtime_checkable
 
 import torch
 

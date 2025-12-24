@@ -3442,7 +3442,6 @@ def infer(
     dataset: Optional[Dataset] = None,
 ) -> Optional[Dict[Tuple, torch.Tensor]]:
 
-    import gc
     import glob
 
     if data_loader is None:

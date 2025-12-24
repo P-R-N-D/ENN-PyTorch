@@ -918,10 +918,13 @@ class CrossTransformer(nn.Module):
         requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
         mode_l = _coerce_modeling_types(requested)
 
-        if mode_l == "ss":
-            return self.cross_s(spatial_tokens, temporal_tokens)
-        if mode_l == "tt":
-            return self.cross_t(temporal_tokens, spatial_tokens)
+        match mode_l:
+            case "ss":
+                return self.cross_s(spatial_tokens, temporal_tokens)
+            case "tt":
+                return self.cross_t(temporal_tokens, spatial_tokens)
+            case _:
+                pass
 
         # Mixed mode: always compute both and return a stable concatenation.
         s_context = self.cross_s(spatial_tokens, temporal_tokens)  # (B, Ns, D)

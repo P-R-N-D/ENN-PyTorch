@@ -34,7 +34,6 @@ try:
     from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase
 except Exception:
     TensorDict = None  # type: ignore[assignment]
-    stack = None  # type: ignore[assignment]
     MemoryMappedTensor = None  # type: ignore[assignment]
 
     class TensorDictBase:  # type: ignore[no-redef]
@@ -2010,7 +2009,7 @@ class Collate:
                 return batch
 
             if all(isinstance(elem, TensorDictBase) for elem in batch):
-                stacked = torch.stack(list(batch), dim=0)
+                stacked = torch.stack(batch, dim=0)
                 with contextlib.suppress(Exception):
                     canonicalize_xy_keys_(stacked, allow_missing_labels=True)
                 try:
@@ -2105,12 +2104,12 @@ class Collate:
                 X: Any
                 Y: Any
                 if all(isinstance(x, torch.Tensor) for x in Xs):
-                    X = torch.stack(list(Xs), dim=0)
+                    X = torch.stack(Xs, dim=0)
                 else:
                     X = Xs
 
                 if all(isinstance(y, torch.Tensor) for y in Ys):
-                    Y = torch.stack(list(Ys), dim=0)
+                    Y = torch.stack(Ys, dim=0)
                 else:
                     Y = Ys
 
@@ -2759,51 +2758,96 @@ class Dataset(Generic[TExtra]):
                 keys = data.get("row_ids", None) or data.get("keys", None) or ()
             else:
                 # Heuristic: mapping may be {key: (feature, label)} or {feature: label}.
-                items = list(data.items())
-                keys = [k for (k, _v) in items]
-                values = [_v for (_k, _v) in items]
-
-                if values and isinstance(values[0], (list, tuple)) and len(values[0]) >= 2:
-                    feat_list = [_to_tensor_safe(v[0], self.feature_dtype) for v in values]
-                    label_list = [_to_tensor_safe(v[1], self.label_float_dtype) for v in values]
-                    features = torch.stack(feat_list, dim=0) if feat_list else None
-                    labels = torch.stack(label_list, dim=0) if label_list else None
+                # Avoid materializing list(data.items()) which can cause large transient allocations.
+                it = iter(data.items())
+                try:
+                    k0, v0 = next(it)
+                except StopIteration:
+                    keys = []
+                    values: list[Any] = []
                 else:
-                    parsed = False
-                    if keys and values:
-                        ksize0 = _feature_size_hint(keys[0])
-                        if ksize0 is not None and 1 < int(ksize0) <= 64:
-                            if all(_feature_size_hint(k) == ksize0 for k in keys):
-                                has_missing_labels = any((v is None for v in values))
-                                try:
-                                    feat_list = [
-                                        _to_tensor_safe(k, self.feature_dtype).reshape(-1) for k in keys
-                                    ]
-                                    features = torch.stack(feat_list, dim=0) if feat_list else None
-                                    if has_missing_labels:
-                                        labels = None
-                                        parsed = features is not None
-                                    else:
-                                        label_list = [
-                                            _to_tensor_safe(v, self.label_float_dtype) for v in values
-                                        ]
-                                        labels = (
-                                            torch.stack(label_list, dim=0) if label_list else None
-                                        )
-                                        parsed = features is not None and labels is not None
-                                except Exception:
-                                    parsed = False
+                    keys_list: list[Any] = [k0]
 
-                    if not parsed:
-                        features = (
-                            torch.stack(
-                                [_to_tensor_safe(v, self.feature_dtype) for v in values],
-                                dim=0,
-                            )
-                            if values
-                            else None
-                        )
+                    if isinstance(v0, (list, tuple)) and len(v0) >= 2:
+                        # Case: {row_id: (feature, label)}
+                        x0 = _to_tensor_safe(v0[0], self.feature_dtype)
+                        if x0 is None:
+                            raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
+                        feat_list: list[torch.Tensor] = [x0]
+                        label_list: list[torch.Tensor] = []
+                        has_missing_labels = v0[1] is None
+                        if not has_missing_labels:
+                            y0 = _to_tensor_safe(v0[1], self.label_float_dtype)
+                            if y0 is None:
+                                has_missing_labels = True
+                            else:
+                                label_list.append(y0)
+
+                        for k, v in it:
+                            keys_list.append(k)
+                            x_i = _to_tensor_safe(v[0], self.feature_dtype)
+                            if x_i is None:
+                                raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
+                            feat_list.append(x_i)
+                            if v[1] is None:
+                                if not has_missing_labels:
+                                    has_missing_labels = True
+                                    label_list.clear()
+                            elif not has_missing_labels:
+                                y_i = _to_tensor_safe(v[1], self.label_float_dtype)
+                                if y_i is None:
+                                    has_missing_labels = True
+                                    label_list.clear()
+                                else:
+                                    label_list.append(y_i)
+                        features = torch.stack(feat_list, dim=0) if feat_list else None
                         labels = None
+                        if not has_missing_labels:
+                            labels = torch.stack(label_list, dim=0) if label_list else None
+                        keys = keys_list
+                    else:
+                        # Case: mapping may be {key: feature} or {feature: label}
+                        values = [v0]
+                        for k, v in it:
+                            keys_list.append(k)
+                            values.append(v)
+                        keys = keys_list
+
+                        parsed = False
+                        if keys and values:
+                            ksize0 = _feature_size_hint(keys[0])
+                            if ksize0 is not None and 1 < int(ksize0) <= 64:
+                                if all(_feature_size_hint(k) == ksize0 for k in keys):
+                                    has_missing_labels = any((v is None for v in values))
+                                    try:
+                                        feat_list = [
+                                            _to_tensor_safe(k, self.feature_dtype).reshape(-1) for k in keys
+                                        ]
+                                        features = torch.stack(feat_list, dim=0) if feat_list else None
+                                        if has_missing_labels:
+                                            labels = None
+                                            parsed = features is not None
+                                        else:
+                                            label_list = [
+                                                _to_tensor_safe(v, self.label_float_dtype) for v in values
+                                            ]
+                                            labels = (
+                                                torch.stack(label_list, dim=0) if label_list else None
+                                            )
+                                            parsed = features is not None and labels is not None
+                                    except Exception:
+                                        parsed = False
+
+                        if not parsed:
+                            features = (
+                                torch.stack(
+                                    [_to_tensor_safe(v, self.feature_dtype) for v in values],
+                                    dim=0,
+                                )
+                                if values
+                                else None
+                            )
+                            labels = None
 
         if features is None:
             raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
