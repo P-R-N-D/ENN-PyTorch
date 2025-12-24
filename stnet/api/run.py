@@ -1221,14 +1221,13 @@ def _write_predictions_h5_from_memmaps(
     out_parent = os.path.dirname(out_path) or "."
     os.makedirs(out_parent, exist_ok=True)
     with h5py.File(out_path, "w") as f:
-        grp = f.require_group("data")
-        dset_X = grp.create_dataset(
+        dset_X = f.create_dataset(
             "X",
             shape=(n, int(X_mmt.shape[1])),
             dtype=x_np_dtype,
             chunks=(min(n, int(chunk_size)), int(X_mmt.shape[1])),
         )
-        dset_Y = grp.create_dataset(
+        dset_Y = f.create_dataset(
             "Y",
             shape=(n, *[int(x) for x in Y_mmt.shape[1:]]),
             dtype=y_np_dtype,
