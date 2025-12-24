@@ -7,7 +7,6 @@ import math
 import os
 import random
 from dataclasses import dataclass, field, replace
-from functools import partial
 from typing import (
     Any,
     Callable,
@@ -175,7 +174,7 @@ def canonicalize_xy_keys_(
 
 from ..backend.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
 from ..backend.system import Memory, WorkerPolicy, get_tlb
-from .datatype import env_first
+from .datatype import env_first, env_first_float, env_first_int
 
 _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
@@ -630,15 +629,13 @@ def _batch_interval(
     # Prefer instance-scoped per-sample bytes if present.
     per_sample = int(getattr(_ds, "_per_sample_mem_bytes", 0) or 0)
     if per_sample <= 0:
-        try:
-            env_v = (
-                os.environ.get("STNET_PER_SAMPLE_MEM_BYTES")
-                or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
+        per_sample = int(
+            env_first_int(
+                ("STNET_PER_SAMPLE_MEM_BYTES", "STNET_DEVICE_BYTES_PER_SAMPLE"),
+                default=0,
             )
-            if env_v is not None:
-                per_sample = int(env_v)
-        except Exception:
-            per_sample = 0
+            or 0
+        )
     if per_sample <= 0:
         per_sample = sbytes
 
@@ -657,59 +654,23 @@ def _batch_interval(
             _wp = None
             _max_conc, _streams, _lws = (1, 1, 1)
 
-    dev_margin = 0.90
-    host_margin = 0.10
+    # Environment-derived knobs (centralized via datatype.py helpers).
+    dev_margin = float(env_first_float(("STNET_DEVICE_MARGIN",), default=0.90) or 0.90)
+    host_margin = float(env_first_float(("STNET_HOST_MARGIN",), default=0.10) or 0.10)
 
     # Soft slack for auto-derived budgets (only used when budgets are unset).
-    budget_slack = 1.25
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_BUDGET_SLACK")
-        if v is not None and str(v).strip():
-            budget_slack = float(v)
+    budget_slack = float(env_first_float(("STNET_BUDGET_SLACK",), default=1.25) or 1.25)
     budget_slack = max(1.0, min(4.0, float(budget_slack)))
 
-    dev_budget_ratio = 1.0
-    dev_budget_min_bytes = 0
-    dev_budget_max_bytes: Optional[int] = None
+    dev_budget_ratio = float(env_first_float(("STNET_DEVICE_BUDGET_RATIO",), default=1.0) or 1.0)
+    dev_budget_min_bytes = int(env_first_int(("STNET_DEVICE_BUDGET_MIN_BYTES",), default=0) or 0)
+    _dev_budget_max = int(env_first_int(("STNET_DEVICE_BUDGET_MAX_BYTES",), default=0) or 0)
+    dev_budget_max_bytes: Optional[int] = None if _dev_budget_max <= 0 else int(_dev_budget_max)
 
-    host_budget_ratio = 1.0
-    host_budget_min_bytes = 0
-    host_budget_max_bytes: Optional[int] = None
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_MARGIN")
-        if v is not None and str(v).strip():
-            dev_margin = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_MARGIN")
-        if v is not None and str(v).strip():
-            host_margin = float(v)
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_RATIO")
-        if v is not None and str(v).strip():
-            dev_budget_ratio = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_MIN_BYTES")
-        if v is not None and str(v).strip():
-            dev_budget_min_bytes = int(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_MAX_BYTES")
-        if v is not None and str(v).strip():
-            dev_budget_max_bytes = int(v)
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_RATIO")
-        if v is not None and str(v).strip():
-            host_budget_ratio = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_MIN_BYTES")
-        if v is not None and str(v).strip():
-            host_budget_min_bytes = int(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_MAX_BYTES")
-        if v is not None and str(v).strip():
-            host_budget_max_bytes = int(v)
+    host_budget_ratio = float(env_first_float(("STNET_HOST_BUDGET_RATIO",), default=1.0) or 1.0)
+    host_budget_min_bytes = int(env_first_int(("STNET_HOST_BUDGET_MIN_BYTES",), default=0) or 0)
+    _host_budget_max = int(env_first_int(("STNET_HOST_BUDGET_MAX_BYTES",), default=0) or 0)
+    host_budget_max_bytes: Optional[int] = None if _host_budget_max <= 0 else int(_host_budget_max)
 
     dev_margin = max(0.0, min(1.0, float(dev_margin)))
     host_margin = max(0.0, min(1.0, float(host_margin)))
@@ -853,12 +814,11 @@ def _batch_interval(
     with contextlib.suppress(Exception):
         setattr(_ds, "_S_B_cap", int(B_cap))
 
-    env_max = os.environ.get("STNET_MAX_BATCH_SIZE") or os.environ.get("STNET_MAX_BATCH")
-    try:
-        if env_max:
-            B_cap = max(1, min(B_cap, int(env_max)))
-    except Exception:
-        pass
+    env_max = int(
+        env_first_int(("STNET_MAX_BATCH_SIZE", "STNET_MAX_BATCH"), default=0) or 0
+    )
+    if env_max > 0:
+        B_cap = max(1, min(B_cap, int(env_max)))
 
     with contextlib.suppress(Exception):
         setattr(_ds, "_S_B_cap", int(B_cap))
@@ -1010,6 +970,199 @@ def _process(
     return out
 
 
+def _td_batch_size_from_X(x: Any) -> list[int]:
+    """Infer TensorDict batch_size from an 'X' field."""
+    if isinstance(x, torch.Tensor) and x.ndim >= 1:
+        return [int(x.shape[0])]
+    return []
+
+
+@dataclass(slots=True)
+class Collate:
+    """Reusable collate function (callable object).
+
+    Avoids per-batch closure/partial allocation in hot dataloading loops.
+    """
+
+    labels_dtype: Optional[torch.dtype] = None
+    sanitize: bool = False
+    flatten_features: bool = False
+
+    def __call__(self, batch: Any) -> Any:
+        labels_dtype = self.labels_dtype
+        sanitize = bool(self.sanitize)
+        flatten_features = bool(self.flatten_features)
+
+        if isinstance(batch, (list, tuple)):
+            if not batch:
+                return batch
+
+            if all(isinstance(elem, TensorDictBase) for elem in batch):
+                stacked = torch.stack(list(batch), dim=0)
+                with contextlib.suppress(Exception):
+                    canonicalize_xy_keys_(stacked, allow_missing_labels=True)
+                try:
+                    conv = _process(
+                        stacked,
+                        flatten_features=flatten_features,
+                        labels_dtype=labels_dtype,
+                        sanitize=sanitize,
+                    )
+                except Exception:
+                    return stacked
+
+                # Update only the fields that exist (avoid exception-driven control flow).
+                if isinstance(conv, Mapping):
+                    if "X" in conv:
+                        stacked["X"] = conv["X"]
+                    if "Y" in conv and conv.get("Y", None) is not None:
+                        stacked["Y"] = conv["Y"]
+                    if "row_ids" in conv and conv.get("row_ids", None) is not None:
+                        stacked["row_ids"] = conv["row_ids"]
+                return stacked
+
+            if all(isinstance(elem, Mapping) for elem in batch):
+                if TensorDict is not None:
+                    samples = []
+                    for elem in batch:
+                        try:
+                            x_i, y_i = extract_xy(elem, labels_required=False)
+                        except Exception:
+                            x_i = elem.get("X")
+                            if x_i is None:
+                                x_i = elem.get("x")
+                            y_i = elem.get("Y", None)
+                            if y_i is None and "y" in elem:
+                                y_i = elem.get("y")
+
+                        x_t = _to_tensor_safe(x_i)
+                        y_t = _to_tensor_safe(y_i)
+
+                        sample_dict = {"X": x_t}
+                        if y_t is not None:
+                            sample_dict["Y"] = y_t
+
+                        try:
+                            rid = elem.get("row_ids", None)
+                            if rid is not None:
+                                rid_t = rid if isinstance(rid, torch.Tensor) else torch.as_tensor(rid)
+                                sample_dict["row_ids"] = rid_t.reshape(())
+                        except Exception:
+                            pass
+
+                        samples.append(TensorDict(sample_dict, batch_size=[]))
+
+                    stacked = torch.stack(samples, dim=0)
+                    canonicalize_xy_keys_(stacked)
+
+                    try:
+                        out = _process(
+                            stacked,
+                            flatten_features=flatten_features,
+                            labels_dtype=labels_dtype,
+                            sanitize=sanitize,
+                        )
+                    except Exception:
+                        out = stacked
+
+                    if isinstance(out, Mapping):
+                        if "X" in out:
+                            stacked.set("X", out["X"])
+                        if "Y" in out and out.get("Y", None) is not None:
+                            stacked.set("Y", out["Y"])
+                        if "row_ids" in out and out.get("row_ids", None) is not None:
+                            stacked.set("row_ids", out["row_ids"])
+
+                    return stacked
+
+                # Fallback (no TensorDict): stack into plain tensors/dicts.
+                Xs: list[Any] = []
+                Ys: list[Any] = []
+                for elem in batch:
+                    try:
+                        x_i, y_i = extract_xy(elem, labels_required=False)
+                    except Exception:
+                        x_i = elem.get("X")
+                        y_i = elem.get("Y", None)
+                    Xs.append(x_i)
+                    Ys.append(y_i)
+
+                Xs = [_to_tensor_safe(x) for x in Xs]
+                Ys = [_to_tensor_safe(y) for y in Ys]
+
+                X: Any
+                Y: Any
+                if all(isinstance(x, torch.Tensor) for x in Xs):
+                    X = torch.stack(list(Xs), dim=0)
+                else:
+                    X = Xs
+
+                if all(isinstance(y, torch.Tensor) for y in Ys):
+                    Y = torch.stack(list(Ys), dim=0)
+                else:
+                    Y = Ys
+
+                data: dict[str, Any] = {"X": X}
+                if isinstance(Y, torch.Tensor):
+                    data["Y"] = Y
+
+                try:
+                    rids = [elem.get("row_ids") for elem in batch]
+                    if rids and all(r is not None for r in rids):
+                        parts = [
+                            (r if isinstance(r, torch.Tensor) else torch.as_tensor(r)).reshape(-1)
+                            for r in rids
+                        ]
+                        row_ids = torch.cat(parts, dim=0) if parts else None
+                        if row_ids is not None:
+                            data["row_ids"] = row_ids
+                except Exception:
+                    pass
+
+                return data
+
+            return batch
+
+        if isinstance(batch, Mapping):
+            try:
+                conv = _process(
+                    batch,
+                    flatten_features=flatten_features,
+                    labels_dtype=labels_dtype,
+                    sanitize=sanitize,
+                )
+            except Exception:
+                conv = batch
+
+            X = conv.get("X", None) if isinstance(conv, Mapping) else None
+            Y = conv.get("Y", None) if isinstance(conv, Mapping) else None
+
+            if X is None:
+                with contextlib.suppress(Exception):
+                    X, Y = extract_xy(batch, labels_required=False)
+            if X is None:
+                X = batch.get("X")
+            if Y is None:
+                Y = batch.get("Y")
+
+            row_ids = None
+            if isinstance(conv, Mapping):
+                row_ids = conv.get("row_ids", None)
+            if row_ids is None:
+                row_ids = batch.get("row_ids")
+
+            data: dict[str, Any] = {"X": X}
+            if isinstance(Y, torch.Tensor):
+                data["Y"] = Y
+            if row_ids is not None:
+                data["row_ids"] = row_ids
+            if TensorDict is None:
+                return data
+            return TensorDict(data, batch_size=_td_batch_size_from_X(X))
+
+        return batch
+
+
 def collate(
     batch: Any,
     *args: Any,
@@ -1018,156 +1171,11 @@ def collate(
     flatten_features: bool = False,
     **kwargs: Any,
 ) -> Any:
-    converter = partial(
-        _process,
-        flatten_features=flatten_features,
+    return Collate(
         labels_dtype=labels_dtype,
-        sanitize=sanitize,
-    )
-
-    def _td_batch_size_from_X(x: Any) -> list[int]:
-        if isinstance(x, torch.Tensor) and x.ndim >= 1:
-            return [int(x.shape[0])]
-        return []
-
-    if isinstance(batch, (list, tuple)):
-        if not batch:
-            return batch
-
-        if all(isinstance(elem, TensorDictBase) for elem in batch):
-            stacked = torch.stack(list(batch), dim=0)
-            with contextlib.suppress(Exception):
-                canonicalize_xy_keys_(stacked, allow_missing_labels=True)
-            try:
-                conv = converter(stacked)
-            except Exception:
-                return stacked
-            stacked["X"] = conv["X"]
-            stacked["Y"] = conv["Y"]
-            if "row_ids" in conv:
-                stacked["row_ids"] = conv["row_ids"]
-            return stacked
-
-        if all(isinstance(elem, Mapping) for elem in batch):
-            if TensorDict is not None:
-                samples = []
-                for elem in batch:
-                    try:
-                        x_i, y_i = extract_xy(elem, labels_required=False)
-                    except Exception:
-                        x_i = elem.get("X")
-                        if x_i is None:
-                            x_i = elem.get("x")
-                        y_i = elem.get("Y", None)
-                        if y_i is None and "y" in elem:
-                            y_i = elem.get("y")
-
-                    x_t = _to_tensor_safe(x_i)
-                    y_t = _to_tensor_safe(y_i)
-
-                    sample_dict = {"X": x_t}
-                    if y_t is not None:
-                        sample_dict["Y"] = y_t
-
-                    try:
-                        rid = elem.get("row_ids", None)
-                        if rid is not None:
-                            rid_t = rid if isinstance(rid, torch.Tensor) else torch.as_tensor(rid)
-                            sample_dict["row_ids"] = rid_t.reshape(())
-                    except Exception:
-                        pass
-
-                    samples.append(TensorDict(sample_dict, batch_size=[]))
-
-                stacked = torch.stack(samples, dim=0)
-
-                canonicalize_xy_keys_(stacked)
-
-                try:
-                    out = converter(stacked)
-                except Exception:
-                    out = stacked
-
-                if isinstance(out, Mapping):
-                    if "X" in out:
-                        stacked.set("X", out["X"])
-                    if "Y" in out:
-                        stacked.set("Y", out["Y"])
-                    if "row_ids" in out and out["row_ids"] is not None:
-                        stacked.set("row_ids", out["row_ids"])
-
-                return stacked
-
-            Xs: list[Any] = []
-            Ys: list[Any] = []
-            for elem in batch:
-                try:
-                    x_i, y_i = extract_xy(elem, labels_required=False)
-                except Exception:
-                    x_i = elem.get("X")
-                    y_i = elem.get("Y", None)
-                Xs.append(x_i)
-                Ys.append(y_i)
-
-            Xs = [_to_tensor_safe(x) for x in Xs]
-            Ys = [_to_tensor_safe(y) for y in Ys]
-
-            if all(isinstance(x, torch.Tensor) for x in Xs):
-                X = torch.stack(Xs, dim=0)
-            else:
-                X = Xs
-
-            if all(isinstance(y, torch.Tensor) for y in Ys):
-                Y = torch.stack(Ys, dim=0)
-            else:
-                Y = Ys
-
-            data = {"X": X}
-            if isinstance(Y, torch.Tensor):
-                data["Y"] = Y
-
-            try:
-                rids = [elem.get("row_ids") for elem in batch]
-                if rids and all(r is not None for r in rids):
-                    parts = [
-                        (r if isinstance(r, torch.Tensor) else torch.as_tensor(r)).reshape(-1)
-                        for r in rids
-                    ]
-                    row_ids = torch.cat(parts, dim=0) if parts else None
-                    if row_ids is not None:
-                        data["row_ids"] = row_ids
-            except Exception:
-                pass
-
-            return data
-
-        return batch
-
-    if isinstance(batch, Mapping):
-        try:
-            conv = converter(batch)
-        except Exception:
-            conv = batch
-        X = conv.get("X", None)
-        Y = conv.get("Y", None)
-        if X is None:
-            with contextlib.suppress(Exception):
-                X, Y = extract_xy(batch, labels_required=False)
-        if X is None:
-            X = batch.get("X")
-        if Y is None:
-            Y = batch.get("Y")
-        row_ids = conv.get("row_ids", batch.get("row_ids"))
-        data = {"X": X}
-        if isinstance(Y, torch.Tensor):
-            data["Y"] = Y
-        if row_ids is not None:
-            data["row_ids"] = row_ids
-        if TensorDict is None:
-            return data
-        return TensorDict(data, batch_size=_td_batch_size_from_X(X))
-
-    return batch
+        sanitize=bool(sanitize),
+        flatten_features=bool(flatten_features),
+    )(batch)
 
 
 def compose(
@@ -1250,11 +1258,10 @@ def fetch(
     pf_depth_fixed = max(1, min(8, int(pf_depth_fixed)))
     pf_depth = int(pf_depth_fixed)
 
-    collate_fn = partial(
-        collate,
+    collate_fn = Collate(
         labels_dtype=labels_dtype,
-        sanitize=sanitize,
-        flatten_features=flatten_features,
+        sanitize=bool(sanitize),
+        flatten_features=bool(flatten_features),
     )
 
     allocated = Disposable()
@@ -2175,40 +2182,37 @@ class Dataset(Generic[TExtra]):
             return torch.device("cuda")
         return torch.device("cpu")
 
-    def _refresh_dtypes_from_env(self) -> None:
-        def _parse_dtypes(value: str) -> Tuple[torch.dtype, ...]:
-            entries = []
-            for token in value.split(","):
-                name = token.strip()
-                if not name:
-                    continue
-                dtype = getattr(torch, name, None)
-                if isinstance(dtype, torch.dtype):
-                    entries.append(dtype)
-            return tuple(entries)
+    @staticmethod
+    def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
+        entries: list[torch.dtype] = []
+        for token in str(value).split(","):
+            name = token.strip()
+            if not name:
+                continue
+            dtype = getattr(torch, name, None)
+            if isinstance(dtype, torch.dtype):
+                entries.append(dtype)
+        return tuple(entries)
 
-        float_env = os.environ.get("STNET_DATA_FLOAT_DTYPES") or os.environ.get("STNET_FLOAT_DTYPES")
+    def _refresh_dtypes_from_env(self) -> None:
+        float_env = env_first(("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES"))
         if float_env:
-            parsed = _parse_dtypes(float_env)
+            parsed = self._parse_dtypes_env(float_env)
             if parsed:
                 self.float_dtypes = parsed
 
-        int_env = os.environ.get("STNET_DATA_INT_DTYPES") or os.environ.get("STNET_INT_DTYPES")
+        int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
         if int_env:
-            parsed = _parse_dtypes(int_env)
+            parsed = self._parse_dtypes_env(int_env)
             if parsed:
                 self.int_dtypes = parsed
 
     def _refresh_quant_from_env(self) -> None:
-        env_bits = os.environ.get("STNET_DATA_INT_QUANT_BITS") or os.environ.get("STNET_INT_QUANT_BITS")
-        if env_bits:
-            env_bits = env_bits.strip()
-            try:
-                bits = int(env_bits)
-                if bits > 0:
-                    self.int_quant_bits = bits
-            except Exception:
-                pass
+        bits = env_first_int(
+            ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
+        )
+        if bits > 0:
+            self.int_quant_bits = int(bits)
 
     @classmethod
     def is_float8_supported(

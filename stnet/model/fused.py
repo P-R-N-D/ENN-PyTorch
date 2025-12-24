@@ -714,25 +714,22 @@ class Gradient:
 
                     try:
                         if getattr(_inductor_config, "compile_threads", None) is not None:
-                            import os
-
                             # max-autotune can be very memory hungry; default to serial compilation
                             # unless the user explicitly overrides the thread count.
-                            override = None
-                            for _k in (
-                                "STNET_INDUCTOR_COMPILE_THREADS",
-                                "STNET_COMPILE_THREADS",
-                                "TORCHINDUCTOR_COMPILE_THREADS",
-                            ):
-                                try:
-                                    _v = os.environ.get(_k)
-                                    if _v is not None and str(_v).strip():
-                                        override = int(_v)
-                                        break
-                                except Exception:
-                                    continue
+                            override_raw = env_first(
+                                (
+                                    "STNET_INDUCTOR_COMPILE_THREADS",
+                                    "STNET_COMPILE_THREADS",
+                                    "TORCHINDUCTOR_COMPILE_THREADS",
+                                )
+                            )
+                            override_valid = False
+                            if override_raw is not None:
+                                with contextlib.suppress(Exception):
+                                    int(override_raw)
+                                    override_valid = True
 
-                            if override is None:
+                            if not override_valid:
                                 _inductor_config.compile_threads = 1
                     except Exception:
                         pass

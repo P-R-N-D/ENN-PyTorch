@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import inspect
 import warnings
-import os
 from typing import Any, Optional, Tuple
 
 import torch
@@ -13,6 +12,7 @@ from torch import nn
 from ..functional.profiler import FLOP_PROFILER, capture
 from ..backend.system import get_device, get_dpa_backends, get_runtime_config
 from ..backend.compat import torch_no_compile
+from ..data.datatype import env_str
 
 try:
     import triton
@@ -44,6 +44,103 @@ except Exception:
     tl = _TLStub()  # type: ignore[assignment]
 
 _HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
+
+
+def _flatten_attn_mask4(
+    mask: torch.Tensor,
+    *,
+    device: torch.device,
+    B: int,
+    H: int,
+    L: int,
+    S: int,
+) -> tuple[torch.Tensor, int, int, int]:
+    """Normalize a mask/bias into a compact 4D (B?, H?, L?, S) tensor.
+
+    Supports broadcast on batch/head and *query length* (L? can be 1 or L).
+    Returns (mask4, batch_dim, head_dim, q_dim).
+
+    Kept at module scope to avoid per-forward nested function creation.
+    """
+    if mask.dim() == 0:
+        # Scalar mask: broadcast to all positions (rare; keep it simple).
+        m = mask.to(device=device).view(1, 1, 1, 1)
+        m = m.expand(1, 1, 1, int(S))
+        return m, 1, 1, 1
+
+    # Rank-1: key-only mask (S,)
+    if mask.dim() == 1:
+        if int(mask.shape[0]) != int(S):
+            raise RuntimeError(
+                f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
+            )
+        m = mask.to(device=device).view(1, 1, 1, int(S))
+        return m, 1, 1, 1
+
+    if mask.dim() == 2:
+        a, b = int(mask.shape[0]), int(mask.shape[1])
+        if b != int(S):
+            raise RuntimeError(
+                f"attn_mask trailing dim {b} does not match expected S={int(S)}"
+            )
+        if a == int(L):
+            m = mask.to(device=device).view(1, 1, int(L), int(S))
+            return m, 1, 1, int(L)
+        if a == 1:
+            # (1,S) -> key-only
+            m = mask.to(device=device).view(1, 1, 1, int(S))
+            return m, 1, 1, 1
+        if a == int(B):
+            # (B,S) -> per-batch key-only
+            m = mask.to(device=device).view(int(B), 1, 1, int(S))
+            return m, int(B), 1, 1
+        raise RuntimeError(
+            f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
+        )
+
+    if mask.dim() == 3:
+        a, b, c = int(mask.shape[0]), int(mask.shape[1]), int(mask.shape[2])
+        if c != int(S):
+            raise RuntimeError(
+                f"attn_mask trailing dim {c} does not match expected S={int(S)}"
+            )
+        if (a == int(B)) and (b == int(L)):
+            m = mask.to(device=device).view(int(B), 1, int(L), int(S))
+            return m, int(B), 1, int(L)
+        if (a == int(B)) and (b == 1):
+            # (B,1,S) -> per-batch key-only
+            m = mask.to(device=device).view(int(B), 1, 1, int(S))
+            return m, int(B), 1, 1
+        if (a == int(H)) and (b == int(L)):
+            # (H,L,S) -> head-specific, broadcast batch
+            m = mask.to(device=device).view(1, int(H), int(L), int(S))
+            return m, 1, int(H), int(L)
+        if (a == int(B)) and (b == int(H)):
+            # (B,H,S) -> per-(B,H) key-only
+            m = mask.to(device=device).view(int(B), int(H), 1, int(S))
+            return m, int(B), int(H), 1
+        raise RuntimeError(
+            f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, H={int(H)}, L={int(L)}, S={int(S)})"
+        )
+
+    if mask.dim() == 4:
+        b0, h0, l0, s0 = map(int, mask.shape)
+        if s0 != int(S):
+            raise RuntimeError(
+                f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
+            )
+        if b0 not in (1, int(B)):
+            raise RuntimeError(f"attn_mask batch dim {b0} incompatible with B={int(B)}")
+        if h0 not in (1, int(H)):
+            raise RuntimeError(f"attn_mask head dim {h0} incompatible with H={int(H)}")
+        if l0 not in (1, int(L)):
+            raise RuntimeError(
+                f"attn_mask query dim {l0} incompatible with L={int(L)} (broadcast 1 or L allowed)"
+            )
+        m = mask.to(device=device)
+        return m, b0, h0, l0
+
+    raise RuntimeError(f"attn_mask rank {int(mask.dim())} not supported")
 
 
 def _estimate_flops_msr(
@@ -382,103 +479,19 @@ class DotProductAttention(nn.Module):
             else:
                 mask_bool = m.to(torch.bool)
 
-        def _flatten_mask(mask: torch.Tensor) -> tuple[torch.Tensor, int, int, int]:
-            """
-            Normalize a mask/bias into a compact 4D (B?, H?, L?, S) tensor.
-
-            Supports broadcast on batch/head and *query length* (L? can be 1 or L).
-            Returns (mask4, batch_dim, head_dim, q_dim).
-            """
-            if mask.dim() == 0:
-                # Scalar mask: broadcast to all positions (rare; keep it simple).
-                m = mask.to(device=q_bshd.device).view(1, 1, 1, 1)
-                m = m.expand(1, 1, 1, S)
-                return m, 1, 1, 1
-
-            # Rank-1: key-only mask (S,)
-            if mask.dim() == 1:
-                if int(mask.shape[0]) != int(S):
-                    raise RuntimeError(
-                        f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={S}"
-                    )
-                m = mask.to(device=q_bshd.device).view(1, 1, 1, S)
-                return m, 1, 1, 1
-
-            if mask.dim() == 2:
-                a, b = int(mask.shape[0]), int(mask.shape[1])
-                if b != int(S):
-                    raise RuntimeError(
-                        f"attn_mask trailing dim {b} does not match expected S={S}"
-                    )
-                if a == int(L):
-                    m = mask.to(device=q_bshd.device).view(1, 1, L, S)
-                    return m, 1, 1, int(L)
-                if a == 1:
-                    # (1,S) -> key-only
-                    m = mask.to(device=q_bshd.device).view(1, 1, 1, S)
-                    return m, 1, 1, 1
-                if a == int(B):
-                    # (B,S) -> per-batch key-only
-                    m = mask.to(device=q_bshd.device).view(B, 1, 1, S)
-                    return m, int(B), 1, 1
-                raise RuntimeError(
-                    f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={B}, L={L}, S={S})"
-                )
-
-            if mask.dim() == 3:
-                a, b, c = int(mask.shape[0]), int(mask.shape[1]), int(mask.shape[2])
-                if c != int(S):
-                    raise RuntimeError(
-                        f"attn_mask trailing dim {c} does not match expected S={S}"
-                    )
-                if (a == int(B)) and (b == int(L)):
-                    m = mask.to(device=q_bshd.device).view(B, 1, L, S)
-                    return m, int(B), 1, int(L)
-                if (a == int(B)) and (b == 1):
-                    # (B,1,S) -> per-batch key-only
-                    m = mask.to(device=q_bshd.device).view(B, 1, 1, S)
-                    return m, int(B), 1, 1
-                if (a == int(H)) and (b == int(L)):
-                    # (H,L,S) -> head-specific, broadcast batch
-                    m = mask.to(device=q_bshd.device).view(1, H, L, S)
-                    return m, 1, int(H), int(L)
-                if (a == int(B)) and (b == int(H)):
-                    # (B,H,S) -> per-(B,H) key-only
-                    m = mask.to(device=q_bshd.device).view(B, H, 1, S)
-                    return m, int(B), int(H), 1
-                raise RuntimeError(
-                    f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={B}, H={H}, L={L}, S={S})"
-                )
-
-            if mask.dim() == 4:
-                b0, h0, l0, s0 = map(int, mask.shape)
-                if s0 != int(S):
-                    raise RuntimeError(
-                        f"attn_mask trailing dim {s0} does not match expected S={S}"
-                    )
-                if b0 not in (1, int(B)):
-                    raise RuntimeError(
-                        f"attn_mask batch dim {b0} incompatible with B={B}"
-                    )
-                if h0 not in (1, int(H)):
-                    raise RuntimeError(
-                        f"attn_mask head dim {h0} incompatible with H={H}"
-                    )
-                if l0 not in (1, int(L)):
-                    raise RuntimeError(
-                        f"attn_mask query dim {l0} incompatible with L={L} (broadcast 1 or L allowed)"
-                    )
-                m = mask.to(device=q_bshd.device)
-                return m, b0, h0, l0
-
-            raise RuntimeError(f"attn_mask rank {mask.dim()} not supported")
-
         # Normalize to compact 4D forms. Note: mask_bool remains *mask-out* here.
         mb = mh = mL = 0
         bb = bh = bL = 0
         if mask_bool is not None:
             mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
-            mask_bool, mb, mh, mL = _flatten_mask(mask_bool)
+            mask_bool, mb, mh, mL = _flatten_attn_mask4(
+                mask_bool,
+                device=q_bshd.device,
+                B=B,
+                H=H,
+                L=L,
+                S=S,
+            )
             # If the mask is broadcast across query length via expand (stride 0 on q dim),
             # compress to q_dim=1 to:
             #  - keep SDPA mask small
@@ -494,7 +507,14 @@ class DotProductAttention(nn.Module):
                     pass
         if bias_float is not None:
             bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
-            bias_float, bb, bh, bL = _flatten_mask(bias_float)
+            bias_float, bb, bh, bL = _flatten_attn_mask4(
+                bias_float,
+                device=q_bshd.device,
+                B=B,
+                H=H,
+                L=L,
+                S=S,
+            )
 
         try:
             is_compiling = torch._dynamo.is_compiling()
@@ -525,7 +545,7 @@ class DotProductAttention(nn.Module):
                 # "padding-like" means: key-only / no head dependence / query-broadcastable.
                 # We accept:
                 #   (1,1,1,S), (B,1,1,S), (B,1,L,S) with stride(q)=0 (already compressed above),
-                #   (B,S), (S,) etc (handled by _flatten_mask).
+                #   (B,S), (S,) etc (handled by the mask flattener).
                 is_padding_like = (int(mh) == 1) and (int(mL) == 1)
                 if not is_padding_like:
                     use_te = False
@@ -624,6 +644,8 @@ class DotProductAttention(nn.Module):
         v_bhsd = v_bshd.contiguous()
 
         B, H, _, _ = q_bhsd.shape
+        L2 = int(q_bhsd.shape[2])
+        S2 = int(k_bhsd.shape[2])
         fm = sdpa_kwargs["attn_mask"]
         if fm is not None:
             if fm.dtype is torch.bool:
@@ -631,7 +653,14 @@ class DotProductAttention(nn.Module):
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
 
-            fm, batch_dim, head_count, _qdim = _flatten_mask(fm)
+            fm, batch_dim, head_count, _qdim = _flatten_attn_mask4(
+                fm,
+                device=q_bhsd.device,
+                B=B,
+                H=H,
+                L=L2,
+                S=S2,
+            )
             if batch_dim not in (1, B):
                 raise RuntimeError(
                     f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
@@ -1045,7 +1074,7 @@ class MultiScaleRetentionTriton(nn.Module):
         #   - STNET_MSR_TRITON_NUM_WARPS (1/2/4/8/16)
         BLOCK_DH: int
         num_warps: int
-        env_block = os.environ.get("STNET_MSR_TRITON_BLOCK_DH", "").strip()
+        env_block = env_str("STNET_MSR_TRITON_BLOCK_DH") or ""
         if env_block:
             try:
                 _b = int(env_block)
@@ -1058,7 +1087,7 @@ class MultiScaleRetentionTriton(nn.Module):
         else:
             BLOCK_DH = 64 if head_dim >= 64 else 32
 
-        env_warps = os.environ.get("STNET_MSR_TRITON_NUM_WARPS", "").strip()
+        env_warps = env_str("STNET_MSR_TRITON_NUM_WARPS") or ""
         if env_warps:
             try:
                 _w = int(env_warps)

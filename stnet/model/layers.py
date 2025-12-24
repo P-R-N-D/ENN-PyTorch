@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import contextlib
 import math
-import os
 import threading
 from collections import OrderedDict
 from typing import Any, Optional, Tuple
@@ -14,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from ..backend.compat import StochasticDepth
-from ..data.datatype import env_str
+from ..data.datatype import env_bool, env_int, env_str
 
 _Norm = nn.LayerNorm
 
@@ -27,7 +26,7 @@ except Exception:
     flex_attention = None
     _HAS_FLEX_ATTENTION = False
 
-if os.environ.get("STNET_DISABLE_FLEX_ATTENTION") in {"1", "true", "True"}:
+if env_bool("STNET_DISABLE_FLEX_ATTENTION", False):
     _HAS_FLEX_ATTENTION = False
 
 _FLEX_ATTENTION_KWARGS: set[str] = set()
@@ -40,12 +39,12 @@ if _HAS_FLEX_ATTENTION and flex_attention is not None:
 _DILATED_MASK_CACHE_MAX = 32
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 
-_DILATED_MASK_CACHE_MAX_L = int(os.environ.get("STNET_DILATED_MASK_CACHE_MAX_L", "4096"))
-_DILATED_MASK_CACHE_ENTRY_MAX_BYTES = int(
-    os.environ.get("STNET_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", str(64 * 1024 * 1024))
+_DILATED_MASK_CACHE_MAX_L = env_int("STNET_DILATED_MASK_CACHE_MAX_L", 4096)
+_DILATED_MASK_CACHE_ENTRY_MAX_BYTES = env_int(
+    "STNET_DILATED_MASK_CACHE_ENTRY_MAX_BYTES", 64 * 1024 * 1024
 )
-_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = int(
-    os.environ.get("STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", str(128 * 1024 * 1024))
+_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
+    "STNET_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES", 128 * 1024 * 1024
 )
 
 
@@ -844,9 +843,7 @@ class DilatedAttention(nn.Module):
                 causal_mask = causal_mask[None, None, :, :]
 
             # Heuristic batch microbatching to reduce peak memory when computing scores/probs.
-            env_mb = 0
-            with contextlib.suppress(Exception):
-                env_mb = int(os.environ.get("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", "0") or 0)
+            env_mb = int(env_int("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
 
             est = int(B) * int(H) * int(L_q) * int(L_k)
             if env_mb > 0:
@@ -1208,9 +1205,7 @@ class DilatedAttention(nn.Module):
                     else:
                         # Batch-specific padding + base_mask would otherwise force a full (B, Lq, Lk)
                         # materialization (expand+clone). Micro-batch to reduce peak memory.
-                        env_mb = 0
-                        with contextlib.suppress(Exception):
-                            env_mb = int(os.environ.get("STNET_SDPA_BATCH_MICROBATCH", "0") or 0)
+                        env_mb = int(env_int("STNET_SDPA_BATCH_MICROBATCH", 0))
 
                         # Heuristic default: microbatch only when mask would be large.
                         group = int(env_mb)

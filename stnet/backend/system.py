@@ -598,7 +598,7 @@ class WorkerPolicy:
         # Free-threading/No-GIL: enable more aggressive defaults only when actually beneficial.
         _nogil = False
         with contextlib.suppress(Exception):
-            _nogil = bool(Thread.nogil_optimizations_enabled())
+            _nogil = bool(CPUAffinity.nogil_optimizations_enabled())
 
         cap_mult = _default_cap_mult(ncpu_raw, is_accel=is_accel, nogil=_nogil)
 
@@ -1286,7 +1286,7 @@ def get_device(
     if torch.cuda.is_available():
         idx = 0
         with contextlib.suppress(Exception):
-            idx_env = int(os.environ.get("LOCAL_RANK", 0))
+            idx_env = env_first_int(("LOCAL_RANK",), default=0)
             ndev = max(1, int(torch.cuda.device_count()))
             idx = int(idx_env) % int(ndev)
 
@@ -1388,14 +1388,26 @@ def optimal_threads() -> dict[str, Union[int, bool]]:
     return WorkerPolicy.autotune().as_threads_dict()
 
 
-def optimize_threads() -> dict[str, Union[int, bool]]:
+def optimize_threads(
+    intra: Optional[int] = None,
+    inter: Optional[int] = None,
+) -> dict[str, Union[int, bool]]:
+    """Autotune and apply torch thread settings.
+
+    Torch thread configuration is process-global; this helper centralizes the
+    policy and optionally allows overriding intra/inter-op thread counts.
+    """
     wp = WorkerPolicy.autotune()
+    if intra is not None:
+        wp = replace(wp, intra_ops=int(intra))
+    if inter is not None:
+        wp = replace(wp, inter_ops=int(inter))
     wp.apply_torch_threads()
     return wp.as_threads_dict()
 
 
-class ThreadBalancer:
-    """Lightweight thread pinning + telemetry-based retuning for IO-heavy pipelines."""
+class Affinity:
+    """Lightweight CPU affinity pinning + telemetry-based retuning for IO-heavy pipelines."""
 
     __slots__ = (
         "_psutil",
@@ -1435,7 +1447,7 @@ class ThreadBalancer:
 
         # Free-threading/No-GIL: reduce contention in telemetry and allow slightly higher caps.
         with contextlib.suppress(Exception):
-            self._nogil = bool(ThreadBalancer.nogil_optimizations_enabled())
+            self._nogil = bool(Affinity.nogil_optimizations_enabled())
         if not hasattr(self, "_nogil"):
             self._nogil = False
 
@@ -1482,7 +1494,7 @@ class ThreadBalancer:
     @staticmethod
     def nogil_active() -> bool:
         """True only when this is a free-threaded build *and* the GIL is disabled."""
-        return ThreadBalancer.is_free_threaded_build() and (not ThreadBalancer.is_gil_enabled())
+        return Affinity.is_free_threaded_build() and (not Affinity.is_gil_enabled())
 
     @staticmethod
     def nogil_optimizations_enabled() -> bool:
@@ -1496,7 +1508,7 @@ class ThreadBalancer:
             override = parse_bool(os.environ.get(key))
             if override is not None:
                 return bool(override)
-        return ThreadBalancer.nogil_active()
+        return Affinity.nogil_active()
 
     @staticmethod
     def _import_psutil() -> ModuleType | None:
@@ -1627,7 +1639,7 @@ class ThreadBalancer:
                 pass
 
             # Multi-group / fallback mapping.
-            segs, total = ThreadBalancer._windows_group_segments(k32)
+            segs, total = Affinity._windows_group_segments(k32)
             if total <= 0 or not segs:
                 return False
 
@@ -1734,12 +1746,8 @@ class ThreadBalancer:
 
     @staticmethod
     def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
-        wp = WorkerPolicy.autotune()
-        if intra is not None:
-            wp = replace(wp, intra_ops=int(intra))
-        if inter is not None:
-            wp = replace(wp, inter_ops=int(inter))
-        wp.apply_torch_threads()
+        # Backward-compatible alias; canonical implementation lives at module scope.
+        optimize_threads(intra=intra, inter=inter)
 
     def tune_threads(
         self,
@@ -1785,14 +1793,14 @@ class ThreadBalancer:
             if total > int(thread_cap):
                 new_intra = max(1, int(thread_cap) - int(want_inter) - int(tuned_workers))
                 if int(new_intra) != int(intra_now):
-                    self.optimize_threads(intra=int(new_intra))
+                    optimize_threads(intra=int(new_intra))
                     intra_now = int(new_intra)
 
                 total = int(intra_now) + int(want_inter) + int(tuned_workers)
                 if total > int(thread_cap):
                     want_inter = max(1, int(thread_cap) - int(tuned_workers) - int(intra_now))
 
-            self.optimize_threads(inter=int(want_inter))
+            optimize_threads(inter=int(want_inter))
             return
 
         self._retune_threads()
@@ -1845,14 +1853,14 @@ class ThreadBalancer:
 
         new_intra = max(1, int(thread_cap) - int(workers) - int(inter))
         if int(new_intra) < int(intra):
-            self.optimize_threads(intra=int(new_intra))
+            optimize_threads(intra=int(new_intra))
             intra = int(new_intra)
 
         total = int(intra) + int(inter) + int(workers)
         if total > int(thread_cap):
             new_inter = max(1, int(thread_cap) - int(workers) - int(intra))
             if int(new_inter) < int(inter):
-                self.optimize_threads(inter=int(new_inter))
+                optimize_threads(inter=int(new_inter))
 
     def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
         if not self._enabled:
@@ -1916,21 +1924,17 @@ class ThreadBalancer:
         return tuned
 
 
-# Backward compatible alias: external code may import Thread from this module.
-Thread = ThreadBalancer
-
-
-_TLB_SINGLETON: Optional[ThreadBalancer] = None
+_TLB_SINGLETON: Optional[Affinity] = None
 _TLB_SINGLETON_LOCK = Lock()
 
 
-def get_tlb(io_workers: Optional[int] = None) -> ThreadBalancer:
+def get_tlb(io_workers: Optional[int] = None) -> Affinity:
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
         with _TLB_SINGLETON_LOCK:
             if _TLB_SINGLETON is None:
                 default_workers = io_workers if io_workers is not None else max(1, process_cpu_count() // 2)
-                _TLB_SINGLETON = ThreadBalancer(io_workers=int(default_workers))
+                _TLB_SINGLETON = Affinity(io_workers=int(default_workers))
     tlb = _TLB_SINGLETON
     if tlb is not None and io_workers is not None:
         with contextlib.suppress(Exception):
