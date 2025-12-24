@@ -1262,6 +1262,7 @@ def predict(
     underflow_action = kwargs.pop("underflow_action", default_underflow_action())
     chunk_size = kwargs.pop("chunk_size", None)
     lazy = bool(kwargs.pop("lazy", True))
+    writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
 
     def _infer_master_float_dtype(obj: Any) -> torch.dtype:
         """Best-effort dtype inference for predict() materialization.
@@ -1377,8 +1378,7 @@ def predict(
                     shuffle=False,
                     allow_missing_labels=True,
                     features_only=True,
-                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
-                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                    chunk_size=writer_chunk_size,
                 )
 
             # 2) Feature/label mapping input
@@ -1419,8 +1419,7 @@ def predict(
                     shuffle=False,
                     allow_missing_labels=True,
                     features_only=True,
-                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
-                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                    chunk_size=writer_chunk_size,
                 )
 
             # 3) Compact key-index mapping input (no pre-materialization of keys)
@@ -1443,8 +1442,7 @@ def predict(
                     shuffle=False,
                     allow_missing_labels=True,
                     features_only=True,
-                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
-                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                    chunk_size=writer_chunk_size,
                 )
 
             # 4) Fallback: preprocess then preload to memmap
