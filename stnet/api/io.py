@@ -38,7 +38,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..backend.compat import is_meta_or_fake_tensor
-from ..data.collections import LazyTensor
+from ..data.pipeline import BatchIterator
 from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config, model_config_to_dict
 
@@ -567,7 +567,7 @@ class TorchIO:
                 meta_path = p / "meta.json"
                 if _is_rank0_global():
                     # Ensure JSON-serializable payload (Path/device/dtype, etc.).
-                    LazyTensor.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
+                    BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
             return p
 
         # Normalize extension for single-file targets.
@@ -611,7 +611,7 @@ class TorchIO:
                     "extra": _json_sanitize(extra or {}),
                 }
                 meta_path = p.with_suffix(".json")
-                LazyTensor.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
+                BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
                 return p
 
             # torch.save payload: always sanitize extra for weights_only-friendly loads.
@@ -631,7 +631,7 @@ class TorchIO:
             if extra is not None:
                 payload["extra"] = _json_sanitize(extra)
 
-            LazyTensor.atomic_torch_save(p, payload, **opts)
+            BatchIterator.atomic_torch_save(p, payload, **opts)
             return p
 
 

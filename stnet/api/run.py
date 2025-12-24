@@ -37,10 +37,10 @@ from ..backend.system import (
     remove_dir,
     set_multiprocessing_env,
 )
-from ..data.collections import LazyTensor
 from ..data.datatype import dtype_from_name, env_bool, parse_torch_dtype
 from ..data.nodes import preload_memmap
 from ..data.pipeline import (
+    BatchIterator,
     Dataset,
     default_underflow_action,
     extract_xy,
@@ -243,14 +243,14 @@ def read_json(path: str) -> Any:
 
 
 def write_json_atomic(path: str, payload: Any) -> None:
-    """Atomically write JSON using LazyTensor's shared writer."""
+    """Atomically write JSON using BatchIterator's shared writer."""
 
-    LazyTensor.atomic_write_json(path, payload, indent=None)
+    BatchIterator.atomic_write_json(path, payload, indent=None)
 
 
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
     """Open an existing MemoryMappedTensor using the sidecar meta file."""
-    meta_path = LazyTensor.mmt_meta_path(mmt_path)
+    meta_path = BatchIterator.mmt_meta_path(mmt_path)
     if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
         return None
     try:
@@ -342,7 +342,7 @@ def _mat_one(
         if count <= 0:
             raise ValueError("Empty TensorDict provided to train().")
 
-        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+        in_dim, label_shape = BatchIterator.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -361,15 +361,15 @@ def _mat_one(
         isinstance(d, _Mapping)
         and d
         and all(not isinstance(v, _Mapping) for v in d.values())
-        and not LazyTensor.is_feature_label_batch_mapping(d)
+        and not BatchIterator.is_feature_label_batch_mapping(d)
     ):
         # Key-index mappings can be huge; do not materialize keys.
         # Shuffle should be handled by the sampler, not the data writer.
-        count, _get_batch = LazyTensor.key_index_mapping_getters(d)
+        count, _get_batch = BatchIterator.key_index_mapping_getters(d)
         if count <= 0:
             raise ValueError("Empty dataset provided to train().")
 
-        in_dim, label_shape = LazyTensor.write_memmap_streaming_two_pass(
+        in_dim, label_shape = BatchIterator.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -909,7 +909,7 @@ def _infer_pred_master_dtype(chunks_dir: str, *, default: torch.dtype = torch.fl
 
         # Fast path: memmap chunk with sidecar meta.
         if pred_path.endswith(".mmt"):
-            meta_path = LazyTensor.mmt_meta_path(pred_path)
+            meta_path = BatchIterator.mmt_meta_path(pred_path)
             if os.path.isfile(meta_path):
                 try:
                     meta = read_json(meta_path)
@@ -1005,7 +1005,7 @@ def _assemble_predictions_to_memmap(
 
         Y_out.index_copy_(0, rows_t, preds_t)
 
-    pred_meta_path = LazyTensor.mmt_meta_path(out_path)
+    pred_meta_path = BatchIterator.mmt_meta_path(out_path)
     write_json_atomic(
         pred_meta_path,
         {
@@ -1263,7 +1263,65 @@ def predict(
     chunk_size = kwargs.pop("chunk_size", None)
     lazy = bool(kwargs.pop("lazy", True))
 
-    ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
+    def _infer_master_float_dtype(obj: Any) -> torch.dtype:
+        """Best-effort dtype inference for predict() materialization.
+
+        We prefer to preserve float64 inputs (avoid silent precision loss) while
+        keeping the default path on float32 to reduce CPU memory and copy cost.
+        """
+
+        def _coerce(dt: Any) -> torch.dtype | None:
+            try:
+                if isinstance(dt, torch.dtype):
+                    return dt
+                if dt is None:
+                    return None
+                # numpy dtype
+                ndt = np.dtype(dt)
+                if ndt == np.float64:
+                    return torch.float64
+                if ndt == np.float32:
+                    return torch.float32
+                if ndt == np.float16:
+                    return torch.float16
+            except Exception:
+                return None
+            return None
+
+        try:
+            if TensorDictBase is not None and isinstance(obj, TensorDictBase):
+                X_td, _ = extract_xy(obj, labels_required=False)
+                if X_td is None:
+                    return torch.float32
+                if not bool(torch.is_tensor(X_td)):
+                    X_td = torch.as_tensor(X_td)
+                dt = _coerce(getattr(X_td, "dtype", None))
+                return torch.float64 if dt == torch.float64 else torch.float32
+
+            if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
+                f_key = resolve_feature_key(obj)
+                if f_key is not None and f_key in obj:
+                    X_all = obj.get(f_key)
+                    dt = _coerce(getattr(X_all, "dtype", None))
+                    if dt is not None:
+                        return torch.float64 if dt == torch.float64 else torch.float32
+                    if isinstance(X_all, (list, tuple)) and X_all:
+                        dt0 = _coerce(getattr(X_all[0], "dtype", None))
+                        return torch.float64 if dt0 == torch.float64 else torch.float32
+
+            if torch.is_tensor(obj):
+                dt = _coerce(obj.dtype)
+                return torch.float64 if dt == torch.float64 else torch.float32
+
+            if isinstance(obj, np.ndarray):
+                dt = _coerce(obj.dtype)
+                return torch.float64 if dt == torch.float64 else torch.float32
+        except Exception:
+            pass
+        return torch.float32
+
+    master_dtype = _infer_master_float_dtype(data)
+    ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
     ds.underflow_action = underflow_action
 
     tmp_dir = new_dir("infer")
@@ -1307,7 +1365,7 @@ def predict(
                 def _get_batch(s: int, e: int) -> Mapping[str, Any]:
                     return data[s:e]
 
-                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,
@@ -1324,7 +1382,7 @@ def predict(
                 )
 
             # 2) Feature/label mapping input
-            elif isinstance(data, Mapping) and LazyTensor.is_feature_label_batch_mapping(data):
+            elif isinstance(data, Mapping) and BatchIterator.is_feature_label_batch_mapping(data):
                 f_key = resolve_feature_key(data)
                 if f_key is None:
                     raise ValueError("predict: could not resolve feature key from mapping")
@@ -1349,7 +1407,7 @@ def predict(
                             batch[k] = v
                     return batch
 
-                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,
@@ -1370,10 +1428,10 @@ def predict(
                 isinstance(data, Mapping)
                 and data
                 and all(not isinstance(v, Mapping) for v in data.values())
-                and not LazyTensor.is_feature_label_batch_mapping(data)
+                and not BatchIterator.is_feature_label_batch_mapping(data)
             ):
-                count, _get_batch = LazyTensor.key_index_mapping_getters(data)
-                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                count, _get_batch = BatchIterator.key_index_mapping_getters(data)
+                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,

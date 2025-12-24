@@ -19,8 +19,6 @@ __all__ = [
     "FLOP_PROFILER",
     "FlopCounter",
     "capture",
-    "capture_flops",
-    "interval_flops",
 ]
 
 
@@ -2725,53 +2723,3 @@ def capture(
         training=training,
         include_softmax_scale_dropout=include_softmax_scale_dropout,
     )
-
-
-def capture_flops(*, sort: bool = True, reset: bool = False) -> Tuple[float, Dict[str, float]]:
-    total, breakdown = FLOP_PROFILER.sum(sort=sort)
-    if reset:
-        FLOP_PROFILER.reset()
-    return total, breakdown
-
-
-@contextlib.contextmanager
-def interval_flops(label: str = "", *, sort: bool = True, top_k: int = 12) -> Any:
-    class _IntervalFlops:
-        def __init__(self, label: str) -> None:
-            self.label = label
-            self.total = 0.0
-            self.breakdown: Dict[str, float] = {}
-
-        def verbose(self) -> str:
-            lines: list[str] = []
-            title = f"[FLOPs] region='{self.label}'" if self.label else "[FLOPs] region"
-            lines.append(title)
-            lines.append(f"  total: {self.total:.3e}")
-            if self.breakdown:
-                items = self.breakdown.items()
-                if sort:
-                    items = sorted(items, key=lambda kv: kv[1], reverse=True)
-                lines.append(f"  breakdown (top {top_k}):")
-                for name, value in list(items)[:top_k]:
-                    lines.append(f"    - {name}: {value:.3e}")
-            return "\n".join(lines)
-
-    before_total, before_map = FLOP_PROFILER.sum(sort=False)
-    region = _IntervalFlops(label=label)
-    try:
-        yield region
-    finally:
-        after_total, after_map = FLOP_PROFILER.sum(sort=False)
-        delta_total = float(after_total - before_total)
-
-        delta_map: Dict[str, float] = {}
-        keys = set(before_map.keys()) | set(after_map.keys())
-        for name in keys:
-            v0 = float(before_map.get(name, 0.0))
-            v1 = float(after_map.get(name, 0.0))
-            dv = v1 - v0
-            if dv > 0.0:
-                delta_map[name] = dv
-
-        region.total = max(0.0, delta_total)
-        region.breakdown = delta_map
