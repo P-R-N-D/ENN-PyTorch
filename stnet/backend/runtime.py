@@ -33,36 +33,9 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
+from ..data.collections import LazyTensor
 from ..data.datatype import env_bool, env_float, env_int, parse_bool
 from ..data.pipeline import extract_xy
-
-
-def _atomic_write_json(path: str, payload: Any, *, indent: int | None = None) -> None:
-    """Atomically write JSON (best-effort).
-
-    Used for small sidecar metadata files that must not be left half-written
-    under multi-process or abrupt-interrupt scenarios.
-    """
-    p = os.fspath(path)
-    parent = os.path.dirname(p) or "."
-    os.makedirs(parent, exist_ok=True)
-
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
-    os.close(fd)
-    try:
-        with open(tmp_name, "w", encoding="utf-8") as f:
-            if indent is None:
-                json.dump(payload, f)
-            else:
-                json.dump(payload, f, indent=int(indent))
-        os.replace(tmp_name, p)
-    finally:
-        with contextlib.suppress(Exception):
-            os.remove(tmp_name)
-
-
-def _mmt_meta_path(mmt_path: str) -> str:
-    return str(mmt_path) + ".meta.json"
 
 
 def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
@@ -94,7 +67,7 @@ def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
             os.remove(tmp_name)
 
     meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
-    _atomic_write_json(_mmt_meta_path(p), meta)
+    LazyTensor.atomic_write_json(LazyTensor.mmt_meta_path(p), meta, indent=None)
 
 _nvml = None
 _NVML_READY = False
@@ -3913,7 +3886,7 @@ def infer(
 
                 if os.path.exists(pred_mmt):
                     pred_path = pred_mmt
-                    meta_path = pred_mmt + ".meta.json"
+                    meta_path = LazyTensor.mmt_meta_path(pred_mmt)
                     if not os.path.exists(meta_path):
                         raise RuntimeError(f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}")
                 elif os.path.exists(pred_pt):

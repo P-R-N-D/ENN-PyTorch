@@ -8,7 +8,6 @@ import os
 import random
 import shutil
 import tempfile
-import threading
 import time
 from functools import lru_cache, wraps
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -25,15 +24,14 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 try:
-    from torch.distributed.run import LaunchConfig, elastic_launch
+    from torch.distributed.run import LaunchConfig, Std, elastic_launch
 except ImportError:  # pragma: no cover
-    from torch.distributed.launcher.api import LaunchConfig, elastic_launch
+    from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
 
 from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
 from ..backend.runtime import _torch_load_cpu, _trim_dcp_keys, main
 from ..backend.system import (
     WorkerPolicy,
-    get_master_port,
     initialize_python_path,
     new_dir,
     optimal_start_method,
@@ -41,7 +39,7 @@ from ..backend.system import (
     set_multiprocessing_env,
 )
 from ..data.collections import LazyTensor
-from ..data.datatype import env_bool, env_int
+from ..data.datatype import dtype_from_name, env_bool, parse_torch_dtype
 from ..data.nodes import preload_memmap
 from ..data.pipeline import (
     Dataset,
@@ -51,6 +49,7 @@ from ..data.pipeline import (
     resolve_feature_key,
     resolve_label_key,
 )
+from ..model.fused import Gradient
 from ..model.nn import History, Root, resize_scaler_buffer
 from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
@@ -281,128 +280,8 @@ def _maybe_save_model_checkpoint(
 
 
 # -----------------------------
-# Prediction part memmap (B approach)
+# JSON helpers + MemoryMappedTensor sidecar
 # -----------------------------
-
-_PRED_MEMMAP_LOCK = threading.Lock()
-_PRED_MEMMAP_PATH_LOCKS: dict[str, threading.Lock] = {}
-
-def _pred_memmap_lock_for(path: str) -> threading.Lock:
-    with _PRED_MEMMAP_LOCK:
-        lk = _PRED_MEMMAP_PATH_LOCKS.get(path)
-        if lk is None:
-            lk = threading.Lock()
-            _PRED_MEMMAP_PATH_LOCKS[path] = lk
-        return lk
-
-
-def _mmt_meta_path(mmt_path: str) -> str:
-    return str(mmt_path) + ".meta.json"
-
-
-def _mmt_lock_path(mmt_path: str) -> str:
-    return str(mmt_path) + ".lock"
-
-
-@contextlib.contextmanager
-def _process_file_lock(lock_path: str) -> Any:
-    """Best-effort cross-process exclusive lock.
-
-    Uses:
-    - POSIX: fcntl.flock
-    - Windows: msvcrt.locking
-    - Fallback: atomic mkdir spin-lock (only if neither file-lock API is available)
-    """
-    path = str(lock_path)
-    parent = os.path.dirname(path) or "."
-    with contextlib.suppress(Exception):
-        os.makedirs(parent, exist_ok=True)
-
-    # 1) POSIX: fcntl.flock
-    try:
-        import fcntl  # type: ignore
-
-        f = open(path, "a+b")
-        try:
-            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
-            yield
-        finally:
-            with contextlib.suppress(Exception):
-                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-            with contextlib.suppress(Exception):
-                f.close()
-        return
-    except Exception:
-        pass
-
-    # 2) Windows: msvcrt.locking
-    try:
-        import msvcrt  # type: ignore
-
-        f = open(path, "a+b")
-        try:
-            # Ensure file has at least 1 byte; msvcrt.locking requires a positive length.
-            with contextlib.suppress(Exception):
-                f.seek(0, os.SEEK_END)
-                if f.tell() < 1:
-                    f.write(b"0")
-                    f.flush()
-            with contextlib.suppress(Exception):
-                f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
-            yield
-        finally:
-            with contextlib.suppress(Exception):
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
-            with contextlib.suppress(Exception):
-                f.close()
-        return
-    except Exception:
-        pass
-
-    # 3) Fallback: mkdir spin lock (best-effort).
-    import time
-
-    lock_dir = path + ".d"
-    while True:
-        try:
-            os.mkdir(lock_dir)
-            break
-        except FileExistsError:
-            time.sleep(0.05)
-        except Exception:
-            # If we cannot lock, proceed unlocked rather than hanging forever.
-            yield
-            return
-
-    try:
-        yield
-    finally:
-        with contextlib.suppress(Exception):
-            os.rmdir(lock_dir)
-
-
-def _atomic_write_json(path: str, payload: Any) -> None:
-    """Atomically write JSON to `path` (best-effort).
-
-    This prevents corrupt sidecar metadata files when multiple processes/threads race or the process
-    is interrupted mid-write.
-    """
-    p = str(path)
-    parent = os.path.dirname(p) or "."
-    os.makedirs(parent, exist_ok=True)
-
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
-    os.close(fd)
-    try:
-        with open(tmp_name, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        os.replace(tmp_name, p)
-    finally:
-        with contextlib.suppress(Exception):
-            os.remove(tmp_name)
-
 
 def read_json(path: str) -> Any:
     """Read and parse JSON payload from ``path``.
@@ -418,91 +297,22 @@ def read_json(path: str) -> Any:
 
 
 def write_json_atomic(path: str, payload: Any) -> None:
-    """Atomically write JSON using :func:`_atomic_write_json`."""
+    """Atomically write JSON using LazyTensor's shared writer."""
 
-    _atomic_write_json(path, payload)
-
-
-def _parse_dtype(dtype_s: Any) -> Optional[torch.dtype]:
-    if isinstance(dtype_s, torch.dtype):
-        return dtype_s
-    s = str(dtype_s or "").strip()
-    if not s:
-        return None
-    if s.startswith("torch."):
-        s = s.split(".", 1)[1]
-    # Common aliases
-    if s == "float":
-        s = "float32"
-    if s == "half":
-        s = "float16"
-    return getattr(torch, s, None)
-
-
-def _ensure_pred_memmap_from_pt(pt_path: str, mmt_path: str) -> tuple[str, torch.dtype, Tuple[int, ...]]:
-    """Create a MemoryMappedTensor file from a .pt Tensor if needed.
-
-    - Thread-safe within a process.
-    - Cross-process safe via a best-effort file lock.
-    - Writes the sidecar meta.json atomically.
-    - Writes the .mmt via a temp file + atomic replace to avoid half-written files.
-    """
-    lock = _pred_memmap_lock_for(mmt_path)
-    with lock:
-        # Cross-process lock around conversion + sidecar writes.
-        with _process_file_lock(_mmt_lock_path(mmt_path)):
-            meta_path = _mmt_meta_path(mmt_path)
-
-            if os.path.isfile(mmt_path) and os.path.isfile(meta_path):
-                try:
-                    with open(meta_path, "r", encoding="utf-8") as f:
-                        meta = json.load(f) or {}
-                    dtype = _parse_dtype(meta.get("dtype")) or torch.float32
-                    shape = tuple(int(x) for x in (meta.get("shape") or ()))
-                    if shape:
-                        return mmt_path, dtype, shape
-                except Exception:
-                    # Fall through to re-create metadata if needed.
-                    pass
-
-            preds = _torch_load_cpu(pt_path, weights_only=True)
-            if not isinstance(preds, torch.Tensor):
-                preds = torch.as_tensor(preds)
-            preds = preds.detach().cpu().contiguous()
-
-            parent = os.path.dirname(str(mmt_path)) or "."
-            os.makedirs(parent, exist_ok=True)
-
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=os.path.basename(str(mmt_path)) + ".",
-                suffix=".tmp",
-                dir=parent,
-            )
-            os.close(fd)
-            try:
-                MemoryMappedTensor.from_tensor(preds, filename=tmp_name, existsok=True)
-                os.replace(tmp_name, str(mmt_path))
-            finally:
-                with contextlib.suppress(Exception):
-                    os.remove(tmp_name)
-
-            meta = {"dtype": str(preds.dtype), "shape": list(preds.shape)}
-            _atomic_write_json(meta_path, meta)
-
-            return mmt_path, preds.dtype, tuple(int(x) for x in preds.shape)
+    LazyTensor.atomic_write_json(path, payload, indent=None)
 
 
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
     """Open an existing MemoryMappedTensor using the sidecar meta file."""
-    meta_path = _mmt_meta_path(mmt_path)
+    meta_path = LazyTensor.mmt_meta_path(mmt_path)
     if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
         return None
     try:
         with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f) or {}
-        dtype = _parse_dtype(meta.get("dtype"))
+        dtype = parse_torch_dtype(meta.get("dtype")) or torch.float32
         shape = tuple(int(x) for x in (meta.get("shape") or ()))
-        if dtype is None or not shape:
+        if not isinstance(dtype, torch.dtype) or not shape:
             return None
         return MemoryMappedTensor.from_filename(filename=mmt_path, dtype=dtype, shape=torch.Size(shape))
     except Exception:
@@ -607,8 +417,9 @@ def _mat_one(
         and all(not isinstance(v, _Mapping) for v in d.values())
         and not LazyTensor.is_feature_label_batch_mapping(d)
     ):
-        keys_t, _get_batch, _get_by_indices = LazyTensor.key_index_mapping_getters(d)
-        count = len(keys_t)
+        # Key-index mappings can be huge; do not materialize keys.
+        # Shuffle should be handled by the sampler, not the data writer.
+        count, _get_batch = LazyTensor.key_index_mapping_getters(d)
         if count <= 0:
             raise ValueError("Empty dataset provided to train().")
 
@@ -617,11 +428,11 @@ def _mat_one(
             out_dir=out_dir,
             count=count,
             get_batch=_get_batch,
-            get_by_indices=_get_by_indices,
+            get_by_indices=None,
             val_frac=float(val_frac),
             seed_value=seed_value,
             underflow_action=underflow_action,
-            shuffle=bool(shuffle),
+            shuffle=False,
             allow_missing_labels=False,
             chunk_size=0,
         )
@@ -1046,10 +857,15 @@ def _normalize_path(path: Optional[str]) -> Optional[str]:
 def _torch_dtype_to_numpy(dtype: torch.dtype):
     import numpy as _np
 
+    # Prefer not to upcast unknown float dtypes to float64: it is expensive and
+    # often doubles memory use with no benefit.
+    np_bfloat16 = getattr(_np, "bfloat16", _np.float32)
+
     mapping = {
         torch.float16: _np.float16,
         torch.float32: _np.float32,
         torch.float64: _np.float64,
+        torch.bfloat16: np_bfloat16,
         torch.int8: _np.int8,
         torch.uint8: _np.uint8,
         torch.int16: _np.int16,
@@ -1057,42 +873,7 @@ def _torch_dtype_to_numpy(dtype: torch.dtype):
         torch.int64: _np.int64,
         torch.bool: _np.bool_,
     }
-    return mapping.get(dtype, _np.float64)
-
-
-_DTYPE_ALIASES: dict[str, torch.dtype] = {
-    # floats
-    "float": torch.float32,
-    "float32": torch.float32,
-    "fp32": torch.float32,
-    "float64": torch.float64,
-    "double": torch.float64,
-    "fp64": torch.float64,
-    "float16": torch.float16,
-    "half": torch.float16,
-    "fp16": torch.float16,
-    "bfloat16": torch.bfloat16,
-    "bf16": torch.bfloat16,
-    # ints
-    "int64": torch.int64,
-    "long": torch.int64,
-    "int32": torch.int32,
-    "int": torch.int32,
-    "int16": torch.int16,
-    "short": torch.int16,
-    "int8": torch.int8,
-    "char": torch.int8,
-    "uint8": torch.uint8,
-    "byte": torch.uint8,
-    # bool
-    "bool": torch.bool,
-    "boolean": torch.bool,
-}
-
-
-def _dtype_from_name(name: str, default: torch.dtype) -> torch.dtype:
-    n = str(name).strip().lower().replace("torch.", "")
-    return _DTYPE_ALIASES.get(n, default)
+    return mapping.get(dtype, _np.float32)
 
 
 def _read_memmap_meta(memmap_dir: str) -> Dict[str, Any]:
@@ -1124,7 +905,7 @@ def _open_features_mmt(memmap_dir: str) -> "MemoryMappedTensor":
     if fdim <= 0:
         raise ValueError(f"memmap meta.json under {memmap_dir} has non-positive feature_dim={fdim}")
 
-    f_dtype = _dtype_from_name(meta.get("features_dtype", "float64"), torch.float64)
+    f_dtype = dtype_from_name(meta.get("features_dtype", "float64"), torch.float64)
 
     return MemoryMappedTensor.from_filename(
         feat_path,
@@ -1145,6 +926,64 @@ def _is_writable_file_path(path: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _infer_pred_master_dtype(chunks_dir: str, *, default: torch.dtype = torch.float32) -> torch.dtype:
+    """Infer the prediction dtype from the first available chunk.
+
+    Fixed-shape inference writes .mmt parts with a small .meta.json sidecar.
+    Variable-shape inference uses .pt parts; we then load one part to inspect dtype.
+    """
+
+    manifest_path = os.path.join(chunks_dir, "manifest.json")
+    if not os.path.isfile(manifest_path):
+        return default
+
+    try:
+        manifest = read_json(manifest_path)
+    except Exception:
+        return default
+
+    parts = manifest.get("parts") if isinstance(manifest, dict) else None
+    if not isinstance(parts, list) or not parts:
+        return default
+
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        pred_rel = part.get("pred")
+        if not pred_rel:
+            continue
+
+        pred_path = os.path.join(chunks_dir, str(pred_rel))
+
+        # Fast path: memmap chunk with sidecar meta.
+        if pred_path.endswith(".mmt"):
+            meta_path = LazyTensor.mmt_meta_path(pred_path)
+            if os.path.isfile(meta_path):
+                try:
+                    meta = read_json(meta_path)
+                except Exception:
+                    meta = None
+                if isinstance(meta, dict):
+                    dt = parse_torch_dtype(meta.get("dtype"))
+                    if isinstance(dt, torch.dtype):
+                        return dt
+
+        # Fallback: torch chunk (loads into RAM).
+        if os.path.isfile(pred_path):
+            try:
+                preds_t = _torch_load_cpu(pred_path, weights_only=True)
+            except Exception:
+                preds_t = None
+            if isinstance(preds_t, torch.Tensor):
+                return preds_t.dtype
+            try:
+                return torch.as_tensor(preds_t).dtype
+            except Exception:
+                continue
+
+    return default
 
 
 def _assemble_predictions_to_memmap(
@@ -1204,7 +1043,7 @@ def _assemble_predictions_to_memmap(
 
         Y_out.index_copy_(0, rows_t, preds_t)
 
-    pred_meta_path = out_path + ".meta.json"
+    pred_meta_path = LazyTensor.mmt_meta_path(out_path)
     write_json_atomic(
         pred_meta_path,
         {
@@ -1275,6 +1114,7 @@ def _write_predictions_h5_from_chunks(
     count: int,
     out_shape: Sequence[int],
     store_float: torch.dtype,
+    chunk_size: int = 8192,
 ) -> "PersistentTensorDict":
     if PersistentTensorDict is None:
         raise ImportError(
@@ -1291,12 +1131,16 @@ def _write_predictions_h5_from_chunks(
     os.makedirs(os.path.dirname(out_path) or os.getcwd(), exist_ok=True)
 
     np_float = _torch_dtype_to_numpy(store_float)
+    cast_dtype = store_float
+    # NumPy may not support bfloat16 depending on version.
+    if store_float == torch.bfloat16 and np_float == np.float32:
+        cast_dtype = torch.float32
 
     with h5py.File(out_path, "w") as f:
         dset_X = f.create_dataset("X", shape=tuple(X_mmt.shape), dtype=_torch_dtype_to_numpy(X_mmt.dtype))
         dset_Y = f.create_dataset("Y", shape=(int(count), *out_shape_t), dtype=np_float)
 
-        chunk = 8192
+        chunk = int(chunk_size)
         for s in range(0, int(count), chunk):
             e = min(int(count), s + chunk)
             x_slice = X_mmt[s:e]
@@ -1329,7 +1173,7 @@ def _write_predictions_h5_from_chunks(
                 if not isinstance(preds_t, torch.Tensor):
                     preds_t = torch.as_tensor(preds_t, device="cpu")
 
-            preds_np = preds_t.detach().to(device="cpu", dtype=store_float).numpy()
+            preds_np = preds_t.detach().to(device="cpu", dtype=cast_dtype).numpy()
 
             if preds_np.shape[0] != rows_np.shape[0]:
                 raise ValueError(
@@ -1340,391 +1184,494 @@ def _write_predictions_h5_from_chunks(
 
     return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
 
-@torch.inference_mode()
+
+def _write_predictions_h5_from_memmaps(
+    out_path: str,
+    *,
+    memmap_dir: str,
+    pred_path: str,
+    count: Optional[int] = None,
+    chunk_size: int = 8192,
+) -> PersistentTensorDict:
+    """Write an HDF5 PersistentTensorDict from assembled memmaps."""
+
+    if not _is_writable_file_path(out_path):
+        raise ValueError(f"persist_path is not a writable file path: {out_path}")
+
+    import numpy as _np
+    import h5py
+
+    X_mmt = _open_features_mmt(memmap_dir)
+    Y_mmt = _open_pred_memmap(pred_path)
+    if Y_mmt is None:
+        raise FileNotFoundError(f"missing prediction memmap: {pred_path}")
+
+    n = int(Y_mmt.shape[0]) if count is None else int(count)
+    if n <= 0:
+        raise ValueError(f"non-positive prediction count: {n}")
+
+    x_np_dtype = _torch_dtype_to_numpy(X_mmt.dtype)
+    y_np_dtype = _torch_dtype_to_numpy(Y_mmt.dtype)
+
+    # If numpy doesn't support bfloat16, write float32 instead.
+    y_cast_dtype = Y_mmt.dtype
+    if Y_mmt.dtype == torch.bfloat16 and y_np_dtype == _np.float32:
+        y_cast_dtype = torch.float32
+
+    out_parent = os.path.dirname(out_path) or "."
+    os.makedirs(out_parent, exist_ok=True)
+    with h5py.File(out_path, "w") as f:
+        grp = f.require_group("data")
+        dset_X = grp.create_dataset(
+            "X",
+            shape=(n, int(X_mmt.shape[1])),
+            dtype=x_np_dtype,
+            chunks=(min(n, int(chunk_size)), int(X_mmt.shape[1])),
+        )
+        dset_Y = grp.create_dataset(
+            "Y",
+            shape=(n, *[int(x) for x in Y_mmt.shape[1:]]),
+            dtype=y_np_dtype,
+            chunks=(min(n, int(chunk_size)), *[int(x) for x in Y_mmt.shape[1:]]),
+        )
+
+        for s in range(0, n, int(chunk_size)):
+            e = min(n, s + int(chunk_size))
+            dset_X[s:e] = X_mmt[s:e].detach().to(device="cpu", dtype=X_mmt.dtype).numpy()
+            dset_Y[s:e] = Y_mmt[s:e].detach().to(device="cpu", dtype=y_cast_dtype).numpy()
+
+    return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode="r")
+
 @catchtime(logger, fn_name="predict")
 def predict(
-    model: Root,
     data: Any,
-    *args,
-    seed: int = 7,
+    *args: Any,
+    model: Optional[torch.nn.Module] = None,
     mode: OpsMode = "predict",
-    max_nodes: Optional[int] = None,
-    rdzv_backend: Optional[str] = None,
-    lazy: bool = True,
-    path: Optional[str] = None,
+    seed: int = 0,
     shuffle: bool = False,
-    **kwargs,
-) -> "TensorDictBase":
-    """Distributed prediction with a single internal streaming path.
+    max_nodes: Optional[int] = None,
+    rdzv_endpoint: Optional[str] = None,
+    rdzv_backend: Optional[str] = None,
+    persist_path: Optional[str] = None,
+    **kwargs: Any,
+) -> TensorDictBase | PersistentTensorDict:
+    """Run distributed inference and return predictions.
 
-    Internal path (always):
-      1) Write input features to a memmap dataset (MemoryMappedTensor on disk).
-      2) elastic_launch() workers consume memmaps and write sharded prediction parts.
-      3) Driver assembles a single pred.mmt (MemoryMappedTensor on disk).
-
-    Return types (only these three):
-      * lazy=False -> TensorDict with in-memory torch.Tensor leaves
-      * lazy=True and valid `path` -> PersistentTensorDict (HDF5) written to `path`
-      * lazy=True and no/invalid `path` -> TensorDict with MemoryMappedTensor leaves
-
-    Notes:
-      - We intentionally do NOT wrap the output in a LazyStackedTensorDict.
-        When X/Y are already memmap tensors, TensorDict indexing/slicing is already
-        lazy without creating N Python objects (better for GIL/no-GIL).
+    By default this returns a lazy TensorDict backed by memmaps. Set ``lazy=False``
+    to materialize tensors in-memory. If ``persist_path`` is provided, an HDF5
+    PersistentTensorDict is written instead.
     """
 
+    if model is None:
+        raise ValueError("predict: model must not be None")
+
+    # Ensure a clean distributed state.
     _reset_process_group()
     initialize_python_path()
     set_multiprocessing_env()
 
-    persist_path = _normalize_path(path)
-    shuffle = bool(kwargs.pop("shuffle", shuffle))
+    # Required fixed output shape (fixed-shape inference uses .mmt parts).
+    out_shape = kwargs.pop("out_shape", getattr(model, "out_shape", None))
+    if out_shape is None:
+        raise ValueError(
+            "predict: out_shape is required (pass out_shape=... or set model.out_shape)"
+        )
+    out_shape_t = tuple(int(x) for x in out_shape)
+    if not out_shape_t or any(int(x) <= 0 for x in out_shape_t):
+        raise ValueError(f"predict: invalid out_shape={out_shape!r}")
 
+    # Input materialization settings.
     underflow_action = kwargs.pop("underflow_action", default_underflow_action())
+    chunk_size = kwargs.pop("chunk_size", None)
+    lazy = bool(kwargs.pop("lazy", True))
+
     ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
     ds.underflow_action = underflow_action
-
-    out_shape = kwargs.pop("out_shape", getattr(model, "out_shape", ()))
-    out_shape = tuple(int(x) for x in (out_shape or ()))
 
     tmp_dir = new_dir("infer")
     ckpt_dir = os.path.join(tmp_dir, "ckpt")
     memmap_dir = os.path.join(tmp_dir, "memmap")
     os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(memmap_dir, exist_ok=True)
 
-    dcp_dir = os.path.join(ckpt_dir, "model")
-    _maybe_save_model_checkpoint(model, dcp_dir)
-
-    key0: Any = 0
-    keys: Any = range(0)
-    count: int = 0
-    feature_dim: int = 0
-
-    if TensorDictBase is not None and isinstance(data, TensorDictBase):
+    inference_ctx = Gradient.inference(model)
+    with inference_ctx:
         try:
-            X_raw, _Y_raw = extract_xy(data, labels_required=False)
-            if X_raw is None or not hasattr(X_raw, "shape"):
-                raise ValueError("TensorDict input must contain a feature column ('X'/'x' etc).")
-            count = int(X_raw.shape[0])
-        except Exception:
-            count = int(getattr(data, "batch_size", [0])[0] or 0)
-
-        key0 = 0
-        keys = range(count)
-
-        def _get_batch(s: int, e: int):
-            return data[s:e]
-
-        def _get_by_indices(idxs: Sequence[int]):
-            return data[torch.as_tensor(idxs, device="cpu")]
-
-        count, feature_dim, _label_shape, write_labels = LazyTensor.write_memmap_streaming_two_pass(
-            ds,
-            count,
-            memmap_dir,
-            get_batch=_get_batch,
-            get_by_indices=_get_by_indices,
-            key0=key0,
-            keys=keys,
-            seed_value=seed,
-            shuffle=shuffle,
-        )
-
-    elif isinstance(data, Mapping) and data:
-        if LazyTensor.is_feature_label_batch_mapping(data):
-            fkey = resolve_feature_key(data) or "X"
-            lkey = resolve_label_key(data)
-            X_all = data.get(fkey)
-            if X_all is None or not hasattr(X_all, "shape"):
-                raise ValueError("Feature/label mapping must include a feature column ('X'/'x' etc).")
-            Y_all = data.get(lkey) if lkey is not None else None
-
-            count = int(X_all.shape[0])
-            key0 = 0
-            keys = range(count)
-
-            def _get_batch(s: int, e: int):
-                out = {fkey: X_all[s:e]}
-                if Y_all is not None:
-                    out[lkey] = Y_all[s:e]
-                return out
-
-            def _get_by_indices(idxs):
-                idx_t = torch.as_tensor(list(idxs), device="cpu")
-                out = {fkey: X_all.index_select(0, idx_t)}
-                if Y_all is not None:
-                    out[lkey] = Y_all.index_select(0, idx_t)
-                return out
-
-            count, feature_dim, _label_shape, write_labels = LazyTensor.write_memmap_streaming_two_pass(
-                ds,
-                count,
-                memmap_dir,
-                get_batch=_get_batch,
-                get_by_indices=_get_by_indices,
-                key0=key0,
-                keys=keys,
-                seed_value=seed,
-                shuffle=shuffle,
+            # Save model checkpoint for the worker process group.
+            dcp_dir = os.path.join(ckpt_dir, "model")
+            save_dcp = env_bool("STNET_SAVE_DCP", True)
+            save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
+            if not (save_dcp or save_pt):
+                save_pt = True
+            _maybe_save_model_checkpoint(
+                model,
+                dcp_dir,
+                save_dcp=save_dcp,
+                save_pt=save_pt,
+                overwrite=True,
             )
 
-        else:
-            keys = list(data.keys())
-            count = len(keys)
-            key0 = keys[0] if keys else 0
+            # Materialize input data to memmap (features-only).
+            count: int
+            in_dim: int
 
-            def _get_batch(s: int, e: int):
-                return {keys[i]: data[keys[i]] for i in range(s, e)}
+            # 1) TensorDict input
+            if TensorDictBase is not None and isinstance(data, TensorDictBase):
+                X_td, _ = extract_xy(data, labels_required=False)
+                if X_td is None:
+                    raise ValueError("predict: failed to extract features from TensorDict")
+                if not bool(torch.is_tensor(X_td)):
+                    X_td = torch.as_tensor(X_td)
+                if X_td.ndim < 2:
+                    X_td = X_td.view(-1, 1)
+                count = int(X_td.shape[0])
 
-            def _get_by_indices(idxs):
-                return {keys[i]: data[keys[i]] for i in idxs}
+                def _get_batch(s: int, e: int) -> Mapping[str, Any]:
+                    return data[s:e]
 
-            count, feature_dim, _label_shape, write_labels = LazyTensor.write_memmap_streaming_two_pass(
-                ds,
-                count,
-                memmap_dir,
-                get_batch=_get_batch,
-                get_by_indices=_get_by_indices,
-                key0=key0,
-                keys=keys,
-                seed_value=seed,
-                shuffle=shuffle,
+                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                    ds=ds,
+                    out_dir=memmap_dir,
+                    count=count,
+                    get_batch=_get_batch,
+                    get_by_indices=None,
+                    val_frac=0.0,
+                    seed_value=int(seed),
+                    underflow_action=underflow_action,
+                    shuffle=False,
+                    allow_missing_labels=True,
+                    features_only=True,
+                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
+                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                )
+
+            # 2) Feature/label mapping input
+            elif isinstance(data, Mapping) and LazyTensor.is_feature_label_batch_mapping(data):
+                f_key = resolve_feature_key(data)
+                if f_key is None:
+                    raise ValueError("predict: could not resolve feature key from mapping")
+                X_all = data[f_key]
+                try:
+                    count = int(len(X_all))
+                except Exception:
+                    count = int(getattr(X_all, "shape", [0])[0] or 0)
+                if count <= 0:
+                    raise ValueError("predict: empty input")
+
+                def _get_batch(s: int, e: int) -> Mapping[str, Any]:
+                    batch: dict[str, Any] = {}
+                    for k, v in data.items():
+                        # Slice per-sample tensors/arrays, keep scalars as-is.
+                        try:
+                            if hasattr(v, "__len__") and int(len(v)) == count:
+                                batch[k] = v[s:e]
+                            else:
+                                batch[k] = v
+                        except Exception:
+                            batch[k] = v
+                    return batch
+
+                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                    ds=ds,
+                    out_dir=memmap_dir,
+                    count=count,
+                    get_batch=_get_batch,
+                    get_by_indices=None,
+                    val_frac=0.0,
+                    seed_value=int(seed),
+                    underflow_action=underflow_action,
+                    shuffle=False,
+                    allow_missing_labels=True,
+                    features_only=True,
+                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
+                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                )
+
+            # 3) Compact key-index mapping input (no pre-materialization of keys)
+            elif (
+                isinstance(data, Mapping)
+                and data
+                and all(not isinstance(v, Mapping) for v in data.values())
+                and not LazyTensor.is_feature_label_batch_mapping(data)
+            ):
+                count, _get_batch = LazyTensor.key_index_mapping_getters(data)
+                in_dim, _ = LazyTensor.write_memmap_streaming_two_pass(
+                    ds=ds,
+                    out_dir=memmap_dir,
+                    count=count,
+                    get_batch=_get_batch,
+                    get_by_indices=None,
+                    val_frac=0.0,
+                    seed_value=int(seed),
+                    underflow_action=underflow_action,
+                    shuffle=False,
+                    allow_missing_labels=True,
+                    features_only=True,
+                    chunk_first=int(chunk_size) if chunk_size is not None else 4096,
+                    chunk_second=int(chunk_size) if chunk_size is not None else 8192,
+                )
+
+            # 4) Fallback: preprocess then preload to memmap
+            else:
+                fx, _lb, _keys, _lshape = ds.preprocess(data)
+                if fx is None:
+                    raise ValueError("predict: preprocess returned no features")
+                if not bool(torch.is_tensor(fx)):
+                    fx = torch.as_tensor(fx)
+                if fx.ndim < 2:
+                    fx = fx.view(-1, 1)
+                count = int(fx.shape[0])
+                in_dim = int(fx.shape[1])
+                preload_memmap(
+                    {"features": fx},
+                    memmap_dir=memmap_dir,
+                    val_frac=0.0,
+                    shuffle=False,
+                    seed=int(seed),
+                    chunk_size=chunk_size,
+                    allow_missing_labels=True,
+                    features_only=True,
+                    underflow_action=underflow_action,
+                )
+
+            if count <= 0:
+                raise ValueError("predict: empty input")
+
+            # Model config dict (optional).
+            cfg_obj = getattr(model, "_Root__config", None)
+            if isinstance(cfg_obj, ModelConfig):
+                cfg_dict: dict[str, Any] = cfg_obj.to_dict()
+            elif isinstance(cfg_obj, Mapping):
+                cfg_dict = dict(cfg_obj)
+            else:
+                cfg_dict = {}
+
+            base: dict[str, Any] = {
+                "sources": {"kind": "memmap", "path": memmap_dir},
+                "ckpt_dir": ckpt_dir,
+                "model_ckpt_dir": dcp_dir,
+                "in_dim": int(in_dim),
+                "out_shape": out_shape_t,
+                "cfg_dict": cfg_dict,
+            }
+
+            # Only pass supported runtime-config keys.
+            keys = kwargs.pop("keys", None)
+            loss_skew = kwargs.pop("loss_skew", None)
+            ops_kwargs: dict[str, Any] = {"seed": int(seed)}
+            if keys is not None:
+                ops_kwargs["keys"] = keys
+            if loss_skew is not None:
+                ops_kwargs["loss_skew"] = float(loss_skew)
+
+            # Launch config knobs (not part of RuntimeConfig).
+            run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
+
+            # Fail fast on any leftover kwargs (previously these would have crashed inside runtime_config).
+            if kwargs:
+                raise ValueError(f"predict: unsupported kwargs: {sorted(kwargs.keys())}")
+
+            ops = runtime_config(mode, base, *args, **ops_kwargs)
+
+            # Distributed rendezvous.
+            _wp = WorkerPolicy.autotune()
+            _wp.apply_torch_threads()
+            nprocs = int(_wp.nproc_per_node)
+            max_nodes_i = max(1, int(max_nodes) if max_nodes is not None else 1)
+
+            resolved_rdzv = rdzv_endpoint or get_preferred_ip()
+            resolved_rdzv = get_available_host(resolved_rdzv)
+            master_addr, _ = initialize_master_addr(resolved_rdzv)
+
+            lc = LaunchConfig(
+                min_nodes=1,
+                max_nodes=max_nodes_i,
+                nproc_per_node=nprocs,
+                rdzv_backend=str(rdzv_backend or "c10d"),
+                rdzv_endpoint=resolved_rdzv,
+                run_id=run_id,
+                max_restarts=0,
+                monitor_interval=5,
+                start_method=optimal_start_method(),
+                local_addr=master_addr,
+                redirects=Std.NONE,
+                tee=Std.NONE,
             )
 
-    else:
-        X, Y, count, key0, keys, _label_shape = ds.preprocess(data, device="cpu", split_frac=0.0)
-        if X is None:
-            raise ValueError("Could not infer features from input data.")
-        feature_dim = int(X.shape[-1])
-        preload_memmap(
-            {"X": X, "Y": Y},
-            memmap_dir,
-            device="cpu",
-            feature_dtype=torch.float64,
-            label_float_dtype=torch.float64,
-            allow_missing_labels=True,
-        )
+            # Reduce peak GPU/CPU memory before forking workers.
+            with contextlib.suppress(Exception):
+                model.to("cpu")
+            _clear_device_caches()
 
-    if count <= 0 or feature_dim <= 0:
-        raise ValueError(f"Invalid inference dataset: count={count}, feature_dim={feature_dim}")
+            elastic_launch(lc, main)(ops)
 
-    cfg_dict = getattr(model, "__config", None)
-    if cfg_dict is None:
-        cfg_dict = getattr(model, "config", None)
-    cfg_dict = cfg_dict or {}
+            chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
+            if not os.path.isdir(chunks_dir):
+                raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
 
-    base = {
-        "sources": [memmap_dir],
-        "feature_dim": int(feature_dim),
-        "out_shape": out_shape,
-        "cfg_dict": cfg_dict,
-        "ckpt_dir": ckpt_dir,
-        "model_ckpt_dir": dcp_dir,
-    }
+            master_dtype = _infer_pred_master_dtype(chunks_dir)
 
-    if mode not in ("predict", "infer"):
-        raise ValueError(f"predict only supports mode='predict'/'infer' (got: {mode})")
+            # Persist to HDF5.
+            if persist_path is not None:
+                persist_path_n = _normalize_path(persist_path)
+                if not _is_writable_file_path(persist_path_n):
+                    raise ValueError(f"predict: persist_path is not writable: {persist_path_n!r}")
+                return _write_predictions_h5_from_chunks(
+                    persist_path_n,
+                    chunks_dir=chunks_dir,
+                    memmap_dir=memmap_dir,
+                    count=count,
+                    out_shape=out_shape_t,
+                    store_float=master_dtype,
+                    chunk_size=int(chunk_size or 8192),
+                )
 
-    default_kwargs = {
-        "log_interval": 0,
-        "progress": False,
-        "seed": seed,
-    }
+            # Lazy memmap output.
+            if lazy:
+                final_dir = new_dir("predictions")
+                moved_memmap_dir = os.path.join(final_dir, "memmap")
+                shutil.move(memmap_dir, moved_memmap_dir)
+                pred_mmt_path = os.path.join(final_dir, "pred.mmt")
+                _assemble_predictions_to_memmap(
+                    chunks_dir=chunks_dir,
+                    out_path=pred_mmt_path,
+                    count=count,
+                    out_shape=out_shape_t,
+                    store_float=master_dtype,
+                )
 
-    ops = runtime_config(mode, base, *args, **default_kwargs, **kwargs)
+                X_mmt = _open_features_mmt(moved_memmap_dir)
+                Y_mmt = _open_pred_memmap(pred_mmt_path)
+                if Y_mmt is None:
+                    raise RuntimeError("predict: failed to open assembled pred.mmt")
+                return TensorDict({"X": X_mmt[:count], "Y": Y_mmt[:count]}, batch_size=[count])
 
-    model.to(device="cpu")
-    torch.cuda.empty_cache()
+            # In-memory output.
+            Y_t = _assemble_predictions_to_tensor(
+                chunks_dir=chunks_dir,
+                count=count,
+                out_shape=out_shape_t,
+                dtype=master_dtype,
+            )
+            X_mmt = _open_features_mmt(memmap_dir)
+            X_t = X_mmt[:count].detach().cpu().clone()
+            return TensorDict({"X": X_t, "Y": Y_t}, batch_size=[count])
 
-    master_addr = initialize_master_addr(seed)
-    master_port = get_master_port(seed)
-
-    wp = WorkerPolicy.autotune(
-        max_nodes=max_nodes,
-        nproc_per_node=env_int("LOCAL_WORLD_SIZE", 0),
-        omp_num_threads=env_int("OMP_NUM_THREADS", 0),
-    )
-
-    lc = LaunchConfig(
-        min_nodes=wp.nnodes,
-        max_nodes=wp.nnodes,
-        nproc_per_node=wp.nproc,
-        run_id=ops.run_id,
-        rdzv_backend=rdzv_backend or "c10d",
-        rdzv_endpoint=f"{master_addr}:{master_port}",
-        max_restarts=0,
-        monitor_interval=0,
-        start_method=wp.start_method,
-    )
-
-    elastic_launch(lc, main)(ops)
-
-    chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
-    if not os.path.isdir(chunks_dir):
-        remove_dir(tmp_dir)
-        return TensorDict({"X": torch.empty((0, feature_dim)), "Y": torch.empty((0, *out_shape))}, batch_size=[0])
-
-    if lazy and persist_path and _is_writable_file_path(persist_path):
-        out_td = _write_predictions_h5_from_chunks(
-            persist_path,
-            memmap_dir=memmap_dir,
-            chunks_dir=chunks_dir,
-            count=int(count),
-            out_shape=out_shape,
-            store_float=torch.float64,
-        )
-        remove_dir(tmp_dir)
-        return out_td
-
-    if lazy:
-        final_dir = new_dir("predictions")
-        os.makedirs(final_dir, exist_ok=True)
-
-        moved_memmap_dir = os.path.join(final_dir, "memmap")
-        os.makedirs(os.path.dirname(moved_memmap_dir), exist_ok=True)
-        shutil.move(memmap_dir, moved_memmap_dir)
-
-        X_mmt = _open_features_mmt(moved_memmap_dir)
-
-        pred_mmt_path = os.path.join(final_dir, "pred.mmt")
-        Y_mmt = _assemble_predictions_to_memmap(
-            chunks_dir,
-            pred_mmt_path,
-            count=int(count),
-            out_shape=out_shape,
-            store_float=torch.float64,
-        )
-
-        remove_dir(tmp_dir)
-
-        td_mm = TensorDict({"X": X_mmt[: int(count)], "Y": Y_mmt[: int(count)]}, batch_size=[int(count)])
-        return td_mm
-
-    X_mmt = _open_features_mmt(memmap_dir)
-    Y_t = _assemble_predictions_to_tensor(
-        chunks_dir,
-        count=int(count),
-        out_shape=out_shape,
-        dtype=torch.float64,
-    )
-
-    X_t = X_mmt[: int(count)].detach().cpu().clone()
-
-    remove_dir(tmp_dir)
-
-    return TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
-@torch.inference_mode()
+        finally:
+            remove_dir(tmp_dir)
 @catchtime(logger, fn_name="get_prediction")
 def get_prediction(
     source: str,
-    mode: str = "predict",
     *,
     lazy: bool = True,
-    path: Optional[str] = None,
-) -> "TensorDictBase":
-    """Load predictions produced by :func:`predict`.
+    persist_path: Optional[str] = None,
+) -> TensorDictBase | PersistentTensorDict:
+    """Load prediction artifacts.
 
     Supported sources:
-      - A persistent HDF5 file written by predict(lazy=True, path=...)
-      - A directory produced by predict(lazy=True, path=None) containing:
-            <dir>/memmap/meta.json
-            <dir>/memmap/features.mmt
-            <dir>/pred.mmt (+ pred.mmt.meta.json)
+      - A .h5 file created by STNet: returns PersistentTensorDict (read-only).
+      - A directory containing `memmap/` and either:
+          * `pred.mmt` (+ sidecar `.meta.json`), or
+          * `pred_chunks/manifest.json` (and per-part tensors).
 
-    Returns:
-      * lazy=False: a TensorDict with in-memory torch.Tensor leaves
-      * lazy=True & path is valid: a PersistentTensorDict
-      * lazy=True & path is None/invalid: a memmap-backed TensorDict (MemoryMappedTensor leaves)
+    If `persist_path` is provided, an HDF5 PersistentTensorDict is written and
+    returned.
     """
-    _ = mode
 
-    source = _normalize_path(source) or source
-    persist_path = _normalize_path(path)
+    with Gradient.inference(torch.nn.Identity()):
+        if not bool(source):
+            raise ValueError("get_prediction: 'source' must be a non-empty path")
 
-    if os.path.isfile(source) and os.path.splitext(source)[1].lower() in (".h5", ".hdf5"):
-        if PersistentTensorDict is None:
-            raise ImportError("tensordict is required to read PersistentTensorDict outputs.")
-        td = PersistentTensorDict(filename=source, batch_size=None, mode="r")
-        if lazy:
-            return td
-        X = torch.as_tensor(td["X"], device="cpu").clone()
-        Y = torch.as_tensor(td["Y"], device="cpu").clone()
-        return TensorDict({"X": X, "Y": Y}, batch_size=[int(X.shape[0])])
+        src = _normalize_path(source)
 
-    if not os.path.isdir(source):
-        raise FileNotFoundError(f"Prediction source not found: {source}")
+        if persist_path is not None:
+            persist_path = _normalize_path(persist_path)
+            if not _is_writable_file_path(persist_path):
+                raise ValueError(f"persist_path is not writable: {persist_path!r}")
 
-    memmap_dir = os.path.join(source, "memmap")
-    pred_path = os.path.join(source, "pred.mmt")
-    chunks_dir = os.path.join(source, "pred_chunks")
+        # Direct .h5 load.
+        if src.endswith(".h5") and os.path.isfile(src):
+            return PersistentTensorDict(filename=src, mode="r")
 
-    if lazy and persist_path and _is_writable_file_path(persist_path):
+        if not os.path.isdir(src):
+            raise FileNotFoundError(f"source must be a directory or .h5 file: {src!r}")
+
+        memmap_dir = os.path.join(src, "memmap")
+        chunks_dir = os.path.join(src, "pred_chunks")
+        pred_path = os.path.join(src, "pred.mmt")
+
+        if not os.path.isdir(memmap_dir):
+            raise FileNotFoundError(f"missing memmap dir: {memmap_dir!r}")
+
+        # Persist to .h5 if requested.
+        if persist_path is not None:
+            if os.path.isfile(pred_path):
+                return _write_predictions_h5_from_memmaps(
+                    persist_path,
+                    memmap_dir=memmap_dir,
+                    pred_path=pred_path,
+                )
+
+            if os.path.isdir(chunks_dir):
+                manifest = read_json(os.path.join(chunks_dir, "manifest.json"))
+                out_shape = tuple(int(x) for x in (manifest.get("out_shape", []) or []))
+                X_mmt = _open_features_mmt(memmap_dir)
+                count = int(X_mmt.shape[0])
+                store_float = _infer_pred_master_dtype(chunks_dir)
+                return _write_predictions_h5_from_chunks(
+                    persist_path,
+                    chunks_dir=chunks_dir,
+                    memmap_dir=memmap_dir,
+                    count=count,
+                    out_shape=out_shape,
+                    store_float=store_float,
+                )
+
+            raise FileNotFoundError(f"missing prediction artifacts under: {src!r}")
+
+        # No persist: return lazy memmaps (or materialize if requested).
+        X_mmt = _open_features_mmt(memmap_dir)
+        count = int(X_mmt.shape[0])
+
         if os.path.isfile(pred_path):
-            if PersistentTensorDict is None:
-                raise ImportError("tensordict is required for PersistentTensorDict outputs.")
-            X_mmt = _open_features_mmt(memmap_dir)
+            Y_mmt = _open_pred_memmap(pred_path)
+            if Y_mmt is None:
+                raise RuntimeError(f"failed to open prediction memmap: {pred_path!r}")
+            td_mm = TensorDict({"X": X_mmt, "Y": Y_mmt}, batch_size=[count])
+            if not bool(lazy):
+                return TensorDict(
+                    {
+                        "X": X_mmt.detach().cpu().clone(),
+                        "Y": Y_mmt.detach().cpu().clone(),
+                    },
+                    batch_size=[count],
+                )
+            return td_mm
 
-            meta = read_json(pred_path + ".meta.json")
-            shape = tuple(int(x) for x in meta.get("shape", []))
-            if not shape:
-                raise ValueError(f"Missing pred meta: {pred_path}.meta.json")
-            count = int(shape[0])
-            out_shape = shape[1:]
-            store_float = _dtype_from_name(meta.get("dtype", "float64"), torch.float64)
-
-            out_td = _write_predictions_h5_from_chunks(
-                persist_path,
-                memmap_dir=memmap_dir,
-                chunks_dir=chunks_dir if os.path.isdir(chunks_dir) else os.path.dirname(pred_path),
+        if os.path.isdir(chunks_dir):
+            manifest = read_json(os.path.join(chunks_dir, "manifest.json"))
+            out_shape = tuple(int(x) for x in (manifest.get("out_shape", []) or []))
+            store_float = _infer_pred_master_dtype(chunks_dir)
+            _assemble_predictions_to_memmap(
+                chunks_dir=chunks_dir,
+                out_path=pred_path,
                 count=count,
                 out_shape=out_shape,
                 store_float=store_float,
             )
-            return out_td
+            Y_mmt = _open_pred_memmap(pred_path)
+            if Y_mmt is None:
+                raise RuntimeError(f"failed to open prediction memmap: {pred_path!r}")
+            td_mm = TensorDict({"X": X_mmt, "Y": Y_mmt}, batch_size=[count])
+            if not bool(lazy):
+                return TensorDict(
+                    {
+                        "X": X_mmt.detach().cpu().clone(),
+                        "Y": Y_mmt.detach().cpu().clone(),
+                    },
+                    batch_size=[count],
+                )
+            return td_mm
 
-        if os.path.isdir(chunks_dir):
-            manifest = read_json(os.path.join(chunks_dir, "manifest.json"))
-            out_shape = tuple(int(x) for x in manifest.get("out_shape", []) or [])
-            X_mmt = _open_features_mmt(memmap_dir)
-            count = int(X_mmt.shape[0])
-            return _write_predictions_h5_from_chunks(
-                persist_path,
-                memmap_dir=memmap_dir,
-                chunks_dir=chunks_dir,
-                count=count,
-                out_shape=out_shape,
-                store_float=torch.float64,
-            )
-
-    if os.path.isfile(pred_path):
-        X_mmt = _open_features_mmt(memmap_dir)
-        Y_mmt = _open_pred_memmap(pred_path)
-        td_mm = TensorDict({"X": X_mmt, "Y": Y_mmt}, batch_size=[int(X_mmt.shape[0])])
-        if not lazy:
-            return TensorDict({
-                "X": X_mmt.detach().cpu().clone(),
-                "Y": Y_mmt.detach().cpu().clone(),
-            }, batch_size=[int(X_mmt.shape[0])])
-        return td_mm
-
-    if os.path.isdir(chunks_dir):
-        manifest = read_json(os.path.join(chunks_dir, "manifest.json"))
-        out_shape = tuple(int(x) for x in manifest.get("out_shape", []) or [])
-        X_mmt = _open_features_mmt(memmap_dir)
-        count = int(X_mmt.shape[0])
-        Y_mmt = _assemble_predictions_to_memmap(
-            chunks_dir,
-            pred_path,
-            count=count,
-            out_shape=out_shape,
-            store_float=torch.float64,
-        )
-        td_mm = TensorDict({"X": X_mmt, "Y": Y_mmt}, batch_size=[count])
-        if not lazy:
-            return TensorDict({
-                "X": X_mmt.detach().cpu().clone(),
-                "Y": Y_mmt.detach().cpu().clone(),
-            }, batch_size=[count])
-        return td_mm
-
-    raise FileNotFoundError(f"No predictions found under: {source}")
+        raise FileNotFoundError(f"No predictions found under: {src!r}")

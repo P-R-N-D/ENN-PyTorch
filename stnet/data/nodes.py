@@ -29,7 +29,7 @@ import torch
 from ..backend.compat import ensure_torchdata
 from ..backend.system import Memory, Thread, process_cpu_count
 from .collections import Buffer, LazyTensor, Pool, ProducerError, best_effort_close
-from .datatype import env_bool, env_first_int
+from .datatype import dtype_from_name, env_bool, env_first_int
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -282,13 +282,6 @@ class SamplerScale:
 class Sampler(_Sampler):
     _per_sample_mem_bytes: int = 0
 
-    @staticmethod
-    def _dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
-        try:
-            return getattr(torch, str(name))
-        except Exception:
-            return default
-
     @classmethod
     def _load_meta(cls: type["Sampler"], memmap_dir: str) -> Mapping[str, Any]:
         meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
@@ -350,8 +343,8 @@ class Sampler(_Sampler):
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
 
-        f_dtype = self._dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
-        l_dtype = self._dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
+        f_dtype = dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
+        l_dtype = dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
 
         # Optional row_ids emission (metadata). Disable to avoid per-batch arange allocations.
         self._include_row_ids = env_bool("STNET_INCLUDE_ROW_IDS", default=True)
