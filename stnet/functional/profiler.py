@@ -2649,40 +2649,84 @@ class FlopCounter:
         if key is not None and (cached_total <= 0.0) and (backend in ("dynamo", "hooks", "dispatch")):
             static_total, static_breakdown = self.prepare(*ex_args, **ex_kwargs)
 
-        if backend == "dynamo":
-            if key is not None and static_total > 0.0:
-                return _StaticFlops(static_total, static_breakdown)
-            return FLOP_PROFILER.monitoring(self._device, display=display, use_torch_profiler=True, use_nvtx=True, dispatch_mode=None)
-
-        if backend == "dispatch":
-            if TorchDispatchMode is None:
-                inner = FLOP_PROFILER.monitoring(self._device, display=display, use_torch_profiler=True, use_nvtx=True, dispatch_mode=None)
-            else:
-                dispatch = _OpFlopDispatchMode(
-                    FLOP_PROFILER,
-                    include_bias=self._include_bias,
-                    effective_bwd=eff_bwd,
-                    count_elementwise=self._count_elementwise,
+        match backend:
+            case "dynamo":
+                if key is not None and static_total > 0.0:
+                    return _StaticFlops(static_total, static_breakdown)
+                return FLOP_PROFILER.monitoring(
+                    self._device,
+                    display=display,
+                    use_torch_profiler=True,
+                    use_nvtx=True,
+                    dispatch_mode=None,
                 )
-                inner = FLOP_PROFILER.monitoring(self._device, display=display, use_torch_profiler=False, use_nvtx=True, dispatch_mode=dispatch)
 
-            if self._static_fallback_on_zero and key is not None and (static_total > 0.0 or cached_total > 0.0):
-                fallback_total = float(cached_total) if cached_total > 0.0 else float(static_total)
-                fallback_breakdown = dict(cached_breakdown) if cached_total > 0.0 else dict(static_breakdown)
-                return _HybridFlops(inner, static_total=fallback_total, static_breakdown=fallback_breakdown, cache_slot=self._runtime_cache, cache_key=key)
+            case "dispatch":
+                if TorchDispatchMode is None:
+                    inner = FLOP_PROFILER.monitoring(
+                        self._device,
+                        display=display,
+                        use_torch_profiler=True,
+                        use_nvtx=True,
+                        dispatch_mode=None,
+                    )
+                else:
+                    dispatch = _OpFlopDispatchMode(
+                        FLOP_PROFILER,
+                        include_bias=self._include_bias,
+                        effective_bwd=eff_bwd,
+                        count_elementwise=self._count_elementwise,
+                    )
+                    inner = FLOP_PROFILER.monitoring(
+                        self._device,
+                        display=display,
+                        use_torch_profiler=False,
+                        use_nvtx=True,
+                        dispatch_mode=dispatch,
+                    )
 
-            return inner
+                if self._static_fallback_on_zero and key is not None and (static_total > 0.0 or cached_total > 0.0):
+                    fallback_total = float(cached_total) if cached_total > 0.0 else float(static_total)
+                    fallback_breakdown = dict(cached_breakdown) if cached_total > 0.0 else dict(static_breakdown)
+                    return _HybridFlops(
+                        inner,
+                        static_total=fallback_total,
+                        static_breakdown=fallback_breakdown,
+                        cache_slot=self._runtime_cache,
+                        cache_key=key,
+                    )
 
-        if backend == "hooks":
-            inner = FLOP_PROFILER.monitoring(self._device, display=display, use_torch_profiler=True, use_nvtx=True, dispatch_mode=None)
-            if self._static_fallback_on_zero and key is not None and (static_total > 0.0 or cached_total > 0.0):
-                fallback_total = float(cached_total) if cached_total > 0.0 else float(static_total)
-                fallback_breakdown = dict(cached_breakdown) if cached_total > 0.0 else dict(static_breakdown)
-                return _HybridFlops(inner, static_total=fallback_total, static_breakdown=fallback_breakdown, cache_slot=self._runtime_cache, cache_key=key)
-            return inner
+                return inner
 
-        # backend == "torch" or unknown
-        return FLOP_PROFILER.monitoring(self._device, display=display, use_torch_profiler=True, use_nvtx=True, dispatch_mode=None)
+            case "hooks":
+                inner = FLOP_PROFILER.monitoring(
+                    self._device,
+                    display=display,
+                    use_torch_profiler=True,
+                    use_nvtx=True,
+                    dispatch_mode=None,
+                )
+                if self._static_fallback_on_zero and key is not None and (static_total > 0.0 or cached_total > 0.0):
+                    fallback_total = float(cached_total) if cached_total > 0.0 else float(static_total)
+                    fallback_breakdown = dict(cached_breakdown) if cached_total > 0.0 else dict(static_breakdown)
+                    return _HybridFlops(
+                        inner,
+                        static_total=fallback_total,
+                        static_breakdown=fallback_breakdown,
+                        cache_slot=self._runtime_cache,
+                        cache_key=key,
+                    )
+                return inner
+
+            case _:
+                # backend == "torch" or unknown
+                return FLOP_PROFILER.monitoring(
+                    self._device,
+                    display=display,
+                    use_torch_profiler=True,
+                    use_nvtx=True,
+                    dispatch_mode=None,
+                )
 
 
 def _export_fx(model: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[torch.fx.GraphModule]:

@@ -1394,15 +1394,39 @@ def predict(
                 if count <= 0:
                     raise ValueError("predict: empty input")
 
+                # Pre-classify sliceable vs constant entries once to avoid scanning `data.items()`
+                # for every batch window.
+                slice_items: list[tuple[Any, Any]] = []
+                const_items: dict[Any, Any] = {}
+                for k, v in data.items():
+                    # Treat strings/bytes as constants even though they are sized.
+                    if isinstance(v, (str, bytes, bytearray)):
+                        const_items[k] = v
+                        continue
+
+                    # Nested mappings are typically metadata/config. Avoid misclassifying dict-likes
+                    # as per-sample sequences. TensorDict is an exception: it supports slicing.
+                    if isinstance(v, Mapping) and not (
+                        TensorDictBase is not None and isinstance(v, TensorDictBase)
+                    ):
+                        const_items[k] = v
+                        continue
+
+                    try:
+                        if len(v) == count:
+                            slice_items.append((k, v))
+                        else:
+                            const_items[k] = v
+                    except Exception:
+                        const_items[k] = v
+
+                slice_items_t = tuple(slice_items)
+
                 def _get_batch(s: int, e: int) -> Mapping[str, Any]:
-                    batch: dict[str, Any] = {}
-                    for k, v in data.items():
-                        # Slice per-sample tensors/arrays, keep scalars as-is.
+                    batch = dict(const_items)
+                    for k, v in slice_items_t:
                         try:
-                            if hasattr(v, "__len__") and int(len(v)) == count:
-                                batch[k] = v[s:e]
-                            else:
-                                batch[k] = v
+                            batch[k] = v[s:e]
                         except Exception:
                             batch[k] = v
                     return batch
