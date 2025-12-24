@@ -7,7 +7,6 @@ import math
 import multiprocessing as mp
 import os
 import queue
-import sys
 import threading
 from contextlib import suppress
 from dataclasses import dataclass

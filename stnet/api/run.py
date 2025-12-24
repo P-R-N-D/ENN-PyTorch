@@ -7,10 +7,9 @@ import logging
 import os
 import random
 import shutil
-import tempfile
 import time
 from functools import lru_cache, wraps
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -47,7 +46,6 @@ from ..data.pipeline import (
     extract_xy,
     normalize_underflow_action,
     resolve_feature_key,
-    resolve_label_key,
 )
 from ..model.fused import Gradient
 from ..model.nn import History, Root, resize_scaler_buffer
@@ -1514,6 +1512,8 @@ def predict(
             # Persist to HDF5.
             if persist_path is not None:
                 persist_path_n = _normalize_path(persist_path)
+                if persist_path_n is None:
+                    raise ValueError("predict: persist_path is empty/None after normalization")
                 if not _is_writable_file_path(persist_path_n):
                     raise ValueError(f"predict: persist_path is not writable: {persist_path_n!r}")
                 return _write_predictions_h5_from_chunks(
@@ -1584,8 +1584,13 @@ def get_prediction(
 
         src = _normalize_path(source)
 
+        if src is None:
+            raise ValueError("get_prediction: 'source' is empty/None after normalization")
+
         if persist_path is not None:
             persist_path = _normalize_path(persist_path)
+            if persist_path is None:
+                raise ValueError("get_prediction: persist_path is empty/None after normalization")
             if not _is_writable_file_path(persist_path):
                 raise ValueError(f"persist_path is not writable: {persist_path!r}")
 
