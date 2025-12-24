@@ -4,7 +4,6 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
-import os
 import threading
 import weakref
 from collections.abc import Iterator
@@ -42,6 +41,7 @@ from ..backend.compat import (
     torch_no_compile,
 )
 from ..backend.system import empty_device_cache
+from ..data.datatype import env_first_int, env_int
 from ..data.pipeline import resolve_feature_key, resolve_label_key
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
@@ -89,20 +89,23 @@ def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 @torch.no_grad()
-def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
-    def _expand_bits(v: torch.Tensor) -> torch.Tensor:
-        v = (v | (v << 16)) & 0x030000FF
-        v = (v | (v << 8)) & 0x0300F00F
-        v = (v | (v << 4)) & 0x030C30C3
-        v = (v | (v << 2)) & 0x09249249
-        return v
+def _expand_morton_bits_3d(v: torch.Tensor) -> torch.Tensor:
+    """Interleave bits for 3D Morton (Z-order) encoding."""
+    v = (v | (v << 16)) & 0x030000FF
+    v = (v | (v << 8)) & 0x0300F00F
+    v = (v | (v << 4)) & 0x030C30C3
+    v = (v | (v << 2)) & 0x09249249
+    return v
 
+
+@torch.no_grad()
+def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
     maxv = (1 << int(bits)) - 1
     xyz = (coords01 * maxv).to(torch.int32)
     x, y, z = xyz.unbind(dim=-1)
-    xx = _expand_bits(x)
-    yy = _expand_bits(y) << 1
-    zz = _expand_bits(z) << 2
+    xx = _expand_morton_bits_3d(x)
+    yy = _expand_morton_bits_3d(y) << 1
+    zz = _expand_morton_bits_3d(z) << 2
     return (xx | yy | zz)
 
 
@@ -119,13 +122,11 @@ def _serialize_z_index(
     keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)
     if shift_order and (block_index % 2 == 1):
-        B, N = perm.shape
+        N = int(perm.size(1))
         shift = (patch // 2) % max(N, 1)
         if shift:
-            roll = torch.roll(
-                torch.arange(N, device=perm.device), shifts=int(shift), dims=0
-            )
-            perm = perm.gather(1, roll.unsqueeze(0).expand(B, N))
+            # Equivalent to gather(perm, rolled_arange), but avoids building an index tensor.
+            perm = torch.roll(perm, shifts=int(shift), dims=1)
     invperm = torch.empty_like(perm)
     scatter_src = torch.arange(perm.size(1), device=perm.device)
     if scatter_src.dim() < perm.dim():
@@ -190,6 +191,28 @@ def _apply_norm_fp16_safe(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
     if cast_back:
         y = y.to(dtype=x.dtype)
     return y
+
+
+def _sanitize_tensor(
+    t: torch.Tensor,
+    *,
+    enabled: bool,
+    inplace: bool,
+) -> torch.Tensor:
+    """Best-effort NaN/Inf sanitization.
+
+    Kept as a module-level helper to avoid per-forward nested function creation
+    in hot paths.
+    """
+    if not bool(enabled):
+        return t
+    if not (t.is_floating_point() or t.is_complex()):
+        return t
+    if bool(inplace):
+        # In-place path avoids extra allocations, but relies on the caller to
+        # ensure it's safe for autograd.
+        return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _microbatch_prealloc(
@@ -2415,34 +2438,22 @@ class Root(nn.Module):
         if not isinstance(X, torch.Tensor):
             return 64
         b = int(X.shape[0] if X.ndim > 0 else 1)
-        hard_max = 64
-        try:
-            v = os.environ.get("STNET_MICROBATCH_MAX")
-            if v is not None and str(v).strip():
-                hard_max = int(v)
-        except (TypeError, ValueError):
-            pass
+        hard_max = int(env_int("STNET_MICROBATCH_MAX", 64))
         hard_max = max(1, min(hard_max, b))
 
-        per_sample = 0
-        env_ps = os.environ.get("STNET_PER_SAMPLE_MEM_BYTES") or os.environ.get("STNET_DEVICE_BYTES_PER_SAMPLE")
-        if env_ps:
-            try:
-                per_sample = int(env_ps)
-            except (TypeError, ValueError):
-                per_sample = 0
+        per_sample = int(
+            env_first_int(
+                ("STNET_PER_SAMPLE_MEM_BYTES", "STNET_DEVICE_BYTES_PER_SAMPLE"),
+                default=0,
+            )
+            or 0
+        )
         if per_sample <= 0:
             one = X[:1]
             bytes_per_sample = int(one.nelement()) * int(one.element_size())
             per_sample = int(bytes_per_sample * 8)
 
-        stage_div = 4
-        try:
-            v = os.environ.get("STNET_MICROBATCH_STAGE_DIV")
-            if v is not None and str(v).strip():
-                stage_div = max(1, int(v))
-        except (TypeError, ValueError):
-            stage_div = 4
+        stage_div = max(1, int(env_int("STNET_MICROBATCH_STAGE_DIV", 4)))
         per_sample = max(1, int(per_sample // stage_div))
 
         mb_size = _auto_microbatch(device=device, hard_max=hard_max, per_sample_bytes=per_sample)
@@ -2482,14 +2493,8 @@ class Root(nn.Module):
 
         grad_enabled = torch.is_grad_enabled()
         infer_mode = not grad_enabled
-        sanitize_inplace = bool(sanitize_nan and infer_mode)
-
-        def _sanitize(t: torch.Tensor) -> torch.Tensor:
-            if not sanitize_nan:
-                return t
-            if sanitize_inplace and (torch.is_floating_point(t) or torch.is_complex(t)):
-                return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
-            return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
+        sanitize_enabled = bool(sanitize_nan)
+        sanitize_inplace = bool(sanitize_enabled and infer_mode)
 
         td_input: TensorDictBase | None = None
         if isinstance(features, TensorDictBase):
@@ -2700,8 +2705,8 @@ class Root(nn.Module):
                     ),
                 )
 
-            tokens = _sanitize(tokens)
-            context = _sanitize(context)
+            tokens = _sanitize_tensor(tokens, enabled=sanitize_enabled, inplace=sanitize_inplace)
+            context = _sanitize_tensor(context, enabled=sanitize_enabled, inplace=sanitize_inplace)
 
             if int(tokens.shape[0]) != int(b):
                 raise RuntimeError(
@@ -2732,7 +2737,11 @@ class Root(nn.Module):
                 auto_microbatch_fn=lambda t: self._auto_microbatch(t, device),
                 graph_break_fn=graph_break,
             )
-            refined_tokens = _sanitize(refined_tokens)
+            refined_tokens = _sanitize_tensor(
+                refined_tokens,
+                enabled=sanitize_enabled,
+                inplace=sanitize_inplace,
+            )
 
             ctrl_mb = max(1, min(int(b), int(self.controller.microbatch) or int(b)))
 
@@ -2759,12 +2768,16 @@ class Root(nn.Module):
                     ),
                 )
 
-            residual_context = _sanitize(residual_context)
+            residual_context = _sanitize_tensor(
+                residual_context,
+                enabled=sanitize_enabled,
+                inplace=sanitize_inplace,
+            )
             residual = residual_context.reshape(b, -1)
             if residual.dtype != assembled.dtype:
                 residual = residual.to(dtype=assembled.dtype)
             y_hat = assembled + residual
-            y_hat = _sanitize(y_hat)
+            y_hat = _sanitize_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
 
             pred = y_hat.reshape(b, *self.out_shape)
 
@@ -2807,7 +2820,19 @@ class Root(nn.Module):
                     use_base_detach = bool(
                         is_train_path and (local_loss is not None) and (float(weights[1]) > 1e-12)
                     )
-                    z_top = _sanitize(assembled.detach() + residual) if use_base_detach else _sanitize(y_hat)
+                    z_top = (
+                        _sanitize_tensor(
+                            assembled.detach() + residual,
+                            enabled=sanitize_enabled,
+                            inplace=sanitize_inplace,
+                        )
+                        if use_base_detach
+                        else _sanitize_tensor(
+                            y_hat,
+                            enabled=sanitize_enabled,
+                            inplace=sanitize_inplace,
+                        )
+                    )
                     top_component = cast(torch.Tensor, global_loss(z_top, z_true))
                     total = total + weights[0] * top_component
 

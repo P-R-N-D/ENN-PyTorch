@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
 
 from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
-from ..backend.runtime import _torch_load_cpu, _trim_dcp_keys, main
+from ..backend.runtime import _trim_dcp_keys, main
 from ..backend.system import (
     WorkerPolicy,
     initialize_python_path,
@@ -49,6 +49,7 @@ from ..data.pipeline import (
 )
 from ..model.fused import Gradient
 from ..model.nn import History, Root, resize_scaler_buffer
+from .io import _to_cpu, _torch_load_checkpoint
 from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
 
@@ -141,59 +142,6 @@ def _clear_device_caches() -> None:
         mps = getattr(torch, "mps", None)
         if mps is not None and callable(getattr(mps, "empty_cache", None)):
             mps.empty_cache()
-
-
-# -----------------------------
-def _preload_state(state: Any) -> Any:
-    """Normalize a loaded state_dict for safe CPU-side use.
-
-    - Ensures tensors are detached and resident on CPU.
-    - Converts meta/fake tensors to real CPU tensors when encountered.
-    - Makes tensors contiguous when possible.
-
-    This is useful when user code provides a state dict (or torch.load result)
-    that may contain non-standard tensor types.
-    """
-    from collections.abc import Mapping as _Mapping
-
-    if isinstance(state, _Mapping):
-        return {k: _preload_state(v) for k, v in state.items()}
-    if isinstance(state, list):
-        return [_preload_state(v) for v in state]
-    if isinstance(state, tuple):
-        seq = tuple(_preload_state(v) for v in state)
-        if type(state) is tuple:
-            return seq
-        # namedtuple: constructor expects positional args.
-        if hasattr(state, "_fields"):
-            try:
-                return type(state)(*seq)
-            except Exception:
-                return seq
-        try:
-            return type(state)(seq)
-        except Exception:
-            return seq
-
-    if isinstance(state, torch.Tensor):
-        t = state
-        with contextlib.suppress(Exception):
-            from ..backend.compat import is_meta_or_fake_tensor
-
-            if is_meta_or_fake_tensor(t):
-                t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
-
-        if t.device.type != "cpu":
-            t = t.detach().to(device="cpu")
-        else:
-            t = t.detach()
-
-        with contextlib.suppress(Exception):
-            if hasattr(t, "is_contiguous") and not bool(t.is_contiguous()):
-                t = t.contiguous()
-        return t
-
-    return state
 
 
 # -----------------------------
@@ -754,8 +702,12 @@ def train(
         # Load final model weights back into this process.
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
-            cpu_state = _torch_load_cpu(fallback, weights_only=True)
-            cpu_state = _preload_state(cpu_state)
+            cpu_state = _torch_load_checkpoint(
+                fallback,
+                map_location="cpu",
+                weights_only=True,
+            )
+            cpu_state = _to_cpu(cpu_state)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
         else:
@@ -971,7 +923,11 @@ def _infer_pred_master_dtype(chunks_dir: str, *, default: torch.dtype = torch.fl
         # Fallback: torch chunk (loads into RAM).
         if os.path.isfile(pred_path):
             try:
-                preds_t = _torch_load_cpu(pred_path, weights_only=True)
+                preds_t = _torch_load_checkpoint(
+                    pred_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
             except Exception:
                 preds_t = None
             if isinstance(preds_t, torch.Tensor):
@@ -1020,7 +976,11 @@ def _assemble_predictions_to_memmap(
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
-        rows_t = _torch_load_cpu(rows_file, weights_only=True)
+        rows_t = _torch_load_checkpoint(
+            rows_file,
+            map_location="cpu",
+            weights_only=True,
+        )
         if not isinstance(rows_t, torch.Tensor):
             rows_t = torch.as_tensor(rows_t, device="cpu")
         rows_t = rows_t.to(dtype=torch.int64, device="cpu")
@@ -1028,7 +988,11 @@ def _assemble_predictions_to_memmap(
         if pred_file.endswith(".mmt"):
             preds_t = _open_pred_memmap(pred_file)
         else:
-            preds_t = _torch_load_cpu(pred_file, weights_only=True)
+            preds_t = _torch_load_checkpoint(
+                pred_file,
+                map_location="cpu",
+                weights_only=True,
+            )
             if not isinstance(preds_t, torch.Tensor):
                 preds_t = torch.as_tensor(preds_t, device="cpu")
 
@@ -1080,7 +1044,11 @@ def _assemble_predictions_to_tensor(
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
-        rows_t = _torch_load_cpu(rows_file, weights_only=True)
+        rows_t = _torch_load_checkpoint(
+            rows_file,
+            map_location="cpu",
+            weights_only=True,
+        )
         if not isinstance(rows_t, torch.Tensor):
             rows_t = torch.as_tensor(rows_t, device="cpu")
         rows_t = rows_t.to(dtype=torch.int64, device="cpu")
@@ -1088,7 +1056,11 @@ def _assemble_predictions_to_tensor(
         if pred_file.endswith(".mmt"):
             preds_t = _open_pred_memmap(pred_file)
         else:
-            preds_t = _torch_load_cpu(pred_file, weights_only=True)
+            preds_t = _torch_load_checkpoint(
+                pred_file,
+                map_location="cpu",
+                weights_only=True,
+            )
             if not isinstance(preds_t, torch.Tensor):
                 preds_t = torch.as_tensor(preds_t, device="cpu")
 
@@ -1159,7 +1131,11 @@ def _write_predictions_h5_from_chunks(
             rows_file = os.path.join(chunks_dir, str(part["rows"]))
             pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
-            rows_t = _torch_load_cpu(rows_file, weights_only=True)
+            rows_t = _torch_load_checkpoint(
+                rows_file,
+                map_location="cpu",
+                weights_only=True,
+            )
             if not isinstance(rows_t, torch.Tensor):
                 rows_t = torch.as_tensor(rows_t, device="cpu")
             rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
@@ -1167,7 +1143,11 @@ def _write_predictions_h5_from_chunks(
             if pred_file.endswith(".mmt"):
                 preds_t = _open_pred_memmap(pred_file)
             else:
-                preds_t = _torch_load_cpu(pred_file, weights_only=True)
+                preds_t = _torch_load_checkpoint(
+                    pred_file,
+                    map_location="cpu",
+                    weights_only=True,
+                )
                 if not isinstance(preds_t, torch.Tensor):
                     preds_t = torch.as_tensor(preds_t, device="cpu")
 

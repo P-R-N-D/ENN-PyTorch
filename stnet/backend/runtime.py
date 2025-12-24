@@ -16,7 +16,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed
@@ -34,8 +34,9 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..data.collections import LazyTensor
-from ..data.datatype import env_bool, env_float, env_int, parse_bool
+from ..data.datatype import env_bool, env_first, env_first_int, env_float, env_int, env_str, parse_bool
 from ..data.pipeline import extract_xy
+from ..api.io import _torch_load_checkpoint
 
 
 def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
@@ -95,13 +96,11 @@ def _nvml_disabled() -> bool:
     """Return True if NVML telemetry is explicitly disabled via env vars."""
 
     # STNET_NVML_DISABLE=1 disables NVML unconditionally.
-    v = parse_bool(os.environ.get("STNET_NVML_DISABLE"))
-    if v is True:
+    if env_bool("STNET_NVML_DISABLE", False):
         return True
 
     # STNET_NVML=0 also disables (mirrors other STNET toggles).
-    v = parse_bool(os.environ.get("STNET_NVML"))
-    if v is False:
+    if not env_bool("STNET_NVML", True):
         return True
     return False
 
@@ -113,16 +112,8 @@ def _nvml_fail_max() -> int:
     if _NVML_FAIL_MAX is not None:
         return int(_NVML_FAIL_MAX)
 
-    v = os.environ.get("STNET_NVML_FAIL_MAX")
-    if v is None:
-        v = os.environ.get("STNET_NVML_FAILURES")
-    if v is not None and str(v).strip():
-        try:
-            _NVML_FAIL_MAX = max(1, int(v))
-            return int(_NVML_FAIL_MAX)
-        except Exception:
-            pass
-    _NVML_FAIL_MAX = 3
+    v = env_first_int(("STNET_NVML_FAIL_MAX", "STNET_NVML_FAILURES"), default=3)
+    _NVML_FAIL_MAX = max(1, int(v))
     return int(_NVML_FAIL_MAX)
 
 
@@ -138,21 +129,18 @@ def _nvml_backoff_s() -> float:
     if _NVML_BACKOFF_S is not None:
         return float(_NVML_BACKOFF_S)
 
-    for key in ("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"):
-        v = os.environ.get(key)
-        if v is not None and str(v).strip():
-            try:
-                _NVML_BACKOFF_S = max(0.0, float(v))
-                return float(_NVML_BACKOFF_S)
-            except Exception:
-                pass
+    raw = env_first(("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"))
+    if raw is not None:
+        with contextlib.suppress(Exception):
+            _NVML_BACKOFF_S = max(0.0, float(raw))
+            return float(_NVML_BACKOFF_S)
 
     # Default: slightly longer backoff when no-GIL optimizations are enabled,
     # because telemetry is polled much more frequently.
     try:
-        from .system import Thread
+        from .system import Affinity
 
-        _NVML_BACKOFF_S = 30.0 if bool(Thread.nogil_optimizations_enabled()) else 10.0
+        _NVML_BACKOFF_S = 30.0 if bool(Affinity.nogil_optimizations_enabled()) else 10.0
     except Exception:
         _NVML_BACKOFF_S = 10.0
     return float(_NVML_BACKOFF_S)
@@ -184,21 +172,17 @@ def _nvml_min_interval_s() -> float:
     if _NVML_MIN_INTERVAL_S is not None:
         return float(_NVML_MIN_INTERVAL_S)
 
-    # Env override (seconds)
-    for key in ("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"):
-        v = os.environ.get(key)
-        if v is not None and str(v).strip():
-            try:
-                _NVML_MIN_INTERVAL_S = max(0.0, float(v))
-                return float(_NVML_MIN_INTERVAL_S)
-            except Exception:
-                pass
+    raw = env_first(("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"))
+    if raw is not None:
+        with contextlib.suppress(Exception):
+            _NVML_MIN_INTERVAL_S = max(0.0, float(raw))
+            return float(_NVML_MIN_INTERVAL_S)
 
     # Default: throttle only when no-GIL optimizations are enabled.
     try:
-        from .system import Thread
+        from .system import Affinity
 
-        _NVML_MIN_INTERVAL_S = 0.10 if bool(Thread.nogil_optimizations_enabled()) else 0.0
+        _NVML_MIN_INTERVAL_S = 0.10 if bool(Affinity.nogil_optimizations_enabled()) else 0.0
     except Exception:
         _NVML_MIN_INTERVAL_S = 0.0
     return float(_NVML_MIN_INTERVAL_S)
@@ -274,9 +258,15 @@ from .distributed import (distributed_barrier, distributed_sync,
                           get_world_size, is_distributed, joining, no_sync,
                           to_ddp, to_fsdp)
 from ..functional.profiler import FlopCounter
-from .system import (Memory, Thread, empty_device_cache, get_device, get_tlb,
-                     initialize_python_path, posix_time,
-                     set_float32_precision)
+from .system import (
+    Memory,
+    empty_device_cache,
+    get_device,
+    get_tlb,
+    initialize_python_path,
+    posix_time,
+    set_float32_precision,
+)
 
 if TYPE_CHECKING:
     import numpy as _np
@@ -289,27 +279,6 @@ else:
 _LOGGER = logging.getLogger(__name__)
 
 torch_safe_distributed()
-def _torch_load_cpu(path: str, *, weights_only: Optional[bool] = None) -> Any:
-    """torch.load wrapper with CPU map + best-effort weights_only support.
-
-    - On newer PyTorch versions, weights_only=True is recommended for loading pure weights/state_dicts.
-    - On older versions, passing weights_only raises TypeError; we fall back to plain torch.load.
-    """
-    if weights_only is not None:
-        try:
-            return torch.load(path, map_location="cpu", weights_only=bool(weights_only))
-        except TypeError:
-            return torch.load(path, map_location="cpu")
-        except Exception:
-            if bool(weights_only):
-                # Some files are not compatible with weights_only=True (e.g., pickled Python objects).
-                try:
-                    return torch.load(path, map_location="cpu", weights_only=False)
-                except Exception:
-                    pass
-            raise
-    return torch.load(path, map_location="cpu")
-
 
 _SAMPLER_SCALE_LOG_LOCK = threading.Lock()
 _SAMPLER_SCALE_LOG_LAST_S: Dict[Tuple[int, str], float] = {}
@@ -604,11 +573,7 @@ def _meta_monitor_pre_hook(
 
 
 def _enable_meta_monitor(model: torch.nn.Module) -> None:
-    hook_mode = (
-        os.environ.get("STNET_META_MONITOR")
-        or os.environ.get("STNET_META_HOOK")
-        or "off"
-    ).strip().lower()
+    hook_mode = str(env_first(("STNET_META_MONITOR", "STNET_META_HOOK"), default="off") or "off").strip().lower()
     if hook_mode in {"0", "", "false", "off"}:
         return
     warn_only = hook_mode in {"warn", "warning"}
@@ -850,7 +815,7 @@ def _set_backend(device: torch.device) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.benchmark = True
-    rank = int(os.environ.get("LOCAL_RANK", 0))
+    rank = int(_rt_env_int("LOCAL_RANK", 0))
     if device.type == "cuda":
         torch.cuda.set_device(rank)
     elif device.type == "xpu":
@@ -1308,7 +1273,7 @@ def _initialize_group(backend: str, device: torch.device, local_rank: int) -> No
         index = (
             device.index
             if getattr(device, "index", None) is not None
-            else int(os.environ.get("LOCAL_RANK", local_rank))
+            else env_int("LOCAL_RANK", int(local_rank))
         )
         try:
             dev_id = torch.device(dev_type, index)
@@ -1915,57 +1880,22 @@ def epochs(
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
     max_grad_accum = fixed_accum
-    dev_margin = 0.8
-    host_margin = 0.8
-    budget_slack = 1.25
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_BUDGET_SLACK")
-        if v is not None and str(v).strip():
-            budget_slack = float(v)
+    # Centralize env parsing through stnet.data.datatype helpers.
+    dev_margin = env_float("STNET_DEVICE_MARGIN", 0.8)
+    host_margin = env_float("STNET_HOST_MARGIN", 0.8)
+
+    budget_slack = env_float("STNET_BUDGET_SLACK", 1.25)
     budget_slack = max(1.0, min(4.0, float(budget_slack)))
 
-    dev_budget_ratio = 1.0
-    dev_budget_min_bytes = 0
-    dev_budget_max_bytes: Optional[int] = None
+    dev_budget_ratio = env_float("STNET_DEVICE_BUDGET_RATIO", 1.0)
+    dev_budget_min_bytes = env_int("STNET_DEVICE_BUDGET_MIN_BYTES", 0)
+    _dev_budget_max_raw = env_int("STNET_DEVICE_BUDGET_MAX_BYTES", 0)
+    dev_budget_max_bytes: Optional[int] = None if int(_dev_budget_max_raw) <= 0 else int(_dev_budget_max_raw)
 
-    host_budget_ratio = 1.0
-    host_budget_min_bytes = 0
-    host_budget_max_bytes: Optional[int] = None
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_MARGIN")
-        if v is not None and str(v).strip():
-            dev_margin = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_MARGIN")
-        if v is not None and str(v).strip():
-            host_margin = float(v)
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_RATIO")
-        if v is not None and str(v).strip():
-            dev_budget_ratio = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_MIN_BYTES")
-        if v is not None and str(v).strip():
-            dev_budget_min_bytes = int(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_DEVICE_BUDGET_MAX_BYTES")
-        if v is not None and str(v).strip():
-            dev_budget_max_bytes = int(v)
-
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_RATIO")
-        if v is not None and str(v).strip():
-            host_budget_ratio = float(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_MIN_BYTES")
-        if v is not None and str(v).strip():
-            host_budget_min_bytes = int(v)
-    with contextlib.suppress(Exception):
-        v = os.environ.get("STNET_HOST_BUDGET_MAX_BYTES")
-        if v is not None and str(v).strip():
-            host_budget_max_bytes = int(v)
+    host_budget_ratio = env_float("STNET_HOST_BUDGET_RATIO", 1.0)
+    host_budget_min_bytes = env_int("STNET_HOST_BUDGET_MIN_BYTES", 0)
+    _host_budget_max_raw = env_int("STNET_HOST_BUDGET_MAX_BYTES", 0)
+    host_budget_max_bytes: Optional[int] = None if int(_host_budget_max_raw) <= 0 else int(_host_budget_max_raw)
 
     dev_margin = max(0.0, min(1.0, float(dev_margin)))
     host_margin = max(0.0, min(1.0, float(host_margin)))
@@ -1995,9 +1925,7 @@ def epochs(
                 sample_bytes=int(est_bytes_per_sample),
                 host_sample_bytes=int(est_bytes_per_sample),
                 prebatch=1,
-                prefetch_factor=int(
-                    os.environ.get("STNET_HOST_PREFETCH_FACTOR") or "4"
-                ),
+                prefetch_factor=int(env_int("STNET_HOST_PREFETCH_FACTOR", 4)),
                 num_workers=getattr(train_loader, "num_workers", 0),
                 num_streams=int(effective_streams),
                 max_concurrency=1,
@@ -2417,7 +2345,7 @@ def epochs(
         prof_all_ranks = _rt_env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
         prof_rank = int(torch.distributed.get_rank()) if is_distributed() else 0
         if prof_enabled and (prof_all_ranks or prof_rank == 0):
-            prof_dir = os.environ.get("STNET_TORCH_PROFILE_DIR", None)
+            prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
             if not prof_dir:
                 prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
             torch_prof = _rt_maybe_torch_profiler(
@@ -3535,7 +3463,7 @@ def infer(
     )
     prof_all_ranks = _rt_env_flag("STNET_TORCH_PROFILE_ALL_RANKS", False)
     if prof_enabled and (prof_all_ranks or int(rank) == 0):
-        prof_dir = os.environ.get("STNET_TORCH_PROFILE_DIR", None)
+        prof_dir = env_str("STNET_TORCH_PROFILE_DIR")
         if not prof_dir:
             prof_dir = os.path.join(str(ops.ckpt_dir or "."), "torch_profiler")
         torch_prof = _rt_maybe_torch_profiler(
@@ -3554,10 +3482,7 @@ def infer(
     distributed_barrier(device)
     cache = Cache(chunk_dir, max_queue=4)
 
-    try:
-        target_rows = int(os.environ.get("STNET_PRED_CHUNK_ROWS", "0") or 0)
-    except Exception:
-        target_rows = 0
+    target_rows = int(_rt_env_int("STNET_PRED_CHUNK_ROWS", 0))
 
     if target_rows <= 0:
         out_shape = tuple(int(x) for x in (ops.out_shape or ()))
@@ -3565,7 +3490,7 @@ def infer(
         for d in out_shape:
             out_numel *= max(1, int(d))
         est_row_bytes = max(1, out_numel * 4)
-        target_bytes = int(os.environ.get("STNET_PRED_CHUNK_BYTES", str(64 * 1024 * 1024)))
+        target_bytes = int(_rt_env_int("STNET_PRED_CHUNK_BYTES", 64 * 1024 * 1024))
         target_rows = max(256, min(65536, target_bytes // est_row_bytes))
 
     run_model = to_ddp(model, device=device)
@@ -3925,7 +3850,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     ret_sink: Optional[Dict[Any, Any]] = None
     if isinstance(args[0], RuntimeConfig):
         ops = args[0]
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        local_rank = env_int("LOCAL_RANK", 0)
         if len(args) >= 2:
             ret_sink = args[1]
     elif len(args) >= 2 and isinstance(args[1], RuntimeConfig):
@@ -3980,7 +3905,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
-                cpu_state = _torch_load_cpu(fallback_init, weights_only=True)
+                cpu_state = _torch_load_checkpoint(
+                    fallback_init,
+                    map_location="cpu",
+                    weights_only=True,
+                )
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:
@@ -4510,7 +4439,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
-                cpu_state = _torch_load_cpu(fallback_model, weights_only=True)
+                cpu_state = _torch_load_checkpoint(
+                    fallback_model,
+                    map_location="cpu",
+                    weights_only=True,
+                )
                 resize_scaler_buffer(model, cpu_state)
                 model.load_state_dict(cpu_state, strict=False)
             else:

@@ -1565,6 +1565,9 @@ class LazyTensor:
             if not os.path.isfile(stats_path):
                 return None
             try:
+                payload = torch.load(stats_path, map_location="cpu", weights_only=True)
+            except TypeError:
+                # Older PyTorch: no weights_only support.
                 payload = torch.load(stats_path, map_location="cpu")
             except Exception:
                 return None

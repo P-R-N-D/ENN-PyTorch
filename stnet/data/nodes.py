@@ -26,7 +26,7 @@ from typing import (
 import torch
 
 from ..backend.compat import ensure_torchdata
-from ..backend.system import Memory, Thread, process_cpu_count
+from ..backend.system import Affinity, Memory, process_cpu_count
 from .collections import Buffer, LazyTensor, Pool, ProducerError, best_effort_close
 from .datatype import dtype_from_name, env_bool, env_first_int
 
@@ -390,7 +390,7 @@ class Sampler(_Sampler):
 
         default_tl = False
         with suppress(Exception):
-            default_tl = bool(Thread.nogil_optimizations_enabled())
+            default_tl = bool(Affinity.nogil_optimizations_enabled())
         self._mmap_thread_local = env_bool(
             (
                 # Primary (code):
@@ -749,16 +749,8 @@ class Sampler(_Sampler):
         except Exception:
             pass
 
-        env_world = os.environ.get("WORLD_SIZE")
-        env_rank = os.environ.get("RANK")
-        try:
-            world = int(env_world) if env_world is not None else 1
-        except Exception:
-            world = 1
-        try:
-            rank = int(env_rank) if env_rank is not None else 0
-        except Exception:
-            rank = 0
+        world = env_first_int(("WORLD_SIZE",), default=1)
+        rank = env_first_int(("RANK",), default=0)
 
         if world > 1:
             self._num_shards = max(1, int(world))

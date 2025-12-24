@@ -37,6 +37,7 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
+from ..backend.compat import is_meta_or_fake_tensor
 from ..data.collections import LazyTensor
 from ..model.nn import Root, resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config, model_config_to_dict
@@ -92,20 +93,64 @@ def _is_required(module: str, pip_hint: str | None = None) -> None:
     _export_backend().is_required(module, pip_hint)
 
 
-def _to_cpu(value: Any) -> Any:
+def _to_cpu(
+    value: Any,
+    *,
+    materialize_meta: bool = True,
+    make_contiguous: bool = True,
+) -> Any:
     """Detach tensors and move them to CPU recursively.
 
-    This is used for formats that require CPU tensors (e.g. safetensors).
-    It is defensive about tuple subclasses (e.g. namedtuple).
+    This is used for formats that require CPU tensors (e.g. safetensors) and for
+    normalizing loaded state dicts.
+
+    Notes:
+        - Defensive about tuple subclasses (e.g. namedtuple).
+        - Best-effort materializes meta/fake tensors when requested.
     """
+
+    # Fast path: tensors
     if isinstance(value, torch.Tensor):
-        return value.detach().to("cpu")
+        t = value
+
+        if materialize_meta and is_meta_or_fake_tensor(t):
+            # Meta tensors cannot be moved; materialize a real CPU tensor.
+            t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
+
+        if t.device.type != "cpu":
+            t = t.detach().to(device="cpu")
+        else:
+            t = t.detach()
+
+        if make_contiguous:
+            with contextlib.suppress(Exception):
+                if hasattr(t, "is_contiguous") and not bool(t.is_contiguous()):
+                    t = t.contiguous()
+        return t
+
+    # Recursive containers
     if isinstance(value, dict):
-        return type(value)((k, _to_cpu(v)) for k, v in value.items())
+        return type(value)(
+            (
+                k,
+                _to_cpu(
+                    v,
+                    materialize_meta=materialize_meta,
+                    make_contiguous=make_contiguous,
+                ),
+            )
+            for k, v in value.items()
+        )
     if isinstance(value, list):
-        return [_to_cpu(v) for v in value]
+        return [
+            _to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+            for v in value
+        ]
     if isinstance(value, tuple):
-        seq = tuple(_to_cpu(v) for v in value)
+        seq = tuple(
+            _to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+            for v in value
+        )
         if type(value) is tuple:
             return seq
         # namedtuple: constructor expects positional args.
@@ -217,18 +262,26 @@ def _dist_barrier() -> None:
 
 
 @contextlib.contextmanager
-def _save_sync(path: str | Path | None = None) -> Any:
-    """Synchronize saves within a process (lock) and across ranks (barrier)."""
+def _save_sync(path: str | Path | None = None, *, barrier: bool = False) -> Any:
+    """Synchronize saves within a process (lock) and optionally across ranks.
+
+    IMPORTANT:
+        A distributed barrier requires *all ranks* to participate. Many call
+        sites only save on global-rank0 (single-file checkpoints). For those
+        cases, use barrier=False to avoid deadlocks.
+    """
     with _save_lock_for(path):
-        _dist_barrier()
+        if barrier:
+            _dist_barrier()
         try:
             yield
         finally:
-            _dist_barrier()
+            if barrier:
+                _dist_barrier()
 
 
 def _torch_load_checkpoint(
-    path: Path,
+    path: str | Path,
     *,
     map_location: Optional[torch.device | str] = None,
     weights_only: bool = True,
@@ -238,15 +291,17 @@ def _torch_load_checkpoint(
     - Prefer `weights_only=True` when supported by the installed torch.
     - Fall back for older torch versions that don't support this argument.
     """
+    p = Path(path)
+
     try:
         return torch.load(
-            str(path),
+            str(p),
             map_location=map_location or "cpu",
             weights_only=bool(weights_only),
         )
     except TypeError:
         # Older PyTorch: no weights_only support.
-        return torch.load(str(path), map_location=map_location or "cpu")
+        return torch.load(str(p), map_location=map_location or "cpu")
     except Exception as exc:
         if weights_only:
             raise RuntimeError(
@@ -495,7 +550,7 @@ class TorchIO:
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
 
-            with _save_sync(p):
+            with _save_sync(p, barrier=True):
                 opts_sd = StateDictOptions(full_state_dict=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
                 dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
@@ -522,7 +577,7 @@ class TorchIO:
 
         p.parent.mkdir(parents=True, exist_ok=True)
 
-        with _save_sync(p):
+        with _save_sync(p, barrier=False):
             if not _is_rank0_global():
                 return p
 
