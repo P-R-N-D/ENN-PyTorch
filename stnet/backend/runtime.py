@@ -33,8 +33,8 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
-from ..data.collections import LazyTensor
-from ..data.datatype import env_bool, env_first, env_first_int, env_float, env_int, env_str, parse_bool
+from ..data.pipeline import BatchIterator
+from ..data.datatype import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..data.pipeline import extract_xy
 from ..api.io import _torch_load_checkpoint
 
@@ -68,7 +68,7 @@ def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
             os.remove(tmp_name)
 
     meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
-    LazyTensor.atomic_write_json(LazyTensor.mmt_meta_path(p), meta, indent=None)
+    BatchIterator.atomic_write_json(BatchIterator.mmt_meta_path(p), meta, indent=None)
 
 _nvml = None
 _NVML_READY = False
@@ -239,7 +239,7 @@ except Exception:
     _psutil = None
 
 from ..api.config import RuntimeConfig, coerce_model_config
-from ..data.collections import Cache, Pool, LazyTensor
+from ..data.collections import Cache, Pool
 from ..data.datatype import to_torch_tensor
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
@@ -804,11 +804,13 @@ def _trim_dcp_keys(state: Any) -> Any:
 
 
 def _backend_type(device: torch.device) -> str:
-    if device.type == "cuda":
-        return "nccl"
-    if device.type == "xpu":
-        return "xccl"
-    return "gloo"
+    match str(getattr(device, "type", "cpu")):
+        case "cuda":
+            return "nccl"
+        case "xpu":
+            return "xccl"
+        case _:
+            return "gloo"
 
 
 def _set_backend(device: torch.device) -> None:
@@ -921,11 +923,11 @@ def _first_source_path(obj: Any) -> str:
 
 
 def _merge_meta_infos(sources: Any) -> Dict[str, Any]:
-    return LazyTensor.merge_meta_infos(sources)
+    return BatchIterator.merge_meta_infos(sources)
 
 
 def _expand(sources: Any) -> Any:
-    return LazyTensor.expand_sources(sources)
+    return BatchIterator.expand_sources(sources)
 
 
 def _calibrate_per_sample_mem(
@@ -2169,7 +2171,7 @@ def epochs(
         # This avoids an expensive pre-epoch full scan of the training loader.
         scaler_stats: Optional[dict] = None
         with contextlib.suppress(Exception):
-            scaler_stats = LazyTensor.load_scaler_stats(ops.sources)
+            scaler_stats = BatchIterator.load_scaler_stats(ops.sources)
         if scaler_stats is not None:
             used_memmap_stats = True
             x_count = int(scaler_stats.get("train_count") or 0)
@@ -3422,7 +3424,7 @@ def epochs(
                         "meta": meta,
                         "records": records,
                     }
-                    LazyTensor.atomic_write_json(history_path, payload, indent=2)
+                    BatchIterator.atomic_write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:
@@ -3809,7 +3811,7 @@ def infer(
 
                 if os.path.exists(pred_mmt):
                     pred_path = pred_mmt
-                    meta_path = LazyTensor.mmt_meta_path(pred_mmt)
+                    meta_path = BatchIterator.mmt_meta_path(pred_mmt)
                     if not os.path.exists(meta_path):
                         raise RuntimeError(f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}")
                 elif os.path.exists(pred_pt):

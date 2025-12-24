@@ -683,38 +683,72 @@ class SpatialAxis(nn.Module):
                 # Inference / no-grad: reuse buffer to avoid an extra allocation.
                 out_s = x_s
 
-            for s, e in _block_ranges(N, patch):
-                xb = x_s[:, s:e, :]
-                cb = c_s[:, s:e, :]
+            # Vectorize per-block processing by folding blocks into the batch dimension.
+            # This reduces Python overhead while keeping peak memory bounded.
+            full = (N // patch) * patch
+            if full > 0:
+                nblk = full // patch
 
-                mb = None
+                x_full = x_s[:, :full, :].contiguous().view(B, nblk, patch, D)
+                c_full = c_s[:, :full, :].contiguous().view(B, nblk, patch, coords.size(-1))
+
+                x_flat = x_full.reshape(B * nblk, patch, D)
+                c_flat = c_full.reshape(B * nblk, patch, coords.size(-1))
+
+                mb_flat = None
                 if attn_mask is not None:
                     # Build attention mask per-block only (avoid allocating (B,N,N)).
                     if attn_mask.dim() == 0:
-                        mb = attn_mask
+                        mb_flat = attn_mask
                     else:
-                        idx = perm[:, s:e]  # (B, M)
-                        M = int(idx.shape[1])
+                        idx = perm[:, :full].contiguous().view(B, nblk, patch)  # (B,nblk,patch)
                         if attn_mask.dim() == 3:
-                            # (B,N,N) -> (B,M,N) -> (B,M,M)
-                            rows = attn_mask.gather(
-                                1, idx.unsqueeze(-1).expand(B, M, N)
-                            )
-                            mb = rows.gather(
-                                2, idx.unsqueeze(1).expand(B, M, M)
-                            )
+                            base = attn_mask
                         elif attn_mask.dim() == 4:
                             if attn_mask.size(1) != 1:
                                 raise ValueError(
                                     "attn_mask with per-head shape not supported here"
                                 )
                             base = attn_mask.squeeze(1)
-                            rows = base.gather(
-                                1, idx.unsqueeze(-1).expand(B, M, N)
-                            )
-                            mb = rows.gather(
-                                2, idx.unsqueeze(1).expand(B, M, M)
-                            )
+                        else:
+                            raise ValueError("attn_mask must be rank 0, 3, or 4 here")
+
+                        rows = base.gather(
+                            1,
+                            idx.reshape(B, nblk * patch)
+                            .unsqueeze(-1)
+                            .expand(B, nblk * patch, N),
+                        ).view(B, nblk, patch, N)
+                        mb = rows.gather(3, idx.unsqueeze(-2).expand(B, nblk, patch, patch))
+                        mb_flat = mb.reshape(B * nblk, patch, patch).contiguous()
+
+                y_flat = blk(x_flat, c_flat, attn_mask=mb_flat)
+                out_s[:, :full, :].copy_(y_flat.reshape(B, nblk, patch, D).reshape(B, full, D))
+
+            # Tail (non-full block)
+            if full < N:
+                s, e = full, N
+                xb = x_s[:, s:e, :]
+                cb = c_s[:, s:e, :]
+
+                mb = None
+                if attn_mask is not None:
+                    if attn_mask.dim() == 0:
+                        mb = attn_mask
+                    else:
+                        idx = perm[:, s:e]  # (B, M)
+                        M = int(idx.shape[1])
+                        if attn_mask.dim() == 3:
+                            rows = attn_mask.gather(1, idx.unsqueeze(-1).expand(B, M, N))
+                            mb = rows.gather(2, idx.unsqueeze(1).expand(B, M, M))
+                        elif attn_mask.dim() == 4:
+                            if attn_mask.size(1) != 1:
+                                raise ValueError(
+                                    "attn_mask with per-head shape not supported here"
+                                )
+                            base = attn_mask.squeeze(1)
+                            rows = base.gather(1, idx.unsqueeze(-1).expand(B, M, N))
+                            mb = rows.gather(2, idx.unsqueeze(1).expand(B, M, M))
                         else:
                             raise ValueError("attn_mask must be rank 0, 3, or 4 here")
 

@@ -116,11 +116,38 @@ class PatchAttention(nn.Module):
                 num_heads=self.nhead, head_dim=self.head_dim
             )
 
+        # Thread-safe bounded caches (important for free-threaded / no-GIL Python).
+        # NOTE: runtime-only cache (not part of state_dict).
+        self._block_mask_cache_lock = threading.Lock()
+        self._block_mask_cache = OrderedDict()
+
+    @staticmethod
+    def _device_key(device: torch.device) -> Tuple[str, int]:
+        idx = -1
+        with contextlib.suppress(Exception):
+            if device.index is not None:
+                idx = int(device.index)
+        return (str(device.type), idx)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        # Locks are not picklable; caches are runtime-only.
+        state.pop("_block_mask_cache_lock", None)
+        state.pop("_block_mask_cache", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._block_mask_cache_lock = threading.Lock()
+        self._block_mask_cache = OrderedDict()
+
     def forward(
         self,
         x: torch.Tensor,
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
+        *,
+        block_mask: Any = None,
     ) -> torch.Tensor:
         B, N, _ = x.shape
         if coords.shape[:2] != (B, N):
@@ -143,74 +170,135 @@ class PatchAttention(nn.Module):
         coords_f32 = coords.to(dtype=torch.float32, device=x.device).contiguous()
         W = self.rel_weight.to(dtype=coords_f32.dtype, device=coords_f32.device)
 
-        block = None
+        block = block_mask
         mask_bias: torch.Tensor | None = None
         mask_bias_kind: str | None = None
         if isinstance(attn_mask, torch.Tensor):
             m = attn_mask
             if m.dtype == torch.bool:
-                m = m.to(device=qh.device)
-                match m.dim():
-                    case 2:
-                        if m.shape != (N, N):
-                            raise ValueError(
-                                f"bool attn_mask shape {tuple(m.shape)} incompatible with (N,N)=({N},{N})"
-                            )
-
-                        def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            # Project boundary: mask-out (True=masked).
-                            # flex_attention expects keep-mask (True=allowed) -> invert.
-                            return ~m[qi, kj]
-
-                    case 3:
-                        if m.shape != (B, N, N):
-                            raise ValueError(
-                                f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
-                            )
-
-                        def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                            return ~m[b, qi, kj]
-
-                    case 4:
-                        b0, hm, s1, s2 = m.shape
-                        if (b0 != B) or (s1 != N) or (s2 != N):
-                            raise ValueError(
-                                f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
-                            )
-                        if hm == 1:
-
-                            def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return ~m[b, 0, qi, kj]
-
-                        elif hm != self.nhead:
-                            raise ValueError(
-                                f"bool attn_mask head dim {hm} incompatible with nhead={self.nhead}"
-                            )
-                        else:
-
-                            def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                return ~m[b, h, qi, kj]
-
-                    case _:
-                        raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
-
-                _block_size: int
-                if N <= 2048:
-                    _block_size = 128
-                elif N <= 16384:
-                    _block_size = 256
+                if block is not None:
+                    # Caller provided a precomputed block mask.
+                    pass
                 else:
-                    _block_size = 512
+                    # Build (and cache) a flex block mask derived from the boolean attention mask.
+                    # Cache key includes the source tensor identity + version so in-place edits
+                    # cannot reuse stale masks.
+                    src_ptr = int(m.data_ptr()) if m.numel() else 0
+                    src_ver = int(getattr(m, "_version", 0))
+                    src_shape = tuple(int(x) for x in m.shape)
+                    src_rank = int(m.dim())
 
-                block = create_block_mask(
-                    mask_mod,
-                    B,
-                    self.nhead,
-                    N,
-                    N,
-                    device=qh.device,
-                    BLOCK_SIZE=_block_size,
-                )
+                    _block_size: int
+                    if N <= 2048:
+                        _block_size = 128
+                    elif N <= 16384:
+                        _block_size = 256
+                    else:
+                        _block_size = 512
+
+                    cache_key = (
+                        src_rank,
+                        src_shape,
+                        self._device_key(m.device),
+                        src_ptr,
+                        src_ver,
+                        int(B),
+                        int(self.nhead),
+                        int(N),
+                        int(_block_size),
+                        self._device_key(qh.device),
+                    )
+
+                    cache = getattr(self, "_block_mask_cache", None)
+                    if cache is None:
+                        cache = OrderedDict()
+                        setattr(self, "_block_mask_cache", cache)
+                    lock = getattr(self, "_block_mask_cache_lock", None)
+                    if lock is None:
+                        lock = threading.Lock()
+                        setattr(self, "_block_mask_cache_lock", lock)
+
+                    with lock:
+                        cached = cache.get(cache_key)
+                        if cached is not None:
+                            with contextlib.suppress(Exception):
+                                cache.move_to_end(cache_key)
+                            block = cached
+
+                    if block is None:
+                        # Move mask to the attention device only when we need to (cache miss).
+                        if m.device != qh.device:
+                            m = m.to(device=qh.device)
+
+                        match m.dim():
+                            case 2:
+                                if m.shape != (N, N):
+                                    raise ValueError(
+                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (N,N)=({N},{N})"
+                                    )
+
+                                def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                                    # Project boundary: mask-out (True=masked).
+                                    # flex_attention expects keep-mask (True=allowed) -> invert.
+                                    return ~m[qi, kj]
+
+                            case 3:
+                                if m.shape != (B, N, N):
+                                    raise ValueError(
+                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
+                                    )
+
+                                def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                                    return ~m[b, qi, kj]
+
+                            case 4:
+                                b0, hm, s1, s2 = m.shape
+                                if (b0 != B) or (s1 != N) or (s2 != N):
+                                    raise ValueError(
+                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
+                                    )
+                                if hm == 1:
+
+                                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                                        return ~m[b, 0, qi, kj]
+
+                                elif hm != self.nhead:
+                                    raise ValueError(
+                                        f"bool attn_mask head dim {hm} incompatible with nhead={self.nhead}"
+                                    )
+                                else:
+
+                                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+                                        return ~m[b, h, qi, kj]
+
+                            case _:
+                                raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
+
+                        if create_block_mask is None:
+                            raise RuntimeError("create_block_mask was not imported")
+
+                        block_new = create_block_mask(
+                            mask_mod,
+                            B,
+                            self.nhead,
+                            N,
+                            N,
+                            device=qh.device,
+                            BLOCK_SIZE=_block_size,
+                        )
+
+                        # Best-effort caching: bound entry count and estimated memory.
+                        est_bytes = int(B) * int(self.nhead) * int(N) * int(N)
+                        if est_bytes <= int(_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES):
+                            with lock:
+                                if cache.get(cache_key) is None:
+                                    cache[cache_key] = block_new
+                                    with contextlib.suppress(Exception):
+                                        cache.move_to_end(cache_key)
+                                    while len(cache) > int(_FLEX_BLOCK_MASK_CACHE_MAX):
+                                        with contextlib.suppress(Exception):
+                                            cache.popitem(last=False)
+                        block = block_new
             else:
                 bias = m.to(device=qh.device, dtype=qh.dtype)
                 match bias.dim():
@@ -1093,50 +1181,44 @@ class DilatedAttention(nn.Module):
 
             is_simple = (int(self.dilation) == 1) and (self.window_size is None)
 
-            # Varlen causal fast-path:
-            # For right-padded batches under simple causal attention, we can avoid
-            # constructing a (B, Lq, Lk) boolean mask by slicing each group to its
-            # true length and using is_causal=True.
+            # Right-padding causal fast-path:
+            # For simple causal attention, right padding is safe with is_causal=True because
+            # padded keys live strictly in the future for all valid query positions.
+            #
+            # IMPORTANT: to avoid GPU->CPU implicit sync, run the right-padding check only
+            # when we have a host-side (CPU) padding mask.
             attn_out: Optional[torch.Tensor] = None
             if (
                 is_simple
                 and bool(self.causal)
                 and (kpm_k is not None)
                 and isinstance(kpm_k, torch.Tensor)
-                and (kpm_k.dim() == 2)
             ):
-                kpm_b = kpm_k.to(torch.bool)
-                right_padded = True
-                if int(kpm_b.shape[1]) >= 2:
-                    right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
-                if right_padded:
-                    lengths = (~kpm_b).sum(dim=-1).clamp(min=0, max=int(L_q)).to(torch.int64)
-                    y_full = qh.new_zeros((B, H, L_q, Dh))
-                    unique_lengths = torch.unique(lengths.detach().cpu()).tolist()
-                    for li in unique_lengths:
-                        li = int(li)
-                        if li <= 0:
-                            continue
-                        idx = (lengths == li).nonzero(as_tuple=False).squeeze(-1)
-                        if idx.numel() == 0:
-                            continue
-                        q_g = qh.index_select(0, idx)[:, :, :li, :]
-                        k_g = kh.index_select(0, idx)[:, :, :li, :]
-                        v_g = vh.index_select(0, idx)[:, :, :li, :]
-                        y_g = self._call_dot_attn(
-                            q_g,
-                            k_g,
-                            v_g,
+                kpm_check: Optional[torch.Tensor] = None
+                if isinstance(key_padding_mask, torch.Tensor) and key_padding_mask.device.type == "cpu":
+                    kpm_check = key_padding_mask
+                elif isinstance(kpm_k, torch.Tensor) and kpm_k.device.type == "cpu":
+                    kpm_check = kpm_k
+
+                if kpm_check is not None:
+                    kpm_b = kpm_check.to(torch.bool)
+                    right_padded = True
+                    if int(kpm_b.shape[1]) >= 2:
+                        right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
+                    if right_padded:
+                        y_full = self._call_dot_attn(
+                            qh,
+                            kh,
+                            vh,
                             attn_mask=None,
                             dropout_p=dropout_p,
                             is_causal=True,
                         )
-                        y_full[idx, :, :li, :] = y_g
-                    attn_out = self.out_proj(
-                        y_full.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
-                    )
-                    if q_pad is not None:
-                        attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
+                        attn_out = self.out_proj(
+                            y_full.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+                        )
+                        if q_pad is not None:
+                            attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
 
             if attn_out is None:
                 # IMPORTANT:

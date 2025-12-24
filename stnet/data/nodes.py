@@ -27,7 +27,8 @@ import torch
 
 from ..backend.compat import ensure_torchdata
 from ..backend.system import Affinity, Memory, process_cpu_count
-from .collections import Buffer, LazyTensor, Pool, ProducerError, best_effort_close
+from .collections import Buffer, Pool, ProducerError, best_effort_close
+from .pipeline import BatchIterator
 from .datatype import dtype_from_name, env_bool, env_first_int
 
 _LOGGER = logging.getLogger(__name__)
@@ -902,7 +903,7 @@ def preload_memmap(
 ) -> None:
     """Create a memory-mapped dataset on disk.
 
-    Backwards-compat shim; implementation centralized in stnet.data.collections.LazyTensor.
+    Backwards-compat shim; implementation centralized in stnet.data.pipeline.BatchIterator.
 
     Notes:
       - `shuffle=True` performs *physical* shuffle at write time (no perm file).
@@ -919,7 +920,7 @@ def preload_memmap(
     features_only = bool(kwargs.pop("features_only", False))
     default_label_shape = kwargs.pop("default_label_shape", None)
 
-    LazyTensor.preload_memmap(
+    BatchIterator.preload_memmap(
         data,
         memmap_dir=os.fspath(memmap_dir),
         val_frac=float(val_frac),
