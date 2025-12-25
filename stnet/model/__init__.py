@@ -5,11 +5,12 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "architecture",
     "activations",
     "fused",
     "kernels",
-    "layers",
-    "nn",
+    "primitives",
+    "blocks",
 ]
 
 

@@ -33,7 +33,8 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..model.nn import Root, resize_scaler_buffer
+from ..model.architecture import Root
+from ..model.blocks import resize_scaler_buffer
 from .config import ModelConfig, coerce_model_config
 
 _LOGGER = logging.getLogger(__name__)
