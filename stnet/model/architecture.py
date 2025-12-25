@@ -23,7 +23,6 @@ from ..data.datatype import env_first_int, env_int
 from ..data.pipeline import resolve_feature_key, resolve_label_key
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
-from .primitives import CrossAttention, DilatedAttention, PatchAttention, Retention, norm_layer
 from .blocks import (
     History,
     LongNet,
@@ -41,6 +40,7 @@ from .blocks import (
     stochastic_depth_schedule,
     CrossTransformer,
     LossWeightPolicy,
+    norm_layer,
 )
 
 _LOGGER = logging.getLogger(__name__)
