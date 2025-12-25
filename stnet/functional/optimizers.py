@@ -17,11 +17,12 @@ from torch import nn, optim
 
 from ..backend.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-from ..model.fused import Autocast, ModelPolicy, is_scale_safe
+from ..model.architecture import ModelPolicy
+from ..model.fused import Autocast, is_scale_safe
 
 try:
-    from ..model.fused import PrecisionPolicy
-except Exception: 
+    from ..model.architecture import PrecisionPolicy
+except Exception:
     PrecisionPolicy = None
 
 try:

@@ -12,7 +12,7 @@ from torch import nn
 from ..functional.profiler import FLOP_PROFILER, capture
 from ..backend.system import get_device, get_dpa_backends, get_runtime_config
 from ..backend.compat import torch_no_compile
-from ..data.datatype import env_str
+from ..backend.casting import env_str
 
 try:
     import triton

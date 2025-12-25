@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
 from ..backend.compat import StochasticDepth
-from ..data.datatype import env_bool, env_int, env_str
+from ..backend.casting import env_bool, env_int, env_str
 
 _Norm = nn.LayerNorm
 

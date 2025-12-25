@@ -5,8 +5,7 @@ import importlib
 from types import ModuleType
 
 __all__ = [
-    "collections",
-    "datatype",
+    "schemas",
     "nodes",
     "pipeline",
 ]

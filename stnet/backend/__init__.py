@@ -8,6 +8,7 @@ __all__ = [
     "compat",
     "distributed",
     "export",
+    "staging",
     "runtime",
     "system",
 ]

@@ -10,7 +10,7 @@ from typing import Any, Optional, Tuple, Protocol, runtime_checkable
 
 import torch
 
-from .datatype import env_flag as _env_flag
+from .datatype import env_flag
 
 
 # -----------------------------------------------------------------------------
@@ -559,7 +559,7 @@ class Buffer:
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
-        self._warn_blocking = _env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
+        self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
 
     def put(self, item: Any, *, timeout: float | None = None) -> bool:
         """Put an item into the buffer."""

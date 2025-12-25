@@ -33,9 +33,9 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
-from ..data.pipeline import BatchIterator
-from ..data.datatype import env_bool, env_first, env_first_int, env_float, env_int, env_str
-from ..data.pipeline import extract_xy
+from ..data.pipeline import BatchIterator, extract_xy
+from .casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..model.architecture import ModelPolicy, PrecisionPolicy
 
 
 _nvml = None
@@ -207,8 +207,8 @@ except Exception:
     _psutil = None
 
 from ..api.config import RuntimeConfig, coerce_model_config
-from ..data.collections import Cache, Pool
-from ..data.datatype import to_torch_tensor
+from .casting import to_torch_tensor
+from .staging import Cache, Pool
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
 from ..model import fused
@@ -1866,7 +1866,7 @@ def epochs(
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
     max_grad_accum = fixed_accum
-    # Centralize env parsing through stnet.data.datatype helpers.
+    # Centralize env parsing through backend.casting helpers.
     dev_margin = env_float("STNET_DEVICE_MARGIN", 0.8)
     host_margin = env_float("STNET_HOST_MARGIN", 0.8)
 
@@ -4043,7 +4043,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             metadata.is_negotiable = False
 
         # Resolve a coherent precision policy (master dtype + optional AMP compute dtype) from metadata.
-        precision = fused.PrecisionPolicy.from_metadata(device=device, metadata=metadata, logger=_LOGGER)
+        precision = PrecisionPolicy.from_metadata(device=device, metadata=metadata, logger=_LOGGER)
         param_dtype = precision.master_float
 
         if device.type != "cuda":
@@ -4051,7 +4051,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 "Forcing CPU / non-CUDA config: mixed precision + NVIDIA fused layers may be unavailable."
             )
 
-        model, _, _ = fused.ModelPolicy.use_nvidia_layers(
+        model, _, _ = ModelPolicy.use_nvidia_layers(
             model,
             device=device,
             metadata=metadata,
@@ -4075,7 +4075,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if param_dtype is torch.float64:
             disable_note = "master dtype is float64"
         elif fp8_ok:
-            model, fp8_enabled, fp8_backend = fused.ModelPolicy.enable_float8_training(
+            model, fp8_enabled, fp8_backend = ModelPolicy.enable_float8_training(
                 model,
                 metadata=metadata,
                 logger=_float8_log,
@@ -4521,7 +4521,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                 )
         model.to(device, non_blocking=(device.type in ("cuda", "xpu"))).eval()
         metadata = Dataset.for_device(device)
-        model, _, _ = fused.ModelPolicy.use_nvidia_layers(model, device=device)
+        model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, "module") else model
         _preload_layers(_m_eval, device)
         _assert_unified_layer_dtype(_m_eval, device)
@@ -4542,7 +4542,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         Autocast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
         if fp8_infer_ok:
-            model, _, _ = fused.ModelPolicy.enable_float8_prediction(
+            model, _, _ = ModelPolicy.enable_float8_prediction(
                 model, metadata=metadata, logger=_float8_log
             )
         else:

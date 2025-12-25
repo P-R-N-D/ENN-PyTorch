@@ -25,14 +25,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing as mp
 
-from ..data.datatype import (
-    env_bool,
-    env_first_float,
-    env_first_int,
-    env_float,
-    env_str,
-    parse_bool,
-)
+from .casting import env_bool, env_first_float, env_first_int, env_float, env_str, parse_bool
 
 try:
     from zoneinfo import ZoneInfo

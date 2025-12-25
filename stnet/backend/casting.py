@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 import numpy as np
 import torch
-from tensordict import TensorDict, TensorDictBase
 
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
@@ -238,8 +237,6 @@ _PLATFORM_ALIASES: dict[str, str] = {
     "canonical": "name",
 }
 
-BatchLike = Mapping[str, Any] | TensorDictBase
-
 
 def _canonical_dtype(src: Any) -> str:
     if src is None:
@@ -359,35 +356,6 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
         raise TypeError(f"cannot convert to torch.Tensor: {type(obj)}") from e
 
 
-def _infer_batch_size(d: Mapping[str, Any]) -> list[int]:
-    for value in d.values():
-        if isinstance(value, TensorDictBase):
-            bs = list(value.batch_size)
-            if bs:
-                return bs
-        if torch.is_tensor(value) and value.ndim >= 1:
-            return [int(value.shape[0])]
-        if isinstance(value, np.ndarray) and value.ndim >= 1:
-            return [int(value.shape[0])]
-    return []
-
-
-def _maybe_to_device(t: torch.Tensor, device: torch.device) -> torch.Tensor:
-    # Avoid accidental moves when device index is unspecified (e.g., "cuda")
-    if device.index is None:
-        return t if t.device.type == device.type else t.to(device)
-    return t if t.device == device else t.to(device)
-
-
-def _maybe_td_to_device(td: TensorDictBase, device: torch.device) -> TensorDictBase:
-    td_dev = getattr(td, "device", None)
-    if td_dev is None:
-        return td.to(device)
-    if device.index is None:
-        return td if td_dev.type == device.type else td.to(device)
-    return td if td_dev == device else td.to(device)
-
-
 def _is_numpy_non_numeric(x: np.ndarray | np.generic) -> bool:
     dt = getattr(x, "dtype", None)
     if dt is None:
@@ -397,92 +365,3 @@ def _is_numpy_non_numeric(x: np.ndarray | np.generic) -> bool:
     # - datetime / timedelta: "M", "m"
     # - void / structured: "V"
     return dt.kind in {"O", "U", "S", "M", "m", "V"}
-
-
-def to_tensordict(
-    batch: BatchLike,
-    *_args: Any,
-    device: torch.device | str | None = None,
-    batch_size: Iterable[int] | None = None,
-    **_kwargs: Any,
-) -> TensorDict:
-    resolved_device = torch.device(device) if device is not None else None
-    if isinstance(batch, TensorDictBase):
-        return _maybe_td_to_device(batch, resolved_device) if resolved_device is not None else batch
-    if not isinstance(batch, Mapping):
-        raise TypeError(f"Unexpected batch type: {type(batch)}")
-
-    resolved_batch = list(batch_size) if batch_size is not None else _infer_batch_size(batch)
-    td = TensorDict({}, batch_size=resolved_batch, device=resolved_device)
-
-    for key, value in batch.items():
-        if torch.is_tensor(value):
-            tensor = value
-            if resolved_device is not None:
-                tensor = _maybe_to_device(tensor, resolved_device)
-            td.set(key, tensor)
-        elif isinstance(value, TensorDictBase):
-            nested = _maybe_td_to_device(value, resolved_device) if resolved_device is not None else value
-            td.set(key, nested)
-        elif isinstance(value, (np.ndarray, np.generic)) and not _is_numpy_non_numeric(value):
-            tensor = torch.as_tensor(value)
-            if resolved_device is not None:
-                tensor = _maybe_to_device(tensor, resolved_device)
-            td.set(key, tensor)
-        else:
-            td.set_non_tensor(key, value)
-    return td
-
-
-def to_dict(
-    td_or_dict: TensorDictBase | Mapping[str, Any],
-    *_args: Any,
-    detach: bool = True,
-    cpu: bool = True,
-    keys: Iterable[str] | None = None,
-    **_kwargs: Any,
-) -> dict[str, Any]:
-    if isinstance(td_or_dict, TensorDictBase):
-        td = td_or_dict
-        key_iter = td.keys() if keys is None else keys
-        out: dict[str, Any] = {}
-        for key in key_iter:
-            value = td.get(key)
-            if torch.is_tensor(value):
-                tensor = value.detach() if detach else value
-                if cpu and tensor.is_cuda:
-                    tensor = tensor.cpu()
-                out[key] = tensor
-            elif isinstance(value, TensorDictBase):
-                out[key] = to_dict(value, detach=detach, cpu=cpu)
-            else:
-                out[key] = value
-        return out
-    if not isinstance(td_or_dict, Mapping):
-        raise TypeError(f"to_dict expects TensorDictBase or Mapping, got: {type(td_or_dict)}")
-
-    out: dict[str, Any] = {}
-    for key, value in td_or_dict.items():
-        if torch.is_tensor(value):
-            tensor = value.detach() if detach else value
-            tensor = tensor.cpu() if cpu and tensor.is_cuda else tensor
-            out[key] = tensor
-        elif isinstance(value, TensorDictBase):
-            out[key] = to_dict(value, detach=detach, cpu=cpu)
-        else:
-            out[key] = value
-    return out
-
-
-def to_tuple(x: Any) -> tuple:
-    if isinstance(x, tuple):
-        return x
-    elif isinstance(x, list):
-        return tuple(x)
-    elif torch.is_tensor(x):
-        return tuple(x.flatten().detach().cpu().tolist())
-    elif hasattr(x, "tolist"):
-        values = x.tolist()
-        return tuple(values if isinstance(values, (list, tuple)) else [values])
-    else:
-        return (x,)
