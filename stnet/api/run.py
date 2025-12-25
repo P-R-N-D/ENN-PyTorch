@@ -49,7 +49,8 @@ from ..data.pipeline import (
 )
 from ..model.fused import Gradient
 from ..model.nn import History, Root, resize_scaler_buffer
-from .io import _to_cpu, _torch_load_checkpoint
+from ..backend.export import _to_cpu
+from .io import _torch_load_checkpoint
 from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
 
