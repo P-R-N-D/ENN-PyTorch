@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing as mp
 
-from .casting import env_bool, env_first_float, env_first_int, env_float, env_str, parse_bool
+from .casting import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
 
 try:
     from zoneinfo import ZoneInfo
@@ -1192,16 +1192,189 @@ def get_sdpa_backends() -> list[object]:
 get_dpa_backends = get_sdpa_backends
 
 
+def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
+    if device is not None:
+        return device if isinstance(device, torch.device) else torch.device(str(device))
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]:
+    dev = _resolve_device(device)
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return (0, 0)
+    try:
+        major, minor = torch.cuda.get_device_capability(dev)
+    except Exception:
+        return (0, 0)
+    return (int(major), int(minor))
+
+
 def is_cpu_bf16_supported() -> bool:
-    from ..data.pipeline import Dataset
+    """Return True when BF16 ops are supported on CPU (best-effort)."""
+    try:
+        mkldnn = getattr(torch.backends, "mkldnn", None)
+        if mkldnn is None:
+            return False
+        if not bool(mkldnn.is_available()) or not bool(getattr(mkldnn, "enabled", True)):
+            return False
+        mkldnn_ops = getattr(torch.ops, "mkldnn", None)
+        f = getattr(mkldnn_ops, "_is_mkldnn_bf16_supported", None) if mkldnn_ops is not None else None
+        if callable(f):
+            return bool(f())
+    except Exception:
+        return False
+    return False
 
-    return Dataset.is_cpu_bf16_supported()
+
+def is_cuda_bf16_supported(device: Optional[Union[torch.device, str]] = None) -> bool:
+    """Return True when BF16 ops are supported on CUDA device (best-effort)."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        dev = _resolve_device(device)
+        if dev.type != "cuda":
+            return False
+        with torch.cuda.device(dev):
+            f = getattr(torch.cuda, "is_bf16_supported", None)
+            if callable(f):
+                try:
+                    return bool(f(including_emulation=False))
+                except TypeError:
+                    return bool(f())
+            major, _ = torch.cuda.get_device_capability(dev)
+            return int(major) >= 8
+    except Exception:
+        return False
 
 
-def is_cuda_bf16_supported() -> bool:
-    from ..data.pipeline import Dataset
+def is_float8_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
+    try:
+        dev = _resolve_device(device)
+        if dev.type == "cuda" and torch.cuda.is_available():
+            try:
+                import torch.cuda.amp as _tca
 
-    return Dataset.is_cuda_bf16_supported()
+                with contextlib.suppress(Exception):
+                    if getattr(_tca, "is_float8_available", None) is not None:
+                        ok, reason = _tca.is_float8_available()
+                        return (bool(ok), str(reason))
+            except Exception:
+                pass
+            major, _minor = cuda_compute_capability(dev)
+            if major >= 9:
+                return (True, "Hopper+ supports FP8")
+            return (False, "FP8 requires sm90+")
+        return (False, "FP8 requires CUDA sm90+ and torch.cuda")
+    except Exception:
+        return (False, "Unknown float8 support")
+
+
+def is_int8_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
+    try:
+        dev = _resolve_device(device)
+        if dev.type == "cuda" and torch.cuda.is_available():
+            return (True, "Int8 supported on CUDA")
+        return (True, "Int8 supported on CPU")
+    except Exception:
+        return (False, "Unknown int8 support")
+
+
+def is_int4_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
+    try:
+        dev = _resolve_device(device)
+        if dev.type == "cuda" and torch.cuda.is_available():
+            return (True, "Int4 supported on CUDA")
+        return (True, "Int4 supported on CPU")
+    except Exception:
+        return (False, "Unknown int4 support")
+
+
+def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
+    entries: list[torch.dtype] = []
+    for token in str(value).split(","):
+        name = token.strip()
+        if not name:
+            continue
+        dtype = getattr(torch, name, None)
+        if isinstance(dtype, torch.dtype):
+            entries.append(dtype)
+    return tuple(entries)
+
+
+@dataclass(slots=True)
+class DeviceStats:
+    """Device capability snapshot used for precision negotiation.
+
+    This intentionally lives in backend.system to avoid backend->data imports.
+    """
+
+    device: torch.device
+    device_type: str
+    cuda_cc: Optional[Tuple[int, int]]
+    float_dtypes: Tuple[torch.dtype, ...]
+    int_dtypes: Tuple[torch.dtype, ...]
+    float8_dtypes: Tuple[torch.dtype, ...]
+    int_quant_bits: int
+
+
+_DEVICE_STATS_CACHE: dict[Tuple[str, int], DeviceStats] = {}
+_DEVICE_STATS_LOCK = threading.Lock()
+
+
+def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> DeviceStats:
+    """Return a cached DeviceStats for the given device."""
+    dev = _resolve_device(device)
+    key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
+    with _DEVICE_STATS_LOCK:
+        cached = _DEVICE_STATS_CACHE.get(key)
+        if cached is not None:
+            return cached
+
+    # Compute capabilities.
+    device_type = str(dev.type)
+    cc = None
+    if device_type == "cuda" and torch.cuda.is_available():
+        major, minor = cuda_compute_capability(dev)
+        cc = (int(major), int(minor)) if (major > 0 or minor > 0) else None
+
+    # Dtypes from env (if present).
+    float_env = env_first(("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES"))
+    float_dtypes = _parse_dtypes_env(float_env) if float_env else tuple()
+    int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
+    int_dtypes = _parse_dtypes_env(int_env) if int_env else tuple()
+
+    # Defaults.
+    if not float_dtypes:
+        floats: list[torch.dtype] = [torch.float32]
+        if device_type == "cuda" and torch.cuda.is_available():
+            floats.insert(0, torch.float16)
+            if is_cuda_bf16_supported(dev):
+                floats.insert(0, torch.bfloat16)
+        elif device_type == "cpu" and is_cpu_bf16_supported():
+            floats.insert(0, torch.bfloat16)
+        float_dtypes = tuple(dict.fromkeys(floats))
+
+    if not int_dtypes:
+        int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
+
+    # Quant bits.
+    bits = env_first_int(("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0)
+    quant_bits = int(bits) if int(bits) > 0 else 8
+
+    stats = DeviceStats(
+        device=dev,
+        device_type=device_type,
+        cuda_cc=cc,
+        float_dtypes=tuple(float_dtypes),
+        int_dtypes=tuple(int_dtypes),
+        float8_dtypes=tuple(),
+        int_quant_bits=quant_bits,
+    )
+    with _DEVICE_STATS_LOCK:
+        _DEVICE_STATS_CACHE[key] = stats
+    return stats
 
 
 def get_device(
@@ -1318,30 +1491,6 @@ def optimal_optimizer_params(device: torch.device, use_foreach: Optional[bool], 
         flags["fused"] = True
         flags["foreach"] = False
     return flags
-
-
-def cuda_compute_capability(device: torch.device) -> Tuple[int, int]:
-    from ..data.pipeline import Dataset
-
-    return Dataset.cuda_compute_capability(device)
-
-
-def is_float8_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
-    from ..data.pipeline import Dataset
-
-    return Dataset.is_float8_supported(device)
-
-
-def is_int8_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
-    from ..data.pipeline import Dataset
-
-    return Dataset.is_int8_supported(device)
-
-
-def is_int4_supported(device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
-    from ..data.pipeline import Dataset
-
-    return Dataset.is_int4_supported(device)
 
 
 def optimal_procs() -> dict[str, Union[int, str]]:

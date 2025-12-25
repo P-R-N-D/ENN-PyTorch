@@ -7,7 +7,6 @@ from types import ModuleType
 __all__ = [
     "architecture",
     "activations",
-    "fused",
     "kernels",
     "primitives",
     "blocks",

@@ -7,6 +7,7 @@ import math
 import threading
 import weakref
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
 import torch
@@ -19,26 +20,16 @@ from ..backend.compat import (
     is_meta_or_fake_tensor,
     torch_no_compile,
 )
-from ..backend.system import empty_device_cache, get_device
+from ..backend.system import _log_debug, _log_info, empty_device_cache, get_device
 from ..backend.casting import env_first_int, env_int
 from ..data.pipeline import (
     Dataset,
-    default_underflow_action,
-    normalize_underflow_action,
     resolve_feature_key,
     resolve_label_key,
 )
 from ..api.profiler import FLOP_PROFILER
-from ..model.fused import (
-    Autocast,
-    Gradient,
-    Quantization,
-    _dot_product_attention_cls,
-    _invalidate_model_introspection_caches,
-    _log_debug,
-    _log_info,
-    is_scale_safe,
-)
+from ..backend.graph import compile, inference_mode, invalidate_model_introspection_caches
+from ..backend.precision import Autocast, is_scale_safe
 from .blocks import (
     History,
     LongNet,
@@ -515,7 +506,7 @@ class Context(nn.Module):
 
         infer_mode = not torch.is_grad_enabled()
         controller_ctx = (
-            Gradient.inference(self.backbone) if infer_mode else contextlib.nullcontext()
+            inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
         )
 
         runner = _ControllerChunkRunner(
@@ -828,7 +819,7 @@ class Root(nn.Module):
             try:
                 _raw_head = self.processor.head
                 _decode_mod = _CompiledDecode(self.processor.norm, _raw_head, self.out_shape).to(self._device)
-                _compiled = Gradient.compile(
+                _compiled = compile(
                     _decode_mod,
                     mode=compile_mode_arg,
                     fullgraph=False,
@@ -851,7 +842,7 @@ class Root(nn.Module):
             if compile_heavy_submodules:
                 try:
                     _orig = self.processor.temporal_net
-                    _compiled = Gradient.compile(
+                    _compiled = compile(
                         _orig,
                         mode=compile_mode_arg,
                         fullgraph=False,
@@ -873,7 +864,7 @@ class Root(nn.Module):
             if compile_heavy_submodules:
                 try:
                     _orig = self.processor.perception
-                    _compiled = Gradient.compile(
+                    _compiled = compile(
                         _orig,
                         mode=compile_mode_arg,
                         fullgraph=False,
@@ -1196,7 +1187,7 @@ class Root(nn.Module):
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                     return self.processor(inp)
 
-            enc_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
+            enc_ctx = inference_mode(self.processor) if infer_mode else contextlib.nullcontext()
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
@@ -1253,7 +1244,7 @@ class Root(nn.Module):
 
             # --- Decode stage ---
             graph_break()
-            processor_ctx = Gradient.inference(self.processor) if infer_mode else contextlib.nullcontext()
+            processor_ctx = inference_mode(self.processor) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
 
@@ -1469,123 +1460,6 @@ class Root(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
-class PrecisionPolicy:
-    """End-to-end precision policy used by runtime."""
-
-    master_float: torch.dtype = torch.float32
-    amp_dtype: Optional[torch.dtype] = None
-
-    fsdp_param_dtype: torch.dtype = torch.float32
-    fsdp_reduce_dtype: torch.dtype = torch.float32
-    fsdp_output_dtype: torch.dtype = torch.float32
-
-    bn_buffers_dtype: torch.dtype = torch.float32
-    underflow_action: str = "warn"
-
-    @property
-    def amp_float(self) -> Optional[torch.dtype]:
-        return self.amp_dtype
-
-    @classmethod
-    def from_metadata(
-        cls,
-        device: Union[torch.device, str],
-        metadata: Optional[Dataset[Any]],
-        *,
-        logger: Optional[logging.Logger] = None,
-        safety_margin: float = 8.0,
-    ) -> "PrecisionPolicy":
-        dev = torch.device(device)
-        meta = metadata
-        if meta is None:
-            meta = Dataset.for_device(dev)
-        else:
-            with contextlib.suppress(Exception):
-                meta.device = dev
-                meta.refresh()
-
-        action = normalize_underflow_action(
-            getattr(meta, "underflow_action", None), default=default_underflow_action()
-        )
-        with contextlib.suppress(Exception):
-            meta.underflow_action = action
-
-        is_negotiable = bool(getattr(meta, "is_negotiable", False))
-        safety = float(safety_margin)
-
-        master_float = torch.float64
-        amp_dtype = None
-
-        if dev.type == "cuda":
-            if is_negotiable and is_scale_safe(torch.float32, meta, safety_margin=safety):
-                master_float = torch.float32
-
-            if Dataset.is_cuda_bf16_supported(dev) and is_scale_safe(
-                torch.bfloat16, meta, safety_margin=safety
-            ):
-                amp_dtype = torch.bfloat16
-            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
-                amp_dtype = torch.float16
-        elif dev.type == "cpu":
-            master_float = torch.float32 if is_negotiable else torch.float64
-        elif dev.type == "xpu":
-            master_float = torch.float32 if is_negotiable else torch.float64
-            amp_dtype = torch.bfloat16
-        elif dev.type == "mps":
-            master_float = torch.float32 if is_negotiable else torch.float64
-            amp_dtype = torch.float16
-        else:
-            if is_scale_safe(torch.float32, meta, safety_margin=safety):
-                master_float = torch.float32
-
-        bn_dtype = master_float
-        fsdp_param_dtype = master_float
-        fsdp_reduce_dtype = master_float
-        fsdp_output_dtype = master_float
-
-        if master_float == torch.float32 and amp_dtype is not None:
-            fsdp_param_dtype = amp_dtype
-            fsdp_reduce_dtype = amp_dtype
-            fsdp_output_dtype = amp_dtype
-
-        if logger is not None:
-            try:
-                logger.info(
-                    "[PrecisionPolicy] device=%s master=%s amp=%s fsdp=(param=%s, reduce=%s, out=%s) bn=%s underflow=%s negotiable=%s safety=%s",
-                    str(dev),
-                    str(master_float),
-                    str(amp_dtype),
-                    str(fsdp_param_dtype),
-                    str(fsdp_reduce_dtype),
-                    str(fsdp_output_dtype),
-                    str(bn_dtype),
-                    str(action),
-                    str(is_negotiable),
-                    str(safety_margin),
-                )
-            except Exception:
-                pass
-
-        return cls(
-            master_float=master_float,
-            amp_dtype=amp_dtype,
-            fsdp_param_dtype=fsdp_param_dtype,
-            fsdp_reduce_dtype=fsdp_reduce_dtype,
-            fsdp_output_dtype=fsdp_output_dtype,
-            bn_buffers_dtype=bn_dtype,
-            underflow_action=str(action),
-        )
-
-    def to_fsdp_policy(self):
-        from torch.distributed.fsdp import MixedPrecisionPolicy
-
-        return MixedPrecisionPolicy(
-            param_dtype=self.fsdp_param_dtype,
-            reduce_dtype=self.fsdp_reduce_dtype,
-            output_dtype=self.fsdp_output_dtype,
-            cast_forward_inputs=True,
-        )
 
 
 class ModelPolicy:
@@ -1636,7 +1510,7 @@ class ModelPolicy:
         model: nn.Module, metadata: Optional[Dataset[Any]] = None
     ) -> Dataset[Any]:
         Autocast.configure(model, metadata=metadata)
-        meta = Autocast._get_tls_metadata()
+        meta = Autocast.metadata()
         if meta is None:
             ref = ModelPolicy._peek_layer(model)
             dev = ref.device if isinstance(ref, torch.Tensor) else get_device()
@@ -1815,7 +1689,7 @@ class ModelPolicy:
 
         count = _convert(model)
         if count:
-            _invalidate_model_introspection_caches(model)
+            invalidate_model_introspection_caches(model)
         return (model, count)
 
     @staticmethod
@@ -1834,7 +1708,7 @@ class ModelPolicy:
                     module.te_first = True
                 swapped += 1
         if swapped:
-            _invalidate_model_introspection_caches(model)
+            invalidate_model_introspection_caches(model)
         return (model, swapped)
 
     @staticmethod
@@ -1970,7 +1844,7 @@ class ModelPolicy:
         )
         if te_present:
             setattr(model, "__fp8_inference_te__", True)
-            _invalidate_model_introspection_caches(model)
+            invalidate_model_introspection_caches(model)
             if logger:
                 logger("[FP8][TE] te.* already present; using te.fp8_autocast")
             return (model, True, "TE present")
@@ -2132,3 +2006,228 @@ class ModelPolicy:
         )
         Autocast.configure(m2 if ok else model, metadata=meta)
         return (m2, ok, why)
+
+
+# -----------------------------------------------------------------------------
+# Quantization helpers (moved from fused.py)
+# -----------------------------------------------------------------------------
+
+
+def _is_ptq_unavailable(
+    model: nn.Module, *args: Any, **kwargs: Any
+) -> tuple[nn.Module, bool, str]:
+    return (model, False, "PTQ backend unavailable")
+
+
+_Int8DynamicActivationInt8WeightConfig: Any | None
+_Int8WeightOnlyConfig: Any | None
+_PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
+
+try:
+    from torchao.quantization.quant_api import (
+        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
+        Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
+        quantize_ as _quantize,
+    )
+
+    try:
+        from torchao.quantization import quant_primitives as _qp
+    except Exception:
+        _qp = None
+
+    _PTQ_IMPL = _quantize
+except Exception:  # pragma: no cover
+    _Int8DynamicActivationInt8WeightConfig = None
+    _Int8WeightOnlyConfig = None
+    _PTQ_IMPL = None
+    _qp = None
+
+
+class Quantization:
+    """Best-effort quantization utilities.
+
+    - QAT: prepare model for fake-quant aware training
+    - PTQ: apply post-training quantization where available
+
+    This lives in model space because it fundamentally changes the module graph.
+    """
+
+    @staticmethod
+    def is_qat_available() -> bool:
+        return bool(_qp is not None)
+
+    @staticmethod
+    def is_ptq_available() -> bool:
+        return bool(_PTQ_IMPL is not None and _Int8DynamicActivationInt8WeightConfig is not None)
+
+    @staticmethod
+    def _prepare_qat(
+        model: nn.Module,
+        *args: Any,
+        dynamic_activations: bool = True,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        if _qp is None:
+            raise RuntimeError("torchao.quantization.quant_primitives unavailable")
+        # QAT uses fake-quantize modules; keep it conservative.
+        _log_debug(logger, f"[INT8][QAT] prepare(dynamic_activations={dynamic_activations}, group={group_size})")
+
+        # torchao does not provide a single stable public QAT API across versions.
+        # Best-effort: attach fake quant stubs where possible.
+        # NOTE: This intentionally does not attempt to calibrate.
+        try:
+            # Some versions expose `FakeQuantize` in torchao.
+            from torchao.quantization.fake_quant import (
+                FakeQuantizeConfig,
+                Int8ActivationConfig,
+                Int8WeightConfig,
+                prepare_qat_ as _prepare_qat,
+            )
+
+            cfg = FakeQuantizeConfig(
+                activation=Int8ActivationConfig(dynamic=bool(dynamic_activations)),
+                weight=Int8WeightConfig(group_size=int(group_size)),
+            )
+            _prepare_qat(model, cfg)
+            invalidate_model_introspection_caches(model)
+            return cfg
+        except Exception as exc:
+            raise RuntimeError(f"torchao QAT prepare unavailable: {exc}") from exc
+
+    @staticmethod
+    def _apply_ptq(
+        model: nn.Module,
+        *args: Any,
+        dynamic_activations: bool = True,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> tuple[nn.Module, bool, str]:
+        if _PTQ_IMPL is None:
+            return _is_ptq_unavailable(model)
+
+        if _Int8DynamicActivationInt8WeightConfig is None:
+            return _is_ptq_unavailable(model)
+
+        cfg: Any
+        why: str
+        if bool(dynamic_activations):
+            cfg = _Int8DynamicActivationInt8WeightConfig(group_size=int(group_size))
+            why = "int8_dynamic_act_int8_weight"
+        else:
+            # Weight-only PTQ (activations remain fp16/fp32).
+            if _Int8WeightOnlyConfig is None:
+                return (model, False, "Int8WeightOnlyConfig unavailable")
+            cfg = _Int8WeightOnlyConfig(group_size=int(group_size))
+            why = "int8_weight_only"
+
+        try:
+            _log_info(logger, f"[INT8][PTQ] applying {why} (group={group_size})")
+            _PTQ_IMPL(model, cfg)
+            invalidate_model_introspection_caches(model)
+            return (model, True, why)
+        except Exception as exc:
+            return (model, False, f"PTQ failed: {exc}")
+
+    @classmethod
+    def enable_qat(
+        cls,
+        model: nn.Module,
+        *args: Any,
+        dynamic_activations: bool = True,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> tuple[nn.Module, bool, str]:
+        if not cls.is_qat_available():
+            return (model, False, "QAT backend unavailable")
+        try:
+            cls._prepare_qat(
+                model,
+                dynamic_activations=dynamic_activations,
+                group_size=group_size,
+                logger=logger,
+            )
+            setattr(model, "__int8_training_qat__", True)
+            return (model, True, "QAT-prepare")
+        except Exception as exc:
+            return (model, False, f"QAT prepare failed: {exc}")
+
+    @classmethod
+    def _enable_ptq(
+        cls,
+        model: nn.Module,
+        *args: Any,
+        dynamic_activations: bool = True,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> tuple[nn.Module, bool, str]:
+        return cls._apply_ptq(
+            model,
+            dynamic_activations=dynamic_activations,
+            group_size=group_size,
+            logger=logger,
+        )
+
+    @classmethod
+    def enable_int8_training(
+        cls,
+        model: nn.Module,
+        *args: Any,
+        dynamic_activations: bool = True,
+        group_size: int = 128,
+        logger: Optional[Callable[[str], None]] = None,
+        **kwargs: Any,
+    ) -> tuple[nn.Module, bool, str]:
+        """Enable INT8 training.
+
+        Prefer QAT when available; fall back to PTQ if possible.
+        """
+        if getattr(model, "__int8_training_qat__", False) or getattr(
+            model, "__int8_training_ptq__", False
+        ):
+            return (model, True, "already-enabled")
+
+        last_err: Optional[Exception] = None
+        if cls.is_qat_available():
+            try:
+                cls._prepare_qat(
+                    model,
+                    dynamic_activations=dynamic_activations,
+                    group_size=group_size,
+                    logger=logger,
+                )
+                setattr(model, "__int8_training_qat__", True)
+                return (model, True, "QAT-prepare")
+            except Exception as exc:
+                last_err = exc
+                _log_info(logger, f"[INT8][QAT] prepare failed: {exc}")
+
+        try:
+            m2, ok, why = cls._apply_ptq(
+                model,
+                dynamic_activations=dynamic_activations,
+                group_size=group_size,
+                logger=logger,
+            )
+        except Exception as exc:
+            err = exc or last_err or RuntimeError("Unknown PTQ failure")
+            return (model, False, f"INT8 training path unavailable: {err}")
+
+        if ok:
+            setattr(m2, "__int8_training_ptq__", True)
+            return (m2, True, f"PTQ({why})")
+        return (model, False, f"PTQ failed: {why}")
+
+
+@lru_cache(maxsize=1)
+def _dot_product_attention_cls() -> Any:
+    try:
+        from .kernels import DotProductAttention as _DotProductAttention
+
+        return _DotProductAttention
+    except Exception:
+        return None

@@ -35,7 +35,9 @@ from tqdm.auto import tqdm
 
 from ..data.pipeline import BatchIterator, extract_xy
 from ..backend.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
-from ..model.architecture import ModelPolicy, PrecisionPolicy
+from ..model.architecture import ModelPolicy
+from ..backend.precision import Autocast, PrecisionPolicy
+from ..backend.graph import inference_mode
 
 
 _nvml = None
@@ -211,8 +213,6 @@ from ..backend.casting import to_torch_tensor
 from ..backend.staging import Cache, Pool
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
-from ..model import fused
-from ..model.fused import Autocast, Gradient
 from .losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
                      LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss)
 from .optimizers import (SWALR, AdamW, StochasticWeightAverage,
@@ -1032,8 +1032,8 @@ def _calibrate_per_sample_mem(
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
         try:
-            from ..model.fused import Autocast
-            from ..model.fused import Gradient
+            from ..backend.precision import Autocast
+            from ..backend.graph import inference_mode
 
             feats, labels, *_rest = meta.preprocess(batch)
             X = to_torch_tensor(feats)
@@ -1070,7 +1070,7 @@ def _calibrate_per_sample_mem(
                         loss.backward()
                         forward_ran = True
                 else:
-                    with Gradient.inference(model), Autocast.float(device):
+                    with inference_mode(model), Autocast.float(device):
                         _ = model(
                             X,
                             global_loss=None,
@@ -2722,7 +2722,7 @@ def epochs(
                                     raise
 
                                 # Also request input batch scale-down for NEXT batches (true runtime recovery).
-                                # NOTE: scale controller is per-session/per-loader (see SamplerScale).
+                                # NOTE: scale controller is per-session/per-loader (see BatchState).
                                 try:
                                     scale_ctl = None
                                     obj = train_loader
@@ -2854,7 +2854,7 @@ def epochs(
                 flop_counter_val = FlopCounter(model, mode="eval", device=device)
                 with flop_counter_val:
                     model.eval()
-                    with Gradient.inference(model), Autocast.float(device):
+                    with inference_mode(model), Autocast.float(device):
                         t_fetch_start = time.perf_counter_ns()
                         for _vstep, _raw in enumerate(val_loader):
                             while True:
@@ -3712,7 +3712,7 @@ def infer(
 
 
     try:
-        with Gradient.inference(run_model), Autocast.float(device):
+        with inference_mode(run_model), Autocast.float(device):
             row_ids_buf: Optional[torch.Tensor] = None
             for batch in data_loader:
                 if batch is None:

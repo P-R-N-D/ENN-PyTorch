@@ -13,6 +13,21 @@ os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
 os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
 import torch
+
+# Apply Torch compatibility patches early (adds missing APIs/aliases across versions).
+# This is best-effort and must never fail import.
+try:
+    from .backend.compat import patch_torch as _patch_torch
+except Exception:  # pragma: no cover
+    _patch_torch = None
+else:
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        try:
+            _patch_torch()
+        except Exception:
+            pass
+
 try:
     from tensordict import set_list_to_stack as _set_list_to_stack
 except Exception:

@@ -52,7 +52,7 @@ from ..backend.compat import is_meta_or_fake_tensor
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
 from ..data.pipeline import BatchIterator
-from ..model.fused import Gradient
+from ..backend.graph import inference_mode
 from .config import ModelConfig, coerce_model_config
 
 _LOGGER = logging.getLogger(__name__)
@@ -565,7 +565,7 @@ def _get_tensor_shape(model: nn.Module, sample_input: Optional[torch.Tensor]) ->
     if (in_dim is None or out_shape is None) and sample_input is not None:
         dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
         sample = sample_input.to(dev)
-        with Gradient.inference(model.eval()):
+        with inference_mode(model.eval()):
             if sample.ndim == 1:
                 sample = sample.unsqueeze(0)
             y_flat = _extract_pred_tensor(_forward_model(model, sample))
@@ -894,7 +894,7 @@ class CoreML(Format):
         with _serving_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
             wrapper = _CompatLayer(serving_model).eval()
-            with Gradient.inference(wrapper):
+            with inference_mode(wrapper):
                 scripted = torch.jit.trace(wrapper, sample)
 
             cu_map = {
@@ -1002,10 +1002,10 @@ class TorchScript(Format):
             if method == "trace":
                 if sample is None:
                     sample = _pad_sample(serving_model, None)
-                with Gradient.inference(wrapper):
+                with inference_mode(wrapper):
                     scripted = torch.jit.trace(wrapper, sample)
             else:
-                with Gradient.inference(wrapper):
+                with inference_mode(wrapper):
                     scripted = torch.jit.script(wrapper)
 
             if bool(kwargs.get("optimize_for_mobile", False)):
@@ -1043,7 +1043,7 @@ class ExecuTorch(Format):
             sample = _pad_sample(serving_model, sample)
             wrapper = _CompatLayer(serving_model).eval()
 
-            with Gradient.inference(wrapper):
+            with inference_mode(wrapper):
                 exported = torch_export(wrapper, (sample,))
 
             edge = exir.to_edge(exported)
