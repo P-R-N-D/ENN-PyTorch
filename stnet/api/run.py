@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
 
 from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
-from ..backend.runtime import _trim_dcp_keys, main
+from .runtime import _trim_dcp_keys, main
 from ..backend.system import (
     WorkerPolicy,
     initialize_python_path,
@@ -50,8 +50,7 @@ from ..data.pipeline import (
 from ..model.fused import Gradient
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
-from ..backend.export import _to_cpu
-from .io import _torch_load_checkpoint
+from .io import _torch_load_checkpoint, _to_cpu
 from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
 
