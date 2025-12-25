@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover
 
 from torch import nn
 
-from ..model.nn import History
+from ..model.blocks import History
 from .compat import is_meta_or_fake_tensor
 
 _LOGGER = logging.getLogger(__name__)
