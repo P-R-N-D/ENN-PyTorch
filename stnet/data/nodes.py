@@ -1016,7 +1016,7 @@ class BatchIterator:
 
     @staticmethod
     def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:
-        from .datatype import env_str
+        from ..backend.casting import env_str
 
         req = str(env_str("STNET_MEMMAP_FLOAT_DTYPE") or "").strip()
         if req.startswith("torch."):
