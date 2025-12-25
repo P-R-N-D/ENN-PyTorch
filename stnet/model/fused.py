@@ -859,7 +859,7 @@ class Autocast:
                     continue
                 cls._preferred_fp8_backend = "te"
                 return "te"
-            if backend == "ao":
+            elif backend == "ao":
                 try:
                     _float8_mod = importlib.import_module("torchao.float8")
 
@@ -905,7 +905,7 @@ class Autocast:
                     continue
                 cls._preferred_int_backend = "te"
                 return "te"
-            if backend == "ao":
+            elif backend == "ao":
                 try:
                     quant_mod = importlib.import_module("torchao.quantization")
                     int8_autocast = getattr(quant_mod, "int8_autocast", None)

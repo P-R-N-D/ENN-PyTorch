@@ -406,7 +406,6 @@ class Cache:
             pass
 
     def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
-        import json
         import os as _os
 
         if not torch.is_tensor(tensor):
@@ -426,19 +425,39 @@ class Cache:
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
 
-            MemoryMappedTensor.from_tensor(buf, filename=path)
+            # Write to a temp file and atomically replace, so readers never see a half-written .mmt.
+            parent = _os.path.dirname(path) or "."
+            _os.makedirs(parent, exist_ok=True)
+
+            import tempfile as _tempfile
+
+            fd, tmp_name = _tempfile.mkstemp(prefix=_os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+            _os.close(fd)
+            try:
+                MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
+                _os.replace(tmp_name, path)
+            finally:
+                with contextlib.suppress(Exception):
+                    _os.remove(tmp_name)
+
+            # Sidecar meta: keep the naming consistent across the codebase.
+            from .pipeline import BatchIterator
+
             meta = {
-                "shape": list(buf.shape),
+                "shape": [int(x) for x in buf.shape],
                 "dtype": str(buf.dtype).replace("torch.", ""),
             }
-            tmp_json = path + ".json.tmp"
-            final_json = path + ".json"
-            with open(tmp_json, "w", encoding="utf-8") as f:
-                json.dump(meta, f)
-            _os.replace(tmp_json, final_json)
+            BatchIterator.atomic_write_json(BatchIterator.mmt_meta_path(path), meta, indent=None)
             return
 
-        torch.save(buf, path)
+        # torch.save pickles (rows.pt / pred.pt)
+        if str(path).endswith((".pt", ".pth")):
+            # Use the shared atomic writer for consistency.
+            from .pipeline import BatchIterator
+
+            BatchIterator.atomic_torch_save(buf, path)
+        else:
+            torch.save(buf, path)
 
     def close(self) -> None:
         if self._closed.is_set():

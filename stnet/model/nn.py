@@ -6,7 +6,6 @@ import logging
 import math
 import threading
 import weakref
-from collections.abc import Iterator
 from typing import (
     Any,
     Callable,
@@ -75,6 +74,38 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
     return fallback
 
 
+class _ControllerChunkRunner:
+    """Callable used by Context.run microbatch executor.
+
+    Kept at module scope to avoid nested function definitions (cleaner pickling
+    and friendlier to free-threaded/no-GIL builds).
+    """
+
+    __slots__ = ("backbone", "device", "meta", "amp_enabled")
+
+    def __init__(
+        self,
+        backbone: nn.Module,
+        *,
+        device: torch.device,
+        meta: Any,
+        amp_enabled: bool,
+    ) -> None:
+        self.backbone = backbone
+        self.device = device
+        self.meta = meta
+        self.amp_enabled = bool(amp_enabled)
+
+    def __call__(self, chunk: torch.Tensor) -> torch.Tensor:
+        with (
+            Autocast.float(self.device, metadata=self.meta)
+            if self.amp_enabled
+            else Autocast.suspend(self.device)
+        ):
+            out, _ = self.backbone(chunk)
+        return cast(torch.Tensor, out)
+
+
 @torch.no_grad()
 def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     B, N, C = coords.shape
@@ -133,13 +164,6 @@ def _serialize_z_index(
         scatter_src = scatter_src.view(1, -1).expand_as(perm)
     invperm.scatter_(1, perm, scatter_src)
     return perm, invperm
-
-
-def _block_ranges(N: int, patch: int) -> Iterator[tuple[int, int]]:
-    patch_i = max(1, int(patch))
-    for s in range(0, int(N), patch_i):
-        e = min(s + patch_i, int(N))
-        yield s, e
 
 
 def _materialize_layernorm_(ln: nn.Module, ref: torch.Tensor) -> None:
@@ -1189,15 +1213,16 @@ class Context(nn.Module):
             Gradient.inference(self.backbone) if infer_mode else contextlib.nullcontext()
         )
 
-        def _run_controller_chunk(chunk: torch.Tensor) -> torch.Tensor:
-            with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                out, _ = self.backbone(chunk)
-            return out
-
+        runner = _ControllerChunkRunner(
+            self.backbone,
+            device=device,
+            meta=meta,
+            amp_enabled=amp_enabled,
+        )
         with controller_ctx:
             refined = cast(
                 torch.Tensor,
-                _microbatch_prealloc(tokens, mb, _run_controller_chunk, stage="controller"),
+                _microbatch_prealloc(tokens, mb, runner, stage="controller"),
             )
         return refined
 
@@ -2289,8 +2314,9 @@ class Root(nn.Module):
                 self.scaler.x_mean.zero_()
                 self.scaler.x_std.fill_(1.0)
 
-        # Keep History on the same device so Root.forward device inference can't be hijacked by CPU buffers.
-        self.logger = History().to(self._device)
+        # History/logging is runtime metadata; keep it on CPU to reduce device
+        # traffic and GPU memory pressure.
+        self.logger = History()
 
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
@@ -2451,6 +2477,20 @@ class Root(nn.Module):
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = threading.Lock()
         self.__config = config
+
+    def to(self, *args: Any, **kwargs: Any) -> "Root":
+        """Move the model to a device/dtype while keeping History on CPU.
+
+        Root owns device placement for the core model, but History is runtime
+        metadata/logging and should remain on CPU (especially important for
+        CUDA/XPU where moving it would allocate device memory and can trigger
+        unnecessary device syncs).
+        """
+        out = super().to(*args, **kwargs)
+        with contextlib.suppress(Exception):
+            if isinstance(getattr(self, "logger", None), History):
+                self.logger.cpu()
+        return cast(Root, out)
 
     @staticmethod
     def _cast_graph_safe(x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:

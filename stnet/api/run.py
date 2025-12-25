@@ -232,8 +232,8 @@ def _maybe_save_model_checkpoint(
 def read_json(path: str) -> Any:
     """Read and parse JSON payload from ``path``.
 
-    This thin wrapper exists for symmetry with ``write_json_atomic`` and to avoid
-    sprinkling ``json.load`` calls throughout prediction assembly helpers. Using
+    This thin wrapper exists to avoid sprinkling ``json.load`` calls throughout
+    prediction assembly helpers. Using
     ``utf-8-sig`` tolerates BOM-prefixed files (common on Windows) when manifests
     are created or edited outside Python.
     """
@@ -242,12 +242,31 @@ def read_json(path: str) -> Any:
         return json.load(f)
 
 
-def write_json_atomic(path: str, payload: Any) -> None:
-    """Atomically write JSON using BatchIterator's shared writer."""
-
-    BatchIterator.atomic_write_json(path, payload, indent=None)
 
 
+def _is_contiguous_row_range(rows: torch.Tensor) -> tuple[bool, int, int]:
+    """Return (is_contiguous_range, start, end) for rows.
+
+    A contiguous range means: rows = [start, start+1, ..., end-1].
+    """
+    rows = rows.reshape(-1)
+    n = int(rows.numel())
+    if n <= 0:
+        return True, 0, 0
+
+    start = int(rows[0].item())
+    if n == 1:
+        return True, start, start + 1
+
+    last = int(rows[-1].item())
+    if last != start + n - 1:
+        return False, 0, 0
+
+    # Vectorized O(n) check (fast enough; avoids allocating an arange).
+    if not bool(torch.all(rows[1:] == rows[:-1] + 1)):
+        return False, 0, 0
+
+    return True, start, start + n
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
     """Open an existing MemoryMappedTensor using the sidecar meta file."""
     meta_path = BatchIterator.mmt_meta_path(mmt_path)
@@ -615,9 +634,12 @@ def train(
             raise RuntimeError("no training data provided to train()")
 
         if manifest is not None:
-            with open(os.path.join(memmap_dir, "multinode.json"), "w", encoding="utf-8") as f:
-                payload = manifest if isinstance(manifest, dict) else list(manifest)
-                json.dump(payload, f)
+            payload = manifest if isinstance(manifest, dict) else list(manifest)
+            BatchIterator.atomic_write_json(
+                os.path.join(memmap_dir, "multinode.json"),
+                payload,
+                indent=None,
+            )
 
         ckpt_dir = new_dir("ckpt_dcp")
 
@@ -983,7 +1005,9 @@ def _assemble_predictions_to_memmap(
         )
         if not isinstance(rows_t, torch.Tensor):
             rows_t = torch.as_tensor(rows_t, device="cpu")
-        rows_t = rows_t.to(dtype=torch.int64, device="cpu")
+        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
+        if not bool(rows_t.is_contiguous()):
+            rows_t = rows_t.contiguous()
 
         if pred_file.endswith(".mmt"):
             preds_t = _open_pred_memmap(pred_file)
@@ -993,25 +1017,43 @@ def _assemble_predictions_to_memmap(
                 map_location="cpu",
                 weights_only=True,
             )
-            if not isinstance(preds_t, torch.Tensor):
-                preds_t = torch.as_tensor(preds_t, device="cpu")
-
-        preds_t = preds_t.to(dtype=store_float, device="cpu")
+        if not isinstance(preds_t, torch.Tensor):
+            preds_t = torch.as_tensor(preds_t, device="cpu")
+        if preds_t.device.type != "cpu":
+            preds_t = preds_t.to(device="cpu")
+        preds_t = preds_t.to(dtype=store_float, copy=False)
 
         if preds_t.shape[0] != rows_t.shape[0]:
             raise ValueError(
                 f"Pred/rows mismatch in {pred_file}: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
             )
 
-        Y_out.index_copy_(0, rows_t, preds_t)
+        is_contig, start, end = _is_contiguous_row_range(rows_t)
+        if is_contig:
+            if start < 0 or end > int(count):
+                raise ValueError(
+                    f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
+                )
+            # Slice copy is noticeably faster than index_copy_ when rows are contiguous.
+            Y_out[start:end].copy_(preds_t)
+        else:
+            if rows_t.numel() > 0:
+                rmin = int(rows_t.min().item())
+                rmax = int(rows_t.max().item())
+                if rmin < 0 or rmax >= int(count):
+                    raise ValueError(
+                        f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
+                    )
+            Y_out.index_copy_(0, rows_t, preds_t)
 
     pred_meta_path = BatchIterator.mmt_meta_path(out_path)
-    write_json_atomic(
+    BatchIterator.atomic_write_json(
         pred_meta_path,
         {
             "dtype": str(store_float).replace("torch.", ""),
             "shape": list(map(int, full_shape)),
         },
+        indent=None,
     )
 
     return Y_out
@@ -1051,7 +1093,9 @@ def _assemble_predictions_to_tensor(
         )
         if not isinstance(rows_t, torch.Tensor):
             rows_t = torch.as_tensor(rows_t, device="cpu")
-        rows_t = rows_t.to(dtype=torch.int64, device="cpu")
+        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
+        if not bool(rows_t.is_contiguous()):
+            rows_t = rows_t.contiguous()
 
         if pred_file.endswith(".mmt"):
             preds_t = _open_pred_memmap(pred_file)
@@ -1061,17 +1105,33 @@ def _assemble_predictions_to_tensor(
                 map_location="cpu",
                 weights_only=True,
             )
-            if not isinstance(preds_t, torch.Tensor):
-                preds_t = torch.as_tensor(preds_t, device="cpu")
-
-        preds_t = preds_t.to(dtype=dtype, device="cpu")
+        if not isinstance(preds_t, torch.Tensor):
+            preds_t = torch.as_tensor(preds_t, device="cpu")
+        if preds_t.device.type != "cpu":
+            preds_t = preds_t.to(device="cpu")
+        preds_t = preds_t.to(dtype=dtype, copy=False)
 
         if preds_t.shape[0] != rows_t.shape[0]:
             raise ValueError(
                 f"Pred/rows mismatch in {pred_file}: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
             )
 
-        Y_out.index_copy_(0, rows_t, preds_t)
+        is_contig, start, end = _is_contiguous_row_range(rows_t)
+        if is_contig:
+            if start < 0 or end > int(count):
+                raise ValueError(
+                    f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
+                )
+            Y_out[start:end].copy_(preds_t)
+        else:
+            if rows_t.numel() > 0:
+                rmin = int(rows_t.min().item())
+                rmax = int(rows_t.max().item())
+                if rmin < 0 or rmax >= int(count):
+                    raise ValueError(
+                        f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
+                    )
+            Y_out.index_copy_(0, rows_t, preds_t)
 
     return Y_out
 
@@ -1158,7 +1218,12 @@ def _write_predictions_h5_from_chunks(
                     f"Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={rows_np.shape[0]}"
                 )
 
-            dset_Y[rows_np] = preds_np
+            # Faster path: contiguous write avoids fancy-index overhead in h5py.
+            is_contig, start, end = _is_contiguous_row_range(rows_t)
+            if is_contig:
+                dset_Y[start:end] = preds_np
+            else:
+                dset_Y[rows_np] = preds_np
 
     return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
 

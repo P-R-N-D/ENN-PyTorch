@@ -92,6 +92,86 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
             return nn.LayerNorm(dim)
 
 
+class _FlexBoolMaskMod:
+    """Callable mask adapter for torch flex_attention block masks.
+
+    The project uses boolean attention masks with semantics:
+        True = masked/disallowed
+
+    flex_attention / create_block_mask expects:
+        True = allowed
+
+    So we invert (~) the supplied mask.
+    """
+
+    __slots__ = ("m", "mode")
+
+    def __init__(self, m: torch.Tensor, mode: str) -> None:
+        self.m = m
+        self.mode = mode
+
+    def __call__(self, b: int, h: int, qi: int, kj: int) -> torch.Tensor:
+        m = self.m
+        match self.mode:
+            case "2d":
+                return ~m[qi, kj]
+            case "3d":
+                return ~m[b, qi, kj]
+            case "4d1":
+                return ~m[b, 0, qi, kj]
+            case "4d":
+                return ~m[b, h, qi, kj]
+            case _:
+                # Should never happen; keep behavior conservative.
+                return ~m[qi, kj]
+
+
+class _FlexScoreMod:
+    """Callable score modifier for torch flex_attention.
+
+    Adds a coordinate-dependent relative bias + optional additive attn_mask bias.
+    """
+
+    __slots__ = ("coord_proj", "mask_bias", "mask_bias_kind")
+
+    def __init__(
+        self,
+        coord_proj: torch.Tensor,
+        *,
+        mask_bias: torch.Tensor | None,
+        mask_bias_kind: str | None,
+    ) -> None:
+        self.coord_proj = coord_proj
+        self.mask_bias = mask_bias
+        self.mask_bias_kind = mask_bias_kind
+
+    def __call__(
+        self,
+        score: torch.Tensor,
+        b: int,
+        h: int,
+        qi: int,
+        kj: int,
+    ) -> torch.Tensor:
+        total = score
+        coord_term = self.coord_proj[b, h, qi] - self.coord_proj[b, h, kj]
+        total = total + coord_term.to(dtype=score.dtype)
+
+        bias = self.mask_bias
+        if bias is not None:
+            match self.mask_bias_kind:
+                case "2d":
+                    total = total + bias[qi, kj].to(dtype=score.dtype)
+                case "3d":
+                    total = total + bias[b, qi, kj].to(dtype=score.dtype)
+                case "4d1":
+                    total = total + bias[b, 0, qi, kj].to(dtype=score.dtype)
+                case _:
+                    total = total + bias[b, h, qi, kj].to(dtype=score.dtype)
+
+        return total
+
+
 class PatchAttention(nn.Module):
     def __init__(
         self,
@@ -236,20 +316,14 @@ class PatchAttention(nn.Module):
                                     raise ValueError(
                                         f"bool attn_mask shape {tuple(m.shape)} incompatible with (N,N)=({N},{N})"
                                     )
-
-                                def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                    # Project boundary: mask-out (True=masked).
-                                    # flex_attention expects keep-mask (True=allowed) -> invert.
-                                    return ~m[qi, kj]
+                                mask_mod = _FlexBoolMaskMod(m, "2d")
 
                             case 3:
                                 if m.shape != (B, N, N):
                                     raise ValueError(
                                         f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
                                     )
-
-                                def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                    return ~m[b, qi, kj]
+                                mask_mod = _FlexBoolMaskMod(m, "3d")
 
                             case 4:
                                 b0, hm, s1, s2 = m.shape
@@ -258,18 +332,13 @@ class PatchAttention(nn.Module):
                                         f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
                                     )
                                 if hm == 1:
-
-                                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                        return ~m[b, 0, qi, kj]
-
+                                    mask_mod = _FlexBoolMaskMod(m, "4d1")
                                 elif hm != self.nhead:
                                     raise ValueError(
                                         f"bool attn_mask head dim {hm} incompatible with nhead={self.nhead}"
                                     )
                                 else:
-
-                                    def mask_mod(b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-                                        return ~m[b, h, qi, kj]
+                                    mask_mod = _FlexBoolMaskMod(m, "4d")
 
                             case _:
                                 raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
@@ -339,23 +408,11 @@ class PatchAttention(nn.Module):
             )
         coord_proj = torch.matmul(coords_f32, W.t()).transpose(1, 2).contiguous()
 
-        def score_mod(
-            score: torch.Tensor, b: int, h: int, qi: int, kj: int
-        ) -> torch.Tensor:
-            total = score
-            coord_term = coord_proj[b, h, qi] - coord_proj[b, h, kj]
-            total = total + coord_term.to(dtype=score.dtype)
-            if mask_bias is not None:
-                match mask_bias_kind:
-                    case "2d":
-                        total = total + mask_bias[qi, kj].to(dtype=score.dtype)
-                    case "3d":
-                        total = total + mask_bias[b, qi, kj].to(dtype=score.dtype)
-                    case "4d1":
-                        total = total + mask_bias[b, 0, qi, kj].to(dtype=score.dtype)
-                    case _:
-                        total = total + mask_bias[b, h, qi, kj].to(dtype=score.dtype)
-            return total
+        score_mod = _FlexScoreMod(
+            coord_proj,
+            mask_bias=mask_bias,
+            mask_bias_kind=mask_bias_kind,
+        )
 
         scale = 1.0 / math.sqrt(float(self.head_dim))
         out = flex_attention(
