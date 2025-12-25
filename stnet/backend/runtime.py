@@ -218,7 +218,8 @@ from ..functional.losses import (CRPSLoss, DataFidelityLoss,
                                  StandardNormalLoss, StudentsTLoss, TiledLoss)
 from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                      stochastic_weight_average)
-from ..model.nn import History, Root, resize_scaler_buffer
+from ..model.architecture import Root
+from ..model.blocks import History, resize_scaler_buffer
 from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
                      torch_compile_safe,
                      torch_safe_distributed)
