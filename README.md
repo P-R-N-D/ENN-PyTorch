@@ -22,11 +22,11 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 ## Features
 - **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
 - **I/O helpers** (`stnet.api.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
-- **Runtime utilities** (`stnet.backend.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
+- **Runtime utilities** (`stnet.api.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.backend.distributed`): utilities to bootstrap and coordinate multi‑process training.
-- **Export** (`stnet.backend.export`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
+- **Export** (`stnet.api.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
 - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
-- **Functional blocks** (`stnet.functional`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
+- **Functional blocks** (`stnet.api.losses`, `stnet.api.optimizers`, `stnet.api.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
 - **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `Root`, `History`).
 - **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
 
@@ -80,7 +80,7 @@ import torch
 
 from stnet.api.config import ModelConfig
 from stnet.api.io import new_model
-from stnet.functional.losses import StudentsTLoss
+from stnet.api.losses import StudentsTLoss
 from stnet.backend.system import optimize_threads
 
 # 1) Build a config and model

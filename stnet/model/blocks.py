@@ -41,7 +41,7 @@ from ..backend.compat import (
 from ..backend.system import empty_device_cache
 from ..backend.casting import env_first_int, env_int
 from ..data.pipeline import resolve_feature_key, resolve_label_key
-from ..functional.profiler import FLOP_PROFILER
+from ..api.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient
 from .primitives import (
     CrossAttention,

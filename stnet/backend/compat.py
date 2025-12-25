@@ -497,7 +497,7 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
 
     if runtime_module is None:
         with suppress(Exception):
-            runtime_module = importlib.import_module("stnet.backend.runtime")
+            runtime_module = importlib.import_module("stnet.api.runtime")
 
     if runtime_module is not None:
         # NOTE: Runtime metric aggregation helpers used to live in stnet.backend.runtime.

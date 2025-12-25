@@ -7,6 +7,10 @@ from types import ModuleType
 __all__ = [
     "config",
     "io",
+    "runtime",
+    "losses",
+    "optimizers",
+    "profiler",
     "run",
 ]
 

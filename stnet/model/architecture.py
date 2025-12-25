@@ -28,7 +28,7 @@ from ..data.pipeline import (
     resolve_feature_key,
     resolve_label_key,
 )
-from ..functional.profiler import FLOP_PROFILER
+from ..api.profiler import FLOP_PROFILER
 from ..model.fused import (
     Autocast,
     Gradient,

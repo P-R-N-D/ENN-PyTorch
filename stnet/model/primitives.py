@@ -64,7 +64,7 @@ def _stnet_checkpoint_mode() -> str:
 
 _STNET_CHECKPOINT_MODE = _stnet_checkpoint_mode()
 
-from ..functional.profiler import FLOP_PROFILER
+from ..api.profiler import FLOP_PROFILER
 from ..backend.system import empty_device_cache
 from .kernels import (
     DotProductAttention,

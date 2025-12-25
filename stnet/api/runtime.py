@@ -34,7 +34,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..data.pipeline import BatchIterator, extract_xy
-from .casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..backend.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..model.architecture import ModelPolicy, PrecisionPolicy
 
 
@@ -106,7 +106,7 @@ def _nvml_backoff_s() -> float:
     # Default: slightly longer backoff when no-GIL optimizations are enabled,
     # because telemetry is polled much more frequently.
     try:
-        from .system import Affinity
+        from ..backend.system import Affinity
 
         _NVML_BACKOFF_S = 30.0 if bool(Affinity.nogil_optimizations_enabled()) else 10.0
     except Exception:
@@ -148,7 +148,7 @@ def _nvml_min_interval_s() -> float:
 
     # Default: throttle only when no-GIL optimizations are enabled.
     try:
-        from .system import Affinity
+        from ..backend.system import Affinity
 
         _NVML_MIN_INTERVAL_S = 0.10 if bool(Affinity.nogil_optimizations_enabled()) else 0.0
     except Exception:
@@ -206,28 +206,27 @@ try:
 except Exception:
     _psutil = None
 
-from ..api.config import RuntimeConfig, coerce_model_config
-from .casting import to_torch_tensor
-from .staging import Cache, Pool
+from .config import RuntimeConfig, coerce_model_config
+from ..backend.casting import to_torch_tensor
+from ..backend.staging import Cache, Pool
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
 from ..model import fused
 from ..model.fused import Autocast, Gradient
-from ..functional.losses import (CRPSLoss, DataFidelityLoss,
-                                 LinearCombinationLoss, LossWeightController,
-                                 StandardNormalLoss, StudentsTLoss, TiledLoss)
-from ..functional.optimizers import (SWALR, AdamW, StochasticWeightAverage,
-                                     stochastic_weight_average)
+from .losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
+                     LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss)
+from .optimizers import (SWALR, AdamW, StochasticWeightAverage,
+                         stochastic_weight_average)
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
-from .compat import (cudagraph_step_end, is_meta_or_fake_tensor,
-                     torch_compile_safe,
-                     torch_safe_distributed)
-from .distributed import (distributed_barrier, distributed_sync,
-                          get_world_size, is_distributed, joining, no_sync,
-                          to_ddp, to_fsdp)
-from ..functional.profiler import FlopCounter
-from .system import (
+from ..backend.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
+                              torch_compile_safe,
+                              torch_safe_distributed)
+from ..backend.distributed import (distributed_barrier, distributed_sync,
+                                   get_world_size, is_distributed, joining, no_sync,
+                                   to_ddp, to_fsdp)
+from .profiler import FlopCounter
+from ..backend.system import (
     Memory,
     empty_device_cache,
     get_device,

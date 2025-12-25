@@ -9,7 +9,7 @@ import torch
 import torch._dynamo
 from torch import nn
 
-from ..functional.profiler import FLOP_PROFILER, capture
+from ..api.profiler import FLOP_PROFILER, capture
 from ..backend.system import get_device, get_dpa_backends, get_runtime_config
 from ..backend.compat import torch_no_compile
 from ..backend.casting import env_str
