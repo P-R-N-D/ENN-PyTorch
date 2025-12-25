@@ -727,6 +727,7 @@ class MultiScaleRetentionCompat(nn.Module):
         self,
         x: torch.Tensor,
         *args: Any,
+        decay: Any = None,
         attn_mask: Optional[torch.Tensor] = None,
         state: Any = None,
         **kwargs: Any,
@@ -737,10 +738,8 @@ class MultiScaleRetentionCompat(nn.Module):
             restore_dtype = x.dtype
             x_in = x.to(torch.float16)
 
-        # sin/cos are currently unused by this implementation, but may be passed by callers.
-        _ = kwargs.pop("sin", None)
-        _ = kwargs.pop("cos", None)
-        decay = kwargs.pop("decay", None)
+        # Compat implementation ignores extra args/kwargs.
+        del args, kwargs
 
         batch, seq_len, _ = x_in.shape
         if seq_len == 0:
@@ -900,8 +899,6 @@ class MultiScaleRetention(nn.Module):
             try:
                 out_tr = self._triton_msr(
                     x,
-                    None,
-                    None,
                     lam,
                     attn_mask=attn_mask,
                     state=state,
@@ -998,16 +995,14 @@ class MultiScaleRetentionTriton(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        sin: Any,
-        cos: Any,
         decay: Any,
         *args: Any,
         attn_mask: Optional[torch.Tensor] = None,
         state: Any = None,
         **kwargs: Any,
     ) -> torch.Tensor:
-        # sin/cos are currently unused by the Triton implementation.
-        del sin, cos, kwargs
+        # Triton path ignores extra args/kwargs; keep signature lean for callers.
+        del args, kwargs
 
         if x.dim() != 3:
             raise ValueError(f"MultiScaleRetentionTriton expects (B,L,D), got {tuple(x.shape)}")

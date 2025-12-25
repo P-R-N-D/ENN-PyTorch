@@ -36,39 +36,7 @@ from tqdm.auto import tqdm
 from ..data.pipeline import BatchIterator
 from ..data.datatype import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..data.pipeline import extract_xy
-from ..api.io import _torch_load_checkpoint
 
-
-def _write_pred_memmap(preds_cpu: torch.Tensor, path: str) -> None:
-    """Write preds as MemoryMappedTensor (.mmt) plus a small sidecar meta JSON.
-
-    This enables truly lazy/random access on the reader side without loading
-    the full tensor into RAM.
-    """
-    if not isinstance(preds_cpu, torch.Tensor):
-        preds_cpu = torch.as_tensor(preds_cpu)
-    if preds_cpu.device.type != "cpu":
-        preds_cpu = preds_cpu.to(device="cpu")
-    preds_cpu = preds_cpu.detach()
-    if not bool(preds_cpu.is_contiguous()):
-        preds_cpu = preds_cpu.contiguous()
-
-    p = os.fspath(path)
-    parent = os.path.dirname(p) or "."
-    os.makedirs(parent, exist_ok=True)
-
-    # Best-effort atomic replace to avoid half-written .mmt files.
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
-    os.close(fd)
-    try:
-        MemoryMappedTensor.from_tensor(preds_cpu, filename=tmp_name, existsok=True)
-        os.replace(tmp_name, p)
-    finally:
-        with contextlib.suppress(Exception):
-            os.remove(tmp_name)
-
-    meta = {"dtype": str(preds_cpu.dtype), "shape": [int(x) for x in preds_cpu.shape]}
-    BatchIterator.atomic_write_json(BatchIterator.mmt_meta_path(p), meta, indent=None)
 
 _nvml = None
 _NVML_READY = False
@@ -277,6 +245,21 @@ else:
     Float64Array = Any
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_COMPILE_SAFE_DONE: bool = False
+
+
+def _ensure_torch_compile_safe() -> None:
+    """Call torch_compile_safe(...) once, but avoid import-time side effects."""
+
+    global _COMPILE_SAFE_DONE
+    if _COMPILE_SAFE_DONE:
+        return
+    _COMPILE_SAFE_DONE = True
+    with contextlib.suppress(Exception):
+        torch_compile_safe(runtime_module=sys.modules[__name__])
+
 
 torch_safe_distributed()
 
@@ -2094,7 +2077,8 @@ def epochs(
             pass
 
     if isinstance(hist, History):
-        start_ns = posix_time("Asia/Seoul")
+        # posix_time is epoch-based; tz_name does not affect the value.
+        start_ns = posix_time()
         start_sec = round(float(start_ns) / 1e9, 6)
         hist.start_session(start_sec)
         hist.set_epochs(total_epochs)
@@ -3310,7 +3294,8 @@ def epochs(
             f"{mbps:.2f} MB/s, {tflops:.2f} TFLOPS", refresh=True
         )
         status_bar.close()
-    end_kst_ns = posix_time("Asia/Seoul")
+    # posix_time is epoch-based; tz_name does not affect the value.
+    end_kst_ns = posix_time()
     try:
         dev_t = getattr(device, "type", "")
         total_t = prev_io_time + prev_comp_time
@@ -3444,6 +3429,8 @@ def infer(
 
     import glob
 
+    _ensure_torch_compile_safe()
+
     if data_loader is None:
         return None
 
@@ -3510,6 +3497,15 @@ def infer(
             cpu_pool_cap = max(2, int(_rt_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
             cpu_pool = Pool(capacity=cpu_pool_cap)
 
+    # Dedicated (small) pinned CPU pool for prediction chunks (D2H staging).
+    # This lets us use non_blocking=True for GPU->CPU copies and avoid re-allocating
+    # large pinned buffers every flush.
+    pred_pool: Any | None = None
+    if device.type == "cuda" and Pool is not None and _rt_env_flag("STNET_PRED_PINNED", True):
+        with contextlib.suppress(Exception):
+            pred_pool_cap = max(2, int(_rt_env_int("STNET_PRED_PIN_POOL_CAPACITY", 2)))
+            pred_pool = Pool(capacity=pred_pool_cap, pin_memory=True)
+
     pool_handles: dict[int, object] = {}
     pin_tensor = partial(
         _pin_tensors_with_cpu_pool,
@@ -3539,6 +3535,8 @@ def infer(
     use_buffer = True
     rows_buf: Optional[torch.Tensor] = None
     pred_buf: Optional[torch.Tensor] = None
+    pred_handle: Any | None = None
+    buf_needs_wait_evt = False
     buf_fill = 0
 
     # Fallback path for variable-shaped outputs.
@@ -3552,14 +3550,25 @@ def infer(
     variable_shape = False
 
     def _flush() -> None:
-        nonlocal chunk_idx, pending_count, buf_fill, pending_tail
+        nonlocal chunk_idx, pending_count, buf_fill, pending_tail, pred_buf, pred_handle, buf_needs_wait_evt
         if use_buffer:
             if buf_fill <= 0:
                 return
             assert rows_buf is not None and pred_buf is not None
-            rows = rows_buf[:buf_fill]
+            # rows_buf is reused immediately; clone to avoid the writer thread
+            # observing mutated contents (race).
+            rows = rows_buf[:buf_fill].clone()
             preds = pred_buf[:buf_fill]
+
+            # Hand off this pred buffer to the async writer. Do not reuse until
+            # release_cb fires.
+            local_handle = pred_handle
+            need_wait_evt = bool(buf_needs_wait_evt)
+
             buf_fill = 0
+            pred_buf = None
+            pred_handle = None
+            buf_needs_wait_evt = False
         else:
             if pending_count <= 0:
                 return
@@ -3569,6 +3578,8 @@ def infer(
             preds = torch.cat(pending_preds, dim=0)
             if not bool(preds.is_contiguous()):
                 preds = preds.contiguous()
+            local_handle = None
+            need_wait_evt = False
 
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
 
@@ -3582,7 +3593,19 @@ def infer(
 
         cache.submit(rows, path=rows_path)
         if use_buffer:
-            _write_pred_memmap(preds, pred_path)
+            # If we used non_blocking GPU->CPU copies into a pinned buffer, wait for
+            # the final D2H transfer to complete before writing.
+            wait_evt = None
+            if need_wait_evt and device.type == "cuda":
+                with contextlib.suppress(Exception):
+                    wait_evt = torch.cuda.Event()
+                    wait_evt.record()
+
+            release_cb = None
+            if local_handle is not None and pred_pool is not None:
+                release_cb = lambda h=local_handle: pred_pool.release(h)
+
+            cache.submit(preds, path=pred_path, wait_event=wait_evt, release_cb=release_cb)
         else:
             cache.submit(preds, path=pred_path)
 
@@ -3595,20 +3618,22 @@ def infer(
 
         del rows, preds
 
-    def _append(rows_cpu: torch.Tensor, preds_cpu: torch.Tensor) -> None:
-        nonlocal use_buffer, rows_buf, pred_buf, buf_fill, pending_count, first_tail, variable_shape, pending_tail
+    def _append(rows_cpu: torch.Tensor, preds: torch.Tensor) -> None:
+        nonlocal use_buffer, rows_buf, pred_buf, pred_handle, buf_fill, pending_count, first_tail, variable_shape, pending_tail, buf_needs_wait_evt
 
-        if preds_cpu.ndim < 1:
+        if preds.ndim < 1:
             return
-        b = int(preds_cpu.shape[0])
+        b = int(preds.shape[0])
         if b <= 0:
             return
 
-        rows_cpu = rows_cpu.reshape(-1).to(dtype=torch.int64, copy=False)
+        rows_cpu = rows_cpu.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
         if rows_cpu.numel() != b:
             raise RuntimeError(f"infer: rows/preds batch mismatch rows={rows_cpu.numel()} preds={b}")
 
-        tail = tuple(int(x) for x in preds_cpu.shape[1:])
+        preds = preds.detach()
+
+        tail = tuple(int(x) for x in preds.shape[1:])
         if first_tail is None:
             first_tail = tail
         elif tail != first_tail:
@@ -3628,7 +3653,9 @@ def infer(
                 pending_tail = tail
 
             pending_rows.append(rows_cpu.clone())
-            pending_preds.append(preds_cpu)
+            if preds.device.type != "cpu":
+                preds = preds.to(device="cpu")
+            pending_preds.append(preds)
             pending_count += b
             if pending_count >= target_rows:
                 _flush()
@@ -3638,23 +3665,46 @@ def infer(
         if rows_buf is None:
             rows_buf = torch.empty((target_rows,), dtype=torch.int64)
 
+        # Allocate/validate a pinned CPU staging buffer for predictions.
         if pred_buf is None:
-            pred_buf = torch.empty((target_rows, *tail), dtype=preds_cpu.dtype)
+            if pred_pool is not None:
+                pred_buf, pred_handle = pred_pool.get((target_rows, *tail), dtype=preds.dtype, return_handle=True)
+            else:
+                pred_buf = torch.empty((target_rows, *tail), dtype=preds.dtype)
+                pred_handle = None
         else:
-            if pred_buf.dtype != preds_cpu.dtype or tuple(int(x) for x in pred_buf.shape[1:]) != tail:
+            if pred_buf.dtype != preds.dtype or tuple(int(x) for x in pred_buf.shape[1:]) != tail:
                 if buf_fill > 0:
                     _flush()
-                pred_buf = torch.empty((target_rows, *tail), dtype=preds_cpu.dtype)
+                if pred_pool is not None and pred_handle is not None:
+                    with contextlib.suppress(Exception):
+                        pred_pool.release(pred_handle)
+                pred_buf = None
+                pred_handle = None
 
         start = 0
         while start < b:
+            # _flush() hands off and clears pred_buf; reallocate as needed.
+            if pred_buf is None:
+                if pred_pool is not None:
+                    pred_buf, pred_handle = pred_pool.get((target_rows, *tail), dtype=preds.dtype, return_handle=True)
+                else:
+                    pred_buf = torch.empty((target_rows, *tail), dtype=preds.dtype)
+                    pred_handle = None
+
             space = target_rows - buf_fill
             if space <= 0:
                 _flush()
-                space = target_rows
+                continue
             n = min(space, b - start)
             rows_buf[buf_fill : buf_fill + n].copy_(rows_cpu[start : start + n])
-            pred_buf[buf_fill : buf_fill + n].copy_(preds_cpu[start : start + n])
+
+            # GPU->(pinned)CPU D2H copies can be scheduled asynchronously.
+            non_blocking = bool(pred_buf.is_pinned()) and preds.device.type != "cpu"
+            pred_buf[buf_fill : buf_fill + n].copy_(preds[start : start + n], non_blocking=non_blocking)
+            if non_blocking:
+                buf_needs_wait_evt = True
+
             buf_fill += n
             start += n
             if buf_fill >= target_rows:
@@ -3767,11 +3817,11 @@ def infer(
                     if not isinstance(y_hat, torch.Tensor):
                         raise RuntimeError("infer: unexpected model output type")
 
-                    y_cpu = y_hat.detach().to(device="cpu")
+                    preds = y_hat.detach()
                     rows_cpu = rows_i if rows_i.device.type == "cpu" else rows_i.to(device="cpu")
-                    _append(rows_cpu, y_cpu)
+                    _append(rows_cpu, preds)
 
-                    del Xi, rows_i, out, y_hat, y_cpu, rows_cpu
+                    del Xi, rows_i, out, y_hat, preds, rows_cpu
                     start = end
 
                 if torch_prof is not None:
@@ -3834,8 +3884,7 @@ def infer(
             }
 
             man_path = os.path.join(chunk_dir, "manifest.json")
-            with open(man_path, "w", encoding="utf-8") as f:
-                json.dump(manifest, f, indent=2)
+            BatchIterator.atomic_write_json(man_path, manifest, indent=2)
 
         distributed_barrier(device)
 
@@ -3848,6 +3897,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
     if not args:
         raise TypeError("main requires at least a RuntimeConfig argument")
     initialize_python_path()
+    _ensure_torch_compile_safe()
     ret_sink: Optional[Dict[Any, Any]] = None
     if isinstance(args[0], RuntimeConfig):
         ops = args[0]
@@ -3906,6 +3956,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
+                from ..api.io import _torch_load_checkpoint as _torch_load_checkpoint
+
                 cpu_state = _torch_load_checkpoint(
                     fallback_init,
                     map_location="cpu",
@@ -4402,10 +4454,11 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
                             raw_val_loader.state_dict() if raw_val_loader is not None else {}
                         ),
                     }
-                    with open(
-                        loader_state_path(ops.ckpt_dir or ""), "w", encoding="utf-8"
-                    ) as _f:
-                        json.dump(_dl, _f)
+                    BatchIterator.atomic_write_json(
+                        loader_state_path(ops.ckpt_dir or ""),
+                        _dl,
+                        indent=2,
+                    )
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -4440,6 +4493,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
+                from ..api.io import _torch_load_checkpoint as _torch_load_checkpoint
+
                 cpu_state = _torch_load_checkpoint(
                     fallback_model,
                     map_location="cpu",
@@ -4559,6 +4614,3 @@ def _unwrap_for_microbatch(model: torch.nn.Module) -> Optional[torch.nn.Module]:
             break
         m = child
     return None
-
-
-torch_compile_safe(runtime_module=sys.modules[__name__])

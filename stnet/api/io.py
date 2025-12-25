@@ -4,14 +4,10 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import os
-import tempfile
-import threading
-import weakref
 from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Protocol, Sequence, Tuple
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 from torch import nn
@@ -37,49 +33,10 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..backend.compat import is_meta_or_fake_tensor
-from ..data.pipeline import BatchIterator
 from ..model.nn import Root, resize_scaler_buffer
-from .config import ModelConfig, coerce_model_config, model_config_to_dict
+from .config import ModelConfig, coerce_model_config
 
 _LOGGER = logging.getLogger(__name__)
-
-# Serialize/save operations should not overlap within a process.
-# This does not stop training by itself, but prevents concurrent saves and is
-# a good hook point if the training loop cooperates.
-_SAVE_LOCK_GUARD = threading.Lock()
-_SAVE_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
-
-
-def _save_lock_for(path: str | Path | None) -> threading.RLock:
-    """Return a stable per-target lock (within-process).
-
-    Saving is IO-heavy and can be triggered concurrently (e.g. training thread +
-    evaluation thread). A single global lock is safe but unnecessarily serializes
-    saves to unrelated files. A per-path lock reduces contention, especially on
-    no-GIL builds.
-    """
-    if path is None:
-        key = "__global__"
-    else:
-        try:
-            key = str(Path(path).expanduser().resolve())
-        except Exception:
-            key = str(path)
-    with _SAVE_LOCK_GUARD:
-        lk = _SAVE_PATH_LOCKS.get(key)
-        if lk is None:
-            lk = threading.RLock()
-            _SAVE_PATH_LOCKS[key] = lk
-        return lk
-
-
-class Format(Protocol):
-    name: str
-
-    def save(
-        self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any
-    ) -> Tuple[Path, ...]: ...
 
 
 @lru_cache(maxsize=1)
@@ -93,79 +50,6 @@ def _is_required(module: str, pip_hint: str | None = None) -> None:
     _export_backend().is_required(module, pip_hint)
 
 
-def _to_cpu(
-    value: Any,
-    *,
-    materialize_meta: bool = True,
-    make_contiguous: bool = True,
-) -> Any:
-    """Detach tensors and move them to CPU recursively.
-
-    This is used for formats that require CPU tensors (e.g. safetensors) and for
-    normalizing loaded state dicts.
-
-    Notes:
-        - Defensive about tuple subclasses (e.g. namedtuple).
-        - Best-effort materializes meta/fake tensors when requested.
-    """
-
-    # Fast path: tensors
-    if isinstance(value, torch.Tensor):
-        t = value
-
-        if materialize_meta and is_meta_or_fake_tensor(t):
-            # Meta tensors cannot be moved; materialize a real CPU tensor.
-            t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
-
-        if t.device.type != "cpu":
-            t = t.detach().to(device="cpu")
-        else:
-            t = t.detach()
-
-        if make_contiguous:
-            with contextlib.suppress(Exception):
-                if hasattr(t, "is_contiguous") and not bool(t.is_contiguous()):
-                    t = t.contiguous()
-        return t
-
-    # Recursive containers
-    if isinstance(value, dict):
-        return type(value)(
-            (
-                k,
-                _to_cpu(
-                    v,
-                    materialize_meta=materialize_meta,
-                    make_contiguous=make_contiguous,
-                ),
-            )
-            for k, v in value.items()
-        )
-    if isinstance(value, list):
-        return [
-            _to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
-            for v in value
-        ]
-    if isinstance(value, tuple):
-        seq = tuple(
-            _to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
-            for v in value
-        )
-        if type(value) is tuple:
-            return seq
-        # namedtuple: constructor expects positional args.
-        if hasattr(value, "_fields"):
-            try:
-                return type(value)(*seq)
-            except Exception:
-                return seq
-        try:
-            return type(value)(seq)
-        except Exception:
-            return seq
-    return value
-
-
 def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
     """Strip legacy keys like `m.0.module.<real_key>` -> `<real_key>`.
 
@@ -175,7 +59,6 @@ def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
     prefix = ("m",)  # explicit marker for clarity
 
     for k, v in sd.items():
-        # Fast checks before split:
         if not (k.startswith("m.") and ".module." in k):
             nk = k
         else:
@@ -187,15 +70,11 @@ def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
 
         if nk != k and new_sd is None:
             new_sd = type(sd)()
-            # Accumulate already processed entries: we must not copy `sd` blindly to keep O(n)
-            # work bounded and to preserve dict subclass types if possible.
-            # We'll rebuild from scratch in the second pass below.
             break
 
     if new_sd is None:
         return sd
 
-    # Rebuild with the same rule (single pass).
     for k, v in sd.items():
         if not (k.startswith("m.") and ".module." in k):
             nk = k
@@ -210,87 +89,13 @@ def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
     return new_sd
 
 
-def _json_sanitize(obj: Any) -> Any:
-    if obj is None or isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, (torch.device, Path, torch.dtype)):
-        return str(obj)
-    if isinstance(obj, torch.Tensor):
-        return {
-            "__tensor__": True,
-            "shape": list(obj.shape),
-            "dtype": str(obj.dtype),
-            "device": str(obj.device),
-        }
-    if isinstance(obj, dict):
-        return {str(k): _json_sanitize(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple, set)):
-        return [_json_sanitize(v) for v in obj]
-    return str(obj)
-
-
-def _get_dist():
-    try:
-        import torch.distributed as dist  # type: ignore
-    except Exception:
-        return None
-    return dist
-
-
-def _is_rank0_global() -> bool:
-    dist = _get_dist()
-    if dist is None:
-        return True
-    try:
-        if dist.is_available() and dist.is_initialized():
-            return int(dist.get_rank()) == 0
-    except Exception:
-        pass
-    return True
-
-
-def _dist_barrier() -> None:
-    dist = _get_dist()
-    if dist is None:
-        return
-    try:
-        if dist.is_available() and dist.is_initialized():
-            dist.barrier()
-    except Exception:
-        # Never fail saving because barrier isn't available/healthy.
-        pass
-
-
-@contextlib.contextmanager
-def _save_sync(path: str | Path | None = None, *, barrier: bool = False) -> Any:
-    """Synchronize saves within a process (lock) and optionally across ranks.
-
-    IMPORTANT:
-        A distributed barrier requires *all ranks* to participate. Many call
-        sites only save on global-rank0 (single-file checkpoints). For those
-        cases, use barrier=False to avoid deadlocks.
-    """
-    with _save_lock_for(path):
-        if barrier:
-            _dist_barrier()
-        try:
-            yield
-        finally:
-            if barrier:
-                _dist_barrier()
-
-
 def _torch_load_checkpoint(
     path: str | Path,
     *,
     map_location: Optional[torch.device | str] = None,
     weights_only: bool = True,
 ) -> Any:
-    """Load a torch checkpoint with a safe default.
-
-    - Prefer `weights_only=True` when supported by the installed torch.
-    - Fall back for older torch versions that don't support this argument.
-    """
+    """Load a torch checkpoint with a safe default."""
     p = Path(path)
 
     try:
@@ -319,26 +124,6 @@ def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
         return json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception as exc:
         raise RuntimeError(f"Failed to parse checkpoint metadata at {str(meta_path)!r}") from exc
-
-
-def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    cfg_obj = getattr(model, "_Root__config", None)
-    if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_instance_config__", None)
-    if cfg_obj is None:
-        for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Root__config", None)
-            if cfg_obj is not None:
-                break
-    candidate: ModelConfig | Dict[str, Any] | None
-    if isinstance(cfg_obj, (ModelConfig, dict)):
-        candidate = cfg_obj
-    else:
-        candidate = None
-    try:
-        return model_config_to_dict(candidate)
-    except Exception:
-        return {}
 
 
 def new_model(
@@ -472,7 +257,6 @@ def load_model(
 
     model = new_model(use_in_dim, use_out_shape, use_config)
     sd = _strip_legacy_wrapped_keys(sd) if isinstance(sd, dict) else sd
-    # Keep buffer sizing consistent across formats.
     with contextlib.suppress(Exception):
         resize_scaler_buffer(model, sd)  # type: ignore[arg-type]
     model.load_state_dict(sd, strict=False)  # type: ignore[arg-type]
@@ -491,10 +275,11 @@ def save_model(
 ) -> str:
     p = Path(path)
 
+    from ..backend.export import TorchIO as _TorchIO  # local import (breaks backend<->api cycles)
+
     # Native torch checkpoint path (global-rank0 only for single-file outputs).
-    if TorchIO.is_native_target(p):
+    if _TorchIO.is_native_target(p):
         if args:
-            # Native path does not accept positional args (kept only for export converters).
             raise TypeError(
                 "Positional args are only supported for export converters; "
                 "use keyword arguments for TorchIO.save()."
@@ -502,17 +287,13 @@ def save_model(
 
         merged_extra = dict(extra or {})
         if ema_averager is not None and hasattr(ema_averager, "state_dict"):
-            try:
+            with contextlib.suppress(Exception):
                 merged_extra["ema_averager_state"] = ema_averager.state_dict()
-            except Exception:
-                _LOGGER.debug("Failed to serialize ema_averager_state; skipping", exc_info=True)
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
-            try:
+            with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-            except Exception:
-                _LOGGER.debug("Failed to serialize swa_averager_state; skipping", exc_info=True)
 
-        out = TorchIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
+        out = _TorchIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
         return str(out)
 
     # Export converter path (positional args supported here only).
@@ -523,117 +304,11 @@ def save_model(
     return str(p)
 
 
-class TorchIO:
-    NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
-
-    @staticmethod
-    def is_native_target(path: str | Path) -> bool:
-        p = Path(path)
-        suffix = p.suffix.lower()
-        return (not suffix) or (suffix in TorchIO.NATIVE_EXTS)
-
-    @staticmethod
-    def save(
-        model: nn.Module,
-        path: str | Path,
-        optimizer: Optional[torch.optim.Optimizer] = None,
-        extra: Optional[Dict[str, Any]] = None,
-        **opts: Any,
-    ) -> Path:
-        p = Path(path)
-        suffix = p.suffix.lower()
-
-        # Distributed checkpoint directory case:
-        # - All ranks participate in dcp_save
-        # - Only global-rank0 writes meta.json
-        if not suffix and p.exists() and p.is_dir():
-            from torch.distributed.checkpoint import FileSystemWriter
-            from torch.distributed.checkpoint import save as dcp_save
-
-            with _save_sync(p, barrier=True):
-                opts_sd = StateDictOptions(full_state_dict=True)
-                m_sd = get_model_state_dict(model, options=opts_sd)
-                dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
-
-                meta = {
-                    "version": 1,
-                    "format": "dcp-dir-v1",
-                    "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-                    "config": _load_model_config(model),
-                    "pytorch_version": torch.__version__,
-                    "extra": _json_sanitize(extra or {}),
-                }
-                meta_path = p / "meta.json"
-                if _is_rank0_global():
-                    # Ensure JSON-serializable payload (Path/device/dtype, etc.).
-                    BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
-            return p
-
-        # Normalize extension for single-file targets.
-        if not suffix:
-            p = p.with_suffix(".pt")
-            suffix = ".pt"
-
-        p.parent.mkdir(parents=True, exist_ok=True)
-
-        with _save_sync(p, barrier=False):
-            if not _is_rank0_global():
-                return p
-
-            # safetensors: CPU tensors only; include sidecar json.
-            if suffix == ".safetensors":
-                _is_required("safetensors", "pip install safetensors")
-                from safetensors.torch import save_file as save_tensors
-
-                sd = model.state_dict()
-                cpu_sd = {k: _to_cpu(v) for k, v in sd.items()}
-
-                fd, tmp_name = tempfile.mkstemp(
-                    prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent)
-                )
-                os.close(fd)
-                tmp_path = Path(tmp_name)
-                try:
-                    save_tensors(cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"})
-                    tmp_path.replace(p)
-                finally:
-                    with contextlib.suppress(Exception):
-                        if tmp_path.exists():
-                            tmp_path.unlink()
-
-                meta = {
-                    "version": 1,
-                    "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-                    "config": _load_model_config(model),
-                    "pytorch_version": torch.__version__,
-                    "extra": _json_sanitize(extra or {}),
-                }
-                meta_path = p.with_suffix(".json")
-                BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
-                return p
-
-            # torch.save payload: always sanitize extra for weights_only-friendly loads.
-            payload: Dict[str, Any] = {
-                "version": 1,
-                "in_dim": int(getattr(model, "in_dim", 0)),
-                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
-                "config": _load_model_config(model),
-                "state_dict": model.state_dict(),
-                "pytorch_version": torch.__version__,
-            }
-            if optimizer is not None and hasattr(optimizer, "state_dict"):
-                try:
-                    payload["optimizer_state_dict"] = optimizer.state_dict()
-                except Exception:
-                    _LOGGER.debug("Failed to serialize optimizer_state_dict; skipping", exc_info=True)
-            if extra is not None:
-                payload["extra"] = _json_sanitize(extra)
-
-            BatchIterator.atomic_torch_save(p, payload, **opts)
-            return p
-
-
+# TorchIO + Format were moved to stnet.backend.export to break backend<->api cycles.
+# We still provide a lazy re-export for backward compatibility.
 def __getattr__(name: str) -> Any:
+    if name in {"TorchIO", "Format"}:
+        from ..backend.export import TorchIO, Format  # local import (heavy)
+
+        return TorchIO if name == "TorchIO" else Format
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

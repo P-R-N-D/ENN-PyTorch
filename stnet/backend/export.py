@@ -4,14 +4,19 @@ from __future__ import annotations
 import contextlib
 import inspect
 import json
+import logging
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import warnings
+import weakref
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Protocol
 
 import torch
 
@@ -23,8 +28,283 @@ except ImportError:  # pragma: no cover
 
 from torch import nn
 
-from ..api.io import Format
 from ..model.nn import History
+from .compat import is_meta_or_fake_tensor
+
+_LOGGER = logging.getLogger(__name__)
+
+# Serialize/save operations should not overlap within a process.
+# Keep this in backend.export to avoid backend<->api import cycles.
+_SAVE_LOCK_GUARD = threading.Lock()
+_SAVE_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = weakref.WeakValueDictionary()
+
+
+def _save_lock_for(path: str | Path | None = None) -> threading.RLock:
+    """Return a stable per-target lock (within-process)."""
+    if path is None:
+        key = "__global__"
+    else:
+        try:
+            key = str(Path(path).expanduser().resolve())
+        except Exception:
+            key = str(path)
+    with _SAVE_LOCK_GUARD:
+        lk = _SAVE_PATH_LOCKS.get(key)
+        if lk is None:
+            lk = threading.RLock()
+            _SAVE_PATH_LOCKS[key] = lk
+        return lk
+
+
+def _get_dist():
+    try:
+        import torch.distributed as dist  # type: ignore
+    except Exception:
+        return None
+    return dist
+
+
+def _is_rank0_global() -> bool:
+    dist = _get_dist()
+    if dist is None:
+        return True
+    try:
+        if dist.is_available() and dist.is_initialized():
+            return int(dist.get_rank()) == 0
+    except Exception:
+        pass
+    return True
+
+
+def _dist_barrier() -> None:
+    dist = _get_dist()
+    if dist is None:
+        return
+    try:
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+    except Exception:
+        # Never fail saving because barrier isn't available/healthy.
+        pass
+
+
+@contextlib.contextmanager
+def _save_sync(path: str | Path | None = None, *, barrier: bool = False) -> Any:
+    """Synchronize saves within a process (lock) and optionally across ranks."""
+    with _save_lock_for(path):
+        if barrier:
+            _dist_barrier()
+        try:
+            yield
+        finally:
+            if barrier:
+                _dist_barrier()
+
+
+def _json_sanitize(obj: Any) -> Any:
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, (torch.device, Path, torch.dtype)):
+        return str(obj)
+    if isinstance(obj, torch.Tensor):
+        return {
+            "__tensor__": True,
+            "shape": [int(x) for x in obj.shape],
+            "dtype": str(obj.dtype),
+            "device": str(obj.device),
+        }
+    if isinstance(obj, dict):
+        return {str(k): _json_sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_json_sanitize(v) for v in obj]
+    return str(obj)
+
+
+def _load_model_config(model: nn.Module) -> Dict[str, Any]:
+    """Best-effort extraction of the ModelConfig attached to a Root model."""
+    cfg_obj = getattr(model, "_Root__config", None)
+    if cfg_obj is None:
+        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+    if cfg_obj is None:
+        for submodule in model.modules():
+            cfg_obj = getattr(submodule, "_Root__config", None)
+            if cfg_obj is not None:
+                break
+    try:
+        from ..api.config import ModelConfig, model_config_to_dict
+
+        candidate = cfg_obj if isinstance(cfg_obj, (ModelConfig, dict)) else None
+        return model_config_to_dict(candidate)
+    except Exception:
+        return {}
+
+
+def _to_cpu(
+    value: Any,
+    *,
+    materialize_meta: bool = True,
+    make_contiguous: bool = True,
+) -> Any:
+    """Detach tensors and move them to CPU recursively.
+
+    This is used for formats that require CPU tensors (e.g. safetensors).
+    """
+
+    if isinstance(value, torch.Tensor):
+        t = value
+        if materialize_meta and is_meta_or_fake_tensor(t):
+            t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
+        if t.device.type != "cpu":
+            t = t.detach().to(device="cpu")
+        else:
+            t = t.detach()
+        if make_contiguous:
+            with contextlib.suppress(Exception):
+                if hasattr(t, "is_contiguous") and not bool(t.is_contiguous()):
+                    t = t.contiguous()
+        return t
+
+    if isinstance(value, dict):
+        return type(value)((k, _to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)) for k, v in value.items())
+    if isinstance(value, list):
+        return [_to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous) for v in value]
+    if isinstance(value, tuple):
+        seq = tuple(_to_cpu(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous) for v in value)
+        if type(value) is tuple:
+            return seq
+        if hasattr(value, "_fields"):
+            with contextlib.suppress(Exception):
+                return type(value)(*seq)
+        with contextlib.suppress(Exception):
+            return type(value)(seq)
+        return seq
+    return value
+
+
+class Format(Protocol):
+    name: str
+
+    def save(self, model: nn.Module, dst: Path, *args: Any, **kwargs: Any) -> Tuple[Path, ...]: ...
+
+
+class TorchIO:
+    """Native checkpoint writer.
+
+    Supports:
+      - single-file checkpoints (.pt/.pth)
+      - safetensors (.safetensors) with sidecar json
+      - distributed checkpoint directories (existing dir, suffixless path)
+    """
+
+    NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
+
+    @staticmethod
+    def is_native_target(path: str | Path) -> bool:
+        p = Path(path)
+        suffix = p.suffix.lower()
+        return (not suffix) or (suffix in TorchIO.NATIVE_EXTS)
+
+    @staticmethod
+    def save(
+        model: nn.Module,
+        path: str | Path,
+        optimizer: Optional[torch.optim.Optimizer] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        **opts: Any,
+    ) -> Path:
+        from ..data.pipeline import BatchIterator
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+
+        p = Path(path)
+        suffix = p.suffix.lower()
+
+        # Distributed checkpoint directory case:
+        # - All ranks participate in dcp_save
+        # - Only global-rank0 writes meta.json
+        if not suffix and p.exists() and p.is_dir():
+            from torch.distributed.checkpoint import FileSystemWriter
+            from torch.distributed.checkpoint import save as dcp_save
+
+            with _save_sync(p, barrier=True):
+                opts_sd = StateDictOptions(full_state_dict=True)
+                m_sd = get_model_state_dict(model, options=opts_sd)
+                dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
+
+                meta = {
+                    "version": 1,
+                    "format": "dcp-dir-v1",
+                    "in_dim": int(getattr(model, "in_dim", 0)),
+                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                    "config": _load_model_config(model),
+                    "pytorch_version": torch.__version__,
+                    "extra": _json_sanitize(extra or {}),
+                }
+                meta_path = p / "meta.json"
+                if _is_rank0_global():
+                    BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
+            return p
+
+        # Normalize extension for single-file targets.
+        if not suffix:
+            p = p.with_suffix(".pt")
+            suffix = ".pt"
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+
+        with _save_sync(p, barrier=False):
+            if not _is_rank0_global():
+                return p
+
+            # safetensors: CPU tensors only; include sidecar json.
+            if suffix == ".safetensors":
+                from ..api.io import _is_required
+
+                _is_required("safetensors", "pip install safetensors")
+                from safetensors.torch import save_file as save_tensors
+
+                sd = model.state_dict()
+                cpu_sd = {k: _to_cpu(v) for k, v in sd.items()}
+
+                fd, tmp_name = tempfile.mkstemp(prefix=p.name + ".", suffix=p.suffix + ".tmp", dir=str(p.parent))
+                os.close(fd)
+                tmp_path = Path(tmp_name)
+                try:
+                    save_tensors(cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"})
+                    tmp_path.replace(p)
+                finally:
+                    with contextlib.suppress(Exception):
+                        if tmp_path.exists():
+                            tmp_path.unlink()
+
+                meta = {
+                    "version": 1,
+                    "in_dim": int(getattr(model, "in_dim", 0)),
+                    "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                    "config": _load_model_config(model),
+                    "pytorch_version": torch.__version__,
+                    "extra": _json_sanitize(extra or {}),
+                }
+                meta_path = p.with_suffix(".json")
+                BatchIterator.atomic_write_json(meta_path, _json_sanitize(meta), indent=2)
+                return p
+
+            # torch.save payload: always sanitize extra for weights_only-friendly loads.
+            payload: Dict[str, Any] = {
+                "version": 1,
+                "in_dim": int(getattr(model, "in_dim", 0)),
+                "out_shape": tuple(int(x) for x in getattr(model, "out_shape", ())),
+                "config": _load_model_config(model),
+                "state_dict": model.state_dict(),
+                "pytorch_version": torch.__version__,
+            }
+            if optimizer is not None and hasattr(optimizer, "state_dict"):
+                with contextlib.suppress(Exception):
+                    payload["optimizer_state_dict"] = optimizer.state_dict()
+            if extra is not None:
+                payload["extra"] = _json_sanitize(extra)
+
+            BatchIterator.atomic_torch_save(p, payload, **opts)
+            return p
 
 
 def _in_console(cmd: Sequence[str], desc: str) -> None:
