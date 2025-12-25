@@ -37,7 +37,7 @@ from ..backend.system import (
     remove_dir,
     set_multiprocessing_env,
 )
-from ..data.datatype import dtype_from_name, env_bool, parse_torch_dtype
+from ..backend.casting import dtype_from_name, env_bool, parse_torch_dtype
 from ..data.nodes import preload_memmap
 from ..data.pipeline import (
     BatchIterator,

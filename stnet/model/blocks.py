@@ -39,7 +39,7 @@ from ..backend.compat import (
     torch_no_compile,
 )
 from ..backend.system import empty_device_cache
-from ..data.datatype import env_first_int, env_int
+from ..backend.casting import env_first_int, env_int
 from ..data.pipeline import resolve_feature_key, resolve_label_key
 from ..functional.profiler import FLOP_PROFILER
 from ..model.fused import Autocast, Gradient

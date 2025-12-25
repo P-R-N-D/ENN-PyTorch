@@ -10,7 +10,7 @@ from typing import Any, Optional, Tuple, Protocol, runtime_checkable
 
 import torch
 
-from .datatype import env_flag as _env_flag
+from .casting import env_flag
 
 
 # -----------------------------------------------------------------------------
@@ -441,7 +441,7 @@ class Cache:
                     _os.remove(tmp_name)
 
             # Sidecar meta: keep the naming consistent across the codebase.
-            from .pipeline import BatchIterator
+            from ..data.pipeline import BatchIterator
 
             meta = {
                 "shape": [int(x) for x in buf.shape],
@@ -453,7 +453,7 @@ class Cache:
         # torch.save pickles (rows.pt / pred.pt)
         if str(path).endswith((".pt", ".pth")):
             # Use the shared atomic writer for consistency.
-            from .pipeline import BatchIterator
+            from ..data.pipeline import BatchIterator
 
             BatchIterator.atomic_torch_save(buf, path)
         else:
@@ -559,7 +559,7 @@ class Buffer:
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
-        self._warn_blocking = _env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
+        self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
 
     def put(self, item: Any, *, timeout: float | None = None) -> bool:
         """Put an item into the buffer."""

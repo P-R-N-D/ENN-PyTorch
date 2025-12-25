@@ -18,7 +18,7 @@ from torch.distributed.fsdp import fully_shard
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
-from ..data.datatype import env_bool, env_int
+from .casting import env_bool, env_int
 from .system import get_device, process_cpu_count
 
 try:
