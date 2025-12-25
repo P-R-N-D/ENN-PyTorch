@@ -61,7 +61,18 @@ def _is_lazy_tensor(x: Any) -> bool:
 
 from ..backend.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
 from ..backend.casting import env_first, env_first_float, env_first_int
-from ..backend.system import Memory, WorkerPolicy, get_tlb
+from ..backend.system import (
+    Memory,
+    WorkerPolicy,
+    cuda_compute_capability as _sys_cuda_compute_capability,
+    get_device_stats,
+    get_tlb,
+    is_cpu_bf16_supported as _sys_is_cpu_bf16_supported,
+    is_cuda_bf16_supported as _sys_is_cuda_bf16_supported,
+    is_float8_supported as _sys_is_float8_supported,
+    is_int4_supported as _sys_is_int4_supported,
+    is_int8_supported as _sys_is_int8_supported,
+)
 
 
 @dataclass(slots=True)
@@ -298,9 +309,9 @@ except Exception as _e:
 
 _NODES_IMPORT_ERROR: Exception | None = None
 try:
-    from .nodes import BatchIterator, Connector, Disposable, Loader, Sampler, SamplerScale, Source, Wrapper
+    from .nodes import BatchIterator, Connector, Disposable, Loader, Sampler, BatchState, Source, Wrapper
 except Exception as _e:
-    BatchIterator = Connector = Disposable = Loader = Sampler = Source = Wrapper = SamplerScale = None  # type: ignore[assignment]
+    BatchIterator = Connector = Disposable = Loader = Sampler = Source = Wrapper = BatchState = None  # type: ignore[assignment]
     _NODES_IMPORT_ERROR = _e
 
 
@@ -756,7 +767,7 @@ def dataset(
     *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
-    sampler_scale: Optional["SamplerScale"] = None,
+    sampler_scale: Optional["BatchState"] = None,
     **kwargs: Any,
 ) -> "Sampler":
     _require_nodes()
@@ -1086,7 +1097,7 @@ def fetch(
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
     worker_policy: Optional[WorkerPolicy] = None,
-    sampler_scale: Optional["SamplerScale"] = None,
+    sampler_scale: Optional["BatchState"] = None,
     *,
     loader_policy: Optional[LoaderPolicy] = None,
 ) -> Dict[str, Any]:
@@ -1114,7 +1125,7 @@ def fetch(
 
     allocated = Disposable()
     batch_size: Optional[int] = None
-    scale_ctl = sampler_scale if sampler_scale is not None else SamplerScale()
+    scale_ctl = sampler_scale if sampler_scale is not None else BatchState()
 
     train_epochables: list[Any] = []
 
@@ -1388,7 +1399,7 @@ class Session:
     training_loader: Any = None
     validation_loader: Any = None
     disposable: Any = None
-    sampler_scale: Optional["SamplerScale"] = None
+    sampler_scale: Optional["BatchState"] = None
 
     _opened: bool = False
 
@@ -1400,7 +1411,7 @@ class Session:
     ) -> "Session":
         _require_nodes()
         if self.sampler_scale is None:
-            self.sampler_scale = SamplerScale()
+            self.sampler_scale = BatchState()
 
         dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
 
@@ -1546,6 +1557,11 @@ class Dataset(Generic[TExtra]):
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
 
+    @property
+    def device_stats(self):
+        """Backend device capability snapshot (separate from Dataset data stats)."""
+        return get_device_stats(self.device)
+
     def ensure_device_info(self) -> "Dataset[TExtra]":
         self._refresh_device_info()
         return self
@@ -1554,6 +1570,15 @@ class Dataset(Generic[TExtra]):
         self._refresh_device_info()
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
+
+        # Fill in defaults from backend.device_stats when not explicitly provided.
+        dev_stats = get_device_stats(self.device)
+        if not self.float_dtypes:
+            self.float_dtypes = tuple(getattr(dev_stats, "float_dtypes", ()))
+        if not self.int_dtypes:
+            self.int_dtypes = tuple(getattr(dev_stats, "int_dtypes", ()))
+        if self.int_quant_bits is None:
+            self.int_quant_bits = int(getattr(dev_stats, "int_quant_bits", 8))
 
         if not self.float_dtypes:
             floats: list[torch.dtype] = [torch.float32]
@@ -2007,65 +2032,22 @@ class Dataset(Generic[TExtra]):
         return feats, labels
 
     def _refresh_device_info(self) -> None:
-        dev = torch.device(self.device)
-        self.device = dev
-        self.device_type = dev.type
-        if dev.type == "cuda" and torch.cuda.is_available():
-            major, minor = self.cuda_compute_capability(dev)
-            self.cuda_cc = (int(major), int(minor)) if (major > 0 or minor > 0) else None
-        else:
-            self.cuda_cc = None
+        stats = get_device_stats(self.device)
+        self.device = stats.device
+        self.device_type = stats.device_type
+        self.cuda_cc = stats.cuda_cc
 
     @staticmethod
     def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]:
-        dev = torch.device(device)
-        if dev.type != "cuda" or not torch.cuda.is_available():
-            return (0, 0)
-        try:
-            major, minor = torch.cuda.get_device_capability(dev)
-        except Exception:
-            return (0, 0)
-        return (int(major), int(minor))
+        return _sys_cuda_compute_capability(device)
 
     @staticmethod
     def is_cpu_bf16_supported() -> bool:
-        try:
-            mkldnn = getattr(torch.backends, "mkldnn", None)
-            if mkldnn is None:
-                return False
-            if not bool(mkldnn.is_available()) or not bool(getattr(mkldnn, "enabled", True)):
-                return False
-            mkldnn_ops = getattr(torch.ops, "mkldnn", None)
-            f = (
-                getattr(mkldnn_ops, "_is_mkldnn_bf16_supported", None)
-                if mkldnn_ops is not None
-                else None
-            )
-            if callable(f):
-                return bool(f())
-        except Exception:
-            return False
-        return False
+        return bool(_sys_is_cpu_bf16_supported())
 
     @staticmethod
     def is_cuda_bf16_supported(device: Optional[Union[torch.device, str]] = None) -> bool:
-        try:
-            if not torch.cuda.is_available():
-                return False
-            dev = torch.device(device) if device is not None else torch.device("cuda")
-            if dev.type != "cuda":
-                return False
-            with torch.cuda.device(dev):
-                f = getattr(torch.cuda, "is_bf16_supported", None)
-                if callable(f):
-                    try:
-                        return bool(f(including_emulation=False))
-                    except TypeError:
-                        return bool(f())
-                major, _ = torch.cuda.get_device_capability(dev)
-                return int(major) >= 8
-        except Exception:
-            return False
+        return bool(_sys_is_cuda_bf16_supported(device))
 
     @staticmethod
     def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
@@ -2111,45 +2093,15 @@ class Dataset(Generic[TExtra]):
     def is_float8_supported(
         cls, device: Optional[Union[torch.device, str]] = None
     ) -> Tuple[bool, str]:
-        try:
-            dev = cls._resolve_device(device)
-            if dev.type == "cuda" and torch.cuda.is_available():
-                try:
-                    import torch.cuda.amp as _tca
-
-                    with contextlib.suppress(Exception):
-                        if getattr(_tca, "is_float8_available", None) is not None:
-                            ok, reason = _tca.is_float8_available()
-                            return (bool(ok), str(reason))
-                except Exception:
-                    pass
-                major, _minor = cls.cuda_compute_capability(dev)
-                if major >= 9:
-                    return (True, "Hopper+ supports FP8")
-                return (False, "FP8 requires sm90+")
-            return (False, "FP8 requires CUDA sm90+ and torch.cuda")
-        except Exception:
-            return (False, "Unknown float8 support")
+        return _sys_is_float8_supported(device)
 
     @classmethod
     def is_int8_supported(cls, device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
-        try:
-            dev = cls._resolve_device(device)
-            if dev.type == "cuda" and torch.cuda.is_available():
-                return (True, "Int8 supported on CUDA")
-            return (True, "Int8 supported on CPU")
-        except Exception:
-            return (False, "Unknown int8 support")
+        return _sys_is_int8_supported(device)
 
     @classmethod
     def is_int4_supported(cls, device: Optional[Union[torch.device, str]] = None) -> Tuple[bool, str]:
-        try:
-            dev = cls._resolve_device(device)
-            if dev.type == "cuda" and torch.cuda.is_available():
-                return (True, "Int4 supported on CUDA")
-            return (True, "Int4 supported on CPU")
-        except Exception:
-            return (False, "Unknown int4 support")
+        return _sys_is_int4_supported(device)
 
     @classmethod
     def for_device(

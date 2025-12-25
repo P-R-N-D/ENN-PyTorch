@@ -5,8 +5,11 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "casting",
     "compat",
     "distributed",
+    "graph",
+    "precision",
     "staging",
     "system",
 ]

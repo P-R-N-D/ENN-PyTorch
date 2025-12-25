@@ -47,7 +47,7 @@ from ..data.pipeline import (
     normalize_underflow_action,
     resolve_feature_key,
 )
-from ..model.fused import Gradient
+from ..backend.graph import inference_mode
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
 from .io import _torch_load_checkpoint, _to_cpu
@@ -1397,7 +1397,7 @@ def predict(
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(memmap_dir, exist_ok=True)
 
-    inference_ctx = Gradient.inference(model)
+    inference_ctx = inference_mode(model)
     with inference_ctx:
         try:
             # Save model checkpoint for the worker process group.
@@ -1704,7 +1704,7 @@ def get_prediction(
     returned.
     """
 
-    with Gradient.inference(torch.nn.Identity()):
+    with inference_mode(torch.nn.Identity()):
         if not bool(source):
             raise ValueError("get_prediction: 'source' must be a non-empty path")
 

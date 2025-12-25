@@ -156,7 +156,7 @@ def _host_guard_ok(guard_bytes: int) -> bool:
         return True
 
 
-class SamplerScale:
+class BatchState:
     """Per-session (or per-loader) scaling factor for auto batch sizing.
 
     - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
@@ -301,7 +301,7 @@ class Sampler(_Sampler):
         *args: Any,
         split: str = "train",
         val_frac: float = 0.0,
-        sampler_scale: Optional["SamplerScale"] = None,
+        sampler_scale: Optional["BatchState"] = None,
         **kwargs: Any,
     ) -> None:
         self.dir = os.fspath(memmap_dir)
@@ -309,7 +309,7 @@ class Sampler(_Sampler):
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
 
         # Per-session/per-loader scale controller (NOT global).
-        self._sampler_scale = sampler_scale if sampler_scale is not None else SamplerScale()
+        self._sampler_scale = sampler_scale if sampler_scale is not None else BatchState()
 
         # Runtime dynamic-batch cap (computed in pipeline._batch_interval).
         # 0 => unknown/unlimited (will still be clamped by split end).
@@ -454,7 +454,7 @@ class Sampler(_Sampler):
             self._start, self._end = (train_start, train_end)
 
     @property
-    def sampler_scale(self) -> "SamplerScale":
+    def sampler_scale(self) -> "BatchState":
         return self._sampler_scale
 
     @property
@@ -858,14 +858,14 @@ class Sampler(_Sampler):
         self._len_B_snapshot = max(1, int(self._effective_batch_size()))
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
-        from ..model.fused import Gradient as FxGradient
+        from ..backend.graph import inference_mode as _inference_mode
 
         s = int(start)
         e = int(end)
         n = max(0, e - s)
         features, labels = self._get_mmaps()
 
-        with FxGradient.inference(torch.nn.Module()):
+        with _inference_mode(torch.nn.Module()):
             if n <= 0:
                 X0 = features.narrow(0, 0, 0)
                 out0: Dict[str, Any] = {"X": X0}
