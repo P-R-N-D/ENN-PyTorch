@@ -34,7 +34,7 @@ from tqdm.auto import tqdm
 
 from ..data.pipeline import BatchIterator, extract_xy
 from ..core.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
-from ..model.architecture import ModelPolicy
+from ..nn.architecture import ModelPolicy
 from ..core.precision import Autocast, PrecisionPolicy
 from ..core.graph import inference_mode
 
@@ -216,8 +216,8 @@ from ..core.losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
                            LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss)
 from ..core.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                stochastic_weight_average)
-from ..model.architecture import Root
-from ..model.primitives import History, resize_scaler_buffer
+from ..nn.architecture import Model
+from ..nn.primitives import Recorder, resize_scaler_buffer
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.graph import (
     cudagraph_step_end,
@@ -603,7 +603,7 @@ def _cast_model_fp_dtype(model: Any, dtype: torch.dtype) -> None:
     """Cast *floating* parameters/buffers to dtype, skipping precision-exempt modules.
 
     NOTE: We intentionally avoid nn.Module.to(dtype=...) here, because it would also
-    cast bookkeeping buffers (History, Scaler, etc.) that must remain float64/int64.
+    cast bookkeeping buffers (Recorder, Scaler, etc.) that must remain float64/int64.
     """
     if not isinstance(dtype, torch.dtype):
         return
@@ -916,7 +916,7 @@ def _expand(sources: Any) -> Any:
 
 
 def _calibrate_per_sample_mem(
-    model: Root,
+    model: Model,
     device: torch.device,
     ops: RuntimeConfig,
     dataset: Optional[Dataset] = None,
@@ -1729,7 +1729,7 @@ def _all_reduce_sum_in_pg(t: torch.Tensor, pg: Any) -> None:
 
 
 def epochs(
-    model: Root,
+    model: Model,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -2063,22 +2063,22 @@ def epochs(
         _cast_fp_buffers(target_for_buffers, buffers_dtype)
 
     model_for_hist = model.module if hasattr(model, "module") else model
-    hist: Optional[History] = None
+    hist: Optional[Recorder] = None
     maybe_hist = getattr(model_for_hist, "logger", None)
-    if isinstance(maybe_hist, History):
+    if isinstance(maybe_hist, Recorder):
         hist = maybe_hist
     if hist is None:
         maybe_hist = getattr(model_for_hist, "history", None)
-        if isinstance(maybe_hist, History):
+        if isinstance(maybe_hist, Recorder):
             hist = maybe_hist
     if hist is None:
-        hist = History()
+        hist = Recorder()
         try:
             setattr(model_for_hist, "logger", hist)
         except Exception:
             pass
 
-    if isinstance(hist, History):
+    if isinstance(hist, Recorder):
         # posix_time is epoch-based; tz_name does not affect the value.
         start_ns = posix_time()
         start_sec = round(float(start_ns) / 1e9, 6)
@@ -2661,7 +2661,7 @@ def epochs(
                                     tflops=tflops_cur,
                                 )
                                 train_accum_since_last = 0
-                            if isinstance(hist, History):
+                            if isinstance(hist, Recorder):
                                 try:
                                     if train_steps <= 0 or step_idx % max(1, int(train_steps * 0.01)) == 0:
                                         hist.record_batch(X, Y)
@@ -3381,7 +3381,7 @@ def epochs(
             else:
                 if util_fallback > 0.80:
                     time.sleep(min(0.005, total_t * (util_fallback - 0.80)))
-        if isinstance(hist, History):
+        if isinstance(hist, Recorder):
             try:
                 end_sec = round(float(end_kst_ns) / 1e9, 6)
                 world = max(1, get_world_size(device)) if is_distributed() else 1
@@ -3419,7 +3419,7 @@ def epochs(
 
 
 def infer(
-    model: Root,
+    model: Model,
     device: torch.device,
     local_rank: int,
     ops: RuntimeConfig,
@@ -3893,7 +3893,7 @@ def infer(
     return None
 
 
-def main(*args: Any, **kwargs: Any) -> Optional[Root]:
+def main(*args: Any, **kwargs: Any) -> Optional[Model]:
     from ..data.pipeline import Session
 
     if not args:
@@ -3954,7 +3954,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
         cfg = replace(cfg, device=device)
-        model = Root(ops.in_dim, ops.out_shape, config=cfg)
+        model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
@@ -4480,7 +4480,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         cfg = coerce_model_config(
             ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict
         )
-        model = Root(ops.in_dim, ops.out_shape, config=cfg)
+        model = Model(ops.in_dim, ops.out_shape, config=cfg)
         # Fail-fast: predict/infer must load a trained checkpoint.
         if not ops.model_ckpt_dir:
             raise RuntimeError(

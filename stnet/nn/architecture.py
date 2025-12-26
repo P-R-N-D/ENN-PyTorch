@@ -30,7 +30,7 @@ from ..core.graph import (
     torch_compile_disable,
 )
 from ..core.precision import Autocast, is_scale_safe
-from .primitives import History, Scaler
+from .primitives import Recorder, Scaler
 from .blocks import (
     LongNet,
     PointTransformer,
@@ -52,7 +52,7 @@ from .blocks import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class SpatialAxis(nn.Module):
+class SpatialExtractor(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -120,7 +120,7 @@ class SpatialAxis(nn.Module):
         depth = len(self.blocks)
         if coords.dim() != 3:
             raise ValueError(
-                f"SpatialAxis coords must be (B,N,C), got shape {tuple(coords.shape)}"
+                f"SpatialExtractor coords must be (B,N,C), got shape {tuple(coords.shape)}"
             )
         B, N, _ = coords.shape
         patch = int(self.patch_size)
@@ -165,17 +165,15 @@ class SpatialAxis(nn.Module):
             coords_one = coords[:1].contiguous()
 
             # Compute the expensive argsort only once; odd blocks are a cheap roll.
-            perm0_b, inv0_b = _serialize_z_index(
+            perm0, inv0 = _serialize_z_index(
                 coords_one,
                 bits=bits,
                 patch=patch,
                 shift_order=shift,
                 block_index=0,
             )
-            perm0_b = perm0_b.to(dtype=torch.int64)
-            inv0_b = inv0_b.to(dtype=torch.int64)
-            perm0 = perm0_b[0]
-            inv0 = inv0_b[0]
+            perm0 = perm0[0].to(dtype=torch.int64)
+            inv0 = inv0[0].to(dtype=torch.int64)
 
             shift_amt = 0
             if shift:
@@ -184,7 +182,7 @@ class SpatialAxis(nn.Module):
             perm1 = perm0
             inv1 = inv0
             if shift_amt:
-                perm1 = torch.roll(perm0_b, shifts=int(shift_amt), dims=1)[0]
+                perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=0)
                 inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
 
             perms: List[torch.Tensor] = []
@@ -256,7 +254,7 @@ class SpatialAxis(nn.Module):
         inv_b = torch.stack(invperms_b, dim=0)
         return perm_b, inv_b
 
-    @torch_compile_disable(reason="SpatialAxis uses dynamic gather/scatter", recursive=True)
+    @torch_compile_disable(reason="SpatialExtractor uses dynamic gather/scatter", recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -264,16 +262,16 @@ class SpatialAxis(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if is_meta_or_fake_tensor(x):
-            raise RuntimeError("x is meta/fake before SpatialAxis.forward")
+            raise RuntimeError("x is meta/fake before SpatialExtractor.forward")
         if is_meta_or_fake_tensor(coords):
-            raise RuntimeError("coords is meta/fake before SpatialAxis.forward")
+            raise RuntimeError("coords is meta/fake before SpatialExtractor.forward")
         if x.dim() != 3:
             raise ValueError(
-                f"SpatialAxis expects (B, N, C) tokens, got shape {tuple(x.shape)}"
+                f"SpatialExtractor expects (B, N, C) tokens, got shape {tuple(x.shape)}"
             )
         if coords.dim() != 3:
             raise ValueError(
-                f"SpatialAxis expects (B, N, D) coords, got shape {tuple(coords.shape)}"
+                f"SpatialExtractor expects (B, N, D) coords, got shape {tuple(coords.shape)}"
             )
         if x.shape[:2] != coords.shape[:2]:
             raise ValueError(
@@ -283,37 +281,87 @@ class SpatialAxis(nn.Module):
         x = x.contiguous()
 
         # Preserve expanded/shared coordinate templates (stride(0)==0) to keep caching effective.
+        B, N, D = x.shape
         Bc = int(coords.size(0))
-        if Bc > 1 and coords.stride(0) == 0:
+        if Bc != B:
+            raise ValueError(
+                f"coords batch mismatch: tokens batch={B} vs coords batch={Bc}"
+            )
+
+        if B > 1 and coords.stride(0) == 0:
             coords0 = coords[0].contiguous()
-            coords = coords0.unsqueeze(0).expand(Bc, -1, -1)
+            coords = coords0.unsqueeze(0).expand(B, -1, -1)
         else:
             coords = coords.contiguous()
 
         if coords.dtype != torch.float32:
             coords = coords.float()
 
+        # Pre-validate / normalize attn_mask once (avoid repeating dim checks per block).
+        attn_base: torch.Tensor | None = None
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
-                raise RuntimeError("attn_mask is meta/fake before SpatialAxis.forward")
+                raise RuntimeError("attn_mask is meta/fake before SpatialExtractor.forward")
             attn_mask = attn_mask.contiguous()
+            match int(attn_mask.dim()):
+                case 0:
+                    attn_base = None
+                case 3:
+                    if int(attn_mask.size(0)) != int(B):
+                        raise ValueError(
+                            f"attn_mask batch mismatch: expected B={B}, got {int(attn_mask.size(0))}"
+                        )
+                    if attn_mask.shape[-2:] != (N, N):
+                        raise ValueError(
+                            f"attn_mask last 2 dims must be (N,N)=({N},{N}), got {tuple(attn_mask.shape)}"
+                        )
+                    attn_base = attn_mask
+                case 4:
+                    if int(attn_mask.size(0)) != int(B):
+                        raise ValueError(
+                            f"attn_mask batch mismatch: expected B={B}, got {int(attn_mask.size(0))}"
+                        )
+                    if attn_mask.shape[-2:] != (N, N):
+                        raise ValueError(
+                            f"attn_mask last 2 dims must be (N,N)=({N},{N}), got {tuple(attn_mask.shape)}"
+                        )
+                    if attn_mask.size(1) != 1:
+                        raise ValueError("attn_mask with per-head shape not supported here")
+                    attn_base = attn_mask.squeeze(1)
+                case _:
+                    raise ValueError("attn_mask must be rank 0, 3, or 4 here")
 
         perm_cache, inv_cache = self._ensure_permutation_cache(coords)
         patch = int(self.patch_size)
+        full = (N // patch) * patch
+        nblk = (full // patch) if full > 0 else 0
+        coord_dim = int(coords.size(-1))
+
+        # If shift_order is enabled, only two permutation templates are used: even/odd blocks.
+        shift = bool(self.shift_order)
+        shift_amt = 0
+        if shift:
+            shift_amt = (patch // 2) % max(int(N), 1)
+
+        # Optional per-forward mask cache (per permutation template) to avoid rebuilding mb for every block.
+        mb_full_even: torch.Tensor | None = None
+        mb_full_odd: torch.Tensor | None = None
 
         for i, blk in enumerate(self.blocks):
-            B, N, D = x.shape
             perm_i = perm_cache[i]
             inv_i = inv_cache[i]
-            if perm_i.dim() == 2:
-                perm = perm_i
-                invperm = inv_i
-            else:
-                perm = perm_i.unsqueeze(0).expand(B, N)
-                invperm = inv_i.unsqueeze(0).expand(B, N)
+            is_shared_perm = perm_i.dim() == 1
 
-            x_s = x.gather(1, perm.unsqueeze(-1).expand(B, N, D))
-            c_s = coords.gather(1, perm.unsqueeze(-1).expand(B, N, coords.size(-1)))
+            if is_shared_perm:
+                perm_1d = perm_i
+                inv_1d = inv_i
+                x_s = x.index_select(1, perm_1d)
+                c_s = coords.index_select(1, perm_1d)
+            else:
+                perm_2d = perm_i
+                inv_2d = inv_i
+                x_s = x.gather(1, perm_2d.unsqueeze(-1).expand(B, N, D))
+                c_s = coords.gather(1, perm_2d.unsqueeze(-1).expand(B, N, coord_dim))
 
             if torch.is_grad_enabled():
                 out_s = torch.empty_like(x_s)
@@ -323,42 +371,42 @@ class SpatialAxis(nn.Module):
 
             # Vectorize per-block processing by folding blocks into the batch dimension.
             # This reduces Python overhead while keeping peak memory bounded.
-            full = (N // patch) * patch
             if full > 0:
-                nblk = full // patch
-
                 x_full = x_s[:, :full, :].contiguous().view(B, nblk, patch, D)
-                c_full = c_s[:, :full, :].contiguous().view(B, nblk, patch, coords.size(-1))
-
+                c_full = c_s[:, :full, :].contiguous().view(B, nblk, patch, coord_dim)
                 x_flat = x_full.reshape(B * nblk, patch, D)
-                c_flat = c_full.reshape(B * nblk, patch, coords.size(-1))
+                c_flat = c_full.reshape(B * nblk, patch, coord_dim)
 
                 mb_flat = None
                 if attn_mask is not None:
-                    # Build attention mask per-block only (avoid allocating (B,N,N)).
                     if attn_mask.dim() == 0:
                         mb_flat = attn_mask
                     else:
-                        idx = perm[:, :full].contiguous().view(B, nblk, patch)  # (B,nblk,patch)
-                        if attn_mask.dim() == 3:
-                            base = attn_mask
-                        elif attn_mask.dim() == 4:
-                            if attn_mask.size(1) != 1:
-                                raise ValueError(
-                                    "attn_mask with per-head shape not supported here"
-                                )
-                            base = attn_mask.squeeze(1)
-                        else:
-                            raise ValueError("attn_mask must be rank 0, 3, or 4 here")
+                        # Build (B*nblk, patch, patch) block masks without allocating (B, patch, N).
+                        # Advanced indexing reads directly into the final (patch,patch) block.
+                        use_odd = bool(shift_amt and (i % 2 == 1))
+                        cached = mb_full_odd if use_odd else mb_full_even
+                        if cached is None:
+                            base = attn_base
+                            if base is None:
+                                raise RuntimeError("attn_mask base unexpectedly None")
 
-                        rows = base.gather(
-                            1,
-                            idx.reshape(B, nblk * patch)
-                            .unsqueeze(-1)
-                            .expand(B, nblk * patch, N),
-                        ).view(B, nblk, patch, N)
-                        mb = rows.gather(3, idx.unsqueeze(-2).expand(B, nblk, patch, patch))
-                        mb_flat = mb.reshape(B * nblk, patch, patch).contiguous()
+                            if is_shared_perm:
+                                idx_tpl = perm_1d[:full].reshape(nblk, patch)
+                                idx = idx_tpl.unsqueeze(0).expand(B, -1, -1)
+                            else:
+                                idx = perm_2d[:, :full].reshape(B, nblk, patch)
+
+                            b = torch.arange(B, device=idx.device).view(B, 1, 1, 1)
+                            ii = idx.unsqueeze(-1)
+                            jj = idx.unsqueeze(-2)
+                            mb = base[b, ii, jj]
+                            cached = mb.reshape(B * nblk, patch, patch).contiguous()
+                            if use_odd:
+                                mb_full_odd = cached
+                            else:
+                                mb_full_even = cached
+                        mb_flat = cached
 
                 y_flat = blk(x_flat, c_flat, attn_mask=mb_flat)
                 out_s[:, :full, :].copy_(y_flat.reshape(B, nblk, patch, D).reshape(B, full, D))
@@ -374,33 +422,36 @@ class SpatialAxis(nn.Module):
                     if attn_mask.dim() == 0:
                         mb = attn_mask
                     else:
-                        idx = perm[:, s:e]  # (B, M)
-                        M = int(idx.shape[1])
-                        if attn_mask.dim() == 3:
-                            rows = attn_mask.gather(1, idx.unsqueeze(-1).expand(B, M, N))
-                            mb = rows.gather(2, idx.unsqueeze(1).expand(B, M, M))
-                        elif attn_mask.dim() == 4:
-                            if attn_mask.size(1) != 1:
-                                raise ValueError(
-                                    "attn_mask with per-head shape not supported here"
-                                )
-                            base = attn_mask.squeeze(1)
-                            rows = base.gather(1, idx.unsqueeze(-1).expand(B, M, N))
-                            mb = rows.gather(2, idx.unsqueeze(1).expand(B, M, M))
+                        base = attn_base
+                        if base is None:
+                            raise RuntimeError("attn_mask base unexpectedly None")
+
+                        if is_shared_perm:
+                            idx = perm_1d[s:e]
+                            idx2 = idx.unsqueeze(0).expand(B, -1)
                         else:
-                            raise ValueError("attn_mask must be rank 0, 3, or 4 here")
+                            idx2 = perm_2d[:, s:e]
+
+                        M = int(idx2.shape[1])
+                        b = torch.arange(B, device=idx2.device).view(B, 1, 1)
+                        ii = idx2.unsqueeze(-1)
+                        jj = idx2.unsqueeze(-2)
+                        mb = base[b, ii, jj].reshape(B, M, M).contiguous()
 
                 out_s[:, s:e, :] = blk(xb, cb, attn_mask=mb)
 
-            x = out_s.gather(1, invperm.unsqueeze(-1).expand(B, N, D))
+            if is_shared_perm:
+                x = out_s.index_select(1, inv_1d)
+            else:
+                x = out_s.gather(1, inv_2d.unsqueeze(-1).expand(B, N, D))
 
         out = self.norm(x)
         if is_meta_or_fake_tensor(out):
-            raise RuntimeError("SpatialAxis produced meta/fake tensor")
+            raise RuntimeError("SpatialExtractor produced meta/fake tensor")
         return out.contiguous()
 
 
-class TemporalAxis(nn.Module):
+class TemporalExtractor(nn.Module):
     def __init__(
         self,
         d_model: int,
@@ -448,11 +499,11 @@ class TemporalAxis(nn.Module):
         return x
 
 
-class Context(nn.Module):
+class Enhancer(nn.Module):
     """Controller backbone wrapper.
 
     Originally a thin wrapper around LongNet. This module now also owns
-    controller-stage microbatch sizing/execution, so Root.forward doesn't
+    controller-stage microbatch sizing/execution, so Model.forward doesn't
     have to manage controller microbatching details.
     """
 
@@ -527,7 +578,7 @@ class Context(nn.Module):
         """
         if tokens.ndim != 3:
             raise ValueError(
-                f"Context.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+                f"Enhancer.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
         B = int(tokens.shape[0])
         if graph_break_fn is not None:
@@ -562,7 +613,7 @@ class Context(nn.Module):
         return refined
 
 
-class Subcontext(nn.Module):
+class Fuser(nn.Module):
     def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -587,7 +638,7 @@ class Subcontext(nn.Module):
             persistent=False,
         )
 
-        self.spatial_net = SpatialAxis(
+        self.spatial_net = SpatialExtractor(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.spatial_depth)),
@@ -597,7 +648,7 @@ class Subcontext(nn.Module):
             drop_path=self.drop_path,
             norm_type=self.norm_type,
         )
-        self.temporal_net = TemporalAxis(
+        self.temporal_net = TemporalExtractor(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.temporal_depth)),
@@ -631,18 +682,19 @@ class Subcontext(nn.Module):
         # Use ceil(...) so that side**3 >= n_tokens, preserving spatial diversity
         # even for small token counts (e.g. 2-7 tokens).
         side = max(1, int(math.ceil(n_tokens ** (1.0 / 3.0))))
-        coords: List[Tuple[float, float, float]] = []
-        for idx in range(n_tokens):
-            z = idx // (side * side)
-            rem = idx % (side * side)
-            y = rem // side
-            x = rem % side
-            if side == 1:
-                coords.append((0.0, 0.0, 0.0))
-            else:
-                denom = float(side - 1)
-                coords.append((x / denom, y / denom, z / denom))
-        return torch.tensor(coords, dtype=torch.float32, device=device)
+        n = int(n_tokens)
+        if side <= 1 or n <= 0:
+            return torch.zeros((max(0, n), 3), dtype=torch.float32, device=device)
+
+        idx = torch.arange(n, device=device, dtype=torch.long)
+        side2 = int(side) * int(side)
+        z = idx // side2
+        rem = idx % side2
+        y = rem // int(side)
+        x = rem % int(side)
+        coords = torch.stack((x, y, z), dim=1).to(dtype=torch.float32)
+        coords = coords / float(side - 1)
+        return coords
 
     def _spatial_coords(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         _ = dtype
@@ -652,7 +704,7 @@ class Subcontext(nn.Module):
             coords = coords.to(device=device, dtype=torch.float32)
         return coords.unsqueeze(0).expand(int(batch), -1, -1)
 
-    @torch_compile_disable(reason="Subcontext orchestrates eager + compiled submodules", recursive=False)
+    @torch_compile_disable(reason="Fuser orchestrates eager + compiled submodules", recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = int(x.shape[0])
 
@@ -741,7 +793,7 @@ class _CompiledDecode(nn.Module):
         return flat.reshape(tokens.shape[0], *self._out_shape)
 
 
-class Root(nn.Module):
+class Model(nn.Module):
     def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -773,21 +825,21 @@ class Root(nn.Module):
                 self.scaler.x_mean.zero_()
                 self.scaler.x_std.fill_(1.0)
 
-        # History/logging is runtime metadata; keep it on CPU to reduce device
+        # Recorder/logging is runtime metadata; keep it on CPU to reduce device
         # traffic and GPU memory pressure.
-        self.logger = History()
+        self.logger = Recorder()
 
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
 
-        self.processor = Subcontext(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.processor = Fuser(self.in_dim, self.out_shape, config=config).to(self._device)
 
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
 
-        self.controller = Context(
+        self.controller = Enhancer(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -937,19 +989,19 @@ class Root(nn.Module):
         self._amp_dtype_cache_lock = threading.Lock()
         self.__config = config
 
-    def to(self, *args: Any, **kwargs: Any) -> "Root":
-        """Move the model to a device/dtype while keeping History on CPU.
+    def to(self, *args: Any, **kwargs: Any) -> "Model":
+        """Move the model to a device/dtype while keeping Recorder on CPU.
 
-        Root owns device placement for the core model, but History is runtime
+        Model owns device placement for the core model, but Recorder is runtime
         metadata/logging and should remain on CPU (especially important for
         CUDA/XPU where moving it would allocate device memory and can trigger
         unnecessary device syncs).
         """
         out = super().to(*args, **kwargs)
         with contextlib.suppress(Exception):
-            if isinstance(getattr(self, "logger", None), History):
+            if isinstance(getattr(self, "logger", None), Recorder):
                 self.logger.cpu()
-        return cast(Root, out)
+        return cast(Model, out)
 
     @staticmethod
     def _cast_graph_safe(x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:
@@ -1264,7 +1316,7 @@ class Root(nn.Module):
             if is_train_path:
                 tokens_centered = tokens_centered.detach()
 
-            # --- Controller stage (moved into Context.run) ---
+            # --- Controller stage (moved into Enhancer.run) ---
             refined_tokens = self.controller.run(
                 tokens_centered,
                 device=device,
@@ -1470,7 +1522,7 @@ class Root(nn.Module):
         if isinstance(run_hist, list):
             return run_hist
         hist = getattr(self, "logger", None)
-        if isinstance(hist, History):
+        if isinstance(hist, Recorder):
             return hist.save()
         return []
 

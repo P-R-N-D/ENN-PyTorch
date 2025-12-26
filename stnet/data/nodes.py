@@ -382,8 +382,6 @@ class Sampler(_Sampler):
 
         # Thread-local memmap handles are optional; default "auto" for no-GIL builds.
         self._mmap_tls: Optional[threading.local] = None
-        self._mmap_init_lock: Optional[threading.Lock] = threading.Lock()
-
         # Instance-local limit lock (avoid global contention on no-GIL).
         self._mmap_limit_lock: Optional[threading.Lock] = threading.Lock()
 
@@ -521,19 +519,16 @@ class Sampler(_Sampler):
             "_X",
             "_Y",
             "_mmap_tls",
-            "_mmap_init_lock",
             "_mmap_limit_lock",
         ):
             state.pop(key, None)
         state["_mmap_tls"] = None
-        state["_mmap_init_lock"] = None
         state["_mmap_limit_lock"] = None
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
         self._mmap_tls = None
-        self._mmap_init_lock = threading.Lock()
         self._mmap_limit_lock = threading.Lock()
 
         if MemoryMappedTensor is None:
@@ -602,46 +597,48 @@ class Sampler(_Sampler):
                     return self._features, self._labels
                 setattr(self, "_mmap_thread_local_created", created + 1)
 
-        init_lock = getattr(self, "_mmap_init_lock", None)
+        init_lock = getattr(tls, "init_lock", None)
         if init_lock is None:
             init_lock = threading.Lock()
-            self._mmap_init_lock = init_lock
+            setattr(tls, "init_lock", init_lock)
 
         with init_lock:
             f = getattr(tls, "features", None)
             l = getattr(tls, "labels", None)
-            if f is None or (has_labels and l is None):
-                try:
-                    f = MemoryMappedTensor.from_filename(
-                        filename=str(self._feat_path),
-                        dtype=self._feat_dtype,
-                        shape=self._feat_shape,
-                    )
-                    if has_labels:
-                        l = MemoryMappedTensor.from_filename(
-                            filename=str(self._lab_path),
-                            dtype=self._label_dtype,
-                            shape=self._label_shape_full,
-                        )
-                    else:
-                        l = None
-                except Exception:
-                    # Undo created counter on failure.
-                    if max_pairs > 0:
-                        lock = getattr(self, "_mmap_limit_lock", None)
-                        if lock is None:
-                            lock = threading.Lock()
-                            self._mmap_limit_lock = lock
-                        with lock:
-                            created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
-                            setattr(self, "_mmap_thread_local_created", max(0, created - 1))
-                    return self._features, self._labels
+            if f is not None and (not has_labels or l is not None):
+                return f, (l if has_labels else None)
 
-                setattr(tls, "features", f)
+            try:
+                f_new = MemoryMappedTensor.from_filename(
+                    filename=str(self._feat_path),
+                    dtype=self._feat_dtype,
+                    shape=self._feat_shape,
+                )
                 if has_labels:
-                    setattr(tls, "labels", l)
+                    l_new = MemoryMappedTensor.from_filename(
+                        filename=str(self._lab_path),
+                        dtype=self._label_dtype,
+                        shape=self._label_shape_full,
+                    )
+                else:
+                    l_new = None
+            except Exception:
+                # Undo created counter on failure.
+                if max_pairs > 0:
+                    lock = getattr(self, "_mmap_limit_lock", None)
+                    if lock is None:
+                        lock = threading.Lock()
+                        self._mmap_limit_lock = lock
+                    with lock:
+                        created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
+                        setattr(self, "_mmap_thread_local_created", max(0, created - 1))
+                return self._features, self._labels
 
-        return f, (l if has_labels else None)
+            setattr(tls, "features", f_new)
+            if has_labels:
+                setattr(tls, "labels", l_new)
+
+            return f_new, (l_new if has_labels else None)
 
     @property
     def start(self) -> int:

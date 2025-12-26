@@ -49,8 +49,8 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from ..core.compat import is_meta_or_fake_tensor
-from ..model.architecture import Root
-from ..model.primitives import History, resize_scaler_buffer
+from ..nn.architecture import Model
+from ..nn.primitives import Recorder, resize_scaler_buffer
 from ..data.pipeline import BatchIterator
 from ..core.graph import inference_mode
 from ..core.config import ModelConfig, coerce_model_config
@@ -153,13 +153,18 @@ def _json_sanitize(obj: Any) -> Any:
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    """Best-effort extraction of the ModelConfig attached to a Root model."""
-    cfg_obj = getattr(model, "_Root__config", None)
-    if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+    """Best-effort extraction of the ModelConfig attached to a Model model."""
+    def _get_cfg(obj: nn.Module) -> Any:
+        for attr in ("_Model__config", "_Root__config", "__stnet_instance_config__"):
+            cfg_obj = getattr(obj, attr, None)
+            if cfg_obj is not None:
+                return cfg_obj
+        return None
+
+    cfg_obj = _get_cfg(model)
     if cfg_obj is None:
         for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Root__config", None)
+            cfg_obj = _get_cfg(submodule)
             if cfg_obj is not None:
                 break
     try:
@@ -298,7 +303,7 @@ def new_model(
     config: ModelConfig | Dict[str, Any] | None,
 ) -> nn.Module:
     cfg = coerce_model_config(config)
-    core = Root(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    core = Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
     return core
 
 
@@ -438,7 +443,7 @@ def _in_console(cmd: Sequence[str], desc: str) -> None:
 
 @contextlib.contextmanager
 def _serving_model(model: nn.Module) -> Any:
-    """Temporarily strip training-only attributes and History objects.
+    """Temporarily strip training-only attributes and Recorder objects.
 
     This context manager *does not permanently mutate* the model instance.
     """
@@ -470,7 +475,7 @@ def _serving_model(model: nn.Module) -> Any:
                 # Keep export robust even if deletion fails.
                 pass
 
-    # Remove History-based attrs from modules
+    # Remove Recorder-based attrs from modules
     with contextlib.suppress(Exception):
         for module in model.modules():
             for attr in ("logger", "history"):
@@ -479,7 +484,7 @@ def _serving_model(model: nn.Module) -> Any:
                         v = getattr(module, attr)
                     except Exception:
                         continue
-                    if isinstance(v, History):
+                    if isinstance(v, Recorder):
                         try:
                             removed_sub.append((module, attr, v))
                             delattr(module, attr)

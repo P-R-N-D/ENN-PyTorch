@@ -92,3 +92,19 @@ exclude = ["tests*"]
   "**/*.onnx",
   "**/*.bin",
 ]
+
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+# Start with a small rule set (pyflakes + syntax errors) and tighten over time.
+select = ["F", "E9"]
+
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+show_error_codes = true
+warn_unused_ignores = true
