@@ -154,12 +154,17 @@ def _json_sanitize(obj: Any) -> Any:
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
     """Best-effort extraction of the ModelConfig attached to a Model model."""
-    cfg_obj = getattr(model, "_Root__config", None)
-    if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+    def _get_cfg(obj: nn.Module) -> Any:
+        for attr in ("_Model__config", "_Root__config", "__stnet_instance_config__"):
+            cfg_obj = getattr(obj, attr, None)
+            if cfg_obj is not None:
+                return cfg_obj
+        return None
+
+    cfg_obj = _get_cfg(model)
     if cfg_obj is None:
         for submodule in model.modules():
-            cfg_obj = getattr(submodule, "_Root__config", None)
+            cfg_obj = _get_cfg(submodule)
             if cfg_obj is not None:
                 break
     try:
