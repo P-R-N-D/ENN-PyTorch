@@ -1,0 +1,2813 @@
+diff --git a/README.md b/README.md
+index 6f7e96b..5cc7ada 100644
+--- a/README.md
++++ b/README.md
+@@ -26,7 +26,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
+ - **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
+ - **Export** (`stnet.run.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
+ - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
+-- **Functional blocks** (`stnet.core.losses`, `stnet.core.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
++- **Core utilities** (`stnet.core.losses`, `stnet.core.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
+ - **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `Root`, `History`).
+ - **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
+ 
+@@ -78,8 +78,9 @@ Minimal forward/backward loop:
+ ```python
+ import torch
+ 
++import stnet
++
+ from stnet.core.config import ModelConfig
+-from stnet.run.io import new_model
+ from stnet.core.losses import StudentsTLoss
+ from stnet.core.system import optimize_threads
+ 
+@@ -91,7 +92,7 @@ cfg = ModelConfig(
+     # AMP dtype negotiation guard band: safety_margin = 2**n (default n=3 -> margin=8)
+     safety_margin_pow2=3,
+ )
+-model = new_model(in_dim=16, out_shape=(1,), config=cfg)
++model = stnet.new_model(in_dim=16, out_shape=(1,), config=cfg)
+ 
+ # 2) Synthetic batch (B x C_in) -> (B x *out_shape)
+ device = next(model.parameters()).device
+@@ -122,7 +123,7 @@ with torch.no_grad():
+ 
+ Checkpointing:
+ ```python
+-from stnet.run.io import save_model, load_model
++from stnet import load_model, save_model
+ 
+ save_model(model, "ckpt.pth")
+ model2 = load_model("ckpt.pth", map_location="cuda")
+@@ -136,26 +137,26 @@ model3 = load_model("ckpt_dir", map_location="cpu")
+ 
+ Prediction outputs:
+ ```python
+-from stnet.run.compute import predict
++import stnet
+ 
+ # Eager: returns an in-memory TensorDict with keys {"X", "Y"}
+-td = predict(model, data=my_data, lazy=False)
++td = stnet.predict(model, my_data, lazy=False)
+ print(td[0]["X"], td[0]["Y"])
+ 
+ # Lazy (default): returns a memmap-backed TensorDict (MemoryMappedTensor leaves)
+-td_lazy = predict(model, data=my_data)  # same as lazy=True, path=None
++td_lazy = stnet.predict(model, my_data)  # same as lazy=True, persist_path=None
+ print(td_lazy[0]["X"], td_lazy[0]["Y"])
+ 
+-# Persistent: writes an HDF5 PersistentTensorDict to `path` and returns it
+-td_persistent = predict(model, data=my_data, path="predictions.h5")  # lazy defaults to True
++# Persistent: writes an HDF5 PersistentTensorDict to `persist_path` and returns it
++td_persistent = stnet.predict(model, my_data, persist_path="predictions.h5")  # lazy defaults to True
+ print(td_persistent[0]["X"], td_persistent[0]["Y"])
+ 
+ # IMPORTANT: PersistentTensorDict does not auto-close. Close it when you're done.
+ td_persistent.close()
+ ```
+ 
+-When `lazy=True` and `path` is provided, results are streamed to disk and returned as a `PersistentTensorDict`.
+-When `lazy=True` and `path` is `None`/invalid, results are returned as a `memmap-backed TensorDict` with underlying `MemoryMappedTensor` files stored in an auto-created run directory.
++When `lazy=True` and `persist_path` is provided, results are streamed to disk and returned as a `PersistentTensorDict`.
++When `lazy=True` and `persist_path` is `None`/invalid, results are returned as a `memmap-backed TensorDict` with underlying `MemoryMappedTensor` files stored in an auto-created run directory.
+ 
+ Notebook demo:
+ - Open `notebook.ipynb` for an end-to-end workflow using `raw_data.xlsx`.
+@@ -191,18 +192,14 @@ stnet/
+     datatype.py
+     nodes.py
+     pipeline.py
+-  functional/
+-    __init__.py
+-    losses.py
+-    optimizers.py
+-    profiler.py
+   model/
+     __init__.py
+     activations.py
++    architecture.py
++    blocks.py
+     fused.py
+     kernels.py
+-    layers.py
+-    nn.py
++    primitives.py
+ 
+ ```
+ 
+diff --git a/notebook.ipynb b/notebook.ipynb
+index 081e2f8..1cf778d 100644
+--- a/notebook.ipynb
++++ b/notebook.ipynb
+@@ -586,7 +586,7 @@
+     "print(\"X shape:\", tuple(results[\"X\"].shape))\n",
+     "print(\"Y shape:\", tuple(results[\"Y\"].shape))\n",
+     "\n",
+-    "# predict: lazy=True (default), path=None -> memmap-backed TensorDict (MemoryMappedTensor leaves) 반환 (X, Y)\n",
++    "# predict: lazy=True (default), persist_path=None -> memmap-backed TensorDict (MemoryMappedTensor leaves) 반환 (X, Y)\n",
+     "results_lazy = predict(model, infer_samples)\n",
+     "print(results_lazy)\n",
+     "print(\"lazy[0] X shape:\", tuple(results_lazy[0][\"X\"].shape))\n",
+@@ -594,7 +594,7 @@
+     "\n",
+     "# predict: lazy=True, path 유효 -> PersistentTensorDict (HDF5)로 저장 + 반환\n",
+     "out_path = os.path.abspath(\"predictions.h5\")\n",
+-    "results_persistent = predict(model, infer_samples, path=out_path)\n",
++    "results_persistent = predict(model, infer_samples, persist_path=out_path)\n",
+     "print(\"saved to:\", out_path)\n",
+     "print(results_persistent)\n",
+     "print(\"persistent[0] X shape:\", tuple(results_persistent[0][\"X\"].shape))\n",
+diff --git a/stnet/__init__.py b/stnet/__init__.py
+index 006d891..af301e6 100644
+--- a/stnet/__init__.py
++++ b/stnet/__init__.py
+@@ -1,125 +1,110 @@
+-# -*- coding: utf-8 -*-
++"""STNet top-level package.
++
++This package intentionally exposes a small, stable surface area:
++
++Modules:
++- stnet.core
++- stnet.data
++- stnet.model
++- stnet.run
++
++Convenience functions (thin wrappers around stnet.run.*):
++- stnet.new_model
++- stnet.load_model
++- stnet.save_model
++- stnet.train
++- stnet.predict
++- stnet.get_prediction
++"""
++
+ from __future__ import annotations
+ 
+ import importlib
+-import logging
+-import os
+-import re
+-import warnings
+-from types import ModuleType
+-
+-os.environ.setdefault("TORCH_LOGS", "-all")
+-os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+-os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+-
+-import torch
+-
+-# Apply Torch compatibility patches early (adds missing APIs/aliases across versions).
+-# This is best-effort and must never fail import.
+-try:
+-    from .core.compat import patch_torch as _patch_torch
+-except Exception:  # pragma: no cover
+-    _patch_torch = None
+-else:
+-    with warnings.catch_warnings():
+-        warnings.simplefilter('ignore')
+-        try:
+-            _patch_torch()
+-        except Exception:
+-            pass
+-
+-try:
+-    from tensordict import set_list_to_stack as _set_list_to_stack
+-except Exception:
+-    _set_list_to_stack = None
+-
+-from .core.casting import env_bool
++from typing import Any
+ 
+ __all__ = [
+-    "run",
+     "core",
+     "data",
+-    "functional",
+     "model",
++    "run",
++    # Short-call API
++    "new_model",
++    "load_model",
++    "save_model",
++    "train",
++    "predict",
++    "get_prediction",
+ ]
+ 
+ 
+-def __getattr__(name: str) -> ModuleType:
+-    if name in __all__:
+-        module = importlib.import_module(f".{name}", __name__)
+-        globals()[name] = module
+-        return module
+-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+-
+-
+-def __dir__() -> list[str]:
+-    return sorted(list(globals().keys()) + list(__all__))
+-
+-
+-class IgnoreTorchCompileMsg(logging.Filter):
+-
+-    _DROP_SUBSTRINGS = (
+-        "No valid triton configs",
+-        "Runtime error during autotuning",
+-        "Ignoring this choice",
+-        "Autotune Choices Stats",
+-        "triton_flex_",
+-        "Not enough SMs",
+-        "hit config.recompile_limit",
+-        "recompilation reasons",
+-        "recompiles",
+-    )
+-
+-    def filter(self, record: logging.LogRecord) -> bool:
+-        msg = record.getMessage()
+-        if "best_time" in msg and "best_triton_pos" in msg:
+-            return False
+-        return not any(substr in msg for substr in self._DROP_SUBSTRINGS)
+-
+-
+-if env_bool("STNET_DISABLE_MKLDNN", False):
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore")
+-        try:
+-            torch.backends.mkldnn.enabled = False
+-        except Exception:
+-            pass
+-
+-warnings.filterwarnings(
+-    "ignore",
+-    message="Please use the new API settings to control TF32 behavior.*",
+-)
+-ignored_sentences = [
+-    "External init callback must run in same thread as registerClient",
+-    "Initializing zero-element tensors is a no-op",
+-    "gpuGetDeviceCount failed with code",
+-    "torch.distributed is disabled",
+-    "TypedStorage is deprecated",
+-    "flex_attention called without torch.compile",
+-    "SOLUTION: Use torch.compile",
+-    "Not enough SMs to use max_autotune_gemm",
+-    "allowTF32CuDNN",
+-    "allowTF32CuBLAS",
+-    "torch._dynamo hit config.recompile_limit",
+-    "Detected a Jax installation",
+-]
+-ignored_pattern = "|".join([f".*{re.escape(s)}.*" for s in ignored_sentences])
+-warnings.filterwarnings("ignore", message=ignored_pattern)
+-logging.getLogger("torch.distributed").setLevel(logging.ERROR)
+-for logger_name in (
+-    "torch._inductor",
+-    "torch._inductor.select_algorithm",
+-    "torch._dynamo",
+-    "torch._dynamo.convert_frame",
+-):
+-    logger = logging.getLogger(logger_name)
+-    logger.addFilter(IgnoreTorchCompileMsg())
+-    logger.setLevel(logging.ERROR)
+-
+-if _set_list_to_stack is not None:
+-    try:
+-        setter = _set_list_to_stack(True)
+-        if hasattr(setter, "set") and callable(getattr(setter, "set")):
+-            setter.set()
+-    except Exception:
+-        pass
++def __getattr__(name: str) -> Any:
++    # Lazy module imports keep "import stnet" cheap.
++    if name in {"core", "data", "model", "run"}:
++        return importlib.import_module(f"stnet.{name}")
++    raise AttributeError(f"module 'stnet' has no attribute '{name}'")
++
++
++def new_model(*args: Any, **kwargs: Any) -> Any:
++    """Create a new model.
++
++    Wrapper for :func:`stnet.run.io.new_model`.
++    """
++
++    from .run.io import new_model as _new_model
++
++    return _new_model(*args, **kwargs)
++
++
++def load_model(*args: Any, **kwargs: Any) -> Any:
++    """Load a model checkpoint.
++
++    Wrapper for :func:`stnet.run.io.load_model`.
++    """
++
++    from .run.io import load_model as _load_model
++
++    return _load_model(*args, **kwargs)
++
++
++def save_model(*args: Any, **kwargs: Any) -> Any:
++    """Save a model checkpoint.
++
++    Wrapper for :func:`stnet.run.io.save_model`.
++    """
++
++    from .run.io import save_model as _save_model
++
++    return _save_model(*args, **kwargs)
++
++
++def train(*args: Any, **kwargs: Any) -> Any:
++    """Train a model.
++
++    Wrapper for :func:`stnet.run.compute.train`.
++    """
++
++    from .run.compute import train as _train
++
++    return _train(*args, **kwargs)
++
++
++def predict(*args: Any, **kwargs: Any) -> Any:
++    """Run predict/infer.
++
++    Wrapper for :func:`stnet.run.compute.predict`.
++    """
++
++    from .run.compute import predict as _predict
++
++    return _predict(*args, **kwargs)
++
++
++def get_prediction(*args: Any, **kwargs: Any) -> Any:
++    """Read predictions saved by :func:`stnet.predict`.
++
++    Wrapper for :func:`stnet.run.compute.get_prediction`.
++    """
++
++    from .run.compute import get_prediction as _get_prediction
++
++    return _get_prediction(*args, **kwargs)
+diff --git a/stnet/core/compat.py b/stnet/core/compat.py
+index 3822d7d..0e51614 100644
+--- a/stnet/core/compat.py
++++ b/stnet/core/compat.py
+@@ -484,22 +484,80 @@ def torch_disable_compile(target: Any, attr: str, *, reason: str | None = None,
+ 
+ 
+ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
+-    if layers_module is None:
+-        with suppress(Exception):
+-            layers_module = importlib.import_module("stnet.model.nn")
++    """Patch known Python-side helpers to be eager under torch.compile.
+ 
+-    if layers_module is not None:
+-        torch_disable_compile(getattr(layers_module, "Normal", None), "commit_training_success",
+-                             reason="history/BN sync – eager")
+-        torch_disable_compile(getattr(layers_module, "StudentsT", None), "commit_training_success",
+-                             reason="history – eager")
+-        torch_disable_compile(getattr(layers_module, "History", None), "forward")
++    This function is intentionally best-effort and idempotent.
+ 
+-    if runtime_module is None:
+-        with suppress(Exception):
+-            runtime_module = importlib.import_module("stnet.run.elastic")
++    Why this exists:
++    - Some modules (e.g., Scaler) keep small Python caches guarded by locks.
++      Those are great for eager execution, but tend to confuse Dynamo/AOT.
++    - We prefer compiling the pure tensor math while keeping bookkeeping eager.
++    """
+ 
+-    if runtime_module is not None:
+-        # NOTE: Runtime metric aggregation helpers used to live in stnet.core.runtime.
+-        # They were removed/merged; keep the hook here to avoid stale attribute references.
+-        pass
++    if not torch_compile_supported():
++        return
++
++    # Disallow tracing distributed collectives if possible.
++    with suppress(Exception):
++        torch_safe_distributed()
++
++    # Resolve a reasonable default layers module (project layout changed over time).
++    if layers_module is None:
++        for mod_name in ("stnet.model.primitives", "stnet.model.blocks", "stnet.model.architecture"):
++            with suppress(Exception):
++                layers_module = importlib.import_module(mod_name)
++                break
++
++    # Scaler: uses Python dict + locks for dtype/device stats caching.
++    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
++    if scaler_cls is None:
++        for mod_name in ("stnet.model.primitives", "stnet.model.blocks"):
++            with suppress(Exception):
++                mod = importlib.import_module(mod_name)
++                scaler_cls = getattr(mod, "Scaler", None)
++                if scaler_cls is not None:
++                    break
++
++    if scaler_cls is not None:
++        for attr in (
++            "normalize_x",
++            "denormalize_x",
++            "normalize_y",
++            "denormalize_y",
++            "calibrate",
++            "_piecewise",
++        ):
++            torch_disable_compile(
++                scaler_cls,
++                attr,
++                reason="Scaler uses Python-side caches/loops; keep eager",
++                recursive=False,
++            )
++
++    # History: logging / metadata buffers; never performance-critical.
++    history_cls = getattr(layers_module, "History", None) if layers_module is not None else None
++    if history_cls is None:
++        for mod_name in ("stnet.model.primitives", "stnet.model.blocks"):
++            with suppress(Exception):
++                mod = importlib.import_module(mod_name)
++                history_cls = getattr(mod, "History", None)
++                if history_cls is not None:
++                    break
++
++    if history_cls is not None:
++        for attr in (
++            "start_session",
++            "end_session",
++            "set_epochs",
++            "set_system_info",
++            "record_batch",
++            "_append",
++            "save",
++            "clear",
++        ):
++            torch_disable_compile(
++                history_cls,
++                attr,
++                reason="History is logging/bookkeeping; keep eager",
++                recursive=False,
++            )
+diff --git a/stnet/core/config.py b/stnet/core/config.py
+index 7ae7a52..51eb428 100644
+--- a/stnet/core/config.py
++++ b/stnet/core/config.py
+@@ -262,6 +262,22 @@ class ModelConfig:
+     compile_mode: str = "disabled"
+     safety_margin_pow2: int = 3
+ 
++    def to_dict(self) -> Dict[str, Any]:
++        """Convert this config into a JSON-friendly dict.
++
++        - Shallow conversion only (no recursion / deepcopy).
++        - Ensures `patch` is a plain dict.
++        - Ensures `device` is serializable (string) when it's a torch.device.
++        """
++        data = _shallow_dataclass_dict(self)
++        data["patch"] = patch_config_to_dict(getattr(self, "patch", None))
++
++        dev = data.get("device")
++        if isinstance(dev, torch.device):
++            data["device"] = str(dev)
++
++        return {k: _shallow_copy_if_container(v) for k, v in data.items()}
++
+ 
+ _PATCH_FIELDS = _field_name_set(PatchConfig)
+ _MODEL_FIELDS = _field_name_set(ModelConfig)
+@@ -456,22 +472,14 @@ def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[st
+ 
+ 
+ def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[str, Any]:
+-    """Convert ModelConfig/dict/None into a JSON-friendly dict without dataclasses.asdict().
++    """Convert ModelConfig/dict/None into a JSON-friendly dict.
+ 
+-    Notes:
+-    - Shallow conversion only (no recursion / deepcopy).
+-    - Ensures `patch` is a plain dict.
+-    - Ensures `device` is serializable (string) when it's a torch.device.
++    Prefer calling :meth:`ModelConfig.to_dict` directly.
+     """
+-    cfg = coerce_model_config(config)
+-    data = _shallow_dataclass_dict(cfg)
+-    data["patch"] = patch_config_to_dict(cfg.patch)
+-
+-    dev = data.get("device")
+-    if isinstance(dev, torch.device):
+-        data["device"] = str(dev)
+-
+-    return {k: _shallow_copy_if_container(v) for k, v in data.items()}
++    if config is None:
++        return {}
++    cfg = config if isinstance(config, ModelConfig) else coerce_model_config(config)
++    return cfg.to_dict()
+ 
+ 
+ def patch_config(base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any) -> PatchConfig:
+@@ -605,6 +613,7 @@ class RuntimeConfig:
+             "model_ckpt_dir",
+             "keys",
+             "seed",
++            "shuffle",
+             "loss_skew",
+         }
+     )
+@@ -753,6 +762,7 @@ class RuntimeConfig:
+             )
+ 
+         seed = _coerce_int(data.get("seed", 7), name="seed")
++        shuffle = _coerce_bool(data.get("shuffle", False), name="shuffle")
+         loss_skew = _coerce_bool(data.get("loss_skew", True), name="loss_skew")
+ 
+         ckpt_dir = str(data["ckpt_dir"])
+@@ -770,6 +780,7 @@ class RuntimeConfig:
+             model_ckpt_dir=model_ckpt_dir,
+             keys=data.get("keys"),
+             seed=seed,
++            shuffle=shuffle,
+             loss_skew=loss_skew,
+         )
+ 
+diff --git a/stnet/core/precision.py b/stnet/core/precision.py
+index f36278f..e81b837 100644
+--- a/stnet/core/precision.py
++++ b/stnet/core/precision.py
+@@ -26,33 +26,9 @@ from .system import (
+     is_int8_supported,
+ )
+ 
+-_LOGGER = logging.getLogger(__name__)
+-
+-
+-# -----------------------------------------------------------------------------
+-# Underflow policy utilities
+-# -----------------------------------------------------------------------------
+-
+-_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
++from ..data.schemas import default_underflow_action, normalize_underflow_action
+ 
+-
+-def default_underflow_action() -> str:
+-    """Return underflow policy used by precision negotiation."""
+-    from ..core.casting import env_first
+-
+-    raw = str(
+-        env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn")
+-        or "warn"
+-    ).strip().lower()
+-    return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
+-
+-
+-def normalize_underflow_action(value: object, *, default: str = "warn") -> str:
+-    raw = str(value if value is not None else default).strip().lower()
+-    if raw in _DEF_UNDERFLOW_ACTIONS:
+-        return raw
+-    fallback = str(default).strip().lower()
+-    return fallback if fallback in _DEF_UNDERFLOW_ACTIONS else "warn"
++_LOGGER = logging.getLogger(__name__)
+ 
+ 
+ # -----------------------------------------------------------------------------
+diff --git a/stnet/data/nodes.py b/stnet/data/nodes.py
+index d72593d..603a589 100644
+--- a/stnet/data/nodes.py
++++ b/stnet/data/nodes.py
+@@ -30,7 +30,7 @@ import numpy as np
+ from ..core.compat import ensure_torchdata
+ from ..core.casting import dtype_from_name, env_bool, env_first_int
+ from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
+-from ..core.system import Thread
++from ..core.system import Thread, Memory
+ from . import schemas as _schemas
+ from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
+ 
+diff --git a/stnet/data/pipeline.py b/stnet/data/pipeline.py
+index ab38e3e..5b22713 100644
+--- a/stnet/data/pipeline.py
++++ b/stnet/data/pipeline.py
+@@ -1524,6 +1524,46 @@ def _feature_size_hint(obj: Any) -> Optional[int]:
+     return None
+ 
+ 
++def _stack_sequence(
++    seq: Sequence[Any],
++    *,
++    dtype: torch.dtype,
++    reshape_1d: bool = False,
++) -> Optional[torch.Tensor]:
++    """Stack a sequence into a tensor without building an intermediate list of tensors.
++
++    This avoids a potentially large transient allocation of Python objects + tensor views
++    (common with `torch.stack([to_tensor(x) for x in seq])`).
++    """
++    if not seq:
++        return None
++
++    t0 = _to_tensor_safe(seq[0], dtype)
++    if t0 is None:
++        return None
++    if reshape_1d:
++        t0 = t0.reshape(-1)
++
++    n = int(len(seq))
++    out = torch.empty((n, *tuple(t0.shape)), dtype=t0.dtype, device=t0.device)
++    out[0].copy_(t0)
++
++    for i in range(1, n):
++        ti = _to_tensor_safe(seq[i], dtype)
++        if ti is None:
++            raise ValueError("Dataset.preprocess: missing tensor element")
++        if reshape_1d:
++            ti = ti.reshape(-1)
++        if tuple(ti.shape) != tuple(t0.shape):
++            raise ValueError(
++                f"Dataset.preprocess: inconsistent shapes in stacked sequence: "
++                f"{tuple(t0.shape)} vs {tuple(ti.shape)}"
++            )
++        out[i].copy_(ti)
++
++    return out
++
++
+ @dataclass
+ class Dataset(Generic[TExtra]):
+     device: torch.device
+@@ -1640,90 +1680,93 @@ class Dataset(Generic[TExtra]):
+                 try:
+                     k0, v0 = next(it)
+                 except StopIteration:
+-                    keys = []
+-                    values: list[Any] = []
++                    keys = ()
+                 else:
+-                    keys_list: list[Any] = [k0]
+-
++                    # Case A: {row_id: (feature, label)}
+                     if isinstance(v0, (list, tuple)) and len(v0) >= 2:
+-                        # Case: {row_id: (feature, label)}
++                        n = len(data)
++                        keys_list: list[Any] = [k0]
++
+                         x0 = _to_tensor_safe(v0[0], self.feature_dtype)
+                         if x0 is None:
+                             raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
+-                        feat_list: list[torch.Tensor] = [x0]
+-                        label_list: list[torch.Tensor] = []
+-                        has_missing_labels = v0[1] is None
+-                        if not has_missing_labels:
++
++                        feat = torch.empty((n, *x0.shape), dtype=x0.dtype, device=x0.device)
++                        feat[0].copy_(x0)
++
++                        labels_out: Optional[torch.Tensor] = None
++                        y0: Optional[torch.Tensor] = None
++                        if v0[1] is not None:
+                             y0 = _to_tensor_safe(v0[1], self.label_float_dtype)
+-                            if y0 is None:
+-                                has_missing_labels = True
+-                            else:
+-                                label_list.append(y0)
++                            if y0 is not None:
++                                labels_out = torch.empty((n, *y0.shape), dtype=y0.dtype, device=y0.device)
++                                labels_out[0].copy_(y0)
+ 
+-                        for k, v in it:
++                        for i, (k, v) in enumerate(it, start=1):
+                             keys_list.append(k)
++                            if not isinstance(v, (list, tuple)) or len(v) < 1:
++                                raise ValueError("Dataset.preprocess: invalid tuple mapping element")
++
+                             x_i = _to_tensor_safe(v[0], self.feature_dtype)
+                             if x_i is None:
+                                 raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
+-                            feat_list.append(x_i)
+-                            if v[1] is None:
+-                                if not has_missing_labels:
+-                                    has_missing_labels = True
+-                                    label_list.clear()
+-                            elif not has_missing_labels:
+-                                y_i = _to_tensor_safe(v[1], self.label_float_dtype)
+-                                if y_i is None:
+-                                    has_missing_labels = True
+-                                    label_list.clear()
++                            if tuple(x_i.shape) != tuple(x0.shape):
++                                raise ValueError(
++                                    f"Dataset.preprocess: inconsistent feature shapes in tuple mapping: "
++                                    f"{tuple(x0.shape)} vs {tuple(x_i.shape)}"
++                                )
++                            feat[i].copy_(x_i)
++
++                            if labels_out is not None:
++                                if len(v) < 2 or v[1] is None:
++                                    labels_out = None
+                                 else:
+-                                    label_list.append(y_i)
+-                        features = torch.stack(feat_list, dim=0) if feat_list else None
+-                        labels = None
+-                        if not has_missing_labels:
+-                            labels = torch.stack(label_list, dim=0) if label_list else None
++                                    y_i = _to_tensor_safe(v[1], self.label_float_dtype)
++                                    if y_i is None or y0 is None or tuple(y_i.shape) != tuple(y0.shape):
++                                        labels_out = None
++                                    else:
++                                        labels_out[i].copy_(y_i)
++
++                        features = feat
++                        labels = labels_out
+                         keys = keys_list
++
++                    # Case B: mapping may be {key: feature} or {feature: label}
+                     else:
+-                        # Case: mapping may be {key: feature} or {feature: label}
+-                        values = [v0]
++                        keys_list: list[Any] = [k0]
++                        values_list: list[Any] = [v0]
++
++                        ksize0 = _feature_size_hint(k0)
++                        key_as_feature = ksize0 is not None and 1 < int(ksize0) <= 64
++
+                         for k, v in it:
+                             keys_list.append(k)
+-                            values.append(v)
++                            values_list.append(v)
++                            if key_as_feature and _feature_size_hint(k) != ksize0:
++                                key_as_feature = False
++
+                         keys = keys_list
+ 
+                         parsed = False
+-                        if keys and values:
+-                            ksize0 = _feature_size_hint(keys[0])
+-                            if ksize0 is not None and 1 < int(ksize0) <= 64:
+-                                if all(_feature_size_hint(k) == ksize0 for k in keys):
+-                                    has_missing_labels = any((v is None for v in values))
+-                                    try:
+-                                        feat_list = [
+-                                            _to_tensor_safe(k, self.feature_dtype).reshape(-1) for k in keys
+-                                        ]
+-                                        features = torch.stack(feat_list, dim=0) if feat_list else None
+-                                        if has_missing_labels:
+-                                            labels = None
+-                                            parsed = features is not None
+-                                        else:
+-                                            label_list = [
+-                                                _to_tensor_safe(v, self.label_float_dtype) for v in values
+-                                            ]
+-                                            labels = (
+-                                                torch.stack(label_list, dim=0) if label_list else None
+-                                            )
+-                                            parsed = features is not None and labels is not None
+-                                    except Exception:
+-                                        parsed = False
++                        if key_as_feature and keys_list and values_list:
++                            has_missing_labels = any((v is None for v in values_list))
++                            try:
++                                features = _stack_sequence(
++                                    keys_list,
++                                    dtype=self.feature_dtype,
++                                    reshape_1d=True,
++                                )
++                                if has_missing_labels:
++                                    labels = None
++                                    parsed = features is not None
++                                else:
++                                    labels = _stack_sequence(values_list, dtype=self.label_float_dtype)
++                                    parsed = features is not None and labels is not None
++                            except Exception:
++                                parsed = False
+ 
+                         if not parsed:
+-                            features = (
+-                                torch.stack(
+-                                    [_to_tensor_safe(v, self.feature_dtype) for v in values],
+-                                    dim=0,
+-                                )
+-                                if values
+-                                else None
+-                            )
++                            features = _stack_sequence(values_list, dtype=self.feature_dtype)
+                             labels = None
+ 
+         if features is None:
+diff --git a/stnet/model/architecture.py b/stnet/model/architecture.py
+index 18e75c7..e036102 100644
+--- a/stnet/model/architecture.py
++++ b/stnet/model/architecture.py
+@@ -30,12 +30,11 @@ from ..data.pipeline import (
+ from ..core.profiler import FLOP_PROFILER
+ from ..core.graph import compile, inference_mode, invalidate_model_introspection_caches
+ from ..core.precision import Autocast, is_scale_safe
++from .primitives import History, Scaler
+ from .blocks import (
+-    History,
+     LongNet,
+     PointTransformer,
+     RetNet,
+-    Scaler,
+     TensorDictBase,
+     _ControllerChunkRunner,
+     _auto_microbatch,
+diff --git a/stnet/model/blocks.py b/stnet/model/blocks.py
+index 4cfc18d..f1cacdb 100644
+--- a/stnet/model/blocks.py
++++ b/stnet/model/blocks.py
+@@ -765,868 +765,3 @@ class LossWeightPolicy(Protocol):
+         bottom_loss: Optional[torch.Tensor],
+     ) -> None:
+         raise NotImplementedError
+-
+-
+-class Scaler(nn.Module):
+-    def __init__(self, eps: float = 1e-6) -> None:
+-        super().__init__()
+-        # Precision-exempt: scaler stats must remain FP64 for numerical stability.
+-        self.__stnet_precision_exempt__ = True
+-        self.eps = float(eps)
+-        self.calib_mode: str = "none"
+-        self.register_buffer("x_mean", torch.zeros(1, dtype=torch.float64))
+-        self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
+-        self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
+-        self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
+-        self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
+-        self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
+-        self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
+-        self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
+-
+-        # Cache device/dtype-converted stats to avoid per-forward allocations.
+-        self._stats_cache_lock = threading.Lock()
+-        self._stats_cache_max = 8
+-        self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+-        self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+-
+-    def _invalidate_stats_cache(self) -> None:
+-        with self._stats_cache_lock:
+-            self._x_stats_cache.clear()
+-            self._y_stats_cache.clear()
+-
+-    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
+-        super()._apply(fn)
+-        self._invalidate_stats_cache()
+-        return self
+-
+-    def _load_from_state_dict(
+-        self,
+-        state_dict: Mapping[str, Any],
+-        prefix: str,
+-        local_metadata: Dict[str, Any],
+-        strict: bool,
+-        missing_keys: List[str],
+-        unexpected_keys: List[str],
+-        error_msgs: List[str],
+-    ) -> None:
+-        super()._load_from_state_dict(
+-            state_dict,
+-            prefix,
+-            local_metadata,
+-            strict,
+-            missing_keys,
+-            unexpected_keys,
+-            error_msgs,
+-        )
+-        self._invalidate_stats_cache()
+-
+-    @torch.no_grad()
+-    def update_x(self, x: torch.Tensor) -> None:
+-        if x.numel() == 0:
+-            return
+-        x_work = x.detach()
+-        if x_work.dim() == 1:
+-            x_flat = x_work.view(-1, 1)
+-        else:
+-            x_flat = x_work.reshape(-1, x_work.shape[-1])
+-        x_flat = x_flat.to(dtype=torch.float64)
+-        mean = x_flat.mean(dim=0)
+-        std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
+-        if self.x_mean.shape != mean.shape:
+-            self.x_mean.resize_(mean.shape)
+-        if self.x_std.shape != std.shape:
+-            self.x_std.resize_(std.shape)
+-        self.x_mean.copy_(mean)
+-        self.x_std.copy_(std)
+-        self._invalidate_stats_cache()
+-
+-    @torch.no_grad()
+-    def update_y(self, y: torch.Tensor) -> None:
+-        if y.numel() == 0:
+-            return
+-        y_work = y.detach()
+-        if y_work.dim() == 1:
+-            y_flat = y_work.view(-1, 1)
+-        else:
+-            y_flat = y_work.reshape(-1, y_work.shape[-1])
+-        y_flat = y_flat.to(dtype=torch.float64)
+-        mean = y_flat.mean(dim=0)
+-        std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
+-        if self.y_mean.shape != mean.shape:
+-            self.y_mean.resize_(mean.shape)
+-        if self.y_std.shape != std.shape:
+-            self.y_std.resize_(std.shape)
+-        self.y_mean.copy_(mean)
+-        self.y_std.copy_(std)
+-        self._invalidate_stats_cache()
+-
+-    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+-        if x.numel() == 0:
+-            return x
+-        feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
+-        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+-            raise RuntimeError(
+-                "Scaler.normalize_x: feature dimension mismatch: "
+-                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+-            )
+-
+-        key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
+-        with self._stats_cache_lock:
+-            cached = self._x_stats_cache.get(key)
+-        if cached is None:
+-            mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
+-            std_b = self.x_std.to(device=x.device, dtype=x.dtype)
+-            with self._stats_cache_lock:
+-                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+-                    self._x_stats_cache.clear()
+-                self._x_stats_cache[key] = (mean_b, std_b)
+-        else:
+-            mean_b, std_b = cached
+-
+-        if x.dim() == 1:
+-            return (x - mean_b) / (std_b + self.eps)
+-
+-        view_shape = [1] * (x.dim() - 1) + [-1]
+-        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+-        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+-        return (x - mean) / (std + self.eps)
+-
+-    def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
+-        if x_scaled.numel() == 0:
+-            return x_scaled
+-        feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
+-        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+-            raise RuntimeError(
+-                "Scaler.denormalize_x: feature dimension mismatch: "
+-                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+-            )
+-
+-        key = (
+-            x_scaled.device.type,
+-            int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
+-            x_scaled.dtype,
+-        )
+-        with self._stats_cache_lock:
+-            cached = self._x_stats_cache.get(key)
+-        if cached is None:
+-            mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
+-            std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
+-            with self._stats_cache_lock:
+-                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+-                    self._x_stats_cache.clear()
+-                self._x_stats_cache[key] = (mean_b, std_b)
+-        else:
+-            mean_b, std_b = cached
+-
+-        if x_scaled.dim() == 1:
+-            return x_scaled * (std_b + self.eps) + mean_b
+-
+-        view_shape = [1] * (x_scaled.dim() - 1) + [-1]
+-        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+-        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+-        return x_scaled * (std + self.eps) + mean
+-
+-    def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
+-        mean = self.y_mean
+-        std = self.y_std
+-        if mean.ndim > 1:
+-            mean_flat = mean.reshape(-1)
+-            std_flat = std.reshape(-1)
+-            with torch.no_grad():
+-                if self.y_mean.shape != mean_flat.shape:
+-                    self.y_mean.resize_(mean_flat.shape)
+-                if self.y_std.shape != std_flat.shape:
+-                    self.y_std.resize_(std_flat.shape)
+-                self.y_mean.copy_(mean_flat)
+-                self.y_std.copy_(std_flat)
+-            self._invalidate_stats_cache()
+-            mean = self.y_mean
+-            std = self.y_std
+-        return mean, std
+-
+-    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+-        if y.numel() == 0:
+-            return y
+-
+-        orig_shape = y.shape
+-        if y.dim() == 1:
+-            y_flat = y.view(1, -1)
+-            batch_first = False
+-        else:
+-            y_flat = y.view(y.shape[0], -1)
+-            batch_first = True
+-
+-        mean_vec, std_vec = self._y_stats_vector()
+-        key = (
+-            y_flat.device.type,
+-            int(y_flat.device.index) if y_flat.device.index is not None else -1,
+-            y_flat.dtype,
+-        )
+-        with self._stats_cache_lock:
+-            cached = self._y_stats_cache.get(key)
+-        if cached is None:
+-            mean = mean_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+-            std = std_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+-            with self._stats_cache_lock:
+-                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+-                    self._y_stats_cache.clear()
+-                self._y_stats_cache[key] = (mean, std)
+-        else:
+-            mean, std = cached
+-
+-        if mean.numel() == 1 and std.numel() == 1:
+-            z_flat = (y_flat - mean) / (std + self.eps)
+-        else:
+-            if y_flat.shape[1] != mean.numel():
+-                raise RuntimeError(
+-                    "Scaler.normalize_y: feature dimension mismatch: "
+-                    f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
+-                )
+-            z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
+-
+-        return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
+-
+-    def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
+-        if z.numel() == 0:
+-            return z
+-
+-        orig_shape = z.shape
+-        if z.dim() == 1:
+-            z_flat = z.view(1, -1)
+-            batch_first = False
+-        else:
+-            z_flat = z.view(z.shape[0], -1)
+-            batch_first = True
+-
+-        mean_vec, std_vec = self._y_stats_vector()
+-        key = (
+-            z_flat.device.type,
+-            int(z_flat.device.index) if z_flat.device.index is not None else -1,
+-            z_flat.dtype,
+-        )
+-        with self._stats_cache_lock:
+-            cached = self._y_stats_cache.get(key)
+-        if cached is None:
+-            mean = mean_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+-            std = std_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+-            with self._stats_cache_lock:
+-                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+-                    self._y_stats_cache.clear()
+-                self._y_stats_cache[key] = (mean, std)
+-        else:
+-            mean, std = cached
+-
+-        if mean.numel() == 1 and std.numel() == 1:
+-            y_flat = z_flat * std + mean
+-        else:
+-            if z_flat.shape[1] != mean.numel():
+-                raise RuntimeError(
+-                    "Scaler.denormalize_y: feature dimension mismatch: "
+-                    f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
+-                )
+-            y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
+-
+-        return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
+-
+-    def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
+-        match self.calib_mode:
+-            case "piecewise":
+-                if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
+-                    return self._piecewise(z_raw)
+-                return z_raw
+-            case "affine" | "none":
+-                if self.affine_a.numel() > 0:
+-                    return self.affine(z_raw)
+-                return z_raw
+-            case _:
+-                return z_raw
+-
+-    def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
+-        if self.affine_a.numel() == 0:
+-            return z_raw
+-        a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
+-        b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
+-        return z_raw * a + b
+-
+-    @torch.no_grad()
+-    def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
+-        if self.affine_a.shape != a.shape:
+-            self.affine_a.resize_(a.shape)
+-        if self.affine_b.shape != b.shape:
+-            self.affine_b.resize_(b.shape)
+-        self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
+-        self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
+-        self.pw_x.resize_(0)
+-        self.pw_y.resize_(0)
+-        self.calib_mode = "affine"
+-
+-    @torch.no_grad()
+-    def fit(
+-        self,
+-        z_raw: torch.Tensor,
+-        z_true: torch.Tensor,
+-        mode: str = "affine",
+-        num_bins: int = 8,
+-    ) -> None:
+-        if mode == "affine":
+-            self._fit_affine(z_raw, z_true)
+-            self.calib_mode = "affine"
+-        elif mode == "piecewise":
+-            self._fit_piecewise(z_raw, z_true, num_bins=num_bins)
+-            self.calib_mode = "piecewise"
+-        else:
+-            raise ValueError(f"Unsupported calibration mode: {mode}")
+-
+-    @torch.no_grad()
+-    def _fit_affine(self, z_raw: torch.Tensor, z_true: torch.Tensor) -> None:
+-        if z_raw.numel() == 0 or z_true.numel() == 0:
+-            return
+-
+-        x = z_raw.detach()
+-        y = z_true.detach()
+-        if x.ndim == 1:
+-            x = x.unsqueeze(-1)
+-        if y.ndim == 1:
+-            y = y.unsqueeze(-1)
+-
+-        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+-        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+-
+-        x_mean = x.mean(dim=0)
+-        y_mean = y.mean(dim=0)
+-        x_centered = x - x_mean
+-        y_centered = y - y_mean
+-
+-        denom = (x_centered * x_centered).sum(dim=0)
+-        num = (x_centered * y_centered).sum(dim=0)
+-
+-        tiny_mask = denom.abs() < self.eps
+-        if bool(tiny_mask.any().item()):
+-            denom_safe = denom.clone()
+-            denom_safe[tiny_mask] = 1.0
+-        else:
+-            denom_safe = denom
+-
+-        a64 = num / denom_safe
+-        b64 = y_mean - a64 * x_mean
+-
+-        a64[tiny_mask] = 1.0
+-        b64[tiny_mask] = 0.0
+-
+-        a = a64.to(dtype=torch.float64, device=self.affine_a.device)
+-        b = b64.to(dtype=torch.float64, device=self.affine_b.device)
+-
+-        if self.affine_a.shape != a.shape:
+-            self.affine_a.resize_(a.shape)
+-        if self.affine_b.shape != b.shape:
+-            self.affine_b.resize_(b.shape)
+-        self.affine_a.copy_(a)
+-        self.affine_b.copy_(b)
+-
+-        self.pw_x.resize_(0)
+-        self.pw_y.resize_(0)
+-
+-    @torch.no_grad()
+-    def _fit_piecewise(
+-        self,
+-        z_raw: torch.Tensor,
+-        z_true: torch.Tensor,
+-        num_bins: int = 8,
+-    ) -> None:
+-        if z_raw.numel() == 0 or z_true.numel() == 0:
+-            return
+-        if num_bins < 2:
+-            self._fit_affine(z_raw, z_true)
+-            self.calib_mode = "affine"
+-            return
+-
+-        x = z_raw.detach()
+-        y = z_true.detach()
+-        if x.ndim == 1:
+-            x = x.unsqueeze(-1)
+-        if y.ndim == 1:
+-            y = y.unsqueeze(-1)
+-        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+-        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+-
+-        _, C = x.shape
+-        device = self.affine_a.device
+-        knots_x = torch.empty(C, num_bins, dtype=torch.float64, device=device)
+-        knots_y = torch.empty(C, num_bins, dtype=torch.float64, device=device)
+-
+-        for j in range(C):
+-            xj = x[:, j]
+-            yj = y[:, j]
+-            if xj.numel() == 0:
+-                knots_x[j] = torch.linspace(-1.0, 1.0, num_bins, device=device)
+-                knots_y[j] = knots_x[j]
+-                continue
+-            xj_sorted, idx = torch.sort(xj)
+-            yj_sorted = yj[idx]
+-            idx_q = torch.linspace(
+-                0,
+-                max(0, xj_sorted.numel() - 1),
+-                num_bins,
+-                dtype=torch.long,
+-                device=xj_sorted.device,
+-            )
+-            qx = xj_sorted[idx_q]
+-            qy = yj_sorted[idx_q]
+-            knots_x[j] = qx.to(dtype=torch.float64, device=device)
+-            knots_y[j] = qy.to(dtype=torch.float64, device=device)
+-
+-        if self.pw_x.shape != knots_x.shape:
+-            self.pw_x.resize_(knots_x.shape)
+-        if self.pw_y.shape != knots_y.shape:
+-            self.pw_y.resize_(knots_y.shape)
+-        self.pw_x.copy_(knots_x)
+-        self.pw_y.copy_(knots_y)
+-
+-        if self.affine_a.numel() != C:
+-            self.affine_a.resize_(C)
+-            self.affine_b.resize_(C)
+-        self.affine_a.fill_(1.0)
+-        self.affine_b.zero_()
+-
+-    def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
+-        """Piecewise-linear calibration without mutating module buffers.
+-
+-        Previous code resized/sliced/reassigned self.pw_x/self.pw_y inside forward,
+-        which is unsafe under multithreading and can break torch.compile assumptions.
+-        This implementation treats saved knots as read-only and uses local views.
+-        """
+-        if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
+-            return z_raw
+-        if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
+-            return z_raw
+-
+-        pw_x = self.pw_x
+-        pw_y = self.pw_y
+-        C_saved, Kx = pw_x.shape
+-        _, Ky = pw_y.shape
+-        K = int(min(Kx, Ky))
+-        if K < 2:
+-            return z_raw
+-
+-        # Local views only (do not mutate buffers).
+-        pw_x = pw_x[:, :K]
+-        pw_y = pw_y[:, :K]
+-
+-        orig_shape = z_raw.shape
+-        z = z_raw.unsqueeze(-1) if z_raw.ndim == 1 else z_raw
+-        z = z.reshape(-1, int(z.shape[-1]))
+-
+-        _, C_target = z.shape
+-        device = z.device
+-        dtype = z.dtype
+-
+-        out = torch.empty_like(z)
+-
+-        # If saved calibration has fewer channels, reuse the last channel for extras.
+-        last_idx = max(0, int(C_saved) - 1)
+-        for j in range(int(C_target)):
+-            src_j = j if j < int(C_saved) else last_idx
+-            xj = z[:, j]
+-            knots_x = pw_x[src_j].to(device=device, dtype=dtype)
+-            knots_y = pw_y[src_j].to(device=device, dtype=dtype)
+-
+-            idx = torch.bucketize(xj, knots_x)
+-            idx = idx.clamp(1, knots_x.numel() - 1)
+-            x0 = knots_x[idx - 1]
+-            x1 = knots_x[idx]
+-            y0 = knots_y[idx - 1]
+-            y1 = knots_y[idx]
+-            t = (xj - x0) / (x1 - x0 + self.eps)
+-            out[:, j] = y0 + t * (y1 - y0)
+-
+-        out = out.reshape(orig_shape)
+-        return out
+-
+-
+-class History(nn.Module):
+-    def __init__(self) -> None:
+-        super().__init__()
+-        # Precision-exempt: history/logging buffers must remain FP64/INT64.
+-        self.__stnet_precision_exempt__ = True
+-        self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.timezone: str = "UTC"
+-        self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
+-        self.register_buffer("epochs", torch.zeros(1, dtype=torch.int64), persistent=True)
+-        self.os: str = ""
+-        self.kernel: str = ""
+-        self.cpu: List[str] = []
+-        self.arch: List[str] = []
+-        self.ram_gb: float = 0.0
+-        self.python: str = ""
+-        self.backends: List[str] = []
+-
+-        self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+-        self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer(
+-            "sampled_x_min",
+-            torch.full((1,), float("inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer(
+-            "sampled_x_max",
+-            torch.full((1,), float("-inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer(
+-            "sampled_y_min",
+-            torch.full((1,), float("inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer(
+-            "sampled_y_max",
+-            torch.full((1,), float("-inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-
+-        self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+-        self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer(
+-            "reduced_x_min",
+-            torch.full((1,), float("inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer(
+-            "reduced_x_max",
+-            torch.full((1,), float("-inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+-        self.register_buffer(
+-            "reduced_y_min",
+-            torch.full((1,), float("inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self.register_buffer(
+-            "reduced_y_max",
+-            torch.full((1,), float("-inf"), dtype=torch.float64),
+-            persistent=True,
+-        )
+-        self._global_step: int = 0
+-        self._records: List[Dict[str, Any]] = []
+-        self.max_history_steps: int = 0
+-
+-    @torch.no_grad()
+-    def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
+-        self.start.fill_(round(float(start_posix), 6))
+-
+-        if timezone is None or not str(timezone).strip():
+-            try:
+-                import datetime
+-                import time as _time
+-
+-                now = datetime.datetime.now().astimezone()
+-                tzinfo = now.tzinfo
+-                tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
+-                tz_name = tzinfo.tzname(now) if tzinfo is not None else None
+-                tz_env = None
+-                try:
+-                    tz_env = _time.tzname[0]
+-                except (AttributeError, IndexError, TypeError):
+-                    tz_env = None
+-                tz = tz_key or tz_name or tz_env or "UTC"
+-                self.timezone = str(tz)
+-            except Exception:
+-                self.timezone = "UTC"
+-        else:
+-            self.timezone = str(timezone)
+-
+-    @torch.no_grad()
+-    def end_session(self, end_posix: float, peers: int) -> None:
+-        self.end.fill_(round(float(end_posix), 6))
+-        self.peers.fill_(int(peers))
+-
+-    @torch.no_grad()
+-    def set_epochs(self, epochs: int) -> None:
+-        self.epochs.fill_(max(0, int(epochs)))
+-
+-    @torch.no_grad()
+-    def set_system_info(
+-        self,
+-        os_name: str,
+-        kernel: str,
+-        cpu_list: List[str],
+-        arch_list: List[str],
+-        ram_gb: int,
+-        python_version: str,
+-        backends: List[str],
+-    ) -> None:
+-        import platform
+-
+-        self.os = str(os_name)
+-        self.kernel = str(kernel)
+-        self.python = str(python_version)
+-
+-        cpu_models: List[str] = []
+-        arch_norm: List[str] = []
+-        try:
+-            from ..core.system import cpu_info, process_cpu_count
+-
+-            n_cores = max(1, int(process_cpu_count() or 1))
+-
+-            model_name: Optional[str] = None
+-            with contextlib.suppress(Exception):
+-                info = cpu_info()
+-                first = info.split(";", 1)[0]
+-                cand = first.split(":", 1)[1] if ":" in first else first
+-                cand = str(cand).strip()
+-                if cand:
+-                    model_name = cand
+-
+-            if not model_name:
+-                model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
+-
+-            arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
+-
+-            cpu_models = [str(model_name) for _ in range(int(n_cores))]
+-            arch_norm = [str(arch_name) for _ in range(int(n_cores))]
+-        except Exception:
+-            cpu_models = list(cpu_list)
+-            arch_norm = list(arch_list)
+-
+-        self.cpu = cpu_models
+-        self.arch = arch_norm
+-
+-        try:
+-            from ..core.system import Memory
+-
+-            total_bytes = Memory.total()
+-            if total_bytes is not None and int(total_bytes) > 0:
+-                self.ram_gb = float(round(float(total_bytes) / (1024.0 ** 3), 2))
+-            else:
+-                self.ram_gb = float(ram_gb)
+-        except Exception:
+-            self.ram_gb = float(ram_gb)
+-
+-        backend_devices: List[str] = []
+-        try:
+-            if torch.cuda.is_available():
+-                num_cuda = torch.cuda.device_count()
+-                for idx in range(num_cuda):
+-                    try:
+-                        name = torch.cuda.get_device_name(idx)
+-                    except Exception:
+-                        name = "CUDA Device"
+-                    backend_devices.append(f"cuda:{idx}, {name}")
+-
+-            mps = getattr(torch.backends, "mps", None)
+-            if (
+-                mps is not None
+-                and getattr(mps, "is_available", None)
+-                and torch.backends.mps.is_available()
+-            ):
+-                chip_name = platform.processor() or "Apple Silicon"
+-                backend_devices.append(f"mps:0, {chip_name}")
+-
+-            for idx, model_name in enumerate(cpu_models):
+-                backend_devices.append(f"cpu:{idx}, {model_name}")
+-
+-        except Exception:
+-            backend_devices = list(backends)
+-
+-        self.backends = backend_devices
+-
+-    @torch.no_grad()
+-    def record_batch(
+-        self,
+-        x: torch.Tensor,
+-        y: torch.Tensor,
+-        *args: Any,
+-        use_for_sample: bool = True,
+-        use_for_reduced: bool = True,
+-        step: Optional[int] = None,
+-        extra: Optional[Mapping[str, Any]] = None,
+-        **kwargs: Any,
+-    ) -> None:
+-        if x.numel() == 0 or y.numel() == 0:
+-            return
+-        x_det = x.detach()
+-        y_det = y.detach()
+-
+-        def _stats(t: torch.Tensor):
+-            if t.is_floating_point() or t.is_complex():
+-                v, m = torch.var_mean(t, correction=0)
+-                mn, mx = torch.aminmax(t)
+-            else:
+-                mn, mx = torch.aminmax(t)
+-                m = t.sum(dtype=torch.float64) / float(t.numel())
+-                v = torch.zeros((), dtype=torch.float64, device=m.device)
+-            return v, m, mn, mx
+-
+-        xvar_dev, xm_dev, xmin_dev, xmax_dev = _stats(x_det)
+-        yvar_dev, ym_dev, ymin_dev, ymax_dev = _stats(y_det)
+-
+-        stats_device = self.sampled_x_mean.device
+-        xm = xm_dev.to(device=stats_device, dtype=torch.float64)
+-        xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
+-        xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
+-        xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
+-        ym = ym_dev.to(device=stats_device, dtype=torch.float64)
+-        yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
+-        ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
+-        ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
+-
+-        if use_for_sample:
+-            n = int(self.sampled_n.item())
+-            n_new = n + 1
+-            w_old = n / n_new if n_new > 0 else 0.0
+-            w_new = 1.0 / n_new
+-            self.sampled_n.fill_(n_new)
+-            self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
+-            self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
+-            self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
+-            self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
+-            self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
+-            self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
+-            self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
+-            self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
+-
+-        if use_for_reduced:
+-            n = int(self.reduced_n.item())
+-            n_new = n + 1
+-            w_old = n / n_new if n_new > 0 else 0.0
+-            w_new = 1.0 / n_new
+-            self.reduced_n.fill_(n_new)
+-            self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
+-            self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
+-            self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
+-            self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
+-            self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
+-            self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
+-            self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
+-            self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+-
+-        self._append(
+-            xm=xm,
+-            xvar=xvar,
+-            xmin=xmin,
+-            xmax=xmax,
+-            ym=ym,
+-            yvar=yvar,
+-            ymin=ymin,
+-            ymax=ymax,
+-            batch_size=int(x.shape[0]),
+-            step=step,
+-            extra=extra,
+-        )
+-
+-    def _append(
+-        self,
+-        *args: Any,
+-        xm: torch.Tensor,
+-        xvar: torch.Tensor,
+-        xmin: torch.Tensor,
+-        xmax: torch.Tensor,
+-        ym: torch.Tensor,
+-        yvar: torch.Tensor,
+-        ymin: torch.Tensor,
+-        ymax: torch.Tensor,
+-        batch_size: int,
+-        step: Optional[int],
+-        extra: Optional[Mapping[str, Any]],
+-        **kwargs: Any,
+-    ) -> None:
+-        t = int(step) if step is not None else int(self._global_step)
+-        self._global_step = t + 1
+-
+-        def _f(val: torch.Tensor) -> float:
+-            return float(val.item())
+-
+-        rec: Dict[str, Any] = {
+-            "timestep": t,
+-            "batch_size": int(batch_size),
+-            "batch_x_mean": _f(xm),
+-            "batch_x_var": _f(xvar),
+-            "batch_x_min": _f(xmin),
+-            "batch_x_max": _f(xmax),
+-            "batch_y_mean": _f(ym),
+-            "batch_y_var": _f(yvar),
+-            "batch_y_min": _f(ymin),
+-            "batch_y_max": _f(ymax),
+-            "sampled_n": int(self.sampled_n.item()),
+-            "sampled_x_mean": _f(self.sampled_x_mean),
+-            "sampled_x_var": _f(self.sampled_x_var),
+-            "sampled_x_min": _f(self.sampled_x_min),
+-            "sampled_x_max": _f(self.sampled_x_max),
+-            "sampled_y_mean": _f(self.sampled_y_mean),
+-            "sampled_y_var": _f(self.sampled_y_var),
+-            "sampled_y_min": _f(self.sampled_y_min),
+-            "sampled_y_max": _f(self.sampled_y_max),
+-            "reduced_n": int(self.reduced_n.item()),
+-            "reduced_x_mean": _f(self.reduced_x_mean),
+-            "reduced_x_var": _f(self.reduced_x_var),
+-            "reduced_x_min": _f(self.reduced_x_min),
+-            "reduced_x_max": _f(self.reduced_x_max),
+-            "reduced_y_mean": _f(self.reduced_y_mean),
+-            "reduced_y_var": _f(self.reduced_y_var),
+-            "reduced_y_min": _f(self.reduced_y_min),
+-            "reduced_y_max": _f(self.reduced_y_max),
+-        }
+-        if extra is not None:
+-            rec["extra"] = dict(extra)
+-        self._records.append(rec)
+-        max_steps = int(self.max_history_steps or 0)
+-        if max_steps > 0 and len(self._records) > max_steps:
+-            overflow = len(self._records) - max_steps
+-            if overflow > 0:
+-                del self._records[:overflow]
+-
+-    def save(self) -> Sequence[Mapping[str, Any]]:
+-        return list(self._records)
+-
+-    def clear(self) -> None:
+-        self._records.clear()
+-        self._global_step = 0
+-
+-
+-def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
+-    scaler: Optional[Scaler] = None
+-    for module in model.modules():
+-        if isinstance(module, Scaler):
+-            scaler = module
+-            break
+-    if scaler is None:
+-        return
+-
+-    view: Mapping[str, Any]
+-    if "scaler.x_mean" in state or "module.scaler.x_mean" in state:
+-        view = state
+-    elif "model" in state and isinstance(state["model"], Mapping):
+-        view = state["model"]
+-    else:
+-        view = state
+-
+-    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
+-    prefixes = ("scaler.", "module.scaler.")
+-
+-    for prefix in prefixes:
+-        for name in buf_names:
+-            key = prefix + name
+-            if key not in view:
+-                continue
+-            src = view[key]
+-            if not isinstance(src, torch.Tensor):
+-                continue
+-            buf = getattr(scaler, name, None)
+-            if not isinstance(buf, torch.Tensor):
+-                continue
+-            if tuple(buf.shape) == tuple(src.shape):
+-                continue
+-            try:
+-                buf.resize_(src.shape)
+-            except Exception:
+-                new_buf = buf.detach().new_zeros(src.shape)
+-                try:
+-                    scaler._buffers[name] = new_buf
+-                except Exception:
+-                    setattr(scaler, name, new_buf)
+diff --git a/stnet/model/primitives.py b/stnet/model/primitives.py
+index 562a4b6..5c49720 100644
+--- a/stnet/model/primitives.py
++++ b/stnet/model/primitives.py
+@@ -5,7 +5,7 @@ import contextlib
+ import math
+ import threading
+ from collections import OrderedDict
+-from typing import Any, Optional, Tuple
++from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+ 
+ import torch
+ import torch.nn as nn
+@@ -1470,3 +1470,871 @@ class CrossAttention(nn.Module):
+         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
+         ctx = self.out_proj(ctx)
+         return q_tokens + self.drop_path(self.dropout(ctx))
++
++
++# -----------------------------------------------------------------------------
++# Utility modules
++# -----------------------------------------------------------------------------
++class Scaler(nn.Module):
++    def __init__(self, eps: float = 1e-6) -> None:
++        super().__init__()
++        # Precision-exempt: scaler stats must remain FP64 for numerical stability.
++        self.__stnet_precision_exempt__ = True
++        self.eps = float(eps)
++        self.calib_mode: str = "none"
++        self.register_buffer("x_mean", torch.zeros(1, dtype=torch.float64))
++        self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
++        self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
++        self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
++        self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
++        self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
++        self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
++        self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
++
++        # Cache device/dtype-converted stats to avoid per-forward allocations.
++        self._stats_cache_lock = threading.Lock()
++        self._stats_cache_max = 8
++        self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
++        self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
++
++    def _invalidate_stats_cache(self) -> None:
++        with self._stats_cache_lock:
++            self._x_stats_cache.clear()
++            self._y_stats_cache.clear()
++
++    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
++        super()._apply(fn)
++        self._invalidate_stats_cache()
++        return self
++
++    def _load_from_state_dict(
++        self,
++        state_dict: Mapping[str, Any],
++        prefix: str,
++        local_metadata: Dict[str, Any],
++        strict: bool,
++        missing_keys: List[str],
++        unexpected_keys: List[str],
++        error_msgs: List[str],
++    ) -> None:
++        super()._load_from_state_dict(
++            state_dict,
++            prefix,
++            local_metadata,
++            strict,
++            missing_keys,
++            unexpected_keys,
++            error_msgs,
++        )
++        self._invalidate_stats_cache()
++
++    @torch.no_grad()
++    def update_x(self, x: torch.Tensor) -> None:
++        if x.numel() == 0:
++            return
++        x_work = x.detach()
++        if x_work.dim() == 1:
++            x_flat = x_work.view(-1, 1)
++        else:
++            x_flat = x_work.reshape(-1, x_work.shape[-1])
++        x_flat = x_flat.to(dtype=torch.float64)
++        mean = x_flat.mean(dim=0)
++        std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
++        if self.x_mean.shape != mean.shape:
++            self.x_mean.resize_(mean.shape)
++        if self.x_std.shape != std.shape:
++            self.x_std.resize_(std.shape)
++        self.x_mean.copy_(mean)
++        self.x_std.copy_(std)
++        self._invalidate_stats_cache()
++
++    @torch.no_grad()
++    def update_y(self, y: torch.Tensor) -> None:
++        if y.numel() == 0:
++            return
++        y_work = y.detach()
++        if y_work.dim() == 1:
++            y_flat = y_work.view(-1, 1)
++        else:
++            y_flat = y_work.reshape(-1, y_work.shape[-1])
++        y_flat = y_flat.to(dtype=torch.float64)
++        mean = y_flat.mean(dim=0)
++        std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
++        if self.y_mean.shape != mean.shape:
++            self.y_mean.resize_(mean.shape)
++        if self.y_std.shape != std.shape:
++            self.y_std.resize_(std.shape)
++        self.y_mean.copy_(mean)
++        self.y_std.copy_(std)
++        self._invalidate_stats_cache()
++
++    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
++        if x.numel() == 0:
++            return x
++        feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
++        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
++            raise RuntimeError(
++                "Scaler.normalize_x: feature dimension mismatch: "
++                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
++            )
++
++        key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
++        with self._stats_cache_lock:
++            cached = self._x_stats_cache.get(key)
++        if cached is None:
++            mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
++            std_b = self.x_std.to(device=x.device, dtype=x.dtype)
++            with self._stats_cache_lock:
++                if len(self._x_stats_cache) >= int(self._stats_cache_max):
++                    self._x_stats_cache.clear()
++                self._x_stats_cache[key] = (mean_b, std_b)
++        else:
++            mean_b, std_b = cached
++
++        if x.dim() == 1:
++            return (x - mean_b) / (std_b + self.eps)
++
++        view_shape = [1] * (x.dim() - 1) + [-1]
++        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
++        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
++        return (x - mean) / (std + self.eps)
++
++    def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
++        if x_scaled.numel() == 0:
++            return x_scaled
++        feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
++        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
++            raise RuntimeError(
++                "Scaler.denormalize_x: feature dimension mismatch: "
++                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
++            )
++
++        key = (
++            x_scaled.device.type,
++            int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
++            x_scaled.dtype,
++        )
++        with self._stats_cache_lock:
++            cached = self._x_stats_cache.get(key)
++        if cached is None:
++            mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
++            std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
++            with self._stats_cache_lock:
++                if len(self._x_stats_cache) >= int(self._stats_cache_max):
++                    self._x_stats_cache.clear()
++                self._x_stats_cache[key] = (mean_b, std_b)
++        else:
++            mean_b, std_b = cached
++
++        if x_scaled.dim() == 1:
++            return x_scaled * (std_b + self.eps) + mean_b
++
++        view_shape = [1] * (x_scaled.dim() - 1) + [-1]
++        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
++        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
++        return x_scaled * (std + self.eps) + mean
++
++    def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
++        mean = self.y_mean
++        std = self.y_std
++        if mean.ndim > 1:
++            mean_flat = mean.reshape(-1)
++            std_flat = std.reshape(-1)
++            with torch.no_grad():
++                if self.y_mean.shape != mean_flat.shape:
++                    self.y_mean.resize_(mean_flat.shape)
++                if self.y_std.shape != std_flat.shape:
++                    self.y_std.resize_(std_flat.shape)
++                self.y_mean.copy_(mean_flat)
++                self.y_std.copy_(std_flat)
++            self._invalidate_stats_cache()
++            mean = self.y_mean
++            std = self.y_std
++        return mean, std
++
++    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
++        if y.numel() == 0:
++            return y
++
++        orig_shape = y.shape
++        if y.dim() == 1:
++            y_flat = y.view(1, -1)
++            batch_first = False
++        else:
++            y_flat = y.view(y.shape[0], -1)
++            batch_first = True
++
++        mean_vec, std_vec = self._y_stats_vector()
++        key = (
++            y_flat.device.type,
++            int(y_flat.device.index) if y_flat.device.index is not None else -1,
++            y_flat.dtype,
++        )
++        with self._stats_cache_lock:
++            cached = self._y_stats_cache.get(key)
++        if cached is None:
++            mean = mean_vec.to(device=y_flat.device, dtype=y_flat.dtype)
++            std = std_vec.to(device=y_flat.device, dtype=y_flat.dtype)
++            with self._stats_cache_lock:
++                if len(self._y_stats_cache) >= int(self._stats_cache_max):
++                    self._y_stats_cache.clear()
++                self._y_stats_cache[key] = (mean, std)
++        else:
++            mean, std = cached
++
++        if mean.numel() == 1 and std.numel() == 1:
++            z_flat = (y_flat - mean) / (std + self.eps)
++        else:
++            if y_flat.shape[1] != mean.numel():
++                raise RuntimeError(
++                    "Scaler.normalize_y: feature dimension mismatch: "
++                    f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
++                )
++            z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
++
++        return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
++
++    def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
++        if z.numel() == 0:
++            return z
++
++        orig_shape = z.shape
++        if z.dim() == 1:
++            z_flat = z.view(1, -1)
++            batch_first = False
++        else:
++            z_flat = z.view(z.shape[0], -1)
++            batch_first = True
++
++        mean_vec, std_vec = self._y_stats_vector()
++        key = (
++            z_flat.device.type,
++            int(z_flat.device.index) if z_flat.device.index is not None else -1,
++            z_flat.dtype,
++        )
++        with self._stats_cache_lock:
++            cached = self._y_stats_cache.get(key)
++        if cached is None:
++            mean = mean_vec.to(device=z_flat.device, dtype=z_flat.dtype)
++            std = std_vec.to(device=z_flat.device, dtype=z_flat.dtype)
++            with self._stats_cache_lock:
++                if len(self._y_stats_cache) >= int(self._stats_cache_max):
++                    self._y_stats_cache.clear()
++                self._y_stats_cache[key] = (mean, std)
++        else:
++            mean, std = cached
++
++        if mean.numel() == 1 and std.numel() == 1:
++            y_flat = z_flat * std + mean
++        else:
++            if z_flat.shape[1] != mean.numel():
++                raise RuntimeError(
++                    "Scaler.denormalize_y: feature dimension mismatch: "
++                    f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
++                )
++            y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
++
++        return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
++
++    def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
++        match self.calib_mode:
++            case "piecewise":
++                if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
++                    return self._piecewise(z_raw)
++                return z_raw
++            case "affine" | "none":
++                if self.affine_a.numel() > 0:
++                    return self.affine(z_raw)
++                return z_raw
++            case _:
++                return z_raw
++
++    def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
++        if self.affine_a.numel() == 0:
++            return z_raw
++        a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
++        b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
++        return z_raw * a + b
++
++    @torch.no_grad()
++    def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
++        if self.affine_a.shape != a.shape:
++            self.affine_a.resize_(a.shape)
++        if self.affine_b.shape != b.shape:
++            self.affine_b.resize_(b.shape)
++        self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
++        self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
++        self.pw_x.resize_(0)
++        self.pw_y.resize_(0)
++        self.calib_mode = "affine"
++
++    @torch.no_grad()
++    def fit(
++        self,
++        z_raw: torch.Tensor,
++        z_true: torch.Tensor,
++        mode: str = "affine",
++        num_bins: int = 8,
++    ) -> None:
++        if mode == "affine":
++            self._fit_affine(z_raw, z_true)
++            self.calib_mode = "affine"
++        elif mode == "piecewise":
++            self._fit_piecewise(z_raw, z_true, num_bins=num_bins)
++            self.calib_mode = "piecewise"
++        else:
++            raise ValueError(f"Unsupported calibration mode: {mode}")
++
++    @torch.no_grad()
++    def _fit_affine(self, z_raw: torch.Tensor, z_true: torch.Tensor) -> None:
++        if z_raw.numel() == 0 or z_true.numel() == 0:
++            return
++
++        x = z_raw.detach()
++        y = z_true.detach()
++        if x.ndim == 1:
++            x = x.unsqueeze(-1)
++        if y.ndim == 1:
++            y = y.unsqueeze(-1)
++
++        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
++        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
++
++        x_mean = x.mean(dim=0)
++        y_mean = y.mean(dim=0)
++        x_centered = x - x_mean
++        y_centered = y - y_mean
++
++        denom = (x_centered * x_centered).sum(dim=0)
++        num = (x_centered * y_centered).sum(dim=0)
++
++        tiny_mask = denom.abs() < self.eps
++        if bool(tiny_mask.any().item()):
++            denom_safe = denom.clone()
++            denom_safe[tiny_mask] = 1.0
++        else:
++            denom_safe = denom
++
++        a64 = num / denom_safe
++        b64 = y_mean - a64 * x_mean
++
++        a64[tiny_mask] = 1.0
++        b64[tiny_mask] = 0.0
++
++        a = a64.to(dtype=torch.float64, device=self.affine_a.device)
++        b = b64.to(dtype=torch.float64, device=self.affine_b.device)
++
++        if self.affine_a.shape != a.shape:
++            self.affine_a.resize_(a.shape)
++        if self.affine_b.shape != b.shape:
++            self.affine_b.resize_(b.shape)
++        self.affine_a.copy_(a)
++        self.affine_b.copy_(b)
++
++        self.pw_x.resize_(0)
++        self.pw_y.resize_(0)
++
++    @torch.no_grad()
++    def _fit_piecewise(
++        self,
++        z_raw: torch.Tensor,
++        z_true: torch.Tensor,
++        num_bins: int = 8,
++    ) -> None:
++        if z_raw.numel() == 0 or z_true.numel() == 0:
++            return
++        if num_bins < 2:
++            self._fit_affine(z_raw, z_true)
++            self.calib_mode = "affine"
++            return
++
++        x = z_raw.detach()
++        y = z_true.detach()
++        if x.ndim == 1:
++            x = x.unsqueeze(-1)
++        if y.ndim == 1:
++            y = y.unsqueeze(-1)
++        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
++        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
++
++        _, C = x.shape
++        device = self.affine_a.device
++        knots_x = torch.empty(C, num_bins, dtype=torch.float64, device=device)
++        knots_y = torch.empty(C, num_bins, dtype=torch.float64, device=device)
++
++        for j in range(C):
++            xj = x[:, j]
++            yj = y[:, j]
++            if xj.numel() == 0:
++                knots_x[j] = torch.linspace(-1.0, 1.0, num_bins, device=device)
++                knots_y[j] = knots_x[j]
++                continue
++            xj_sorted, idx = torch.sort(xj)
++            yj_sorted = yj[idx]
++            idx_q = torch.linspace(
++                0,
++                max(0, xj_sorted.numel() - 1),
++                num_bins,
++                dtype=torch.long,
++                device=xj_sorted.device,
++            )
++            qx = xj_sorted[idx_q]
++            qy = yj_sorted[idx_q]
++            knots_x[j] = qx.to(dtype=torch.float64, device=device)
++            knots_y[j] = qy.to(dtype=torch.float64, device=device)
++
++        if self.pw_x.shape != knots_x.shape:
++            self.pw_x.resize_(knots_x.shape)
++        if self.pw_y.shape != knots_y.shape:
++            self.pw_y.resize_(knots_y.shape)
++        self.pw_x.copy_(knots_x)
++        self.pw_y.copy_(knots_y)
++
++        if self.affine_a.numel() != C:
++            self.affine_a.resize_(C)
++            self.affine_b.resize_(C)
++        self.affine_a.fill_(1.0)
++        self.affine_b.zero_()
++
++    def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
++        """Piecewise-linear calibration without mutating module buffers.
++
++        Previous code resized/sliced/reassigned self.pw_x/self.pw_y inside forward,
++        which is unsafe under multithreading and can break torch.compile assumptions.
++        This implementation treats saved knots as read-only and uses local views.
++        """
++        if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
++            return z_raw
++        if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
++            return z_raw
++
++        pw_x = self.pw_x
++        pw_y = self.pw_y
++        C_saved, Kx = pw_x.shape
++        _, Ky = pw_y.shape
++        K = int(min(Kx, Ky))
++        if K < 2:
++            return z_raw
++
++        # Local views only (do not mutate buffers).
++        pw_x = pw_x[:, :K]
++        pw_y = pw_y[:, :K]
++
++        orig_shape = z_raw.shape
++        z = z_raw.unsqueeze(-1) if z_raw.ndim == 1 else z_raw
++        z = z.reshape(-1, int(z.shape[-1]))
++
++        _, C_target = z.shape
++        device = z.device
++        dtype = z.dtype
++
++        out = torch.empty_like(z)
++
++        # If saved calibration has fewer channels, reuse the last channel for extras.
++        last_idx = max(0, int(C_saved) - 1)
++        for j in range(int(C_target)):
++            src_j = j if j < int(C_saved) else last_idx
++            xj = z[:, j]
++            knots_x = pw_x[src_j].to(device=device, dtype=dtype)
++            knots_y = pw_y[src_j].to(device=device, dtype=dtype)
++
++            idx = torch.bucketize(xj, knots_x)
++            idx = idx.clamp(1, knots_x.numel() - 1)
++            x0 = knots_x[idx - 1]
++            x1 = knots_x[idx]
++            y0 = knots_y[idx - 1]
++            y1 = knots_y[idx]
++            t = (xj - x0) / (x1 - x0 + self.eps)
++            out[:, j] = y0 + t * (y1 - y0)
++
++        out = out.reshape(orig_shape)
++        return out
++
++
++class History(nn.Module):
++    def __init__(self) -> None:
++        super().__init__()
++        # Precision-exempt: history/logging buffers must remain FP64/INT64.
++        self.__stnet_precision_exempt__ = True
++        self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.timezone: str = "UTC"
++        self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
++        self.register_buffer("epochs", torch.zeros(1, dtype=torch.int64), persistent=True)
++        self.os: str = ""
++        self.kernel: str = ""
++        self.cpu: List[str] = []
++        self.arch: List[str] = []
++        self.ram_gb: float = 0.0
++        self.python: str = ""
++        self.backends: List[str] = []
++
++        self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
++        self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer(
++            "sampled_x_min",
++            torch.full((1,), float("inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer(
++            "sampled_x_max",
++            torch.full((1,), float("-inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer(
++            "sampled_y_min",
++            torch.full((1,), float("inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer(
++            "sampled_y_max",
++            torch.full((1,), float("-inf"), dtype=torch.float64),
++            persistent=True,
++        )
++
++        self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
++        self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer(
++            "reduced_x_min",
++            torch.full((1,), float("inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer(
++            "reduced_x_max",
++            torch.full((1,), float("-inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
++        self.register_buffer(
++            "reduced_y_min",
++            torch.full((1,), float("inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self.register_buffer(
++            "reduced_y_max",
++            torch.full((1,), float("-inf"), dtype=torch.float64),
++            persistent=True,
++        )
++        self._global_step: int = 0
++        self._records: List[Dict[str, Any]] = []
++        self.max_history_steps: int = 0
++
++    @torch.no_grad()
++    def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
++        self.start.fill_(round(float(start_posix), 6))
++
++        if timezone is None or not str(timezone).strip():
++            try:
++                import datetime
++                import time as _time
++
++                now = datetime.datetime.now().astimezone()
++                tzinfo = now.tzinfo
++                tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
++                tz_name = tzinfo.tzname(now) if tzinfo is not None else None
++                tz_env = None
++                try:
++                    tz_env = _time.tzname[0]
++                except (AttributeError, IndexError, TypeError):
++                    tz_env = None
++                tz = tz_key or tz_name or tz_env or "UTC"
++                self.timezone = str(tz)
++            except Exception:
++                self.timezone = "UTC"
++        else:
++            self.timezone = str(timezone)
++
++    @torch.no_grad()
++    def end_session(self, end_posix: float, peers: int) -> None:
++        self.end.fill_(round(float(end_posix), 6))
++        self.peers.fill_(int(peers))
++
++    @torch.no_grad()
++    def set_epochs(self, epochs: int) -> None:
++        self.epochs.fill_(max(0, int(epochs)))
++
++    @torch.no_grad()
++    def set_system_info(
++        self,
++        os_name: str,
++        kernel: str,
++        cpu_list: List[str],
++        arch_list: List[str],
++        ram_gb: int,
++        python_version: str,
++        backends: List[str],
++    ) -> None:
++        import platform
++
++        self.os = str(os_name)
++        self.kernel = str(kernel)
++        self.python = str(python_version)
++
++        cpu_models: List[str] = []
++        arch_norm: List[str] = []
++        try:
++            from ..core.system import cpu_info, process_cpu_count
++
++            n_cores = max(1, int(process_cpu_count() or 1))
++
++            model_name: Optional[str] = None
++            with contextlib.suppress(Exception):
++                info = cpu_info()
++                first = info.split(";", 1)[0]
++                cand = first.split(":", 1)[1] if ":" in first else first
++                cand = str(cand).strip()
++                if cand:
++                    model_name = cand
++
++            if not model_name:
++                model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
++
++            arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
++
++            cpu_models = [str(model_name) for _ in range(int(n_cores))]
++            arch_norm = [str(arch_name) for _ in range(int(n_cores))]
++        except Exception:
++            cpu_models = list(cpu_list)
++            arch_norm = list(arch_list)
++
++        self.cpu = cpu_models
++        self.arch = arch_norm
++
++        try:
++            from ..core.system import Memory
++
++            total_bytes = Memory.total()
++            if total_bytes is not None and int(total_bytes) > 0:
++                self.ram_gb = float(round(float(total_bytes) / (1024.0 ** 3), 2))
++            else:
++                self.ram_gb = float(ram_gb)
++        except Exception:
++            self.ram_gb = float(ram_gb)
++
++        backend_devices: List[str] = []
++        try:
++            if torch.cuda.is_available():
++                num_cuda = torch.cuda.device_count()
++                for idx in range(num_cuda):
++                    try:
++                        name = torch.cuda.get_device_name(idx)
++                    except Exception:
++                        name = "CUDA Device"
++                    backend_devices.append(f"cuda:{idx}, {name}")
++
++            mps = getattr(torch.backends, "mps", None)
++            if (
++                mps is not None
++                and getattr(mps, "is_available", None)
++                and torch.backends.mps.is_available()
++            ):
++                chip_name = platform.processor() or "Apple Silicon"
++                backend_devices.append(f"mps:0, {chip_name}")
++
++            for idx, model_name in enumerate(cpu_models):
++                backend_devices.append(f"cpu:{idx}, {model_name}")
++
++        except Exception:
++            backend_devices = list(backends)
++
++        self.backends = backend_devices
++
++    @torch.no_grad()
++    def record_batch(
++        self,
++        x: torch.Tensor,
++        y: torch.Tensor,
++        *args: Any,
++        use_for_sample: bool = True,
++        use_for_reduced: bool = True,
++        step: Optional[int] = None,
++        extra: Optional[Mapping[str, Any]] = None,
++        **kwargs: Any,
++    ) -> None:
++        if x.numel() == 0 or y.numel() == 0:
++            return
++        x_det = x.detach()
++        y_det = y.detach()
++
++        def _stats(t: torch.Tensor):
++            if t.is_floating_point() or t.is_complex():
++                v, m = torch.var_mean(t, correction=0)
++                mn, mx = torch.aminmax(t)
++            else:
++                mn, mx = torch.aminmax(t)
++                m = t.sum(dtype=torch.float64) / float(t.numel())
++                v = torch.zeros((), dtype=torch.float64, device=m.device)
++            return v, m, mn, mx
++
++        xvar_dev, xm_dev, xmin_dev, xmax_dev = _stats(x_det)
++        yvar_dev, ym_dev, ymin_dev, ymax_dev = _stats(y_det)
++
++        stats_device = self.sampled_x_mean.device
++        xm = xm_dev.to(device=stats_device, dtype=torch.float64)
++        xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
++        xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
++        xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
++        ym = ym_dev.to(device=stats_device, dtype=torch.float64)
++        yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
++        ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
++        ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
++
++        if use_for_sample:
++            n = int(self.sampled_n.item())
++            n_new = n + 1
++            w_old = n / n_new if n_new > 0 else 0.0
++            w_new = 1.0 / n_new
++            self.sampled_n.fill_(n_new)
++            self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
++            self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
++            self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
++            self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
++            self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
++            self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
++            self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
++            self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
++
++        if use_for_reduced:
++            n = int(self.reduced_n.item())
++            n_new = n + 1
++            w_old = n / n_new if n_new > 0 else 0.0
++            w_new = 1.0 / n_new
++            self.reduced_n.fill_(n_new)
++            self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
++            self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
++            self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
++            self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
++            self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
++            self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
++            self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
++            self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
++
++        self._append(
++            xm=xm,
++            xvar=xvar,
++            xmin=xmin,
++            xmax=xmax,
++            ym=ym,
++            yvar=yvar,
++            ymin=ymin,
++            ymax=ymax,
++            batch_size=int(x.shape[0]),
++            step=step,
++            extra=extra,
++        )
++
++    def _append(
++        self,
++        *args: Any,
++        xm: torch.Tensor,
++        xvar: torch.Tensor,
++        xmin: torch.Tensor,
++        xmax: torch.Tensor,
++        ym: torch.Tensor,
++        yvar: torch.Tensor,
++        ymin: torch.Tensor,
++        ymax: torch.Tensor,
++        batch_size: int,
++        step: Optional[int],
++        extra: Optional[Mapping[str, Any]],
++        **kwargs: Any,
++    ) -> None:
++        t = int(step) if step is not None else int(self._global_step)
++        self._global_step = t + 1
++
++        def _f(val: torch.Tensor) -> float:
++            return float(val.item())
++
++        rec: Dict[str, Any] = {
++            "timestep": t,
++            "batch_size": int(batch_size),
++            "batch_x_mean": _f(xm),
++            "batch_x_var": _f(xvar),
++            "batch_x_min": _f(xmin),
++            "batch_x_max": _f(xmax),
++            "batch_y_mean": _f(ym),
++            "batch_y_var": _f(yvar),
++            "batch_y_min": _f(ymin),
++            "batch_y_max": _f(ymax),
++            "sampled_n": int(self.sampled_n.item()),
++            "sampled_x_mean": _f(self.sampled_x_mean),
++            "sampled_x_var": _f(self.sampled_x_var),
++            "sampled_x_min": _f(self.sampled_x_min),
++            "sampled_x_max": _f(self.sampled_x_max),
++            "sampled_y_mean": _f(self.sampled_y_mean),
++            "sampled_y_var": _f(self.sampled_y_var),
++            "sampled_y_min": _f(self.sampled_y_min),
++            "sampled_y_max": _f(self.sampled_y_max),
++            "reduced_n": int(self.reduced_n.item()),
++            "reduced_x_mean": _f(self.reduced_x_mean),
++            "reduced_x_var": _f(self.reduced_x_var),
++            "reduced_x_min": _f(self.reduced_x_min),
++            "reduced_x_max": _f(self.reduced_x_max),
++            "reduced_y_mean": _f(self.reduced_y_mean),
++            "reduced_y_var": _f(self.reduced_y_var),
++            "reduced_y_min": _f(self.reduced_y_min),
++            "reduced_y_max": _f(self.reduced_y_max),
++        }
++        if extra is not None:
++            rec["extra"] = dict(extra)
++        self._records.append(rec)
++        max_steps = int(self.max_history_steps or 0)
++        if max_steps > 0 and len(self._records) > max_steps:
++            overflow = len(self._records) - max_steps
++            if overflow > 0:
++                del self._records[:overflow]
++
++    def save(self) -> Sequence[Mapping[str, Any]]:
++        return list(self._records)
++
++    def clear(self) -> None:
++        self._records.clear()
++        self._global_step = 0
++
++
++def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
++    scaler: Optional[Scaler] = None
++    for module in model.modules():
++        if isinstance(module, Scaler):
++            scaler = module
++            break
++    if scaler is None:
++        return
++
++    view: Mapping[str, Any]
++    if "scaler.x_mean" in state or "module.scaler.x_mean" in state:
++        view = state
++    elif "model" in state and isinstance(state["model"], Mapping):
++        view = state["model"]
++    else:
++        view = state
++
++    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
++    prefixes = ("scaler.", "module.scaler.")
++
++    for prefix in prefixes:
++        for name in buf_names:
++            key = prefix + name
++            if key not in view:
++                continue
++            src = view[key]
++            if not isinstance(src, torch.Tensor):
++                continue
++            buf = getattr(scaler, name, None)
++            if not isinstance(buf, torch.Tensor):
++                continue
++            if tuple(buf.shape) == tuple(src.shape):
++                continue
++            try:
++                buf.resize_(src.shape)
++            except Exception:
++                new_buf = buf.detach().new_zeros(src.shape)
++                try:
++                    scaler._buffers[name] = new_buf
++                except Exception:
++                    setattr(scaler, name, new_buf)
+diff --git a/stnet/run/compute.py b/stnet/run/compute.py
+index c105373..272c810 100644
+--- a/stnet/run/compute.py
++++ b/stnet/run/compute.py
+@@ -49,9 +49,9 @@ from ..data.pipeline import (
+ )
+ from ..core.graph import inference_mode
+ from ..model.architecture import Root
+-from ..model.blocks import History, resize_scaler_buffer
++from ..model.primitives import History, resize_scaler_buffer
+ from .io import _torch_load_checkpoint, _to_cpu
+-from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
++from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
+ 
+ 
+ logger = logging.getLogger(__name__)
+@@ -668,7 +668,7 @@ def train(
+             cfg_model = coerce_model_config(cfg_obj)
+         else:
+             cfg_model = ModelConfig()
+-        cfg_dict: Dict[str, Any] = model_config_to_dict(cfg_model)
++        cfg_dict: Dict[str, Any] = cfg_model.to_dict()
+ 
+         lc = LaunchConfig(
+             min_nodes=1,
+@@ -1285,13 +1285,77 @@ def _write_predictions_h5_from_memmaps(
+ 
+     return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode="r")
+ 
++
++def _coerce_float_dtype_like_to_torch(dt: Any) -> torch.dtype | None:
++    """Best-effort conversion of dtype-like objects to torch float dtypes."""
++    try:
++        if isinstance(dt, torch.dtype):
++            return dt
++        if dt is None:
++            return None
++        ndt = np.dtype(dt)
++        if ndt == np.float64:
++            return torch.float64
++        if ndt == np.float32:
++            return torch.float32
++        if ndt == np.float16:
++            return torch.float16
++    except Exception:
++        return None
++    return None
++
++
++def _infer_master_float_dtype_for_predict_input(obj: Any) -> torch.dtype:
++    """Infer the master floating dtype to use when preprocessing predict() input.
++
++    Goal: preserve float64 inputs (avoid silent precision loss) while keeping the
++    default path on float32 to reduce CPU memory and copy cost.
++    """
++
++    try:
++        # TensorDict input
++        if TensorDictBase is not None and isinstance(obj, TensorDictBase):
++            X_td, _ = extract_xy(obj, labels_required=False)
++            if X_td is None:
++                return torch.float32
++            if not bool(torch.is_tensor(X_td)):
++                X_td = torch.as_tensor(X_td)
++            dt = _coerce_float_dtype_like_to_torch(getattr(X_td, "dtype", None))
++            return torch.float64 if dt == torch.float64 else torch.float32
++
++        # Feature/label mapping input
++        if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
++            f_key = resolve_feature_key(obj)
++            if f_key is not None and f_key in obj:
++                X_all = obj.get(f_key)
++                dt = _coerce_float_dtype_like_to_torch(getattr(X_all, "dtype", None))
++                if dt is not None:
++                    return torch.float64 if dt == torch.float64 else torch.float32
++                if isinstance(X_all, (list, tuple)) and X_all:
++                    dt0 = _coerce_float_dtype_like_to_torch(getattr(X_all[0], "dtype", None))
++                    return torch.float64 if dt0 == torch.float64 else torch.float32
++
++        # Tensor / numpy
++        if torch.is_tensor(obj):
++            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
++            return torch.float64 if dt == torch.float64 else torch.float32
++
++        if isinstance(obj, np.ndarray):
++            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
++            return torch.float64 if dt == torch.float64 else torch.float32
++
++    except Exception:
++        pass
++
++    return torch.float32
++
+ @catchtime(logger, fn_name="predict")
+ def predict(
++    model: torch.nn.Module,
+     data: Any,
+     *args: Any,
+-    model: Optional[torch.nn.Module] = None,
+     mode: OpsMode = "predict",
+-    seed: int = 0,
++    seed: int = 7,
+     shuffle: bool = False,
+     max_nodes: Optional[int] = None,
+     rdzv_endpoint: Optional[str] = None,
+@@ -1306,6 +1370,7 @@ def predict(
+     PersistentTensorDict is written instead.
+     """
+ 
++    # (model is positional, but keep a clear error if a caller passes None.)
+     if model is None:
+         raise ValueError("predict: model must not be None")
+ 
+@@ -1330,64 +1395,7 @@ def predict(
+     lazy = bool(kwargs.pop("lazy", True))
+     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
+ 
+-    def _infer_master_float_dtype(obj: Any) -> torch.dtype:
+-        """Best-effort dtype inference for predict() materialization.
+-
+-        We prefer to preserve float64 inputs (avoid silent precision loss) while
+-        keeping the default path on float32 to reduce CPU memory and copy cost.
+-        """
+-
+-        def _coerce(dt: Any) -> torch.dtype | None:
+-            try:
+-                if isinstance(dt, torch.dtype):
+-                    return dt
+-                if dt is None:
+-                    return None
+-                # numpy dtype
+-                ndt = np.dtype(dt)
+-                if ndt == np.float64:
+-                    return torch.float64
+-                if ndt == np.float32:
+-                    return torch.float32
+-                if ndt == np.float16:
+-                    return torch.float16
+-            except Exception:
+-                return None
+-            return None
+-
+-        try:
+-            if TensorDictBase is not None and isinstance(obj, TensorDictBase):
+-                X_td, _ = extract_xy(obj, labels_required=False)
+-                if X_td is None:
+-                    return torch.float32
+-                if not bool(torch.is_tensor(X_td)):
+-                    X_td = torch.as_tensor(X_td)
+-                dt = _coerce(getattr(X_td, "dtype", None))
+-                return torch.float64 if dt == torch.float64 else torch.float32
+-
+-            if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
+-                f_key = resolve_feature_key(obj)
+-                if f_key is not None and f_key in obj:
+-                    X_all = obj.get(f_key)
+-                    dt = _coerce(getattr(X_all, "dtype", None))
+-                    if dt is not None:
+-                        return torch.float64 if dt == torch.float64 else torch.float32
+-                    if isinstance(X_all, (list, tuple)) and X_all:
+-                        dt0 = _coerce(getattr(X_all[0], "dtype", None))
+-                        return torch.float64 if dt0 == torch.float64 else torch.float32
+-
+-            if torch.is_tensor(obj):
+-                dt = _coerce(obj.dtype)
+-                return torch.float64 if dt == torch.float64 else torch.float32
+-
+-            if isinstance(obj, np.ndarray):
+-                dt = _coerce(obj.dtype)
+-                return torch.float64 if dt == torch.float64 else torch.float32
+-        except Exception:
+-            pass
+-        return torch.float32
+-
+-    master_dtype = _infer_master_float_dtype(data)
++    master_dtype = _infer_master_float_dtype_for_predict_input(data)
+     ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
+     ds.underflow_action = underflow_action
+ 
+@@ -1582,11 +1590,11 @@ def predict(
+             # Only pass supported runtime-config keys.
+             keys = kwargs.pop("keys", None)
+             loss_skew = kwargs.pop("loss_skew", None)
+-            ops_kwargs: dict[str, Any] = {"seed": int(seed)}
++            ops_kwargs: dict[str, Any] = {"seed": int(seed), "shuffle": bool(shuffle)}
+             if keys is not None:
+                 ops_kwargs["keys"] = keys
+             if loss_skew is not None:
+-                ops_kwargs["loss_skew"] = float(loss_skew)
++                ops_kwargs["loss_skew"] = bool(loss_skew)
+ 
+             # Launch config knobs (not part of RuntimeConfig).
+             run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
+diff --git a/stnet/run/elastic.py b/stnet/run/elastic.py
+index 7cf45dd..68455c4 100644
+--- a/stnet/run/elastic.py
++++ b/stnet/run/elastic.py
+@@ -218,7 +218,7 @@ from ..core.losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
+ from ..core.optimizers import (SWALR, AdamW, StochasticWeightAverage,
+                                stochastic_weight_average)
+ from ..model.architecture import Root
+-from ..model.blocks import History, resize_scaler_buffer
++from ..model.primitives import History, resize_scaler_buffer
+ from ..core.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
+                               torch_compile_safe,
+                               torch_safe_distributed)
+@@ -4569,8 +4569,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
+             non_blocking_copy=True,
+             sanitize=True,
+             flatten_features=True,
+-            train_shuffle=False,
+-            seed=int(getattr(ops, "seed", 42)),
++            train_shuffle=bool(getattr(ops, "shuffle", False)),
++            seed=int(getattr(ops, "seed", 7)),
+         ).open()
+         data_loader = session.training_loader
+         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
+diff --git a/stnet/run/io.py b/stnet/run/io.py
+index 2b0d087..587d540 100644
+--- a/stnet/run/io.py
++++ b/stnet/run/io.py
+@@ -50,7 +50,7 @@ from torch.distributed.checkpoint.state_dict import (
+ 
+ from ..core.compat import is_meta_or_fake_tensor
+ from ..model.architecture import Root
+-from ..model.blocks import History, resize_scaler_buffer
++from ..model.primitives import History, resize_scaler_buffer
+ from ..data.pipeline import BatchIterator
+ from ..core.graph import inference_mode
+ from ..core.config import ModelConfig, coerce_model_config
+@@ -163,10 +163,13 @@ def _load_model_config(model: nn.Module) -> Dict[str, Any]:
+             if cfg_obj is not None:
+                 break
+     try:
+-        from ..core.config import ModelConfig, model_config_to_dict
++        from ..core.config import ModelConfig, coerce_model_config
+ 
+         candidate = cfg_obj if isinstance(cfg_obj, (ModelConfig, dict)) else None
+-        return model_config_to_dict(candidate)
++        if candidate is None:
++            return {}
++        cfg = candidate if isinstance(candidate, ModelConfig) else coerce_model_config(candidate)
++        return cfg.to_dict()
+     except Exception:
+         return {}
+ 
