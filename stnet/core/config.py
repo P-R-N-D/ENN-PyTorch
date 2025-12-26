@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 """
-stnet/api/config.py
+stnet/core/config.py
 
 Configuration dataclasses + coercion/validation helpers.
 

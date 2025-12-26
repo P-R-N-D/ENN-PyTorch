@@ -48,12 +48,12 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
 )
 
-from ..backend.compat import is_meta_or_fake_tensor
+from ..core.compat import is_meta_or_fake_tensor
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
 from ..data.pipeline import BatchIterator
-from ..backend.graph import inference_mode
-from .config import ModelConfig, coerce_model_config
+from ..core.graph import inference_mode
+from ..core.config import ModelConfig, coerce_model_config
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ def _load_model_config(model: nn.Module) -> Dict[str, Any]:
             if cfg_obj is not None:
                 break
     try:
-        from .config import ModelConfig, model_config_to_dict
+        from ..core.config import ModelConfig, model_config_to_dict
 
         candidate = cfg_obj if isinstance(cfg_obj, (ModelConfig, dict)) else None
         return model_config_to_dict(candidate)

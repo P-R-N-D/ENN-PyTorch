@@ -497,9 +497,9 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
 
     if runtime_module is None:
         with suppress(Exception):
-            runtime_module = importlib.import_module("stnet.api.runtime")
+            runtime_module = importlib.import_module("stnet.run.elastic")
 
     if runtime_module is not None:
-        # NOTE: Runtime metric aggregation helpers used to live in stnet.backend.runtime.
+        # NOTE: Runtime metric aggregation helpers used to live in stnet.core.runtime.
         # They were removed/merged; keep the hook here to avoid stale attribute references.
         pass

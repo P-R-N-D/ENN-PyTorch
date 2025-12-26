@@ -27,9 +27,10 @@ from typing import (
 import torch
 import numpy as np
 
-from ..backend.compat import ensure_torchdata
-from ..backend.casting import dtype_from_name, env_bool, env_first_int
-from ..backend.staging import Buffer, Pool, ProducerError, best_effort_close
+from ..core.compat import ensure_torchdata
+from ..core.casting import dtype_from_name, env_bool, env_first_int
+from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
+from ..core.system import Thread
 from . import schemas as _schemas
 from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
 
@@ -393,7 +394,7 @@ class Sampler(_Sampler):
 
         default_tl = False
         with suppress(Exception):
-            default_tl = bool(Affinity.nogil_optimizations_enabled())
+            default_tl = bool(Thread.nogil_optimizations_enabled())
         self._mmap_thread_local = env_bool(
             (
                 # Primary (code):
@@ -858,7 +859,7 @@ class Sampler(_Sampler):
         self._len_B_snapshot = max(1, int(self._effective_batch_size()))
 
     def get(self, start: int, end: int) -> Mapping[str, Any]:
-        from ..backend.graph import inference_mode as _inference_mode
+        from ..core.graph import inference_mode as _inference_mode
 
         s = int(start)
         e = int(end)
@@ -895,7 +896,7 @@ class Sampler(_Sampler):
 
 
 # -----------------------------------------------------------------------------
-# BatchIterator: streaming + memmap utilities (shared across run/runtime/nodes)
+# BatchIterator: streaming + memmap utilities (shared across compute/elastic/nodes)
 # -----------------------------------------------------------------------------
 
 class BatchIterator:
@@ -1016,7 +1017,7 @@ class BatchIterator:
 
     @staticmethod
     def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:
-        from ..backend.casting import env_str
+        from ..core.casting import env_str
 
         req = str(env_str("STNET_MEMMAP_FLOAT_DTYPE") or "").strip()
         if req.startswith("torch."):
@@ -1219,7 +1220,7 @@ class BatchIterator:
                 target_bytes = int(target_mb) * 1024 * 1024
 
             try:
-                from ..backend.system import Memory
+                from ..core.system import Memory
 
                 avail = int(Memory.available() or 0)
                 if avail > 0:
@@ -2055,7 +2056,7 @@ class Connector:
         **kwargs: Any,
     ) -> None:
         self.map_fn = map_fn
-        from ..backend.system import WorkerPolicy
+        from ..core.system import WorkerPolicy
 
         wp = WorkerPolicy.autotune()
         wp.apply_torch_threads()
@@ -2084,14 +2085,14 @@ class Connector:
 
         self.max_concurrency = max(1, int(self.io_workers))
         try:
-            from ..backend.system import get_tlb
+            from ..core.system import get_tlb
 
             get_tlb(io_workers=self.io_workers)
         except Exception:
             pass
 
     def compose(self, source: "BaseNode") -> "BaseNode":
-        from ..backend.system import wrap_with_tlb
+        from ..core.system import wrap_with_tlb
 
         if ParallelMapper is None:
             raise RuntimeError("torchdata.nodes.ParallelMapper is required")
@@ -2236,7 +2237,7 @@ class Loader:
         self._num_shards = 1
         self._shard_id = 0
         try:
-            from ..backend.system import num_accelerators
+            from ..core.system import num_accelerators
 
             acc = max(1, int(num_accelerators()))
             thr = max(1, int(self._threads_hint))

@@ -1304,10 +1304,10 @@ def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
 
 
 @dataclass(slots=True)
-class DeviceStats:
+class Device:
     """Device capability snapshot used for precision negotiation.
 
-    This intentionally lives in backend.system to avoid backend->data imports.
+    This intentionally lives in core.system to avoid core->data imports.
     """
 
     device: torch.device
@@ -1319,12 +1319,12 @@ class DeviceStats:
     int_quant_bits: int
 
 
-_DEVICE_STATS_CACHE: dict[Tuple[str, int], DeviceStats] = {}
+_DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
 _DEVICE_STATS_LOCK = threading.Lock()
 
 
-def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> DeviceStats:
-    """Return a cached DeviceStats for the given device."""
+def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Device:
+    """Return a cached Device for the given device."""
     dev = _resolve_device(device)
     key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
     with _DEVICE_STATS_LOCK:
@@ -1363,7 +1363,7 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
     bits = env_first_int(("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0)
     quant_bits = int(bits) if int(bits) > 0 else 8
 
-    stats = DeviceStats(
+    stats = Device(
         device=dev,
         device_type=device_type,
         cuda_cc=cc,
@@ -1548,7 +1548,7 @@ def optimize_threads(
     return wp.as_threads_dict()
 
 
-class Affinity:
+class Thread:
     """Lightweight CPU affinity pinning + telemetry-based retuning for IO-heavy pipelines."""
 
     __slots__ = (
@@ -1589,7 +1589,7 @@ class Affinity:
 
         # Free-threading/No-GIL: reduce contention in telemetry and allow slightly higher caps.
         with contextlib.suppress(Exception):
-            self._nogil = bool(Affinity.nogil_optimizations_enabled())
+            self._nogil = bool(Thread.nogil_optimizations_enabled())
         if not hasattr(self, "_nogil"):
             self._nogil = False
 
@@ -1636,7 +1636,7 @@ class Affinity:
     @staticmethod
     def nogil_active() -> bool:
         """True only when this is a free-threaded build *and* the GIL is disabled."""
-        return Affinity.is_free_threaded_build() and (not Affinity.is_gil_enabled())
+        return Thread.is_free_threaded_build() and (not Thread.is_gil_enabled())
 
     @staticmethod
     def nogil_optimizations_enabled() -> bool:
@@ -1650,7 +1650,7 @@ class Affinity:
             override = parse_bool(os.environ.get(key))
             if override is not None:
                 return bool(override)
-        return Affinity.nogil_active()
+        return Thread.nogil_active()
 
     @staticmethod
     def _import_psutil() -> ModuleType | None:
@@ -1781,7 +1781,7 @@ class Affinity:
                 pass
 
             # Multi-group / fallback mapping.
-            segs, total = Affinity._windows_group_segments(k32)
+            segs, total = Thread._windows_group_segments(k32)
             if total <= 0 or not segs:
                 return False
 
@@ -2066,17 +2066,17 @@ class Affinity:
         return tuned
 
 
-_TLB_SINGLETON: Optional[Affinity] = None
+_TLB_SINGLETON: Optional[Thread] = None
 _TLB_SINGLETON_LOCK = Lock()
 
 
-def get_tlb(io_workers: Optional[int] = None) -> Affinity:
+def get_tlb(io_workers: Optional[int] = None) -> Thread:
     global _TLB_SINGLETON
     if _TLB_SINGLETON is None:
         with _TLB_SINGLETON_LOCK:
             if _TLB_SINGLETON is None:
                 default_workers = io_workers if io_workers is not None else max(1, process_cpu_count() // 2)
-                _TLB_SINGLETON = Affinity(io_workers=int(default_workers))
+                _TLB_SINGLETON = Thread(io_workers=int(default_workers))
     tlb = _TLB_SINGLETON
     if tlb is not None and io_workers is not None:
         with contextlib.suppress(Exception):

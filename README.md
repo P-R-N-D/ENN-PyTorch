@@ -20,13 +20,13 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **torchao**: >= 0.14.0
 
 ## Features
-- **Typed configuration** (`stnet.api.config`): dataclass-based configs with sensible defaults and validation/coercion.
-- **I/O helpers** (`stnet.api.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
-- **Runtime utilities** (`stnet.api.runtime`, `stnet.backend.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
-- **Distributed** (`stnet.backend.distributed`): utilities to bootstrap and coordinate multi‑process training.
-- **Export** (`stnet.api.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
+- **Typed configuration** (`stnet.core.config`): dataclass-based configs with sensible defaults and validation/coercion.
+- **I/O helpers** (`stnet.run.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
+- **Runtime utilities** (`stnet.run.elastic`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
+- **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
+- **Export** (`stnet.run.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
 - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
-- **Functional blocks** (`stnet.api.losses`, `stnet.api.optimizers`, `stnet.api.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
+- **Functional blocks** (`stnet.core.losses`, `stnet.core.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
 - **Model library** (`stnet.model`): attention variants and spatio‑temporal layers (e.g., `Root`, `History`).
 - **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
 
@@ -78,10 +78,10 @@ Minimal forward/backward loop:
 ```python
 import torch
 
-from stnet.api.config import ModelConfig
-from stnet.api.io import new_model
-from stnet.api.losses import StudentsTLoss
-from stnet.backend.system import optimize_threads
+from stnet.core.config import ModelConfig
+from stnet.run.io import new_model
+from stnet.core.losses import StudentsTLoss
+from stnet.core.system import optimize_threads
 
 # 1) Build a config and model
 cfg = ModelConfig(
@@ -122,7 +122,7 @@ with torch.no_grad():
 
 Checkpointing:
 ```python
-from stnet.api.io import save_model, load_model
+from stnet.run.io import save_model, load_model
 
 save_model(model, "ckpt.pth")
 model2 = load_model("ckpt.pth", map_location="cuda")
@@ -136,7 +136,7 @@ model3 = load_model("ckpt_dir", map_location="cpu")
 
 Prediction outputs:
 ```python
-from stnet.api.run import predict
+from stnet.run.compute import predict
 
 # Eager: returns an in-memory TensorDict with keys {"X", "Y"}
 td = predict(model, data=my_data, lazy=False)
@@ -167,17 +167,23 @@ Notebook demo:
 ```
 stnet/
   __init__.py
-  api/
+  run/
     __init__.py
-    config.py
+    compute.py
+    elastic.py
     io.py
-    run.py
-  backend/
+  core/
     __init__.py
     compat.py
+    config.py
     distributed.py
-    export.py
-    runtime.py
+    casting.py
+    graph.py
+    losses.py
+    optimizers.py
+    precision.py
+    profiler.py
+    staging.py
     system.py
   data/
     __init__.py

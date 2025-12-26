@@ -9,10 +9,10 @@ import torch
 import torch._dynamo
 from torch import nn
 
-from ..api.profiler import FLOP_PROFILER, capture
-from ..backend.system import get_device, get_dpa_backends, get_runtime_config
-from ..backend.compat import torch_no_compile
-from ..backend.casting import env_str
+from ..core.profiler import FLOP_PROFILER, capture
+from ..core.system import get_device, get_dpa_backends, get_runtime_config
+from ..core.compat import torch_no_compile
+from ..core.casting import env_str
 
 try:
     import triton

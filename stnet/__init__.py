@@ -17,7 +17,7 @@ import torch
 # Apply Torch compatibility patches early (adds missing APIs/aliases across versions).
 # This is best-effort and must never fail import.
 try:
-    from .backend.compat import patch_torch as _patch_torch
+    from .core.compat import patch_torch as _patch_torch
 except Exception:  # pragma: no cover
     _patch_torch = None
 else:
@@ -33,11 +33,11 @@ try:
 except Exception:
     _set_list_to_stack = None
 
-from .backend.casting import env_bool
+from .core.casting import env_bool
 
 __all__ = [
-    "api",
-    "backend",
+    "run",
+    "core",
     "data",
     "functional",
     "model",

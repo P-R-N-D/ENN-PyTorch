@@ -38,7 +38,7 @@ _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
 def default_underflow_action() -> str:
     """Return underflow policy used by precision negotiation."""
-    from ..backend.casting import env_first
+    from ..core.casting import env_first
 
     raw = str(
         env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn")
@@ -361,7 +361,7 @@ def is_scale_safe(
 
 
 @dataclass(slots=True)
-class PrecisionMetaLite:
+class DeviceMeta:
     """Minimal metadata object used when a full Dataset is not available.
 
     This mirrors the subset of attributes/methods used by Autocast/PrecisionPolicy
@@ -387,11 +387,11 @@ class PrecisionMetaLite:
     is_negotiable: Optional[bool] = None
     underflow_action: str = "warn"
 
-    def ensure_device_info(self) -> "PrecisionMetaLite":
+    def ensure_device_info(self) -> "DeviceMeta":
         self._refresh_device_info()
         return self
 
-    def refresh(self) -> "PrecisionMetaLite":
+    def refresh(self) -> "DeviceMeta":
         self._refresh_device_info()
         # Fill candidates from backend device stats if not explicitly set.
         ds = get_device_stats(self.device)
@@ -413,7 +413,7 @@ class PrecisionMetaLite:
         self.cuda_cc = ds.cuda_cc
 
     @classmethod
-    def for_device(cls, device: Union[torch.device, str]) -> "PrecisionMetaLite":
+    def for_device(cls, device: Union[torch.device, str]) -> "DeviceMeta":
         ds = get_device_stats(device)
         return cls(
             device=ds.device,
@@ -588,7 +588,7 @@ class Autocast:
         dev = cls._device(device_hint)
 
         if meta is None:
-            meta = PrecisionMetaLite.for_device(dev)
+            meta = DeviceMeta.for_device(dev)
         else:
             current_device = torch.device(getattr(meta, "device", dev))
             if current_device != dev:
@@ -1209,7 +1209,7 @@ class PrecisionPolicy:
         dev = torch.device(device)
         meta = metadata
         if meta is None:
-            meta = PrecisionMetaLite.for_device(dev)
+            meta = DeviceMeta.for_device(dev)
         else:
             with contextlib.suppress(Exception):
                 setattr(meta, "device", dev)

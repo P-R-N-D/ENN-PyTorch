@@ -12,8 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-from ..backend.compat import StochasticDepth
-from ..backend.casting import env_bool, env_int, env_str
+from ..core.compat import StochasticDepth
+from ..core.casting import env_bool, env_int, env_str
 
 _Norm = nn.LayerNorm
 
@@ -64,8 +64,8 @@ def _stnet_checkpoint_mode() -> str:
 
 _STNET_CHECKPOINT_MODE = _stnet_checkpoint_mode()
 
-from ..api.profiler import FLOP_PROFILER
-from ..backend.system import empty_device_cache
+from ..core.profiler import FLOP_PROFILER
+from ..core.system import empty_device_cache
 from .kernels import (
     DotProductAttention,
     MultiHeadAttention,

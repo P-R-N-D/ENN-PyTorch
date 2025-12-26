@@ -206,7 +206,7 @@ def default_underflow_action() -> str:
     - warn: allowed but may be logged
     - forbid: treat underflow as unsafe for downcasting
     """
-    from ..backend.casting import env_first
+    from ..core.casting import env_first
 
     raw = str(
         env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn") or "warn"
