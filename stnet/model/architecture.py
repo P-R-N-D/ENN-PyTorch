@@ -165,15 +165,17 @@ class SpatialAxis(nn.Module):
             coords_one = coords[:1].contiguous()
 
             # Compute the expensive argsort only once; odd blocks are a cheap roll.
-            perm0, inv0 = _serialize_z_index(
+            perm0_b, inv0_b = _serialize_z_index(
                 coords_one,
                 bits=bits,
                 patch=patch,
                 shift_order=shift,
                 block_index=0,
             )
-            perm0 = perm0[0].to(dtype=torch.int64)
-            inv0 = inv0[0].to(dtype=torch.int64)
+            perm0_b = perm0_b.to(dtype=torch.int64)
+            inv0_b = inv0_b.to(dtype=torch.int64)
+            perm0 = perm0_b[0]
+            inv0 = inv0_b[0]
 
             shift_amt = 0
             if shift:
@@ -182,7 +184,7 @@ class SpatialAxis(nn.Module):
             perm1 = perm0
             inv1 = inv0
             if shift_amt:
-                perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=0)
+                perm1 = torch.roll(perm0_b, shifts=int(shift_amt), dims=1)[0]
                 inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
 
             perms: List[torch.Tensor] = []
