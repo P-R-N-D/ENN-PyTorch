@@ -48,8 +48,8 @@ from ..data.pipeline import (
     resolve_feature_key,
 )
 from ..core.graph import inference_mode
-from ..model.architecture import Root
-from ..model.primitives import History, resize_scaler_buffer
+from ..nn.architecture import Model
+from ..nn.primitives import Recorder, resize_scaler_buffer
 from .io import _torch_load_checkpoint, _to_cpu
 from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
 
@@ -185,7 +185,7 @@ def _seed_everything(seed_value: Optional[int]) -> None:
 # -----------------------------
 
 def _maybe_save_model_checkpoint(
-    model: Root,
+    model: Model,
     out_dir: str,
     *,
     save_dcp: bool,
@@ -552,7 +552,7 @@ def _update_cum_stats(
 # -----------------------------
 
 def train(
-    model: Root,
+    model: Model,
     data: (
         Dict[Tuple, torch.Tensor]
         | Sequence[Dict[Tuple, torch.Tensor]]
@@ -577,7 +577,7 @@ def train(
     loss_mask_mode: str = "none",
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
-) -> Root:
+) -> Model:
     _reset_process_group()
 
     try:
@@ -801,7 +801,7 @@ def train(
                     new_run_hist = (run_hist_prev + [run_record]) if isinstance(run_hist_prev, list) else [run_record]
                     setattr(model, "_train_history", new_run_hist)
 
-                    if isinstance(logger, History):
+                    if isinstance(logger, Recorder):
                         logger._records = new_run_hist
         except Exception:
             pass

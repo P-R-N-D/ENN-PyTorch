@@ -5,7 +5,7 @@ This package intentionally exposes a small, stable surface area:
 Modules:
 - stnet.core
 - stnet.data
-- stnet.model
+- stnet.nn
 - stnet.run
 
 Convenience functions (thin wrappers around stnet.run.*):
@@ -25,7 +25,7 @@ from typing import Any
 __all__ = [
     "core",
     "data",
-    "model",
+    "nn",
     "run",
     # Short-call API
     "new_model",
@@ -39,7 +39,7 @@ __all__ = [
 
 def __getattr__(name: str) -> Any:
     # Lazy module imports keep "import stnet" cheap.
-    if name in {"core", "data", "model", "run"}:
+    if name in {"core", "data", "nn", "run"}:
         return importlib.import_module(f"stnet.{name}")
     raise AttributeError(f"module 'stnet' has no attribute '{name}'")
 

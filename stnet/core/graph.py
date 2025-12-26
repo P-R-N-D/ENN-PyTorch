@@ -684,7 +684,7 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
 
     # Resolve a reasonable default layers module (project layout changed over time).
     if layers_module is None:
-        for mod_name in ("stnet.model.primitives", "stnet.model.blocks", "stnet.model.architecture"):
+        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks", "stnet.nn.architecture"):
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
@@ -692,7 +692,7 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
     # Scaler: uses Python dict + locks for dtype/device stats caching.
     scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
     if scaler_cls is None:
-        for mod_name in ("stnet.model.primitives", "stnet.model.blocks"):
+        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
                 scaler_cls = getattr(mod, "Scaler", None)
@@ -715,13 +715,13 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
                 recursive=False,
             )
 
-    # History: logging / metadata buffers; never performance-critical.
-    history_cls = getattr(layers_module, "History", None) if layers_module is not None else None
+    # Recorder: logging / metadata buffers; never performance-critical.
+    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
     if history_cls is None:
-        for mod_name in ("stnet.model.primitives", "stnet.model.blocks"):
+        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
-                history_cls = getattr(mod, "History", None)
+                history_cls = getattr(mod, "Recorder", None)
                 if history_cls is not None:
                     break
 
@@ -739,6 +739,6 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
             torch_compile_disable(
                 history_cls,
                 attr,
-                reason="History is logging/bookkeeping; keep eager",
+                reason="Recorder is logging/bookkeeping; keep eager",
                 recursive=False,
             )

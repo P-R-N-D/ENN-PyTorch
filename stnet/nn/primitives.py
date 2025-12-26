@@ -48,6 +48,20 @@ _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
 )
 
 
+def _device_key(device: torch.device) -> Tuple[str, int]:
+    """Return a hashable (type, index) key for caches.
+
+    Kept as a tiny helper to avoid repeating defensive device.index handling
+    in multiple hot-path caches.
+    """
+
+    idx = -1
+    with contextlib.suppress(Exception):
+        if device.index is not None:
+            idx = int(device.index)
+    return (str(device.type), idx)
+
+
 def _stnet_checkpoint_mode() -> str:
     raw = str(env_str("STNET_CHECKPOINT_MODE") or env_str("STNET_CHECKPOINT") or "ffn").strip().lower()
     match raw:
@@ -172,6 +186,50 @@ class _FlexScoreMod:
         return total
 
 
+class _FlexDilatedMaskMod:
+    """Callable mask for create_block_mask used by DilatedAttention.
+
+    This replaces an inner-function closure to reduce per-call allocations
+    and to keep the hot path friendlier to free-threaded / no-GIL builds.
+    """
+
+    __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
+
+    def __init__(
+        self,
+        *,
+        L_q: int,
+        L_k: int,
+        dilation: int,
+        win: Optional[int],
+        causal: bool,
+    ) -> None:
+        self.L_q = int(L_q)
+        self.L_k = int(L_k)
+        self.dilation = max(1, int(dilation))
+        self.win = None if win is None else int(win)
+        self.causal = bool(causal)
+
+    def __call__(self, b: int, h: int, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+        _ = (b, h)
+        dq = q_idx - kv_idx
+        keep = torch.ones_like(dq, dtype=torch.bool)
+        # Bucket padding handling:
+        # When we pad keys to L_k > L_q (length bucketing), prevent attention to padded keys.
+        try:
+            if int(self.L_k) > int(self.L_q):
+                keep &= (kv_idx < int(self.L_q))
+        except Exception:
+            pass
+        if self.causal:
+            keep &= (kv_idx <= q_idx)
+        if self.win is not None:
+            keep &= (dq.abs() <= int(self.win))
+        if self.dilation > 1:
+            keep &= ((dq % int(self.dilation)) == 0)
+        return keep
+
+
 class PatchAttention(nn.Module):
     def __init__(
         self,
@@ -200,26 +258,21 @@ class PatchAttention(nn.Module):
         # NOTE: runtime-only cache (not part of state_dict).
         self._block_mask_cache_lock = threading.Lock()
         self._block_mask_cache = OrderedDict()
-
-    @staticmethod
-    def _device_key(device: torch.device) -> Tuple[str, int]:
-        idx = -1
-        with contextlib.suppress(Exception):
-            if device.index is not None:
-                idx = int(device.index)
-        return (str(device.type), idx)
+        self._block_mask_cache_last: tuple[Any, Any] | None = None
 
     def __getstate__(self):
         state = super().__getstate__()
         # Locks are not picklable; caches are runtime-only.
         state.pop("_block_mask_cache_lock", None)
         state.pop("_block_mask_cache", None)
+        state.pop("_block_mask_cache_last", None)
         return state
 
     def __setstate__(self, state):
         super().__setstate__(state)
         self._block_mask_cache_lock = threading.Lock()
         self._block_mask_cache = OrderedDict()
+        self._block_mask_cache_last = None
 
     def forward(
         self,
@@ -279,31 +332,38 @@ class PatchAttention(nn.Module):
                     cache_key = (
                         src_rank,
                         src_shape,
-                        self._device_key(m.device),
+                        _device_key(m.device),
                         src_ptr,
                         src_ver,
                         int(B),
                         int(self.nhead),
                         int(N),
                         int(_block_size),
-                        self._device_key(qh.device),
+                        _device_key(qh.device),
                     )
 
-                    cache = getattr(self, "_block_mask_cache", None)
-                    if cache is None:
-                        cache = OrderedDict()
-                        setattr(self, "_block_mask_cache", cache)
-                    lock = getattr(self, "_block_mask_cache_lock", None)
-                    if lock is None:
-                        lock = threading.Lock()
-                        setattr(self, "_block_mask_cache_lock", lock)
+                    last = getattr(self, "_block_mask_cache_last", None)
+                    if last is not None and last[0] == cache_key:
+                        block = last[1]
+                    else:
+                        cache = getattr(self, "_block_mask_cache", None)
+                        if cache is None:
+                            cache = OrderedDict()
+                            setattr(self, "_block_mask_cache", cache)
+                        lock = getattr(self, "_block_mask_cache_lock", None)
+                        if lock is None:
+                            lock = threading.Lock()
+                            setattr(self, "_block_mask_cache_lock", lock)
 
-                    with lock:
-                        cached = cache.get(cache_key)
-                        if cached is not None:
-                            with contextlib.suppress(Exception):
-                                cache.move_to_end(cache_key)
-                            block = cached
+                        with lock:
+                            cached = cache.get(cache_key)
+                            if cached is not None:
+                                with contextlib.suppress(Exception):
+                                    cache.move_to_end(cache_key)
+                                block = cached
+                        if block is not None:
+                            # Fast-path for repeated masks (avoid lock next time).
+                            self._block_mask_cache_last = (cache_key, block)
 
                     if block is None:
                         # Move mask to the attention device only when we need to (cache miss).
@@ -368,6 +428,7 @@ class PatchAttention(nn.Module):
                                         with contextlib.suppress(Exception):
                                             cache.popitem(last=False)
                         block = block_new
+                        self._block_mask_cache_last = (cache_key, block_new)
             else:
                 bias = m.to(device=qh.device, dtype=qh.dtype)
                 match bias.dim():
@@ -542,7 +603,7 @@ class DilatedAttention(nn.Module):
         self.length_bucket_multiple: int = 64
 
         # Use project-local attention wrapper instead of calling F.scaled_dot_product_attention directly.
-        # (DotProductAttention lives in stnet/model/kernels.py)
+        # (DotProductAttention lives in stnet/nn/kernels.py)
         self._dot_attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
         # Cache supported kwarg names to avoid per-forward inspect overhead (signature varies by version).
         self._dot_attn_mask_kw: str | None = "attn_mask"
@@ -587,14 +648,8 @@ class DilatedAttention(nn.Module):
         self._flex_block_mask_cache_lock = threading.Lock()
         self._mask_cache = OrderedDict()
         self._flex_block_mask_cache = OrderedDict()
-
-    @staticmethod
-    def _device_key(device: torch.device) -> Tuple[str, int]:
-        idx = -1
-        with contextlib.suppress(Exception):
-            if device.index is not None:
-                idx = int(device.index)
-        return (str(device.type), idx)
+        self._mask_cache_last: tuple[Any, Any] | None = None
+        self._flex_block_mask_cache_last: tuple[Any, Any] | None = None
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -603,6 +658,8 @@ class DilatedAttention(nn.Module):
         state.pop("_flex_block_mask_cache_lock", None)
         state.pop("_mask_cache", None)
         state.pop("_flex_block_mask_cache", None)
+        state.pop("_mask_cache_last", None)
+        state.pop("_flex_block_mask_cache_last", None)
         return state
 
     def __setstate__(self, state):
@@ -611,6 +668,8 @@ class DilatedAttention(nn.Module):
         self._flex_block_mask_cache_lock = threading.Lock()
         self._mask_cache = OrderedDict()
         self._flex_block_mask_cache = OrderedDict()
+        self._mask_cache_last = None
+        self._flex_block_mask_cache_last = None
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
         if int(L) > _DILATED_MASK_CACHE_MAX_L:
@@ -628,8 +687,12 @@ class DilatedAttention(nn.Module):
             int(self.dilation),
             win_key,
             int(self.causal),
-            self._device_key(device),
+            _device_key(device),
         )
+
+        last = getattr(self, "_mask_cache_last", None)
+        if last is not None and last[0] == key:
+            return last[1]
 
         cache = getattr(self, "_mask_cache", None)
         if cache is None:
@@ -645,6 +708,7 @@ class DilatedAttention(nn.Module):
             if cached is not None:
                 with contextlib.suppress(Exception):
                     cache.move_to_end(key)
+                self._mask_cache_last = (key, cached)
                 return cached
 
         mask = _get_dilated_mask(
@@ -665,8 +729,10 @@ class DilatedAttention(nn.Module):
             if cached is not None:
                 with contextlib.suppress(Exception):
                     cache.move_to_end(key)
+                self._mask_cache_last = (key, cached)
                 return cached
             cache[key] = mask
+            self._mask_cache_last = (key, mask)
             with contextlib.suppress(Exception):
                 cache.move_to_end(key)
             try:
@@ -689,7 +755,7 @@ class DilatedAttention(nn.Module):
     ) -> Any:
         win_key = int(win) if win is not None else -1
         key = (
-            self._device_key(device),
+            _device_key(device),
             int(B),
             int(H),
             int(L_q),
@@ -699,6 +765,10 @@ class DilatedAttention(nn.Module):
             win_key,
             int(self.causal),
         )
+
+        last = getattr(self, "_flex_block_mask_cache_last", None)
+        if last is not None and last[0] == key:
+            return last[1]
 
         cache = getattr(self, "_flex_block_mask_cache", None)
         if cache is None:
@@ -714,6 +784,7 @@ class DilatedAttention(nn.Module):
             if cached is not None:
                 with contextlib.suppress(Exception):
                     cache.move_to_end(key)
+                self._flex_block_mask_cache_last = (key, cached)
                 return cached
 
         try:
@@ -722,28 +793,19 @@ class DilatedAttention(nn.Module):
             est_bool_bytes = _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES + 1
         skip_cache = est_bool_bytes > _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES
 
-        def _mask_mod(b, h, q_idx, kv_idx):
-            dq = q_idx - kv_idx
-            keep = torch.ones_like(dq, dtype=torch.bool)
-            # Bucket padding handling:
-            # When we pad keys to L_k > L_q (length bucketing), prevent attention to padded keys.
-            # This keeps flex_attention outputs consistent with the SDPA path without building
-            # an explicit padding mask tensor.
-            try:
-                if int(L_k) > int(L_q):
-                    keep &= (kv_idx < int(L_q))
-            except Exception:
-                pass
-            if self.causal:
-                keep &= (kv_idx <= q_idx)
-            if win is not None:
-                keep &= (dq.abs() <= win)
-            if self.dilation > 1:
-                keep &= ((dq % self.dilation) == 0)
-            return keep
+        if create_block_mask is None:
+            raise RuntimeError("create_block_mask was not imported")
+
+        mask_mod = _FlexDilatedMaskMod(
+            L_q=int(L_q),
+            L_k=int(L_k),
+            dilation=int(self.dilation),
+            win=win,
+            causal=bool(self.causal),
+        )
 
         block_mask = create_block_mask(
-            _mask_mod,
+            mask_mod,
             B,
             H,
             L_q,
@@ -760,8 +822,10 @@ class DilatedAttention(nn.Module):
             if cached is not None:
                 with contextlib.suppress(Exception):
                     cache.move_to_end(key)
+                self._flex_block_mask_cache_last = (key, cached)
                 return cached
             cache[key] = block_mask
+            self._flex_block_mask_cache_last = (key, block_mask)
             with contextlib.suppress(Exception):
                 cache.move_to_end(key)
             try:
@@ -1951,7 +2015,7 @@ class Scaler(nn.Module):
         return out
 
 
-class History(nn.Module):
+class Recorder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         # Precision-exempt: history/logging buffers must remain FP64/INT64.

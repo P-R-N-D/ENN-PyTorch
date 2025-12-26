@@ -17,7 +17,7 @@ from torch import nn, optim
 
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
-from ..model.architecture import ModelPolicy
+from ..nn.architecture import ModelPolicy
 from ..core.precision import Autocast, PrecisionPolicy, is_scale_safe
 
 try:
