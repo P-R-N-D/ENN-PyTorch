@@ -34,10 +34,10 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..data.pipeline import BatchIterator, extract_xy
-from ..backend.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
+from ..core.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..model.architecture import ModelPolicy
-from ..backend.precision import Autocast, PrecisionPolicy
-from ..backend.graph import inference_mode
+from ..core.precision import Autocast, PrecisionPolicy
+from ..core.graph import inference_mode
 
 
 _nvml = None
@@ -108,9 +108,9 @@ def _nvml_backoff_s() -> float:
     # Default: slightly longer backoff when no-GIL optimizations are enabled,
     # because telemetry is polled much more frequently.
     try:
-        from ..backend.system import Affinity
+        from ..core.system import Thread
 
-        _NVML_BACKOFF_S = 30.0 if bool(Affinity.nogil_optimizations_enabled()) else 10.0
+        _NVML_BACKOFF_S = 30.0 if bool(Thread.nogil_optimizations_enabled()) else 10.0
     except Exception:
         _NVML_BACKOFF_S = 10.0
     return float(_NVML_BACKOFF_S)
@@ -150,9 +150,9 @@ def _nvml_min_interval_s() -> float:
 
     # Default: throttle only when no-GIL optimizations are enabled.
     try:
-        from ..backend.system import Affinity
+        from ..core.system import Thread
 
-        _NVML_MIN_INTERVAL_S = 0.10 if bool(Affinity.nogil_optimizations_enabled()) else 0.0
+        _NVML_MIN_INTERVAL_S = 0.10 if bool(Thread.nogil_optimizations_enabled()) else 0.0
     except Exception:
         _NVML_MIN_INTERVAL_S = 0.0
     return float(_NVML_MIN_INTERVAL_S)
@@ -208,9 +208,9 @@ try:
 except Exception:
     _psutil = None
 
-from .config import RuntimeConfig, coerce_model_config
-from ..backend.casting import to_torch_tensor
-from ..backend.staging import Cache, Pool
+from ..core.config import RuntimeConfig, coerce_model_config
+from ..core.casting import to_torch_tensor
+from ..core.staging import Cache, Pool
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
 from .losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
@@ -219,14 +219,14 @@ from .optimizers import (SWALR, AdamW, StochasticWeightAverage,
                          stochastic_weight_average)
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
-from ..backend.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
+from ..core.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
                               torch_compile_safe,
                               torch_safe_distributed)
-from ..backend.distributed import (distributed_barrier, distributed_sync,
+from ..core.distributed import (distributed_barrier, distributed_sync,
                                    get_world_size, is_distributed, joining, no_sync,
                                    to_ddp, to_fsdp)
 from .profiler import FlopCounter
-from ..backend.system import (
+from ..core.system import (
     Memory,
     empty_device_cache,
     get_device,
@@ -1032,8 +1032,8 @@ def _calibrate_per_sample_mem(
         meta = dataset if isinstance(dataset, Dataset) else Dataset.for_device(device)
 
         try:
-            from ..backend.precision import Autocast
-            from ..backend.graph import inference_mode
+            from ..core.precision import Autocast
+            from ..core.graph import inference_mode
 
             feats, labels, *_rest = meta.preprocess(batch)
             X = to_torch_tensor(feats)
@@ -1865,7 +1865,7 @@ def epochs(
     fixed_accum = 2 if getattr(device, "type", "cpu") == "cpu" else 4
     min_grad_accum = fixed_accum
     max_grad_accum = fixed_accum
-    # Centralize env parsing through backend.casting helpers.
+    # Centralize env parsing through core.casting helpers.
     dev_margin = env_float("STNET_DEVICE_MARGIN", 0.8)
     host_margin = env_float("STNET_HOST_MARGIN", 0.8)
 
@@ -3956,7 +3956,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
-                from ..api.io import _torch_load_checkpoint as _torch_load_checkpoint
+                from .io import _torch_load_checkpoint as _torch_load_checkpoint
 
                 cpu_state = _torch_load_checkpoint(
                     fallback_init,
@@ -4493,7 +4493,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
-                from ..api.io import _torch_load_checkpoint as _torch_load_checkpoint
+                from .io import _torch_load_checkpoint as _torch_load_checkpoint
 
                 cpu_state = _torch_load_checkpoint(
                     fallback_model,

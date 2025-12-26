@@ -32,17 +32,17 @@ except ImportError:
 
 _LOGGER = logging.getLogger(__name__)
 
-from ..backend.compat import (
+from ..core.compat import (
     StochasticDepth,
     graph_break,
     is_meta_or_fake_tensor,
     torch_no_compile,
 )
-from ..backend.system import empty_device_cache
-from ..backend.casting import env_first_int, env_int
+from ..core.system import empty_device_cache
+from ..core.casting import env_first_int, env_int
 from ..data.pipeline import resolve_feature_key, resolve_label_key
-from ..api.profiler import FLOP_PROFILER
-from ..backend.precision import Autocast
+from ..core.profiler import FLOP_PROFILER
+from ..core.precision import Autocast
 from .primitives import (
     CrossAttention,
     DilatedAttention,
@@ -625,7 +625,7 @@ def _auto_microbatch(
     dev_free: Optional[int] = None
     host_free: Optional[int] = None
 
-    from ..backend.system import Memory as _Mem
+    from ..core.system import Memory as _Mem
 
     try:
         host_free = int(_Mem.available())
@@ -1370,7 +1370,7 @@ class History(nn.Module):
         cpu_models: List[str] = []
         arch_norm: List[str] = []
         try:
-            from ..backend.system import cpu_info, process_cpu_count
+            from ..core.system import cpu_info, process_cpu_count
 
             n_cores = max(1, int(process_cpu_count() or 1))
 
@@ -1398,7 +1398,7 @@ class History(nn.Module):
         self.arch = arch_norm
 
         try:
-            from ..backend.system import Memory
+            from ..core.system import Memory
 
             total_bytes = Memory.total()
             if total_bytes is not None and int(total_bytes) > 0:

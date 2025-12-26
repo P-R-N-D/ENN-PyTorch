@@ -27,9 +27,9 @@ try:
 except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
 
-from ..backend.distributed import get_available_host, get_preferred_ip, initialize_master_addr
-from .runtime import _trim_dcp_keys, main
-from ..backend.system import (
+from ..core.distributed import get_available_host, get_preferred_ip, initialize_master_addr
+from .elastic import _trim_dcp_keys, main
+from ..core.system import (
     WorkerPolicy,
     initialize_python_path,
     new_dir,
@@ -37,7 +37,7 @@ from ..backend.system import (
     remove_dir,
     set_multiprocessing_env,
 )
-from ..backend.casting import dtype_from_name, env_bool, parse_torch_dtype
+from ..core.casting import dtype_from_name, env_bool, parse_torch_dtype
 from ..data.nodes import preload_memmap
 from ..data.pipeline import (
     BatchIterator,
@@ -47,11 +47,11 @@ from ..data.pipeline import (
     normalize_underflow_action,
     resolve_feature_key,
 )
-from ..backend.graph import inference_mode
+from ..core.graph import inference_mode
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
 from .io import _torch_load_checkpoint, _to_cpu
-from .config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
+from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
 
 
 logger = logging.getLogger(__name__)
@@ -123,7 +123,7 @@ def _clear_device_caches() -> None:
 
     # Prefer the project helper when available (rate-limited).
     with contextlib.suppress(Exception):
-        from ..backend.system import empty_device_cache, get_device
+        from ..core.system import empty_device_cache, get_device
 
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
 

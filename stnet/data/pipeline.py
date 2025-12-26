@@ -59,9 +59,9 @@ def _is_lazy_tensor(x: Any) -> bool:
     except Exception:
         return False
 
-from ..backend.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
-from ..backend.casting import env_first, env_first_float, env_first_int
-from ..backend.system import (
+from ..core.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
+from ..core.casting import env_first, env_first_float, env_first_int
+from ..core.system import (
     Memory,
     WorkerPolicy,
     cuda_compute_capability as _sys_cuda_compute_capability,
@@ -1571,7 +1571,7 @@ class Dataset(Generic[TExtra]):
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
 
-        # Fill in defaults from backend.device_stats when not explicitly provided.
+        # Fill in defaults from core.device_stats when not explicitly provided.
         dev_stats = get_device_stats(self.device)
         if not self.float_dtypes:
             self.float_dtypes = tuple(getattr(dev_stats, "float_dtypes", ()))

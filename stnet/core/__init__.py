@@ -5,13 +5,17 @@ import importlib
 from types import ModuleType
 
 __all__ = [
+    "casting",
+    "compat",
     "config",
-    "io",
-    "runtime",
+    "distributed",
+    "graph",
     "losses",
     "optimizers",
+    "precision",
     "profiler",
-    "run",
+    "staging",
+    "system",
 ]
 
 

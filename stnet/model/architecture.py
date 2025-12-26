@@ -13,23 +13,23 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-from ..api.config import ModelConfig
-from ..backend.compat import (
+from ..core.config import ModelConfig
+from ..core.compat import (
     StochasticDepth,
     graph_break,
     is_meta_or_fake_tensor,
     torch_no_compile,
 )
-from ..backend.system import _log_debug, _log_info, empty_device_cache, get_device
-from ..backend.casting import env_first_int, env_int
+from ..core.system import _log_debug, _log_info, empty_device_cache, get_device
+from ..core.casting import env_first_int, env_int
 from ..data.pipeline import (
     Dataset,
     resolve_feature_key,
     resolve_label_key,
 )
-from ..api.profiler import FLOP_PROFILER
-from ..backend.graph import compile, inference_mode, invalidate_model_introspection_caches
-from ..backend.precision import Autocast, is_scale_safe
+from ..core.profiler import FLOP_PROFILER
+from ..core.graph import compile, inference_mode, invalidate_model_introspection_caches
+from ..core.precision import Autocast, is_scale_safe
 from .blocks import (
     History,
     LongNet,
