@@ -136,10 +136,10 @@ class LoaderPolicy:
         return wp
 
     def wrap_input(self, loader: Any, device: torch.device | str, *, name: str) -> Any:
-        from ..data.nodes import BufferedLoader
+        from ..data.nodes import BatchQueue
 
         max_batches = self.hard_inflight_batches(device)
-        return BufferedLoader(loader, max_batches=max_batches, name=name)
+        return BatchQueue(loader, max_batches=max_batches, name=name)
 
 
 @dataclass
@@ -309,9 +309,9 @@ except Exception as _e:
 
 _NODES_IMPORT_ERROR: Exception | None = None
 try:
-    from .nodes import BatchIterator, Connector, Disposable, Loader, Sampler, BatchState, Source, Wrapper
+    from .nodes import BatchIO, Mapper, Disposable, Loader, Sampler, BatchState, Source, Multiplexer, BatchQueue
 except Exception as _e:
-    BatchIterator = Connector = Disposable = Loader = Sampler = Source = Wrapper = BatchState = None  # type: ignore[assignment]
+    BatchIO = Mapper = Disposable = Loader = Sampler = Source = Multiplexer = BatchQueue = BatchState = None  # type: ignore[assignment]
     _NODES_IMPORT_ERROR = _e
 
 
@@ -1057,7 +1057,7 @@ def compose(
         get_tlb(io_workers=io_workers)
 
     mx_weights = weights if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping) else None
-    sampler = Wrapper(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=mx_weights)
+    sampler = Multiplexer(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=mx_weights)
     source = sampler.compose(node_or_nodes)
 
     if epochables is not None and getattr(sampler, "_node", None) is not None:
@@ -1065,7 +1065,7 @@ def compose(
             # Put it first so it runs before per-dataset epoch hooks.
             epochables.insert(0, sampler)
 
-    mapper = Connector(
+    mapper = Mapper(
         map_fn=map_fn,
         io_workers=io_workers,
         prebatch=prebatch,

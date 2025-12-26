@@ -8,11 +8,13 @@ import os
 import random
 import shutil
 import time
+from pathlib import Path
 from functools import lru_cache, wraps
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+from torch import nn
 import torch.multiprocessing as mp
 from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase, PersistentTensorDict
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
@@ -38,9 +40,8 @@ from ..core.system import (
     set_multiprocessing_env,
 )
 from ..core.casting import dtype_from_name, env_bool, parse_torch_dtype
-from ..data.nodes import preload_memmap
 from ..data.pipeline import (
-    BatchIterator,
+    BatchIO,
     Dataset,
     default_underflow_action,
     extract_xy,
@@ -50,11 +51,243 @@ from ..data.pipeline import (
 from ..core.graph import inference_mode
 from ..nn.architecture import Model
 from ..nn.primitives import Recorder, resize_scaler_buffer
-from .io import _torch_load_checkpoint, _to_cpu
+from .io import _torch_load_checkpoint, _to_cpu, is_required
 from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
 
 
 logger = logging.getLogger(__name__)
+
+
+# -----------------------------------------------------------------------------
+# Model lifecycle helpers (create/load/save)
+# -----------------------------------------------------------------------------
+
+def _strip_legacy_wrapped_keys(sd: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip legacy keys like `m.0.module.<real_key>` -> `<real_key>`.
+
+    This is done lazily: we only allocate a new dict if we actually change a key.
+    """
+    new_sd: Optional[Dict[str, Any]] = None
+    prefix = ("m",)  # explicit marker for clarity
+
+    for k, v in sd.items():
+        if not (k.startswith("m.") and ".module." in k):
+            nk = k
+        else:
+            parts = k.split(".")
+            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and parts[2] == "module":
+                nk = ".".join(parts[3:])
+            else:
+                nk = k
+
+        if nk != k and new_sd is None:
+            new_sd = type(sd)()
+            break
+
+    if new_sd is None:
+        return sd
+
+    for k, v in sd.items():
+        if not (k.startswith("m.") and ".module." in k):
+            nk = k
+        else:
+            parts = k.split(".")
+            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and parts[2] == "module":
+                nk = ".".join(parts[3:])
+            else:
+                nk = k
+        new_sd[nk] = v
+
+    return new_sd
+
+
+def _read_checkpoint_dir_meta(p: Path) -> Dict[str, Any]:
+    meta_path = p / "meta.json"
+    if not meta_path.exists():
+        return {}
+    try:
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to parse checkpoint metadata at {str(meta_path)!r}") from exc
+
+
+def new_model(
+    in_dim: int,
+    out_shape: Sequence[int],
+    config: ModelConfig | Dict[str, Any] | None,
+) -> nn.Module:
+    cfg = coerce_model_config(config)
+    core = Model(in_dim, tuple(int(x) for x in out_shape), config=cfg)
+    return core
+
+
+def load_model(
+    checkpoint_path: str | Path,
+    in_dim: Optional[int] = None,
+    out_shape: Optional[Sequence[int]] = None,
+    config: ModelConfig | Dict[str, Any] | None = None,
+    map_location: Optional[torch.device | str] = None,
+    weights_only: bool = True,
+) -> nn.Module:
+    p = Path(checkpoint_path)
+    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
+
+    # 1) Distributed Checkpoint directory
+    if p.is_dir():
+        meta: Dict[str, Any] = _read_checkpoint_dir_meta(p)
+
+        use_in_dim = int(in_dim if in_dim is not None else (meta.get("in_dim") or 0))
+        out_shape_meta = out_shape if out_shape is not None else (meta.get("out_shape") or ())
+        use_out_shape = tuple(int(x) for x in out_shape_meta) if out_shape_meta else ()
+
+        user_provided_config = config is not None
+        raw_cfg = config if user_provided_config else meta.get("config")
+        use_config = coerce_model_config(raw_cfg)
+        if not user_provided_config:
+            use_config.device = load_dev
+        elif map_location is not None and use_config.device is None:
+            use_config.device = load_dev
+
+        if use_in_dim <= 0 or not use_out_shape:
+            raise ValueError(
+                "Loading from a checkpoint directory requires in_dim and out_shape, "
+                "or a valid meta.json inside the directory."
+            )
+
+        model = new_model(use_in_dim, use_out_shape, use_config)
+        opts = StateDictOptions(full_state_dict=True)
+        m_sd = get_model_state_dict(model, options=opts)
+        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
+        resize_scaler_buffer(model, m_sd)
+        set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
+        return model
+
+    if not p.exists():
+        raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
+
+    suffix = p.suffix.lower()
+
+    # 2) safetensors + sidecar json
+    if suffix == ".safetensors":
+        meta_path = p.with_suffix(".json")
+        if not meta_path.exists():
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+
+        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
+        out_shape_meta = out_shape if out_shape is not None else (meta.get("out_shape") or ())
+        use_out_shape = tuple(int(x) for x in out_shape_meta) if out_shape_meta else ()
+
+        user_provided_config = config is not None
+        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
+        if not user_provided_config:
+            use_config.device = load_dev
+        elif map_location is not None and use_config.device is None:
+            use_config.device = load_dev
+
+        if use_in_dim <= 0 or not use_out_shape:
+            raise RuntimeError(
+                f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: "
+                f"in_dim={use_in_dim}, out_shape={use_out_shape}"
+            )
+
+        model = new_model(use_in_dim, use_out_shape, use_config)
+
+        is_required("safetensors", "pip install safetensors")
+        from safetensors.torch import load_file as load_tensors
+
+        dev: str
+        if map_location is None:
+            dev = "cpu"
+        elif isinstance(map_location, torch.device):
+            dev = str(map_location)
+        else:
+            dev = str(map_location)
+
+        sd = load_tensors(str(p), device=dev)
+        sd = _strip_legacy_wrapped_keys(sd)
+        resize_scaler_buffer(model, sd)
+        model.load_state_dict(sd, strict=False)
+        return model
+
+    # 3) torch.save checkpoints (.pt/.pth or any other file)
+    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
+    if isinstance(obj, dict):
+        meta_in_dim = obj.get("in_dim")
+        meta_out_shape = obj.get("out_shape")
+        meta_cfg = obj.get("config")
+        sd = obj["state_dict"] if "state_dict" in obj else obj
+    else:
+        meta_in_dim = None
+        meta_out_shape = None
+        meta_cfg = None
+        sd = obj
+
+    use_in_dim = int(in_dim if in_dim is not None else meta_in_dim)
+    out_shape_meta = out_shape if out_shape is not None else (meta_out_shape or ())
+    use_out_shape = tuple(int(x) for x in out_shape_meta)
+    user_provided_config = config is not None
+
+    use_config = coerce_model_config(config if user_provided_config else meta_cfg)
+    if not user_provided_config:
+        use_config.device = load_dev
+    elif map_location is not None and use_config.device is None:
+        use_config.device = load_dev
+
+    if use_in_dim <= 0 or not use_out_shape:
+        raise RuntimeError(
+            f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: "
+            f"in_dim={use_in_dim}, out_shape={use_out_shape}"
+        )
+
+    model = new_model(use_in_dim, use_out_shape, use_config)
+    sd = _strip_legacy_wrapped_keys(sd) if isinstance(sd, dict) else sd
+    with contextlib.suppress(Exception):
+        resize_scaler_buffer(model, sd)  # type: ignore[arg-type]
+    model.load_state_dict(sd, strict=False)  # type: ignore[arg-type]
+    return model
+
+
+def save_model(
+    model: nn.Module,
+    path: str | Path,
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    *args: Any,
+    ema_averager: Optional[Any] = None,
+    swa_averager: Optional[Any] = None,
+    **kwargs: Any,
+) -> str:
+    from .io import TorchIO, OnnxIO
+
+    p = Path(path)
+
+    # Native torch checkpoint path (global-rank0 only for single-file outputs).
+    if TorchIO.is_native_target(p):
+        if args:
+            raise TypeError(
+                "Positional args are only supported for export converters; "
+                "use keyword arguments for TorchIO.save()."
+            )
+
+        merged_extra = dict(extra or {})
+        if ema_averager is not None and hasattr(ema_averager, "state_dict"):
+            with contextlib.suppress(Exception):
+                merged_extra["ema_averager_state"] = ema_averager.state_dict()
+        if swa_averager is not None and hasattr(swa_averager, "state_dict"):
+            with contextlib.suppress(Exception):
+                merged_extra["swa_averager_state"] = swa_averager.state_dict()
+
+        out = TorchIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
+        return str(out)
+
+    # Export converter path (positional args supported here only).
+    conv = OnnxIO.for_export(p.suffix)
+    if conv is None:
+        raise ValueError(f"Unknown export format for path '{path}'.")
+    conv.save(model, p, *args, **kwargs)
+    return str(p)
+
 
 
 @lru_cache(maxsize=1)
@@ -270,7 +503,7 @@ def _is_contiguous_row_range(rows: torch.Tensor) -> tuple[bool, int, int]:
     return True, start, start + n
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
     """Open an existing MemoryMappedTensor using the sidecar meta file."""
-    meta_path = BatchIterator.mmt_meta_path(mmt_path)
+    meta_path = BatchIO.mmt_meta_path(mmt_path)
     if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
         return None
     try:
@@ -362,7 +595,7 @@ def _mat_one(
         if count <= 0:
             raise ValueError("Empty TensorDict provided to train().")
 
-        in_dim, label_shape = BatchIterator.write_memmap_streaming_two_pass(
+        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -381,15 +614,15 @@ def _mat_one(
         isinstance(d, _Mapping)
         and d
         and all(not isinstance(v, _Mapping) for v in d.values())
-        and not BatchIterator.is_feature_label_batch_mapping(d)
+        and not BatchIO.is_feature_label_batch_mapping(d)
     ):
         # Key-index mappings can be huge; do not materialize keys.
         # Shuffle should be handled by the sampler, not the data writer.
-        count, _get_batch = BatchIterator.key_index_mapping_getters(d)
+        count, _get_batch = BatchIO.key_index_mapping_getters(d)
         if count <= 0:
             raise ValueError("Empty dataset provided to train().")
 
-        in_dim, label_shape = BatchIterator.write_memmap_streaming_two_pass(
+        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -414,7 +647,7 @@ def _mat_one(
         raise ValueError("Empty dataset provided to train().")
     in_dim = int(fx.reshape(count, -1).shape[1])
 
-    preload_memmap(
+    BatchIO.preload_memmap(
         {"features": fx, "labels": lb},
         memmap_dir=out_dir,
         train_frac=1.0 - float(val_frac),
@@ -636,7 +869,7 @@ def train(
 
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            BatchIterator.atomic_write_json(
+            BatchIO.atomic_write_json(
                 os.path.join(memmap_dir, "multinode.json"),
                 payload,
                 indent=None,
@@ -678,6 +911,7 @@ def train(
                         cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
                     if cfg_obj is not None:
                         break
+
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
         else:
@@ -946,7 +1180,7 @@ def _infer_pred_master_dtype(chunks_dir: str, *, default: torch.dtype = torch.fl
 
         # Fast path: memmap chunk with sidecar meta.
         if pred_path.endswith(".mmt"):
-            meta_path = BatchIterator.mmt_meta_path(pred_path)
+            meta_path = BatchIO.mmt_meta_path(pred_path)
             if os.path.isfile(meta_path):
                 try:
                     meta = read_json(meta_path)
@@ -1061,8 +1295,8 @@ def _assemble_predictions_to_memmap(
                     )
             Y_out.index_copy_(0, rows_t, preds_t)
 
-    pred_meta_path = BatchIterator.mmt_meta_path(out_path)
-    BatchIterator.atomic_write_json(
+    pred_meta_path = BatchIO.mmt_meta_path(out_path)
+    BatchIO.atomic_write_json(
         pred_meta_path,
         {
             "dtype": str(store_float).replace("torch.", ""),
@@ -1338,7 +1572,7 @@ def _infer_master_float_dtype_for_predict_input(obj: Any) -> torch.dtype:
             return torch.float64 if dt == torch.float64 else torch.float32
 
         # Feature/label mapping input
-        if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
+        if isinstance(obj, Mapping) and BatchIO.is_feature_label_batch_mapping(obj):
             f_key = resolve_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
@@ -1454,7 +1688,7 @@ def predict(
                 def _get_batch(s: int, e: int) -> Mapping[str, Any]:
                     return data[s:e]
 
-                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
+                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,
@@ -1470,7 +1704,7 @@ def predict(
                 )
 
             # 2) Feature/label mapping input
-            elif isinstance(data, Mapping) and BatchIterator.is_feature_label_batch_mapping(data):
+            elif isinstance(data, Mapping) and BatchIO.is_feature_label_batch_mapping(data):
                 f_key = resolve_feature_key(data)
                 if f_key is None:
                     raise ValueError("predict: could not resolve feature key from mapping")
@@ -1519,7 +1753,7 @@ def predict(
                             batch[k] = v
                     return batch
 
-                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
+                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,
@@ -1539,10 +1773,10 @@ def predict(
                 isinstance(data, Mapping)
                 and data
                 and all(not isinstance(v, Mapping) for v in data.values())
-                and not BatchIterator.is_feature_label_batch_mapping(data)
+                and not BatchIO.is_feature_label_batch_mapping(data)
             ):
-                count, _get_batch = BatchIterator.key_index_mapping_getters(data)
-                in_dim, _ = BatchIterator.write_memmap_streaming_two_pass(
+                count, _get_batch = BatchIO.key_index_mapping_getters(data)
+                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=count,
@@ -1568,7 +1802,7 @@ def predict(
                     fx = fx.view(-1, 1)
                 count = int(fx.shape[0])
                 in_dim = int(fx.shape[1])
-                preload_memmap(
+                BatchIO.preload_memmap(
                     {"features": fx},
                     memmap_dir=memmap_dir,
                     val_frac=0.0,
@@ -1599,6 +1833,7 @@ def predict(
                             cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
                         if cfg_obj is not None:
                             break
+
             if isinstance(cfg_obj, ModelConfig):
                 cfg_dict: dict[str, Any] = cfg_obj.to_dict()
             elif isinstance(cfg_obj, Mapping):

@@ -47,10 +47,10 @@ def __getattr__(name: str) -> Any:
 def new_model(*args: Any, **kwargs: Any) -> Any:
     """Create a new model.
 
-    Wrapper for :func:`stnet.run.io.new_model`.
+    Wrapper for :func:`stnet.run.launch.new_model`.
     """
 
-    from .run.io import new_model as _new_model
+    from .run.launch import new_model as _new_model
 
     return _new_model(*args, **kwargs)
 
@@ -58,10 +58,10 @@ def new_model(*args: Any, **kwargs: Any) -> Any:
 def load_model(*args: Any, **kwargs: Any) -> Any:
     """Load a model checkpoint.
 
-    Wrapper for :func:`stnet.run.io.load_model`.
+    Wrapper for :func:`stnet.run.launch.load_model`.
     """
 
-    from .run.io import load_model as _load_model
+    from .run.launch import load_model as _load_model
 
     return _load_model(*args, **kwargs)
 
@@ -69,10 +69,10 @@ def load_model(*args: Any, **kwargs: Any) -> Any:
 def save_model(*args: Any, **kwargs: Any) -> Any:
     """Save a model checkpoint.
 
-    Wrapper for :func:`stnet.run.io.save_model`.
+    Wrapper for :func:`stnet.run.launch.save_model`.
     """
 
-    from .run.io import save_model as _save_model
+    from .run.launch import save_model as _save_model
 
     return _save_model(*args, **kwargs)
 
@@ -80,10 +80,10 @@ def save_model(*args: Any, **kwargs: Any) -> Any:
 def train(*args: Any, **kwargs: Any) -> Any:
     """Train a model.
 
-    Wrapper for :func:`stnet.run.compute.train`.
+    Wrapper for :func:`stnet.run.launch.train`.
     """
 
-    from .run.compute import train as _train
+    from .run.launch import train as _train
 
     return _train(*args, **kwargs)
 
@@ -91,10 +91,10 @@ def train(*args: Any, **kwargs: Any) -> Any:
 def predict(*args: Any, **kwargs: Any) -> Any:
     """Run predict/infer.
 
-    Wrapper for :func:`stnet.run.compute.predict`.
+    Wrapper for :func:`stnet.run.launch.predict`.
     """
 
-    from .run.compute import predict as _predict
+    from .run.launch import predict as _predict
 
     return _predict(*args, **kwargs)
 
@@ -102,9 +102,9 @@ def predict(*args: Any, **kwargs: Any) -> Any:
 def get_prediction(*args: Any, **kwargs: Any) -> Any:
     """Read predictions saved by :func:`stnet.predict`.
 
-    Wrapper for :func:`stnet.run.compute.get_prediction`.
+    Wrapper for :func:`stnet.run.launch.get_prediction`.
     """
 
-    from .run.compute import get_prediction as _get_prediction
+    from .run.launch import get_prediction as _get_prediction
 
     return _get_prediction(*args, **kwargs)

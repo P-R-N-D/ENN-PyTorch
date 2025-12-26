@@ -21,7 +21,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 
 ## Features
 - **Typed configuration** (`stnet.core.config`): dataclass-based configs with sensible defaults and validation/coercion.
-- **I/O helpers** (`stnet.run.io`): create models from config and save/load checkpoints with device‑safe tensor handling.
+- **Run helpers** (`stnet.run.launch`): create models, save/load checkpoints, and provide train/predict entrypoints. Low-level exporters and native checkpoint writers live in `stnet.run.io`.
 - **Runtime utilities** (`stnet.run.elastic`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
 - **Export** (`stnet.run.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
@@ -170,7 +170,7 @@ stnet/
   __init__.py
   run/
     __init__.py
-    compute.py
+    launch.py
     elastic.py
     io.py
   core/
