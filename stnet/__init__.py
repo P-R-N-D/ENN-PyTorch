@@ -1,125 +1,110 @@
-# -*- coding: utf-8 -*-
+"""STNet top-level package.
+
+This package intentionally exposes a small, stable surface area:
+
+Modules:
+- stnet.core
+- stnet.data
+- stnet.model
+- stnet.run
+
+Convenience functions (thin wrappers around stnet.run.*):
+- stnet.new_model
+- stnet.load_model
+- stnet.save_model
+- stnet.train
+- stnet.predict
+- stnet.get_prediction
+"""
+
 from __future__ import annotations
 
 import importlib
-import logging
-import os
-import re
-import warnings
-from types import ModuleType
-
-os.environ.setdefault("TORCH_LOGS", "-all")
-os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
-os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
-
-import torch
-
-# Apply Torch compatibility patches early (adds missing APIs/aliases across versions).
-# This is best-effort and must never fail import.
-try:
-    from .core.compat import patch_torch as _patch_torch
-except Exception:  # pragma: no cover
-    _patch_torch = None
-else:
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore')
-        try:
-            _patch_torch()
-        except Exception:
-            pass
-
-try:
-    from tensordict import set_list_to_stack as _set_list_to_stack
-except Exception:
-    _set_list_to_stack = None
-
-from .core.casting import env_bool
+from typing import Any
 
 __all__ = [
-    "run",
     "core",
     "data",
-    "functional",
     "model",
+    "run",
+    # Short-call API
+    "new_model",
+    "load_model",
+    "save_model",
+    "train",
+    "predict",
+    "get_prediction",
 ]
 
 
-def __getattr__(name: str) -> ModuleType:
-    if name in __all__:
-        module = importlib.import_module(f".{name}", __name__)
-        globals()[name] = module
-        return module
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+def __getattr__(name: str) -> Any:
+    # Lazy module imports keep "import stnet" cheap.
+    if name in {"core", "data", "model", "run"}:
+        return importlib.import_module(f"stnet.{name}")
+    raise AttributeError(f"module 'stnet' has no attribute '{name}'")
 
 
-def __dir__() -> list[str]:
-    return sorted(list(globals().keys()) + list(__all__))
+def new_model(*args: Any, **kwargs: Any) -> Any:
+    """Create a new model.
+
+    Wrapper for :func:`stnet.run.io.new_model`.
+    """
+
+    from .run.io import new_model as _new_model
+
+    return _new_model(*args, **kwargs)
 
 
-class IgnoreTorchCompileMsg(logging.Filter):
+def load_model(*args: Any, **kwargs: Any) -> Any:
+    """Load a model checkpoint.
 
-    _DROP_SUBSTRINGS = (
-        "No valid triton configs",
-        "Runtime error during autotuning",
-        "Ignoring this choice",
-        "Autotune Choices Stats",
-        "triton_flex_",
-        "Not enough SMs",
-        "hit config.recompile_limit",
-        "recompilation reasons",
-        "recompiles",
-    )
+    Wrapper for :func:`stnet.run.io.load_model`.
+    """
 
-    def filter(self, record: logging.LogRecord) -> bool:
-        msg = record.getMessage()
-        if "best_time" in msg and "best_triton_pos" in msg:
-            return False
-        return not any(substr in msg for substr in self._DROP_SUBSTRINGS)
+    from .run.io import load_model as _load_model
+
+    return _load_model(*args, **kwargs)
 
 
-if env_bool("STNET_DISABLE_MKLDNN", False):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        try:
-            torch.backends.mkldnn.enabled = False
-        except Exception:
-            pass
+def save_model(*args: Any, **kwargs: Any) -> Any:
+    """Save a model checkpoint.
 
-warnings.filterwarnings(
-    "ignore",
-    message="Please use the new API settings to control TF32 behavior.*",
-)
-ignored_sentences = [
-    "External init callback must run in same thread as registerClient",
-    "Initializing zero-element tensors is a no-op",
-    "gpuGetDeviceCount failed with code",
-    "torch.distributed is disabled",
-    "TypedStorage is deprecated",
-    "flex_attention called without torch.compile",
-    "SOLUTION: Use torch.compile",
-    "Not enough SMs to use max_autotune_gemm",
-    "allowTF32CuDNN",
-    "allowTF32CuBLAS",
-    "torch._dynamo hit config.recompile_limit",
-    "Detected a Jax installation",
-]
-ignored_pattern = "|".join([f".*{re.escape(s)}.*" for s in ignored_sentences])
-warnings.filterwarnings("ignore", message=ignored_pattern)
-logging.getLogger("torch.distributed").setLevel(logging.ERROR)
-for logger_name in (
-    "torch._inductor",
-    "torch._inductor.select_algorithm",
-    "torch._dynamo",
-    "torch._dynamo.convert_frame",
-):
-    logger = logging.getLogger(logger_name)
-    logger.addFilter(IgnoreTorchCompileMsg())
-    logger.setLevel(logging.ERROR)
+    Wrapper for :func:`stnet.run.io.save_model`.
+    """
 
-if _set_list_to_stack is not None:
-    try:
-        setter = _set_list_to_stack(True)
-        if hasattr(setter, "set") and callable(getattr(setter, "set")):
-            setter.set()
-    except Exception:
-        pass
+    from .run.io import save_model as _save_model
+
+    return _save_model(*args, **kwargs)
+
+
+def train(*args: Any, **kwargs: Any) -> Any:
+    """Train a model.
+
+    Wrapper for :func:`stnet.run.compute.train`.
+    """
+
+    from .run.compute import train as _train
+
+    return _train(*args, **kwargs)
+
+
+def predict(*args: Any, **kwargs: Any) -> Any:
+    """Run predict/infer.
+
+    Wrapper for :func:`stnet.run.compute.predict`.
+    """
+
+    from .run.compute import predict as _predict
+
+    return _predict(*args, **kwargs)
+
+
+def get_prediction(*args: Any, **kwargs: Any) -> Any:
+    """Read predictions saved by :func:`stnet.predict`.
+
+    Wrapper for :func:`stnet.run.compute.get_prediction`.
+    """
+
+    from .run.compute import get_prediction as _get_prediction
+
+    return _get_prediction(*args, **kwargs)

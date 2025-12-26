@@ -11,7 +11,7 @@ from torch import nn
 
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
-from ..core.compat import torch_no_compile
+from ..core.graph import torch_no_compile
 from ..core.casting import env_str
 
 try:

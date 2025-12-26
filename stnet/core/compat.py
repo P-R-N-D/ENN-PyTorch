@@ -10,6 +10,15 @@ from typing import Any, Callable, Iterator, NoReturn
 
 import torch
 from torch import nn
+from .graph import (
+    cudagraph_step_end,
+    graph_break,
+    torch_compile_safe,
+    torch_compile_supported,
+    torch_disable_compile,
+    torch_no_compile,
+    torch_safe_distributed,
+)
 
 # -----------------------------------------------------------------------------
 # Optional imports / version-dependent APIs
@@ -24,40 +33,6 @@ try:
     from torch._subclasses.fake_tensor import FakeTensor  # type: ignore
 except Exception:
     FakeTensor = tuple()  # empty tuple-of-types works with isinstance()
-
-try:
-    from torch import compiler as _TORCH_COMPILER  # type: ignore
-except Exception:
-    _TORCH_COMPILER = None
-
-try:
-    import torch._dynamo as _TORCH_DYNAMO  # type: ignore
-except Exception:
-    _TORCH_DYNAMO = None
-
-
-def _resolve_compile_disable() -> Any | None:
-    if _TORCH_COMPILER is not None:
-        fn = getattr(_TORCH_COMPILER, "disable", None)
-        if callable(fn):
-            return fn
-    if _TORCH_DYNAMO is not None:
-        fn = getattr(_TORCH_DYNAMO, "disable", None)
-        if callable(fn):
-            return fn
-    return None
-
-
-_TORCH_COMPILE_DISABLE = _resolve_compile_disable()
-
-_COLLECTIVE_NAMES: tuple[str, ...] = (
-    "all_gather",
-    "all_gather_into_tensor",
-    "all_reduce",
-    "reduce_scatter_tensor",
-    "broadcast",
-    "barrier",
-)
 
 RMSNorm = getattr(nn, "RMSNorm", None)
 
@@ -102,58 +77,6 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
-
-
-# -----------------------------------------------------------------------------
-# graph_break (cache resolved callable; avoid repeated imports/lookups)
-# -----------------------------------------------------------------------------
-
-_GRAPH_BREAK_FN: Callable[[], None] | None = None
-_GRAPH_BREAK_LOCK = threading.Lock()
-
-
-def _resolve_graph_break_fn() -> Callable[[], None] | None:
-    # Prefer inductor.graph_break if present; fallback to dynamo.graph_break
-    try:
-        import torch._inductor as _inductor  # type: ignore
-
-        gb = getattr(_inductor, "graph_break", None)
-        if callable(gb):
-            return gb
-    except Exception:
-        pass
-
-    if _TORCH_DYNAMO is not None:
-        gb = getattr(_TORCH_DYNAMO, "graph_break", None)
-        if callable(gb):
-            return gb
-    return None
-
-
-def graph_break() -> None:
-    """Break torch.compile graphs only when tracing (safe no-op otherwise)."""
-    dyn = _TORCH_DYNAMO
-    if dyn is None:
-        return
-
-    try:
-        if not dyn.is_compiling():
-            return
-    except Exception:
-        return
-
-    global _GRAPH_BREAK_FN
-    fn = _GRAPH_BREAK_FN
-    if fn is None:
-        with _GRAPH_BREAK_LOCK:
-            if _GRAPH_BREAK_FN is None:
-                _GRAPH_BREAK_FN = _resolve_graph_break_fn()
-            fn = _GRAPH_BREAK_FN
-
-    if fn is None:
-        return
-    with suppress(Exception):
-        fn()
 
 
 # -----------------------------------------------------------------------------
@@ -302,11 +225,7 @@ def _nansum_impl(
 # -----------------------------------------------------------------------------
 
 _PATCH_LOCK = threading.RLock()
-_SAFE_DIST_LOCK = threading.Lock()
-_SAFE_DIST_PATCHED: set[str] = set()
-
 _TORCH_COMPAT: TorchCompat | None = None
-_NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
 
 
 class TorchCompat:
@@ -378,13 +297,6 @@ def patch_torch(module: Any | None = None, nn_module: Any | None = None) -> Torc
         return compat
 
 
-def cudagraph_step_end() -> None:
-    mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
-    if callable(mark_step):
-        with suppress(Exception):
-            mark_step()
-
-
 def is_fake_tensor(value: Any) -> bool:
     if not isinstance(value, torch.Tensor):
         return False
@@ -400,106 +312,3 @@ def is_meta_tensor(value: Any) -> bool:
 
 def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
-
-
-def torch_no_compile(*, reason: str | None = None, recursive: bool = True) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    if _TORCH_COMPILE_DISABLE is None:
-        def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
-            return fn
-        return _identity
-
-    kwargs: dict[str, Any] = {}
-    if reason is not None:
-        kwargs["reason"] = reason
-    kwargs["recursive"] = recursive
-
-    attempts = [kwargs]
-    if "reason" in kwargs:
-        attempts.append({k: v for k, v in kwargs.items() if k != "recursive"})
-    if "recursive" in kwargs:
-        attempts.append({k: v for k, v in kwargs.items() if k != "reason"})
-    attempts.append({})
-
-    for opts in attempts:
-        try:
-            return _TORCH_COMPILE_DISABLE(**opts)
-        except TypeError:
-            continue
-
-    def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
-        return fn
-
-    return _identity
-
-
-def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
-    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
-        return False
-    try:
-        import torch.distributed as dist
-    except Exception:
-        return False
-
-    disallow = getattr(_TORCH_DYNAMO, "disallow_in_graph", None)
-    if disallow is None:
-        return False
-
-    updated = False
-    with _SAFE_DIST_LOCK:
-        for name in collectives:
-            if name in _SAFE_DIST_PATCHED:
-                continue
-            fn = getattr(dist, name, None)
-            if fn is None:
-                continue
-            with suppress(Exception):
-                disallow(fn)
-                _SAFE_DIST_PATCHED.add(name)
-                updated = True
-    return updated
-
-
-def torch_disable_compile(target: Any, attr: str, *, reason: str | None = None, recursive: bool = True) -> bool:
-    if target is None or not hasattr(target, attr):
-        return False
-
-    fn = getattr(target, attr)
-    if getattr(fn, _NO_COMPILE_SENTINEL, False):
-        return True
-
-    decorator = torch_no_compile(reason=reason, recursive=recursive)
-    try:
-        wrapped = decorator(fn)
-    except Exception:
-        return False
-
-    with suppress(Exception):
-        setattr(wrapped, _NO_COMPILE_SENTINEL, True)
-
-    try:
-        setattr(target, attr, wrapped)
-    except Exception:
-        return False
-    return True
-
-
-def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
-    if layers_module is None:
-        with suppress(Exception):
-            layers_module = importlib.import_module("stnet.model.nn")
-
-    if layers_module is not None:
-        torch_disable_compile(getattr(layers_module, "Normal", None), "commit_training_success",
-                             reason="history/BN sync – eager")
-        torch_disable_compile(getattr(layers_module, "StudentsT", None), "commit_training_success",
-                             reason="history – eager")
-        torch_disable_compile(getattr(layers_module, "History", None), "forward")
-
-    if runtime_module is None:
-        with suppress(Exception):
-            runtime_module = importlib.import_module("stnet.run.elastic")
-
-    if runtime_module is not None:
-        # NOTE: Runtime metric aggregation helpers used to live in stnet.core.runtime.
-        # They were removed/merged; keep the hook here to avoid stale attribute references.
-        pass

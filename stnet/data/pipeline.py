@@ -1524,6 +1524,46 @@ def _feature_size_hint(obj: Any) -> Optional[int]:
     return None
 
 
+def _stack_sequence(
+    seq: Sequence[Any],
+    *,
+    dtype: torch.dtype,
+    reshape_1d: bool = False,
+) -> Optional[torch.Tensor]:
+    """Stack a sequence into a tensor without building an intermediate list of tensors.
+
+    This avoids a potentially large transient allocation of Python objects + tensor views
+    (common with `torch.stack([to_tensor(x) for x in seq])`).
+    """
+    if not seq:
+        return None
+
+    t0 = _to_tensor_safe(seq[0], dtype)
+    if t0 is None:
+        return None
+    if reshape_1d:
+        t0 = t0.reshape(-1)
+
+    n = int(len(seq))
+    out = torch.empty((n, *tuple(t0.shape)), dtype=t0.dtype, device=t0.device)
+    out[0].copy_(t0)
+
+    for i in range(1, n):
+        ti = _to_tensor_safe(seq[i], dtype)
+        if ti is None:
+            raise ValueError("Dataset.preprocess: missing tensor element")
+        if reshape_1d:
+            ti = ti.reshape(-1)
+        if tuple(ti.shape) != tuple(t0.shape):
+            raise ValueError(
+                f"Dataset.preprocess: inconsistent shapes in stacked sequence: "
+                f"{tuple(t0.shape)} vs {tuple(ti.shape)}"
+            )
+        out[i].copy_(ti)
+
+    return out
+
+
 @dataclass
 class Dataset(Generic[TExtra]):
     device: torch.device
@@ -1640,90 +1680,93 @@ class Dataset(Generic[TExtra]):
                 try:
                     k0, v0 = next(it)
                 except StopIteration:
-                    keys = []
-                    values: list[Any] = []
+                    keys = ()
                 else:
-                    keys_list: list[Any] = [k0]
-
+                    # Case A: {row_id: (feature, label)}
                     if isinstance(v0, (list, tuple)) and len(v0) >= 2:
-                        # Case: {row_id: (feature, label)}
+                        n = len(data)
+                        keys_list: list[Any] = [k0]
+
                         x0 = _to_tensor_safe(v0[0], self.feature_dtype)
                         if x0 is None:
                             raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
-                        feat_list: list[torch.Tensor] = [x0]
-                        label_list: list[torch.Tensor] = []
-                        has_missing_labels = v0[1] is None
-                        if not has_missing_labels:
-                            y0 = _to_tensor_safe(v0[1], self.label_float_dtype)
-                            if y0 is None:
-                                has_missing_labels = True
-                            else:
-                                label_list.append(y0)
 
-                        for k, v in it:
+                        feat = torch.empty((n, *x0.shape), dtype=x0.dtype, device=x0.device)
+                        feat[0].copy_(x0)
+
+                        labels_out: Optional[torch.Tensor] = None
+                        y0: Optional[torch.Tensor] = None
+                        if v0[1] is not None:
+                            y0 = _to_tensor_safe(v0[1], self.label_float_dtype)
+                            if y0 is not None:
+                                labels_out = torch.empty((n, *y0.shape), dtype=y0.dtype, device=y0.device)
+                                labels_out[0].copy_(y0)
+
+                        for i, (k, v) in enumerate(it, start=1):
                             keys_list.append(k)
+                            if not isinstance(v, (list, tuple)) or len(v) < 1:
+                                raise ValueError("Dataset.preprocess: invalid tuple mapping element")
+
                             x_i = _to_tensor_safe(v[0], self.feature_dtype)
                             if x_i is None:
                                 raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
-                            feat_list.append(x_i)
-                            if v[1] is None:
-                                if not has_missing_labels:
-                                    has_missing_labels = True
-                                    label_list.clear()
-                            elif not has_missing_labels:
-                                y_i = _to_tensor_safe(v[1], self.label_float_dtype)
-                                if y_i is None:
-                                    has_missing_labels = True
-                                    label_list.clear()
+                            if tuple(x_i.shape) != tuple(x0.shape):
+                                raise ValueError(
+                                    f"Dataset.preprocess: inconsistent feature shapes in tuple mapping: "
+                                    f"{tuple(x0.shape)} vs {tuple(x_i.shape)}"
+                                )
+                            feat[i].copy_(x_i)
+
+                            if labels_out is not None:
+                                if len(v) < 2 or v[1] is None:
+                                    labels_out = None
                                 else:
-                                    label_list.append(y_i)
-                        features = torch.stack(feat_list, dim=0) if feat_list else None
-                        labels = None
-                        if not has_missing_labels:
-                            labels = torch.stack(label_list, dim=0) if label_list else None
+                                    y_i = _to_tensor_safe(v[1], self.label_float_dtype)
+                                    if y_i is None or y0 is None or tuple(y_i.shape) != tuple(y0.shape):
+                                        labels_out = None
+                                    else:
+                                        labels_out[i].copy_(y_i)
+
+                        features = feat
+                        labels = labels_out
                         keys = keys_list
+
+                    # Case B: mapping may be {key: feature} or {feature: label}
                     else:
-                        # Case: mapping may be {key: feature} or {feature: label}
-                        values = [v0]
+                        keys_list: list[Any] = [k0]
+                        values_list: list[Any] = [v0]
+
+                        ksize0 = _feature_size_hint(k0)
+                        key_as_feature = ksize0 is not None and 1 < int(ksize0) <= 64
+
                         for k, v in it:
                             keys_list.append(k)
-                            values.append(v)
+                            values_list.append(v)
+                            if key_as_feature and _feature_size_hint(k) != ksize0:
+                                key_as_feature = False
+
                         keys = keys_list
 
                         parsed = False
-                        if keys and values:
-                            ksize0 = _feature_size_hint(keys[0])
-                            if ksize0 is not None and 1 < int(ksize0) <= 64:
-                                if all(_feature_size_hint(k) == ksize0 for k in keys):
-                                    has_missing_labels = any((v is None for v in values))
-                                    try:
-                                        feat_list = [
-                                            _to_tensor_safe(k, self.feature_dtype).reshape(-1) for k in keys
-                                        ]
-                                        features = torch.stack(feat_list, dim=0) if feat_list else None
-                                        if has_missing_labels:
-                                            labels = None
-                                            parsed = features is not None
-                                        else:
-                                            label_list = [
-                                                _to_tensor_safe(v, self.label_float_dtype) for v in values
-                                            ]
-                                            labels = (
-                                                torch.stack(label_list, dim=0) if label_list else None
-                                            )
-                                            parsed = features is not None and labels is not None
-                                    except Exception:
-                                        parsed = False
+                        if key_as_feature and keys_list and values_list:
+                            has_missing_labels = any((v is None for v in values_list))
+                            try:
+                                features = _stack_sequence(
+                                    keys_list,
+                                    dtype=self.feature_dtype,
+                                    reshape_1d=True,
+                                )
+                                if has_missing_labels:
+                                    labels = None
+                                    parsed = features is not None
+                                else:
+                                    labels = _stack_sequence(values_list, dtype=self.label_float_dtype)
+                                    parsed = features is not None and labels is not None
+                            except Exception:
+                                parsed = False
 
                         if not parsed:
-                            features = (
-                                torch.stack(
-                                    [_to_tensor_safe(v, self.feature_dtype) for v in values],
-                                    dim=0,
-                                )
-                                if values
-                                else None
-                            )
+                            features = _stack_sequence(values_list, dtype=self.feature_dtype)
                             labels = None
 
         if features is None:

@@ -30,7 +30,7 @@ import numpy as np
 from ..core.compat import ensure_torchdata
 from ..core.casting import dtype_from_name, env_bool, env_first_int
 from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
-from ..core.system import Thread
+from ..core.system import Thread, Memory
 from . import schemas as _schemas
 from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
 

@@ -262,6 +262,22 @@ class ModelConfig:
     compile_mode: str = "disabled"
     safety_margin_pow2: int = 3
 
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert this config into a JSON-friendly dict.
+
+        - Shallow conversion only (no recursion / deepcopy).
+        - Ensures `patch` is a plain dict.
+        - Ensures `device` is serializable (string) when it's a torch.device.
+        """
+        data = _shallow_dataclass_dict(self)
+        data["patch"] = patch_config_to_dict(getattr(self, "patch", None))
+
+        dev = data.get("device")
+        if isinstance(dev, torch.device):
+            data["device"] = str(dev)
+
+        return {k: _shallow_copy_if_container(v) for k, v in data.items()}
+
 
 _PATCH_FIELDS = _field_name_set(PatchConfig)
 _MODEL_FIELDS = _field_name_set(ModelConfig)
@@ -456,22 +472,14 @@ def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[st
 
 
 def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[str, Any]:
-    """Convert ModelConfig/dict/None into a JSON-friendly dict without dataclasses.asdict().
+    """Convert ModelConfig/dict/None into a JSON-friendly dict.
 
-    Notes:
-    - Shallow conversion only (no recursion / deepcopy).
-    - Ensures `patch` is a plain dict.
-    - Ensures `device` is serializable (string) when it's a torch.device.
+    Prefer calling :meth:`ModelConfig.to_dict` directly.
     """
-    cfg = coerce_model_config(config)
-    data = _shallow_dataclass_dict(cfg)
-    data["patch"] = patch_config_to_dict(cfg.patch)
-
-    dev = data.get("device")
-    if isinstance(dev, torch.device):
-        data["device"] = str(dev)
-
-    return {k: _shallow_copy_if_container(v) for k, v in data.items()}
+    if config is None:
+        return {}
+    cfg = config if isinstance(config, ModelConfig) else coerce_model_config(config)
+    return cfg.to_dict()
 
 
 def patch_config(base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any) -> PatchConfig:
@@ -605,6 +613,7 @@ class RuntimeConfig:
             "model_ckpt_dir",
             "keys",
             "seed",
+            "shuffle",
             "loss_skew",
         }
     )
@@ -753,6 +762,7 @@ class RuntimeConfig:
             )
 
         seed = _coerce_int(data.get("seed", 7), name="seed")
+        shuffle = _coerce_bool(data.get("shuffle", False), name="shuffle")
         loss_skew = _coerce_bool(data.get("loss_skew", True), name="loss_skew")
 
         ckpt_dir = str(data["ckpt_dir"])
@@ -770,6 +780,7 @@ class RuntimeConfig:
             model_ckpt_dir=model_ckpt_dir,
             keys=data.get("keys"),
             seed=seed,
+            shuffle=shuffle,
             loss_skew=loss_skew,
         )
 

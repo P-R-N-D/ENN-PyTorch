@@ -5,7 +5,7 @@ import contextlib
 import math
 import threading
 from collections import OrderedDict
-from typing import Any, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -1470,3 +1470,871 @@ class CrossAttention(nn.Module):
         ctx, _ = self.attn(qn, kvn, kvn, need_weights=False)
         ctx = self.out_proj(ctx)
         return q_tokens + self.drop_path(self.dropout(ctx))
+
+
+# -----------------------------------------------------------------------------
+# Utility modules
+# -----------------------------------------------------------------------------
+class Scaler(nn.Module):
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        # Precision-exempt: scaler stats must remain FP64 for numerical stability.
+        self.__stnet_precision_exempt__ = True
+        self.eps = float(eps)
+        self.calib_mode: str = "none"
+        self.register_buffer("x_mean", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
+        self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
+        self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
+
+        # Cache device/dtype-converted stats to avoid per-forward allocations.
+        self._stats_cache_lock = threading.Lock()
+        self._stats_cache_max = 8
+        self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _invalidate_stats_cache(self) -> None:
+        with self._stats_cache_lock:
+            self._x_stats_cache.clear()
+            self._y_stats_cache.clear()
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
+        super()._apply(fn)
+        self._invalidate_stats_cache()
+        return self
+
+    def _load_from_state_dict(
+        self,
+        state_dict: Mapping[str, Any],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        self._invalidate_stats_cache()
+
+    @torch.no_grad()
+    def update_x(self, x: torch.Tensor) -> None:
+        if x.numel() == 0:
+            return
+        x_work = x.detach()
+        if x_work.dim() == 1:
+            x_flat = x_work.view(-1, 1)
+        else:
+            x_flat = x_work.reshape(-1, x_work.shape[-1])
+        x_flat = x_flat.to(dtype=torch.float64)
+        mean = x_flat.mean(dim=0)
+        std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
+        if self.x_mean.shape != mean.shape:
+            self.x_mean.resize_(mean.shape)
+        if self.x_std.shape != std.shape:
+            self.x_std.resize_(std.shape)
+        self.x_mean.copy_(mean)
+        self.x_std.copy_(std)
+        self._invalidate_stats_cache()
+
+    @torch.no_grad()
+    def update_y(self, y: torch.Tensor) -> None:
+        if y.numel() == 0:
+            return
+        y_work = y.detach()
+        if y_work.dim() == 1:
+            y_flat = y_work.view(-1, 1)
+        else:
+            y_flat = y_work.reshape(-1, y_work.shape[-1])
+        y_flat = y_flat.to(dtype=torch.float64)
+        mean = y_flat.mean(dim=0)
+        std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
+        if self.y_mean.shape != mean.shape:
+            self.y_mean.resize_(mean.shape)
+        if self.y_std.shape != std.shape:
+            self.y_std.resize_(std.shape)
+        self.y_mean.copy_(mean)
+        self.y_std.copy_(std)
+        self._invalidate_stats_cache()
+
+    def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        if x.numel() == 0:
+            return x
+        feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
+        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+            raise RuntimeError(
+                "Scaler.normalize_x: feature dimension mismatch: "
+                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+            )
+
+        key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
+        with self._stats_cache_lock:
+            cached = self._x_stats_cache.get(key)
+        if cached is None:
+            mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
+            std_b = self.x_std.to(device=x.device, dtype=x.dtype)
+            with self._stats_cache_lock:
+                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+                    self._x_stats_cache.clear()
+                self._x_stats_cache[key] = (mean_b, std_b)
+        else:
+            mean_b, std_b = cached
+
+        if x.dim() == 1:
+            return (x - mean_b) / (std_b + self.eps)
+
+        view_shape = [1] * (x.dim() - 1) + [-1]
+        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+        return (x - mean) / (std + self.eps)
+
+    def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
+        if x_scaled.numel() == 0:
+            return x_scaled
+        feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
+        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+            raise RuntimeError(
+                "Scaler.denormalize_x: feature dimension mismatch: "
+                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+            )
+
+        key = (
+            x_scaled.device.type,
+            int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
+            x_scaled.dtype,
+        )
+        with self._stats_cache_lock:
+            cached = self._x_stats_cache.get(key)
+        if cached is None:
+            mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
+            std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
+            with self._stats_cache_lock:
+                if len(self._x_stats_cache) >= int(self._stats_cache_max):
+                    self._x_stats_cache.clear()
+                self._x_stats_cache[key] = (mean_b, std_b)
+        else:
+            mean_b, std_b = cached
+
+        if x_scaled.dim() == 1:
+            return x_scaled * (std_b + self.eps) + mean_b
+
+        view_shape = [1] * (x_scaled.dim() - 1) + [-1]
+        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+        return x_scaled * (std + self.eps) + mean
+
+    def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean = self.y_mean
+        std = self.y_std
+        if mean.ndim > 1:
+            mean_flat = mean.reshape(-1)
+            std_flat = std.reshape(-1)
+            with torch.no_grad():
+                if self.y_mean.shape != mean_flat.shape:
+                    self.y_mean.resize_(mean_flat.shape)
+                if self.y_std.shape != std_flat.shape:
+                    self.y_std.resize_(std_flat.shape)
+                self.y_mean.copy_(mean_flat)
+                self.y_std.copy_(std_flat)
+            self._invalidate_stats_cache()
+            mean = self.y_mean
+            std = self.y_std
+        return mean, std
+
+    def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
+        if y.numel() == 0:
+            return y
+
+        orig_shape = y.shape
+        if y.dim() == 1:
+            y_flat = y.view(1, -1)
+            batch_first = False
+        else:
+            y_flat = y.view(y.shape[0], -1)
+            batch_first = True
+
+        mean_vec, std_vec = self._y_stats_vector()
+        key = (
+            y_flat.device.type,
+            int(y_flat.device.index) if y_flat.device.index is not None else -1,
+            y_flat.dtype,
+        )
+        with self._stats_cache_lock:
+            cached = self._y_stats_cache.get(key)
+        if cached is None:
+            mean = mean_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+            std = std_vec.to(device=y_flat.device, dtype=y_flat.dtype)
+            with self._stats_cache_lock:
+                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+                    self._y_stats_cache.clear()
+                self._y_stats_cache[key] = (mean, std)
+        else:
+            mean, std = cached
+
+        if mean.numel() == 1 and std.numel() == 1:
+            z_flat = (y_flat - mean) / (std + self.eps)
+        else:
+            if y_flat.shape[1] != mean.numel():
+                raise RuntimeError(
+                    "Scaler.normalize_y: feature dimension mismatch: "
+                    f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
+                )
+            z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
+
+        return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
+
+    def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
+        if z.numel() == 0:
+            return z
+
+        orig_shape = z.shape
+        if z.dim() == 1:
+            z_flat = z.view(1, -1)
+            batch_first = False
+        else:
+            z_flat = z.view(z.shape[0], -1)
+            batch_first = True
+
+        mean_vec, std_vec = self._y_stats_vector()
+        key = (
+            z_flat.device.type,
+            int(z_flat.device.index) if z_flat.device.index is not None else -1,
+            z_flat.dtype,
+        )
+        with self._stats_cache_lock:
+            cached = self._y_stats_cache.get(key)
+        if cached is None:
+            mean = mean_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+            std = std_vec.to(device=z_flat.device, dtype=z_flat.dtype)
+            with self._stats_cache_lock:
+                if len(self._y_stats_cache) >= int(self._stats_cache_max):
+                    self._y_stats_cache.clear()
+                self._y_stats_cache[key] = (mean, std)
+        else:
+            mean, std = cached
+
+        if mean.numel() == 1 and std.numel() == 1:
+            y_flat = z_flat * std + mean
+        else:
+            if z_flat.shape[1] != mean.numel():
+                raise RuntimeError(
+                    "Scaler.denormalize_y: feature dimension mismatch: "
+                    f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
+                )
+            y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
+
+        return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
+
+    def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
+        match self.calib_mode:
+            case "piecewise":
+                if self.pw_x.numel() > 0 and self.pw_y.numel() > 0:
+                    return self._piecewise(z_raw)
+                return z_raw
+            case "affine" | "none":
+                if self.affine_a.numel() > 0:
+                    return self.affine(z_raw)
+                return z_raw
+            case _:
+                return z_raw
+
+    def affine(self, z_raw: torch.Tensor) -> torch.Tensor:
+        if self.affine_a.numel() == 0:
+            return z_raw
+        a = self.affine_a.to(device=z_raw.device, dtype=z_raw.dtype)
+        b = self.affine_b.to(device=z_raw.device, dtype=z_raw.dtype)
+        return z_raw * a + b
+
+    @torch.no_grad()
+    def set_affine(self, a: torch.Tensor, b: torch.Tensor) -> None:
+        if self.affine_a.shape != a.shape:
+            self.affine_a.resize_(a.shape)
+        if self.affine_b.shape != b.shape:
+            self.affine_b.resize_(b.shape)
+        self.affine_a.copy_(a.to(self.affine_a.device, dtype=self.affine_a.dtype))
+        self.affine_b.copy_(b.to(self.affine_b.device, dtype=self.affine_b.dtype))
+        self.pw_x.resize_(0)
+        self.pw_y.resize_(0)
+        self.calib_mode = "affine"
+
+    @torch.no_grad()
+    def fit(
+        self,
+        z_raw: torch.Tensor,
+        z_true: torch.Tensor,
+        mode: str = "affine",
+        num_bins: int = 8,
+    ) -> None:
+        if mode == "affine":
+            self._fit_affine(z_raw, z_true)
+            self.calib_mode = "affine"
+        elif mode == "piecewise":
+            self._fit_piecewise(z_raw, z_true, num_bins=num_bins)
+            self.calib_mode = "piecewise"
+        else:
+            raise ValueError(f"Unsupported calibration mode: {mode}")
+
+    @torch.no_grad()
+    def _fit_affine(self, z_raw: torch.Tensor, z_true: torch.Tensor) -> None:
+        if z_raw.numel() == 0 or z_true.numel() == 0:
+            return
+
+        x = z_raw.detach()
+        y = z_true.detach()
+        if x.ndim == 1:
+            x = x.unsqueeze(-1)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+
+        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+
+        x_mean = x.mean(dim=0)
+        y_mean = y.mean(dim=0)
+        x_centered = x - x_mean
+        y_centered = y - y_mean
+
+        denom = (x_centered * x_centered).sum(dim=0)
+        num = (x_centered * y_centered).sum(dim=0)
+
+        tiny_mask = denom.abs() < self.eps
+        if bool(tiny_mask.any().item()):
+            denom_safe = denom.clone()
+            denom_safe[tiny_mask] = 1.0
+        else:
+            denom_safe = denom
+
+        a64 = num / denom_safe
+        b64 = y_mean - a64 * x_mean
+
+        a64[tiny_mask] = 1.0
+        b64[tiny_mask] = 0.0
+
+        a = a64.to(dtype=torch.float64, device=self.affine_a.device)
+        b = b64.to(dtype=torch.float64, device=self.affine_b.device)
+
+        if self.affine_a.shape != a.shape:
+            self.affine_a.resize_(a.shape)
+        if self.affine_b.shape != b.shape:
+            self.affine_b.resize_(b.shape)
+        self.affine_a.copy_(a)
+        self.affine_b.copy_(b)
+
+        self.pw_x.resize_(0)
+        self.pw_y.resize_(0)
+
+    @torch.no_grad()
+    def _fit_piecewise(
+        self,
+        z_raw: torch.Tensor,
+        z_true: torch.Tensor,
+        num_bins: int = 8,
+    ) -> None:
+        if z_raw.numel() == 0 or z_true.numel() == 0:
+            return
+        if num_bins < 2:
+            self._fit_affine(z_raw, z_true)
+            self.calib_mode = "affine"
+            return
+
+        x = z_raw.detach()
+        y = z_true.detach()
+        if x.ndim == 1:
+            x = x.unsqueeze(-1)
+        if y.ndim == 1:
+            y = y.unsqueeze(-1)
+        x = x.reshape(-1, x.shape[-1]).to(dtype=torch.float64)
+        y = y.reshape(-1, y.shape[-1]).to(dtype=torch.float64)
+
+        _, C = x.shape
+        device = self.affine_a.device
+        knots_x = torch.empty(C, num_bins, dtype=torch.float64, device=device)
+        knots_y = torch.empty(C, num_bins, dtype=torch.float64, device=device)
+
+        for j in range(C):
+            xj = x[:, j]
+            yj = y[:, j]
+            if xj.numel() == 0:
+                knots_x[j] = torch.linspace(-1.0, 1.0, num_bins, device=device)
+                knots_y[j] = knots_x[j]
+                continue
+            xj_sorted, idx = torch.sort(xj)
+            yj_sorted = yj[idx]
+            idx_q = torch.linspace(
+                0,
+                max(0, xj_sorted.numel() - 1),
+                num_bins,
+                dtype=torch.long,
+                device=xj_sorted.device,
+            )
+            qx = xj_sorted[idx_q]
+            qy = yj_sorted[idx_q]
+            knots_x[j] = qx.to(dtype=torch.float64, device=device)
+            knots_y[j] = qy.to(dtype=torch.float64, device=device)
+
+        if self.pw_x.shape != knots_x.shape:
+            self.pw_x.resize_(knots_x.shape)
+        if self.pw_y.shape != knots_y.shape:
+            self.pw_y.resize_(knots_y.shape)
+        self.pw_x.copy_(knots_x)
+        self.pw_y.copy_(knots_y)
+
+        if self.affine_a.numel() != C:
+            self.affine_a.resize_(C)
+            self.affine_b.resize_(C)
+        self.affine_a.fill_(1.0)
+        self.affine_b.zero_()
+
+    def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
+        """Piecewise-linear calibration without mutating module buffers.
+
+        Previous code resized/sliced/reassigned self.pw_x/self.pw_y inside forward,
+        which is unsafe under multithreading and can break torch.compile assumptions.
+        This implementation treats saved knots as read-only and uses local views.
+        """
+        if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
+            return z_raw
+        if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
+            return z_raw
+
+        pw_x = self.pw_x
+        pw_y = self.pw_y
+        C_saved, Kx = pw_x.shape
+        _, Ky = pw_y.shape
+        K = int(min(Kx, Ky))
+        if K < 2:
+            return z_raw
+
+        # Local views only (do not mutate buffers).
+        pw_x = pw_x[:, :K]
+        pw_y = pw_y[:, :K]
+
+        orig_shape = z_raw.shape
+        z = z_raw.unsqueeze(-1) if z_raw.ndim == 1 else z_raw
+        z = z.reshape(-1, int(z.shape[-1]))
+
+        _, C_target = z.shape
+        device = z.device
+        dtype = z.dtype
+
+        out = torch.empty_like(z)
+
+        # If saved calibration has fewer channels, reuse the last channel for extras.
+        last_idx = max(0, int(C_saved) - 1)
+        for j in range(int(C_target)):
+            src_j = j if j < int(C_saved) else last_idx
+            xj = z[:, j]
+            knots_x = pw_x[src_j].to(device=device, dtype=dtype)
+            knots_y = pw_y[src_j].to(device=device, dtype=dtype)
+
+            idx = torch.bucketize(xj, knots_x)
+            idx = idx.clamp(1, knots_x.numel() - 1)
+            x0 = knots_x[idx - 1]
+            x1 = knots_x[idx]
+            y0 = knots_y[idx - 1]
+            y1 = knots_y[idx]
+            t = (xj - x0) / (x1 - x0 + self.eps)
+            out[:, j] = y0 + t * (y1 - y0)
+
+        out = out.reshape(orig_shape)
+        return out
+
+
+class History(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        # Precision-exempt: history/logging buffers must remain FP64/INT64.
+        self.__stnet_precision_exempt__ = True
+        self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.timezone: str = "UTC"
+        self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("epochs", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.os: str = ""
+        self.kernel: str = ""
+        self.cpu: List[str] = []
+        self.arch: List[str] = []
+        self.ram_gb: float = 0.0
+        self.python: str = ""
+        self.backends: List[str] = []
+
+        self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_x_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "sampled_x_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_y_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "sampled_y_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+
+        self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_x_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "reduced_x_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_y_min",
+            torch.full((1,), float("inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self.register_buffer(
+            "reduced_y_max",
+            torch.full((1,), float("-inf"), dtype=torch.float64),
+            persistent=True,
+        )
+        self._global_step: int = 0
+        self._records: List[Dict[str, Any]] = []
+        self.max_history_steps: int = 0
+
+    @torch.no_grad()
+    def start_session(self, start_posix: float, timezone: Optional[str] = None) -> None:
+        self.start.fill_(round(float(start_posix), 6))
+
+        if timezone is None or not str(timezone).strip():
+            try:
+                import datetime
+                import time as _time
+
+                now = datetime.datetime.now().astimezone()
+                tzinfo = now.tzinfo
+                tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
+                tz_name = tzinfo.tzname(now) if tzinfo is not None else None
+                tz_env = None
+                try:
+                    tz_env = _time.tzname[0]
+                except (AttributeError, IndexError, TypeError):
+                    tz_env = None
+                tz = tz_key or tz_name or tz_env or "UTC"
+                self.timezone = str(tz)
+            except Exception:
+                self.timezone = "UTC"
+        else:
+            self.timezone = str(timezone)
+
+    @torch.no_grad()
+    def end_session(self, end_posix: float, peers: int) -> None:
+        self.end.fill_(round(float(end_posix), 6))
+        self.peers.fill_(int(peers))
+
+    @torch.no_grad()
+    def set_epochs(self, epochs: int) -> None:
+        self.epochs.fill_(max(0, int(epochs)))
+
+    @torch.no_grad()
+    def set_system_info(
+        self,
+        os_name: str,
+        kernel: str,
+        cpu_list: List[str],
+        arch_list: List[str],
+        ram_gb: int,
+        python_version: str,
+        backends: List[str],
+    ) -> None:
+        import platform
+
+        self.os = str(os_name)
+        self.kernel = str(kernel)
+        self.python = str(python_version)
+
+        cpu_models: List[str] = []
+        arch_norm: List[str] = []
+        try:
+            from ..core.system import cpu_info, process_cpu_count
+
+            n_cores = max(1, int(process_cpu_count() or 1))
+
+            model_name: Optional[str] = None
+            with contextlib.suppress(Exception):
+                info = cpu_info()
+                first = info.split(";", 1)[0]
+                cand = first.split(":", 1)[1] if ":" in first else first
+                cand = str(cand).strip()
+                if cand:
+                    model_name = cand
+
+            if not model_name:
+                model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
+
+            arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
+
+            cpu_models = [str(model_name) for _ in range(int(n_cores))]
+            arch_norm = [str(arch_name) for _ in range(int(n_cores))]
+        except Exception:
+            cpu_models = list(cpu_list)
+            arch_norm = list(arch_list)
+
+        self.cpu = cpu_models
+        self.arch = arch_norm
+
+        try:
+            from ..core.system import Memory
+
+            total_bytes = Memory.total()
+            if total_bytes is not None and int(total_bytes) > 0:
+                self.ram_gb = float(round(float(total_bytes) / (1024.0 ** 3), 2))
+            else:
+                self.ram_gb = float(ram_gb)
+        except Exception:
+            self.ram_gb = float(ram_gb)
+
+        backend_devices: List[str] = []
+        try:
+            if torch.cuda.is_available():
+                num_cuda = torch.cuda.device_count()
+                for idx in range(num_cuda):
+                    try:
+                        name = torch.cuda.get_device_name(idx)
+                    except Exception:
+                        name = "CUDA Device"
+                    backend_devices.append(f"cuda:{idx}, {name}")
+
+            mps = getattr(torch.backends, "mps", None)
+            if (
+                mps is not None
+                and getattr(mps, "is_available", None)
+                and torch.backends.mps.is_available()
+            ):
+                chip_name = platform.processor() or "Apple Silicon"
+                backend_devices.append(f"mps:0, {chip_name}")
+
+            for idx, model_name in enumerate(cpu_models):
+                backend_devices.append(f"cpu:{idx}, {model_name}")
+
+        except Exception:
+            backend_devices = list(backends)
+
+        self.backends = backend_devices
+
+    @torch.no_grad()
+    def record_batch(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        *args: Any,
+        use_for_sample: bool = True,
+        use_for_reduced: bool = True,
+        step: Optional[int] = None,
+        extra: Optional[Mapping[str, Any]] = None,
+        **kwargs: Any,
+    ) -> None:
+        if x.numel() == 0 or y.numel() == 0:
+            return
+        x_det = x.detach()
+        y_det = y.detach()
+
+        def _stats(t: torch.Tensor):
+            if t.is_floating_point() or t.is_complex():
+                v, m = torch.var_mean(t, correction=0)
+                mn, mx = torch.aminmax(t)
+            else:
+                mn, mx = torch.aminmax(t)
+                m = t.sum(dtype=torch.float64) / float(t.numel())
+                v = torch.zeros((), dtype=torch.float64, device=m.device)
+            return v, m, mn, mx
+
+        xvar_dev, xm_dev, xmin_dev, xmax_dev = _stats(x_det)
+        yvar_dev, ym_dev, ymin_dev, ymax_dev = _stats(y_det)
+
+        stats_device = self.sampled_x_mean.device
+        xm = xm_dev.to(device=stats_device, dtype=torch.float64)
+        xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
+        xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
+        xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
+        ym = ym_dev.to(device=stats_device, dtype=torch.float64)
+        yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
+        ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
+        ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
+
+        if use_for_sample:
+            n = int(self.sampled_n.item())
+            n_new = n + 1
+            w_old = n / n_new if n_new > 0 else 0.0
+            w_new = 1.0 / n_new
+            self.sampled_n.fill_(n_new)
+            self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
+            self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
+            self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
+            self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
+            self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
+            self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
+            self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
+            self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
+
+        if use_for_reduced:
+            n = int(self.reduced_n.item())
+            n_new = n + 1
+            w_old = n / n_new if n_new > 0 else 0.0
+            w_new = 1.0 / n_new
+            self.reduced_n.fill_(n_new)
+            self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
+            self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
+            self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
+            self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
+            self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
+            self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
+            self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
+            self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+
+        self._append(
+            xm=xm,
+            xvar=xvar,
+            xmin=xmin,
+            xmax=xmax,
+            ym=ym,
+            yvar=yvar,
+            ymin=ymin,
+            ymax=ymax,
+            batch_size=int(x.shape[0]),
+            step=step,
+            extra=extra,
+        )
+
+    def _append(
+        self,
+        *args: Any,
+        xm: torch.Tensor,
+        xvar: torch.Tensor,
+        xmin: torch.Tensor,
+        xmax: torch.Tensor,
+        ym: torch.Tensor,
+        yvar: torch.Tensor,
+        ymin: torch.Tensor,
+        ymax: torch.Tensor,
+        batch_size: int,
+        step: Optional[int],
+        extra: Optional[Mapping[str, Any]],
+        **kwargs: Any,
+    ) -> None:
+        t = int(step) if step is not None else int(self._global_step)
+        self._global_step = t + 1
+
+        def _f(val: torch.Tensor) -> float:
+            return float(val.item())
+
+        rec: Dict[str, Any] = {
+            "timestep": t,
+            "batch_size": int(batch_size),
+            "batch_x_mean": _f(xm),
+            "batch_x_var": _f(xvar),
+            "batch_x_min": _f(xmin),
+            "batch_x_max": _f(xmax),
+            "batch_y_mean": _f(ym),
+            "batch_y_var": _f(yvar),
+            "batch_y_min": _f(ymin),
+            "batch_y_max": _f(ymax),
+            "sampled_n": int(self.sampled_n.item()),
+            "sampled_x_mean": _f(self.sampled_x_mean),
+            "sampled_x_var": _f(self.sampled_x_var),
+            "sampled_x_min": _f(self.sampled_x_min),
+            "sampled_x_max": _f(self.sampled_x_max),
+            "sampled_y_mean": _f(self.sampled_y_mean),
+            "sampled_y_var": _f(self.sampled_y_var),
+            "sampled_y_min": _f(self.sampled_y_min),
+            "sampled_y_max": _f(self.sampled_y_max),
+            "reduced_n": int(self.reduced_n.item()),
+            "reduced_x_mean": _f(self.reduced_x_mean),
+            "reduced_x_var": _f(self.reduced_x_var),
+            "reduced_x_min": _f(self.reduced_x_min),
+            "reduced_x_max": _f(self.reduced_x_max),
+            "reduced_y_mean": _f(self.reduced_y_mean),
+            "reduced_y_var": _f(self.reduced_y_var),
+            "reduced_y_min": _f(self.reduced_y_min),
+            "reduced_y_max": _f(self.reduced_y_max),
+        }
+        if extra is not None:
+            rec["extra"] = dict(extra)
+        self._records.append(rec)
+        max_steps = int(self.max_history_steps or 0)
+        if max_steps > 0 and len(self._records) > max_steps:
+            overflow = len(self._records) - max_steps
+            if overflow > 0:
+                del self._records[:overflow]
+
+    def save(self) -> Sequence[Mapping[str, Any]]:
+        return list(self._records)
+
+    def clear(self) -> None:
+        self._records.clear()
+        self._global_step = 0
+
+
+def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
+    scaler: Optional[Scaler] = None
+    for module in model.modules():
+        if isinstance(module, Scaler):
+            scaler = module
+            break
+    if scaler is None:
+        return
+
+    view: Mapping[str, Any]
+    if "scaler.x_mean" in state or "module.scaler.x_mean" in state:
+        view = state
+    elif "model" in state and isinstance(state["model"], Mapping):
+        view = state["model"]
+    else:
+        view = state
+
+    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
+    prefixes = ("scaler.", "module.scaler.")
+
+    for prefix in prefixes:
+        for name in buf_names:
+            key = prefix + name
+            if key not in view:
+                continue
+            src = view[key]
+            if not isinstance(src, torch.Tensor):
+                continue
+            buf = getattr(scaler, name, None)
+            if not isinstance(buf, torch.Tensor):
+                continue
+            if tuple(buf.shape) == tuple(src.shape):
+                continue
+            try:
+                buf.resize_(src.shape)
+            except Exception:
+                new_buf = buf.detach().new_zeros(src.shape)
+                try:
+                    scaler._buffers[name] = new_buf
+                except Exception:
+                    setattr(scaler, name, new_buf)

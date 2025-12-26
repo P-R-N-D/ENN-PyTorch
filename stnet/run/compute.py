@@ -49,9 +49,9 @@ from ..data.pipeline import (
 )
 from ..core.graph import inference_mode
 from ..model.architecture import Root
-from ..model.blocks import History, resize_scaler_buffer
+from ..model.primitives import History, resize_scaler_buffer
 from .io import _torch_load_checkpoint, _to_cpu
-from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, model_config_to_dict, runtime_config
+from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
 
 
 logger = logging.getLogger(__name__)
@@ -668,7 +668,7 @@ def train(
             cfg_model = coerce_model_config(cfg_obj)
         else:
             cfg_model = ModelConfig()
-        cfg_dict: Dict[str, Any] = model_config_to_dict(cfg_model)
+        cfg_dict: Dict[str, Any] = cfg_model.to_dict()
 
         lc = LaunchConfig(
             min_nodes=1,
@@ -1285,13 +1285,77 @@ def _write_predictions_h5_from_memmaps(
 
     return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode="r")
 
+
+def _coerce_float_dtype_like_to_torch(dt: Any) -> torch.dtype | None:
+    """Best-effort conversion of dtype-like objects to torch float dtypes."""
+    try:
+        if isinstance(dt, torch.dtype):
+            return dt
+        if dt is None:
+            return None
+        ndt = np.dtype(dt)
+        if ndt == np.float64:
+            return torch.float64
+        if ndt == np.float32:
+            return torch.float32
+        if ndt == np.float16:
+            return torch.float16
+    except Exception:
+        return None
+    return None
+
+
+def _infer_master_float_dtype_for_predict_input(obj: Any) -> torch.dtype:
+    """Infer the master floating dtype to use when preprocessing predict() input.
+
+    Goal: preserve float64 inputs (avoid silent precision loss) while keeping the
+    default path on float32 to reduce CPU memory and copy cost.
+    """
+
+    try:
+        # TensorDict input
+        if TensorDictBase is not None and isinstance(obj, TensorDictBase):
+            X_td, _ = extract_xy(obj, labels_required=False)
+            if X_td is None:
+                return torch.float32
+            if not bool(torch.is_tensor(X_td)):
+                X_td = torch.as_tensor(X_td)
+            dt = _coerce_float_dtype_like_to_torch(getattr(X_td, "dtype", None))
+            return torch.float64 if dt == torch.float64 else torch.float32
+
+        # Feature/label mapping input
+        if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
+            f_key = resolve_feature_key(obj)
+            if f_key is not None and f_key in obj:
+                X_all = obj.get(f_key)
+                dt = _coerce_float_dtype_like_to_torch(getattr(X_all, "dtype", None))
+                if dt is not None:
+                    return torch.float64 if dt == torch.float64 else torch.float32
+                if isinstance(X_all, (list, tuple)) and X_all:
+                    dt0 = _coerce_float_dtype_like_to_torch(getattr(X_all[0], "dtype", None))
+                    return torch.float64 if dt0 == torch.float64 else torch.float32
+
+        # Tensor / numpy
+        if torch.is_tensor(obj):
+            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
+            return torch.float64 if dt == torch.float64 else torch.float32
+
+        if isinstance(obj, np.ndarray):
+            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
+            return torch.float64 if dt == torch.float64 else torch.float32
+
+    except Exception:
+        pass
+
+    return torch.float32
+
 @catchtime(logger, fn_name="predict")
 def predict(
+    model: torch.nn.Module,
     data: Any,
     *args: Any,
-    model: Optional[torch.nn.Module] = None,
     mode: OpsMode = "predict",
-    seed: int = 0,
+    seed: int = 7,
     shuffle: bool = False,
     max_nodes: Optional[int] = None,
     rdzv_endpoint: Optional[str] = None,
@@ -1306,6 +1370,7 @@ def predict(
     PersistentTensorDict is written instead.
     """
 
+    # (model is positional, but keep a clear error if a caller passes None.)
     if model is None:
         raise ValueError("predict: model must not be None")
 
@@ -1330,64 +1395,7 @@ def predict(
     lazy = bool(kwargs.pop("lazy", True))
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
 
-    def _infer_master_float_dtype(obj: Any) -> torch.dtype:
-        """Best-effort dtype inference for predict() materialization.
-
-        We prefer to preserve float64 inputs (avoid silent precision loss) while
-        keeping the default path on float32 to reduce CPU memory and copy cost.
-        """
-
-        def _coerce(dt: Any) -> torch.dtype | None:
-            try:
-                if isinstance(dt, torch.dtype):
-                    return dt
-                if dt is None:
-                    return None
-                # numpy dtype
-                ndt = np.dtype(dt)
-                if ndt == np.float64:
-                    return torch.float64
-                if ndt == np.float32:
-                    return torch.float32
-                if ndt == np.float16:
-                    return torch.float16
-            except Exception:
-                return None
-            return None
-
-        try:
-            if TensorDictBase is not None and isinstance(obj, TensorDictBase):
-                X_td, _ = extract_xy(obj, labels_required=False)
-                if X_td is None:
-                    return torch.float32
-                if not bool(torch.is_tensor(X_td)):
-                    X_td = torch.as_tensor(X_td)
-                dt = _coerce(getattr(X_td, "dtype", None))
-                return torch.float64 if dt == torch.float64 else torch.float32
-
-            if isinstance(obj, Mapping) and BatchIterator.is_feature_label_batch_mapping(obj):
-                f_key = resolve_feature_key(obj)
-                if f_key is not None and f_key in obj:
-                    X_all = obj.get(f_key)
-                    dt = _coerce(getattr(X_all, "dtype", None))
-                    if dt is not None:
-                        return torch.float64 if dt == torch.float64 else torch.float32
-                    if isinstance(X_all, (list, tuple)) and X_all:
-                        dt0 = _coerce(getattr(X_all[0], "dtype", None))
-                        return torch.float64 if dt0 == torch.float64 else torch.float32
-
-            if torch.is_tensor(obj):
-                dt = _coerce(obj.dtype)
-                return torch.float64 if dt == torch.float64 else torch.float32
-
-            if isinstance(obj, np.ndarray):
-                dt = _coerce(obj.dtype)
-                return torch.float64 if dt == torch.float64 else torch.float32
-        except Exception:
-            pass
-        return torch.float32
-
-    master_dtype = _infer_master_float_dtype(data)
+    master_dtype = _infer_master_float_dtype_for_predict_input(data)
     ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
     ds.underflow_action = underflow_action
 
@@ -1582,11 +1590,11 @@ def predict(
             # Only pass supported runtime-config keys.
             keys = kwargs.pop("keys", None)
             loss_skew = kwargs.pop("loss_skew", None)
-            ops_kwargs: dict[str, Any] = {"seed": int(seed)}
+            ops_kwargs: dict[str, Any] = {"seed": int(seed), "shuffle": bool(shuffle)}
             if keys is not None:
                 ops_kwargs["keys"] = keys
             if loss_skew is not None:
-                ops_kwargs["loss_skew"] = float(loss_skew)
+                ops_kwargs["loss_skew"] = bool(loss_skew)
 
             # Launch config knobs (not part of RuntimeConfig).
             run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))

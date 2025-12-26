@@ -26,33 +26,9 @@ from .system import (
     is_int8_supported,
 )
 
+from ..data.schemas import default_underflow_action, normalize_underflow_action
+
 _LOGGER = logging.getLogger(__name__)
-
-
-# -----------------------------------------------------------------------------
-# Underflow policy utilities
-# -----------------------------------------------------------------------------
-
-_DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
-
-
-def default_underflow_action() -> str:
-    """Return underflow policy used by precision negotiation."""
-    from ..core.casting import env_first
-
-    raw = str(
-        env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn")
-        or "warn"
-    ).strip().lower()
-    return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
-
-
-def normalize_underflow_action(value: object, *, default: str = "warn") -> str:
-    raw = str(value if value is not None else default).strip().lower()
-    if raw in _DEF_UNDERFLOW_ACTIONS:
-        return raw
-    fallback = str(default).strip().lower()
-    return fallback if fallback in _DEF_UNDERFLOW_ACTIONS else "warn"
 
 
 # -----------------------------------------------------------------------------
