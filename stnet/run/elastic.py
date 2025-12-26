@@ -213,10 +213,10 @@ from ..core.casting import to_torch_tensor
 from ..core.staging import Cache, Pool
 from ..data.pipeline import Dataset
 # NOTE: Sampler scale is per-session/per-loader now; avoid global Sampler scaling here.
-from .losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
-                     LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss)
-from .optimizers import (SWALR, AdamW, StochasticWeightAverage,
-                         stochastic_weight_average)
+from ..core.losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
+                           LossWeightController, StandardNormalLoss, StudentsTLoss, TiledLoss)
+from ..core.optimizers import (SWALR, AdamW, StochasticWeightAverage,
+                               stochastic_weight_average)
 from ..model.architecture import Root
 from ..model.blocks import History, resize_scaler_buffer
 from ..core.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
@@ -225,7 +225,7 @@ from ..core.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
 from ..core.distributed import (distributed_barrier, distributed_sync,
                                    get_world_size, is_distributed, joining, no_sync,
                                    to_ddp, to_fsdp)
-from .profiler import FlopCounter
+from ..core.profiler import FlopCounter
 from ..core.system import (
     Memory,
     empty_device_cache,
