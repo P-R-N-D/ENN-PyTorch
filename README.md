@@ -188,10 +188,9 @@ stnet/
     system.py
   data/
     __init__.py
-    collections.py
-    datatype.py
     nodes.py
     pipeline.py
+    schemas.py
   nn/
     __init__.py
     activations.py
@@ -199,7 +198,6 @@ stnet/
     blocks.py
     kernels.py
     primitives.py
-
 ```
 
 > Note: the neural-network implementation lives under `stnet.nn`.

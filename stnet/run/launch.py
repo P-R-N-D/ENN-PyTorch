@@ -476,8 +476,6 @@ def read_json(path: str) -> Any:
         return json.load(f)
 
 
-
-
 def _is_contiguous_row_range(rows: torch.Tensor) -> tuple[bool, int, int]:
     """Return (is_contiguous_range, start, end) for rows.
 
@@ -501,6 +499,8 @@ def _is_contiguous_row_range(rows: torch.Tensor) -> tuple[bool, int, int]:
         return False, 0, 0
 
     return True, start, start + n
+
+
 def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
     """Open an existing MemoryMappedTensor using the sidecar meta file."""
     meta_path = BatchIO.mmt_meta_path(mmt_path)
@@ -516,7 +516,6 @@ def _open_pred_memmap(mmt_path: str) -> Optional[MemoryMappedTensor]:
         return MemoryMappedTensor.from_filename(filename=mmt_path, dtype=dtype, shape=torch.Size(shape))
     except Exception:
         return None
-
 
 
 # -----------------------------
@@ -780,9 +779,9 @@ def _update_cum_stats(
     return out
 
 
-# -----------------------------
-# Public API
-# -----------------------------
+# -----------------------------------------------------------------------------
+# Training entrypoint
+# -----------------------------------------------------------------------------
 
 def train(
     model: Model,
@@ -811,6 +810,16 @@ def train(
     loss_mask_value: Optional[float] = None,
     **kwargs: Any,
 ) -> Model:
+    """Train a model using the distributed runtime.
+
+    This function materializes the provided dataset(s) into a memmap-backed
+    Dataset on disk, launches worker processes via an elastic torchrun-style
+    entrypoint (`stnet.run.elastic.main`), and then restores the resulting
+    checkpoint back into the provided `model` instance.
+
+    Most additional keyword arguments are forwarded to
+    `stnet.core.config.runtime_config("train", ...)`.
+    """
     _reset_process_group()
 
     try:
@@ -1286,14 +1295,47 @@ def _assemble_predictions_to_memmap(
             # Slice copy is noticeably faster than index_copy_ when rows are contiguous.
             Y_out[start:end].copy_(preds_t)
         else:
-            if rows_t.numel() > 0:
-                rmin = int(rows_t.min().item())
-                rmax = int(rows_t.max().item())
-                if rmin < 0 or rmax >= int(count):
-                    raise ValueError(
-                        f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
-                    )
-            Y_out.index_copy_(0, rows_t, preds_t)
+            did_segment_copy = False
+
+            # Middle ground: if rows are strictly increasing and mostly contiguous
+            # (few segments), block slice-copies are faster than a full index_copy_.
+            n_rows = int(rows_t.numel())
+            if n_rows > 1:
+                d = rows_t[1:] - rows_t[:-1]
+                if bool(torch.all(d > 0)):
+                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+                    segs = int(breaks.numel()) + 1
+                    if segs <= 64:
+                        seg_start = 0
+                        for b in breaks.tolist():
+                            seg_end = int(b) + 1
+                            r0 = int(rows_t[seg_start].item())
+                            r1 = int(rows_t[seg_end - 1].item()) + 1
+                            if r0 < 0 or r1 > int(count):
+                                raise ValueError(
+                                    f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                                )
+                            Y_out[r0:r1].copy_(preds_t[seg_start:seg_end])
+                            seg_start = seg_end
+
+                        r0 = int(rows_t[seg_start].item())
+                        r1 = int(rows_t[-1].item()) + 1
+                        if r0 < 0 or r1 > int(count):
+                            raise ValueError(
+                                f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                            )
+                        Y_out[r0:r1].copy_(preds_t[seg_start:])
+                        did_segment_copy = True
+
+            if not did_segment_copy:
+                if rows_t.numel() > 0:
+                    rmin = int(rows_t.min().item())
+                    rmax = int(rows_t.max().item())
+                    if rmin < 0 or rmax >= int(count):
+                        raise ValueError(
+                            f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
+                        )
+                Y_out.index_copy_(0, rows_t, preds_t)
 
     pred_meta_path = BatchIO.mmt_meta_path(out_path)
     BatchIO.atomic_write_json(
@@ -1373,14 +1415,45 @@ def _assemble_predictions_to_tensor(
                 )
             Y_out[start:end].copy_(preds_t)
         else:
-            if rows_t.numel() > 0:
-                rmin = int(rows_t.min().item())
-                rmax = int(rows_t.max().item())
-                if rmin < 0 or rmax >= int(count):
-                    raise ValueError(
-                        f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
-                    )
-            Y_out.index_copy_(0, rows_t, preds_t)
+            did_segment_copy = False
+
+            n_rows = int(rows_t.numel())
+            if n_rows > 1:
+                d = rows_t[1:] - rows_t[:-1]
+                if bool(torch.all(d > 0)):
+                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+                    segs = int(breaks.numel()) + 1
+                    if segs <= 64:
+                        seg_start = 0
+                        for b in breaks.tolist():
+                            seg_end = int(b) + 1
+                            r0 = int(rows_t[seg_start].item())
+                            r1 = int(rows_t[seg_end - 1].item()) + 1
+                            if r0 < 0 or r1 > int(count):
+                                raise ValueError(
+                                    f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                                )
+                            Y_out[r0:r1].copy_(preds_t[seg_start:seg_end])
+                            seg_start = seg_end
+
+                        r0 = int(rows_t[seg_start].item())
+                        r1 = int(rows_t[-1].item()) + 1
+                        if r0 < 0 or r1 > int(count):
+                            raise ValueError(
+                                f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                            )
+                        Y_out[r0:r1].copy_(preds_t[seg_start:])
+                        did_segment_copy = True
+
+            if not did_segment_copy:
+                if rows_t.numel() > 0:
+                    rmin = int(rows_t.min().item())
+                    rmax = int(rows_t.max().item())
+                    if rmin < 0 or rmax >= int(count):
+                        raise ValueError(
+                            f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
+                        )
+                Y_out.index_copy_(0, rows_t, preds_t)
 
     return Y_out
 
@@ -1447,7 +1520,9 @@ def _write_predictions_h5_from_chunks(
             )
             if not isinstance(rows_t, torch.Tensor):
                 rows_t = torch.as_tensor(rows_t, device="cpu")
-            rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
+            rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
+            if not bool(rows_t.is_contiguous()):
+                rows_t = rows_t.contiguous()
 
             if pred_file.endswith(".mmt"):
                 preds_t = _open_pred_memmap(pred_file)
@@ -1457,21 +1532,64 @@ def _write_predictions_h5_from_chunks(
                     map_location="cpu",
                     weights_only=True,
                 )
-                if not isinstance(preds_t, torch.Tensor):
-                    preds_t = torch.as_tensor(preds_t, device="cpu")
+            if not isinstance(preds_t, torch.Tensor):
+                preds_t = torch.as_tensor(preds_t, device="cpu")
 
             preds_np = preds_t.detach().to(device="cpu", dtype=cast_dtype).numpy()
 
-            if preds_np.shape[0] != rows_np.shape[0]:
+            n_rows = int(rows_t.numel())
+            if preds_np.shape[0] != n_rows:
                 raise ValueError(
-                    f"Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={rows_np.shape[0]}"
+                    f"Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={n_rows}"
                 )
 
-            # Faster path: contiguous write avoids fancy-index overhead in h5py.
+            # Faster paths: contiguous (or low-segment) writes avoid fancy-index overhead in h5py.
             is_contig, start, end = _is_contiguous_row_range(rows_t)
             if is_contig:
+                if start < 0 or end > int(count):
+                    raise ValueError(
+                        f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
+                    )
                 dset_Y[start:end] = preds_np
-            else:
+                continue
+
+            did_segment_write = False
+            if n_rows > 1:
+                d = rows_t[1:] - rows_t[:-1]
+                if bool(torch.all(d > 0)):
+                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+                    segs = int(breaks.numel()) + 1
+                    if segs <= 64:
+                        seg_start = 0
+                        for b in breaks.tolist():
+                            seg_end = int(b) + 1
+                            r0 = int(rows_t[seg_start].item())
+                            r1 = int(rows_t[seg_end - 1].item()) + 1
+                            if r0 < 0 or r1 > int(count):
+                                raise ValueError(
+                                    f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                                )
+                            dset_Y[r0:r1] = preds_np[seg_start:seg_end]
+                            seg_start = seg_end
+
+                        r0 = int(rows_t[seg_start].item())
+                        r1 = int(rows_t[-1].item()) + 1
+                        if r0 < 0 or r1 > int(count):
+                            raise ValueError(
+                                f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                            )
+                        dset_Y[r0:r1] = preds_np[seg_start:]
+                        did_segment_write = True
+
+            if not did_segment_write:
+                rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
+                if rows_np.size:
+                    rmin = int(rows_np.min())
+                    rmax = int(rows_np.max())
+                    if rmin < 0 or rmax >= int(count):
+                        raise ValueError(
+                            f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
+                        )
                 dset_Y[rows_np] = preds_np
 
     return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
@@ -1596,6 +1714,10 @@ def _infer_master_float_dtype_for_predict_input(obj: Any) -> torch.dtype:
         pass
 
     return torch.float32
+
+# -----------------------------------------------------------------------------
+# Inference / prediction entrypoint
+# -----------------------------------------------------------------------------
 
 @catchtime(logger, fn_name="predict")
 def predict(
@@ -1850,21 +1972,14 @@ def predict(
                 "cfg_dict": cfg_dict,
             }
 
-            # Only pass supported runtime-config keys.
-            keys = kwargs.pop("keys", None)
-            loss_skew = kwargs.pop("loss_skew", None)
-            ops_kwargs: dict[str, Any] = {"seed": int(seed), "shuffle": bool(shuffle)}
-            if keys is not None:
-                ops_kwargs["keys"] = keys
-            if loss_skew is not None:
-                ops_kwargs["loss_skew"] = bool(loss_skew)
-
             # Launch config knobs (not part of RuntimeConfig).
             run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
 
-            # Fail fast on any leftover kwargs (previously these would have crashed inside runtime_config).
-            if kwargs:
-                raise ValueError(f"predict: unsupported kwargs: {sorted(kwargs.keys())}")
+            # Delegate runtime option validation/coercion to RuntimeConfig.
+            # At this point, `kwargs` should only contain RuntimeConfig(...) fields.
+            ops_kwargs: dict[str, Any] = dict(kwargs)
+            ops_kwargs.setdefault("seed", seed)
+            ops_kwargs.setdefault("shuffle", shuffle)
 
             ops = runtime_config(mode, base, *args, **ops_kwargs)
 
@@ -1956,6 +2071,11 @@ def predict(
 
         finally:
             remove_dir(tmp_dir)
+
+# -----------------------------------------------------------------------------
+# Prediction artifact loading
+# -----------------------------------------------------------------------------
+
 @catchtime(logger, fn_name="get_prediction")
 def get_prediction(
     source: str,

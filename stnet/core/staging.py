@@ -638,6 +638,42 @@ class Buffer:
         with self._cv:
             return int(len(self._buf))
 
+    def wait_for_space(self, *, timeout: float | None = None) -> bool:
+        """Block until the buffer has capacity (or stop is requested).
+
+        This is useful for producers that want to avoid holding an extra "in-flight"
+        item outside the buffer when at capacity.
+
+        Returns:
+            True if space is available, False if timed out or stop is set.
+        """
+        import time
+
+        if self._stop.is_set():
+            return False
+
+        t0 = time.monotonic()
+        deadline = None if timeout is None else (t0 + float(timeout))
+        with self._cv:
+            while len(self._buf) >= self.max_batches and not self._stop.is_set():
+                if deadline is None:
+                    self._cv.wait()
+                else:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return False
+                    self._cv.wait(timeout=remaining)
+            return not bool(self._stop.is_set())
+
+    def clear(self) -> None:
+        """Drop all buffered items (best-effort).
+
+        This is primarily a memory hygiene helper for early-abort scenarios.
+        """
+        with self._cv:
+            self._buf.clear()
+            self._cv.notify_all()
+
     def stop(self) -> None:
         self._stop.set()
         with self._cv:
