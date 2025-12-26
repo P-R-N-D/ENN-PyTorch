@@ -10,7 +10,7 @@ import threading
 from collections import OrderedDict
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn

@@ -6,7 +6,7 @@ import re
 import threading
 from contextlib import contextmanager, suppress
 from functools import partial
-from typing import Any, Callable, Iterator, NoReturn
+from typing import Any, Iterator, NoReturn
 
 import torch
 from torch import nn
@@ -15,8 +15,7 @@ from .graph import (
     graph_break,
     torch_compile_safe,
     torch_compile_supported,
-    torch_disable_compile,
-    torch_no_compile,
+    torch_compile_disable,
     torch_safe_distributed,
 )
 

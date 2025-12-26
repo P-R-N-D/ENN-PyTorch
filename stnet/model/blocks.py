@@ -1,11 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import contextlib
 import logging
-import math
-import threading
-import weakref
 from typing import (
     Any,
     Callable,
@@ -33,11 +29,6 @@ except ImportError:
 _LOGGER = logging.getLogger(__name__)
 
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from ..core.graph import graph_break, torch_no_compile
-from ..core.system import empty_device_cache
-from ..core.casting import env_first_int, env_int
-from ..data.pipeline import resolve_feature_key, resolve_label_key
-from ..core.profiler import FLOP_PROFILER
 from ..core.precision import Autocast
 from .primitives import (
     CrossAttention,

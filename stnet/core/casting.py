@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import os
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any, Optional
 
 import numpy as np
