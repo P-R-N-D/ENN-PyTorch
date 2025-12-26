@@ -530,7 +530,17 @@ def graph_break() -> None:
         fn()
 
 
-def torch_no_compile(*, reason: str | None = None, recursive: bool = True) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+def _compile_disable_decorator(
+    *, reason: str | None = None, recursive: bool = True
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Return a decorator that disables torch.compile/Dynamo tracing for a function.
+
+    Prefers `torch.compiler.disable` (newer) and falls back to `torch._dynamo.disable`
+    (older). When the API is unavailable, this becomes a no-op identity decorator.
+
+    The `disable()` signature has changed across PyTorch releases; this helper tries a
+    few keyword combinations to stay compatible.
+    """
     if _TORCH_COMPILE_DISABLE is None:
         def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn
@@ -539,25 +549,92 @@ def torch_no_compile(*, reason: str | None = None, recursive: bool = True) -> Ca
     kwargs: dict[str, Any] = {}
     if reason is not None:
         kwargs["reason"] = reason
-    kwargs["recursive"] = recursive
+    # Some versions accept this keyword, others don't.
+    kwargs["recursive"] = bool(recursive)
 
-    attempts = [kwargs]
-    if "reason" in kwargs:
-        attempts.append({k: v for k, v in kwargs.items() if k != "recursive"})
-    if "recursive" in kwargs:
-        attempts.append({k: v for k, v in kwargs.items() if k != "reason"})
-    attempts.append({})
-
-    for opts in attempts:
+    for opts in (
+        kwargs,
+        {k: v for k, v in kwargs.items() if k != "recursive"},
+        {k: v for k, v in kwargs.items() if k != "reason"},
+        {},
+    ):
         try:
-            return _TORCH_COMPILE_DISABLE(**opts)
+            dec = _TORCH_COMPILE_DISABLE(**opts)
+            if callable(dec):
+                return dec
         except TypeError:
             continue
+        except Exception:
+            break
 
     def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
         return fn
 
     return _identity
+
+
+def torch_compile_disable(
+    target: Any | None = None,
+    attr: str | None = None,
+    /,
+    *,
+    reason: str | None = None,
+    recursive: bool = True,
+) -> Any:
+    """Disable torch.compile for a function, or patch an attribute in-place.
+
+    Supports both decorator and "patch an attribute" call styles:
+
+    Decorator (with or without args):
+        @torch_compile_disable
+        def fn(...): ...
+
+        @torch_compile_disable(reason="...", recursive=True)
+        def fn(...): ...
+
+    Attribute patching:
+        torch_compile_disable(SomeClass, "method", reason="...", recursive=False) -> bool
+    """
+    if attr is not None:
+        if target is None or (not hasattr(target, attr)):
+            return False
+
+        fn = getattr(target, attr)
+        if getattr(fn, _NO_COMPILE_SENTINEL, False):
+            return True
+
+        decorator = _compile_disable_decorator(reason=reason, recursive=recursive)
+        try:
+            wrapped = decorator(fn)
+        except Exception:
+            return False
+
+        with suppress(Exception):
+            setattr(wrapped, _NO_COMPILE_SENTINEL, True)
+
+        try:
+            setattr(target, attr, wrapped)
+        except Exception:
+            return False
+        return True
+
+    decorator = _compile_disable_decorator(reason=reason, recursive=recursive)
+    if callable(target):
+        return decorator(target)
+    return decorator
+
+
+# Backward-compatible aliases (prefer torch_compile_disable).
+def torch_no_compile(
+    *, reason: str | None = None, recursive: bool = True
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    return torch_compile_disable(reason=reason, recursive=recursive)
+
+
+def torch_disable_compile(
+    target: Any, attr: str, *, reason: str | None = None, recursive: bool = True
+) -> bool:
+    return bool(torch_compile_disable(target, attr, reason=reason, recursive=recursive))
 
 
 def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
@@ -585,30 +662,6 @@ def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) 
                 _SAFE_DIST_PATCHED.add(name)
                 updated = True
     return updated
-
-
-def torch_disable_compile(target: Any, attr: str, *, reason: str | None = None, recursive: bool = True) -> bool:
-    if target is None or not hasattr(target, attr):
-        return False
-
-    fn = getattr(target, attr)
-    if getattr(fn, _NO_COMPILE_SENTINEL, False):
-        return True
-
-    decorator = torch_no_compile(reason=reason, recursive=recursive)
-    try:
-        wrapped = decorator(fn)
-    except Exception:
-        return False
-
-    with suppress(Exception):
-        setattr(wrapped, _NO_COMPILE_SENTINEL, True)
-
-    try:
-        setattr(target, attr, wrapped)
-    except Exception:
-        return False
-    return True
 
 
 def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
@@ -655,7 +708,7 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
             "calibrate",
             "_piecewise",
         ):
-            torch_disable_compile(
+            torch_compile_disable(
                 scaler_cls,
                 attr,
                 reason="Scaler uses Python-side caches/loops; keep eager",
@@ -683,7 +736,7 @@ def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any 
             "save",
             "clear",
         ):
-            torch_disable_compile(
+            torch_compile_disable(
                 history_cls,
                 attr,
                 reason="History is logging/bookkeeping; keep eager",

@@ -10,7 +10,6 @@ import os
 import platform
 import sys
 import threading
-import tempfile
 import time
 import warnings
 from collections.abc import Mapping
@@ -21,7 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional,
 import torch
 import torch.distributed
 import torch.nn as nn
-from tensordict import MemoryMappedTensor, TensorDictBase
+from tensordict import TensorDictBase
 from torch.distributed.checkpoint import (FileSystemReader, FileSystemWriter,
                                           load, save)
 from torch.distributed.checkpoint.api import CheckpointException

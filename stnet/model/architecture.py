@@ -6,7 +6,6 @@ import logging
 import math
 import threading
 import weakref
-from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
 
@@ -14,7 +13,7 @@ import torch
 import torch.nn as nn
 
 from ..core.config import ModelConfig
-from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
+from ..core.compat import is_meta_or_fake_tensor
 from ..core.system import _log_debug, _log_info, empty_device_cache, get_device
 from ..core.casting import env_first_int, env_int
 from ..data.pipeline import (
@@ -28,7 +27,7 @@ from ..core.graph import (
     graph_break,
     inference_mode,
     invalidate_model_introspection_caches,
-    torch_no_compile,
+    torch_compile_disable,
 )
 from ..core.precision import Autocast, is_scale_safe
 from .primitives import History, Scaler
@@ -164,21 +163,42 @@ class SpatialAxis(nn.Module):
                     return perm_cache, inv_cache
 
             coords_one = coords[:1].contiguous()
+
+            # Compute the expensive argsort only once; odd blocks are a cheap roll.
+            perm0_b, inv0_b = _serialize_z_index(
+                coords_one,
+                bits=bits,
+                patch=patch,
+                shift_order=shift,
+                block_index=0,
+            )
+            perm0_b = perm0_b.to(dtype=torch.int64)
+            inv0_b = inv0_b.to(dtype=torch.int64)
+            perm0 = perm0_b[0]
+            inv0 = inv0_b[0]
+
+            shift_amt = 0
+            if shift:
+                shift_amt = (patch // 2) % max(int(N), 1)
+
+            perm1 = perm0
+            inv1 = inv0
+            if shift_amt:
+                perm1 = torch.roll(perm0_b, shifts=int(shift_amt), dims=1)[0]
+                inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
+
             perms: List[torch.Tensor] = []
             invperms: List[torch.Tensor] = []
             for i in range(depth):
-                perm_i, inv_i = _serialize_z_index(
-                    coords_one,
-                    bits=bits,
-                    patch=patch,
-                    shift_order=shift,
-                    block_index=i,
-                )
-                perms.append(perm_i[0].to(dtype=torch.int64))
-                invperms.append(inv_i[0].to(dtype=torch.int64))
+                if shift and shift_amt and (i % 2 == 1):
+                    perms.append(perm1)
+                    invperms.append(inv1)
+                else:
+                    perms.append(perm0)
+                    invperms.append(inv0)
 
-            perm_new = torch.stack(perms, dim=0).to(device=coords.device)
-            inv_new = torch.stack(invperms, dim=0).to(device=coords.device)
+            perm_new = torch.stack(perms, dim=0)
+            inv_new = torch.stack(invperms, dim=0)
 
             with lock:
                 perm_cache = getattr(self, "_perm_cache", None)
@@ -203,21 +223,40 @@ class SpatialAxis(nn.Module):
         perms_b: List[torch.Tensor] = []
         invperms_b: List[torch.Tensor] = []
         coords_batch = coords.contiguous()
+
+        # Compute the expensive argsort only once; odd blocks are a cheap roll.
+        perm0, inv0 = _serialize_z_index(
+            coords_batch,
+            bits=bits,
+            patch=patch,
+            shift_order=shift,
+            block_index=0,
+        )
+        perm0 = perm0.to(dtype=torch.int64)
+        inv0 = inv0.to(dtype=torch.int64)
+
+        shift_amt = 0
+        if shift:
+            shift_amt = (patch // 2) % max(int(N), 1)
+
+        perm1 = perm0
+        inv1 = inv0
+        if shift_amt:
+            perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=1)
+            inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
+
         for i in range(depth):
-            perm_i, inv_i = _serialize_z_index(
-                coords_batch,
-                bits=bits,
-                patch=patch,
-                shift_order=shift,
-                block_index=i,
-            )
-            perms_b.append(perm_i.to(dtype=torch.int64))
-            invperms_b.append(inv_i.to(dtype=torch.int64))
+            if shift and shift_amt and (i % 2 == 1):
+                perms_b.append(perm1)
+                invperms_b.append(inv1)
+            else:
+                perms_b.append(perm0)
+                invperms_b.append(inv0)
         perm_b = torch.stack(perms_b, dim=0)
         inv_b = torch.stack(invperms_b, dim=0)
         return perm_b, inv_b
 
-    @torch_no_compile(reason="SpatialAxis uses dynamic gather/scatter", recursive=True)
+    @torch_compile_disable(reason="SpatialAxis uses dynamic gather/scatter", recursive=True)
     def forward(
         self,
         x: torch.Tensor,
@@ -613,7 +652,7 @@ class Subcontext(nn.Module):
             coords = coords.to(device=device, dtype=torch.float32)
         return coords.unsqueeze(0).expand(int(batch), -1, -1)
 
-    @torch_no_compile(reason="Subcontext orchestrates eager + compiled submodules", recursive=False)
+    @torch_compile_disable(reason="Subcontext orchestrates eager + compiled submodules", recursive=False)
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = int(x.shape[0])
 

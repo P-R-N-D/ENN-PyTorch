@@ -11,7 +11,7 @@ from torch import nn
 
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
-from ..core.graph import torch_no_compile
+from ..core.graph import torch_compile_disable
 from ..core.casting import env_str
 
 try:
@@ -991,7 +991,7 @@ class MultiScaleRetentionTriton(nn.Module):
         if not (_HAS_TRITON_MSR and torch.cuda.is_available()):
             raise RuntimeError("Triton MSR backend is not available (Triton+CUDA required).")
 
-    @torch_no_compile(recursive=False, reason='Unable to be compiled')
+    @torch_compile_disable(recursive=False, reason='Unable to be compiled')
     def forward(
         self,
         x: torch.Tensor,
