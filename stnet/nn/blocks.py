@@ -61,7 +61,7 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
 
 
 class _ControllerChunkRunner:
-    """Callable used by Context.run microbatch executor.
+    """Callable used by Enhancer.run microbatch executor.
 
     Kept at module scope to avoid nested function definitions (cleaner pickling
     and friendlier to free-threaded/no-GIL builds).

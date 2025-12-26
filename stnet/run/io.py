@@ -153,20 +153,34 @@ def _json_sanitize(obj: Any) -> Any:
 
 
 def _load_model_config(model: nn.Module) -> Dict[str, Any]:
-    """Best-effort extraction of the ModelConfig attached to a Model model."""
+    """Best-effort extraction of the ModelConfig attached to a model instance.
+
+    Notes:
+        - Prefer stable, non-mangled attributes (`.config`, `__stnet_instance_config__`).
+        - When the passed module is a wrapper (e.g., DDP/FSDP), scan submodules.
+    """
+
+    cfg_obj: Any = None
+
     def _get_cfg(obj: nn.Module) -> Any:
-        for attr in ("_Model__config", "_Root__config", "__stnet_instance_config__"):
-            cfg_obj = getattr(obj, attr, None)
-            if cfg_obj is not None:
-                return cfg_obj
+        with contextlib.suppress(Exception):
+            return getattr(obj, "config", None)
         return None
 
+    # 1) Stable attributes on the top-level module.
     cfg_obj = _get_cfg(model)
     if cfg_obj is None:
-        for submodule in model.modules():
-            cfg_obj = _get_cfg(submodule)
-            if cfg_obj is not None:
-                break
+        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+
+    # 2) Wrapper modules: scan for a child with config attached.
+    if cfg_obj is None:
+        with contextlib.suppress(Exception):
+            for submodule in model.modules():
+                cfg_obj = _get_cfg(submodule)
+                if cfg_obj is None:
+                    cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
+                if cfg_obj is not None:
+                    break
     try:
         from ..core.config import ModelConfig, coerce_model_config
 

@@ -192,16 +192,40 @@ stnet/
     datatype.py
     nodes.py
     pipeline.py
-  model/
+  nn/
     __init__.py
     activations.py
     architecture.py
     blocks.py
-    fused.py
     kernels.py
     primitives.py
 
 ```
+
+> Note: the neural-network implementation lives under `stnet.nn`.
+> If you have local scripts that previously imported from `stnet.model`, update
+> those import paths to `stnet.nn`.
+
+## Configuration notes
+
+### ModelConfig string options
+
+`stnet.core.config.coerce_model_config()` normalizes common separator variants in a few string fields
+to reduce "almost-right" config bugs:
+
+- `modeling_type`: canonical values `{ss, tt, st}`.
+  - Examples accepted: `spatial`, `temporal`, `spatiotemporal`, `spatio-temporal`, `spatio_temporal`, `temporal-spatial`, …
+- `normalization_method`: canonical values `layernorm`, `batchnorm`, `rmsnorm`.
+  - Examples accepted: `ln`, `layer_norm`, `layer-norm`, `bn`, `batch_norm`, `rms_norm`, …
+- `compile_mode`: canonical values `disabled` (default), `default`, `reduce-overhead`, `max-autotune`,
+  `max-autotune-no-cudagraphs`, `aot-eager`.
+  - Examples accepted: `max_autotune`, `max-autotune`, `reduce_overhead`, `aot_eager`, …
+
+### RuntimeConfig string options (training)
+
+- `loss_mask_mode`: must be one of `none`, `finite`, or `neq`.
+  - Examples accepted: `isfinite`, `not_equal`, `!=`, …
+
 
 ## Environment variables
 
