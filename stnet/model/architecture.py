@@ -14,12 +14,7 @@ import torch
 import torch.nn as nn
 
 from ..core.config import ModelConfig
-from ..core.compat import (
-    StochasticDepth,
-    graph_break,
-    is_meta_or_fake_tensor,
-    torch_no_compile,
-)
+from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
 from ..core.system import _log_debug, _log_info, empty_device_cache, get_device
 from ..core.casting import env_first_int, env_int
 from ..data.pipeline import (
@@ -28,14 +23,19 @@ from ..data.pipeline import (
     resolve_label_key,
 )
 from ..core.profiler import FLOP_PROFILER
-from ..core.graph import compile, inference_mode, invalidate_model_introspection_caches
+from ..core.graph import (
+    compile,
+    graph_break,
+    inference_mode,
+    invalidate_model_introspection_caches,
+    torch_no_compile,
+)
 from ..core.precision import Autocast, is_scale_safe
+from .primitives import History, Scaler
 from .blocks import (
-    History,
     LongNet,
     PointTransformer,
     RetNet,
-    Scaler,
     TensorDictBase,
     _ControllerChunkRunner,
     _auto_microbatch,

@@ -218,10 +218,13 @@ from ..core.losses import (CRPSLoss, DataFidelityLoss, LinearCombinationLoss,
 from ..core.optimizers import (SWALR, AdamW, StochasticWeightAverage,
                                stochastic_weight_average)
 from ..model.architecture import Root
-from ..model.blocks import History, resize_scaler_buffer
-from ..core.compat import (cudagraph_step_end, is_meta_or_fake_tensor,
-                              torch_compile_safe,
-                              torch_safe_distributed)
+from ..model.primitives import History, resize_scaler_buffer
+from ..core.compat import is_meta_or_fake_tensor
+from ..core.graph import (
+    cudagraph_step_end,
+    torch_compile_safe,
+    torch_safe_distributed,
+)
 from ..core.distributed import (distributed_barrier, distributed_sync,
                                    get_world_size, is_distributed, joining, no_sync,
                                    to_ddp, to_fsdp)
@@ -4569,8 +4572,8 @@ def main(*args: Any, **kwargs: Any) -> Optional[Root]:
             non_blocking_copy=True,
             sanitize=True,
             flatten_features=True,
-            train_shuffle=False,
-            seed=int(getattr(ops, "seed", 42)),
+            train_shuffle=bool(getattr(ops, "shuffle", False)),
+            seed=int(getattr(ops, "seed", 7)),
         ).open()
         data_loader = session.training_loader
         chunk_dir = (os.path.join(ops.ckpt_dir, "pred_chunks") if (ops.ckpt_dir or "") else None)
