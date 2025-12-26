@@ -32,7 +32,7 @@ from torch.distributed.checkpoint.state_dict import (StateDictOptions,
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
-from ..data.pipeline import BatchIterator, extract_xy
+from ..data.pipeline import BatchIO, extract_xy
 from ..core.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
 from ..nn.architecture import ModelPolicy
 from ..core.precision import Autocast, PrecisionPolicy
@@ -908,11 +908,11 @@ def _first_source_path(obj: Any) -> str:
 
 
 def _merge_meta_infos(sources: Any) -> Dict[str, Any]:
-    return BatchIterator.merge_meta_infos(sources)
+    return BatchIO.merge_meta_infos(sources)
 
 
 def _expand(sources: Any) -> Any:
-    return BatchIterator.expand_sources(sources)
+    return BatchIO.expand_sources(sources)
 
 
 def _calibrate_per_sample_mem(
@@ -2157,7 +2157,7 @@ def epochs(
         # This avoids an expensive pre-epoch full scan of the training loader.
         scaler_stats: Optional[dict] = None
         with contextlib.suppress(Exception):
-            scaler_stats = BatchIterator.load_scaler_stats(ops.sources)
+            scaler_stats = BatchIO.load_scaler_stats(ops.sources)
         if scaler_stats is not None:
             used_memmap_stats = True
             x_count = int(scaler_stats.get("train_count") or 0)
@@ -3411,7 +3411,7 @@ def epochs(
                         "meta": meta,
                         "records": records,
                     }
-                    BatchIterator.atomic_write_json(history_path, payload, indent=2)
+                    BatchIO.atomic_write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:
@@ -3862,7 +3862,7 @@ def infer(
 
                 if os.path.exists(pred_mmt):
                     pred_path = pred_mmt
-                    meta_path = BatchIterator.mmt_meta_path(pred_mmt)
+                    meta_path = BatchIO.mmt_meta_path(pred_mmt)
                     if not os.path.exists(meta_path):
                         raise RuntimeError(f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}")
                 elif os.path.exists(pred_pt):
@@ -3886,7 +3886,7 @@ def infer(
             }
 
             man_path = os.path.join(chunk_dir, "manifest.json")
-            BatchIterator.atomic_write_json(man_path, manifest, indent=2)
+            BatchIO.atomic_write_json(man_path, manifest, indent=2)
 
         distributed_barrier(device)
 
@@ -4456,7 +4456,7 @@ def main(*args: Any, **kwargs: Any) -> Optional[Model]:
                             raw_val_loader.state_dict() if raw_val_loader is not None else {}
                         ),
                     }
-                    BatchIterator.atomic_write_json(
+                    BatchIO.atomic_write_json(
                         loader_state_path(ops.ckpt_dir or ""),
                         _dl,
                         indent=2,

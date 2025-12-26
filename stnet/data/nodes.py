@@ -893,10 +893,10 @@ class Sampler(_Sampler):
 
 
 # -----------------------------------------------------------------------------
-# BatchIterator: streaming + memmap utilities (shared across compute/elastic/nodes)
+# BatchIO: streaming + memmap utilities (shared across launch/elastic/nodes)
 # -----------------------------------------------------------------------------
 
-class BatchIterator:
+class BatchIO:
     """Centralized memmap/streaming/chunking utilities."""
 
     class KeyIndexMappingView(_abc.Mapping):
@@ -973,7 +973,7 @@ class BatchIterator:
 
             need = e_i - s_i
             if need <= 0:
-                return BatchIterator.KeyIndexMappingView(data, ())
+                return BatchIO.KeyIndexMappingView(data, ())
 
             batch_keys: list[Any] = []
             for _ in range(int(need)):
@@ -984,7 +984,7 @@ class BatchIterator:
                 batch_keys.append(k)
 
             pos += int(len(batch_keys))
-            return BatchIterator.KeyIndexMappingView(data, batch_keys)
+            return BatchIO.KeyIndexMappingView(data, batch_keys)
 
         return count, get_batch
 
@@ -1040,7 +1040,7 @@ class BatchIterator:
 
     @staticmethod
     def _flat2d_cpu_contig(t: torch.Tensor, n: int) -> torch.Tensor:
-        t_cpu = BatchIterator._to_cpu_contig(t)
+        t_cpu = BatchIO._to_cpu_contig(t)
         if t_cpu.ndim == 0:
             t_cpu = t_cpu.reshape(1)
         return t_cpu.reshape(int(n), -1)
@@ -1076,7 +1076,7 @@ class BatchIterator:
 
     @staticmethod
     def _atomic_write_json(path: str, payload: Any, *, indent: int = 2) -> None:
-        BatchIterator.atomic_write_json(path, payload, indent=int(indent))
+        BatchIO.atomic_write_json(path, payload, indent=int(indent))
 
     @staticmethod
     def atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
@@ -1088,7 +1088,7 @@ class BatchIterator:
 
     @staticmethod
     def _atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
-        BatchIterator.atomic_torch_save(path, payload, **opts)
+        BatchIO.atomic_torch_save(path, payload, **opts)
 
     @staticmethod
     def write_memmap_streaming_two_pass(
@@ -1147,7 +1147,7 @@ class BatchIterator:
             e = min(count_i, s + int(chunk_first))
             batch = get_batch(int(s), int(e))
             fx, lb, _, _ = ds.preprocess(batch)
-            n = BatchIterator._batch_n(fx)
+            n = BatchIO._batch_n(fx)
             if n <= 0:
                 continue
             expected = int(e) - int(s)
@@ -1156,7 +1156,7 @@ class BatchIterator:
                     f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
 
-            fx_flat = BatchIterator._flat2d_cpu_contig(fx, n)
+            fx_flat = BatchIO._flat2d_cpu_contig(fx, n)
             cur_in_dim = int(fx_flat.shape[1])
             if in_dim is None:
                 in_dim = cur_in_dim
@@ -1170,7 +1170,7 @@ class BatchIterator:
                 lb_flat = None
             else:
                 cur_label_shape = tuple(lb.shape[1:])
-                lb_flat = BatchIterator._flat2d_cpu_contig(lb, n)
+                lb_flat = BatchIO._flat2d_cpu_contig(lb, n)
 
             if label_shape is None:
                 label_shape = cur_label_shape
@@ -1203,7 +1203,7 @@ class BatchIterator:
             underflow_action=underflow_action,
             safety_margin=1.0,
         )
-        store_float = BatchIterator._resolve_memmap_store_float(negotiable=bool(negotiable))
+        store_float = BatchIO._resolve_memmap_store_float(negotiable=bool(negotiable))
 
         # Auto-tune chunk size for pass 2 (bound memory).
         if auto_chunk:
@@ -1396,7 +1396,7 @@ class BatchIterator:
                 batch = get_by_indices(idx)
 
             fx, lb, _, _ = ds.preprocess(batch)
-            n = BatchIterator._batch_n(fx)
+            n = BatchIO._batch_n(fx)
             if n <= 0:
                 continue
             expected = int(e) - int(s)
@@ -1405,7 +1405,7 @@ class BatchIterator:
                     f"Pass2 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
 
-            fx_flat = BatchIterator._flat2d_cpu_contig(fx, n)
+            fx_flat = BatchIO._flat2d_cpu_contig(fx, n)
             if int(fx_flat.shape[1]) != int(in_dim):
                 raise RuntimeError(
                     f"feature dim mismatch: expected {in_dim}, got {int(fx_flat.shape[1])}"
@@ -1436,7 +1436,7 @@ class BatchIterator:
                         raise RuntimeError(
                             f"label shape mismatch: expected {label_shape}, got {tuple(lb.shape[1:])}"
                         )
-                    lb_cpu = BatchIterator._to_cpu_contig(lb)
+                    lb_cpu = BatchIO._to_cpu_contig(lb)
                     lb_out = lb_cpu if lb_cpu.dtype == store_float else lb_cpu.to(dtype=store_float)
 
                     labels_mmt[int(s) : int(s) + int(n)].copy_(lb_out)
@@ -1474,7 +1474,7 @@ class BatchIterator:
             }
             scaler_stats_path = "scaler_stats.pt"
             try:
-                BatchIterator._atomic_torch_save(os.path.join(out_dir, scaler_stats_path), payload)
+                BatchIO._atomic_torch_save(os.path.join(out_dir, scaler_stats_path), payload)
             except Exception:
                 scaler_stats_path = None
 
@@ -1508,7 +1508,7 @@ class BatchIterator:
             "features_only": bool(features_only),
         }
 
-        BatchIterator._atomic_write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
+        BatchIO._atomic_write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
         return int(in_dim), tuple(label_shape)
 
     @staticmethod
@@ -1578,7 +1578,7 @@ class BatchIterator:
         def _gather_any(obj: Any, idx: torch.Tensor, *, name: str) -> Any:
             if obj is None:
                 return None
-            idx_cpu = BatchIterator._idx_to_cpu_int64(idx)
+            idx_cpu = BatchIO._idx_to_cpu_int64(idx)
             if torch.is_tensor(obj):
                 return obj[idx_cpu]
             if isinstance(obj, np.ndarray):
@@ -1604,7 +1604,7 @@ class BatchIterator:
                 out["labels"] = _gather_any(raw_Y, idx, name="labels")
             return out
 
-        BatchIterator.write_memmap_streaming_two_pass(
+        BatchIO.write_memmap_streaming_two_pass(
             ds=ds,
             out_dir=os.fspath(memmap_dir),
             count=int(count),
@@ -1632,10 +1632,10 @@ class BatchIterator:
                 yield obj["path"]
             else:
                 for v in obj.values():
-                    yield from BatchIterator.iter_source_paths(v)
+                    yield from BatchIO.iter_source_paths(v)
         elif isinstance(obj, (list, tuple)):
             for v in obj:
-                yield from BatchIterator.iter_source_paths(v)
+                yield from BatchIO.iter_source_paths(v)
 
     @staticmethod
     def from_meta(memmap_dir: str) -> Dict[str, Any]:
@@ -1747,29 +1747,29 @@ class BatchIterator:
 
     @staticmethod
     def merge_meta_infos(sources: Any) -> Dict[str, Any]:
-        sources = BatchIterator.expand_sources(sources)
+        sources = BatchIO.expand_sources(sources)
         metas: list[dict] = []
-        for path in BatchIterator.iter_source_paths(sources):
+        for path in BatchIO.iter_source_paths(sources):
             try:
-                metas.append(BatchIterator.from_meta(path))
+                metas.append(BatchIO.from_meta(path))
             except Exception:
                 continue
         if not metas:
             return {}
-        return dict(BatchIterator.merge_meta_dicts(metas))
+        return dict(BatchIO.merge_meta_dicts(metas))
 
     @staticmethod
     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
-        expanded = BatchIterator.expand_sources(sources)
+        expanded = BatchIO.expand_sources(sources)
         total = 0
         x_sum: Optional[torch.Tensor] = None
         x_sum_sq: Optional[torch.Tensor] = None
         y_sum: Optional[torch.Tensor] = None
         y_sum_sq: Optional[torch.Tensor] = None
 
-        for path in BatchIterator.iter_source_paths(expanded):
+        for path in BatchIO.iter_source_paths(expanded):
             try:
-                meta = BatchIterator.from_meta(path)
+                meta = BatchIO.from_meta(path)
             except Exception:
                 return None
             rel = meta.get("scaler_stats_path")
@@ -1867,50 +1867,6 @@ class BatchIterator:
         return sources
 
 
-def preload_memmap(
-    data: Mapping[str, Any],
-    *,
-    memmap_dir: str,
-    train_frac: float = 0.0,
-    val_frac: float = 0.0,
-    shuffle: bool = False,
-    seed: int | None = None,
-    **kwargs: Any,
-) -> None:
-    """Create a memory-mapped dataset on disk.
-
-    Backwards-compat shim; implementation centralized in stnet.data.pipeline.BatchIterator.
-
-    Notes:
-      - `shuffle=True` performs *physical* shuffle at write time (no perm file).
-      - `train_frac` is currently metadata-only; the split is driven by `val_frac`.
-    """
-    chunk_size = int(kwargs.pop("chunk_size", 4096) or 4096)
-    with suppress(Exception):
-        env_cs = int(env_first_int(("STNET_MEMMAP_CHUNK_SIZE",), default=0) or 0)
-        if env_cs > 0:
-            chunk_size = max(1, int(env_cs))
-
-    underflow_action = kwargs.pop("underflow_action", None)
-    allow_missing_labels = bool(kwargs.pop("allow_missing_labels", False))
-    features_only = bool(kwargs.pop("features_only", False))
-    default_label_shape = kwargs.pop("default_label_shape", None)
-
-    BatchIterator.preload_memmap(
-        data,
-        memmap_dir=os.fspath(memmap_dir),
-        val_frac=float(val_frac),
-        shuffle=bool(shuffle),
-        seed=int(seed) if seed is not None else None,
-        underflow_action=underflow_action,
-        chunk_size=int(chunk_size),
-        allow_missing_labels=bool(allow_missing_labels),
-        features_only=bool(features_only),
-        default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
-    )
-    return None
-
-
 SourceType = Literal["memmap"]
 
 
@@ -1951,7 +1907,7 @@ class Disposable:
         return iter(self._keep)
 
 
-class Wrapper:
+class Multiplexer:
     def __init__(
         self,
         *args: Any,
@@ -2039,7 +1995,7 @@ class _MapBatch:
         return self.fn(x)
 
 
-class Connector:
+class Mapper:
     def __init__(
         self,
         *args: Any,
@@ -2311,7 +2267,7 @@ class Loader:
         return 0
 
 
-class BufferedLoader(Buffer):
+class BatchQueue(Buffer):
     """Small in-memory backpressure wrapper for any iterable/loader (session-based)."""
 
     def __init__(
@@ -2343,7 +2299,7 @@ class BufferedLoader(Buffer):
     def __iter__(self) -> Iterator[Any]:
         if not bool(self._session):
             return iter(
-                BufferedLoader(
+                BatchQueue(
                     self._src,
                     max_batches=int(self.max_batches),
                     name=self._name,
@@ -2391,7 +2347,7 @@ class BufferedLoader(Buffer):
                     break
 
                 if isinstance(item, ProducerError):
-                    raise RuntimeError(f"BufferedLoader producer crashed: {item.exc}\n{item.tb}") from item.exc
+                    raise RuntimeError(f"BatchQueue producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 yield item
         finally:

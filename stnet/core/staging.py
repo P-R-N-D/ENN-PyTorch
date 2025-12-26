@@ -441,21 +441,21 @@ class Cache:
                     _os.remove(tmp_name)
 
             # Sidecar meta: keep the naming consistent across the codebase.
-            from ..data.pipeline import BatchIterator
+            from ..data.pipeline import BatchIO
 
             meta = {
                 "shape": [int(x) for x in buf.shape],
                 "dtype": str(buf.dtype).replace("torch.", ""),
             }
-            BatchIterator.atomic_write_json(BatchIterator.mmt_meta_path(path), meta, indent=None)
+            BatchIO.atomic_write_json(BatchIO.mmt_meta_path(path), meta, indent=None)
             return
 
         # torch.save pickles (rows.pt / pred.pt)
         if str(path).endswith((".pt", ".pth")):
             # Use the shared atomic writer for consistency.
-            from ..data.pipeline import BatchIterator
+            from ..data.pipeline import BatchIO
 
-            BatchIterator.atomic_torch_save(buf, path)
+            BatchIO.atomic_torch_save(buf, path)
         else:
             torch.save(buf, path)
 
