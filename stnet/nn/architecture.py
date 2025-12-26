@@ -298,14 +298,28 @@ class SpatialExtractor(nn.Module):
             coords = coords.float()
 
         # Pre-validate / normalize attn_mask once (avoid repeating dim checks per block).
-        attn_base: torch.Tensor | None = None
+        # We support two forms:
+        #   - scalar (0D) mask: forwarded as-is
+        #   - (B,N,N) or (B,1,N,N): block-sliced internally according to permutation
+        mask_scalar: torch.Tensor | None = None
+        mask_base: torch.Tensor | None = None
         if attn_mask is not None:
             if is_meta_or_fake_tensor(attn_mask):
                 raise RuntimeError("attn_mask is meta/fake before SpatialExtractor.forward")
+
+            # A 0D mask is cheap to move; full masks should already be on-device.
+            if attn_mask.device != x.device:
+                if int(attn_mask.dim()) == 0:
+                    attn_mask = attn_mask.to(device=x.device)
+                else:
+                    raise ValueError(
+                        "attn_mask must be on the same device as tokens: "
+                        f"attn_mask.device={attn_mask.device} vs x.device={x.device}"
+                    )
             attn_mask = attn_mask.contiguous()
             match int(attn_mask.dim()):
                 case 0:
-                    attn_base = None
+                    mask_scalar = attn_mask
                 case 3:
                     if int(attn_mask.size(0)) != int(B):
                         raise ValueError(
@@ -315,7 +329,7 @@ class SpatialExtractor(nn.Module):
                         raise ValueError(
                             f"attn_mask last 2 dims must be (N,N)=({N},{N}), got {tuple(attn_mask.shape)}"
                         )
-                    attn_base = attn_mask
+                    mask_base = attn_mask
                 case 4:
                     if int(attn_mask.size(0)) != int(B):
                         raise ValueError(
@@ -327,9 +341,13 @@ class SpatialExtractor(nn.Module):
                         )
                     if attn_mask.size(1) != 1:
                         raise ValueError("attn_mask with per-head shape not supported here")
-                    attn_base = attn_mask.squeeze(1)
+                    mask_base = attn_mask.squeeze(1)
                 case _:
                     raise ValueError("attn_mask must be rank 0, 3, or 4 here")
+
+        b_index: torch.Tensor | None = None
+        if mask_base is not None:
+            b_index = torch.arange(B, device=mask_base.device)
 
         perm_cache, inv_cache = self._ensure_permutation_cache(coords)
         patch = int(self.patch_size)
@@ -343,23 +361,89 @@ class SpatialExtractor(nn.Module):
         if shift:
             shift_amt = (patch // 2) % max(int(N), 1)
 
+        # Permutations are either shared (depth, N) or per-sample (depth, B, N).
+        shared_perm = int(perm_cache.dim()) == 2
+
+        # Parity templates (even/odd) to avoid repeatedly slicing perm_cache.
+        perm_even = perm_cache[0]
+        inv_even = inv_cache[0]
+        perm_odd = perm_even
+        inv_odd = inv_even
+        if shift and shift_amt and len(self.blocks) > 1:
+            perm_odd = perm_cache[1]
+            inv_odd = inv_cache[1]
+
+        # Pre-sliced indices for mask building (per parity). These are views (no new allocations)
+        # and help avoid repeatedly materializing expanded index tensors (especially when shared_perm=True).
+        idx_full_even: torch.Tensor | None = None
+        idx_full_odd: torch.Tensor | None = None
+        idx_tail_even: torch.Tensor | None = None
+        idx_tail_odd: torch.Tensor | None = None
+        tail_len = int(N - full)
+
+        if mask_base is not None:
+            if full > 0:
+                if shared_perm:
+                    idx_full_even = perm_even[:full].reshape(nblk, patch)
+                    idx_full_odd = perm_odd[:full].reshape(nblk, patch) if (shift and shift_amt) else idx_full_even
+                else:
+                    idx_full_even = perm_even[:, :full].reshape(B, nblk, patch)
+                    idx_full_odd = perm_odd[:, :full].reshape(B, nblk, patch) if (shift and shift_amt) else idx_full_even
+            if tail_len > 0:
+                if shared_perm:
+                    idx_tail_even = perm_even[full:N]
+                    idx_tail_odd = perm_odd[full:N] if (shift and shift_amt) else idx_tail_even
+                else:
+                    idx_tail_even = perm_even[:, full:N]
+                    idx_tail_odd = perm_odd[:, full:N] if (shift and shift_amt) else idx_tail_even
+
         # Optional per-forward mask cache (per permutation template) to avoid rebuilding mb for every block.
+        # Guarded by a conservative size cap to avoid holding 2x huge tensors when shift_order alternates.
         mb_full_even: torch.Tensor | None = None
         mb_full_odd: torch.Tensor | None = None
+        mb_tail_even: torch.Tensor | None = None
+        mb_tail_odd: torch.Tensor | None = None
+
+        cache_full_masks = False
+        cache_tail_masks = False
+        if mask_base is not None:
+            try:
+                elem = int(mask_base.element_size())
+            except Exception:
+                elem = 1
+            if full > 0 and nblk > 0:
+                try:
+                    one_bytes = int(B) * int(nblk) * int(patch) * int(patch) * elem
+                    cache_full_masks = one_bytes <= (32 << 20)  # cache at most ~32MB per parity
+                except Exception:
+                    cache_full_masks = False
+            if tail_len > 0:
+                try:
+                    tail_bytes = int(B) * int(tail_len) * int(tail_len) * elem
+                    cache_tail_masks = tail_bytes <= (16 << 20)  # tail is usually small; still cap it
+                except Exception:
+                    cache_tail_masks = False
+
+        b_full: torch.Tensor | None = None
+        b_tail: torch.Tensor | None = None
+        if mask_base is not None:
+            base = mask_base
+            if b_index is None:
+                b_index = torch.arange(B, device=base.device)
+            b_full = b_index.view(B, 1, 1, 1)
+            b_tail = b_index.view(B, 1, 1)
 
         for i, blk in enumerate(self.blocks):
-            perm_i = perm_cache[i]
-            inv_i = inv_cache[i]
-            is_shared_perm = perm_i.dim() == 1
+            use_odd = bool(shift_amt and (i % 2 == 1))
 
-            if is_shared_perm:
-                perm_1d = perm_i
-                inv_1d = inv_i
+            if shared_perm:
+                perm_1d = perm_odd if use_odd else perm_even
+                inv_1d = inv_odd if use_odd else inv_even
                 x_s = x.index_select(1, perm_1d)
                 c_s = coords.index_select(1, perm_1d)
             else:
-                perm_2d = perm_i
-                inv_2d = inv_i
+                perm_2d = perm_odd if use_odd else perm_even
+                inv_2d = inv_odd if use_odd else inv_even
                 x_s = x.gather(1, perm_2d.unsqueeze(-1).expand(B, N, D))
                 c_s = coords.gather(1, perm_2d.unsqueeze(-1).expand(B, N, coord_dim))
 
@@ -377,36 +461,33 @@ class SpatialExtractor(nn.Module):
                 x_flat = x_full.reshape(B * nblk, patch, D)
                 c_flat = c_full.reshape(B * nblk, patch, coord_dim)
 
-                mb_flat = None
-                if attn_mask is not None:
-                    if attn_mask.dim() == 0:
-                        mb_flat = attn_mask
-                    else:
-                        # Build (B*nblk, patch, patch) block masks without allocating (B, patch, N).
-                        # Advanced indexing reads directly into the final (patch,patch) block.
-                        use_odd = bool(shift_amt and (i % 2 == 1))
+                mb_flat: torch.Tensor | None = None
+                if mask_scalar is not None:
+                    mb_flat = mask_scalar
+                elif mask_base is not None and b_full is not None:
+                    cached = None
+                    if cache_full_masks:
                         cached = mb_full_odd if use_odd else mb_full_even
-                        if cached is None:
-                            base = attn_base
-                            if base is None:
-                                raise RuntimeError("attn_mask base unexpectedly None")
 
-                            if is_shared_perm:
-                                idx_tpl = perm_1d[:full].reshape(nblk, patch)
-                                idx = idx_tpl.unsqueeze(0).expand(B, -1, -1)
+                    if cached is None:
+                        idx = idx_full_odd if use_odd else idx_full_even
+                        if idx is not None:
+                            if shared_perm:
+                                # idx: (nblk, patch) -> broadcast across B without explicit expand
+                                ii = idx.view(1, nblk, patch, 1)
+                                jj = idx.view(1, nblk, 1, patch)
                             else:
-                                idx = perm_2d[:, :full].reshape(B, nblk, patch)
-
-                            b = torch.arange(B, device=idx.device).view(B, 1, 1, 1)
-                            ii = idx.unsqueeze(-1)
-                            jj = idx.unsqueeze(-2)
-                            mb = base[b, ii, jj]
+                                # idx: (B, nblk, patch)
+                                ii = idx.unsqueeze(-1)
+                                jj = idx.unsqueeze(-2)
+                            mb = mask_base[b_full, ii, jj]
                             cached = mb.reshape(B * nblk, patch, patch).contiguous()
-                            if use_odd:
-                                mb_full_odd = cached
-                            else:
-                                mb_full_even = cached
-                        mb_flat = cached
+                            if cache_full_masks:
+                                if use_odd:
+                                    mb_full_odd = cached
+                                else:
+                                    mb_full_even = cached
+                    mb_flat = cached
 
                 y_flat = blk(x_flat, c_flat, attn_mask=mb_flat)
                 out_s[:, :full, :].copy_(y_flat.reshape(B, nblk, patch, D).reshape(B, full, D))
@@ -417,30 +498,36 @@ class SpatialExtractor(nn.Module):
                 xb = x_s[:, s:e, :]
                 cb = c_s[:, s:e, :]
 
-                mb = None
-                if attn_mask is not None:
-                    if attn_mask.dim() == 0:
-                        mb = attn_mask
-                    else:
-                        base = attn_base
-                        if base is None:
-                            raise RuntimeError("attn_mask base unexpectedly None")
+                mb: torch.Tensor | None = None
+                if mask_scalar is not None:
+                    mb = mask_scalar
+                elif mask_base is not None and b_tail is not None:
+                    cached_tail = None
+                    if cache_tail_masks:
+                        cached_tail = mb_tail_odd if use_odd else mb_tail_even
 
-                        if is_shared_perm:
-                            idx = perm_1d[s:e]
-                            idx2 = idx.unsqueeze(0).expand(B, -1)
-                        else:
-                            idx2 = perm_2d[:, s:e]
-
-                        M = int(idx2.shape[1])
-                        b = torch.arange(B, device=idx2.device).view(B, 1, 1)
-                        ii = idx2.unsqueeze(-1)
-                        jj = idx2.unsqueeze(-2)
-                        mb = base[b, ii, jj].reshape(B, M, M).contiguous()
+                    if cached_tail is None:
+                        idx2 = idx_tail_odd if use_odd else idx_tail_even
+                        if idx2 is not None:
+                            if shared_perm:
+                                M = int(idx2.shape[0])
+                                ii = idx2.view(1, M, 1)
+                                jj = idx2.view(1, 1, M)
+                            else:
+                                M = int(idx2.shape[1])
+                                ii = idx2.unsqueeze(-1)
+                                jj = idx2.unsqueeze(-2)
+                            cached_tail = mask_base[b_tail, ii, jj].reshape(B, M, M).contiguous()
+                            if cache_tail_masks:
+                                if use_odd:
+                                    mb_tail_odd = cached_tail
+                                else:
+                                    mb_tail_even = cached_tail
+                    mb = cached_tail
 
                 out_s[:, s:e, :] = blk(xb, cb, attn_mask=mb)
 
-            if is_shared_perm:
+            if shared_perm:
                 x = out_s.index_select(1, inv_1d)
             else:
                 x = out_s.gather(1, inv_2d.unsqueeze(-1).expand(B, N, D))
@@ -864,10 +951,41 @@ class Model(nn.Module):
             pass
 
         raw_mode = getattr(config, "compile_mode", "disabled")
-        mode = str(raw_mode or "").strip()
-        normalized_mode = mode.lower()
-        disable_compile = normalized_mode in {"", "disabled", "none"}
-        compile_mode_arg = normalized_mode if not disable_compile else None
+        mode_raw = str(raw_mode or "").strip().lower()
+
+        compile_mode_canonical = mode_raw.replace("_", "-").replace(" ", "-")
+        if "-" in compile_mode_canonical:
+            compile_mode_canonical = "-".join(
+                part for part in compile_mode_canonical.split("-") if part
+            )
+
+        # Match stnet.core.graph.compile mode normalization.
+        mode_compact = compile_mode_canonical.replace("-", "")
+        match compile_mode_canonical:
+            case "" | "none" | "disabled" | "disable" | "off" | "false" | "0":
+                compile_mode_canonical = "disabled"
+            case (
+                "default"
+                | "reduce-overhead"
+                | "max-autotune"
+                | "max-autotune-no-cudagraphs"
+                | "aot-eager"
+            ):
+                pass
+            case _:
+                match mode_compact:
+                    case "reduceoverhead":
+                        compile_mode_canonical = "reduce-overhead"
+                    case "maxautotune":
+                        compile_mode_canonical = "max-autotune"
+                    case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
+                        compile_mode_canonical = "max-autotune-no-cudagraphs"
+                    case "aoteager":
+                        compile_mode_canonical = "aot-eager"
+                    case _:
+                        pass
+
+        compile_mode_arg = None if compile_mode_canonical == "disabled" else compile_mode_canonical
 
         compile_requested = compile_mode_arg is not None
         compile_available = callable(getattr(torch, "compile", None))
@@ -877,27 +995,33 @@ class Model(nn.Module):
                 "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; running eagerly",
                 raw_mode,
             )
-        compile_dynamic = bool(getattr(config, "compile_dynamic", normalized_mode == "reduce-overhead"))
+        compile_dynamic = bool(
+            getattr(config, "compile_dynamic", compile_mode_canonical == "reduce-overhead")
+        )
+        compile_cudagraphs_default = compile_mode_canonical not in {
+            "reduce-overhead",
+            "max-autotune-no-cudagraphs",
+        }
         compile_cudagraphs = bool(
-            getattr(
-                config,
-                "compile_cudagraphs",
-                normalized_mode not in {"reduce-overhead", "max-autotune-no-cudagraphs"},
-            )
+            getattr(config, "compile_cudagraphs", compile_cudagraphs_default)
         )
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
 
         # max-autotune modes are significantly more memory hungry; default to compiling only the small decode head.
+        compile_heavy_submodules_default = compile_mode_canonical not in {
+            "max-autotune",
+            "max-autotune-no-cudagraphs",
+        }
         compile_heavy_submodules = bool(
-            getattr(
-                config,
-                "compile_heavy_submodules",
-                normalized_mode not in {"max-autotune", "max-autotune-no-cudagraphs"},
-            )
+            getattr(config, "compile_heavy_submodules", compile_heavy_submodules_default)
         )
-        if compile_enabled and (not compile_heavy_submodules) and normalized_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
+        if (
+            compile_enabled
+            and (not compile_heavy_submodules)
+            and compile_mode_canonical in {"max-autotune", "max-autotune-no-cudagraphs"}
+        ):
             _LOGGER.warning(
                 "max-autotune hotfix: compiling only decode head (skip temporal/perception). "
                 "Set config.compile_heavy_submodules=True to override."
@@ -987,7 +1111,16 @@ class Model(nn.Module):
         self._amp_dtype_cache_last_dtype: torch.dtype | None = None
         self._amp_dtype_cache_max = 64
         self._amp_dtype_cache_lock = threading.Lock()
+
+        # Keep a stable, non-mangled reference for runtime tools (save/load, launchers).
+        # Do not rely on name-mangled attributes outside of this class.
         self.__config = config
+        self.__stnet_instance_config__ = config
+
+    @property
+    def config(self) -> ModelConfig:
+        """The :class:`~stnet.core.config.ModelConfig` used to construct this instance."""
+        return self.__config
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
         """Move the model to a device/dtype while keeping Recorder on CPU.
@@ -1547,7 +1680,7 @@ class Model(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Precision / model policies (previously in fused.py)
+# Precision / model policies (merged here; previously in fused.py)
 # -----------------------------------------------------------------------------
 
 
@@ -2100,7 +2233,7 @@ class ModelPolicy:
 
 
 # -----------------------------------------------------------------------------
-# Quantization helpers (moved from fused.py)
+# Quantization helpers (merged here; previously in fused.py)
 # -----------------------------------------------------------------------------
 
 

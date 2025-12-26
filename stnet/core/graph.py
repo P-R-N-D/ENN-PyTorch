@@ -59,10 +59,6 @@ def invalidate_model_introspection_caches(model: Optional[nn.Module]) -> None:
             delattr(model, attr)
 
 
-# Backward-compatible private alias.
-_invalidate_model_introspection_caches = invalidate_model_introspection_caches
-
-
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
     cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
     if isinstance(cached, bool):
@@ -260,28 +256,52 @@ def compile(
 
     NOTE: signature matches the historical `Gradient.compile` API.
     """
-    normalized_mode = ""
-    if mode is not None:
-        normalized_mode = str(mode).strip().lower()
-    if disable or normalized_mode in {"", "disabled", "none"}:
+    mode_given = str(mode) if mode is not None else None
+    mode_raw = str(mode_given or "").strip().lower()
+
+    canonical_mode = mode_raw.replace("_", "-").replace(" ", "-")
+    if "-" in canonical_mode:
+        canonical_mode = "-".join(part for part in canonical_mode.split("-") if part)
+
+    # Map common synonyms / separator variants to canonical torch.compile modes.
+    mode_compact = canonical_mode.replace("-", "")
+    match canonical_mode:
+        case "" | "none" | "disabled" | "disable" | "off" | "false" | "0":
+            canonical_mode = "disabled"
+        case (
+            "default"
+            | "reduce-overhead"
+            | "max-autotune"
+            | "max-autotune-no-cudagraphs"
+            | "aot-eager"
+        ):
+            pass
+        case _:
+            match mode_compact:
+                case "reduceoverhead":
+                    canonical_mode = "reduce-overhead"
+                case "maxautotune":
+                    canonical_mode = "max-autotune"
+                case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
+                    canonical_mode = "max-autotune-no-cudagraphs"
+                case "aoteager":
+                    canonical_mode = "aot-eager"
+                case _:
+                    # Keep normalized string; may be a custom/forward-compatible torch.compile mode.
+                    pass
+
+    if disable:
         return module
+
+    match canonical_mode:
+        case "disabled":
+            return module
+        case _:
+            pass
+
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         return module
-
-    normalized_alias = normalized_mode.replace("_", "-").replace(" ", "-")
-    if "-" in normalized_alias:
-        normalized_alias = "-".join(part for part in normalized_alias.split("-") if part)
-
-    recognized_modes = {
-        "default",
-        "aot_eager",
-        "reduce-overhead",
-        "max-autotune",
-        "max-autotune-no-cudagraphs",
-    }
-
-    canonical_mode = normalized_alias or normalized_mode
 
     # TorchInductor compilation can be very CPU hungry. When running multiple local
     # ranks (DDP/FSDP), each process compiling with a large thread pool can easily
@@ -403,12 +423,14 @@ def compile(
 
     backend_value = backend
     mode_value: Optional[str] = None
-    if canonical_mode in {"aot_eager", "aot-eager"}:
-        backend_value = "aot_eager"
-    elif canonical_mode in recognized_modes:
-        mode_value = canonical_mode
-    elif mode is not None:
-        mode_value = str(mode)
+    match canonical_mode:
+        case "aot-eager":
+            # AOT eager uses a backend name rather than a mode string.
+            backend_value = "aot_eager"
+        case "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
+            mode_value = canonical_mode
+        case _:
+            mode_value = mode_given
 
     compile_kwargs: Dict[str, Any] = dict(kwargs)
     if backend_value is not None:
@@ -622,20 +644,6 @@ def torch_compile_disable(
     if callable(target):
         return decorator(target)
     return decorator
-
-
-# Backward-compatible aliases (prefer torch_compile_disable).
-def torch_no_compile(
-    *, reason: str | None = None, recursive: bool = True
-) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    return torch_compile_disable(reason=reason, recursive=recursive)
-
-
-def torch_disable_compile(
-    target: Any, attr: str, *, reason: str | None = None, recursive: bool = True
-) -> bool:
-    return bool(torch_compile_disable(target, attr, reason=reason, recursive=recursive))
-
 
 def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):

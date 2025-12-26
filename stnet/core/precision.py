@@ -1139,7 +1139,7 @@ class Autocast:
 
     @classmethod
     def _torchao_int8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        # Alias to the internal helper; preserves fused.py behavior.
+        # Alias to the internal helper; preserves historical behavior.
         return cls._torchao_int8_autocast(device, enabled)
 
     @classmethod

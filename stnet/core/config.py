@@ -398,6 +398,19 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         lower=True,
     )
 
+    # Canonicalize for stable serialization / CLI friendliness.
+    # Accept common separators (space/_/-) and fold to known norms where possible.
+    _norm_key = normalization_method.replace(" ", "").replace("_", "").replace("-", "")
+    match _norm_key:
+        case "ln" | "layernorm":
+            normalization_method = "layernorm"
+        case "bn" | "batchnorm":
+            normalization_method = "batchnorm"
+        case "rms" | "rmsnorm":
+            normalization_method = "rmsnorm"
+        case _:
+            pass
+
     d_model = _coerce_int(get("d_model", _MODEL_DEFAULTS.d_model), name="d_model", minimum=1)
     heads = _coerce_int(get("heads", _MODEL_DEFAULTS.heads), name="heads", minimum=1)
     spatial_depth = _coerce_int(get("spatial_depth", _MODEL_DEFAULTS.spatial_depth), name="spatial_depth", minimum=1)
@@ -421,6 +434,35 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         lower=True,
     )
 
+    # Canonicalize modeling_type: normalize separators and map synonyms to {ss, tt, st}.
+    _mt_key = modeling_type.replace("_", "-").replace(" ", "-")
+    if "-" in _mt_key:
+        _mt_key = "-".join(part for part in _mt_key.split("-") if part)
+
+    match _mt_key:
+        case "ss" | "spatial" | "sxs":
+            modeling_type = "ss"
+        case "tt" | "temporal" | "txt":
+            modeling_type = "tt"
+        case (
+            "st"
+            | "ts"
+            | "sxt"
+            | "txs"
+            | "temporal-spatial"
+            | "temporo-spatial"
+            | "temporospatial"
+            | "tempospatial"
+            | "tempo-spatial"
+            | "temporalspatial"
+            | "spatiotemporal"
+            | "spatio-temporal"
+        ):
+            modeling_type = "st"
+        case _:
+            # Keep normalized string for forward compat; blocks._coerce_modeling_types will validate.
+            modeling_type = _mt_key
+
     use_linear_branch = _coerce_bool(
         get("use_linear_branch", _MODEL_DEFAULTS.use_linear_branch),
         name="use_linear_branch",
@@ -432,6 +474,37 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         default=_MODEL_DEFAULTS.compile_mode,
         lower=True,
     )
+
+    # Canonicalize compile_mode.
+    _cm_key = compile_mode.replace("_", "-").replace(" ", "-")
+    if "-" in _cm_key:
+        _cm_key = "-".join(part for part in _cm_key.split("-") if part)
+    _cm_compact = _cm_key.replace("-", "")
+
+    match _cm_key:
+        case "" | "none" | "disabled" | "disable" | "off" | "false" | "0":
+            compile_mode = "disabled"
+        case (
+            "default"
+            | "reduce-overhead"
+            | "max-autotune"
+            | "max-autotune-no-cudagraphs"
+            | "aot-eager"
+        ):
+            compile_mode = _cm_key
+        case _:
+            match _cm_compact:
+                case "reduceoverhead":
+                    compile_mode = "reduce-overhead"
+                case "maxautotune":
+                    compile_mode = "max-autotune"
+                case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
+                    compile_mode = "max-autotune-no-cudagraphs"
+                case "aoteager":
+                    compile_mode = "aot-eager"
+                case _:
+                    # Keep normalized string; stnet.core.graph.compile will pass it through.
+                    compile_mode = _cm_key or "disabled"
 
     safety_margin_pow2 = _coerce_int(
         get("safety_margin_pow2", _MODEL_DEFAULTS.safety_margin_pow2),
@@ -702,6 +775,31 @@ class RuntimeConfig:
                 default="none",
                 lower=True,
             )
+
+            # Canonicalize/validate loss_mask_mode (used by TiledLoss).
+            _lm_key = loss_mask_mode.replace("_", "-").replace(" ", "-")
+            if "-" in _lm_key:
+                _lm_key = "-".join(part for part in _lm_key.split("-") if part)
+            _lm_compact = _lm_key.replace("-", "")
+
+            match _lm_key:
+                case "" | "none" | "disabled" | "off":
+                    loss_mask_mode = "none"
+                case "finite" | "isfinite" | "is-finite":
+                    loss_mask_mode = "finite"
+                case "neq" | "ne" | "not-equal" | "not-eq" | "!=":
+                    loss_mask_mode = "neq"
+                case _:
+                    match _lm_compact:
+                        case "isfinite":
+                            loss_mask_mode = "finite"
+                        case "notequal" | "notneq" | "ne":
+                            loss_mask_mode = "neq"
+                        case _:
+                            raise ValueError(
+                                "loss_mask_mode must be one of ('none', 'finite', 'neq'), got "
+                                f"{loss_mask_mode!r}"
+                            )
 
             loss_mask_value = data.get("loss_mask_value")
             if loss_mask_value is not None:

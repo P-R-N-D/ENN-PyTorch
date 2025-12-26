@@ -663,7 +663,21 @@ def train(
         _wp.apply_torch_threads()
         nprocs = int(_wp.nproc_per_node)
 
-        cfg_obj = getattr(model, "_Root__config", None)
+        cfg_obj: Any = None
+        with contextlib.suppress(Exception):
+            cfg_obj = getattr(model, "config", None)
+        if cfg_obj is None:
+            cfg_obj = getattr(model, "__stnet_instance_config__", None)
+
+        if cfg_obj is None:
+            with contextlib.suppress(Exception):
+                for submodule in model.modules():
+                    with contextlib.suppress(Exception):
+                        cfg_obj = getattr(submodule, "config", None)
+                    if cfg_obj is None:
+                        cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
+                    if cfg_obj is not None:
+                        break
         if isinstance(cfg_obj, (ModelConfig, dict)):
             cfg_model = coerce_model_config(cfg_obj)
         else:
@@ -1570,7 +1584,21 @@ def predict(
                 raise ValueError("predict: empty input")
 
             # Model config dict (optional).
-            cfg_obj = getattr(model, "_Root__config", None)
+            cfg_obj: Any = None
+            with contextlib.suppress(Exception):
+                cfg_obj = getattr(model, "config", None)
+            if cfg_obj is None:
+                cfg_obj = getattr(model, "__stnet_instance_config__", None)
+
+            if cfg_obj is None:
+                with contextlib.suppress(Exception):
+                    for submodule in model.modules():
+                        with contextlib.suppress(Exception):
+                            cfg_obj = getattr(submodule, "config", None)
+                        if cfg_obj is None:
+                            cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
+                        if cfg_obj is not None:
+                            break
             if isinstance(cfg_obj, ModelConfig):
                 cfg_dict: dict[str, Any] = cfg_obj.to_dict()
             elif isinstance(cfg_obj, Mapping):
