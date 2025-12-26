@@ -2268,7 +2268,7 @@ class Loader:
 
 
 class BatchQueue(Buffer):
-    """Small in-memory backpressure wrapper for any iterable/loader (session-based)."""
+    """Bounded in-memory backpressure wrapper for any iterable/loader (session-based)."""
 
     def __init__(
         self,
@@ -2317,10 +2317,19 @@ class BatchQueue(Buffer):
 
         def _producer() -> None:
             try:
-                for item in src_iter:
+                while not self.is_stopped():
+                    # Avoid pulling one extra item from the upstream iterable when the
+                    # internal buffer is already at capacity.
+                    if not self.wait_for_space(timeout=None):
+                        break
+                    try:
+                        item = next(src_iter)
+                    except StopIteration:
+                        break
+
                     if self.is_stopped():
                         break
-                    if not self.put(item):
+                    if not self.put(item, timeout=0.0):
                         break
             except BaseException as exc:
                 with suppress(Exception):
@@ -2347,11 +2356,16 @@ class BatchQueue(Buffer):
                     break
 
                 if isinstance(item, ProducerError):
+                    # Preserve "hard" shutdown exceptions when possible.
+                    if isinstance(item.exc, (KeyboardInterrupt, SystemExit)):
+                        raise item.exc
                     raise RuntimeError(f"BatchQueue producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 yield item
         finally:
             self.stop()
+            with suppress(Exception):
+                self.clear()
             best_effort_close(src_iter)
             with suppress(Exception):
                 if t.is_alive():
@@ -2360,6 +2374,14 @@ class BatchQueue(Buffer):
 
 
 class Prefetcher(Buffer):
+    """Prefetch batches onto the target device with bounded buffering.
+
+    - ``depth`` bounds the number of in-flight batches.
+    - On CUDA with ``non_blocking=True``, a dedicated stream + CUDA events are used
+      to overlap H2D copies while safely releasing pinned staging buffers.
+    - Optional memory guards can pause production to reduce OOM risk.
+    """
+
     def __init__(
         self,
         iterable: Any,
@@ -2541,7 +2563,19 @@ class Prefetcher(Buffer):
                     if device.index is not None:
                         torch.cuda.set_device(device.index)
 
-            for batch in it:
+            while True:
+                if self.is_stopped():
+                    break
+
+                # Strict backpressure: do not pull a new batch when our bounded queue is full.
+                if not self.wait_for_space(timeout=None):
+                    break
+
+                try:
+                    batch = next(it)
+                except StopIteration:
+                    break
+
                 if self.is_stopped():
                     break
 
@@ -2549,18 +2583,43 @@ class Prefetcher(Buffer):
 
                 if self._backpressure:
                     ok = guards_ok(force=True)
+                    sleep_s = 0.001
                     while (not self.is_stopped()) and (not ok):
-                        # Exponential backoff with a small ceiling to reduce CPU churn
-                        time.sleep(0.001)
+                        time.sleep(sleep_s)
+                        sleep_s = min(float(sleep_s) * 2.0, 0.05)
                         ok = guards_ok(force=False)
+                    if self.is_stopped():
+                        # Producer is being torn down; release any reserved pool tokens.
+                        if self._host_pool is not None and pool_tokens:
+                            for tok in pool_tokens:
+                                with suppress(Exception):
+                                    self._host_pool.release(tok)
+                        break
 
                 if use_device:
                     if use_cuda_stream and self._gpu_stream is not None:
                         ev = None
                         pool = self._gpu_event_pool
                         if pool is not None:
-                            with suppress(Exception):
-                                ev = pool.get()
+                            # `SimpleQueue.get()` supports timeout; keep this stop-aware.
+                            while ev is None and not self.is_stopped():
+                                try:
+                                    ev = pool.get(timeout=0.05)
+                                except queue.Empty:
+                                    continue
+
+                        # Event reuse safety:
+                        # The consumer records the same event on its current stream after
+                        # inserting the wait. We must not re-record this event until that
+                        # consumer-side record has completed.
+                        if ev is not None:
+                            try:
+                                if not bool(ev.query()):
+                                    # Best-effort wait; should be very short in practice.
+                                    ev.synchronize()
+                            except Exception:
+                                with suppress(Exception):
+                                    ev.synchronize()
 
                         try:
                             with torch.cuda.stream(self._gpu_stream):
@@ -2568,26 +2627,44 @@ class Prefetcher(Buffer):
                                 if ev is not None:
                                     ev.record(self._gpu_stream)
 
-                            if self._host_pool is not None and pool_tokens and ev is not None:
-                                for tok in pool_tokens:
-                                    self._host_pool.release_after(tok, ev)
+                            if self._host_pool is not None and pool_tokens:
+                                if ev is not None:
+                                    for tok in pool_tokens:
+                                        self._host_pool.release_after(tok, ev)
+                                else:
+                                    for tok in pool_tokens:
+                                        self._host_pool.release(tok)
 
-                            if not self.put((batch_dev, ev)):
+                            # `wait_for_space()` above ensures this should not block.
+                            if not self.put((batch_dev, ev), timeout=0.0):
+                                # If we can't hand the event to the consumer, ensure it is safe
+                                # before returning it to the pool.
                                 if ev is not None and pool is not None:
+                                    with suppress(Exception):
+                                        ev.synchronize()
                                     with suppress(Exception):
                                         pool.put(ev)
                                 break
-                        except Exception:
+                        except BaseException:
+                            # Release pinned staging tokens on error to avoid pool starvation.
+                            if self._host_pool is not None and pool_tokens:
+                                for tok in pool_tokens:
+                                    with suppress(Exception):
+                                        self._host_pool.release(tok)
+
+                            # Return events best-effort.
                             if ev is not None and pool is not None:
+                                with suppress(Exception):
+                                    ev.synchronize()
                                 with suppress(Exception):
                                     pool.put(ev)
                             raise
                     else:
                         batch_dev = self._to_device(batch, device)
-                        if not self.put((batch_dev, None)):
+                        if not self.put((batch_dev, None), timeout=0.0):
                             break
                 else:
-                    if not self.put((batch, None)):
+                    if not self.put((batch, None), timeout=0.0):
                         break
 
         except BaseException as exc:
@@ -2653,6 +2730,8 @@ class Prefetcher(Buffer):
                     break
 
                 if isinstance(item, ProducerError):
+                    if isinstance(item.exc, (KeyboardInterrupt, SystemExit)):
+                        raise item.exc
                     raise RuntimeError(f"Prefetcher producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 batch, ev = item
@@ -2660,6 +2739,13 @@ class Prefetcher(Buffer):
                     cs = torch.cuda.current_stream(device=device if isinstance(device, torch.device) else None)
                     with suppress(Exception):
                         cs.wait_event(ev)
+
+                    # Important: record the event on the consumer stream *after* inserting
+                    # the wait, so the producer can safely reuse the same event only once
+                    # the consumer has reached this point.
+                    with suppress(Exception):
+                        ev.record(cs)
+
                     pool = self._gpu_event_pool
                     if pool is not None:
                         with suppress(Exception):
@@ -2673,3 +2759,39 @@ class Prefetcher(Buffer):
                 if t.is_alive():
                     t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
             best_effort_close(t)
+
+            # Best-effort drain: return any remaining CUDA events to the pool and
+            # synchronize them so a later GC doesn't observe an "in flight" handle.
+            pool = self._gpu_event_pool
+            if use_cuda_stream and pool is not None:
+                while True:
+                    try:
+                        leftover = self.get(block=False)
+                    except queue.Empty:
+                        break
+
+                    if leftover is sentinel or isinstance(leftover, ProducerError):
+                        continue
+
+                    if isinstance(leftover, tuple) and len(leftover) == 2:
+                        _batch, ev = leftover
+                        if ev is not None:
+                            with suppress(Exception):
+                                ev.synchronize()
+                            with suppress(Exception):
+                                pool.put(ev)
+
+                # Drain the pool itself to drop references and flush pending work.
+                while True:
+                    try:
+                        ev = pool.get_nowait()
+                    except queue.Empty:
+                        break
+                    with suppress(Exception):
+                        ev.synchronize()
+
+                self._gpu_event_pool = None
+                self._gpu_stream = None
+
+            with suppress(Exception):
+                self.clear()
