@@ -9,6 +9,7 @@ import multiprocessing as mp
 import os
 import queue
 import threading
+from functools import lru_cache
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import (
@@ -155,6 +156,74 @@ def _host_guard_ok(guard_bytes: int) -> bool:
         return bool(int(Memory.available()) >= int(guard_bytes))
     except Exception:
         return True
+
+
+@lru_cache(maxsize=1)
+def _cuda_event_poll_params() -> tuple[float, float, float]:
+    """Return (base_sleep_s, max_sleep_s, stop_min_sleep_s) for CUDA event polling.
+
+    These can be tuned via environment variables:
+      - STNET_CUDA_EVENT_POLL_START_US (default: 500)
+      - STNET_CUDA_EVENT_POLL_MAX_MS (default: 50)
+      - STNET_CUDA_EVENT_POLL_STOP_MIN_MS (default: 5)
+    """
+
+    start_us = int(env_first_int(("STNET_CUDA_EVENT_POLL_START_US",), default=500) or 500)
+    max_ms = int(env_first_int(("STNET_CUDA_EVENT_POLL_MAX_MS",), default=50) or 50)
+    stop_min_ms = int(env_first_int(("STNET_CUDA_EVENT_POLL_STOP_MIN_MS",), default=5) or 5)
+
+    base_s = max(0.0, float(start_us) / 1_000_000.0)
+    max_s = max(base_s, float(max_ms) / 1000.0)
+    stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
+    return base_s, max_s, stop_min_s
+
+
+def _wait_cuda_event_done(
+    ev: Any,
+    *,
+    stopped: Callable[[], bool] | None = None,
+    base_sleep_s: float | None = None,
+    max_sleep_s: float | None = None,
+    stop_min_sleep_s: float | None = None,
+) -> None:
+    """Wait for a CUDA event to complete using query()+backoff.
+
+    This avoids a hard blocking synchronize() call in the hot path, while still
+    guaranteeing the event is complete before reuse.
+
+    If `ev.query()` is unavailable or raises, falls back to `ev.synchronize()`.
+    """
+    import time
+
+    stop_fn = stopped if stopped is not None else (lambda: False)
+
+    if base_sleep_s is None or max_sleep_s is None or stop_min_sleep_s is None:
+        d_base, d_max, d_stop_min = _cuda_event_poll_params()
+        if base_sleep_s is None:
+            base_sleep_s = d_base
+        if max_sleep_s is None:
+            max_sleep_s = d_max
+        if stop_min_sleep_s is None:
+            stop_min_sleep_s = d_stop_min
+
+    sleep_s = max(0.0, float(base_sleep_s))
+    max_s = max(sleep_s, float(max_sleep_s))
+    stop_min_s = max(0.0, float(stop_min_sleep_s))
+    while True:
+        try:
+            if bool(ev.query()):
+                return
+        except Exception:
+            with suppress(Exception):
+                ev.synchronize()
+            return
+
+        # Be gentle on shutdown: increase the minimum sleep to reduce CPU burn.
+        if stop_fn():
+            sleep_s = max(float(sleep_s), stop_min_s)
+
+        time.sleep(sleep_s)
+        sleep_s = min(float(sleep_s) * 2.0, max_s)
 
 
 class BatchState:
@@ -2613,13 +2682,7 @@ class Prefetcher(Buffer):
                         # inserting the wait. We must not re-record this event until that
                         # consumer-side record has completed.
                         if ev is not None:
-                            try:
-                                if not bool(ev.query()):
-                                    # Best-effort wait; should be very short in practice.
-                                    ev.synchronize()
-                            except Exception:
-                                with suppress(Exception):
-                                    ev.synchronize()
+                            _wait_cuda_event_done(ev, stopped=self.is_stopped)
 
                         try:
                             with torch.cuda.stream(self._gpu_stream):
@@ -2640,8 +2703,7 @@ class Prefetcher(Buffer):
                                 # If we can't hand the event to the consumer, ensure it is safe
                                 # before returning it to the pool.
                                 if ev is not None and pool is not None:
-                                    with suppress(Exception):
-                                        ev.synchronize()
+                                    _wait_cuda_event_done(ev, stopped=self.is_stopped)
                                     with suppress(Exception):
                                         pool.put(ev)
                                 break
@@ -2654,8 +2716,7 @@ class Prefetcher(Buffer):
 
                             # Return events best-effort.
                             if ev is not None and pool is not None:
-                                with suppress(Exception):
-                                    ev.synchronize()
+                                _wait_cuda_event_done(ev, stopped=self.is_stopped)
                                 with suppress(Exception):
                                     pool.put(ev)
                             raise
@@ -2761,7 +2822,7 @@ class Prefetcher(Buffer):
             best_effort_close(t)
 
             # Best-effort drain: return any remaining CUDA events to the pool and
-            # synchronize them so a later GC doesn't observe an "in flight" handle.
+            # ensure they are complete so a later GC doesn't observe an "in flight" handle.
             pool = self._gpu_event_pool
             if use_cuda_stream and pool is not None:
                 while True:
@@ -2776,8 +2837,7 @@ class Prefetcher(Buffer):
                     if isinstance(leftover, tuple) and len(leftover) == 2:
                         _batch, ev = leftover
                         if ev is not None:
-                            with suppress(Exception):
-                                ev.synchronize()
+                            _wait_cuda_event_done(ev, stopped=self.is_stopped)
                             with suppress(Exception):
                                 pool.put(ev)
 
@@ -2787,8 +2847,7 @@ class Prefetcher(Buffer):
                         ev = pool.get_nowait()
                     except queue.Empty:
                         break
-                    with suppress(Exception):
-                        ev.synchronize()
+                    _wait_cuda_event_done(ev, stopped=self.is_stopped)
 
                 self._gpu_event_pool = None
                 self._gpu_stream = None

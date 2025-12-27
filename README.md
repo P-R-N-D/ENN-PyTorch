@@ -242,6 +242,26 @@ to reduce "almost-right" config bugs:
 - **TorchInductor compilation**
   - `STNET_INDUCTOR_COMPILE_THREADS` (alias: `STNET_COMPILE_THREADS`): cap Inductor compile threads per process to avoid oversubscription on multi-rank nodes.
 
+- **Prediction assembly (predict)**
+  - `STNET_PRED_ASSEMBLE_MAX_SEGMENTS`: threshold for the "segment slice-copy" fast path when assembling chunked predictions.
+    - Default: `64`.
+    - If `<= 0`, the segment fast path is disabled (always uses index-based writes).
+  - `STNET_PRED_ASSEMBLE_TUNE`: enable best-effort tuning logs for prediction assembly.
+    - Default: `1`.
+    - When enabled, assembly reports how often the segment-copy path was applicable and may suggest a better `STNET_PRED_ASSEMBLE_MAX_SEGMENTS`.
+  - `STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE`: log tuning guidance at most once per process.
+    - Default: `1`.
+  - `STNET_PRED_ASSEMBLE_TUNE_MIN_PARTS`: minimum number of manifest parts required before emitting tuning logs.
+    - Default: `4`.
+
+- **Prefetch (CUDA event polling)**
+  - `STNET_CUDA_EVENT_POLL_START_US`: initial sleep (microseconds) for CUDA event completion polling.
+    - Default: `500` (0.5 ms).
+  - `STNET_CUDA_EVENT_POLL_MAX_MS`: max sleep (milliseconds) for CUDA event polling backoff.
+    - Default: `50`.
+  - `STNET_CUDA_EVENT_POLL_STOP_MIN_MS`: minimum sleep (milliseconds) once shutdown/stop is requested.
+    - Default: `5`.
+
 ## Version & compatibility notes
 
 - Python ≥ 3.10 is required.
