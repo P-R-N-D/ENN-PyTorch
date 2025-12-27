@@ -472,7 +472,7 @@ def _mat_one(d, out_dir, *, ds, val_frac, seed_value, underflow_action, shuffle)
             raise ValueError('Empty dataset provided to train().')
         in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=out_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=float(val_frac), seed_value=seed_value, underflow_action=underflow_action, shuffle=False, allow_missing_labels=False, chunk_size=0)
         return (int(in_dim), tuple(label_shape), int(count))
-    fx, lb, _, lshape = ds.preprocess(d)
+    fx, lb, _, lshape = ds.preprocess(d, return_keys=False)
     if not fx.is_contiguous():
         fx = fx.contiguous()
     if lb is None:
@@ -1291,7 +1291,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 count, _get_batch = BatchIO.key_index_mapping_getters(data)
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
             else:
-                fx, _lb, _keys, _lshape = ds.preprocess(data)
+                fx, _lb, _keys, _lshape = ds.preprocess(data, return_keys=False)
                 if fx is None:
                     raise ValueError('predict: preprocess returned no features')
                 if not bool(torch.is_tensor(fx)):

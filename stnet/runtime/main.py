@@ -147,7 +147,26 @@ from ..core.compat import is_meta_or_fake_tensor
 from ..core.graph import cudagraph_step_end, torch_compile_safe, torch_safe_distributed
 from ..core.distributed import distributed_barrier, distributed_sync, get_world_size, is_distributed, joining, no_sync, to_ddp, to_fsdp
 from ..core.profiler import FlopCounter
-from ..core.system import Memory, empty_device_cache, get_device, get_tlb, initialize_python_path, posix_time, set_float32_precision
+from ..core.system import (
+    Memory,
+    accel_device_count as _accel_device_count,
+    accel_is_available as _accel_is_available,
+    accel_manual_seed_all as _accel_manual_seed_all,
+    accel_set_device_index as _accel_set_device_index,
+    device_mem_util_percent as _device_mem_util_percent,
+    accel_backend_for_device_type as _accel_backend_for_device_type,
+    accel_make_event as _accel_make_event,
+    accel_pinned_h2d_supported_for_device_type as _pinned_h2d_supported_for_device_type,
+    accel_stream_context as _accel_stream_context,
+    accel_synchronize as _accel_synchronize,
+    accel_timing_events_supported_for_device_type as _timing_events_supported_for_device_type,
+    empty_device_cache,
+    get_device,
+    get_tlb,
+    initialize_python_path,
+    posix_time,
+    set_float32_precision,
+)
 if TYPE_CHECKING:
     import numpy as _np
     from numpy.typing import NDArray as _NDArray
@@ -181,75 +200,6 @@ _TIMING_EVENTS_UNSUPPORTED = object()
 
 
 @lru_cache(maxsize=8)
-def _accel_backend_for_device_type(dev_type: str):
-    """Return torch.<backend> module for a device type, or None.
-
-    Supported: cuda / xpu / mps. CPU returns None.
-    """
-    if not dev_type:
-        return None
-    dt = str(dev_type)
-    if dt in ("cuda", "xpu", "mps"):
-        return getattr(torch, dt, None)
-    return None
-
-
-
-def _accel_synchronize(device: torch.device) -> None:
-    """Best-effort synchronize for the device backend (CUDA/XPU/MPS).
-
-    This is intentionally permissive across backends with different signatures:
-    - torch.cuda.synchronize(device=...) or torch.cuda.synchronize(device)
-    - torch.xpu.synchronize() / synchronize(device)
-    - torch.mps.synchronize()
-    """
-    try:
-        dev_type = str(getattr(device, "type", "cpu"))
-    except Exception:
-        dev_type = "cpu"
-    backend = _accel_backend_for_device_type(dev_type)
-    sync = getattr(backend, "synchronize", None) if backend is not None else None
-    if not callable(sync):
-        return
-    try:
-        sync(device=device)
-        return
-    except TypeError:
-        pass
-    except Exception:
-        return
-    try:
-        sync(device)
-        return
-    except TypeError:
-        pass
-    except Exception:
-        return
-    with contextlib.suppress(Exception):
-        sync()
-
-
-@lru_cache(maxsize=8)
-def _pinned_h2d_supported_for_device_type(dev_type: str) -> bool:
-    """Whether this device type can benefit from pinned-CPU + non_blocking H2D.
-
-    In practice this is CUDA/XPU. We still gate on the presence of stream + Event
-    APIs to keep behavior robust across builds.
-    """
-    dt = str(dev_type or "cpu")
-    if dt not in ("cuda", "xpu"):
-        return False
-    backend = _accel_backend_for_device_type(dt)
-    if backend is None:
-        return False
-    if not callable(getattr(backend, "current_stream", None)):
-        return False
-    if getattr(backend, "Event", None) is None:
-        return False
-    return True
-
-
-@lru_cache(maxsize=8)
 def _wallclock_timer_sync_enabled_for_device_type(dev_type: str) -> bool:
     """Whether to synchronize when measuring with wall-clock timers.
 
@@ -268,27 +218,6 @@ def _wallclock_timer_sync_enabled_for_device_type(dev_type: str) -> bool:
         return bool(_rt_env_flag("STNET_CUDA_TIMER_SYNC", False))
     return False
 
-@lru_cache(maxsize=8)
-def _timing_events_supported_for_device_type(dev_type: str) -> bool:
-    """Whether this device type supports Event-based elapsed_time timing."""
-    backend = _accel_backend_for_device_type(str(dev_type))
-    Event = getattr(backend, "Event", None) if backend is not None else None
-    if Event is None:
-        return False
-    try:
-        ev = Event(enable_timing=True)
-    except TypeError:
-        # Some builds may not accept enable_timing; try best-effort.
-        try:
-            ev = Event()
-        except Exception:
-            return False
-    except Exception:
-        return False
-    # We rely on record()/synchronize()/elapsed_time() in the hot path.
-    return bool(hasattr(ev, "record") and hasattr(ev, "synchronize") and hasattr(ev, "elapsed_time"))
-
-
 def _timing_events_supported(device: torch.device) -> bool:
     try:
         return bool(_timing_events_supported_for_device_type(str(getattr(device, "type", "cpu"))))
@@ -304,19 +233,7 @@ def _make_timing_event(device: torch.device):
         dev_type = "cpu"
     if not _timing_events_supported_for_device_type(dev_type):
         return None
-    backend = _accel_backend_for_device_type(dev_type)
-    Event = getattr(backend, "Event", None) if backend is not None else None
-    if Event is None:
-        return None
-    try:
-        return Event(enable_timing=True)
-    except TypeError:
-        try:
-            return Event()
-        except Exception:
-            return None
-    except Exception:
-        return None
+    return _accel_make_event(device, enable_timing=True)
 
 
 def _get_thread_timing_events(device: torch.device, slot: str):
@@ -513,6 +430,179 @@ def _log_sampler_scale_rate_limited(*, logger, scale_ctl, tag, msg, level='info'
             logger.info(msg)
     except Exception:
         pass
+
+
+def _find_sampler_scale_ctl(loader: Any, *, max_depth: int = 4):
+    """Best-effort find of a sampler scale controller in a loader wrapper chain."""
+    obj = loader
+    try:
+        depth = max(1, int(max_depth))
+    except Exception:
+        depth = 4
+    for _ in range(depth):
+        if obj is None:
+            break
+        ctl = getattr(obj, '_stnet_sampler_scale', None)
+        if ctl is not None:
+            return ctl
+        obj = getattr(obj, '_src', None) or getattr(obj, 'src', None)
+    return None
+
+
+def _oom_backoff_sleep_s(oom_try: int, phase: str | None = None) -> float:
+    # Optional small sleep between retries to avoid immediate reallocation thrash.
+    # Defaults to 0 (disabled). Configure with STNET_OOM_BACKOFF_BASE_MS / _MAX_MS.
+    try:
+        base_ms = float(_rt_env_float('STNET_OOM_BACKOFF_BASE_MS', 0.0))
+    except Exception:
+        base_ms = 0.0
+    if base_ms <= 0.0:
+        return 0.0
+    try:
+        max_ms = float(_rt_env_float('STNET_OOM_BACKOFF_MAX_MS', 50.0))
+    except Exception:
+        max_ms = 50.0
+    if max_ms < 0.0:
+        max_ms = 0.0
+    # Start backing off from the 2nd failure (first failure usually benefits more from cache clear).
+    p = max(0, int(oom_try) - 2)
+    try:
+        sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
+    except Exception:
+        sleep_ms = float(base_ms)
+    return max(0.0, float(sleep_ms) / 1000.0)
+
+
+def _handle_oom_recovery(
+    *,
+    phase: str,
+    loader: Any,
+    step_idx: int,
+    device: torch.device,
+    model: Any,
+    optimizer: Any | None = None,
+    global_step: int | None = None,
+    grad_accum_steps: int | None = None,
+    min_grad_accum: int = 1,
+) -> tuple[str, int | None]:
+    """Centralized OOM recovery policy.
+
+    Returns:
+        (decision, updated_grad_accum_steps)
+        decision in {'retry','skip','raise'}
+    """
+    ph = str(phase).strip().lower()
+    oom_try = _oom_retry_inc(loader, ph, int(step_idx))
+    max_tries = _oom_max_retries(ph)
+
+    if ph == 'train':
+        if global_step is not None and oom_try <= 1:
+            _LOGGER.error('[epochs] OOM during train step %d (global_step=%d). Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)', int(step_idx), int(global_step), int(oom_try), int(max_tries))
+        elif global_step is not None:
+            _LOGGER.warning('[epochs] OOM during train step %d (global_step=%d). Retrying. (try=%d/%d)', int(step_idx), int(global_step), int(oom_try), int(max_tries))
+        elif oom_try <= 1:
+            _LOGGER.error('[epochs] OOM during train step %d. Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)', int(step_idx), int(oom_try), int(max_tries))
+        else:
+            _LOGGER.warning('[epochs] OOM during train step %d. Retrying. (try=%d/%d)', int(step_idx), int(oom_try), int(max_tries))
+    else:
+        if oom_try <= 1:
+            _LOGGER.error('[epochs] OOM during %s step %d. Trying to reduce microbatch and retry same batch. (try=%d/%d)', str(ph), int(step_idx), int(oom_try), int(max_tries))
+        else:
+            _LOGGER.warning('[epochs] OOM during %s step %d. Retrying. (try=%d/%d)', str(ph), int(step_idx), int(oom_try), int(max_tries))
+
+    if max_tries > 0 and oom_try > max_tries:
+        if _oom_skip_enabled(ph):
+            _LOGGER.error('[epochs] OOM storm: exceeded retry budget (try=%d/%d) at %s step %d. Skipping this batch.', int(oom_try), int(max_tries), str(ph), int(step_idx))
+            with contextlib.suppress(Exception):
+                _oom_retry_clear(loader, ph, int(step_idx))
+            with contextlib.suppress(Exception):
+                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+            if optimizer is not None:
+                with contextlib.suppress(Exception):
+                    optimizer.zero_grad(set_to_none=True)
+            return ('skip', grad_accum_steps)
+        return ('raise', grad_accum_steps)
+
+    # Scale down sampler on OOM (best-effort).
+    try:
+        scale_ctl = _find_sampler_scale_ctl(loader)
+        if scale_ctl is not None:
+            prev = None
+            with contextlib.suppress(Exception):
+                prev = float(scale_ctl.get())
+            with contextlib.suppress(Exception):
+                scale_ctl.request_scale_down(_oom_scale_down_factor(oom_try))
+            with contextlib.suppress(Exception):
+                cur = float(scale_ctl.get())
+                if prev is not None and cur < prev:
+                    _log_sampler_scale_rate_limited(logger=_LOGGER, scale_ctl=scale_ctl, tag=f'oom-{ph}-scale-down', msg='[epochs] reduced sampler scale from %.4f to %.4f after OOM (factor=%.2f, try=%d/%d)' % (prev, cur, _oom_scale_down_factor(oom_try), oom_try, max_tries), level='info')
+    except Exception:
+        pass
+
+    # Cache clear (rate-limited by empty_device_cache)
+    with contextlib.suppress(Exception):
+        ec_min = 0.0 if oom_try <= 1 else _rt_env_float('STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S', 0.05)
+        empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
+
+    if optimizer is not None:
+        with contextlib.suppress(Exception):
+            optimizer.zero_grad(set_to_none=True)
+
+    reduced_any = False
+    inst = _unwrap_for_microbatch(model)
+    if inst is not None:
+        cur_mb = 0
+        with contextlib.suppress(Exception):
+            cur_mb = int(getattr(inst, 'microbatch', 0) or 0)
+        if cur_mb > 1:
+            new_mb = max(1, cur_mb // 2)
+            try:
+                new_mb = _sync_int_across_ranks(new_mb, device=device, src=0)
+            except Exception:
+                pass
+            if new_mb < cur_mb:
+                with contextlib.suppress(Exception):
+                    inst.microbatch = int(new_mb)
+                    inst._auto_microbatch_pending = False
+                _LOGGER.info('[epochs] reduced Model.microbatch from %d to %d after OOM%s', int(cur_mb), int(new_mb), ' in validation' if ph != 'train' else '')
+                reduced_any = True
+
+    if ph == 'train' and grad_accum_steps is not None:
+        try:
+            cur_ga = int(grad_accum_steps)
+        except Exception:
+            cur_ga = int(grad_accum_steps or 1)
+        if cur_ga > int(min_grad_accum):
+            new_ga = max(int(min_grad_accum), cur_ga // 2)
+            try:
+                new_ga = _sync_int_across_ranks(new_ga, device=device, src=0)
+            except Exception:
+                pass
+            if int(new_ga) != int(cur_ga):
+                _LOGGER.info('[epochs] reduced grad_accum_steps from %d to %d after OOM', int(cur_ga), int(new_ga))
+                grad_accum_steps = int(new_ga)
+                reduced_any = True
+
+    if not reduced_any:
+        if _oom_skip_enabled(ph):
+            _LOGGER.error('[epochs] OOM in %s and no more knobs to reduce. Skipping this batch.', str(ph))
+            with contextlib.suppress(Exception):
+                _oom_retry_clear(loader, ph, int(step_idx))
+            with contextlib.suppress(Exception):
+                empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
+            if optimizer is not None:
+                with contextlib.suppress(Exception):
+                    optimizer.zero_grad(set_to_none=True)
+            return ('skip', grad_accum_steps)
+        _LOGGER.error('[epochs] OOM in %s and no more knobs to reduce; giving up on recovery.', str(ph))
+        return ('raise', grad_accum_steps)
+
+    sleep_s = _oom_backoff_sleep_s(oom_try, ph)
+    if sleep_s > 0.0:
+        with contextlib.suppress(Exception):
+            time.sleep(float(sleep_s))
+
+    return ('retry', grad_accum_steps)
 MB_DIV = 1024.0 * 1024.0
 _device_mem_get_info = Memory.device_mem_get_info
 _DL_STATE_FILE = 'dataloader.json'
@@ -736,10 +826,9 @@ def _set_backend(device):
         if device.type == 'cuda' and hasattr(torch.backends, 'cudnn'):
             torch.backends.cudnn.benchmark = True
     rank = int(_rt_env_int('LOCAL_RANK', 0))
-    if device.type == 'cuda':
-        torch.cuda.set_device(rank)
-    elif device.type == 'xpu':
-        torch.xpu.set_device(rank)
+    if device.type in {'cuda', 'xpu'}:
+        n = max(1, int(_accel_device_count(device.type) or 1))
+        _accel_set_device_index(device.type, int(rank) % int(n))
     else:
         iface = None
         gloo_if = os.environ.get('GLOO_SOCKET_IFNAME')
@@ -856,7 +945,7 @@ def _calibrate_per_sample_mem(model, device, ops, dataset=None, max_probe_batch=
 
     def _to_device(obj, dev):
         if isinstance(obj, torch.Tensor):
-            return obj.to(device=dev, non_blocking=dev.type in {'cuda', 'xpu'})
+            return obj.to(device=dev, non_blocking=_pinned_h2d_supported_for_device_type(dev.type))
         from tensordict import TensorDictBase
         from collections.abc import Mapping
         if isinstance(obj, TensorDictBase):
@@ -868,47 +957,10 @@ def _calibrate_per_sample_mem(model, device, ops, dataset=None, max_probe_batch=
             return type(obj)(seq)
         return obj
     try:
-        base_alloc = None
-        peak_api = None
-        accel = getattr(torch, 'accelerator', None)
-        if accel is not None and hasattr(accel, 'is_available') and accel.is_available():
-            mem_mod = getattr(accel, 'memory', None)
-            with contextlib.suppress(Exception):
-                if mem_mod is not None:
-                    alloc_fn = getattr(mem_mod, 'allocated', None)
-                    reset_fn = getattr(mem_mod, 'reset_peak_memory_stats', None)
-                    peak_fn = getattr(mem_mod, 'max_memory_allocated', None)
-                    if callable(alloc_fn) and callable(peak_fn):
-                        base_alloc = int(alloc_fn(device))
-                        if callable(reset_fn):
-                            reset_fn(device)
-                        peak_api = lambda d: int(peak_fn(d))
+        base_alloc = _accel_memory_allocated(device)
         if base_alloc is None:
-            if dev_type == 'cuda' and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    base_alloc = int(torch.cuda.memory_allocated(device))
-                    torch.cuda.reset_peak_memory_stats(device)
-                    peak_api = lambda d: int(torch.cuda.max_memory_allocated(d))
-            elif dev_type == 'xpu' and hasattr(torch, 'xpu'):
-                with contextlib.suppress(Exception):
-                    alloc = getattr(torch.xpu, 'memory_allocated', None)
-                    reset = getattr(torch.xpu, 'reset_peak_memory_stats', None)
-                    peak = getattr(torch.xpu, 'max_memory_allocated', None)
-                    if callable(alloc) and callable(peak):
-                        base_alloc = int(alloc(device))
-                        if callable(reset):
-                            reset(device)
-                        peak_api = lambda d: int(peak(d))
-            elif dev_type == 'mps' and hasattr(torch, 'mps'):
-                with contextlib.suppress(Exception):
-                    mps = torch.mps
-                    alloc = getattr(mps, 'current_allocated_memory', None)
-                    peak = getattr(mps, 'max_memory_allocated', None)
-                    if callable(alloc) and callable(peak):
-                        base_alloc = int(alloc())
-                        peak_api = lambda d: int(peak())
-        if base_alloc is None or peak_api is None:
             return
+        _accel_reset_peak_memory_stats(device)
         batch = ds.get(0, B0)
         forward_ran = False
         training_mode = bool(model.training)
@@ -916,18 +968,18 @@ def _calibrate_per_sample_mem(model, device, ops, dataset=None, max_probe_batch=
         try:
             from ..core.precision import Autocast
             from ..core.graph import inference_mode
-            feats, labels, *_rest = meta.preprocess(batch)
+            feats, labels, *_rest = meta.preprocess(batch, return_keys=False)
             X = to_torch_tensor(feats)
             X = torch.atleast_2d(X)
             if X.dim() == 2 and int(X.shape[1]) == int(getattr(ops, 'in_dim', X.shape[1])):
-                X = X.to(device=device, non_blocking=device.type in {'cuda', 'xpu'})
+                X = X.to(device=device, non_blocking=_pinned_h2d_supported_for_device_type(device.type))
                 if with_backward:
                     model.train()
                     with Autocast.float(device):
                         Y_flat = None
                         if labels is not None:
                             Y = to_torch_tensor(labels)
-                            Y = torch.atleast_2d(Y).to(device=device, non_blocking=device.type in {'cuda', 'xpu'})
+                            Y = torch.atleast_2d(Y).to(device=device, non_blocking=_pinned_h2d_supported_for_device_type(device.type))
                             Y_flat = Y.reshape(Y.shape[0], -1)
                         y_hat, loss_val = model(X, labels_flat=Y_flat, global_loss=global_loss, local_loss=local_loss, loss_weights=loss_weights, calibrate_output=False)
                     target = None
@@ -966,17 +1018,12 @@ def _calibrate_per_sample_mem(model, device, ops, dataset=None, max_probe_batch=
                         _touch(v)
             _touch(batch_dev)
         with contextlib.suppress(Exception):
-            if dev_type == 'cuda' and torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            elif dev_type == 'xpu' and hasattr(torch, 'xpu'):
-                sync = getattr(torch.xpu, 'synchronize', None)
-                if callable(sync):
-                    sync()
-            elif dev_type == 'mps' and hasattr(torch, 'mps'):
-                sync = getattr(torch.mps, 'synchronize', None)
-                if callable(sync):
-                    sync()
-        peak_alloc = peak_api(device)
+            _accel_synchronize(device)
+        peak_alloc = _accel_max_memory_allocated(device)
+        if peak_alloc is None:
+            peak_alloc = _accel_memory_allocated(device)
+        if peak_alloc is None:
+            return
         delta = max(0, int(peak_alloc) - int(base_alloc))
         if delta <= 0:
             return
@@ -1098,7 +1145,7 @@ def get_tqdm(*args, title, total, device, **kwargs):
 def _gpu_nvml_utils(device):
     if getattr(device, 'type', '') != 'cuda':
         return (None, None)
-    idx = device.index if device.index is not None else torch.cuda.current_device()
+    idx = device.index if device.index is not None else _accel_current_device_index('cuda')
     idx_i = int(idx)
     global _NVML_FAIL_COUNT, _NVML_BACKOFF_UNTIL
     gpu_util = None
@@ -1163,44 +1210,22 @@ def _gpu_nvml_utils(device):
                 _NVML_UTIL_CACHE[idx_i] = (now, gpu_util, mem_util)
     if mem_util is None:
         with contextlib.suppress(Exception):
-            free_bytes, total_bytes = torch.cuda.mem_get_info(idx_i)
-            if total_bytes:
-                used_bytes = float(total_bytes - free_bytes)
-                mem_util = 100.0 * used_bytes / float(total_bytes)
+            mem_util = _device_mem_util_percent(torch.device("cuda", idx_i))
     return (gpu_util, mem_util)
 
 def _xpu_mem_util(device):
     if getattr(device, 'type', '') != 'xpu':
         return None
-    if not hasattr(torch, 'xpu'):
-        return None
-    try:
-        idx = device.index if device.index is not None else torch.xpu.current_device()
-        props = torch.xpu.get_device_properties(idx)
-        total = getattr(props, 'total_memory', None)
-        if not total:
-            return None
-        used = float(torch.xpu.memory_allocated(idx))
-        return 100.0 * used / float(total) if total > 0 else None
-    except Exception:
-        return None
+    with contextlib.suppress(Exception):
+        return _device_mem_util_percent(device)
+    return None
 
 def _mps_mem_util(device):
     if getattr(device, 'type', '') != 'mps':
         return None
-    if not hasattr(torch, 'mps'):
-        return None
-    if _psutil is None:
-        return None
-    try:
-        vm = _psutil.virtual_memory()
-        total = float(getattr(vm, 'total', 0.0))
-        if total <= 0.0:
-            return None
-        used = float(torch.mps.current_allocated_memory())
-        return 100.0 * used / total
-    except Exception:
-        return None
+    with contextlib.suppress(Exception):
+        return _device_mem_util_percent(device)
+    return None
 
 def _sync_int_across_ranks(value, device, src=0):
     if not is_distributed():
@@ -1233,7 +1258,7 @@ def update_tqdm(bar, finish, *args, mbps=None, tflops=None, **kwargs):
         tflops_val = 0.0
     io_expr = f'I/O = {mbps_val:.2f} MB/s' if mbps_val >= 0.01 else 'I/O < 0.01 MB/s'
     com_expr = f'COM = {tflops_val:.2f} TFLOPS' if tflops_val >= 0.01 else 'COM < 0.01 TFLOPS'
-    bar.unit = ', '.join([io_expr, com_expr])
+    bar.unit = io_expr + ', ' + com_expr
     try:
         inc = int(finish)
     except Exception:
@@ -1241,67 +1266,150 @@ def update_tqdm(bar, finish, *args, mbps=None, tflops=None, **kwargs):
     if inc > 0:
         bar.update(inc)
 
-def _pin_tensors_with_cpu_pool(*tensors, device, cpu_pool, pool_handles):
-    if cpu_pool is None or (not _pinned_h2d_supported_for_device_type(str(getattr(device, 'type', 'cpu')))):
-        return tensors
-    out = []
-    for t in tensors:
-        if torch.is_tensor(t) and t.device.type == 'cpu':
-            if hasattr(t, 'is_pinned') and t.is_pinned():
-                out.append(t)
-                continue
-            buf, h = cpu_pool.get(tuple(t.shape), t.dtype, return_handle=True)
-            buf.copy_(t, non_blocking=False)
-            if h is not None:
-                pool_handles[id(buf)] = h
-            out.append(buf)
-        else:
-            out.append(t)
-    return tuple(out)
+def _stage_tensor_with_cpu_pool(
+    tensor: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+    cpu_pool: Pool | None,
+    dev_type: str | None = None,
+    pinned_ok: bool | None = None,
+) -> tuple[torch.Tensor, Pool.Token | None, bool]:
+    """Stage a CPU tensor into a (bounded) pinned pool for fast H2D.
 
-def _to_device_with_stream_and_pool(tensor, *, device, cpu_pool, pool_handles):
+    Returns: (staged_tensor, pool_token_or_None, is_pinned)
+
+    Notes:
+      - When dtype differs, the dtype conversion is performed during the copy_ into
+      - the staging buffer (no intermediate cast allocation).
+      - When the pool overflows, the Pool falls back to an unpinned one-off tensor
+        with token None.
+    """
+    if not torch.is_tensor(tensor):
+        raise TypeError(f"stage_tensor expects a torch.Tensor, got {type(tensor)}")
+
+    if dev_type is None:
+        dev_type = str(getattr(device, "type", "cpu"))
+    if pinned_ok is None:
+        pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
+
+    # Already not on CPU: no staging, but keep dtype consistent if possible.
+    if tensor.device.type != "cpu":
+        if tensor.dtype != dtype:
+            with contextlib.suppress(Exception):
+                tensor = tensor.to(dtype=dtype, copy=False)
+        return tensor, None, False
+
+    # Fast path: already pinned + dtype matches.
+    with contextlib.suppress(Exception):
+        is_pinned = getattr(tensor, "is_pinned", None)
+        if callable(is_pinned) and bool(is_pinned()) and tensor.dtype == dtype:
+            return tensor, None, True
+
+    # Preferred: stage into bounded pinned pool.
+    if cpu_pool is not None and bool(pinned_ok):
+        buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
+        buf.copy_(tensor, non_blocking=False)
+        pinned = False
+        with contextlib.suppress(Exception):
+            is_pinned = getattr(buf, "is_pinned", None)
+            if callable(is_pinned):
+                pinned = bool(is_pinned())
+        return buf, token, pinned
+
+    # Fallback: cast (if needed) without pinning.
+    out = tensor
+    if out.dtype != dtype:
+        out = out.to(dtype=dtype, copy=False)
+    pinned = False
+    with contextlib.suppress(Exception):
+        is_pinned = getattr(out, "is_pinned", None)
+        if callable(is_pinned):
+            pinned = bool(is_pinned())
+    return out, None, pinned
+
+def _to_device_with_stream_and_pool(
+    tensor,
+    *,
+    device,
+    cpu_pool,
+    handle: Pool.Token | None = None,
+    pinned: bool | None = None,
+    dev_type=None,
+    non_blocking_ok=None,
+    backend=None,
+    stream_fn=None,
+    Event=None,
+    fence_event_factory=None,
+    can_stream_release=None,
+):
     if not torch.is_tensor(tensor):
         return tensor
 
-    dev_type = str(getattr(device, 'type', 'cpu'))
-    non_blocking_ok = dev_type in ('cuda', 'xpu')
+    if dev_type is None:
+        dev_type = str(getattr(device, 'type', 'cpu'))
+    if non_blocking_ok is None:
+        non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
 
-    # Fast path: not CPU -> device or no pinned-transfer backend.
-    if tensor.device.type != 'cpu' or cpu_pool is None or (not non_blocking_ok):
-        return tensor.to(device, non_blocking=non_blocking_ok)
+    pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
 
-    backend = _accel_backend_for_device_type(dev_type)
-    stream_fn = getattr(backend, 'current_stream', None) if backend is not None else None
-    Event = getattr(backend, 'Event', None) if backend is not None else None
-    can_stream_release = bool(_pinned_h2d_supported_for_device_type(dev_type) and callable(stream_fn) and Event is not None)
+    if pinned is None:
+        pinned = False
+        with contextlib.suppress(Exception):
+            is_pinned = getattr(tensor, 'is_pinned', None)
+            if callable(is_pinned):
+                pinned = bool(is_pinned())
 
-    h = pool_handles.pop(id(tensor), None)
-
-    pinned = False
-    with contextlib.suppress(Exception):
-        is_pinned = getattr(tensor, 'is_pinned', None)
-        if callable(is_pinned):
-            pinned = bool(is_pinned())
-
-    # If we don't have a pinned staging buffer (overflow path), do a synchronous copy.
-    # This keeps pinned memory bounded under contention and matches Pool's fallback behavior.
-    if (not pinned) or (not can_stream_release):
-        out = tensor.to(device, non_blocking=False)
-        if h is not None and cpu_pool is not None:
+    # Not on CPU (or no async backend): standard move. If a pool token was provided,
+    # release it immediately (best-effort) to avoid leaks.
+    if tensor.device.type != 'cpu' or (not bool(non_blocking_ok)):
+        out = tensor.to(device, non_blocking=bool(non_blocking_ok))
+        if handle is not None and cpu_pool is not None:
             with contextlib.suppress(Exception):
-                cpu_pool.release(h)
+                cpu_pool.release(handle)
+        return out
+
+    # No pool handle: we can still take advantage of pinned memory for async copies,
+    # but there is no pool page to release.
+    if handle is None:
+        return tensor.to(device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok))
+
+    if backend is None:
+        backend = _accel_backend_for_device_type(dev_type)
+    if stream_fn is None and backend is not None:
+        stream_fn = getattr(backend, 'current_stream', None)
+    if Event is None and backend is not None:
+        Event = getattr(backend, 'Event', None)
+    if can_stream_release is None:
+        can_stream_release = bool(pinned and pinned_ok and callable(stream_fn) and (Event is not None))
+
+    # If we cannot safely delay pool release (overflow/unpinned, or no Event/stream support),
+    # fall back to a synchronous copy and release immediately.
+    if (not bool(pinned)) or (not bool(can_stream_release)):
+        out = tensor.to(device, non_blocking=False)
+        if cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(handle)
         return out
 
     # Pinned + backend stream support: async H2D and release pool page after stream completes.
-    try:
-        out = tensor.to(device, non_blocking=True)
-
-        stream = None
+    stream = None
+    if callable(stream_fn):
         with contextlib.suppress(Exception):
             try:
-                stream = stream_fn(device)
+                stream = stream_fn(device=device)
             except TypeError:
-                stream = stream_fn()
+                try:
+                    stream = stream_fn(device)
+                except TypeError:
+                    stream = stream_fn()
+
+    try:
+        if stream is not None:
+            with _accel_stream_context(stream, dev_type):
+                out = tensor.to(device, non_blocking=True)
+        else:
+            out = tensor.to(device, non_blocking=True)
 
         if stream is not None:
             rec = getattr(tensor, 'record_stream', None)
@@ -1309,105 +1417,143 @@ def _to_device_with_stream_and_pool(tensor, *, device, cpu_pool, pool_handles):
                 with contextlib.suppress(Exception):
                     rec(stream)
 
-        if h is not None and cpu_pool is not None:
+        if cpu_pool is not None:
             try:
-                evt = Event()
-                if stream is not None:
-                    evt.record(stream)
+                evt = None
+                fe = getattr(cpu_pool, 'fence_event', None)
+                if callable(fe) and fence_event_factory is not None:
+                    with contextlib.suppress(Exception):
+                        evt = fe(handle, fence_event_factory)
+                if evt is None:
+                    if fence_event_factory is not None:
+                        with contextlib.suppress(Exception):
+                            evt = fence_event_factory()
+                    elif Event is not None:
+                        with contextlib.suppress(Exception):
+                            evt = Event()
+
+                if evt is not None:
+                    if stream is not None:
+                        try:
+                            evt.record(stream)
+                        except TypeError:
+                            evt.record()
+                    else:
+                        evt.record()
+                    cpu_pool.release_after(handle, evt)
                 else:
-                    evt.record()
-                cpu_pool.release_after(h, evt)
+                    with contextlib.suppress(Exception):
+                        _accel_synchronize(device)
+                    with contextlib.suppress(Exception):
+                        cpu_pool.release(handle)
             except Exception:
                 with contextlib.suppress(Exception):
                     _accel_synchronize(device)
                 with contextlib.suppress(Exception):
-                    cpu_pool.release(h)
+                    cpu_pool.release(handle)
         return out
     except Exception:
         out = tensor.to(device, non_blocking=False)
-        if h is not None and cpu_pool is not None:
+        if cpu_pool is not None:
             with contextlib.suppress(Exception):
-                cpu_pool.release(h)
+                cpu_pool.release(handle)
         return out
 
 
 
-def _drain_pool_handles(pool_handles, *, cpu_pool, device):
-    if not pool_handles or cpu_pool is None:
-        pool_handles.clear()
-        return
-    # Best-effort sync on the device backend before releasing pinned buffers.
-    try:
-        backend = _accel_backend_for_device_type(str(getattr(device, "type", "cpu")))
-        sync = getattr(backend, "synchronize", None) if backend is not None else None
-        if callable(sync):
-            try:
-                sync(device=device)
-            except TypeError:
-                sync(device)
-    except Exception:
-        pass
-    for h in tuple(pool_handles.values()):
-        with contextlib.suppress(Exception):
-            cpu_pool.release(h)
-    pool_handles.clear()
+def _preprocess_pin_h2d(
+    meta,
+    raw,
+    *,
+    device,
+    stage_tensor,
+    to_device,
+    cpu_pool,
+    use_timer,
+    timer_sync: bool = False,
+    require_labels: bool = True,
+):
+    feat, label, *_ = meta.preprocess(raw, return_keys=False, cast=False)
 
-def _preprocess_pin_h2d(meta, raw, *, device, pin_tensor, to_device, use_timer, timer_sync=False, require_labels=True):
-    feat, label, *_ = meta.preprocess(raw)
-    X = to_torch_tensor(feat)
-    Y = None
+    X_src = feat if torch.is_tensor(feat) else to_torch_tensor(feat)
+
     if label is None:
         if require_labels:
             raise RuntimeError('Batch is missing labels.')
-        Y = None
+        Y_src = None
     else:
-        Y = to_torch_tensor(label)
-    if Y is None:
-        X, = pin_tensor(X)
-    else:
-        X, Y = pin_tensor(X, Y)
-    t_ready = time.perf_counter_ns()
-    if use_timer:
-        # Prefer device Event timing when supported (CUDA/XPU), fall back to wall-clock.
-        pair = _get_thread_timing_events(device, slot='h2d')
-        if pair is not None:
-            try:
-                h2d_s_ev, h2d_e_ev = pair
-                h2d_s_ev.record()
-                X = to_device(X)
-                if Y is not None:
-                    Y = to_device(Y)
-                h2d_e_ev.record()
-                h2d_e_ev.synchronize()
-                h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
-            except Exception:
+        Y_src = label if torch.is_tensor(label) else to_torch_tensor(label)
+
+    # Stage (optionally cast+pin) and then H2D. If we acquired any pool tokens but fail
+    # before scheduling a release fence, ensure we release them synchronously.
+    x_tok: Pool.Token | None = None
+    y_tok: Pool.Token | None = None
+
+    try:
+        x_dtype = getattr(meta, 'feature_dtype', X_src.dtype)
+        X_st, x_tok, x_pinned = stage_tensor(X_src, dtype=x_dtype)
+
+        Y_st = None
+        y_pinned = False
+        if Y_src is not None:
+            y_dtype = getattr(meta, 'label_float_dtype', Y_src.dtype)
+            Y_st, y_tok, y_pinned = stage_tensor(Y_src, dtype=y_dtype)
+
+        t_ready = time.perf_counter_ns()
+
+        def _move():
+            nonlocal x_tok, y_tok
+            X_dev = to_device(X_st, handle=x_tok, pinned=x_pinned)
+            x_tok = None
+            Y_dev = None
+            if Y_st is not None:
+                Y_dev = to_device(Y_st, handle=y_tok, pinned=y_pinned)
+                y_tok = None
+            return X_dev, Y_dev
+
+        if use_timer:
+            # Prefer device Event timing when supported (CUDA/XPU), fall back to wall-clock.
+            pair = _get_thread_timing_events(device, slot='h2d')
+            if pair is not None:
+                try:
+                    h2d_s_ev, h2d_e_ev = pair
+                    h2d_s_ev.record()
+                    X_dev, Y_dev = _move()
+                    h2d_e_ev.record()
+                    h2d_e_ev.synchronize()
+                    h2d_s = float(h2d_s_ev.elapsed_time(h2d_e_ev)) / 1000.0
+                except Exception:
+                    t_h2d_s = time.perf_counter_ns()
+                    X_dev, Y_dev = _move()
+                    if timer_sync:
+                        _accel_synchronize(device)
+                    t_h2d_e = time.perf_counter_ns()
+                    h2d_s = (t_h2d_e - t_h2d_s) / 1000000000.0
+            else:
                 t_h2d_s = time.perf_counter_ns()
-                X = to_device(X)
-                if Y is not None:
-                    Y = to_device(Y)
+                X_dev, Y_dev = _move()
                 if timer_sync:
                     _accel_synchronize(device)
                 t_h2d_e = time.perf_counter_ns()
                 h2d_s = (t_h2d_e - t_h2d_s) / 1000000000.0
         else:
             t_h2d_s = time.perf_counter_ns()
-            X = to_device(X)
-            if Y is not None:
-                Y = to_device(Y)
+            X_dev, Y_dev = _move()
             if timer_sync:
                 _accel_synchronize(device)
             t_h2d_e = time.perf_counter_ns()
             h2d_s = (t_h2d_e - t_h2d_s) / 1000000000.0
-    else:
-        t_h2d_s = time.perf_counter_ns()
-        X = to_device(X)
-        if Y is not None:
-            Y = to_device(Y)
-        if timer_sync:
-            _accel_synchronize(device)
-        t_h2d_e = time.perf_counter_ns()
-        h2d_s = (t_h2d_e - t_h2d_s) / 1000000000.0
-    return (X, Y, t_ready, h2d_s)
+
+        return (X_dev, Y_dev, t_ready, h2d_s)
+
+    finally:
+        # Only tokens that were not consumed by to_device() remain non-None.
+        if x_tok is not None and cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(x_tok)
+        if y_tok is not None and cpu_pool is not None:
+            with contextlib.suppress(Exception):
+                cpu_pool.release(y_tok)
 
 def _resolve_train_process_group(meta, model):
     candidates = [(meta, 'process_group'), (meta, 'distributed_process_group')]
@@ -1816,8 +1962,18 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
             model_for_scaler.scaler.y_mean.copy_(mean_y)
             model_for_scaler.scaler.y_std.copy_(std_y)
     in_dim = int(ops.in_dim)
+    dev_type = str(getattr(device, 'type', 'cpu'))
+    non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
+    pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
+    backend = _accel_backend_for_device_type(dev_type)
+    stream_fn = getattr(backend, 'current_stream', None) if backend is not None else None
+    Event = getattr(backend, 'Event', None) if backend is not None else None
+    can_stream_release = bool(pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None))
+    make_fence_event = partial(_accel_make_event, device, enable_timing=False)
+    make_fence_event = partial(_accel_make_event, device, enable_timing=False)
+
     use_timer = _timing_events_supported(device)
-    timer_sync = (not use_timer) and bool(_wallclock_timer_sync_enabled_for_device_type(str(getattr(device, 'type', 'cpu'))))
+    timer_sync = (not use_timer) and bool(_wallclock_timer_sync_enabled_for_device_type(dev_type))
     train_steps = _num_batches(train_loader)
     val_steps = _num_batches(val_loader)
     total_updates = int(total_epochs) * (int(train_steps) + int(val_steps))
@@ -1838,9 +1994,25 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
     with join_context:
         with contextlib.suppress(Exception):
             get_tlb().pin_thread()
-        pool_handles = {}
-        pin_tensor = partial(_pin_tensors_with_cpu_pool, device=device, cpu_pool=cpu_pool, pool_handles=pool_handles)
-        to_device_with_stream = partial(_to_device_with_stream_and_pool, device=device, cpu_pool=cpu_pool, pool_handles=pool_handles)
+        stage_tensor = partial(
+            _stage_tensor_with_cpu_pool,
+            device=device,
+            dev_type=dev_type,
+            pinned_ok=pinned_ok,
+            cpu_pool=cpu_pool,
+        )
+        to_device_with_stream = partial(
+            _to_device_with_stream_and_pool,
+            device=device,
+            dev_type=dev_type,
+            non_blocking_ok=non_blocking_ok,
+            backend=backend,
+            stream_fn=stream_fn,
+            Event=Event,
+            fence_event_factory=make_fence_event,
+            can_stream_release=can_stream_release,
+            cpu_pool=cpu_pool,
+        )
         comp_ev_s = None
         comp_ev_e = None
         if use_timer:
@@ -1899,7 +2071,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                     train_accum_since_last += 1
                     while True:
                         try:
-                            X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(meta, _raw, device=device, pin_tensor=pin_tensor, to_device=to_device_with_stream, use_timer=use_timer, timer_sync=timer_sync, require_labels=True)
+                            X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(meta, _raw, device=device, stage_tensor=stage_tensor, to_device=to_device_with_stream, cpu_pool=cpu_pool, use_timer=use_timer, timer_sync=timer_sync, require_labels=True)
                             assert Y_opt is not None
                             Y = Y_opt
                             X = torch.atleast_2d(X)
@@ -1923,11 +2095,11 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                         mark_step = getattr(getattr(torch, 'compiler', None), 'cudagraph_mark_step_begin', None)
                                         if callable(mark_step):
                                             mark_step()
-                                    with Autocast.float(device):
-                                        Y_flat = Y.reshape(Y.shape[0], -1)
-                                        if Y_flat.device != device or Y_flat.dtype != param_dtype:
-                                            Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=device.type in ('cuda', 'xpu'))
-                                        y_hat, loss_val, loss_top_val, loss_bottom_val = model(X, labels_flat=Y_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_controller.weights(), calibrate_output=False, return_loss_components=True)
+                                        with Autocast.float(device):
+                                            Y_flat = Y.reshape(Y.shape[0], -1)
+                                            if Y_flat.device != device or Y_flat.dtype != param_dtype:
+                                                Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=non_blocking_ok)
+                                            y_hat, loss_val, loss_top_val, loss_bottom_val = model(X, labels_flat=Y_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_controller.weights(), calibrate_output=False, return_loss_components=True)
                                     if isinstance(loss_val, torch.Tensor) and loss_val.ndim > 0:
                                         loss_val = loss_val.mean()
                                     if isinstance(loss_top_val, torch.Tensor) and loss_top_val.ndim > 0:
@@ -1983,14 +2155,15 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                                 flop_breakdown_epoch[name] = flop_breakdown_epoch.get(name, 0.0) + float(value)
                             if should_sync:
                                 global_step += 1
-                                if device.type == 'cuda':
-                                    util_now, mem_now = _gpu_nvml_utils(device)
-                                elif device.type == 'xpu':
-                                    util_now, mem_now = (None, _xpu_mem_util(device))
-                                elif device.type == 'mps':
-                                    util_now, mem_now = (None, _mps_mem_util(device))
-                                else:
-                                    util_now, mem_now = (None, None)
+                                match device.type:
+                                    case 'cuda':
+                                        util_now, mem_now = _gpu_nvml_utils(device)
+                                    case 'xpu':
+                                        util_now, mem_now = (None, _xpu_mem_util(device))
+                                    case 'mps':
+                                        util_now, mem_now = (None, _mps_mem_util(device))
+                                    case _:
+                                        util_now, mem_now = (None, None)
                                 if util_now is not None:
                                     util_now = float(util_now)
                                     if gpu_util_ema is None:
@@ -2046,7 +2219,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                             new_grad_accum = min_grad_accum
                                     if new_grad_accum != grad_accum_steps:
                                         new_grad_accum = _sync_int_across_ranks(new_grad_accum, device=device, src=0)
-                                        logging.info(f'[epochs] adjusted grad_accum_steps={new_grad_accum} (gpu_util_ema={gpu_util_ema}, mem_util_ema={mem_util_ema})')
+                                        _LOGGER.info('[epochs] adjusted grad_accum_steps=%d (gpu_util_ema=%s, mem_util_ema=%s)', int(new_grad_accum), str(gpu_util_ema), str(mem_util_ema))
                                         grad_accum_steps = new_grad_accum
                             if use_timer and comp_ev_s is not None and comp_ev_e is not None:
                                 comp_ev_e.record()
@@ -2083,93 +2256,25 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                 _oom_retry_clear(train_loader, 'train', step_idx)
                             break
                         except RuntimeError as e:
-                            with contextlib.suppress(Exception):
-                                _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
                             msg = str(e).lower()
                             if 'out of memory' in msg:
-                                oom_try = _oom_retry_inc(train_loader, 'train', step_idx)
-                                max_tries = _oom_max_retries('train')
-                                if oom_try <= 1:
-                                    _LOGGER.error('[epochs] OOM during train step %d (global_step=%d). Trying to reduce microbatch / grad_accum and retry same batch. (try=%d/%d)', step_idx, global_step, oom_try, max_tries)
-                                else:
-                                    _LOGGER.warning('[epochs] OOM during train step %d (global_step=%d). Retrying. (try=%d/%d)', step_idx, global_step, oom_try, max_tries)
-                                if max_tries > 0 and oom_try > max_tries:
-                                    if _oom_skip_enabled('train'):
-                                        _LOGGER.error('[epochs] OOM storm: exceeded retry budget (try=%d/%d) at train step %d (global_step=%d). Skipping this batch.', oom_try, max_tries, step_idx, global_step)
-                                        with contextlib.suppress(Exception):
-                                            _oom_retry_clear(train_loader, 'train', step_idx)
-                                        with contextlib.suppress(Exception):
-                                            empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
-                                        with contextlib.suppress(Exception):
-                                            optimizer.zero_grad(set_to_none=True)
-                                        break
-                                    raise
-                                try:
-                                    scale_ctl = None
-                                    obj = train_loader
-                                    for _ in range(4):
-                                        if obj is None:
-                                            break
-                                        scale_ctl = getattr(obj, '_stnet_sampler_scale', None)
-                                        if scale_ctl is not None:
-                                            break
-                                        obj = getattr(obj, '_src', None) or getattr(obj, 'src', None)
-                                    if scale_ctl is not None:
-                                        prev = None
-                                        with contextlib.suppress(Exception):
-                                            prev = float(scale_ctl.get())
-                                        with contextlib.suppress(Exception):
-                                            scale_ctl.request_scale_down(_oom_scale_down_factor(oom_try))
-                                        with contextlib.suppress(Exception):
-                                            cur = float(scale_ctl.get())
-                                            if prev is not None and cur < prev:
-                                                _log_sampler_scale_rate_limited(logger=_LOGGER, scale_ctl=scale_ctl, tag='oom-train-scale-down', msg='[epochs] reduced sampler scale from %.4f to %.4f after OOM (factor=%.2f, try=%d/%d)' % (prev, cur, _oom_scale_down_factor(oom_try), oom_try, max_tries), level='info')
-                                except Exception:
-                                    pass
-                                with contextlib.suppress(Exception):
-                                    ec_min = 0.0 if oom_try <= 1 else _rt_env_float('STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S', 0.05)
-                                    empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
-                                with contextlib.suppress(Exception):
-                                    optimizer.zero_grad(set_to_none=True)
-                                reduced_any = False
-                                inst = _unwrap_for_microbatch(model)
-                                if inst is not None:
-                                    with contextlib.suppress(Exception):
-                                        cur_mb = int(getattr(inst, 'microbatch', 0) or 0)
-                                    if cur_mb > 1:
-                                        new_mb = max(1, cur_mb // 2)
-                                        if new_mb < cur_mb:
-                                            with contextlib.suppress(Exception):
-                                                inst.microbatch = new_mb
-                                                inst._auto_microbatch_pending = False
-                                            _LOGGER.info('[epochs] reduced Model.microbatch from %d to %d after OOM', cur_mb, new_mb)
-                                            reduced_any = True
-                                if grad_accum_steps > min_grad_accum:
-                                    new_grad_accum = max(min_grad_accum, grad_accum_steps // 2)
-                                    try:
-                                        new_grad_accum = _sync_int_across_ranks(new_grad_accum, device=device, src=0)
-                                    except Exception:
-                                        pass
-                                    if new_grad_accum != grad_accum_steps:
-                                        _LOGGER.info('[epochs] reduced grad_accum_steps from %d to %d after OOM', grad_accum_steps, new_grad_accum)
-                                        grad_accum_steps = new_grad_accum
-                                        reduced_any = True
-                                if not reduced_any:
-                                    if _oom_skip_enabled('train'):
-                                        _LOGGER.error('[epochs] OOM in train and no more knobs to reduce (microbatch <= 1, grad_accum at min). Skipping this batch.')
-                                        with contextlib.suppress(Exception):
-                                            _oom_retry_clear(train_loader, 'train', step_idx)
-                                        with contextlib.suppress(Exception):
-                                            empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
-                                        with contextlib.suppress(Exception):
-                                            optimizer.zero_grad(set_to_none=True)
-                                        break
-                                    _LOGGER.error('[epochs] OOM in train and no more knobs to reduce; giving up on recovery.')
-                                    raise
-                                continue
+                                decision, grad_accum_steps = _handle_oom_recovery(
+                                    phase='train',
+                                    loader=train_loader,
+                                    step_idx=step_idx,
+                                    global_step=global_step,
+                                    device=device,
+                                    model=model,
+                                    optimizer=optimizer,
+                                    grad_accum_steps=grad_accum_steps,
+                                    min_grad_accum=min_grad_accum,
+                                )
+                                if decision == 'retry':
+                                    continue
+                                if decision == 'skip':
+                                    break
+                                raise
                             raise
-                        finally:
-                            pool_handles.clear()
             if lw_count > 0:
                 top_avg_t = lw_top_sum / float(lw_count) if lw_top_sum is not None else None
                 bottom_avg_t = lw_bottom_sum / float(lw_count) if lw_bottom_sum is not None else None
@@ -2197,7 +2302,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                         for _vstep, _raw in enumerate(val_loader):
                             while True:
                                 try:
-                                    X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(meta, _raw, device=device, pin_tensor=pin_tensor, to_device=to_device_with_stream, use_timer=use_timer, timer_sync=timer_sync, require_labels=True)
+                                    X, Y_opt, t_ready, h2d_s = _preprocess_pin_h2d(meta, _raw, device=device, stage_tensor=stage_tensor, to_device=to_device_with_stream, cpu_pool=cpu_pool, use_timer=use_timer, timer_sync=timer_sync, require_labels=True)
                                     assert Y_opt is not None
                                     Y = Y_opt
                                     X = torch.atleast_2d(X)
@@ -2221,7 +2326,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                             if callable(mark_step):
                                                 mark_step()
                                         with Autocast.float(device):
-                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(device, dtype=param_dtype, non_blocking=device.type in ('cuda', 'xpu'))
+                                            Yv_flat = Y.reshape(Y.shape[0], -1).to(device, dtype=param_dtype, non_blocking=non_blocking_ok)
                                             _y, _loss_val = model(X, labels_flat=Yv_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_controller.weights(), calibrate_output=False)
                                         if isinstance(_loss_val, torch.Tensor) and _loss_val.ndim > 0:
                                             _loss_val = _loss_val.mean()
@@ -2264,77 +2369,25 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                         _oom_retry_clear(val_loader, 'val', _vstep)
                                     break
                                 except RuntimeError as e:
-                                    with contextlib.suppress(Exception):
-                                        _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
                                     msg = str(e).lower()
                                     if 'out of memory' in msg:
-                                        oom_try = _oom_retry_inc(val_loader, 'val', _vstep)
-                                        max_tries = _oom_max_retries('val')
-                                        if oom_try <= 1:
-                                            _LOGGER.error('[epochs] OOM during validation step %d. Trying to reduce microbatch and retry same batch. (try=%d/%d)', _vstep, oom_try, max_tries)
-                                        else:
-                                            _LOGGER.warning('[epochs] OOM during validation step %d. Retrying. (try=%d/%d)', _vstep, oom_try, max_tries)
-                                        if max_tries > 0 and oom_try > max_tries:
-                                            if _oom_skip_enabled('val'):
-                                                _LOGGER.error('[epochs] OOM storm: exceeded retry budget (try=%d/%d) at validation step %d. Skipping this batch.', oom_try, max_tries, _vstep)
-                                                with contextlib.suppress(Exception):
-                                                    _oom_retry_clear(val_loader, 'val', _vstep)
-                                                with contextlib.suppress(Exception):
-                                                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
-                                                break
-                                            raise
-                                        try:
-                                            scale_ctl = None
-                                            obj = val_loader
-                                            for _ in range(4):
-                                                if obj is None:
-                                                    break
-                                                scale_ctl = getattr(obj, '_stnet_sampler_scale', None)
-                                                if scale_ctl is not None:
-                                                    break
-                                                obj = getattr(obj, '_src', None) or getattr(obj, 'src', None)
-                                            if scale_ctl is not None:
-                                                prev = None
-                                                with contextlib.suppress(Exception):
-                                                    prev = float(scale_ctl.get())
-                                                with contextlib.suppress(Exception):
-                                                    scale_ctl.request_scale_down(_oom_scale_down_factor(oom_try))
-                                                with contextlib.suppress(Exception):
-                                                    cur = float(scale_ctl.get())
-                                                    if prev is not None and cur < prev:
-                                                        _log_sampler_scale_rate_limited(logger=_LOGGER, scale_ctl=scale_ctl, tag='oom-val-scale-down', msg='[epochs] reduced sampler scale from %.4f to %.4f after OOM (validation) (factor=%.2f, try=%d/%d)' % (prev, cur, _oom_scale_down_factor(oom_try), oom_try, max_tries), level='info')
-                                        except Exception:
-                                            pass
-                                        with contextlib.suppress(Exception):
-                                            ec_min = 0.0 if oom_try <= 1 else _rt_env_float('STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S', 0.05)
-                                            empty_device_cache(device=device, do_gc=False, min_interval_s=ec_min)
-                                        reduced_any = False
-                                        inst = _unwrap_for_microbatch(model)
-                                        if inst is not None:
-                                            with contextlib.suppress(Exception):
-                                                cur_mb = int(getattr(inst, 'microbatch', 0) or 0)
-                                            if cur_mb > 1:
-                                                new_mb = max(1, cur_mb // 2)
-                                                if new_mb < cur_mb:
-                                                    with contextlib.suppress(Exception):
-                                                        inst.microbatch = new_mb
-                                                        inst._auto_microbatch_pending = False
-                                                    _LOGGER.info('[epochs] reduced Model.microbatch from %d to %d after OOM in validation', cur_mb, new_mb)
-                                                    reduced_any = True
-                                        if not reduced_any:
-                                            if _oom_skip_enabled('val'):
-                                                _LOGGER.error('[epochs] OOM in validation and no more knobs to reduce (microbatch <= 1). Skipping this batch.')
-                                                with contextlib.suppress(Exception):
-                                                    _oom_retry_clear(val_loader, 'val', _vstep)
-                                                with contextlib.suppress(Exception):
-                                                    empty_device_cache(device=device, do_gc=False, min_interval_s=0.0)
-                                                break
-                                            _LOGGER.error('[epochs] OOM in validation and no more knobs to reduce (microbatch <= 1). Giving up on recovery.')
-                                            raise
-                                        continue
+                                        decision, _ = _handle_oom_recovery(
+                                            phase='val',
+                                            loader=val_loader,
+                                            step_idx=_vstep,
+                                            device=device,
+                                            model=model,
+                                            optimizer=None,
+                                            global_step=None,
+                                            grad_accum_steps=None,
+                                            min_grad_accum=1,
+                                        )
+                                        if decision == 'retry':
+                                            continue
+                                        if decision == 'skip':
+                                            break
+                                        raise
                                     raise
-                                finally:
-                                    pool_handles.clear()
             if is_distributed():
                 stats = torch.tensor([comp_time, io_time, flops, io_bytes, train_samples_epoch], device=device, dtype=torch.float64)
                 torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
@@ -2489,15 +2542,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
             util_for_cap = max(0.0, min(1.0, util_for_cap))
             try:
                 if train_loader is not None:
-                    scale_ctl = None
-                    obj = train_loader
-                    for _ in range(4):
-                        if obj is None:
-                            break
-                        scale_ctl = getattr(obj, '_stnet_sampler_scale', None)
-                        if scale_ctl is not None:
-                            break
-                        obj = getattr(obj, '_src', None) or getattr(obj, 'src', None)
+                    scale_ctl = _find_sampler_scale_ctl(train_loader)
                     if scale_ctl is not None:
                         if mem_util_frac is not None and mem_util_frac > 0.92:
                             prev = None
@@ -2585,26 +2630,51 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, 'module') else run_model
     distributed_sync(module_eval, device=device)
+    dev_type = str(getattr(device, 'type', 'cpu'))
+    non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
+    pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
+    backend = _accel_backend_for_device_type(dev_type)
+    stream_fn = getattr(backend, 'current_stream', None) if backend is not None else None
+    Event = getattr(backend, 'Event', None) if backend is not None else None
+    can_stream_release = bool(pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None))
+
     cpu_pool = None
-    if _pinned_h2d_supported_for_device_type(str(getattr(device, 'type', 'cpu'))) and Pool is not None:
+    if pinned_ok and Pool is not None:
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         with contextlib.suppress(Exception):
             cpu_pool_cap = max(2, int(_rt_env_int('STNET_RUNTIME_PIN_POOL_CAPACITY', 8)))
             cpu_pool = Pool(capacity=cpu_pool_cap)
     pred_pool = None
-    if device.type in {'cuda', 'xpu'} and Pool is not None and _rt_env_flag('STNET_PRED_PINNED', True):
+    if non_blocking_ok and Pool is not None and _rt_env_flag('STNET_PRED_PINNED', True):
         with contextlib.suppress(Exception):
             pred_pool_cap = max(2, int(_rt_env_int('STNET_PRED_PIN_POOL_CAPACITY', 2)))
             pred_pool = Pool(capacity=pred_pool_cap, pin_memory=True)
-    pool_handles = {}
-    pin_tensor = partial(_pin_tensors_with_cpu_pool, device=device, cpu_pool=cpu_pool, pool_handles=pool_handles)
-    to_device_with_stream = partial(_to_device_with_stream_and_pool, device=device, cpu_pool=cpu_pool, pool_handles=pool_handles)
+    stage_tensor = partial(
+        _stage_tensor_with_cpu_pool,
+        device=device,
+        dev_type=dev_type,
+        pinned_ok=pinned_ok,
+        cpu_pool=cpu_pool,
+    )
+    to_device_with_stream = partial(
+        _to_device_with_stream_and_pool,
+        device=device,
+        dev_type=dev_type,
+        non_blocking_ok=non_blocking_ok,
+        backend=backend,
+        stream_fn=stream_fn,
+        Event=Event,
+        fence_event_factory=make_fence_event,
+        can_stream_release=can_stream_release,
+        cpu_pool=cpu_pool,
+    )
     status_bar = get_tqdm(title='Prediction', total=_num_batches(data_loader), device=device, leave=False) if local_rank == 0 else None
     use_buffer = True
     rows_buf = None
     pred_buf = None
     pred_handle = None
+    pred_buf_is_pinned = False
     buf_needs_wait_evt = False
     buf_fill = 0
     pending_rows = []
@@ -2617,7 +2687,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     variable_shape = False
 
     def _flush():
-        nonlocal chunk_idx, pending_count, buf_fill, pending_tail, pred_buf, pred_handle, buf_needs_wait_evt
+        nonlocal chunk_idx, pending_count, buf_fill, pending_tail, pred_buf, pred_handle, pred_buf_is_pinned, buf_needs_wait_evt
         if use_buffer:
             if buf_fill <= 0:
                 return
@@ -2629,6 +2699,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             buf_fill = 0
             pred_buf = None
             pred_handle = None
+            pred_buf_is_pinned = False
             buf_needs_wait_evt = False
         else:
             if pending_count <= 0:
@@ -2650,15 +2721,21 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
         if use_buffer:
             wait_evt = None
             if need_wait_evt:
-                backend = _accel_backend_for_device_type(str(getattr(device, 'type', 'cpu')))
-                Event = getattr(backend, 'Event', None) if backend is not None else None
-                if Event is not None:
-                    with contextlib.suppress(Exception):
-                        wait_evt = Event()
-                        wait_evt.record()
+                try:
+                    if local_handle is not None and pred_pool is not None:
+                        fe = getattr(pred_pool, 'fence_event', None)
+                        if callable(fe):
+                            wait_evt = fe(local_handle, make_fence_event)
+                    if wait_evt is None:
+                        wait_evt = make_fence_event()
+                    if wait_evt is not None:
+                        with contextlib.suppress(Exception):
+                            wait_evt.record()
+                except Exception:
+                    wait_evt = None
             release_cb = None
             if local_handle is not None and pred_pool is not None:
-                release_cb = lambda h=local_handle: pred_pool.release(h)
+                release_cb = partial(pred_pool.release, local_handle)
             cache.submit(preds, path=pred_path, wait_event=wait_evt, release_cb=release_cb)
         else:
             cache.submit(preds, path=pred_path)
@@ -2671,7 +2748,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
         del rows, preds
 
     def _append(rows_cpu, preds):
-        nonlocal use_buffer, rows_buf, pred_buf, pred_handle, buf_fill, pending_count, first_tail, variable_shape, pending_tail, buf_needs_wait_evt
+        nonlocal use_buffer, rows_buf, pred_buf, pred_handle, pred_buf_is_pinned, buf_fill, pending_count, first_tail, variable_shape, pending_tail, buf_needs_wait_evt
         if preds.ndim < 1:
             return
         b = int(preds.shape[0])
@@ -2712,6 +2789,11 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             else:
                 pred_buf = torch.empty((target_rows, *tail), dtype=preds.dtype)
                 pred_handle = None
+            pred_buf_is_pinned = False
+            with contextlib.suppress(Exception):
+                is_pinned = getattr(pred_buf, 'is_pinned', None)
+                if callable(is_pinned):
+                    pred_buf_is_pinned = bool(is_pinned())
         elif pred_buf.dtype != preds.dtype or tuple((int(x) for x in pred_buf.shape[1:])) != tail:
             if buf_fill > 0:
                 _flush()
@@ -2720,6 +2802,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                     pred_pool.release(pred_handle)
             pred_buf = None
             pred_handle = None
+            pred_buf_is_pinned = False
         start = 0
         while start < b:
             if pred_buf is None:
@@ -2728,13 +2811,18 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                 else:
                     pred_buf = torch.empty((target_rows, *tail), dtype=preds.dtype)
                     pred_handle = None
+                pred_buf_is_pinned = False
+                with contextlib.suppress(Exception):
+                    is_pinned = getattr(pred_buf, 'is_pinned', None)
+                    if callable(is_pinned):
+                        pred_buf_is_pinned = bool(is_pinned())
             space = target_rows - buf_fill
             if space <= 0:
                 _flush()
                 continue
             n = min(space, b - start)
             rows_buf[buf_fill:buf_fill + n].copy_(rows_cpu[start:start + n])
-            non_blocking = bool(pred_buf.is_pinned()) and preds.device.type != 'cpu'
+            non_blocking = bool(pred_buf_is_pinned) and preds.device.type != 'cpu'
             pred_buf[buf_fill:buf_fill + n].copy_(preds[start:start + n], non_blocking=non_blocking)
             if non_blocking:
                 buf_needs_wait_evt = True
@@ -2759,13 +2847,9 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                 except Exception:
                     row_ids = None
                 try:
-                    X, _Y, _t_ready, _h2d_s = _preprocess_pin_h2d(dataset, batch, device=device, pin_tensor=pin_tensor, to_device=to_device_with_stream, use_timer=False, require_labels=False)
+                    X, _Y, _t_ready, _h2d_s = _preprocess_pin_h2d(dataset, batch, device=device, stage_tensor=stage_tensor, to_device=to_device_with_stream, cpu_pool=cpu_pool, use_timer=False, require_labels=False)
                 except Exception:
-                    with contextlib.suppress(Exception):
-                        _drain_pool_handles(pool_handles, cpu_pool=cpu_pool, device=device)
                     raise
-                finally:
-                    pool_handles.clear()
                 X = torch.atleast_2d(X)
                 bs = int(getattr(X, 'shape', [0])[0]) if hasattr(X, 'shape') else 0
                 if bs <= 0:
@@ -2909,10 +2993,12 @@ def process(*args, **kwargs):
         torch.backends.cudnn.benchmark = not det
     if ops.mode == 'train':
         with contextlib.suppress(Exception):
-            if torch.cuda.is_available():
-                torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
-            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
+            if _accel_is_available('cuda'):
+                n = max(1, int(_accel_device_count('cuda') or 1))
+                _accel_set_device_index('cuda', int(local_rank) % int(n))
+            elif _accel_is_available('xpu'):
+                n = max(1, int(_accel_device_count('xpu') or 1))
+                _accel_set_device_index('xpu', int(local_rank) % int(n))
         device = get_device()
         _set_backend(device)
         backend = _backend_type(device)
@@ -3158,10 +3244,12 @@ def process(*args, **kwargs):
         return None
     if ops.mode in ('predict', 'infer'):
         with contextlib.suppress(Exception):
-            if torch.cuda.is_available():
-                torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
-            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                torch.xpu.set_device(local_rank % max(1, torch.xpu.device_count()))
+            if _accel_is_available('cuda'):
+                n = max(1, int(_accel_device_count('cuda') or 1))
+                _accel_set_device_index('cuda', int(local_rank) % int(n))
+            elif _accel_is_available('xpu'):
+                n = max(1, int(_accel_device_count('xpu') or 1))
+                _accel_set_device_index('xpu', int(local_rank) % int(n))
         device = get_device()
         _set_backend(device)
         backend = _backend_type(device)
@@ -3186,7 +3274,7 @@ def process(*args, **kwargs):
                 load(state_dict={'model': m_sd}, storage_reader=FileSystemReader(ops.model_ckpt_dir))
                 resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-        model.to(device, non_blocking=device.type in ('cuda', 'xpu')).eval()
+        model.to(device, non_blocking=non_blocking_ok).eval()
         metadata = Dataset.for_device(device)
         model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, 'module') else model
