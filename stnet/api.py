@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import contextlib
 import json
 import logging
@@ -7,100 +8,148 @@ import math
 import os
 import random
 import shutil
+import threading
 import time
-from pathlib import Path
 from functools import lru_cache, wraps
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from pathlib import Path
+from typing import Mapping, Sequence
+
 import numpy as np
 import torch
-from torch import nn
 import torch.multiprocessing as mp
-from tensordict import MemoryMappedTensor, TensorDict, TensorDictBase, PersistentTensorDict
+from tensordict import MemoryMappedTensor, PersistentTensorDict, TensorDict, TensorDictBase
 from torch.distributed.checkpoint import FileSystemReader, FileSystemWriter, load, save
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+    set_model_state_dict,
+)
+
 try:
     from torch.distributed.run import LaunchConfig, Std, elastic_launch
-except ImportError:
+except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
-from .core.distributed import get_available_host, get_preferred_ip, initialize_master_addr
-from .runtime.main import _trim_dcp_keys, process
-from .core.system import WorkerPolicy, initialize_python_path, new_dir, optimal_start_method, remove_dir, set_multiprocessing_env
+
 from .core.casting import dtype_from_name, env_bool, env_int, parse_torch_dtype
-from .data.pipeline import BatchIO, Dataset, default_underflow_action, extract_xy, normalize_underflow_action, resolve_feature_key
+from .core.config import ModelConfig, RuntimeConfig, coerce_model_config, runtime_config
+from .core.distributed import get_available_host, get_preferred_ip, initialize_master_addr
 from .core.graph import inference_mode
+from .core.system import (
+    WorkerPolicy,
+    initialize_python_path,
+    new_dir,
+    optimal_start_method,
+    remove_dir,
+    set_multiprocessing_env,
+)
+from .data.pipeline import (
+    BatchIO,
+    Dataset,
+    default_underflow_action,
+    extract_xy,
+    normalize_underflow_action,
+    resolve_feature_key,
+)
 from .nn.architecture import Model
 from .nn.primitives import Recorder, resize_scaler_buffer
-from .runtime.io import _torch_load_checkpoint, _to_cpu, is_required
-from .core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_config, runtime_config
+from .runtime.io import _to_cpu, _torch_load_checkpoint, is_required
+from .runtime.main import _trim_dcp_keys, process
+
 logger = logging.getLogger(__name__)
 _PRED_ASSEMBLE_MAX_SEGMENTS = int(env_int('STNET_PRED_ASSEMBLE_MAX_SEGMENTS', default=64))
 _PRED_ASSEMBLE_TUNE = env_bool('STNET_PRED_ASSEMBLE_TUNE', default=True)
 _PRED_ASSEMBLE_TUNE_LOG_ONCE = env_bool('STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE', default=True)
 _PRED_ASSEMBLE_TUNE_MIN_PARTS = int(env_int('STNET_PRED_ASSEMBLE_TUNE_MIN_PARTS', default=4))
 _PRED_ASSEMBLE_TUNE_LOGGED = False
+_PRED_ASSEMBLE_TUNE_LOG_LOCK = threading.Lock()
 
 def _maybe_log_pred_assemble_tuning(stats, *, kind):
     global _PRED_ASSEMBLE_TUNE_LOGGED
+
     if not bool(_PRED_ASSEMBLE_TUNE):
         return
-    if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) and bool(_PRED_ASSEMBLE_TUNE_LOGGED):
-        return
-    parts = int(stats.get('parts', 0) or 0)
+
+    if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE):
+        with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
+            if bool(_PRED_ASSEMBLE_TUNE_LOGGED):
+                return
+
+    parts = int(stats.get("parts", 0) or 0)
     if parts < int(_PRED_ASSEMBLE_TUNE_MIN_PARTS):
         return
-    inc = int(stats.get('inc_noncontig', 0) or 0)
+
+    inc = int(stats.get("inc_noncontig", 0) or 0)
     if inc <= 0:
         return
-    segs_sum = float(stats.get('segs_sum', 0.0) or 0.0)
-    segs_min = int(stats.get('segs_min', 0) or 0)
-    segs_max = int(stats.get('segs_max', 0) or 0)
+
+    segs_sum = float(stats.get("segs_sum", 0.0) or 0.0)
+    segs_min = int(stats.get("segs_min", 0) or 0)
+    segs_max = int(stats.get("segs_max", 0) or 0)
     avg = float(segs_sum) / float(max(1, inc))
     thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
-    used = int(stats.get('seg_used', 0) or 0)
-    skipped = int(stats.get('seg_skipped_threshold', 0) or 0)
-    disabled = int(stats.get('seg_disabled', 0) or 0)
+    used = int(stats.get("seg_used", 0) or 0)
+    skipped = int(stats.get("seg_skipped_threshold", 0) or 0)
+    disabled = int(stats.get("seg_disabled", 0) or 0)
+
     recommended = None
     if thr <= 0:
         if segs_max > 0 and avg <= 64.0:
-            recommended = max(8, min(int(max(16.0, math.ceil(avg * 1.5))), max(64, min(segs_max, 512))))
+            recommended = max(
+                8,
+                min(
+                    int(max(16.0, math.ceil(avg * 1.5))),
+                    max(64, min(segs_max, 512)),
+                ),
+            )
     elif skipped > 0:
-        skipped_max = int(stats.get('skipped_segs_max', 0) or 0)
+        skipped_max = int(stats.get("skipped_segs_max", 0) or 0)
         if skipped_max > thr:
             recommended = min(max(skipped_max, thr + 1), max(thr * 2, 128), 4096)
-    msg = f"Prediction assembly ({kind}): parts={parts}, contiguous={int(stats.get('contig', 0) or 0)}, noncontig={int(stats.get('noncontig', 0) or 0)}, strictly_inc_noncontig={inc}; segments avg={avg:.1f} (min={segs_min}, max={segs_max}); segment_copy used={used}, skipped(threshold={thr})={skipped}, disabled={disabled}."
+
+    msg = (
+        f"Prediction assembly ({kind}): parts={parts}, "
+        f"contiguous={int(stats.get('contig', 0) or 0)}, "
+        f"noncontig={int(stats.get('noncontig', 0) or 0)}, "
+        f"strictly_inc_noncontig={inc}; "
+        f"segments avg={avg:.1f} (min={segs_min}, max={segs_max}); "
+        f"segment_copy used={used}, skipped(threshold={thr})={skipped}, disabled={disabled}."
+    )
+
     if recommended is not None and recommended != thr:
-        logger.info('%s Suggested env: STNET_PRED_ASSEMBLE_MAX_SEGMENTS=%d (set <=0 to disable).', msg, int(recommended))
+        logger.info(
+            "%s Suggested env: STNET_PRED_ASSEMBLE_MAX_SEGMENTS=%d (set <=0 to disable).",
+            msg,
+            int(recommended),
+        )
     else:
-        logger.info('%s', msg)
-    _PRED_ASSEMBLE_TUNE_LOGGED = True
+        logger.info("%s", msg)
+
+    with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
+        _PRED_ASSEMBLE_TUNE_LOGGED = True
 
 def _strip_legacy_wrapped_keys(sd):
+
+    def _rewrite(k: str) -> str:
+        # Fast path: most keys are already clean.
+        if not (k.startswith("m.") and ".module." in k):
+            return k
+        parts = k.split(".")
+        if len(parts) >= 4 and parts[0] == "m" and parts[1].isdigit() and parts[2] == "module":
+            return ".".join(parts[3:])
+        return k
+
     new_sd = None
-    prefix = ('m',)
-    for k, v in sd.items():
-        if not (k.startswith('m.') and '.module.' in k):
-            nk = k
-        else:
-            parts = k.split('.')
-            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and (parts[2] == 'module'):
-                nk = '.'.join(parts[3:])
-            else:
-                nk = k
-        if nk != k and new_sd is None:
+    for k in sd.keys():
+        nk = _rewrite(k)
+        if nk != k:
             new_sd = type(sd)()
             break
+
     if new_sd is None:
         return sd
+
     for k, v in sd.items():
-        if not (k.startswith('m.') and '.module.' in k):
-            nk = k
-        else:
-            parts = k.split('.')
-            if len(parts) >= 4 and parts[0] == prefix[0] and parts[1].isdigit() and (parts[2] == 'module'):
-                nk = '.'.join(parts[3:])
-            else:
-                nk = k
-        new_sd[nk] = v
+        new_sd[_rewrite(k)] = v
     return new_sd
 
 def _read_checkpoint_dir_meta(p):
@@ -418,7 +467,7 @@ def _mat_one(d, out_dir, *, ds, val_frac, seed_value, underflow_action, shuffle)
     if count <= 0:
         raise ValueError('Empty dataset provided to train().')
     in_dim = int(fx.reshape(count, -1).shape[1])
-    BatchIO.preload_memmap({'features': fx, 'labels': lb}, memmap_dir=out_dir, train_frac=1.0 - float(val_frac), val_frac=float(val_frac), shuffle=bool(shuffle), seed=seed_value, underflow_action=underflow_action)
+    BatchIO.preload_memmap({'features': fx, 'labels': lb}, memmap_dir=out_dir, val_frac=float(val_frac), shuffle=bool(shuffle), seed=seed_value, underflow_action=underflow_action)
     del fx, lb
     return (int(in_dim), tuple(lshape), int(count))
 
@@ -751,199 +800,239 @@ def _infer_pred_master_dtype(chunks_dir, *, default=torch.float32):
                 continue
     return default
 
+
+def _pred_assemble_tune_stats_init():
+    # Collect perf/behavior stats only when requested.
+    if not bool(_PRED_ASSEMBLE_TUNE):
+        return None
+    if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE):
+        with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
+            if bool(_PRED_ASSEMBLE_TUNE_LOGGED):
+                return None
+    return {
+        'parts': 0,
+        'contig': 0,
+        'noncontig': 0,
+        'inc_noncontig': 0,
+        'seg_used': 0,
+        'seg_skipped_threshold': 0,
+        'seg_disabled': 0,
+        'segs_sum': 0.0,
+        'segs_min': 0,
+        'segs_max': 0,
+        'skipped_segs_max': 0,
+    }
+
+
+def _pred_assemble_tune_stats_update_segments(tune_stats, segs):
+    # Update segment statistics used for logging/tuning.
+    if tune_stats is None:
+        return
+    tune_stats['inc_noncontig'] += 1
+    tune_stats['segs_sum'] += float(segs)
+    mn = int(tune_stats.get('segs_min', 0) or 0)
+    mx = int(tune_stats.get('segs_max', 0) or 0)
+    tune_stats['segs_min'] = segs if mn <= 0 else min(mn, segs)
+    tune_stats['segs_max'] = max(mx, segs)
+    thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
+    if thr <= 0:
+        tune_stats['seg_disabled'] += 1
+    elif segs <= thr:
+        tune_stats['seg_used'] += 1
+    else:
+        tune_stats['seg_skipped_threshold'] += 1
+        tune_stats['skipped_segs_max'] = max(int(tune_stats.get('skipped_segs_max', 0) or 0), segs)
+
+
+def _load_rows_cpu_int64(rows_file):
+    rows_t = _torch_load_checkpoint(rows_file, map_location='cpu', weights_only=True)
+    if not isinstance(rows_t, torch.Tensor):
+        rows_t = torch.as_tensor(rows_t, device='cpu')
+    rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device='cpu', copy=False)
+    if not bool(rows_t.is_contiguous()):
+        rows_t = rows_t.contiguous()
+    return rows_t
+
+
+def _load_preds_cpu_tensor(pred_file, *, dtype):
+    if pred_file.endswith('.mmt'):
+        preds_t = _open_pred_memmap(pred_file)
+        if preds_t is None:
+            raise FileNotFoundError(f'missing prediction memmap or meta: {pred_file!r}')
+    else:
+        preds_t = _torch_load_checkpoint(pred_file, map_location='cpu', weights_only=True)
+    if not isinstance(preds_t, torch.Tensor):
+        preds_t = torch.as_tensor(preds_t, device='cpu')
+    if preds_t.device.type != 'cpu':
+        preds_t = preds_t.to(device='cpu')
+    preds_t = preds_t.to(dtype=dtype, copy=False)
+    return preds_t
+
+
+def _scatter_rows_torch(dst, rows_t, preds_t, *, count, tune_stats=None):
+    # Write predictions into a tensor-like dst using the most efficient strategy.
+    if preds_t.shape[0] != rows_t.shape[0]:
+        raise ValueError(f'Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}')
+
+    is_contig, start, end = _is_contiguous_row_range(rows_t)
+    if is_contig:
+        if tune_stats is not None:
+            tune_stats['contig'] += 1
+        if start < 0 or end > int(count):
+            raise ValueError(f'Row indices out of bounds: [{start}, {end}) vs count={int(count)}')
+        dst[start:end].copy_(preds_t)
+        return
+
+    if tune_stats is not None:
+        tune_stats['noncontig'] += 1
+
+    did_segment_copy = False
+    n_rows = int(rows_t.numel())
+    need_segs = _PRED_ASSEMBLE_MAX_SEGMENTS > 0 or tune_stats is not None
+    if n_rows > 1 and need_segs:
+        d = rows_t[1:] - rows_t[:-1]
+        if bool(torch.all(d > 0)):
+            breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+            segs = int(breaks.numel()) + 1
+            _pred_assemble_tune_stats_update_segments(tune_stats, segs)
+            if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
+                seg_start = 0
+                for b in breaks.tolist():
+                    seg_end = int(b) + 1
+                    r0 = int(rows_t[seg_start].item())
+                    r1 = int(rows_t[seg_end - 1].item()) + 1
+                    if r0 < 0 or r1 > int(count):
+                        raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                    dst[r0:r1].copy_(preds_t[seg_start:seg_end])
+                    seg_start = seg_end
+                r0 = int(rows_t[seg_start].item())
+                r1 = int(rows_t[-1].item()) + 1
+                if r0 < 0 or r1 > int(count):
+                    raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                dst[r0:r1].copy_(preds_t[seg_start:])
+                did_segment_copy = True
+
+    if not did_segment_copy:
+        if rows_t.numel() > 0:
+            rmin = int(rows_t.min().item())
+            rmax = int(rows_t.max().item())
+            if rmin < 0 or rmax >= int(count):
+                raise ValueError(f'Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}')
+        dst.index_copy_(0, rows_t, preds_t)
+
+
+def _scatter_rows_h5(dset_Y, rows_t, preds_np, *, count, tune_stats=None):
+    # Same idea as _scatter_rows_torch, but for HDF5 datasets.
+    is_contig, start, end = _is_contiguous_row_range(rows_t)
+    if is_contig:
+        if tune_stats is not None:
+            tune_stats['contig'] += 1
+        if start < 0 or end > int(count):
+            raise ValueError(f'Row indices out of bounds: [{start}, {end}) vs count={int(count)}')
+        dset_Y[start:end] = preds_np
+        return
+
+    if tune_stats is not None:
+        tune_stats['noncontig'] += 1
+
+    did_segment_write = False
+    n_rows = int(rows_t.numel())
+    need_segs = _PRED_ASSEMBLE_MAX_SEGMENTS > 0 or tune_stats is not None
+    if n_rows > 1 and need_segs:
+        d = rows_t[1:] - rows_t[:-1]
+        if bool(torch.all(d > 0)):
+            breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+            segs = int(breaks.numel()) + 1
+            _pred_assemble_tune_stats_update_segments(tune_stats, segs)
+            if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
+                seg_start = 0
+                for b in breaks.tolist():
+                    seg_end = int(b) + 1
+                    r0 = int(rows_t[seg_start].item())
+                    r1 = int(rows_t[seg_end - 1].item()) + 1
+                    if r0 < 0 or r1 > int(count):
+                        raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                    dset_Y[r0:r1] = preds_np[seg_start:seg_end]
+                    seg_start = seg_end
+                r0 = int(rows_t[seg_start].item())
+                r1 = int(rows_t[-1].item()) + 1
+                if r0 < 0 or r1 > int(count):
+                    raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                dset_Y[r0:r1] = preds_np[seg_start:]
+                did_segment_write = True
+
+    if not did_segment_write:
+        rows_np = rows_t.detach().to(device='cpu', dtype=torch.int64).numpy()
+        if rows_np.size:
+            rmin = int(rows_np.min())
+            rmax = int(rows_np.max())
+            if rmin < 0 or rmax >= int(count):
+                raise ValueError(f'Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}')
+        dset_Y[rows_np] = preds_np
+
 def _assemble_predictions_to_memmap(chunks_dir, out_path, *, count, out_shape, store_float):
     if MemoryMappedTensor is None:
         raise ImportError("tensordict is required for MemoryMappedTensor-backed prediction assembly. Please install 'tensordict'.")
     out_shape_t = tuple((int(x) for x in out_shape))
     full_shape = torch.Size([int(count), *out_shape_t])
     Y_out = MemoryMappedTensor.empty(full_shape, dtype=store_float, filename=out_path, existsok=True)
+
     manifest_path = os.path.join(chunks_dir, 'manifest.json')
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
         raise ValueError(f'Invalid manifest: {manifest_path}')
-    variable_shape = bool(manifest.get('variable_shape', False))
-    if variable_shape:
-        raise NotImplementedError('Variable-shaped predictions cannot be assembled into a single dense MemoryMappedTensor. Please rerun with a fixed output shape, or set lazy=False and handle per-sample tensors.')
-    parts = list(manifest.get('parts', []))
-    tune_stats = None
-    if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
-        tune_stats = {'parts': 0, 'contig': 0, 'noncontig': 0, 'inc_noncontig': 0, 'seg_used': 0, 'seg_skipped_threshold': 0, 'seg_disabled': 0, 'segs_sum': 0.0, 'segs_min': 0, 'segs_max': 0, 'skipped_segs_max': 0}
+    if bool(manifest.get('variable_shape', False)):
+        raise NotImplementedError(
+            'Variable-shaped predictions cannot be assembled into a single dense MemoryMappedTensor. '
+            'Please rerun with a fixed output shape, or set lazy=False and handle per-sample tensors.'
+        )
+
+    parts = list(manifest.get('parts', []) or [])
+    tune_stats = _pred_assemble_tune_stats_init()
+
     for part in parts:
         if tune_stats is not None:
             tune_stats['parts'] += 1
         rows_file = os.path.join(chunks_dir, str(part['rows']))
         pred_file = os.path.join(chunks_dir, str(part['pred']))
-        rows_t = _torch_load_checkpoint(rows_file, map_location='cpu', weights_only=True)
-        if not isinstance(rows_t, torch.Tensor):
-            rows_t = torch.as_tensor(rows_t, device='cpu')
-        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device='cpu', copy=False)
-        if not bool(rows_t.is_contiguous()):
-            rows_t = rows_t.contiguous()
-        if pred_file.endswith('.mmt'):
-            preds_t = _open_pred_memmap(pred_file)
-        else:
-            preds_t = _torch_load_checkpoint(pred_file, map_location='cpu', weights_only=True)
-        if not isinstance(preds_t, torch.Tensor):
-            preds_t = torch.as_tensor(preds_t, device='cpu')
-        if preds_t.device.type != 'cpu':
-            preds_t = preds_t.to(device='cpu')
-        preds_t = preds_t.to(dtype=store_float, copy=False)
-        if preds_t.shape[0] != rows_t.shape[0]:
-            raise ValueError(f'Pred/rows mismatch in {pred_file}: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}')
-        is_contig, start, end = _is_contiguous_row_range(rows_t)
-        if is_contig:
-            if tune_stats is not None:
-                tune_stats['contig'] += 1
-            if start < 0 or end > int(count):
-                raise ValueError(f'Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}')
-            Y_out[start:end].copy_(preds_t)
-        else:
-            if tune_stats is not None:
-                tune_stats['noncontig'] += 1
-            did_segment_copy = False
-            n_rows = int(rows_t.numel())
-            need_segs = _PRED_ASSEMBLE_MAX_SEGMENTS > 0 or tune_stats is not None
-            if n_rows > 1 and need_segs:
-                d = rows_t[1:] - rows_t[:-1]
-                if bool(torch.all(d > 0)):
-                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
-                    segs = int(breaks.numel()) + 1
-                    if tune_stats is not None:
-                        tune_stats['inc_noncontig'] += 1
-                        tune_stats['segs_sum'] += float(segs)
-                        mn = int(tune_stats.get('segs_min', 0) or 0)
-                        mx = int(tune_stats.get('segs_max', 0) or 0)
-                        tune_stats['segs_min'] = segs if mn <= 0 else min(mn, segs)
-                        tune_stats['segs_max'] = max(mx, segs)
-                        thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
-                        if thr <= 0:
-                            tune_stats['seg_disabled'] += 1
-                        elif segs <= thr:
-                            tune_stats['seg_used'] += 1
-                        else:
-                            tune_stats['seg_skipped_threshold'] += 1
-                            tune_stats['skipped_segs_max'] = max(int(tune_stats.get('skipped_segs_max', 0) or 0), segs)
-                    if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
-                        seg_start = 0
-                        for b in breaks.tolist():
-                            seg_end = int(b) + 1
-                            r0 = int(rows_t[seg_start].item())
-                            r1 = int(rows_t[seg_end - 1].item()) + 1
-                            if r0 < 0 or r1 > int(count):
-                                raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                            Y_out[r0:r1].copy_(preds_t[seg_start:seg_end])
-                            seg_start = seg_end
-                        r0 = int(rows_t[seg_start].item())
-                        r1 = int(rows_t[-1].item()) + 1
-                        if r0 < 0 or r1 > int(count):
-                            raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                        Y_out[r0:r1].copy_(preds_t[seg_start:])
-                        did_segment_copy = True
-            if not did_segment_copy:
-                if rows_t.numel() > 0:
-                    rmin = int(rows_t.min().item())
-                    rmax = int(rows_t.max().item())
-                    if rmin < 0 or rmax >= int(count):
-                        raise ValueError(f'Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}')
-                Y_out.index_copy_(0, rows_t, preds_t)
+        rows_t = _load_rows_cpu_int64(rows_file)
+        preds_t = _load_preds_cpu_tensor(pred_file, dtype=store_float)
+        _scatter_rows_torch(Y_out, rows_t, preds_t, count=int(count), tune_stats=tune_stats)
+
     if tune_stats is not None:
         _maybe_log_pred_assemble_tuning(tune_stats, kind='memmap')
+
     pred_meta_path = BatchIO.mmt_meta_path(out_path)
-    BatchIO.atomic_write_json(pred_meta_path, {'dtype': str(store_float).replace('torch.', ''), 'shape': list(map(int, full_shape))}, indent=None)
+    BatchIO.atomic_write_json(
+        pred_meta_path,
+        {'dtype': str(store_float).replace('torch.', ''), 'shape': list(map(int, full_shape))},
+        indent=None,
+    )
     return Y_out
 
 def _assemble_predictions_to_tensor(chunks_dir, *, count, out_shape, dtype):
     out_shape_t = tuple((int(x) for x in out_shape))
     Y_out = torch.empty((int(count), *out_shape_t), dtype=dtype, device='cpu')
+
     manifest_path = os.path.join(chunks_dir, 'manifest.json')
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
         raise ValueError(f'Invalid manifest: {manifest_path}')
-    variable_shape = bool(manifest.get('variable_shape', False))
-    if variable_shape:
+    if bool(manifest.get('variable_shape', False)):
         raise NotImplementedError('Variable-shaped predictions cannot be returned as a single dense Tensor. Please rerun with a fixed output shape.')
-    parts = list(manifest.get('parts', []))
-    tune_stats = None
-    if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
-        tune_stats = {'parts': 0, 'contig': 0, 'noncontig': 0, 'inc_noncontig': 0, 'seg_used': 0, 'seg_skipped_threshold': 0, 'seg_disabled': 0, 'segs_sum': 0.0, 'segs_min': 0, 'segs_max': 0, 'skipped_segs_max': 0}
+
+    parts = list(manifest.get('parts', []) or [])
+    tune_stats = _pred_assemble_tune_stats_init()
+
     for part in parts:
         if tune_stats is not None:
             tune_stats['parts'] += 1
         rows_file = os.path.join(chunks_dir, str(part['rows']))
         pred_file = os.path.join(chunks_dir, str(part['pred']))
-        rows_t = _torch_load_checkpoint(rows_file, map_location='cpu', weights_only=True)
-        if not isinstance(rows_t, torch.Tensor):
-            rows_t = torch.as_tensor(rows_t, device='cpu')
-        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device='cpu', copy=False)
-        if not bool(rows_t.is_contiguous()):
-            rows_t = rows_t.contiguous()
-        if pred_file.endswith('.mmt'):
-            preds_t = _open_pred_memmap(pred_file)
-        else:
-            preds_t = _torch_load_checkpoint(pred_file, map_location='cpu', weights_only=True)
-        if not isinstance(preds_t, torch.Tensor):
-            preds_t = torch.as_tensor(preds_t, device='cpu')
-        if preds_t.device.type != 'cpu':
-            preds_t = preds_t.to(device='cpu')
-        preds_t = preds_t.to(dtype=dtype, copy=False)
-        if preds_t.shape[0] != rows_t.shape[0]:
-            raise ValueError(f'Pred/rows mismatch in {pred_file}: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}')
-        is_contig, start, end = _is_contiguous_row_range(rows_t)
-        if is_contig:
-            if tune_stats is not None:
-                tune_stats['contig'] += 1
-            if start < 0 or end > int(count):
-                raise ValueError(f'Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}')
-            Y_out[start:end].copy_(preds_t)
-        else:
-            if tune_stats is not None:
-                tune_stats['noncontig'] += 1
-            did_segment_copy = False
-            n_rows = int(rows_t.numel())
-            need_segs = _PRED_ASSEMBLE_MAX_SEGMENTS > 0 or tune_stats is not None
-            if n_rows > 1 and need_segs:
-                d = rows_t[1:] - rows_t[:-1]
-                if bool(torch.all(d > 0)):
-                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
-                    segs = int(breaks.numel()) + 1
-                    if tune_stats is not None:
-                        tune_stats['inc_noncontig'] += 1
-                        tune_stats['segs_sum'] += float(segs)
-                        mn = int(tune_stats.get('segs_min', 0) or 0)
-                        mx = int(tune_stats.get('segs_max', 0) or 0)
-                        tune_stats['segs_min'] = segs if mn <= 0 else min(mn, segs)
-                        tune_stats['segs_max'] = max(mx, segs)
-                        thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
-                        if thr <= 0:
-                            tune_stats['seg_disabled'] += 1
-                        elif segs <= thr:
-                            tune_stats['seg_used'] += 1
-                        else:
-                            tune_stats['seg_skipped_threshold'] += 1
-                            tune_stats['skipped_segs_max'] = max(int(tune_stats.get('skipped_segs_max', 0) or 0), segs)
-                    if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
-                        seg_start = 0
-                        for b in breaks.tolist():
-                            seg_end = int(b) + 1
-                            r0 = int(rows_t[seg_start].item())
-                            r1 = int(rows_t[seg_end - 1].item()) + 1
-                            if r0 < 0 or r1 > int(count):
-                                raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                            Y_out[r0:r1].copy_(preds_t[seg_start:seg_end])
-                            seg_start = seg_end
-                        r0 = int(rows_t[seg_start].item())
-                        r1 = int(rows_t[-1].item()) + 1
-                        if r0 < 0 or r1 > int(count):
-                            raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                        Y_out[r0:r1].copy_(preds_t[seg_start:])
-                        did_segment_copy = True
-            if not did_segment_copy:
-                if rows_t.numel() > 0:
-                    rmin = int(rows_t.min().item())
-                    rmax = int(rows_t.max().item())
-                    if rmin < 0 or rmax >= int(count):
-                        raise ValueError(f'Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}')
-                Y_out.index_copy_(0, rows_t, preds_t)
+        rows_t = _load_rows_cpu_int64(rows_file)
+        preds_t = _load_preds_cpu_tensor(pred_file, dtype=dtype)
+        _scatter_rows_torch(Y_out, rows_t, preds_t, count=int(count), tune_stats=tune_stats)
+
     if tune_stats is not None:
         _maybe_log_pred_assemble_tuning(tune_stats, kind='tensor')
     return Y_out
@@ -953,112 +1042,50 @@ def _write_predictions_h5_from_chunks(out_path, *, memmap_dir, chunks_dir, count
         raise ImportError("tensordict is required for PersistentTensorDict outputs. Please install 'tensordict'.")
     import h5py
     import numpy as np
+
     X_mmt = _open_features_mmt(memmap_dir)
     out_shape_t = tuple((int(x) for x in out_shape))
     os.makedirs(os.path.dirname(out_path) or os.getcwd(), exist_ok=True)
+
     np_float = _torch_dtype_to_numpy(store_float)
     cast_dtype = store_float
     if store_float == torch.bfloat16 and np_float == np.float32:
         cast_dtype = torch.float32
+
     with h5py.File(out_path, 'w') as f:
         dset_X = f.create_dataset('X', shape=tuple(X_mmt.shape), dtype=_torch_dtype_to_numpy(X_mmt.dtype))
         dset_Y = f.create_dataset('Y', shape=(int(count), *out_shape_t), dtype=np_float)
+
         chunk = int(chunk_size)
         for s in range(0, int(count), chunk):
             e = min(int(count), s + chunk)
             x_slice = X_mmt[s:e]
             dset_X[s:e] = x_slice.detach().to(device='cpu').numpy()
+
         manifest = read_json(os.path.join(chunks_dir, 'manifest.json'))
         if not isinstance(manifest, dict):
             raise ValueError(f'Invalid manifest under: {chunks_dir}')
         if bool(manifest.get('variable_shape', False)):
             raise NotImplementedError('Variable-shaped predictions cannot be stored as a dense HDF5 dataset. Please rerun with a fixed output shape.')
-        parts = list(manifest.get('parts', []))
-        tune_stats = None
-        if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
-            tune_stats = {'parts': 0, 'contig': 0, 'noncontig': 0, 'inc_noncontig': 0, 'seg_used': 0, 'seg_skipped_threshold': 0, 'seg_disabled': 0, 'segs_sum': 0.0, 'segs_min': 0, 'segs_max': 0, 'skipped_segs_max': 0}
+
+        parts = list(manifest.get('parts', []) or [])
+        tune_stats = _pred_assemble_tune_stats_init()
+
         for part in parts:
             if tune_stats is not None:
                 tune_stats['parts'] += 1
             rows_file = os.path.join(chunks_dir, str(part['rows']))
             pred_file = os.path.join(chunks_dir, str(part['pred']))
-            rows_t = _torch_load_checkpoint(rows_file, map_location='cpu', weights_only=True)
-            if not isinstance(rows_t, torch.Tensor):
-                rows_t = torch.as_tensor(rows_t, device='cpu')
-            rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device='cpu', copy=False)
-            if not bool(rows_t.is_contiguous()):
-                rows_t = rows_t.contiguous()
-            if pred_file.endswith('.mmt'):
-                preds_t = _open_pred_memmap(pred_file)
-            else:
-                preds_t = _torch_load_checkpoint(pred_file, map_location='cpu', weights_only=True)
-                if not isinstance(preds_t, torch.Tensor):
-                    preds_t = torch.as_tensor(preds_t, device='cpu')
-            if not isinstance(preds_t, torch.Tensor):
-                preds_t = torch.as_tensor(preds_t, device='cpu')
+            rows_t = _load_rows_cpu_int64(rows_file)
+            preds_t = _load_preds_cpu_tensor(pred_file, dtype=cast_dtype)
             preds_np = preds_t.detach().to(device='cpu', dtype=cast_dtype).numpy()
-            n_rows = int(rows_t.numel())
-            if preds_np.shape[0] != n_rows:
-                raise ValueError(f'Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={n_rows}')
-            is_contig, start, end = _is_contiguous_row_range(rows_t)
-            if is_contig:
-                if tune_stats is not None:
-                    tune_stats['contig'] += 1
-                if start < 0 or end > int(count):
-                    raise ValueError(f'Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}')
-                dset_Y[start:end] = preds_np
-                continue
-            if tune_stats is not None:
-                tune_stats['noncontig'] += 1
-            did_segment_write = False
-            if n_rows > 1:
-                need_segs = _PRED_ASSEMBLE_MAX_SEGMENTS > 0 or tune_stats is not None
-                if need_segs:
-                    d = rows_t[1:] - rows_t[:-1]
-                    if bool(torch.all(d > 0)):
-                        breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
-                        segs = int(breaks.numel()) + 1
-                        if tune_stats is not None:
-                            tune_stats['inc_noncontig'] += 1
-                            tune_stats['segs_sum'] += float(segs)
-                            mn = int(tune_stats.get('segs_min', 0) or 0)
-                            mx = int(tune_stats.get('segs_max', 0) or 0)
-                            tune_stats['segs_min'] = segs if mn <= 0 else min(mn, segs)
-                            tune_stats['segs_max'] = max(mx, segs)
-                            thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
-                            if thr <= 0:
-                                tune_stats['seg_disabled'] += 1
-                            elif segs <= thr:
-                                tune_stats['seg_used'] += 1
-                            else:
-                                tune_stats['seg_skipped_threshold'] += 1
-                                tune_stats['skipped_segs_max'] = max(int(tune_stats.get('skipped_segs_max', 0) or 0), segs)
-                        if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
-                            seg_start = 0
-                            for b in breaks.tolist():
-                                seg_end = int(b) + 1
-                                r0 = int(rows_t[seg_start].item())
-                                r1 = int(rows_t[seg_end - 1].item()) + 1
-                                if r0 < 0 or r1 > int(count):
-                                    raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                                dset_Y[r0:r1] = preds_np[seg_start:seg_end]
-                                seg_start = seg_end
-                            r0 = int(rows_t[seg_start].item())
-                            r1 = int(rows_t[-1].item()) + 1
-                            if r0 < 0 or r1 > int(count):
-                                raise ValueError(f'Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}')
-                            dset_Y[r0:r1] = preds_np[seg_start:]
-                            did_segment_write = True
-            if not did_segment_write:
-                rows_np = rows_t.detach().to(device='cpu', dtype=torch.int64).numpy()
-                if rows_np.size:
-                    rmin = int(rows_np.min())
-                    rmax = int(rows_np.max())
-                    if rmin < 0 or rmax >= int(count):
-                        raise ValueError(f'Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}')
-                dset_Y[rows_np] = preds_np
+            if preds_np.shape[0] != int(rows_t.numel()):
+                raise ValueError(f'Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={int(rows_t.numel())}')
+            _scatter_rows_h5(dset_Y, rows_t, preds_np, count=int(count), tune_stats=tune_stats)
+
         if tune_stats is not None:
             _maybe_log_pred_assemble_tuning(tune_stats, kind='h5')
+
     return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode='r')
 
 def _write_predictions_h5_from_memmaps(out_path, *, memmap_dir, pred_path, count=None, chunk_size=8192):
@@ -1136,6 +1163,37 @@ def _infer_master_float_dtype_for_predict_input(obj):
         pass
     return torch.float32
 
+
+class _TensorDictSliceGetter:
+    # Keep at module scope to remain picklable on spawn (Windows) and
+    # friendlier to free-threaded/no-GIL builds.
+
+    __slots__ = ("td",)
+
+    def __init__(self, td):
+        self.td = td
+
+    def __call__(self, s, e):
+        return self.td[s:e]
+
+
+class _MappingSliceGetter:
+    __slots__ = ("const_items", "slice_items")
+
+    def __init__(self, const_items, slice_items):
+        # Store builtin containers for easier pickling.
+        self.const_items = dict(const_items)
+        self.slice_items = tuple(slice_items)
+
+    def __call__(self, s, e):
+        batch = dict(self.const_items)
+        for k, v in self.slice_items:
+            try:
+                batch[k] = v[s:e]
+            except Exception:
+                batch[k] = v
+        return batch
+
 @catchtime(logger, fn_name='predict')
 def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes=None, rdzv_endpoint=None, rdzv_backend=None, persist_path=None, **kwargs):
     if model is None:
@@ -1182,9 +1240,8 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     X_td = X_td.view(-1, 1)
                 count = int(X_td.shape[0])
 
-                def _get_batch(s, e):
-                    return data[s:e]
-                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
+                get_batch = _TensorDictSliceGetter(data)
+                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
             elif isinstance(data, Mapping) and BatchIO.is_feature_label_batch_mapping(data):
                 f_key = resolve_feature_key(data)
                 if f_key is None:
@@ -1214,15 +1271,8 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                         const_items[k] = v
                 slice_items_t = tuple(slice_items)
 
-                def _get_batch(s, e):
-                    batch = dict(const_items)
-                    for k, v in slice_items_t:
-                        try:
-                            batch[k] = v[s:e]
-                        except Exception:
-                            batch[k] = v
-                    return batch
-                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
+                get_batch = _MappingSliceGetter(const_items, slice_items_t)
+                in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
             elif isinstance(data, Mapping) and data and all((not isinstance(v, Mapping) for v in data.values())) and (not BatchIO.is_feature_label_batch_mapping(data)):
                 count, _get_batch = BatchIO.key_index_mapping_getters(data)
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=memmap_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=0.0, seed_value=int(seed), underflow_action=underflow_action, shuffle=False, allow_missing_labels=True, features_only=True, chunk_size=writer_chunk_size)
