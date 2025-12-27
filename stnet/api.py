@@ -1326,7 +1326,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             resolved_rdzv = rdzv_endpoint or get_preferred_ip()
             resolved_rdzv = get_available_host(resolved_rdzv)
             master_addr, _ = initialize_master_addr(resolved_rdzv)
-            lc = LaunchConfig(min_nodes=1, max_nodes=max_nodes_i, nproc_per_node=nprocs, rdzv_backend=str(rdzv_backend or 'c10d'), rdzv_endpoint=resolved_rdzv, run_id=run_id, max_restarts=0, monitor_interval=5, start_method=optimal_start_method(), local_addr=master_addr)
+            lc = LaunchConfig(min_nodes=1, max_nodes=max_nodes_i, nproc_per_node=nprocs, rdzv_backend=str(rdzv_backend or 'c10d'), rdzv_endpoint=resolved_rdzv, run_id=run_id, max_restarts=0, monitor_interval=5, start_method=optimal_start_method(), local_addr=master_addr, redirects=Std.NONE, tee=Std.NONE)
             with contextlib.suppress(Exception):
                 model.to('cpu')
             _clear_device_caches()

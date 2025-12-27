@@ -34,7 +34,6 @@ from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
 from ..core.system import (
     Thread,
     Memory,
-    process_cpu_count,
     accel_is_available as _accel_is_available,
     accel_backend_for_device_type as _accel_backend_for_device_type,
     accel_current_stream as _accel_current_stream,
@@ -49,18 +48,6 @@ from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow
 _LOGGER = logging.getLogger(__name__)
 
 TensorLike = Any
-
-Dataset = None  # type: ignore
-
-
-def _ensure_dataset():
-    """Late import of Dataset to avoid circular imports when nodes.py is loaded."""
-    global Dataset
-    if Dataset is None:
-        from .pipeline import Dataset as _Dataset  # pylint: disable=import-error
-
-        Dataset = _Dataset
-
 
 def _rebuild_tuple_like(proto: tuple[Any, ...], items: tuple[Any, ...]) -> Any:
     # Namedtuple-safe tuple reconstruction.
@@ -1324,7 +1311,6 @@ class BatchIO:
         Pass 1: infer shapes and collect scale stats (for dtype negotiation).
         Pass 2: write contiguous memmaps (optionally shuffled).
         """
-        _ensure_dataset()
         out_dir = os.fspath(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1332,7 +1318,7 @@ class BatchIO:
         if count_i <= 0:
             raise ValueError("count must be > 0")
 
-        env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), chunk_size)
+        env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), None)
         if env_chunk is not None and int(env_chunk) > 0:
             chunk_size = int(env_chunk)
 
@@ -1778,7 +1764,6 @@ class BatchIO:
         default_label_shape: Optional[Tuple[int, ...]] = None,
     ) -> None:
         """Materialize an in-memory dataset into a memmap directory."""
-        _ensure_dataset()
         if not isinstance(data, Mapping):
             raise TypeError("preload_memmap expects a Mapping with at least 'features'")
         if "features" not in data:

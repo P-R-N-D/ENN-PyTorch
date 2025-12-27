@@ -2123,17 +2123,8 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                         loss_val = loss_val.to(device=device, dtype=param_dtype)
                                     accum_scale = max(1, grad_accum_steps)
                                     loss_for_backprop = loss_val / float(accum_scale)
-                                    backward_ok = True
-                                    try:
-                                        scaler.scale(loss_for_backprop).backward()
-                                    except RuntimeError as exc:
-                                        backward_ok = False
-                                        _LOGGER.warning(
-                                            "Backward failed; skipping optimizer step this batch. Details: %s",
-                                            exc,
-                                        )
-                                        optimizer.zero_grad(set_to_none=True)
-                                    if backward_ok and (loss_top_val is not None or loss_bottom_val is not None):
+                                    scaler.scale(loss_for_backprop).backward()
+                                    if loss_top_val is not None or loss_bottom_val is not None:
                                         lw_count += 1
                                         if isinstance(loss_top_val, torch.Tensor):
                                             v = loss_top_val.detach()
@@ -2142,15 +2133,14 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                             v = loss_bottom_val.detach()
                                             lw_bottom_sum = v if lw_bottom_sum is None else lw_bottom_sum + v
                                     if should_sync:
-                                        if backward_ok:
-                                            scaler.unscale_(optimizer)
-                                            scaler.step(optimizer)
-                                            scaler.update()
+                                        scaler.unscale_(optimizer)
+                                        scaler.step(optimizer)
+                                        scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
-                                        if backward_ok and scheduler_step_per_batch:
+                                        if scheduler_step_per_batch:
                                             with contextlib.suppress(Exception):
                                                 sched.step()
-                                        if backward_ok and lw_count > 0:
+                                        if lw_count > 0:
                                             top_avg_t = lw_top_sum / float(lw_count) if lw_top_sum is not None else None
                                             bottom_avg_t = lw_bottom_sum / float(lw_count) if lw_bottom_sum is not None else None
                                             if is_distributed():
