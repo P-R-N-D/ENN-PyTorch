@@ -218,7 +218,11 @@ def _sanitize_tensor(
     if bool(inplace):
         # In-place path avoids extra allocations, but relies on the caller to
         # ensure it's safe for autograd.
-        return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
+        try:
+            return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
+        except RuntimeError:
+            # Fallback for inference tensors that disallow in-place writes.
+            return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
     return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
 
 
