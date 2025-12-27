@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import importlib
-from typing import Any
 __all__ = ['core', 'data', 'nn', 'runtime', 'api', 'new_model', 'load_model', 'save_model', 'train', 'predict', 'get_prediction']
 
 def __getattr__(name):
