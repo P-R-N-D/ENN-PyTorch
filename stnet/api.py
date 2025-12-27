@@ -64,11 +64,17 @@ _PRED_ASSEMBLE_TUNE_LOGGED = False
 _PRED_ASSEMBLE_TUNE_LOG_LOCK = threading.Lock()
 
 def _maybe_log_pred_assemble_tuning(stats, *, kind):
+    """Log tuning hints when prediction chunks are highly noncontiguous.
+
+    This is primarily useful for selecting STNET_PRED_ASSEMBLE_MAX_SEGMENTS.
+    Uses a lock to remain safe on free-threaded/no-GIL builds.
+    """
     global _PRED_ASSEMBLE_TUNE_LOGGED
 
     if not bool(_PRED_ASSEMBLE_TUNE):
         return
 
+    # If we only log once per process, avoid racy "check then log" on no-GIL builds.
     if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE):
         with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
             if bool(_PRED_ASSEMBLE_TUNE_LOGGED):
@@ -128,6 +134,14 @@ def _maybe_log_pred_assemble_tuning(stats, *, kind):
         _PRED_ASSEMBLE_TUNE_LOGGED = True
 
 def _strip_legacy_wrapped_keys(sd):
+    """Strip legacy wrapper prefixes from state-dict keys.
+
+    Older multi-process training runs may save keys like:
+        m.<rank>.module.<...>
+
+    We remove that prefix and return a dict of the same type, but avoid allocating
+    a new mapping unless at least one key actually changes.
+    """
 
     def _rewrite(k: str) -> str:
         # Fast path: most keys are already clean.
