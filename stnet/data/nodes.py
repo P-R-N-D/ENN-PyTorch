@@ -1324,6 +1324,7 @@ class BatchIO:
         Pass 1: infer shapes and collect scale stats (for dtype negotiation).
         Pass 2: write contiguous memmaps (optionally shuffled).
         """
+        _ensure_dataset()
         out_dir = os.fspath(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
