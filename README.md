@@ -21,10 +21,10 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 
 ## Features
 - **Typed configuration** (`stnet.core.config`): dataclass-based configs with sensible defaults and validation/coercion.
-- **Run helpers** (`stnet.run.launch`): create models, save/load checkpoints, and provide train/predict entrypoints. Low-level exporters and native checkpoint writers live in `stnet.run.io`.
-- **Runtime utilities** (`stnet.run.elastic`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
+- **API** (`stnet.api`): create models, save/load checkpoints, and provide train/predict entrypoints. Low-level exporters and native checkpoint writers live in `stnet.runtime.io`.
+- **Runtime utilities** (`stnet.runtime.main`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
-- **Export** (`stnet.run.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
+- **Export** (`stnet.runtime.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
 - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
 - **Core utilities** (`stnet.core.losses`, `stnet.core.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
 - **NN library** (`stnet.nn`): attention variants and spatio‑temporal layers (e.g., `Model`, `Recorder`).
@@ -168,11 +168,11 @@ Notebook demo:
 ```
 stnet/
   __init__.py
-  run/
+  api.py
+  runtime/
     __init__.py
-    launch.py
-    elastic.py
     io.py
+    main.py
   core/
     __init__.py
     compat.py
