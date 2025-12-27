@@ -11,7 +11,6 @@ import math
 import multiprocessing
 import os
 import platform
-import shutil
 import sys
 import sysconfig
 import threading
@@ -2004,18 +2003,6 @@ def new_dir(prefix: str) -> str:
     directory = os.path.join(base, f"{prefix}_{os.getpid()}_{os.urandom(4).hex()}")
     os.makedirs(directory, exist_ok=True)
     return directory
-
-
-def remove_dir(path: str) -> None:
-    if not path:
-        return
-    try:
-        shutil.rmtree(path, ignore_errors=False)
-    except FileNotFoundError:
-        return
-    except Exception:
-        with contextlib.suppress(Exception):
-            shutil.rmtree(path, ignore_errors=True)
 
 
 def get_sdpa_backends() -> list[object]:
