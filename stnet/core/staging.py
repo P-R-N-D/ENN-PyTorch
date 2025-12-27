@@ -337,6 +337,7 @@ class Pool:
         # Token no longer matches a live entry; return the new event anyway.
         return ev_new
 
+
     def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
         if token is None:
             return

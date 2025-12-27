@@ -19,7 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
 from .casting import env_bool, env_int
-from .system import get_device, process_cpu_count
+from .system import accel_device_count, get_device, process_cpu_count
 
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
@@ -645,19 +645,11 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
         dev = torch.device("cpu")
 
     match getattr(dev, "type", "cpu"):
-        case "cuda":
+        case "cuda" | "xpu" | "mps":
             with contextlib.suppress(Exception):
-                count = int(torch.cuda.device_count())
+                count = int(accel_device_count(str(getattr(dev, "type", "cpu") or "cpu")))
                 if count > 0:
                     return count
-            return 1
-        case "xpu":
-            xpu = getattr(torch, "xpu", None)
-            if xpu is not None:
-                with contextlib.suppress(Exception):
-                    count = int(xpu.device_count())
-                    if count > 0:
-                        return count
             return 1
         case _:
             ncpu = process_cpu_count()

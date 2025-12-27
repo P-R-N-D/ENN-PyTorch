@@ -889,18 +889,15 @@ class Model(nn.Module):
 
         if config.device is not None:
             self._device = torch.device(config.device)
+            # Keep "current device" consistent for backends that use implicit device context.
+            if self._device.type in {"cuda", "xpu"} and self._device.index is not None:
+                with contextlib.suppress(Exception):
+                    from ..core.system import accel_set_device_index
+
+                    accel_set_device_index(self._device.type, int(self._device.index))
         else:
-            if torch.cuda.is_available():
-                device_name = "cuda"
-            elif (getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()):
-                device_name = "mps"
-            elif (getattr(torch, "is_vulkan_available", None) and torch.is_vulkan_available()):
-                device_name = "vulkan"
-            elif hasattr(torch, "xpu") and torch.xpu.is_available():
-                device_name = "xpu"
-            else:
-                device_name = "cpu"
-            self._device = torch.device(device_name)
+            # Centralize backend preference logic (CUDA > XPU > MPS > Vulkan > CPU).
+            self._device = get_device()
 
         self.scaler = Scaler().to(self._device)
 

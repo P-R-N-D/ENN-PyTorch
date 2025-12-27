@@ -64,7 +64,14 @@ from ..core.casting import env_first, env_first_float, env_first_int
 from ..core.system import (
     Memory,
     WorkerPolicy,
+    accel_device_context as _accel_device_context,
+    accel_is_available as _accel_is_available,
+    accel_make_event as _accel_make_event,
+    accel_pinned_h2d_supported_for_device_type as _accel_pinned_h2d_supported_for_device_type,
+    accel_synchronize as _accel_synchronize,
+    accel_timing_events_supported_for_device_type as _accel_timing_events_supported_for_device_type,
     cuda_compute_capability as _sys_cuda_compute_capability,
+    get_device as _sys_get_device,
     get_device_stats,
     get_tlb,
     is_cpu_bf16_supported as _sys_is_cpu_bf16_supported,
@@ -326,20 +333,11 @@ def _require_nodes() -> None:
 
 
 def _sync_device(device: torch.device) -> None:
-    dev_t = getattr(device, "type", "cpu")
-    try:
-        if dev_t == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(device=device)
-        elif dev_t == "xpu" and hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
-        elif (
-            dev_t == "mps"
-            and getattr(torch.backends, "mps", None)
-            and torch.backends.mps.is_available()
-        ):
-            torch.mps.synchronize()
-    except Exception:
-        pass
+    """Best-effort device synchronize.
+
+    Centralized in core.system to keep backend-specific edge cases in one place.
+    """
+    _accel_synchronize(device)
 
 
 _device_mem_get_info = Memory.device_mem_get_info
@@ -403,13 +401,16 @@ def _h2d_counter(
 
     times: list[float] = []
 
-    # Reuse CUDA events instead of creating them per-iteration.
-    use_cuda_events = bool(_device.type == "cuda" and torch.cuda.is_available())
+    # Reuse backend events instead of creating them per-iteration.
+    # CUDA/XPU typically support Event-based timing; MPS/CPU fall back to wall-clock.
+    dev_t = str(getattr(_device, "type", "cpu") or "cpu")
+    pin_ok = bool(_accel_pinned_h2d_supported_for_device_type(dev_t))
+    non_blocking = bool(pin_ok)
+
     ev0 = ev1 = None
-    if use_cuda_events:
-        with contextlib.suppress(Exception):
-            ev0 = torch.cuda.Event(enable_timing=True)
-            ev1 = torch.cuda.Event(enable_timing=True)
+    if _accel_timing_events_supported_for_device_type(dev_t):
+        ev0 = _accel_make_event(_device, enable_timing=True)
+        ev1 = _accel_make_event(_device, enable_timing=True)
 
     for s in range(_steps + _warmup):
         start = 0
@@ -421,13 +422,18 @@ def _h2d_counter(
             yb = _y_cpu[start : start + bs]
 
         # Pin only if needed and supported.
-        if _device.type in {"cuda", "xpu"}:
-            xbp = xb if (hasattr(xb, "is_pinned") and xb.is_pinned()) else xb.pin_memory()
-            ybp = (
-                yb
-                if (yb is None or (hasattr(yb, "is_pinned") and yb.is_pinned()))
-                else yb.pin_memory()
-            )
+        if pin_ok:
+            try:
+                xbp = xb if (hasattr(xb, "is_pinned") and bool(xb.is_pinned())) else xb.pin_memory()
+            except Exception:
+                xbp = xb
+            if yb is not None:
+                try:
+                    ybp = yb if (hasattr(yb, "is_pinned") and bool(yb.is_pinned())) else yb.pin_memory()
+                except Exception:
+                    ybp = yb
+            else:
+                ybp = None
         else:
             xbp = xb
             ybp = yb
@@ -435,22 +441,27 @@ def _h2d_counter(
         _sync_device(_device)
 
         if ev0 is not None and ev1 is not None:
-            # Measure with CUDA events (ms).
-            with torch.cuda.device(_device):
-                ev0.record()
-                _ = xbp.to(_device, non_blocking=True)
+            # Measure with backend events (ms).
+            with _accel_device_context(_device):
+                with contextlib.suppress(Exception):
+                    ev0.record()
+                _ = xbp.to(_device, non_blocking=bool(non_blocking))
                 if ybp is not None:
-                    _ = ybp.to(_device, non_blocking=True)
-                ev1.record()
-                _sync_device(_device)
+                    _ = ybp.to(_device, non_blocking=bool(non_blocking))
+                with contextlib.suppress(Exception):
+                    ev1.record()
+            _sync_device(_device)
+            try:
                 ms = float(ev0.elapsed_time(ev1))
+            except Exception:
+                ms = 0.0
         else:
             import time as _t
 
             tns0 = _t.perf_counter_ns()
-            _ = xbp.to(_device, non_blocking=True)
+            _ = xbp.to(_device, non_blocking=bool(non_blocking))
             if ybp is not None:
-                _ = ybp.to(_device, non_blocking=True)
+                _ = ybp.to(_device, non_blocking=bool(non_blocking))
             _sync_device(_device)
             tns1 = _t.perf_counter_ns()
             ms = (tns1 - tns0) / 1e6
@@ -1622,7 +1633,7 @@ class Dataset(Generic[TExtra]):
 
         if not self.float_dtypes:
             floats: list[torch.dtype] = [torch.float32]
-            if self.device_type == "cuda" and torch.cuda.is_available():
+            if self.device_type == "cuda" and _accel_is_available("cuda"):
                 floats.insert(0, torch.float16)
                 if self.is_cuda_bf16_supported(self.device):
                     floats.insert(0, torch.bfloat16)
@@ -2111,8 +2122,9 @@ class Dataset(Generic[TExtra]):
     def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
         if device is not None:
             return torch.device(device)
-        if torch.cuda.is_available():
-            return torch.device("cuda")
+        # Use the project's centralized device selection (CUDA/XPU/MPS/CPU).
+        with contextlib.suppress(Exception):
+            return _sys_get_device()
         return torch.device("cpu")
 
     @staticmethod
