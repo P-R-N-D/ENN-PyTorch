@@ -150,8 +150,12 @@ from ..core.profiler import FlopCounter
 from ..core.system import (
     Memory,
     accel_device_count as _accel_device_count,
+    accel_current_device_index as _accel_current_device_index,
     accel_is_available as _accel_is_available,
+    accel_max_memory_allocated as _accel_max_memory_allocated,
+    accel_memory_allocated as _accel_memory_allocated,
     accel_manual_seed_all as _accel_manual_seed_all,
+    accel_reset_peak_memory_stats as _accel_reset_peak_memory_stats,
     accel_set_device_index as _accel_set_device_index,
     device_mem_util_percent as _device_mem_util_percent,
     accel_backend_for_device_type as _accel_backend_for_device_type,
