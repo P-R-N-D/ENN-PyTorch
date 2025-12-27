@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
@@ -600,31 +601,34 @@ class CRPSLoss(nn.Module):
         candidates = (32 * _MIB, 64 * _MIB, 128 * _MIB)
 
         # Determine a conservative cap from device memory.
-        if device.type == "cuda":
-            idx = device.index if device.index is not None else torch.cuda.current_device()
-            total = 0
-            try:
-                total = int(torch.cuda.get_device_properties(idx).total_memory)
-            except Exception:
-                total = 0
+        if device.type in {"cuda", "xpu", "mps"}:
+            free: Optional[int] = None
+            total: Optional[int] = None
 
-            free = None
             if not self._is_compiling():
-                try:
-                    free_i, total_i = torch.cuda.mem_get_info(idx)  # type: ignore[arg-type]
-                    free = int(free_i)
-                    total = int(total_i)
-                except Exception:
-                    free = None
+                with contextlib.suppress(Exception):
+                    from .system import Memory
 
-            if free is None:
-                # Use total as a proxy when free-memory query is unavailable.
-                free = total
+                    free_i, total_i = Memory.device_mem_get_info(device)
+                    free = int(free_i) if free_i is not None else None
+                    total = int(total_i) if total_i is not None else None
 
-            # Use a small fraction of memory as a safe budget cap.
-            # (Budgets are tiny compared to typical VRAM; this is mainly to
-            #  choose 32 vs 64 on very constrained GPUs.)
-            cap = int(min(free * 0.06, total * 0.03)) if total > 0 else candidates[0]
+            # Total-only fallback when mem_get_info is unavailable.
+            if total is None or total <= 0:
+                with contextlib.suppress(Exception):
+                    from .system import accel_device_total_memory_bytes
+
+                    total = accel_device_total_memory_bytes(device)
+
+            if total is None or total <= 0:
+                cap = candidates[0]
+            else:
+                if free is None:
+                    # Use total as a proxy when free-memory query is unavailable.
+                    free = total
+                cap = int(min(int(free) * 0.06, int(total) * 0.03))
+                if cap <= 0:
+                    cap = candidates[0]
         else:
             # CPU/other backends: default to the largest candidate.
             cap = candidates[-1]
@@ -666,7 +670,8 @@ class CRPSLoss(nn.Module):
         dev = samples.device
         dev_idx = -1
         if dev.type == "cuda":
-            dev_idx = int(dev.index) if dev.index is not None else int(torch.cuda.current_device())
+            from .system import accel_current_device_index
+            dev_idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("cuda"))
 
         key = (dev.type, dev_idx, int(B), int(S), int(out_elem_size))
         if self._energy_cdist_cache_key == key and self._energy_cdist_cache_val is not None:

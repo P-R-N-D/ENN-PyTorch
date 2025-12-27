@@ -616,22 +616,11 @@ def _auto_microbatch(
     except Exception:
         host_free = None
 
-    if dev_t == "cuda" and torch.cuda.is_available():
-        try:
-            free, _ = torch.cuda.mem_get_info(device)
-            dev_free = int(free)
-        except Exception:
-            dev_free = None
-    elif dev_t == "xpu" and hasattr(torch, "xpu"):
-        try:
-            mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-            if callable(mem_get_info):
-                free, _ = mem_get_info(device)
+    if dev_t in {"cuda", "xpu", "mps"}:
+        with contextlib.suppress(Exception):
+            free, _ = _Mem.device_mem_get_info(device)
+            if free is not None:
                 dev_free = int(free)
-        except Exception:
-            dev_free = None
-    elif dev_t == "mps":
-        dev_free = None
 
     effective_free: Optional[int]
     if dev_t in {"cuda", "xpu", "mps"}:

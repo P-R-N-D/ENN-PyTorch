@@ -2022,7 +2022,8 @@ class _FlopProfiler:
         try:
             if getter is None:
                 raise RuntimeError("NVTX getter not set")
-            if not torch.cuda.is_available():
+            from .system import accel_is_available
+            if not accel_is_available("cuda"):
                 raise RuntimeError("CUDA not available")
             getattr(torch.cuda, "nvtx")
         except Exception:
@@ -2036,7 +2037,8 @@ class _FlopProfiler:
             def __enter__(self) -> "_NvtxScope":
                 try:
                     if self._dev is not None and getattr(self._dev, "type", "") == "cuda":
-                        torch.cuda.synchronize(self._dev)
+                        from .system import accel_synchronize
+                        accel_synchronize(self._dev)
                 except Exception:
                     pass
                 try:

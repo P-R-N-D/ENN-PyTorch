@@ -329,20 +329,11 @@ def _clear_device_caches():
     with contextlib.suppress(Exception):
         from .core.system import empty_device_cache, get_device
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
+    # CUDA IPC cache can still benefit from explicit collection in some workloads.
     with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            with contextlib.suppress(Exception):
-                torch.cuda.ipc_collect()
-    with contextlib.suppress(Exception):
-        xpu = getattr(torch, 'xpu', None)
-        if xpu is not None and callable(getattr(xpu, 'empty_cache', None)):
-            if not callable(getattr(xpu, 'is_available', None)) or bool(xpu.is_available()):
-                xpu.empty_cache()
-    with contextlib.suppress(Exception):
-        mps = getattr(torch, 'mps', None)
-        if mps is not None and callable(getattr(mps, 'empty_cache', None)):
-            mps.empty_cache()
+        from .core.system import accel_ipc_collect
+
+        accel_ipc_collect()
 
 def _ensure_seed(seed):
     if seed is None:
@@ -359,11 +350,10 @@ def _seed_everything(seed_value):
         torch.manual_seed(seed_value)
     except (TypeError, ValueError, RuntimeError):
         pass
-    if torch.cuda.is_available():
-        try:
-            torch.cuda.manual_seed_all(seed_value)
-        except (TypeError, ValueError, RuntimeError):
-            pass
+    with contextlib.suppress(Exception):
+        from .core.system import accel_manual_seed_all
+
+        accel_manual_seed_all(int(seed_value))
     try:
         random.seed(seed_value)
     except (TypeError, ValueError):

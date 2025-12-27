@@ -17,6 +17,7 @@ import threading
 import time
 from dataclasses import dataclass, replace
 from datetime import timezone, tzinfo
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from types import ModuleType, SimpleNamespace
@@ -1024,6 +1025,678 @@ def empty_device_cache(
                     empty_cache()
 
 
+# -----------------------------------------------------------------------------
+# Accelerator helpers (CUDA/XPU/MPS + torch.accelerator)
+# -----------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=8)
+def accel_backend_for_device_type(dev_type: str) -> Optional[ModuleType]:
+    """Return the torch backend module for the given device type.
+
+    This intentionally centralizes backend discovery so other modules don't
+    duplicate fragile `getattr(torch, "cuda")` / `getattr(torch, "xpu")` logic.
+    """
+
+    dt = str(dev_type or "cpu").strip().lower()
+    if dt in {"cuda", "xpu", "mps"}:
+        return getattr(torch, dt, None)
+    return None
+
+
+
+
+@lru_cache(maxsize=8)
+def accel_is_available(dev_type: str) -> bool:
+    """Return True if the given accelerator backend is available.
+
+    Notes:
+        - CUDA: `torch.cuda.is_available()`
+        - XPU: `torch.xpu.is_available()` (when present)
+        - MPS: `torch.backends.mps.is_available()` (preferred), else `torch.mps.is_available()` when present
+    """
+    dt = str(dev_type or "cpu").strip().lower()
+
+    if dt == "cuda":
+        with contextlib.suppress(Exception):
+            return bool(torch.cuda.is_available())
+        return False
+
+    if dt == "xpu":
+        xpu = getattr(torch, "xpu", None)
+        fn = getattr(xpu, "is_available", None) if xpu is not None else None
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                return bool(fn())
+        return False
+
+    if dt == "mps":
+        # Prefer the official availability API in torch.backends.
+        with contextlib.suppress(Exception):
+            mps_backend = getattr(torch.backends, "mps", None)
+            fn = getattr(mps_backend, "is_available", None) if mps_backend is not None else None
+            if callable(fn):
+                return bool(fn())
+
+        # Fallback (older/alternate builds).
+        mps_mod = getattr(torch, "mps", None)
+        fn2 = getattr(mps_mod, "is_available", None) if mps_mod is not None else None
+        if callable(fn2):
+            with contextlib.suppress(Exception):
+                return bool(fn2())
+        return False
+
+    return False
+
+
+@lru_cache(maxsize=8)
+def accel_device_count(dev_type: str) -> int:
+    """Return the number of devices for an accelerator backend (0 if unavailable)."""
+    dt = str(dev_type or "cpu").strip().lower()
+
+    if dt == "cuda":
+        if not accel_is_available("cuda"):
+            return 0
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.device_count())
+        return 0
+
+    if dt == "xpu":
+        if not accel_is_available("xpu"):
+            return 0
+        xpu = getattr(torch, "xpu", None)
+        dc = getattr(xpu, "device_count", None) if xpu is not None else None
+        if callable(dc):
+            with contextlib.suppress(Exception):
+                return max(0, int(dc()))
+        return 0
+
+    if dt == "mps":
+        return 1 if accel_is_available("mps") else 0
+
+    return 0
+
+
+def accel_current_device_index(dev_type: str) -> int:
+    """Return the current device index for CUDA/XPU (or 0 for MPS)."""
+    dt = str(dev_type or "cpu").strip().lower()
+
+    if dt == "cuda":
+        if not accel_is_available("cuda"):
+            return -1
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.current_device())
+        return 0
+
+    if dt == "xpu":
+        if not accel_is_available("xpu"):
+            return -1
+        xpu = getattr(torch, "xpu", None)
+        cur = getattr(xpu, "current_device", None) if xpu is not None else None
+        if callable(cur):
+            with contextlib.suppress(Exception):
+                return int(cur())
+        return 0
+
+    if dt == "mps":
+        return 0 if accel_is_available("mps") else -1
+
+    return -1
+
+
+def accel_set_device_index(dev_type: str, idx: int) -> None:
+    """Best-effort set current device for CUDA/XPU (no-op for others)."""
+    dt = str(dev_type or "cpu").strip().lower()
+    i = int(idx)
+
+    if dt == "cuda":
+        if not accel_is_available("cuda"):
+            return
+        with contextlib.suppress(Exception):
+            torch.cuda.set_device(i)
+        return
+
+    if dt == "xpu":
+        if not accel_is_available("xpu"):
+            return
+        xpu = getattr(torch, "xpu", None)
+        fn = getattr(xpu, "set_device", None) if xpu is not None else None
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(i)
+        return
+
+
+def accel_manual_seed_all(seed: int) -> None:
+    """Best-effort seed all devices for the active accelerators."""
+    s = int(seed)
+    # CUDA
+    if accel_is_available("cuda"):
+        with contextlib.suppress(Exception):
+            torch.cuda.manual_seed_all(s)
+    # XPU
+    if accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        fn = getattr(xpu, "manual_seed_all", None) if xpu is not None else None
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                fn(s)
+
+
+def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]:
+    """Return device memory utilization percentage for CUDA/XPU/MPS when possible."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    if dev.type not in {"cuda", "xpu", "mps"}:
+        return None
+
+    # Prefer the common free/total query (also works for MPS via recommended_max_memory).
+    try:
+        free_b, total_b = Memory.device_mem_get_info(dev)
+        if total_b is not None and int(total_b) > 0 and free_b is not None:
+            used_b = max(0, int(total_b) - int(free_b))
+            return 100.0 * float(used_b) / float(total_b)
+    except Exception:
+        pass
+
+    # Backend fallbacks.
+    if dev.type == "cuda" and accel_is_available("cuda"):
+        try:
+            idx = int(dev.index) if dev.index is not None else int(torch.cuda.current_device())
+            total = int(torch.cuda.get_device_properties(idx).total_memory)
+            used = int(torch.cuda.memory_allocated(dev))
+            return 100.0 * float(used) / float(total) if total > 0 else None
+        except Exception:
+            return None
+
+    if dev.type == "xpu" and accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        try:
+            idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("xpu"))
+            props = getattr(xpu, "get_device_properties", None) if xpu is not None else None
+            total = int(getattr(props(idx), "total_memory", 0)) if callable(props) else 0
+            used_fn = getattr(xpu, "memory_allocated", None) if xpu is not None else None
+            used = int(used_fn(dev)) if callable(used_fn) else 0
+            return 100.0 * float(used) / float(total) if total > 0 else None
+        except Exception:
+            return None
+
+    if dev.type == "mps" and accel_is_available("mps"):
+        mps = getattr(torch, "mps", None)
+        try:
+            total = int(getattr(mps, "recommended_max_memory", lambda: 0)())
+            used = int(getattr(mps, "current_allocated_memory", lambda: 0)())
+            return 100.0 * float(used) / float(total) if total > 0 else None
+        except Exception:
+            return None
+
+    return None
+
+
+def accel_device_total_memory_bytes(device: Union[torch.device, str]) -> Optional[int]:
+    """Return total device memory in bytes for CUDA/XPU/MPS when possible."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    if dev.type not in {"cuda", "xpu", "mps"}:
+        return None
+
+    # Preferred common free/total query (also works for MPS via recommended_max_memory).
+    with contextlib.suppress(Exception):
+        free_b, total_b = Memory.device_mem_get_info(dev)
+        if total_b is not None and int(total_b) > 0:
+            return int(total_b)
+
+    # Total-only backend fallbacks.
+    if dev.type == "cuda" and accel_is_available("cuda"):
+        with contextlib.suppress(Exception):
+            idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("cuda"))
+            total = int(torch.cuda.get_device_properties(idx).total_memory)
+            return int(total) if int(total) > 0 else None
+        return None
+
+    if dev.type == "xpu" and accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        props = getattr(xpu, "get_device_properties", None) if xpu is not None else None
+        with contextlib.suppress(Exception):
+            if callable(props):
+                idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("xpu"))
+                total = int(getattr(props(int(idx)), "total_memory", 0) or 0)
+                return int(total) if int(total) > 0 else None
+        return None
+
+    if dev.type == "mps" and accel_is_available("mps"):
+        mps = getattr(torch, "mps", None)
+        fn = getattr(mps, "recommended_max_memory", None) if mps is not None else None
+        with contextlib.suppress(Exception):
+            if callable(fn):
+                total = int(fn())
+                return int(total) if int(total) > 0 else None
+        return None
+
+    return None
+
+
+def accel_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
+    """Best-effort allocated memory in bytes for CUDA/XPU/MPS."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    if dt not in {"cuda", "xpu", "mps"}:
+        return None
+
+    # Prefer the (emerging) torch.accelerator common API when present.
+    with contextlib.suppress(Exception):
+        acc = getattr(torch, "accelerator", None)
+        mem_mod = getattr(acc, "memory", None) if acc is not None else None
+        alloc_fn = getattr(mem_mod, "allocated", None) if mem_mod is not None else None
+        if callable(alloc_fn):
+            try:
+                return int(alloc_fn(device=dev))
+            except TypeError:
+                return int(alloc_fn(dev))
+
+    if dt == "cuda" and accel_is_available("cuda"):
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.memory_allocated(dev))
+
+    if dt == "xpu" and accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        alloc_fn = getattr(xpu, "memory_allocated", None) if xpu is not None else None
+        if callable(alloc_fn):
+            with contextlib.suppress(Exception):
+                return int(alloc_fn(dev))
+
+    if dt == "mps" and accel_is_available("mps"):
+        mps = getattr(torch, "mps", None)
+        alloc_fn = getattr(mps, "current_allocated_memory", None) if mps is not None else None
+        if callable(alloc_fn):
+            with contextlib.suppress(Exception):
+                return int(alloc_fn())
+
+    return None
+
+
+def accel_reset_peak_memory_stats(device: Union[torch.device, str]) -> None:
+    """Best-effort reset of peak memory stats for CUDA/XPU/MPS."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    if dt not in {"cuda", "xpu", "mps"}:
+        return
+
+    # Prefer common API.
+    with contextlib.suppress(Exception):
+        acc = getattr(torch, "accelerator", None)
+        mem_mod = getattr(acc, "memory", None) if acc is not None else None
+        reset_fn = getattr(mem_mod, "reset_peak_memory_stats", None) if mem_mod is not None else None
+        if callable(reset_fn):
+            try:
+                reset_fn(device=dev)
+                return
+            except TypeError:
+                reset_fn(dev)
+                return
+
+    if dt == "cuda" and accel_is_available("cuda"):
+        with contextlib.suppress(Exception):
+            torch.cuda.reset_peak_memory_stats(dev)
+        return
+
+    if dt == "xpu" and accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        reset_fn = getattr(xpu, "reset_peak_memory_stats", None) if xpu is not None else None
+        if callable(reset_fn):
+            with contextlib.suppress(Exception):
+                reset_fn(dev)
+        return
+
+    if dt == "mps" and accel_is_available("mps"):
+        mps = getattr(torch, "mps", None)
+        reset_fn = getattr(mps, "reset_peak_memory_stats", None) if mps is not None else None
+        if callable(reset_fn):
+            with contextlib.suppress(Exception):
+                reset_fn()
+        return
+
+
+def accel_max_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
+    """Best-effort peak allocated memory in bytes for CUDA/XPU/MPS."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    if dt not in {"cuda", "xpu", "mps"}:
+        return None
+
+    # Prefer common API.
+    with contextlib.suppress(Exception):
+        acc = getattr(torch, "accelerator", None)
+        mem_mod = getattr(acc, "memory", None) if acc is not None else None
+        peak_fn = getattr(mem_mod, "max_memory_allocated", None) if mem_mod is not None else None
+        if callable(peak_fn):
+            try:
+                return int(peak_fn(device=dev))
+            except TypeError:
+                return int(peak_fn(dev))
+
+    if dt == "cuda" and accel_is_available("cuda"):
+        with contextlib.suppress(Exception):
+            return int(torch.cuda.max_memory_allocated(dev))
+
+    if dt == "xpu" and accel_is_available("xpu"):
+        xpu = getattr(torch, "xpu", None)
+        peak_fn = getattr(xpu, "max_memory_allocated", None) if xpu is not None else None
+        if callable(peak_fn):
+            with contextlib.suppress(Exception):
+                return int(peak_fn(dev))
+
+    if dt == "mps" and accel_is_available("mps"):
+        mps = getattr(torch, "mps", None)
+        peak_fn = getattr(mps, "max_memory_allocated", None) if mps is not None else None
+        if callable(peak_fn):
+            with contextlib.suppress(Exception):
+                return int(peak_fn())
+
+    return None
+
+
+def accel_ipc_collect() -> None:
+    """Best-effort CUDA IPC cache collection (no-op on non-CUDA builds)."""
+    if not accel_is_available("cuda"):
+        return
+    with contextlib.suppress(Exception):
+        fn = getattr(torch.cuda, "ipc_collect", None)
+        if callable(fn):
+            fn()
+
+
+def accel_device_context(device: torch.device) -> contextlib.AbstractContextManager[None]:
+    """Best-effort device context manager (e.g., torch.cuda.device)."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return contextlib.nullcontext()
+
+    backend = accel_backend_for_device_type(str(getattr(dev, "type", "cpu") or "cpu"))
+    ctx_fn = getattr(backend, "device", None) if backend is not None else None
+    if not callable(ctx_fn):
+        return contextlib.nullcontext()
+
+    # Prefer passing the actual torch.device when supported.
+    try:
+        return ctx_fn(dev)
+    except TypeError:
+        pass
+    except Exception:
+        return contextlib.nullcontext()
+
+    # Some backends accept an int index.
+    idx = getattr(dev, "index", None)
+    if idx is None:
+        return contextlib.nullcontext()
+    try:
+        return ctx_fn(int(idx))
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def accel_synchronize(device: Union[torch.device, str]) -> None:
+    """Best-effort device synchronize.
+
+    - Uses torch.accelerator.synchronize when present (preferred common API).
+    - Falls back to torch.<backend>.synchronize in a backend-agnostic way.
+
+    This is intentionally conservative: it avoids raising even when the backend
+    is missing or the synchronize signature differs.
+    """
+
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return
+
+    dev_type = str(getattr(dev, "type", "cpu") or "cpu")
+    if dev_type not in {"cuda", "xpu", "mps"}:
+        return
+
+    # Prefer the (emerging) torch.accelerator common API when available.
+    with contextlib.suppress(Exception):
+        acc = getattr(torch, "accelerator", None)
+        sync = getattr(acc, "synchronize", None) if acc is not None else None
+        if callable(sync):
+            try:
+                sync(device=dev)
+                return
+            except TypeError:
+                pass
+            try:
+                sync(dev)
+                return
+            except TypeError:
+                pass
+            with contextlib.suppress(Exception):
+                sync()
+                return
+
+    backend = accel_backend_for_device_type(dev_type)
+    sync = getattr(backend, "synchronize", None) if backend is not None else None
+    if not callable(sync):
+        return
+
+    # Prefer the cheapest signature per backend to avoid TypeError overhead.
+    if dev_type == "mps":
+        with contextlib.suppress(Exception):
+            sync()
+        return
+
+    if dev_type == "xpu":
+        # Common: torch.xpu.synchronize() with no args.
+        try:
+            sync()
+            return
+        except TypeError:
+            pass
+        except Exception:
+            return
+
+    # CUDA: try synchronize(device=...)
+    try:
+        sync(device=dev)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+    try:
+        sync(dev)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        return
+    with contextlib.suppress(Exception):
+        sync()
+
+
+@lru_cache(maxsize=8)
+def accel_timing_events_supported_for_device_type(dev_type: str) -> bool:
+    """Return True if backend timing events are supported for device type."""
+    dt = str(dev_type or "cpu").strip().lower()
+    backend = accel_backend_for_device_type(dt)
+    if backend is None:
+        return False
+    avail = getattr(backend, "is_available", None)
+    if callable(avail):
+        with contextlib.suppress(Exception):
+            if not bool(avail()):
+                return False
+    Event = getattr(backend, "Event", None)
+    if Event is None:
+        return False
+    try:
+        ev0 = Event(enable_timing=True)
+        ev1 = Event(enable_timing=True)
+    except TypeError:
+        # Some backends omit enable_timing.
+        try:
+            ev0 = Event()
+            ev1 = Event()
+        except Exception:
+            return False
+    except Exception:
+        return False
+
+    # We rely on record()/synchronize()/elapsed_time() in the hot path.
+    need = ("record", "synchronize", "elapsed_time")
+    for ev in (ev0, ev1):
+        for name in need:
+            if not callable(getattr(ev, name, None)):
+                return False
+    return True
+
+
+def accel_make_event(device: torch.device, *, enable_timing: bool = False) -> object | None:
+    """Create a backend event (CUDA/XPU) when available."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    backend = accel_backend_for_device_type(dt)
+    Event = getattr(backend, "Event", None) if backend is not None else None
+    if Event is None:
+        return None
+
+    if enable_timing:
+        with contextlib.suppress(Exception):
+            return Event(enable_timing=True)
+    # default / no-timing
+    with contextlib.suppress(Exception):
+        return Event(enable_timing=False)
+    with contextlib.suppress(Exception):
+        return Event()
+    return None
+
+
+@lru_cache(maxsize=8)
+def accel_streaming_supported_for_device_type(dev_type: str) -> bool:
+    """Return True if Stream/Event/stream() APIs are available for device type."""
+    dt = str(dev_type or "cpu").strip().lower()
+    if dt not in {"cuda", "xpu"}:
+        return False
+    backend = accel_backend_for_device_type(dt)
+    if backend is None:
+        return False
+
+    # Avoid claiming support on CPU-only builds where torch.cuda exists but is unavailable.
+    avail = getattr(backend, "is_available", None)
+    if callable(avail):
+        with contextlib.suppress(Exception):
+            if not bool(avail()):
+                return False
+
+    Stream = getattr(backend, "Stream", None)
+    Event = getattr(backend, "Event", None)
+    stream_cm = getattr(backend, "stream", None)
+    cur = getattr(backend, "current_stream", None)
+    return bool(callable(Stream) and (Event is not None) and callable(stream_cm) and callable(cur))
+
+
+@lru_cache(maxsize=8)
+def accel_pinned_h2d_supported_for_device_type(dev_type: str) -> bool:
+    """Return True when pinned + non_blocking transfers can be overlapped safely."""
+    dt = str(dev_type or "cpu").strip().lower()
+    if dt not in {"cuda", "xpu"}:
+        return False
+    backend = accel_backend_for_device_type(dt)
+    if backend is None:
+        return False
+    avail = getattr(backend, "is_available", None)
+    if callable(avail):
+        with contextlib.suppress(Exception):
+            if not bool(avail()):
+                return False
+    if not callable(getattr(backend, "current_stream", None)):
+        return False
+    if getattr(backend, "Event", None) is None:
+        return False
+    return True
+
+
+def accel_stream_context(stream: object, dev_type: str) -> contextlib.AbstractContextManager[None]:
+    """Return a backend stream context manager when available."""
+    backend = accel_backend_for_device_type(str(dev_type or "cpu"))
+    fn = getattr(backend, "stream", None) if backend is not None else None
+    if not callable(fn):
+        return contextlib.nullcontext()
+    try:
+        return fn(stream)
+    except Exception:
+        return contextlib.nullcontext()
+
+
+def accel_new_stream(device: torch.device) -> object | None:
+    """Create a backend stream for CUDA/XPU when supported."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    backend = accel_backend_for_device_type(dt)
+    Stream = getattr(backend, "Stream", None) if backend is not None else None
+    if not callable(Stream):
+        return None
+
+    with contextlib.suppress(Exception):
+        return Stream(device=dev)
+    idx = getattr(dev, "index", None)
+    if idx is not None:
+        with contextlib.suppress(Exception):
+            return Stream(int(idx))
+    with contextlib.suppress(Exception):
+        return Stream()
+    return None
+
+
+def accel_current_stream(device: torch.device) -> object | None:
+    """Return the backend current stream for the device (CUDA/XPU)."""
+    try:
+        dev = device if isinstance(device, torch.device) else torch.device(str(device))
+    except Exception:
+        return None
+
+    dt = str(getattr(dev, "type", "cpu") or "cpu")
+    backend = accel_backend_for_device_type(dt)
+    fn = getattr(backend, "current_stream", None) if backend is not None else None
+    if not callable(fn):
+        return None
+
+    # CUDA commonly accepts device=device.
+    with contextlib.suppress(TypeError):
+        return fn(device=dev)
+    with contextlib.suppress(TypeError):
+        return fn(dev)
+    with contextlib.suppress(Exception):
+        return fn()
+    return None
+
+
 def set_float32_precision(
     device: torch.device,
     dtype: Optional[torch.dtype] = None,
@@ -1617,15 +2290,14 @@ def get_device(
         if hasattr(torch, "set_float32_matmul_precision"):
             torch.set_float32_matmul_precision(matmul_prec)
 
-    if torch.cuda.is_available():
+    if accel_is_available("cuda"):
         idx = 0
         with contextlib.suppress(Exception):
             idx_env = env_first_int(("LOCAL_RANK",), default=0)
-            ndev = max(1, int(torch.cuda.device_count()))
+            ndev = max(1, int(accel_device_count("cuda") or 1))
             idx = int(idx_env) % int(ndev)
 
-        with contextlib.suppress(Exception):
-            torch.cuda.set_device(int(idx))
+        accel_set_device_index("cuda", int(idx))
         device = torch.device(f"cuda:{idx}")
 
         # Configure CuDNN determinism/benchmark.
@@ -1642,7 +2314,16 @@ def get_device(
             if hasattr(torch.backends.cudnn, "allow_tf32"):
                 torch.backends.cudnn.allow_tf32 = bool(allow_tf32_val)
 
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    elif accel_is_available("xpu"):
+        idx = 0
+        with contextlib.suppress(Exception):
+            idx_env = env_first_int(("LOCAL_RANK",), default=0)
+            ndev = max(1, int(accel_device_count("xpu") or 1))
+            idx = int(idx_env) % int(ndev)
+        accel_set_device_index("xpu", int(idx))
+        device = torch.device(f"xpu:{idx}")
+
+    elif accel_is_available("mps"):
         device = torch.device("mps")
     elif hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
         device = torch.device("vulkan")

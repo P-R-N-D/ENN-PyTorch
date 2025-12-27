@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .casting import env_first, env_first_int
-from .system import process_cpu_count
+from .system import process_cpu_count, accel_is_available
 
 try:
     from torch import compiler as _TORCH_COMPILER  # type: ignore
@@ -232,7 +232,7 @@ def _is_for_cuda(module: nn.Module) -> bool:
     except Exception:
         pass
     # Fall back to runtime capability.
-    return bool(torch.cuda.is_available())
+    return bool(accel_is_available("cuda"))
 
 
 def compile(

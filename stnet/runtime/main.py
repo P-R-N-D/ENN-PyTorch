@@ -149,13 +149,14 @@ from ..core.distributed import distributed_barrier, distributed_sync, get_world_
 from ..core.profiler import FlopCounter
 from ..core.system import (
     Memory,
-    accel_device_count as _accel_device_count,
     accel_current_device_index as _accel_current_device_index,
-    accel_is_available as _accel_is_available,
-    accel_max_memory_allocated as _accel_max_memory_allocated,
     accel_memory_allocated as _accel_memory_allocated,
-    accel_manual_seed_all as _accel_manual_seed_all,
+    accel_max_memory_allocated as _accel_max_memory_allocated,
     accel_reset_peak_memory_stats as _accel_reset_peak_memory_stats,
+    is_cuda_bf16_supported as _is_cuda_bf16_supported,
+    accel_device_count as _accel_device_count,
+    accel_is_available as _accel_is_available,
+    accel_manual_seed_all as _accel_manual_seed_all,
     accel_set_device_index as _accel_set_device_index,
     device_mem_util_percent as _device_mem_util_percent,
     accel_backend_for_device_type as _accel_backend_for_device_type,
@@ -221,6 +222,7 @@ def _wallclock_timer_sync_enabled_for_device_type(dev_type: str) -> bool:
     if dt == "cuda":
         return bool(_rt_env_flag("STNET_CUDA_TIMER_SYNC", False))
     return False
+
 
 def _timing_events_supported(device: torch.device) -> bool:
     try:
@@ -1285,7 +1287,7 @@ def _stage_tensor_with_cpu_pool(
 
     Notes:
       - When dtype differs, the dtype conversion is performed during the copy_ into
-      - the staging buffer (no intermediate cast allocation).
+        the staging buffer (no intermediate cast allocation).
       - When the pool overflows, the Pool falls back to an unpinned one-off tensor
         with token None.
     """
@@ -1331,6 +1333,7 @@ def _stage_tensor_with_cpu_pool(
         if callable(is_pinned):
             pinned = bool(is_pinned())
     return out, None, pinned
+
 
 def _to_device_with_stream_and_pool(
     tensor,
@@ -1424,6 +1427,7 @@ def _to_device_with_stream_and_pool(
         if cpu_pool is not None:
             try:
                 evt = None
+                # Prefer per-page reusable events when available.
                 fe = getattr(cpu_pool, 'fence_event', None)
                 if callable(fe) and fence_event_factory is not None:
                     with contextlib.suppress(Exception):
@@ -1446,6 +1450,7 @@ def _to_device_with_stream_and_pool(
                         evt.record()
                     cpu_pool.release_after(handle, evt)
                 else:
+                    # No usable event -> synchronize and release synchronously.
                     with contextlib.suppress(Exception):
                         _accel_synchronize(device)
                     with contextlib.suppress(Exception):
@@ -1855,11 +1860,11 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
             ram_gb = 0
         py_ver = platform.python_version()
         backend_list = []
-        if torch.cuda.is_available():
+        if _accel_is_available('cuda'):
             backend_list.append('cuda')
-        if hasattr(torch, 'xpu') and torch.xpu.is_available():
+        if _accel_is_available('xpu'):
             backend_list.append('xpu')
-        if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available():
+        if _accel_is_available('mps'):
             backend_list.append('mps')
         backend_list.append('cpu')
         hist.set_system_info(os_name=os_full, kernel=kernel, cpu_list=cpu_list, arch_list=arch_list, ram_gb=ram_gb, python_version=py_ver, backends=backend_list)
@@ -1973,7 +1978,7 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
     stream_fn = getattr(backend, 'current_stream', None) if backend is not None else None
     Event = getattr(backend, 'Event', None) if backend is not None else None
     can_stream_release = bool(pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None))
-    make_fence_event = partial(_accel_make_event, device, enable_timing=False)
+
     make_fence_event = partial(_accel_make_event, device, enable_timing=False)
 
     use_timer = _timing_events_supported(device)
@@ -2099,11 +2104,11 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                         mark_step = getattr(getattr(torch, 'compiler', None), 'cudagraph_mark_step_begin', None)
                                         if callable(mark_step):
                                             mark_step()
-                                        with Autocast.float(device):
-                                            Y_flat = Y.reshape(Y.shape[0], -1)
-                                            if Y_flat.device != device or Y_flat.dtype != param_dtype:
-                                                Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=non_blocking_ok)
-                                            y_hat, loss_val, loss_top_val, loss_bottom_val = model(X, labels_flat=Y_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_controller.weights(), calibrate_output=False, return_loss_components=True)
+                                    with Autocast.float(device):
+                                        Y_flat = Y.reshape(Y.shape[0], -1)
+                                        if Y_flat.device != device or Y_flat.dtype != param_dtype:
+                                            Y_flat = Y_flat.to(device, dtype=param_dtype, non_blocking=non_blocking_ok)
+                                        y_hat, loss_val, loss_top_val, loss_bottom_val = model(X, labels_flat=Y_flat, global_loss=top_loss, local_loss=bottom_loss, loss_weights=loss_controller.weights(), calibrate_output=False, return_loss_components=True)
                                     if isinstance(loss_val, torch.Tensor) and loss_val.ndim > 0:
                                         loss_val = loss_val.mean()
                                     if isinstance(loss_top_val, torch.Tensor) and loss_top_val.ndim > 0:
@@ -2277,7 +2282,6 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                     continue
                                 if decision == 'skip':
                                     break
-                                raise
                             raise
             if lw_count > 0:
                 top_avg_t = lw_top_sum / float(lw_count) if lw_top_sum is not None else None
@@ -2390,7 +2394,6 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                             continue
                                         if decision == 'skip':
                                             break
-                                        raise
                                     raise
             if is_distributed():
                 stats = torch.tensor([comp_time, io_time, flops, io_bytes, train_samples_epoch], device=device, dtype=torch.float64)
@@ -2642,6 +2645,8 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     Event = getattr(backend, 'Event', None) if backend is not None else None
     can_stream_release = bool(pinned_ok and non_blocking_ok and callable(stream_fn) and (Event is not None))
 
+    make_fence_event = partial(_accel_make_event, device, enable_timing=False)
+
     cpu_pool = None
     if pinned_ok and Pool is not None:
         with contextlib.suppress(Exception):
@@ -2737,6 +2742,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                             wait_evt.record()
                 except Exception:
                     wait_evt = None
+
             release_cb = None
             if local_handle is not None and pred_pool is not None:
                 release_cb = partial(pred_pool.release, local_handle)
@@ -2988,8 +2994,8 @@ def process(*args, **kwargs):
         _np.random.seed(seed_value)
     with contextlib.suppress(Exception):
         torch.manual_seed(seed_value)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed_value)
+    with contextlib.suppress(Exception):
+        _accel_manual_seed_all(seed_value)
     with contextlib.suppress(Exception):
         torch.use_deterministic_algorithms(det, warn_only=False)
     with contextlib.suppress(Exception):
@@ -3278,7 +3284,7 @@ def process(*args, **kwargs):
                 load(state_dict={'model': m_sd}, storage_reader=FileSystemReader(ops.model_ckpt_dir))
                 resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
-        model.to(device, non_blocking=non_blocking_ok).eval()
+        model.to(device, non_blocking=device.type in ('cuda', 'xpu')).eval()
         metadata = Dataset.for_device(device)
         model, _, _ = ModelPolicy.use_nvidia_layers(model, device=device)
         _m_eval = model.module if hasattr(model, 'module') else model
@@ -3287,7 +3293,7 @@ def process(*args, **kwargs):
         _assert_no_meta_tensors(_m_eval)
         _assert_no_fake_dtensor(_m_eval)
         _enable_meta_monitor(_m_eval)
-        _unify_param_dtype(model, prefer=torch.bfloat16 if getattr(device, 'type', None) == 'cuda' and torch.cuda.is_bf16_supported() else None)
+        _unify_param_dtype(model, prefer=torch.bfloat16 if getattr(device, 'type', None) == 'cuda' and _is_cuda_bf16_supported(device) else None)
         Autocast.configure(model, metadata=metadata)
         fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
         if fp8_infer_ok:

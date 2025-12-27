@@ -2182,8 +2182,10 @@ class Recorder(nn.Module):
 
         backend_devices: List[str] = []
         try:
-            if torch.cuda.is_available():
-                num_cuda = torch.cuda.device_count()
+            from ..core.system import accel_device_count, accel_is_available
+
+            if accel_is_available("cuda"):
+                num_cuda = int(accel_device_count("cuda") or 0)
                 for idx in range(num_cuda):
                     try:
                         name = torch.cuda.get_device_name(idx)
@@ -2191,12 +2193,18 @@ class Recorder(nn.Module):
                         name = "CUDA Device"
                     backend_devices.append(f"cuda:{idx}, {name}")
 
-            mps = getattr(torch.backends, "mps", None)
-            if (
-                mps is not None
-                and getattr(mps, "is_available", None)
-                and torch.backends.mps.is_available()
-            ):
+            if accel_is_available("xpu"):
+                num_xpu = int(accel_device_count("xpu") or 0)
+                xpu_mod = getattr(torch, "xpu", None)
+                get_name = getattr(xpu_mod, "get_device_name", None) if xpu_mod is not None else None
+                for idx in range(num_xpu):
+                    name = "XPU Device"
+                    if callable(get_name):
+                        with contextlib.suppress(Exception):
+                            name = str(get_name(idx) or name)
+                    backend_devices.append(f"xpu:{idx}, {name}")
+
+            if accel_is_available("mps"):
                 chip_name = platform.processor() or "Apple Silicon"
                 backend_devices.append(f"mps:0, {chip_name}")
 

@@ -31,7 +31,17 @@ import numpy as np
 from ..core.compat import ensure_torchdata
 from ..core.casting import dtype_from_name, env_bool, env_first_int
 from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
-from ..core.system import Thread, Memory
+from ..core.system import (
+    Thread,
+    Memory,
+    accel_is_available as _accel_is_available,
+    accel_backend_for_device_type as _accel_backend_for_device_type,
+    accel_current_stream as _accel_current_stream,
+    accel_make_event as _accel_make_event,
+    accel_new_stream as _accel_new_stream,
+    accel_stream_context as _accel_stream_context,
+    accel_streaming_supported_for_device_type as _accel_streaming_supported_for_device_type,
+)
 from . import schemas as _schemas
 from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
 
@@ -117,44 +127,22 @@ except Exception:  # pragma: no cover
 
 
 def _is_accelerator_available() -> bool:
-    """Best-effort check for an available accelerator backend."""
-    try:
-        if torch.cuda.is_available():
-            return True
-    except Exception:
-        pass
-
-    # Intel XPU (optional)
-    try:
-        xpu = getattr(torch, "xpu", None)
-        if xpu is not None:
-            fn = getattr(xpu, "is_available", None)
-            if callable(fn) and fn():
-                return True
-    except Exception:
-        pass
-
-    # Apple MPS (optional)
-    try:
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None:
-            fn = getattr(mps, "is_available", None)
-            if callable(fn) and fn():
-                return True
-    except Exception:
-        pass
-
-    return False
+    """Best-effort check for an available accelerator backend (CUDA/XPU/MPS)."""
+    return bool(
+        _accel_is_available("cuda")
+        or _accel_is_available("xpu")
+        or _accel_is_available("mps")
+    )
 
 
-def _gpu_guard_ok(use_cuda_stream: bool, device: torch.device, guard_bytes: int) -> bool:
-    """Return True if CUDA free-memory guard is satisfied (or guard disabled)."""
-    if (not use_cuda_stream) or int(guard_bytes) <= 0:
+def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
+    """Return True if device free-memory guard is satisfied (or guard disabled)."""
+    if int(guard_bytes) <= 0:
         return True
     try:
-        free_b, _total_b = torch.cuda.mem_get_info(
-            device=device if isinstance(device, torch.device) else None
-        )
+        free_b, _total_b = Memory.device_mem_get_info(device)
+        if free_b is None:
+            return True
         return bool(int(free_b) >= int(guard_bytes))
     except Exception:
         # best-effort: do not block training
@@ -172,18 +160,18 @@ def _host_guard_ok(guard_bytes: int) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _cuda_event_poll_params() -> tuple[float, float, float]:
-    """Return (base_sleep_s, max_sleep_s, stop_min_sleep_s) for CUDA event polling.
+def _accel_event_poll_params() -> tuple[float, float, float]:
+    """Return (base_sleep_s, max_sleep_s, stop_min_sleep_s) for accelerator event polling.
 
-    These can be tuned via environment variables:
-      - STNET_CUDA_EVENT_POLL_START_US (default: 500)
-      - STNET_CUDA_EVENT_POLL_MAX_MS (default: 50)
-      - STNET_CUDA_EVENT_POLL_STOP_MIN_MS (default: 5)
+    These can be tuned via environment variables (generic first, legacy fallback):
+      - STNET_ACCEL_EVENT_POLL_START_US (default: 500; legacy: STNET_CUDA_EVENT_POLL_START_US)
+      - STNET_ACCEL_EVENT_POLL_MAX_MS (default: 50; legacy: STNET_CUDA_EVENT_POLL_MAX_MS)
+      - STNET_ACCEL_EVENT_POLL_STOP_MIN_MS (default: 5; legacy: STNET_CUDA_EVENT_POLL_STOP_MIN_MS)
     """
 
-    start_us = int(env_first_int(("STNET_CUDA_EVENT_POLL_START_US",), default=500) or 500)
-    max_ms = int(env_first_int(("STNET_CUDA_EVENT_POLL_MAX_MS",), default=50) or 50)
-    stop_min_ms = int(env_first_int(("STNET_CUDA_EVENT_POLL_STOP_MIN_MS",), default=5) or 5)
+    start_us = int(env_first_int(("STNET_ACCEL_EVENT_POLL_START_US", "STNET_CUDA_EVENT_POLL_START_US"), default=500) or 500)
+    max_ms = int(env_first_int(("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"), default=50) or 50)
+    stop_min_ms = int(env_first_int(("STNET_ACCEL_EVENT_POLL_STOP_MIN_MS", "STNET_CUDA_EVENT_POLL_STOP_MIN_MS"), default=5) or 5)
 
     base_s = max(0.0, float(start_us) / 1_000_000.0)
     max_s = max(base_s, float(max_ms) / 1000.0)
@@ -191,7 +179,7 @@ def _cuda_event_poll_params() -> tuple[float, float, float]:
     return base_s, max_s, stop_min_s
 
 
-def _wait_cuda_event_done(
+def _wait_accel_event_done(
     ev: Any,
     *,
     stopped: Callable[[], bool] | None = None,
@@ -199,7 +187,7 @@ def _wait_cuda_event_done(
     max_sleep_s: float | None = None,
     stop_min_sleep_s: float | None = None,
 ) -> None:
-    """Wait for a CUDA event to complete using query()+backoff.
+    """Wait for an accelerator event to complete using query()+backoff.
 
     This avoids a hard blocking synchronize() call in the hot path, while still
     guaranteeing the event is complete before reuse.
@@ -211,7 +199,7 @@ def _wait_cuda_event_done(
     stop_fn = stopped if stopped is not None else (lambda: False)
 
     if base_sleep_s is None or max_sleep_s is None or stop_min_sleep_s is None:
-        d_base, d_max, d_stop_min = _cuda_event_poll_params()
+        d_base, d_max, d_stop_min = _accel_event_poll_params()
         if base_sleep_s is None:
             base_sleep_s = d_base
         if max_sleep_s is None:
@@ -2458,13 +2446,12 @@ class Loader:
 
     def _local_device_index(self) -> int:
         try:
-            if getattr(torch, "cuda", None) is not None and torch.cuda.is_available():
-                return int(torch.cuda.current_device())
-            xpu = getattr(torch, "xpu", None)
-            if xpu is not None:
-                fn = getattr(xpu, "is_available", None)
-                if callable(fn) and fn():
-                    return int(xpu.current_device())
+            from ..core.system import accel_current_device_index, accel_is_available
+
+            if accel_is_available("cuda"):
+                return int(accel_current_device_index("cuda"))
+            if accel_is_available("xpu"):
+                return int(accel_current_device_index("xpu"))
         except Exception:
             pass
         return 0
@@ -2538,8 +2525,6 @@ class BatchQueue(Buffer):
                 self.put(sentinel)
 
     def _iter_session(self) -> Iterator[Any]:
-        import traceback
-
         src_iter = iter(self._src)
         sentinel = object()
 
@@ -2583,8 +2568,8 @@ class Prefetcher(Buffer):
     """Prefetch batches onto the target device with bounded buffering.
 
     - ``depth`` bounds the number of in-flight batches.
-    - On CUDA with ``non_blocking=True``, a dedicated stream + CUDA events are used
-      to overlap H2D copies while safely releasing pinned staging buffers.
+    - On CUDA/XPU with ``non_blocking=True``, a dedicated stream + backend events are
+      used to overlap H2D copies while safely releasing pinned staging buffers.
     - Optional memory guards can pause production to reduce OOM risk.
     """
 
@@ -2615,15 +2600,10 @@ class Prefetcher(Buffer):
         use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu", "mps")
         self._pin = bool(kwargs.get("pin_host", use_accel))
 
-        # Optional pinned staging pool (CUDA-only): reduces repeated pinned allocations
+        # Optional pinned staging pool (CUDA/XPU): reduces repeated pinned allocations
         self._pin_pool = False
         self._host_pool: Optional[Pool] = None
-        if (
-            self._pin
-            and self._non_blocking
-            and self._device.type == "cuda"
-            and torch.cuda.is_available()
-        ):
+        if self._pin and self._non_blocking and _accel_streaming_supported_for_device_type(self._device.type):
             use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
             cap_default = max(8, max(2, int(self._depth) * 2))
             cap = env_first_int(("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default)
@@ -2631,8 +2611,8 @@ class Prefetcher(Buffer):
                 self._host_pool = Pool(capacity=int(cap), pin_memory=True)
                 self._pin_pool = True
 
-        self._gpu_stream: Optional[torch.cuda.Stream] = None
-        self._gpu_event_pool: Optional[queue.SimpleQueue] = None
+        self._accel_stream: Optional[object] = None
+        self._accel_event_pool: Optional[queue.SimpleQueue] = None
 
         self._session = bool(_session)
 
@@ -2780,7 +2760,7 @@ class Prefetcher(Buffer):
         *,
         device: torch.device,
         use_device: bool,
-        use_cuda_stream: bool,
+        use_accel_stream: bool,
         gpu_guard_bytes: int,
         host_guard_bytes: int,
     ) -> None:
@@ -2791,26 +2771,13 @@ class Prefetcher(Buffer):
         last_guards_ok = True
         ttl_s = float(getattr(self, "_guard_ttl_s", 0.0) or 0.0)
 
-        def guards_ok(force: bool = False) -> bool:
-            nonlocal last_check_t, last_guards_ok
-            if not self._backpressure:
-                return True
-            if (not force) and ttl_s > 0.0:
-                now = time.monotonic()
-                if (now - last_check_t) < ttl_s:
-                    return bool(last_guards_ok)
-
-            last_check_t = time.monotonic()
-            host_ok = _host_guard_ok(host_guard_bytes)
-            gpu_ok = _gpu_guard_ok(use_cuda_stream, device, gpu_guard_bytes)
-            last_guards_ok = bool(host_ok and gpu_ok)
-            return bool(last_guards_ok)
-
         try:
-            if use_cuda_stream and isinstance(device, torch.device):
+            if use_device and isinstance(device, torch.device):
+                backend = _accel_backend_for_device_type(device.type)
+                set_dev = getattr(backend, "set_device", None) if backend is not None else None
                 with suppress(Exception):
-                    if device.index is not None:
-                        torch.cuda.set_device(device.index)
+                    if callable(set_dev) and device.index is not None:
+                        set_dev(int(device.index))
 
             while True:
                 if self.is_stopped():
@@ -2831,12 +2798,20 @@ class Prefetcher(Buffer):
                 batch, pool_tokens = self._pin_batch(batch)
 
                 if self._backpressure:
-                    ok = guards_ok(force=True)
                     sleep_s = 0.001
-                    while (not self.is_stopped()) and (not ok):
+                    while not self.is_stopped():
+                        now = time.monotonic()
+                        if ttl_s <= 0.0 or (now - last_check_t) >= ttl_s:
+                            last_check_t = now
+                            host_ok = _host_guard_ok(host_guard_bytes)
+                            dev_ok = _device_guard_ok(device, gpu_guard_bytes)
+                            last_guards_ok = bool(host_ok and dev_ok)
+
+                        if bool(last_guards_ok):
+                            break
+
                         time.sleep(sleep_s)
                         sleep_s = min(float(sleep_s) * 2.0, 0.05)
-                        ok = guards_ok(force=False)
                     if self.is_stopped():
                         # Producer is being torn down; release any reserved pool tokens.
                         if self._host_pool is not None and pool_tokens:
@@ -2846,9 +2821,9 @@ class Prefetcher(Buffer):
                         break
 
                 if use_device:
-                    if use_cuda_stream and self._gpu_stream is not None:
+                    if use_accel_stream and self._accel_stream is not None:
                         ev = None
-                        pool = self._gpu_event_pool
+                        pool = self._accel_event_pool
                         if pool is not None:
                             # `SimpleQueue.get()` supports timeout; keep this stop-aware.
                             while ev is None and not self.is_stopped():
@@ -2862,13 +2837,16 @@ class Prefetcher(Buffer):
                         # inserting the wait. We must not re-record this event until that
                         # consumer-side record has completed.
                         if ev is not None:
-                            _wait_cuda_event_done(ev, stopped=self.is_stopped)
+                            _wait_accel_event_done(ev, stopped=self.is_stopped)
 
                         try:
-                            with torch.cuda.stream(self._gpu_stream):
+                            with _accel_stream_context(self._accel_stream, device.type):
                                 batch_dev = self._to_device(batch, device)
                                 if ev is not None:
-                                    ev.record(self._gpu_stream)
+                                    try:
+                                        ev.record(self._accel_stream)
+                                    except TypeError:
+                                        ev.record()
 
                             if self._host_pool is not None and pool_tokens:
                                 if ev is not None:
@@ -2883,7 +2861,7 @@ class Prefetcher(Buffer):
                                 # If we can't hand the event to the consumer, ensure it is safe
                                 # before returning it to the pool.
                                 if ev is not None and pool is not None:
-                                    _wait_cuda_event_done(ev, stopped=self.is_stopped)
+                                    _wait_accel_event_done(ev, stopped=self.is_stopped)
                                     with suppress(Exception):
                                         pool.put(ev)
                                 break
@@ -2896,7 +2874,7 @@ class Prefetcher(Buffer):
 
                             # Return events best-effort.
                             if ev is not None and pool is not None:
-                                _wait_cuda_event_done(ev, stopped=self.is_stopped)
+                                _wait_accel_event_done(ev, stopped=self.is_stopped)
                                 with suppress(Exception):
                                     pool.put(ev)
                             raise
@@ -2922,25 +2900,34 @@ class Prefetcher(Buffer):
 
         device = getattr(self, "_device", torch.device("cpu"))
         use_device = device.type in {"cuda", "mps", "xpu"}
-        use_cuda_stream = device.type == "cuda" and hasattr(torch, "cuda") and torch.cuda.is_available()
+        use_accel_stream = bool(self._non_blocking and _accel_streaming_supported_for_device_type(device.type))
 
         iterable = getattr(self, "_iterable", self._src)
         gpu_guard_bytes = int(getattr(self, "_gpu_guard_bytes", 0) or 0)
         host_guard_bytes = int(getattr(self, "_host_guard_bytes", 0) or 0)
 
         # Main process: producer thread + bounded buffer.
-        if use_cuda_stream and self._gpu_stream is None:
-            self._gpu_stream = torch.cuda.Stream(device=device)
+        if use_accel_stream and self._accel_stream is None:
+            self._accel_stream = _accel_new_stream(device)
+        if use_accel_stream and self._accel_stream is None:
+            use_accel_stream = False
 
         # Event pool (no per-batch allocation; safe reuse via producer/consumer handshake).
-        if use_cuda_stream:
+        if use_accel_stream:
             pool: queue.SimpleQueue = queue.SimpleQueue()
+            created = 0
             for _ in range(max(1, int(getattr(self, "_depth", 2) or 2))):
-                with suppress(Exception):
-                    pool.put(torch.cuda.Event(enable_timing=False))
-            self._gpu_event_pool = pool
+                ev = _accel_make_event(device, enable_timing=False)
+                if ev is not None:
+                    pool.put(ev)
+                    created += 1
+            if created <= 0:
+                use_accel_stream = False
+                self._accel_event_pool = None
+            else:
+                self._accel_event_pool = pool
         else:
-            self._gpu_event_pool = None
+            self._accel_event_pool = None
 
         sentinel = object()
         it = iter(iterable)
@@ -2953,7 +2940,7 @@ class Prefetcher(Buffer):
             kwargs={
                 "device": device,
                 "use_device": use_device,
-                "use_cuda_stream": use_cuda_stream,
+                "use_accel_stream": use_accel_stream,
                 "gpu_guard_bytes": gpu_guard_bytes,
                 "host_guard_bytes": host_guard_bytes,
             },
@@ -2976,18 +2963,22 @@ class Prefetcher(Buffer):
                     raise RuntimeError(f"Prefetcher producer crashed: {item.exc}\n{item.tb}") from item.exc
 
                 batch, ev = item
-                if use_cuda_stream and ev is not None:
-                    cs = torch.cuda.current_stream(device=device if isinstance(device, torch.device) else None)
-                    with suppress(Exception):
-                        cs.wait_event(ev)
+                if use_accel_stream and ev is not None:
+                    cs = _accel_current_stream(device)
+                    if cs is not None:
+                        with suppress(Exception):
+                            cs.wait_event(ev)
 
-                    # Important: record the event on the consumer stream *after* inserting
-                    # the wait, so the producer can safely reuse the same event only once
-                    # the consumer has reached this point.
-                    with suppress(Exception):
-                        ev.record(cs)
+                        # Important: record the event on the consumer stream *after* inserting
+                        # the wait, so the producer can safely reuse the same event only once
+                        # the consumer has reached this point.
+                        with suppress(Exception):
+                            try:
+                                ev.record(cs)
+                            except TypeError:
+                                ev.record()
 
-                    pool = self._gpu_event_pool
+                    pool = self._accel_event_pool
                     if pool is not None:
                         with suppress(Exception):
                             pool.put(ev)
@@ -3001,10 +2992,10 @@ class Prefetcher(Buffer):
                     t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
             best_effort_close(t)
 
-            # Best-effort drain: return any remaining CUDA events to the pool and
+            # Best-effort drain: return any remaining accelerator events to the pool and
             # ensure they are complete so a later GC doesn't observe an "in flight" handle.
-            pool = self._gpu_event_pool
-            if use_cuda_stream and pool is not None:
+            pool = self._accel_event_pool
+            if use_accel_stream and pool is not None:
                 while True:
                     try:
                         leftover = self.get(block=False)
@@ -3017,7 +3008,7 @@ class Prefetcher(Buffer):
                     if isinstance(leftover, tuple) and len(leftover) == 2:
                         _batch, ev = leftover
                         if ev is not None:
-                            _wait_cuda_event_done(ev, stopped=self.is_stopped)
+                            _wait_accel_event_done(ev, stopped=self.is_stopped)
                             with suppress(Exception):
                                 pool.put(ev)
 
@@ -3027,10 +3018,10 @@ class Prefetcher(Buffer):
                         ev = pool.get_nowait()
                     except queue.Empty:
                         break
-                    _wait_cuda_event_done(ev, stopped=self.is_stopped)
+                    _wait_accel_event_done(ev, stopped=self.is_stopped)
 
-                self._gpu_event_pool = None
-                self._gpu_stream = None
+                self._accel_event_pool = None
+                self._accel_stream = None
 
             with suppress(Exception):
                 self.clear()
