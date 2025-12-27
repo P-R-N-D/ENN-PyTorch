@@ -39,7 +39,6 @@ from .core.system import (
     initialize_python_path,
     new_dir,
     optimal_start_method,
-    remove_dir,
     set_multiprocessing_env,
 )
 from .data.pipeline import (
@@ -1358,7 +1357,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             X_t = X_mmt[:count].detach().cpu().clone()
             return TensorDict({'X': X_t, 'Y': Y_t}, batch_size=[count])
         finally:
-            remove_dir(tmp_dir)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 @catchtime(logger, fn_name='get_prediction')
 def get_prediction(source, *, lazy=True, persist_path=None):

@@ -43,6 +43,7 @@ from ..core.system import (
     accel_streaming_supported_for_device_type as _accel_streaming_supported_for_device_type,
 )
 from . import schemas as _schemas
+from .pipeline import Dataset
 from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
 
 _LOGGER = logging.getLogger(__name__)
