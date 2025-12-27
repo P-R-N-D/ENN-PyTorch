@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import shutil
@@ -39,7 +40,7 @@ from ..core.system import (
     remove_dir,
     set_multiprocessing_env,
 )
-from ..core.casting import dtype_from_name, env_bool, parse_torch_dtype
+from ..core.casting import dtype_from_name, env_bool, env_int, parse_torch_dtype
 from ..data.pipeline import (
     BatchIO,
     Dataset,
@@ -56,6 +57,83 @@ from ..core.config import ModelConfig, OpsMode, RuntimeConfig, coerce_model_conf
 
 
 logger = logging.getLogger(__name__)
+
+
+# Prediction assembly tuning
+# If <= 0, segment-based slice copies are disabled (always use index_copy/fancy indexing).
+_PRED_ASSEMBLE_MAX_SEGMENTS = int(env_int("STNET_PRED_ASSEMBLE_MAX_SEGMENTS", default=64))
+# Prediction assembly auto-tuning logs (best-effort guidance; does not change behavior).
+_PRED_ASSEMBLE_TUNE = env_bool("STNET_PRED_ASSEMBLE_TUNE", default=True)
+_PRED_ASSEMBLE_TUNE_LOG_ONCE = env_bool("STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE", default=True)
+_PRED_ASSEMBLE_TUNE_MIN_PARTS = int(env_int("STNET_PRED_ASSEMBLE_TUNE_MIN_PARTS", default=4))
+_PRED_ASSEMBLE_TUNE_LOGGED = False
+
+
+def _maybe_log_pred_assemble_tuning(stats: Mapping[str, Any], *, kind: str) -> None:
+    """Log best-effort guidance for STNET_PRED_ASSEMBLE_MAX_SEGMENTS.
+
+    The goal is to make tuning discoverable without requiring a profiler:
+    we report how often the 'segment slice-copy' path was applicable and what
+    segment counts were observed.
+    """
+
+    global _PRED_ASSEMBLE_TUNE_LOGGED
+
+    if not bool(_PRED_ASSEMBLE_TUNE):
+        return
+    if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) and bool(_PRED_ASSEMBLE_TUNE_LOGGED):
+        return
+
+    parts = int(stats.get("parts", 0) or 0)
+    if parts < int(_PRED_ASSEMBLE_TUNE_MIN_PARTS):
+        return
+
+    inc = int(stats.get("inc_noncontig", 0) or 0)
+    if inc <= 0:
+        return
+
+    segs_sum = float(stats.get("segs_sum", 0.0) or 0.0)
+    segs_min = int(stats.get("segs_min", 0) or 0)
+    segs_max = int(stats.get("segs_max", 0) or 0)
+    avg = float(segs_sum) / float(max(1, inc))
+
+    thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
+    used = int(stats.get("seg_used", 0) or 0)
+    skipped = int(stats.get("seg_skipped_threshold", 0) or 0)
+    disabled = int(stats.get("seg_disabled", 0) or 0)
+
+    # Compute a conservative recommendation that avoids chasing a single outlier.
+    recommended: int | None = None
+    if thr <= 0:
+        # Segment fast path is disabled; recommend enabling only if observed segments are modest.
+        if segs_max > 0 and avg <= 64.0:
+            # Prefer something near 1.5x average but cap to a sane upper bound.
+            recommended = max(8, min(int(max(16.0, math.ceil(avg * 1.5))), max(64, min(segs_max, 512))))
+    else:
+        if skipped > 0:
+            skipped_max = int(stats.get("skipped_segs_max", 0) or 0)
+            # Suggest bumping towards 2x the current threshold, but avoid very large jumps.
+            if skipped_max > thr:
+                recommended = min(max(skipped_max, thr + 1), max(thr * 2, 128), 4096)
+
+    msg = (
+        f"Prediction assembly ({kind}): parts={parts}, contiguous={int(stats.get('contig', 0) or 0)}, "
+        f"noncontig={int(stats.get('noncontig', 0) or 0)}, strictly_inc_noncontig={inc}; "
+        f"segments avg={avg:.1f} (min={segs_min}, max={segs_max}); "
+        f"segment_copy used={used}, skipped(threshold={thr})={skipped}, disabled={disabled}."
+    )
+
+    # Only emit guidance when it is likely to be actionable.
+    if recommended is not None and recommended != thr:
+        logger.info(
+            "%s Suggested env: STNET_PRED_ASSEMBLE_MAX_SEGMENTS=%d (set <=0 to disable).",
+            msg,
+            int(recommended),
+        )
+    else:
+        logger.info("%s", msg)
+
+    _PRED_ASSEMBLE_TUNE_LOGGED = True
 
 
 # -----------------------------------------------------------------------------
@@ -1252,7 +1330,25 @@ def _assemble_predictions_to_memmap(
         )
 
     parts = list(manifest.get("parts", []))
+
+    tune_stats: Dict[str, Any] | None = None
+    if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
+        tune_stats = {
+            "parts": 0,
+            "contig": 0,
+            "noncontig": 0,
+            "inc_noncontig": 0,
+            "seg_used": 0,
+            "seg_skipped_threshold": 0,
+            "seg_disabled": 0,
+            "segs_sum": 0.0,
+            "segs_min": 0,
+            "segs_max": 0,
+            "skipped_segs_max": 0,
+        }
     for part in parts:
+        if tune_stats is not None:
+            tune_stats["parts"] += 1
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
@@ -1288,6 +1384,8 @@ def _assemble_predictions_to_memmap(
 
         is_contig, start, end = _is_contiguous_row_range(rows_t)
         if is_contig:
+            if tune_stats is not None:
+                tune_stats["contig"] += 1
             if start < 0 or end > int(count):
                 raise ValueError(
                     f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
@@ -1295,17 +1393,38 @@ def _assemble_predictions_to_memmap(
             # Slice copy is noticeably faster than index_copy_ when rows are contiguous.
             Y_out[start:end].copy_(preds_t)
         else:
+            if tune_stats is not None:
+                tune_stats["noncontig"] += 1
             did_segment_copy = False
 
             # Middle ground: if rows are strictly increasing and mostly contiguous
             # (few segments), block slice-copies are faster than a full index_copy_.
             n_rows = int(rows_t.numel())
-            if n_rows > 1:
+            need_segs = (_PRED_ASSEMBLE_MAX_SEGMENTS > 0) or (tune_stats is not None)
+            if n_rows > 1 and need_segs:
                 d = rows_t[1:] - rows_t[:-1]
                 if bool(torch.all(d > 0)):
                     breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
                     segs = int(breaks.numel()) + 1
-                    if segs <= 64:
+
+                    if tune_stats is not None:
+                        tune_stats["inc_noncontig"] += 1
+                        tune_stats["segs_sum"] += float(segs)
+                        mn = int(tune_stats.get("segs_min", 0) or 0)
+                        mx = int(tune_stats.get("segs_max", 0) or 0)
+                        tune_stats["segs_min"] = segs if mn <= 0 else min(mn, segs)
+                        tune_stats["segs_max"] = max(mx, segs)
+
+                        thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
+                        if thr <= 0:
+                            tune_stats["seg_disabled"] += 1
+                        elif segs <= thr:
+                            tune_stats["seg_used"] += 1
+                        else:
+                            tune_stats["seg_skipped_threshold"] += 1
+                            tune_stats["skipped_segs_max"] = max(int(tune_stats.get("skipped_segs_max", 0) or 0), segs)
+
+                    if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
                         seg_start = 0
                         for b in breaks.tolist():
                             seg_end = int(b) + 1
@@ -1334,8 +1453,11 @@ def _assemble_predictions_to_memmap(
                     if rmin < 0 or rmax >= int(count):
                         raise ValueError(
                             f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
-                        )
+                            )
                 Y_out.index_copy_(0, rows_t, preds_t)
+
+    if tune_stats is not None:
+        _maybe_log_pred_assemble_tuning(tune_stats, kind="memmap")
 
     pred_meta_path = BatchIO.mmt_meta_path(out_path)
     BatchIO.atomic_write_json(
@@ -1373,7 +1495,26 @@ def _assemble_predictions_to_tensor(
         )
 
     parts = list(manifest.get("parts", []))
+
+
+    tune_stats: Dict[str, Any] | None = None
+    if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
+        tune_stats = {
+            "parts": 0,
+            "contig": 0,
+            "noncontig": 0,
+            "inc_noncontig": 0,
+            "seg_used": 0,
+            "seg_skipped_threshold": 0,
+            "seg_disabled": 0,
+            "segs_sum": 0.0,
+            "segs_min": 0,
+            "segs_max": 0,
+            "skipped_segs_max": 0,
+        }
     for part in parts:
+        if tune_stats is not None:
+            tune_stats["parts"] += 1
         rows_file = os.path.join(chunks_dir, str(part["rows"]))
         pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
@@ -1409,21 +1550,43 @@ def _assemble_predictions_to_tensor(
 
         is_contig, start, end = _is_contiguous_row_range(rows_t)
         if is_contig:
+            if tune_stats is not None:
+                tune_stats["contig"] += 1
             if start < 0 or end > int(count):
                 raise ValueError(
                     f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
                 )
             Y_out[start:end].copy_(preds_t)
         else:
+            if tune_stats is not None:
+                tune_stats["noncontig"] += 1
             did_segment_copy = False
 
             n_rows = int(rows_t.numel())
-            if n_rows > 1:
+            need_segs = (_PRED_ASSEMBLE_MAX_SEGMENTS > 0) or (tune_stats is not None)
+            if n_rows > 1 and need_segs:
                 d = rows_t[1:] - rows_t[:-1]
                 if bool(torch.all(d > 0)):
                     breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
                     segs = int(breaks.numel()) + 1
-                    if segs <= 64:
+
+                    if tune_stats is not None:
+                        tune_stats["inc_noncontig"] += 1
+                        tune_stats["segs_sum"] += float(segs)
+                        mn = int(tune_stats.get("segs_min", 0) or 0)
+                        mx = int(tune_stats.get("segs_max", 0) or 0)
+                        tune_stats["segs_min"] = segs if mn <= 0 else min(mn, segs)
+                        tune_stats["segs_max"] = max(mx, segs)
+
+                        thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
+                        if thr <= 0:
+                            tune_stats["seg_disabled"] += 1
+                        elif segs <= thr:
+                            tune_stats["seg_used"] += 1
+                        else:
+                            tune_stats["seg_skipped_threshold"] += 1
+                            tune_stats["skipped_segs_max"] = max(int(tune_stats.get("skipped_segs_max", 0) or 0), segs)
+                    if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
                         seg_start = 0
                         for b in breaks.tolist():
                             seg_end = int(b) + 1
@@ -1452,8 +1615,11 @@ def _assemble_predictions_to_tensor(
                     if rmin < 0 or rmax >= int(count):
                         raise ValueError(
                             f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
-                        )
+                            )
                 Y_out.index_copy_(0, rows_t, preds_t)
+
+    if tune_stats is not None:
+        _maybe_log_pred_assemble_tuning(tune_stats, kind="tensor")
 
     return Y_out
 
@@ -1509,7 +1675,25 @@ def _write_predictions_h5_from_chunks(
             )
 
         parts = list(manifest.get("parts", []))
+
+        tune_stats: Dict[str, Any] | None = None
+        if bool(_PRED_ASSEMBLE_TUNE) and (not bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE) or not bool(_PRED_ASSEMBLE_TUNE_LOGGED)):
+            tune_stats = {
+                "parts": 0,
+                "contig": 0,
+                "noncontig": 0,
+                "inc_noncontig": 0,
+                "seg_used": 0,
+                "seg_skipped_threshold": 0,
+                "seg_disabled": 0,
+                "segs_sum": 0.0,
+                "segs_min": 0,
+                "segs_max": 0,
+                "skipped_segs_max": 0,
+            }
         for part in parts:
+            if tune_stats is not None:
+                tune_stats["parts"] += 1
             rows_file = os.path.join(chunks_dir, str(part["rows"]))
             pred_file = os.path.join(chunks_dir, str(part["pred"]))
 
@@ -1546,6 +1730,8 @@ def _write_predictions_h5_from_chunks(
             # Faster paths: contiguous (or low-segment) writes avoid fancy-index overhead in h5py.
             is_contig, start, end = _is_contiguous_row_range(rows_t)
             if is_contig:
+                if tune_stats is not None:
+                    tune_stats["contig"] += 1
                 if start < 0 or end > int(count):
                     raise ValueError(
                         f"Row indices out of bounds in {rows_file}: [{start}, {end}) vs count={int(count)}"
@@ -1553,33 +1739,55 @@ def _write_predictions_h5_from_chunks(
                 dset_Y[start:end] = preds_np
                 continue
 
+            if tune_stats is not None:
+                tune_stats["noncontig"] += 1
             did_segment_write = False
             if n_rows > 1:
-                d = rows_t[1:] - rows_t[:-1]
-                if bool(torch.all(d > 0)):
-                    breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
-                    segs = int(breaks.numel()) + 1
-                    if segs <= 64:
-                        seg_start = 0
-                        for b in breaks.tolist():
-                            seg_end = int(b) + 1
+                need_segs = (_PRED_ASSEMBLE_MAX_SEGMENTS > 0) or (tune_stats is not None)
+                if need_segs:
+                    d = rows_t[1:] - rows_t[:-1]
+                    if bool(torch.all(d > 0)):
+                        breaks = (d != 1).nonzero(as_tuple=False).reshape(-1)
+                        segs = int(breaks.numel()) + 1
+
+                        if tune_stats is not None:
+                            tune_stats["inc_noncontig"] += 1
+                            tune_stats["segs_sum"] += float(segs)
+                            mn = int(tune_stats.get("segs_min", 0) or 0)
+                            mx = int(tune_stats.get("segs_max", 0) or 0)
+                            tune_stats["segs_min"] = segs if mn <= 0 else min(mn, segs)
+                            tune_stats["segs_max"] = max(mx, segs)
+
+                            thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
+                            if thr <= 0:
+                                tune_stats["seg_disabled"] += 1
+                            elif segs <= thr:
+                                tune_stats["seg_used"] += 1
+                            else:
+                                tune_stats["seg_skipped_threshold"] += 1
+                                tune_stats["skipped_segs_max"] = max(int(tune_stats.get("skipped_segs_max", 0) or 0), segs)
+
+                        if _PRED_ASSEMBLE_MAX_SEGMENTS > 0 and segs <= _PRED_ASSEMBLE_MAX_SEGMENTS:
+                            seg_start = 0
+                            for b in breaks.tolist():
+                                seg_end = int(b) + 1
+                                r0 = int(rows_t[seg_start].item())
+                                r1 = int(rows_t[seg_end - 1].item()) + 1
+                                if r0 < 0 or r1 > int(count):
+                                    raise ValueError(
+                                        f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
+                                    )
+                                dset_Y[r0:r1] = preds_np[seg_start:seg_end]
+                                seg_start = seg_end
+
                             r0 = int(rows_t[seg_start].item())
-                            r1 = int(rows_t[seg_end - 1].item()) + 1
+                            r1 = int(rows_t[-1].item()) + 1
                             if r0 < 0 or r1 > int(count):
                                 raise ValueError(
                                     f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
                                 )
-                            dset_Y[r0:r1] = preds_np[seg_start:seg_end]
-                            seg_start = seg_end
-
-                        r0 = int(rows_t[seg_start].item())
-                        r1 = int(rows_t[-1].item()) + 1
-                        if r0 < 0 or r1 > int(count):
-                            raise ValueError(
-                                f"Row indices out of bounds in {rows_file}: [{r0}, {r1}) vs count={int(count)}"
-                            )
-                        dset_Y[r0:r1] = preds_np[seg_start:]
-                        did_segment_write = True
+                            dset_Y[r0:r1] = preds_np[seg_start:]
+                            did_segment_write = True
 
             if not did_segment_write:
                 rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
@@ -1591,6 +1799,9 @@ def _write_predictions_h5_from_chunks(
                             f"Row indices out of bounds in {rows_file}: min={rmin}, max={rmax}, count={int(count)}"
                         )
                 dset_Y[rows_np] = preds_np
+
+        if tune_stats is not None:
+            _maybe_log_pred_assemble_tuning(tune_stats, kind="h5")
 
     return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
 
