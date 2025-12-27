@@ -39,6 +39,19 @@ _LOGGER = logging.getLogger(__name__)
 
 TensorLike = Any
 
+def _rebuild_tuple_like(proto: tuple[Any, ...], items: tuple[Any, ...]) -> Any:
+    # Namedtuple-safe tuple reconstruction.
+    tp = type(proto)
+    if tp is tuple:
+        return items
+    try:
+        return tp(*items)
+    except Exception:
+        try:
+            return tp(items)
+        except Exception:
+            return items
+
 # ---- torchdata nodes (robust defaults) ---------------------------------------
 
 _TORCHDATA_AVAILABLE = False
@@ -1344,7 +1357,7 @@ class BatchIO:
         for s in range(0, count_i, int(chunk_first)):
             e = min(count_i, s + int(chunk_first))
             batch = get_batch(int(s), int(e))
-            fx, lb, _, _ = ds.preprocess(batch)
+            fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
             n = BatchIO._batch_n(fx)
             if n <= 0:
                 continue
@@ -1603,7 +1616,7 @@ class BatchIO:
                 idx = shuffle_indexer(int(s), int(e))
                 batch = get_by_indices(idx)
 
-            fx, lb, _, _ = ds.preprocess(batch)
+            fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
             n = BatchIO._batch_n(fx)
             if n <= 0:
                 continue
@@ -2499,39 +2512,42 @@ class BatchQueue(Buffer):
             )
         return self._iter_session()
 
+    def _producer_loop(self, it: Iterator[Any], sentinel: object) -> None:
+        import traceback
+
+        try:
+            while not self.is_stopped():
+                # Avoid pulling one extra item from the upstream iterable when the
+                # internal buffer is already at capacity.
+                if not self.wait_for_space(timeout=None):
+                    break
+                try:
+                    item = next(it)
+                except StopIteration:
+                    break
+
+                if self.is_stopped():
+                    break
+                if not self.put(item, timeout=0.0):
+                    break
+        except BaseException as exc:
+            with suppress(Exception):
+                self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
+        finally:
+            with suppress(Exception):
+                self.put(sentinel)
+
     def _iter_session(self) -> Iterator[Any]:
         import traceback
 
         src_iter = iter(self._src)
         sentinel = object()
 
-        def _producer() -> None:
-            try:
-                while not self.is_stopped():
-                    # Avoid pulling one extra item from the upstream iterable when the
-                    # internal buffer is already at capacity.
-                    if not self.wait_for_space(timeout=None):
-                        break
-                    try:
-                        item = next(src_iter)
-                    except StopIteration:
-                        break
-
-                    if self.is_stopped():
-                        break
-                    if not self.put(item, timeout=0.0):
-                        break
-            except BaseException as exc:
-                with suppress(Exception):
-                    self.put(ProducerError(exc=exc, tb=traceback.format_exc()))
-            finally:
-                with suppress(Exception):
-                    self.put(sentinel)
-
         t = threading.Thread(
-            target=_producer,
+            target=self._producer_loop,
             name=f"{self._name}-producer",
             daemon=self._daemon,
+            args=(src_iter, sentinel),
         )
         t.start()
 
@@ -2559,7 +2575,7 @@ class BatchQueue(Buffer):
             best_effort_close(src_iter)
             with suppress(Exception):
                 if t.is_alive():
-                    t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
+                    t.join(timeout=float(getattr(self, '_join_timeout_s', 0.5)))
             best_effort_close(t)
 
 
@@ -2643,44 +2659,110 @@ class Prefetcher(Buffer):
         )
 
     def _to_device(self, x: Any, device: torch.device) -> Any:
+        # Hot path: move tensors to device with minimal container churn.
         if torch.is_tensor(x):
             if x.device == device:
                 return x
-            return x.to(device, non_blocking=self._non_blocking)
-        if isinstance(x, (list, tuple)):
-            return type(x)(self._to_device(t, device) for t in x)
+            if x.device.type == 'cpu':
+                # Only request non_blocking when the source is pinned.
+                nb = bool(self._non_blocking)
+                if nb:
+                    try:
+                        is_pinned = getattr(x, 'is_pinned', None)
+                        nb = bool(callable(is_pinned) and bool(is_pinned()))
+                    except Exception:
+                        nb = False
+                return x.to(device, non_blocking=nb)
+            return x.to(device, non_blocking=bool(self._non_blocking))
+        if isinstance(x, list):
+            for i in range(len(x)):
+                x[i] = self._to_device(x[i], device)
+            return x
+        if isinstance(x, tuple):
+            mapped = tuple(self._to_device(t, device) for t in x)
+            if type(x) is tuple:
+                return mapped
+            return _rebuild_tuple_like(x, mapped)
         if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ('row_ids', 'keys'):
+                    continue
+                x[k] = self._to_device(v, device)
+            return x
+        if isinstance(x, _abc.Mapping):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                if k == "row_ids":
-                    out[k] = v
-                else:
-                    out[k] = self._to_device(v, device)
+                out[k] = v if k in ('row_ids', 'keys') else self._to_device(v, device)
             return out
         return x
 
     def _pin_memory(self, x: Any) -> Any:
         if not self._pin:
             return x
-        if torch.is_tensor(x) and x.device.type == "cpu":
+        if torch.is_tensor(x) and x.device.type == 'cpu':
             with suppress(Exception):
-                if hasattr(x, "is_pinned") and bool(x.is_pinned()):
+                if hasattr(x, 'is_pinned') and bool(x.is_pinned()):
                     return x
             return x.pin_memory()
-        if isinstance(x, (list, tuple)):
-            return type(x)(self._pin_memory(t) for t in x)
+        if isinstance(x, list):
+            for i in range(len(x)):
+                x[i] = self._pin_memory(x[i])
+            return x
+        if isinstance(x, tuple):
+            mapped = tuple(self._pin_memory(t) for t in x)
+            if type(x) is tuple:
+                return mapped
+            return _rebuild_tuple_like(x, mapped)
         if isinstance(x, dict):
+            for k, v in x.items():
+                if k in ('row_ids', 'keys'):
+                    continue
+                x[k] = self._pin_memory(v)
+            return x
+        if isinstance(x, _abc.Mapping):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                if k == "row_ids":
-                    out[k] = v
-                else:
-                    out[k] = self._pin_memory(v)
+                out[k] = v if k in ('row_ids', 'keys') else self._pin_memory(v)
             return out
         return x
 
+    def _stage_with_pool(self, obj: Any, pool: Pool, tokens: list[Optional[Pool.Token]]) -> Any:
+        if torch.is_tensor(obj) and getattr(obj, 'device', None) is not None:
+            if obj.device.type != 'cpu':
+                return obj
+            try:
+                if hasattr(obj, 'is_pinned') and bool(obj.is_pinned()):
+                    return obj
+            except Exception:
+                pass
+            buf, tok = pool.get_like(obj, return_handle=True, block=False)
+            buf.copy_(obj, non_blocking=False)
+            tokens.append(tok)
+            return buf
+        if isinstance(obj, list):
+            for i in range(len(obj)):
+                obj[i] = self._stage_with_pool(obj[i], pool, tokens)
+            return obj
+        if isinstance(obj, tuple):
+            mapped = tuple(self._stage_with_pool(t, pool, tokens) for t in obj)
+            if type(obj) is tuple:
+                return mapped
+            return _rebuild_tuple_like(obj, mapped)
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if k in ('row_ids', 'keys'):
+                    continue
+                obj[k] = self._stage_with_pool(v, pool, tokens)
+            return obj
+        if isinstance(obj, _abc.Mapping):
+            out: dict[Any, Any] = {}
+            for k, v in obj.items():
+                out[k] = v if k in ('row_ids', 'keys') else self._stage_with_pool(v, pool, tokens)
+            return out
+        return obj
+
     def _pin_batch(self, x: Any) -> tuple[Any, list[Optional[Pool.Token]]]:
-        """Pin/stage tensors in `x` and return (pinned_x, pool_tokens)."""
+        # Pin/stage tensors in `x` and return (pinned_x, pool_tokens).
         if not self._pin:
             return x, []
 
@@ -2689,30 +2771,7 @@ class Prefetcher(Buffer):
             return self._pin_memory(x), []
 
         tokens: list[Optional[Pool.Token]] = []
-
-        def stage(obj: Any) -> Any:
-            if torch.is_tensor(obj) and getattr(obj, "device", None) is not None:
-                if obj.device.type != "cpu":
-                    return obj
-                try:
-                    if hasattr(obj, "is_pinned") and bool(obj.is_pinned()):
-                        return obj
-                except Exception:
-                    pass
-                buf, tok = pool.get_like(obj, return_handle=True, block=False)
-                buf.copy_(obj, non_blocking=False)
-                tokens.append(tok)
-                return buf
-            if isinstance(obj, (list, tuple)):
-                return type(obj)(stage(t) for t in obj)
-            if isinstance(obj, dict):
-                out: dict[Any, Any] = {}
-                for k, v in obj.items():
-                    out[k] = v if k == "row_ids" else stage(v)
-                return out
-            return obj
-
-        return stage(x), tokens
+        return self._stage_with_pool(x, pool, tokens), tokens
 
     def _producer_loop(
         self,

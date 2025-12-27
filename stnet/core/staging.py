@@ -6,7 +6,7 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Protocol, runtime_checkable
+from typing import Any, Optional, Tuple, Protocol, runtime_checkable, Callable
 
 import torch
 
@@ -112,6 +112,7 @@ class Pool:
         page: Page
         busy: bool = False
         fence: object | None = None
+        fence_evt: object | None = None
         gen: int = 0
 
     def __init__(self, capacity: int = 4, *, pin_memory: bool = True) -> None:
@@ -285,6 +286,56 @@ class Pool:
             block=block,
             timeout=timeout,
         )
+
+    def fence_event(
+        self,
+        token: Pool.Token | None,
+        factory: Callable[[], object] | None,
+    ) -> object | None:
+        """Return a reusable fence event associated with a pool token.
+
+        This helps avoid per-batch event allocations when the same pool pages are
+        reused repeatedly for asynchronous staging / I/O.
+
+        Notes:
+          - The returned event object may be recorded multiple times, but callers
+            must only reuse it once the corresponding pool page/token is no
+            longer in-flight (i.e., after the page has been released).
+        """
+        if token is None or factory is None:
+            return None
+
+        i = int(getattr(token, "i", -1))
+        g = int(getattr(token, "g", -1))
+        if i < 0:
+            return None
+
+        # Fast path: already created and still matches this generation.
+        with self._cv:
+            if 0 <= i < len(self._pages):
+                e = self._pages[i]
+                if e.gen == g and e.fence_evt is not None:
+                    return e.fence_evt
+
+        # Create outside the lock (backend event creation can be slow).
+        try:
+            ev_new = factory()
+        except Exception:
+            return None
+        if ev_new is None:
+            return None
+
+        with self._cv:
+            if 0 <= i < len(self._pages):
+                e = self._pages[i]
+                if e.gen == g:
+                    if e.fence_evt is None:
+                        e.fence_evt = ev_new
+                        return ev_new
+                    return e.fence_evt
+
+        # Token no longer matches a live entry; return the new event anyway.
+        return ev_new
 
     def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
         if token is None:

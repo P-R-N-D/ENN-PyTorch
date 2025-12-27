@@ -259,6 +259,174 @@ def _darwin_sysctl_cpu_count() -> Optional[int]:
     return None
 
 
+def accel_backend_for_device_type(device_type: Union[str, torch.device, None]) -> Optional[Any]:
+    dev = str(getattr(device_type, "type", device_type) or "").lower()
+    if dev == "cuda":
+        return getattr(torch, "cuda", None)
+    if dev == "xpu":
+        return getattr(torch, "xpu", None)
+    if dev == "mps":
+        return getattr(torch, "mps", None)
+    acc = getattr(torch, "accelerator", None)
+    if acc is not None:
+        dt = getattr(acc, "device_type", None)
+        if dt == dev:
+            return acc
+    return None
+
+
+def accel_is_available(device_type: Union[str, torch.device, None]) -> bool:
+    backend = accel_backend_for_device_type(device_type)
+    fn = getattr(backend, "is_available", None) if backend is not None else None
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return False
+
+
+def accel_device_count(device_type: Union[str, torch.device, None]) -> int:
+    backend = accel_backend_for_device_type(device_type)
+    fn = getattr(backend, "device_count", None) if backend is not None else None
+    if callable(fn):
+        try:
+            return int(fn())
+        except Exception:
+            return 0
+    return 0
+
+
+def accel_current_device_index(device_type: Union[str, torch.device, None]) -> Optional[int]:
+    backend = accel_backend_for_device_type(device_type)
+    fn = getattr(backend, "current_device", None) if backend is not None else None
+    if callable(fn):
+        try:
+            return int(fn())
+        except Exception:
+            return None
+    return None
+
+
+def accel_set_device_index(device_type: Union[str, torch.device, None], index: int) -> None:
+    backend = accel_backend_for_device_type(device_type)
+    fn = getattr(backend, "set_device", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn(index)
+
+
+def accel_manual_seed_all(device_type: Union[str, torch.device, None], seed: int) -> None:
+    backend = accel_backend_for_device_type(device_type)
+    fn = getattr(backend, "manual_seed_all", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            fn(seed)
+
+
+def accel_make_event(device: torch.device, enable_timing: bool = True) -> Optional[Any]:
+    backend = accel_backend_for_device_type(getattr(device, "type", None))
+    Event = getattr(backend, "Event", None) if backend is not None else None
+    if Event is None:
+        return None
+    try:
+        return Event(enable_timing=bool(enable_timing))
+    except TypeError:
+        with contextlib.suppress(Exception):
+            return Event()
+    except Exception:
+        return None
+
+
+def accel_stream_context(stream: Any, device_type: Union[str, torch.device, None] = None) -> contextlib.AbstractContextManager:
+    backend = accel_backend_for_device_type(device_type)
+    stream_ctx = getattr(backend, "stream", None) if backend is not None else None
+    if callable(stream_ctx):
+        try:
+            return stream_ctx(stream)
+        except Exception:
+            return contextlib.nullcontext()
+    return contextlib.nullcontext()
+
+
+def accel_synchronize(device: torch.device) -> None:
+    backend = accel_backend_for_device_type(getattr(device, "type", None))
+    fn = getattr(backend, "synchronize", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            try:
+                fn(device=device)
+                return
+            except TypeError:
+                fn(device)
+
+
+def accel_timing_events_supported_for_device_type(device_type: Union[str, torch.device, None]) -> bool:
+    backend = accel_backend_for_device_type(device_type)
+    Event = getattr(backend, "Event", None) if backend is not None else None
+    return callable(Event)
+
+
+def accel_memory_allocated(device: torch.device) -> Optional[int]:
+    backend = accel_backend_for_device_type(getattr(device, "type", None))
+    fn = getattr(backend, "memory_allocated", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            try:
+                val = fn(device=device)
+            except TypeError:
+                val = fn(device)
+            except Exception:
+                val = fn()
+            if val is not None:
+                return max(0, int(val))
+    return None
+
+
+def accel_max_memory_allocated(device: torch.device) -> Optional[int]:
+    backend = accel_backend_for_device_type(getattr(device, "type", None))
+    fn = getattr(backend, "max_memory_allocated", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            try:
+                val = fn(device=device)
+            except TypeError:
+                val = fn(device)
+            except Exception:
+                val = fn()
+            if val is not None:
+                return max(0, int(val))
+    return None
+
+
+def accel_reset_peak_memory_stats(device: torch.device) -> None:
+    backend = accel_backend_for_device_type(getattr(device, "type", None))
+    fn = getattr(backend, "reset_peak_memory_stats", None) if backend is not None else None
+    if callable(fn):
+        with contextlib.suppress(Exception):
+            try:
+                fn(device=device)
+            except TypeError:
+                fn(device)
+            except Exception:
+                fn()
+
+
+def accel_pinned_h2d_supported_for_device_type(device_type: Union[str, torch.device, None]) -> bool:
+    dev = str(getattr(device_type, "type", device_type) or "").lower()
+    if dev in {"cuda", "xpu"}:
+        return accel_is_available(dev)
+    return False
+
+
+def device_mem_util_percent(device: torch.device) -> Optional[float]:
+    free, total = Memory.device_mem_get_info(device)
+    if free is None or total is None or total <= 0:
+        return None
+    used = max(0, int(total) - int(free))
+    return float(used) * 100.0 / float(total) if total > 0 else None
+
+
 def _windows_allowed_cpu_indices() -> Optional[list[int]]:
     """Best-effort allowed CPU indices on Windows.
 

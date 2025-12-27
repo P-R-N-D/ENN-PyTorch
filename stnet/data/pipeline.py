@@ -1527,7 +1527,7 @@ def _feature_size_hint(obj: Any) -> Optional[int]:
 def _stack_sequence(
     seq: Sequence[Any],
     *,
-    dtype: torch.dtype,
+    dtype: Optional[torch.dtype],
     reshape_1d: bool = False,
 ) -> Optional[torch.Tensor]:
     """Stack a sequence into a tensor without building an intermediate list of tensors.
@@ -1641,11 +1641,18 @@ class Dataset(Generic[TExtra]):
         return self
 
     def preprocess(
-        self, data: Any
+        self,
+        data: Any,
+        *,
+        return_keys: bool = True,
+        cast: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Sequence[Any], Tuple[int, ...]]:
         features: Optional[torch.Tensor] = None
         labels: Optional[torch.Tensor] = None
         keys: Sequence[Any] = ()
+
+        feat_dtype = self.feature_dtype if bool(cast) else None
+        label_dtype = self.label_float_dtype if bool(cast) else None
 
         if isinstance(data, TensorDictBase):
             # Strict, case-insensitive alias resolution. Enforces "exactly one".
@@ -1653,7 +1660,8 @@ class Dataset(Generic[TExtra]):
             features = data.get(fkey, None)
             lkey = resolve_label_key(data, required=False)
             labels = data.get(lkey, None) if lkey is not None else None
-            keys = data.get("row_ids", None) or data.get("keys", None) or ()
+            if bool(return_keys):
+                keys = data.get("row_ids", None) or data.get("keys", None) or ()
         elif isinstance(data, Mapping):
             # If the mapping explicitly contains feature/label columns, use the strict
             # alias contract. Otherwise, fall back to the {key: label} / {key: (x,y)}
@@ -1672,7 +1680,8 @@ class Dataset(Generic[TExtra]):
                 features = data.get(fkey, None)
                 lkey = resolve_label_key(data, required=False)
                 labels = data.get(lkey, None) if lkey is not None else None
-                keys = data.get("row_ids", None) or data.get("keys", None) or ()
+                if bool(return_keys):
+                    keys = data.get("row_ids", None) or data.get("keys", None) or ()
             else:
                 # Heuristic: mapping may be {key: (feature, label)} or {feature: label}.
                 # Avoid materializing list(data.items()) which can cause large transient allocations.
@@ -1685,9 +1694,9 @@ class Dataset(Generic[TExtra]):
                     # Case A: {row_id: (feature, label)}
                     if isinstance(v0, (list, tuple)) and len(v0) >= 2:
                         n = len(data)
-                        keys_list: list[Any] = [k0]
+                        keys_list: Optional[list[Any]] = [k0] if bool(return_keys) else None
 
-                        x0 = _to_tensor_safe(v0[0], self.feature_dtype)
+                        x0 = _to_tensor_safe(v0[0], feat_dtype)
                         if x0 is None:
                             raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
 
@@ -1697,17 +1706,18 @@ class Dataset(Generic[TExtra]):
                         labels_out: Optional[torch.Tensor] = None
                         y0: Optional[torch.Tensor] = None
                         if v0[1] is not None:
-                            y0 = _to_tensor_safe(v0[1], self.label_float_dtype)
+                            y0 = _to_tensor_safe(v0[1], label_dtype)
                             if y0 is not None:
                                 labels_out = torch.empty((n, *y0.shape), dtype=y0.dtype, device=y0.device)
                                 labels_out[0].copy_(y0)
 
                         for i, (k, v) in enumerate(it, start=1):
-                            keys_list.append(k)
+                            if keys_list is not None:
+                                keys_list.append(k)
                             if not isinstance(v, (list, tuple)) or len(v) < 1:
                                 raise ValueError("Dataset.preprocess: invalid tuple mapping element")
 
-                            x_i = _to_tensor_safe(v[0], self.feature_dtype)
+                            x_i = _to_tensor_safe(v[0], feat_dtype)
                             if x_i is None:
                                 raise ValueError("Dataset.preprocess: missing feature in tuple mapping")
                             if tuple(x_i.shape) != tuple(x0.shape):
@@ -1721,7 +1731,7 @@ class Dataset(Generic[TExtra]):
                                 if len(v) < 2 or v[1] is None:
                                     labels_out = None
                                 else:
-                                    y_i = _to_tensor_safe(v[1], self.label_float_dtype)
+                                    y_i = _to_tensor_safe(v[1], label_dtype)
                                     if y_i is None or y0 is None or tuple(y_i.shape) != tuple(y0.shape):
                                         labels_out = None
                                     else:
@@ -1729,7 +1739,8 @@ class Dataset(Generic[TExtra]):
 
                         features = feat
                         labels = labels_out
-                        keys = keys_list
+                        if bool(return_keys):
+                            keys = keys_list
 
                     # Case B: mapping may be {key: feature} or {feature: label}
                     else:
@@ -1745,7 +1756,8 @@ class Dataset(Generic[TExtra]):
                             if key_as_feature and _feature_size_hint(k) != ksize0:
                                 key_as_feature = False
 
-                        keys = keys_list
+                        if bool(return_keys):
+                            keys = keys_list
 
                         parsed = False
                         if key_as_feature and keys_list and values_list:
@@ -1753,26 +1765,26 @@ class Dataset(Generic[TExtra]):
                             try:
                                 features = _stack_sequence(
                                     keys_list,
-                                    dtype=self.feature_dtype,
+                                    dtype=feat_dtype,
                                     reshape_1d=True,
                                 )
                                 if has_missing_labels:
                                     labels = None
                                     parsed = features is not None
                                 else:
-                                    labels = _stack_sequence(values_list, dtype=self.label_float_dtype)
+                                    labels = _stack_sequence(values_list, dtype=label_dtype)
                                     parsed = features is not None and labels is not None
                             except Exception:
                                 parsed = False
 
                         if not parsed:
-                            features = _stack_sequence(values_list, dtype=self.feature_dtype)
+                            features = _stack_sequence(values_list, dtype=feat_dtype)
                             labels = None
 
         if features is None:
             raise ValueError("Dataset.preprocess: unable to locate feature tensor(s)")
 
-        features = _to_tensor_safe(features, self.feature_dtype)
+        features = _to_tensor_safe(features, feat_dtype)
         if features.ndim == 0:
             features = features.reshape(1, 1)
         elif features.ndim == 1:
@@ -1781,7 +1793,7 @@ class Dataset(Generic[TExtra]):
             features = features.contiguous()
 
         if labels is not None:
-            labels = _to_tensor_safe(labels, self.label_float_dtype)
+            labels = _to_tensor_safe(labels, label_dtype)
             if labels.ndim == 0:
                 labels = labels.reshape(1, 1)
             if labels.shape[0] != features.shape[0]:
@@ -1792,14 +1804,17 @@ class Dataset(Generic[TExtra]):
         else:
             label_shape = tuple()
 
-        if isinstance(keys, torch.Tensor):
-            with contextlib.suppress(Exception):
-                keys = keys.detach().cpu().tolist()
-        elif keys is None:
-            keys = ()
+        if bool(return_keys):
+            if isinstance(keys, torch.Tensor):
+                with contextlib.suppress(Exception):
+                    keys = keys.detach().cpu().tolist()
+            elif keys is None:
+                keys = ()
 
-        if not keys:
-            keys = range(int(features.shape[0]))
+            if not keys:
+                keys = range(int(features.shape[0]))
+        else:
+            keys = ()
 
         return features, labels, keys, label_shape
 
@@ -2068,7 +2083,7 @@ class Dataset(Generic[TExtra]):
         self, batch: Any, device: Union[str, torch.device], non_blocking: bool = True
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         dev = torch.device(device)
-        feats, labels, _, _ = self.preprocess(batch)
+        feats, labels, _, _ = self.preprocess(batch, return_keys=False)
         feats = feats.to(device=dev, non_blocking=non_blocking)
         if labels is not None:
             labels = labels.to(device=dev, non_blocking=non_blocking)
