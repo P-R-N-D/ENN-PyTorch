@@ -6,11 +6,12 @@ import math
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Optional, Tuple, Protocol, runtime_checkable, Callable
 
 import torch
 
-from .casting import env_flag
+from .casting import env_flag, env_first, env_first_float
 
 
 # -----------------------------------------------------------------------------
@@ -375,8 +376,68 @@ class Pool:
 # Async on-disk cache writer
 # -----------------------------------------------------------------------------
 
+
+@lru_cache(maxsize=1)
+def _cache_backpressure_mode() -> str:
+    """Backpressure behavior for Cache.submit() when the queue is full.
+
+    Modes:
+      - "block" (default): wait for the writer thread to catch up.
+      - "sync": fall back to synchronous saving in the caller thread.
+      - "raise": raise an error if the queue is full.
+    """
+    raw = env_first(
+        ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
+        default="block",
+    )
+    s = str(raw or "block").strip().lower()
+    if s in {"sync", "synchronous"}:
+        return "sync"
+    if s in {"raise", "error"}:
+        return "raise"
+    return "block"
+
+
+@lru_cache(maxsize=1)
+def _cache_backpressure_timeout_s() -> float:
+    t = env_first_float(
+        ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"),
+        default=0.05,
+    )
+    with contextlib.suppress(Exception):
+        return max(0.0, float(t))
+    return 0.05
+
+
+@lru_cache(maxsize=1)
+def _cache_early_release_enabled() -> bool:
+    """Whether to release pool-backed pinned tensors before disk I/O."""
+    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
+
+
+@lru_cache(maxsize=1)
+def _cache_force_unpin_enabled() -> bool:
+    """Whether to always copy pinned CPU tensors into an unpinned buffer before saving."""
+    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
+
+
 class Cache:
-    """Asynchronous tensor writer with bounded backpressure."""
+    """Asynchronous tensor writer with bounded backpressure.
+
+    Environment knobs (read once per Cache instance):
+
+      - STNET_CACHE_BACKPRESSURE_MODE: "block" (default) | "sync" | "raise"
+      - STNET_CACHE_BACKPRESSURE_TIMEOUT_S: initial acquire timeout in seconds (default: 0.05)
+      - STNET_CACHE_EARLY_RELEASE: when `release_cb` is provided for a pinned CPU tensor,
+        copy into an unpinned buffer and run `release_cb` *before* disk I/O (default: enabled)
+      - STNET_CACHE_FORCE_UNPIN: always copy pinned CPU tensors into an unpinned buffer before saving
+        (default: disabled)
+
+    Notes:
+      - `release_cb` is intended for pool token release (e.g. pinned staging buffers). When early
+        release is enabled, the writer thread copies the tensor first and only then calls `release_cb`,
+        so the pool page can be reused while disk I/O is still in progress.
+    """
 
     def __init__(self, root: str, max_queue: int = 8) -> None:
         import queue
@@ -385,9 +446,16 @@ class Cache:
         self._root = os.fspath(root)
         os.makedirs(self._root, exist_ok=True)
 
-        max_q = int(max_queue)
-        self._sem = threading.Semaphore(max_q) if max_q > 0 else None
+        # Always keep the queue bounded (max_queue<=0 is coerced to 1 to avoid OOM).
+        max_q = max(1, int(max_queue))
+        self._sem = threading.Semaphore(max_q)
         self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = queue.SimpleQueue()
+
+        # Cache env knobs at construction time (hot path should not repeatedly parse env vars).
+        self._bp_mode = str(_cache_backpressure_mode() or "block")
+        self._bp_timeout_s = float(_cache_backpressure_timeout_s() or 0.0)
+        self._early_release = bool(_cache_early_release_enabled())
+        self._force_unpin = bool(_cache_force_unpin_enabled())
 
         self._t = threading.Thread(target=self._run, daemon=True)
         self._err: BaseException | None = None
@@ -403,11 +471,7 @@ class Cache:
         wait_event: Optional[object] = None,
         release_cb: Optional[object] = None,
     ) -> None:
-        """Submit a tensor for async saving.
-
-        If a bounded queue is configured and backpressure acquisition times out,
-        falls back to synchronous saving in the caller thread.
-        """
+        """Submit a tensor for async saving."""
         import os as _os
 
         if self._err_event.is_set():
@@ -422,23 +486,50 @@ class Cache:
         path = _os.fspath(path)
 
         acquired = False
-        if self._sem is not None:
-            acquired = bool(self._sem.acquire(timeout=0.05))
-            if not acquired:
-                # Synchronous fallback: preserve correctness over throughput.
-                self._wait(wait_event)
-                self._save_tensor(tensor, path)
-                if callable(release_cb):
-                    with contextlib.suppress(Exception):
-                        release_cb()
-                return
+        sem = self._sem
+        if sem is not None:
+            mode = str(getattr(self, "_bp_mode", "block") or "block").lower()
+            timeout_s = float(getattr(self, "_bp_timeout_s", 0.05) or 0.0)
+
+            if mode == "sync":
+                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
+                if not acquired:
+                    # Synchronous fallback: preserve correctness over throughput.
+                    self._wait(wait_event)
+                    buf, released = self._prepare_tensor_for_save(
+                        tensor,
+                        release_cb=(release_cb if callable(release_cb) else None),
+                        early_release=False,
+                        force_unpin=bool(getattr(self, "_force_unpin", False)),
+                    )
+                    self._save_tensor(buf, path)
+                    if callable(release_cb) and not released:
+                        with contextlib.suppress(Exception):
+                            release_cb()
+                    return
+
+            elif mode == "raise":
+                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
+                if not acquired:
+                    raise RuntimeError("Cache queue is full")
+
+            else:
+                # Block (default): wait for the writer thread to catch up.
+                if timeout_s > 0:
+                    acquired = bool(sem.acquire(timeout=float(timeout_s)))
+                while not acquired:
+                    if self._err_event.is_set():
+                        raise RuntimeError(f"Async writer error: {self._err!r}")
+                    if self._closed.is_set():
+                        raise RuntimeError("Cache is closed")
+                    acquired = bool(sem.acquire(timeout=0.1))
 
         try:
             self._q.put((tensor, path, wait_event, release_cb))
         except Exception:
-            if acquired and self._sem is not None:
+            if acquired and sem is not None:
                 with contextlib.suppress(Exception):
-                    self._sem.release()
+                    sem.release()
             raise
 
     def _wait(self, evt: object | None) -> None:
@@ -457,6 +548,62 @@ class Cache:
         except Exception:
             pass
 
+    @staticmethod
+    def _is_pinned_cpu(t: torch.Tensor) -> bool:
+        if not torch.is_tensor(t):
+            return False
+        if getattr(t, "device", None) is None or t.device.type != "cpu":
+            return False
+        is_pinned = getattr(t, "is_pinned", None)
+        if callable(is_pinned):
+            with contextlib.suppress(Exception):
+                return bool(is_pinned())
+        return False
+
+    def _prepare_tensor_for_save(
+        self,
+        tensor: torch.Tensor,
+        *,
+        release_cb: Callable[[], Any] | None = None,
+        early_release: bool | None = None,
+        force_unpin: bool | None = None,
+    ) -> tuple[torch.Tensor, bool]:
+        """Return (cpu_tensor, released_early)."""
+        if not torch.is_tensor(tensor):
+            tensor = torch.as_tensor(tensor)
+
+        buf = tensor.detach()
+        if buf.device.type != "cpu":
+            buf = buf.to(device="cpu", non_blocking=False)
+
+        if early_release is None:
+            early_release = bool(getattr(self, "_early_release", True))
+        if force_unpin is None:
+            force_unpin = bool(getattr(self, "_force_unpin", False))
+
+        released = False
+        pinned = Cache._is_pinned_cpu(buf)
+
+        # If a pool-backed pinned buffer is handed in, we can free it for reuse by copying into a
+        # pageable buffer and releasing the pool token before disk I/O.
+        if pinned and (bool(force_unpin) or (bool(early_release) and callable(release_cb))):
+            try:
+                tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
+                tmp.copy_(buf, non_blocking=False)
+                buf = tmp
+                if bool(early_release) and callable(release_cb):
+                    with contextlib.suppress(Exception):
+                        release_cb()
+                    released = True
+            except Exception:
+                # Best-effort fallback: keep the pinned buffer and release after saving.
+                released = False
+
+        if not bool(buf.is_contiguous()):
+            buf = buf.contiguous()
+
+        return buf, released
+
     def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
         import os as _os
 
@@ -466,13 +613,8 @@ class Cache:
         buf = tensor.detach()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
-
-        if hasattr(buf, "is_pinned") and callable(getattr(buf, "is_pinned")) and bool(buf.is_pinned()):
-            tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
-            tmp.copy_(buf, non_blocking=False)
-            buf = tmp
-
-        buf = buf.contiguous()
+        if not bool(buf.is_contiguous()):
+            buf = buf.contiguous()
 
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
@@ -504,7 +646,6 @@ class Cache:
 
         # torch.save pickles (rows.pt / pred.pt)
         if str(path).endswith((".pt", ".pth")):
-            # Use the shared atomic writer for consistency.
             from ..data.pipeline import BatchIO
 
             BatchIO.atomic_torch_save(buf, path)
@@ -539,12 +680,23 @@ class Cache:
             if tensor is None:
                 break
 
+            rel_cb = rel if callable(rel) else None
+            released_early = False
+
             try:
                 self._wait(evt)
-                self._save_tensor(tensor, path)
-                if callable(rel):
+                buf, released_early = self._prepare_tensor_for_save(
+                    tensor,
+                    release_cb=rel_cb,
+                    early_release=bool(getattr(self, "_early_release", True)),
+                    force_unpin=bool(getattr(self, "_force_unpin", False)),
+                )
+                self._save_tensor(buf, path)
+
+                if rel_cb is not None and not released_early:
                     with contextlib.suppress(Exception):
-                        rel()
+                        rel_cb()
+
             except Exception as e:
                 self._err = e
                 self._err_event.set()

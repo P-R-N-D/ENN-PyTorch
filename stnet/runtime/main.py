@@ -2623,7 +2623,12 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
     distributed_barrier(device)
-    cache = Cache(chunk_dir, max_queue=4)
+    cache_q = max(1, int(env_first_int((
+        "STNET_PRED_CACHE_MAX_QUEUE",
+        "STNET_PRED_WRITE_QUEUE",
+        "STNET_CACHE_MAX_QUEUE",
+    ), default=4)))
+    cache = Cache(chunk_dir, max_queue=cache_q)
     target_rows = int(_rt_env_int('STNET_PRED_CHUNK_ROWS', 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
