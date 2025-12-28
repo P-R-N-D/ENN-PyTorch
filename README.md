@@ -11,6 +11,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **PyTorch**: >= 2.8.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
+- **h5py**: >= 3.11.0 (required for persisted prediction outputs)
 
 ### Recommended
 - **Python**: >= 3.13t (free-threading / no-GIL build)
