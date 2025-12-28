@@ -228,7 +228,7 @@ def _wait_accel_event_done(
         sleep_s = min(float(sleep_s) * 2.0, max_s)
 
 
-class BatchState:
+class BatchScaler:
     """Per-session (or per-loader) scaling factor for auto batch sizing.
 
     - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
@@ -373,7 +373,7 @@ class Sampler(_Sampler):
         *args: Any,
         split: str = "train",
         val_frac: float = 0.0,
-        sampler_scale: Optional["BatchState"] = None,
+        sampler_scale: Optional["BatchScaler"] = None,
         **kwargs: Any,
     ) -> None:
         self.dir = os.fspath(memmap_dir)
@@ -381,7 +381,7 @@ class Sampler(_Sampler):
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
 
         # Per-session/per-loader scale controller (NOT global).
-        self._sampler_scale = sampler_scale if sampler_scale is not None else BatchState()
+        self._sampler_scale = sampler_scale if sampler_scale is not None else BatchScaler()
 
         # Runtime dynamic-batch cap (computed in pipeline._batch_interval).
         # 0 => unknown/unlimited (will still be clamped by split end).
@@ -524,7 +524,7 @@ class Sampler(_Sampler):
             self._start, self._end = (train_start, train_end)
 
     @property
-    def sampler_scale(self) -> "BatchState":
+    def sampler_scale(self) -> "BatchScaler":
         return self._sampler_scale
 
     @property
@@ -1411,8 +1411,8 @@ class BatchIO:
             label_numel = 0 if bool(features_only) else int(np.prod(label_shape))
             row_bytes = max(1, (int(in_dim) + int(label_numel)) * int(elem_size))
 
-            target_bytes = env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), None)
-            if target_bytes is None:
+            target_bytes = env_first_int(("STNET_MEMMAP_CHUNK_BYTES",), 0)
+            if int(target_bytes) <= 0:
                 target_mb = env_first_int(("STNET_MEMMAP_CHUNK_MB",), 64)
                 target_bytes = int(target_mb) * 1024 * 1024
 

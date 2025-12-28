@@ -215,10 +215,9 @@ def _sanitize_tensor(
         return t
     if not (t.is_floating_point() or t.is_complex()):
         return t
-    if bool(inplace):
-        # In-place path avoids extra allocations, but relies on the caller to
-        # ensure it's safe for autograd.
-        return torch.nan_to_num_(t, nan=0.0, posinf=0.0, neginf=0.0)
+    # NOTE: Avoid in-place sanitization even in inference. In-place writes can
+    # introduce subtle aliasing/anomaly issues when tensors are views or shared
+    # across pipeline stages (e.g., Fuser -> Enhancer). Always return a new tensor.
     return torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0)
 
 

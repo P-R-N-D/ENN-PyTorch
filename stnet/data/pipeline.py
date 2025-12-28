@@ -314,12 +314,11 @@ except Exception as _e:
     _TORCHDATA_IMPORT_ERROR = _e
 
 
+# NOTE: nodes.py imports Dataset from this module. Importing nodes before Dataset is defined
+# can trigger circular imports. We therefore import nodes lazily at the end of the file.
 _NODES_IMPORT_ERROR: Exception | None = None
-try:
-    from .nodes import BatchIO, Mapper, Disposable, Loader, Sampler, BatchState, Source, Multiplexer, BatchQueue
-except Exception as _e:
-    BatchIO = Mapper = Disposable = Loader = Sampler = Source = Multiplexer = BatchQueue = BatchState = None  # type: ignore[assignment]
-    _NODES_IMPORT_ERROR = _e
+BatchIO = Mapper = Disposable = Loader = Sampler = Source = Multiplexer = BatchQueue = BatchScaler = None  # type: ignore[assignment]
+FeatureEngineering = Bootstrap = GraphModel = CompiledGraphModel = Prefetch = None  # type: ignore[assignment]
 
 
 def _require_nodes() -> None:
@@ -778,7 +777,7 @@ def dataset(
     *args: Any,
     split: str = "train",
     val_frac: float = 0.0,
-    sampler_scale: Optional["BatchState"] = None,
+    sampler_scale: Optional["BatchScaler"] = None,
     **kwargs: Any,
 ) -> "Sampler":
     _require_nodes()
@@ -1108,7 +1107,7 @@ def fetch(
     train_weights: Optional[Mapping[str, float]] = None,
     val_weights: Optional[Mapping[str, float]] = None,
     worker_policy: Optional[WorkerPolicy] = None,
-    sampler_scale: Optional["BatchState"] = None,
+    sampler_scale: Optional["BatchScaler"] = None,
     *,
     loader_policy: Optional[LoaderPolicy] = None,
 ) -> Dict[str, Any]:
@@ -1410,7 +1409,7 @@ class Session:
     training_loader: Any = None
     validation_loader: Any = None
     disposable: Any = None
-    sampler_scale: Optional["BatchState"] = None
+    sampler_scale: Optional["BatchScaler"] = None
 
     _opened: bool = False
 
@@ -1422,7 +1421,7 @@ class Session:
     ) -> "Session":
         _require_nodes()
         if self.sampler_scale is None:
-            self.sampler_scale = BatchState()
+            self.sampler_scale = BatchScaler()
 
         dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
 
@@ -2196,3 +2195,24 @@ class Dataset(Generic[TExtra]):
             label_float_dtype=label_float_dtype,
             extra=extra_map,
         )
+
+# Late import: avoid circular dependency (nodes.py imports Dataset from this module).
+try:
+    from .nodes import (
+        BatchIO,
+        Mapper,
+        Disposable,
+        Loader,
+        Sampler,
+        Source,
+        Multiplexer,
+        BatchQueue,
+        BatchScaler,
+        FeatureEngineering,
+        Bootstrap,
+        GraphModel,
+        CompiledGraphModel,
+        Prefetch,
+    )
+except Exception as _e:
+    _NODES_IMPORT_ERROR = _e

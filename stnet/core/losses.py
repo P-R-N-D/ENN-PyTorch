@@ -1342,7 +1342,7 @@ class LinearCombinationLoss(nn.Module):
             self.coefficient.copy_(new_w.to(self.coefficient.device, dtype=self.coefficient.dtype))
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        weights = self.coefficient.detach().to(device=pred.device, dtype=pred.dtype)
+        weights = self.coefficient.detach().clone().to(device=pred.device, dtype=pred.dtype)
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
 
         per_loss_vals: List[torch.Tensor] = []
