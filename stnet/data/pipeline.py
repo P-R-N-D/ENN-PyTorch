@@ -1135,7 +1135,7 @@ def fetch(
 
     allocated = Disposable()
     batch_size: Optional[int] = None
-    scale_ctl = sampler_scale if sampler_scale is not None else BatchState()
+    scale_ctl = sampler_scale if sampler_scale is not None else BatchScaler()
 
     train_epochables: list[Any] = []
 
