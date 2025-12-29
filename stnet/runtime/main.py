@@ -1591,6 +1591,241 @@ def _all_reduce_sum_in_pg(t, pg):
     else:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=pg)
 
+
+@torch.no_grad()
+def _maybe_autotune_p_gate_fallback_k(target_module, *, step, pg=None, local_rank=0):
+    """Auto-tune Model.p_gate_fallback_k_low_buf / p_gate_fallback_k_high_buf.
+
+    This is intentionally runtime-side (not in forward) so:
+      - no distributed collectives appear in compiled graphs
+      - updates happen on optimizer-step boundaries (safe with grad accumulation)
+
+    Expected per-batch stats are accumulated inside ResidualGate when
+    fallback_bounds=True and consumed here at a configurable interval.
+
+    Stats layout (float32):
+        [count,
+         active_low_sum, active_high_sum,
+         width_sum,
+         edge_low_sum, edge_high_sum]
+
+    Where "active" measures per-side constraint activation caused by the
+    fallback bounds (mean±kσ) clipping away a meaningful fraction of the user
+    [p_floor, p_ceil] interval.
+    """
+    if target_module is None:
+        return
+    if not bool(getattr(target_module, 'p_gate_auto_k_enabled', False)):
+        return
+    gate = getattr(target_module, 'p_gate', None)
+    if gate is None or not hasattr(gate, 'consume_fallback_stats'):
+        return
+
+    interval = int(getattr(target_module, 'p_gate_auto_k_interval', 0) or 0)
+    if interval <= 0:
+        return
+    warmup = int(getattr(target_module, 'p_gate_auto_k_warmup', 0) or 0)
+    if int(step) < int(warmup):
+        # Still consume+reset occasionally to prevent unbounded accumulation.
+        if int(step) % max(1, int(interval)) == 0:
+            with contextlib.suppress(Exception):
+                gate.consume_fallback_stats()
+        return
+    if int(step) % int(interval) != 0:
+        return
+
+    # Persist the step counter for checkpoint/resume (cheap device-side fill).
+    step_buf = getattr(target_module, 'p_gate_auto_k_step_buf', None)
+    if isinstance(step_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            step_buf.fill_(int(step))
+
+    stats = gate.consume_fallback_stats()
+    if not isinstance(stats, torch.Tensor) or stats.numel() < 6:
+        return
+
+    if bool(is_distributed()):
+        with contextlib.suppress(Exception):
+            _all_reduce_sum_in_pg(stats, pg)
+
+    count = float(stats[0].item())
+    if not math.isfinite(count) or count <= 0.0:
+        return
+
+    active_low_rate = float((stats[1] / stats[0]).item())
+    active_high_rate = float((stats[2] / stats[0]).item())
+    width_mean = float((stats[3] / stats[0]).item())
+    edge_low_rate = float((stats[4] / stats[0]).item())
+    edge_high_rate = float((stats[5] / stats[0]).item())
+
+    # Update per-side EMA.
+    alpha = float(getattr(target_module, 'p_gate_auto_k_ema_alpha', 0.1))
+    alpha = max(0.0, min(1.0, alpha))
+
+    ema_low_buf = getattr(target_module, 'p_gate_auto_k_ema_low_buf', None)
+    ema_high_buf = getattr(target_module, 'p_gate_auto_k_ema_high_buf', None)
+
+    ema_low_prev = float(ema_low_buf.item()) if isinstance(ema_low_buf, torch.Tensor) else 0.0
+    ema_high_prev = float(ema_high_buf.item()) if isinstance(ema_high_buf, torch.Tensor) else 0.0
+
+    ema_low_new = (1.0 - alpha) * ema_low_prev + alpha * active_low_rate
+    ema_high_new = (1.0 - alpha) * ema_high_prev + alpha * active_high_rate
+
+    if isinstance(ema_low_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_low_buf.fill_(float(ema_low_new))
+    if isinstance(ema_high_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_high_buf.fill_(float(ema_high_new))
+
+    # Keep an overall EMA for backwards-compatible logging/tooling.
+    ema_overall = 0.5 * (float(ema_low_new) + float(ema_high_new))
+    ema_buf = getattr(target_module, 'p_gate_auto_k_ema_buf', None)
+    if isinstance(ema_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            ema_buf.fill_(float(ema_overall))
+
+    # Optional edge-based EMA (boundary hugging).
+    edge_enabled = bool(getattr(target_module, 'p_gate_auto_k_edge_enabled', False))
+    edge_alpha = float(getattr(target_module, 'p_gate_auto_k_edge_ema_alpha', alpha))
+    edge_alpha = max(0.0, min(1.0, edge_alpha))
+
+    edge_ema_low_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_low_buf', None)
+    edge_ema_high_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_high_buf', None)
+    edge_ema_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_buf', None)
+
+    edge_ema_low_prev = float(edge_ema_low_buf.item()) if isinstance(edge_ema_low_buf, torch.Tensor) else 0.0
+    edge_ema_high_prev = float(edge_ema_high_buf.item()) if isinstance(edge_ema_high_buf, torch.Tensor) else 0.0
+    edge_ema_low_new = (1.0 - edge_alpha) * edge_ema_low_prev + edge_alpha * edge_low_rate
+    edge_ema_high_new = (1.0 - edge_alpha) * edge_ema_high_prev + edge_alpha * edge_high_rate
+
+    if isinstance(edge_ema_low_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_low_buf.fill_(float(edge_ema_low_new))
+    if isinstance(edge_ema_high_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_high_buf.fill_(float(edge_ema_high_new))
+    if isinstance(edge_ema_buf, torch.Tensor):
+        with contextlib.suppress(Exception):
+            edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
+
+    # Fallback-k buffers (prefer per-side when present).
+    k_low_buf = getattr(target_module, 'p_gate_fallback_k_low_buf', None)
+    k_high_buf = getattr(target_module, 'p_gate_fallback_k_high_buf', None)
+    k_legacy_buf = getattr(target_module, 'p_gate_fallback_k_buf', None)
+
+    use_legacy = not (isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor))
+    if use_legacy:
+        # Backwards compatibility: treat a single k as symmetric.
+        if not isinstance(k_legacy_buf, torch.Tensor):
+            return
+        k_low_buf = k_legacy_buf
+        k_high_buf = k_legacy_buf
+
+    k_low_prev = float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
+    k_high_prev = float(k_high_buf.item()) if isinstance(k_high_buf, torch.Tensor) else 0.0
+    k_low_new = k_low_prev
+    k_high_new = k_high_prev
+
+    target = float(getattr(target_module, 'p_gate_auto_k_target_tight', 0.02))
+    tol = float(getattr(target_module, 'p_gate_auto_k_tolerance', 0.5))
+    hi = target * (1.0 + tol)
+    lo = max(0.0, target * (1.0 - tol))
+
+    step_up = float(getattr(target_module, 'p_gate_auto_k_step_up', 0.1))
+    step_down = float(getattr(target_module, 'p_gate_auto_k_step_down', 0.02))
+
+    step_up_low = float(getattr(target_module, 'p_gate_auto_k_step_up_low', step_up))
+    step_down_low = float(getattr(target_module, 'p_gate_auto_k_step_down_low', step_down))
+    step_up_high = float(getattr(target_module, 'p_gate_auto_k_step_up_high', step_up))
+    step_down_high = float(getattr(target_module, 'p_gate_auto_k_step_down_high', step_down))
+
+    edge_target = float(getattr(target_module, 'p_gate_auto_k_target_edge', 0.05))
+    edge_tol = float(getattr(target_module, 'p_gate_auto_k_edge_tolerance', 0.5))
+    edge_hi = edge_target * (1.0 + edge_tol)
+    edge_lo = max(0.0, edge_target * (1.0 - edge_tol))
+    edge_step_down_low = float(getattr(target_module, 'p_gate_auto_k_edge_step_down_low', 0.01))
+    edge_step_down_high = float(getattr(target_module, 'p_gate_auto_k_edge_step_down_high', 0.01))
+
+    k_min = float(getattr(target_module, 'p_gate_auto_k_min', 1.0))
+    k_max = float(getattr(target_module, 'p_gate_auto_k_max', 16.0))
+    if k_max < k_min:
+        k_max = k_min
+
+    # One-sided by default (grow fast, shrink slowly). Both directions are supported.
+    # Additionally, when constraint activation is within the target band but p frequently hugs
+    # dynamic endpoints, shrink bounds (reduce k) to prevent pathological always/never gating.
+
+    edge_low_eff = float(edge_ema_low_new) if math.isfinite(edge_ema_low_new) else float(edge_low_rate)
+    edge_high_eff = float(edge_ema_high_new) if math.isfinite(edge_ema_high_new) else float(edge_high_rate)
+
+    if math.isfinite(ema_low_new):
+        if ema_low_new > hi and step_up_low > 0.0:
+            k_low_new = k_low_prev * (1.0 + step_up_low)
+        elif ema_low_new < lo and step_down_low > 0.0:
+            k_low_new = k_low_prev * max(0.0, (1.0 - step_down_low))
+        elif edge_enabled and math.isfinite(edge_low_eff) and edge_low_eff > edge_hi and edge_step_down_low > 0.0:
+            k_low_new = k_low_prev * max(0.0, (1.0 - edge_step_down_low))
+    if math.isfinite(ema_high_new):
+        if ema_high_new > hi and step_up_high > 0.0:
+            k_high_new = k_high_prev * (1.0 + step_up_high)
+        elif ema_high_new < lo and step_down_high > 0.0:
+            k_high_new = k_high_prev * max(0.0, (1.0 - step_down_high))
+        elif edge_enabled and math.isfinite(edge_high_eff) and edge_high_eff > edge_hi and edge_step_down_high > 0.0:
+            k_high_new = k_high_prev * max(0.0, (1.0 - edge_step_down_high))
+
+    if math.isfinite(k_low_new):
+        k_low_new = max(k_min, min(k_max, k_low_new))
+    if math.isfinite(k_high_new):
+        k_high_new = max(k_min, min(k_max, k_high_new))
+
+    k_low_changed = bool(math.isfinite(k_low_new) and abs(k_low_new - k_low_prev) > 1e-12)
+    k_high_changed = bool(math.isfinite(k_high_new) and abs(k_high_new - k_high_prev) > 1e-12)
+    k_changed = bool(k_low_changed or k_high_changed)
+
+    if k_changed:
+        with contextlib.suppress(Exception):
+            if isinstance(k_low_buf, torch.Tensor):
+                k_low_buf.fill_(float(k_low_new))
+            if isinstance(k_high_buf, torch.Tensor):
+                k_high_buf.fill_(float(k_high_new))
+
+        # Keep legacy average buffer in sync when present (even if unused).
+        if isinstance(k_legacy_buf, torch.Tensor) and not use_legacy:
+            with contextlib.suppress(Exception):
+                k_legacy_buf.fill_(float(0.5 * (k_low_new + k_high_new)))
+
+        # Keep the boolean fallback flag consistent (used in forward without .item()).
+        with contextlib.suppress(Exception):
+            setattr(target_module, 'p_gate_fallback_enabled', bool(k_low_new > 0.0 and k_high_new > 0.0))
+
+        upd_buf = getattr(target_module, 'p_gate_auto_k_updates_buf', None)
+        if isinstance(upd_buf, torch.Tensor):
+            with contextlib.suppress(Exception):
+                upd_buf.add_(1)
+
+    # Logging (rank0 only).
+    log_interval = int(getattr(target_module, 'p_gate_auto_k_log_interval', 0) or 0)
+    log_due = bool(k_changed) if log_interval <= 0 else bool(int(step) % int(log_interval) == 0)
+    if int(local_rank) == 0 and log_due:
+        _LOGGER.info(
+            "[p_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
+            int(step),
+            int(count),
+            float(active_low_rate),
+            float(active_high_rate),
+            float(width_mean),
+            float(edge_low_rate),
+            float(edge_high_rate),
+            float(ema_low_new),
+            float(ema_high_new),
+            float(edge_ema_low_new),
+            float(edge_ema_high_new),
+            float(k_low_prev),
+            float(k_low_new),
+            float(k_high_prev),
+            float(k_high_new),
+        )
 def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler, sched, loss_controller, top_loss, bottom_loss, train_loader, val_loader, total_epochs, scheduler_step_per_batch=True, swa_helper=None, swa_start_epoch=0, buffers_dtype=None, dataset=None, **kwargs):
     from ..data.nodes import Sampler
     if train_loader is None:
@@ -1778,6 +2013,14 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
     mem_util_ema = None
     util_alpha = 0.2
     global_step = 0
+    # Separate from per-epoch global_step: persists across epochs so p-gate
+    # fallback_k auto-tuning does not reset every epoch.
+    p_gate_auto_step_total = 0
+    with contextlib.suppress(Exception):
+        target_for_autok = model.module if hasattr(model, 'module') else model
+        step_buf = getattr(target_for_autok, 'p_gate_auto_k_step_buf', None)
+        if isinstance(step_buf, torch.Tensor):
+            p_gate_auto_step_total = int(step_buf.item())
     util_adjust_interval = 0
     util_warmup_steps = 0
 
@@ -1879,6 +2122,17 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
         y_count = 0
         y_sum = None
         y_sum_sq = None
+        y_min = None
+        y_max = None
+        y_q_low = None
+        y_q_high = None
+        # Optional quantile bounds for y (used by p_gate when enabled).
+        want_y_quantiles = bool(getattr(model_for_scaler, 'p_gate_bounds_use_quantile', False))
+        q_low = float(getattr(model_for_scaler, 'p_gate_bounds_q_low', 0.005))
+        q_high = float(getattr(model_for_scaler, 'p_gate_bounds_q_high', 0.995))
+        q_max = int(getattr(model_for_scaler, 'p_gate_bounds_q_max_samples', 8192) or 0)
+        want_y_quantiles = bool(want_y_quantiles and q_max > 0 and (0.0 < q_low < q_high < 1.0))
+        y_q_samples = None
         scaler_stats = None
         with contextlib.suppress(Exception):
             scaler_stats = BatchIO.load_scaler_stats(ops.sources)
@@ -1890,11 +2144,23 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
             x_sum_sq = scaler_stats['x_sum_sq'].to(device=scaler_x_device)
             y_sum = scaler_stats['y_sum'].to(device=scaler_y_device)
             y_sum_sq = scaler_stats['y_sum_sq'].to(device=scaler_y_device)
+            y_min = scaler_stats.get('y_min')
+            y_max = scaler_stats.get('y_max')
+            y_q_low = scaler_stats.get('y_q_low')
+            y_q_high = scaler_stats.get('y_q_high')
+            if y_min is not None and y_max is not None:
+                y_min = y_min.to(device=scaler_y_device)
+                y_max = y_max.to(device=scaler_y_device)
+            if y_q_low is not None and y_q_high is not None:
+                y_q_low = y_q_low.to(device=scaler_y_device)
+                y_q_high = y_q_high.to(device=scaler_y_device)
         else:
             sx_tmp = None
             sx2_tmp = None
             sy_tmp = None
             sy2_tmp = None
+            sy_min_tmp = None
+            sy_max_tmp = None
             for batch in train_loader:
                 feats, labs = extract_xy(batch, labels_required=True)
                 if feats.ndim > 2:
@@ -1928,12 +2194,35 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                             y_sum_sq = torch.zeros_like(y_sum)
                             sy_tmp = torch.empty_like(y_sum)
                             sy2_tmp = torch.empty_like(y_sum)
+                            sy_min_tmp = torch.empty_like(y_sum)
+                            sy_max_tmp = torch.empty_like(y_sum)
+                            y_min = torch.full_like(y_sum, float('inf'))
+                            y_max = torch.full_like(y_sum, float('-inf'))
                         assert y_sum is not None and y_sum_sq is not None
                         assert sy_tmp is not None and sy2_tmp is not None
                         torch.sum(yf, dim=0, out=sy_tmp)
                         y_sum.add_(sy_tmp)
                         sy2_tmp.copy_(torch.einsum('ni,ni->i', yf, yf))
                         y_sum_sq.add_(sy2_tmp)
+                        if y_min is not None and y_max is not None:
+                            assert sy_min_tmp is not None and sy_max_tmp is not None
+                            torch.amin(yf, dim=0, out=sy_min_tmp)
+                            torch.minimum(y_min, sy_min_tmp, out=y_min)
+                            torch.amax(yf, dim=0, out=sy_max_tmp)
+                            torch.maximum(y_max, sy_max_tmp, out=y_max)
+                        if want_y_quantiles and q_max > 0:
+                            # Keep an approximately-uniform sample of rows for per-dim quantile estimation.
+                            y_take = yf
+                            if int(y_take.shape[0]) > int(q_max):
+                                idx = torch.randperm(int(y_take.shape[0]), device=y_take.device)[: int(q_max)]
+                                y_take = y_take.index_select(0, idx)
+                            if y_q_samples is None:
+                                y_q_samples = y_take
+                            else:
+                                y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
+                            if int(y_q_samples.shape[0]) > int(q_max):
+                                idx = torch.randperm(int(y_q_samples.shape[0]), device=y_q_samples.device)[: int(q_max)]
+                                y_q_samples = y_q_samples.index_select(0, idx)
             if is_distributed() and (not used_memmap_stats):
                 x_count_t = torch.tensor(float(x_count), device=scaler_x_device, dtype=torch.float64)
                 torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
@@ -1949,6 +2238,68 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                     torch.distributed.all_reduce(y_sum, op=torch.distributed.ReduceOp.SUM)
                 if y_sum_sq is not None:
                     torch.distributed.all_reduce(y_sum_sq, op=torch.distributed.ReduceOp.SUM)
+                if y_min is not None:
+                    torch.distributed.all_reduce(y_min, op=torch.distributed.ReduceOp.MIN)
+                if y_max is not None:
+                    torch.distributed.all_reduce(y_max, op=torch.distributed.ReduceOp.MAX)
+        # Compute y quantile bounds (per-dimension) if requested and not available from memmap stats.
+        if want_y_quantiles and (y_q_low is None or y_q_high is None):
+            # If we didn't collect samples yet (e.g., memmap scaler stats were used),
+            # do a lightweight pass over train_loader to sample y rows.
+            if y_q_samples is None:
+                for batch in train_loader:
+                    _, labs = extract_xy(batch, labels_required=True)
+                    with torch.inference_mode():
+                        yf = labs.to(device=scaler_y_device, dtype=torch.float64)
+                        if yf.ndim > 2:
+                            yf = yf.reshape(yf.shape[0], -1)
+                        if int(yf.shape[0]) <= 0:
+                            continue
+                        y_take = yf
+                        if int(y_take.shape[0]) > int(q_max):
+                            idx2 = torch.randperm(int(y_take.shape[0]), device=y_take.device)[: int(q_max)]
+                            y_take = y_take.index_select(0, idx2)
+                        if y_q_samples is None:
+                            y_q_samples = y_take
+                        else:
+                            y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
+                        if int(y_q_samples.shape[0]) > int(q_max):
+                            idx2 = torch.randperm(int(y_q_samples.shape[0]), device=y_q_samples.device)[: int(q_max)]
+                            y_q_samples = y_q_samples.index_select(0, idx2)
+
+            if y_q_samples is not None and int(y_q_samples.shape[0]) > 0:
+                y_all = y_q_samples
+                if is_distributed():
+                    # All-gather variable number of samples across ranks (pad to max first-dim).
+                    world = int(torch.distributed.get_world_size())
+                    n_local = torch.tensor([int(y_all.shape[0])], device=y_all.device, dtype=torch.int64)
+                    counts = [torch.zeros_like(n_local) for _ in range(world)]
+                    torch.distributed.all_gather(counts, n_local)
+                    counts_i = [int(c.item()) for c in counts]
+                    n_max = int(max(counts_i) if counts_i else 0)
+                    if n_max > 0:
+                        if int(y_all.shape[0]) < n_max:
+                            pad = torch.zeros((n_max - int(y_all.shape[0]), int(y_all.shape[1])), device=y_all.device, dtype=y_all.dtype)
+                            y_pad = torch.cat([y_all, pad], dim=0)
+                        else:
+                            y_pad = y_all
+                        gathered = [torch.empty_like(y_pad) for _ in range(world)]
+                        torch.distributed.all_gather(gathered, y_pad)
+                        parts = []
+                        for gi, c in zip(gathered, counts_i):
+                            if int(c) > 0:
+                                parts.append(gi[: int(c)])
+                        if len(parts) > 0:
+                            y_all = torch.cat(parts, dim=0)
+
+                # Per-dim quantiles in original y scale.
+                try:
+                    y_q_low = torch.quantile(y_all, float(q_low), dim=0)
+                    y_q_high = torch.quantile(y_all, float(q_high), dim=0)
+                except Exception:
+                    y_q_low = None
+                    y_q_high = None
+
         eps = float(model_for_scaler.scaler.eps)
         if x_count > 0 and x_sum is not None and (x_sum_sq is not None):
             mean_x = x_sum / float(x_count)
@@ -1970,6 +2321,20 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                 model_for_scaler.scaler.y_std.resize_(std_y.shape)
             model_for_scaler.scaler.y_mean.copy_(mean_y)
             model_for_scaler.scaler.y_std.copy_(std_y)
+            if y_min is not None and y_max is not None:
+                if model_for_scaler.scaler.y_min.shape != y_min.shape:
+                    model_for_scaler.scaler.y_min.resize_(y_min.shape)
+                if model_for_scaler.scaler.y_max.shape != y_max.shape:
+                    model_for_scaler.scaler.y_max.resize_(y_max.shape)
+                model_for_scaler.scaler.y_min.copy_(y_min)
+                model_for_scaler.scaler.y_max.copy_(y_max)
+            if y_q_low is not None and y_q_high is not None:
+                if model_for_scaler.scaler.y_q_low.shape != y_q_low.shape:
+                    model_for_scaler.scaler.y_q_low.resize_(y_q_low.shape)
+                if model_for_scaler.scaler.y_q_high.shape != y_q_high.shape:
+                    model_for_scaler.scaler.y_q_high.resize_(y_q_high.shape)
+                model_for_scaler.scaler.y_q_low.copy_(y_q_low)
+                model_for_scaler.scaler.y_q_high.copy_(y_q_high)
     in_dim = int(ops.in_dim)
     dev_type = str(getattr(device, 'type', 'cpu'))
     non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
@@ -2164,6 +2529,16 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
                                                 flop_breakdown_epoch[name] = flop_breakdown_epoch.get(name, 0.0) + float(value)
                             if should_sync:
                                 global_step += 1
+                                # p-gate fallback_k auto-tuning (SMA+EMA of fallback-bound tightness).
+                                p_gate_auto_step_total += 1
+                                with contextlib.suppress(Exception):
+                                    target_for_autok = model.module if hasattr(model, 'module') else model
+                                    _maybe_autotune_p_gate_fallback_k(
+                                        target_for_autok,
+                                        step=p_gate_auto_step_total,
+                                        pg=train_pg,
+                                        local_rank=local_rank,
+                                    )
                                 match device.type:
                                     case 'cuda':
                                         util_now, mem_now = _gpu_nvml_utils(device)
