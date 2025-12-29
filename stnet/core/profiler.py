@@ -75,17 +75,6 @@ def _first_tensors_from_args(args: Tuple[Any, ...], max_n: int = 4) -> List[torc
 
 
 def _infer_bhsd(x: torch.Tensor) -> Tuple[int, int, int, int]:
-    """
-    Best-effort inference of (B, H, S, D) from a 4D tensor.
-
-    Typical layouts:
-      - [B, H, S, D]
-      - [B, S, H, D]
-
-    Heuristic:
-      - D is last dimension
-      - assume H is smaller than S (usually true)
-    """
     if not isinstance(x, torch.Tensor) or x.ndim != 4:
         return (0, 0, 0, 0)
     b = int(x.shape[0])
@@ -102,7 +91,6 @@ def _infer_bhsd(x: torch.Tensor) -> Tuple[int, int, int, int]:
 
 
 def _infer_bhsd_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
-    """Infer (B,H,S,D) from a 4D shape tuple without allocating tensors."""
     if not shape or len(shape) != 4:
         return (0, 0, 0, 0)
     b = int(shape[0])
@@ -358,7 +346,6 @@ _ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 
 @lru_cache(maxsize=128)
 def _act_coeff_for_type(t: type) -> Optional[float]:
-    """Fast activation FLOPs coefficient lookup by module type."""
     coeff = _ACT_COEFF.get(t)
     if coeff is not None:
         return float(coeff)
@@ -545,11 +532,6 @@ def _get_tensor_attr(mod: nn.Module, name: str) -> Optional[torch.Tensor]:
 
 
 def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
-    """
-    Aggressive 2D-weight discovery for fused modules (e.g., Transformer Engine).
-
-    Returns list of (name, weight, has_bias). The list is de-duplicated by tensor id.
-    """
     entries: List[Tuple[str, torch.Tensor, bool]] = []
     seen: set[int] = set()
 
@@ -654,7 +636,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
 
 
 def _te_cached_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
-    """Cache TE weight discovery on the module to avoid repeated expensive introspection."""
     try:
         cache = getattr(mod, "_stnet_te_weight_cache", None)
         if isinstance(cache, dict) and cache.get("v") == 1 and isinstance(cache.get("entries"), list):
@@ -686,13 +667,6 @@ def _te_ln_affine(mod: nn.Module) -> Tuple[bool, bool]:
 
 
 def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
-    """
-    Best-effort TE coverage:
-      - Linear-like: use detected 2D weight and optional bias
-      - LayerNormLinear: LN + Linear
-      - LayerNormMLP: LN + (Linear1 + Activation + Linear2)
-      - Attention-like: infer from 4D q/k/v
-    """
     x = inp[0] if inp else None
     cname = type(mod).__name__.lower()
 
@@ -859,17 +833,6 @@ def _op_name(func: Any) -> str:
 
 
 class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
-    """
-    Operator-level FLOP counter via TorchDispatchMode.
-
-    This is the only path that can see:
-      - elementwise ops (aten.add / aten.mul ...)
-      - fused attention variants (flash/efficient/cudnn) as aten ops
-      - Triton/custom ops (best-effort via name matching)
-      - Flex attention (best-effort via SDPA/flash variants + name matching)
-
-    WARNING: counting elementwise ops can be expensive on large graphs.
-    """
 
     def __init__(
         self,
@@ -1368,7 +1331,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
 # ==============================================================================
 
 class _ShapeTensor:
-    """A tiny tensor-like for shapes only (to avoid allocating real tensors)."""
 
     def __init__(self, shape: Tuple[int, ...]) -> None:
         self.shape = tuple(int(x) for x in shape)
@@ -1398,7 +1360,6 @@ def _shape_from_meta(meta: Any) -> Optional[Tuple[int, ...]]:
 
 
 class _FxGraphFlopEstimator:
-    """Compile-safe FLOPs estimator via torch._dynamo.export + FX ShapeProp."""
 
     def __init__(self, *, include_bias: bool, effective_bwd: float, count_elementwise: bool) -> None:
         self._include_bias = bool(include_bias)
@@ -2117,7 +2078,8 @@ class _FlopProfiler:
         class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
             def __init__(self, show: bool) -> None:
                 try:
-                    from torch.utils.flop_counter import FlopCounterMode as _TorchMode
+                    from torch.utils.flop_counter import \
+                        FlopCounterMode as _TorchMode
                     self._impl = _TorchMode(display=show)
                 except Exception:
                     self._impl = None
@@ -2389,13 +2351,6 @@ class _StaticFlops(contextlib.AbstractContextManager[Any]):
 
 
 class _HybridFlops(contextlib.AbstractContextManager[Any]):
-    """
-    Wrap a dynamic monitoring scope, and fall back to cached/static FLOPs if dynamic result is zero.
-
-    Intended for:
-      - CUDA graphs replay (no Python-level hooks/dispatch on replay)
-      - aggressive fusion / opaque kernels
-    """
 
     def __init__(
         self,
@@ -2464,18 +2419,6 @@ class _HybridFlops(contextlib.AbstractContextManager[Any]):
 
 
 class FlopCounter:
-    """
-    FLOP counter with multiple backends:
-
-      - hooks: module forward hooks (fast, but misses functional ops and breaks under compile/fusion/cudagraph replay)
-      - dispatch: TorchDispatchMode op counting (covers elementwise/triton/flex best-effort; higher overhead)
-      - dynamo: torch._dynamo.export + FX ShapeProp (compile-safe/static; best for torch.compile/cudagraph replay)
-      - torch: torch.profiler(with_flops=True) baseline (may miss custom kernels)
-
-    Recommended:
-      - torch.compile / AOTAutograd / cudagraphs replay -> backend="dynamo" + step(example_args=...)
-      - eager + want elementwise detail -> backend="dispatch"
-    """
 
     def __init__(
         self,

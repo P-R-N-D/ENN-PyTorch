@@ -11,7 +11,7 @@ import torch
 from torch import nn
 
 from .casting import env_first, env_first_int
-from .system import process_cpu_count, accel_is_available
+from .system import accel_is_available, process_cpu_count
 
 try:
     from torch import compiler as _TORCH_COMPILER  # type: ignore
@@ -42,12 +42,6 @@ _NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
 
 
 def invalidate_model_introspection_caches(model: Optional[nn.Module]) -> None:
-    """Invalidate cached runtime-introspection hints on `model`.
-
-    We cache a few expensive checks (TorchScript/compile/AOT/TE probing).
-    Any time we swap modules (TE, QAT wrappers) or quantize weights, these
-    hints can become stale.
-    """
     if not isinstance(model, nn.Module):
         return
     for attr in (
@@ -202,12 +196,6 @@ def is_nvidia_te_available(model: torch.nn.Module) -> bool:
 
 
 def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
-    """Return the right inference context for `model`.
-
-    - If the model is compiled / AOT / TransformerEngine, prefer `no_grad()`.
-      (inference_mode() can break some fused/compiled paths)
-    - Otherwise, use `inference_mode()` for extra speed.
-    """
     if (
         is_nvidia_te_available(model)
         or _is_compiled_for_inference(model)
@@ -218,7 +206,6 @@ def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
 
 
 def _is_for_cuda(module: nn.Module) -> bool:
-    """Best-effort check for whether module is intended to run on CUDA."""
     try:
         p0 = next(module.parameters(), None)
         if isinstance(p0, torch.Tensor):
@@ -246,16 +233,6 @@ def compile(
     disable: bool = False,
     **kwargs: Any,
 ) -> nn.Module:
-    """Best-effort wrapper around `torch.compile`.
-
-    This is intentionally conservative:
-    - No-op when torch.compile is unavailable.
-    - No-op when mode is empty/disabled.
-    - Applies a small amount of per-process inductor config guarding to avoid
-      oversubscription when multiple local ranks compile.
-
-    NOTE: signature matches the historical `Gradient.compile` API.
-    """
     mode_given = str(mode) if mode is not None else None
     mode_raw = str(mode_given or "").strip().lower()
 
@@ -445,7 +422,8 @@ def compile(
     # Allow setting torch._inductor.config.* when user passes options in compile.
     if options and mode_value is not None:
         try:
-            from torch._inductor import config as _inductor_config  # type: ignore
+            from torch._inductor import \
+                config as _inductor_config  # type: ignore
         except Exception:
             _inductor_config = None
         if _inductor_config is not None:
@@ -493,7 +471,6 @@ _TORCH_COMPILE_DISABLE = _resolve_compile_disable()
 
 
 def torch_compile_supported() -> bool:
-    """Return True when torch.compile is available in this runtime."""
     return callable(getattr(torch, "compile", None))
 
 
@@ -527,7 +504,6 @@ def _resolve_graph_break_fn() -> Callable[[], None] | None:
 
 
 def graph_break() -> None:
-    """Break torch.compile graphs only when tracing (safe no-op otherwise)."""
     dyn = _TORCH_DYNAMO
     if dyn is None:
         return
@@ -555,14 +531,6 @@ def graph_break() -> None:
 def _compile_disable_decorator(
     *, reason: str | None = None, recursive: bool = True
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-    """Return a decorator that disables torch.compile/Dynamo tracing for a function.
-
-    Prefers `torch.compiler.disable` (newer) and falls back to `torch._dynamo.disable`
-    (older). When the API is unavailable, this becomes a no-op identity decorator.
-
-    The `disable()` signature has changed across PyTorch releases; this helper tries a
-    few keyword combinations to stay compatible.
-    """
     if _TORCH_COMPILE_DISABLE is None:
         def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
             return fn
@@ -603,20 +571,6 @@ def torch_compile_disable(
     reason: str | None = None,
     recursive: bool = True,
 ) -> Any:
-    """Disable torch.compile for a function, or patch an attribute in-place.
-
-    Supports both decorator and "patch an attribute" call styles:
-
-    Decorator (with or without args):
-        @torch_compile_disable
-        def fn(...): ...
-
-        @torch_compile_disable(reason="...", recursive=True)
-        def fn(...): ...
-
-    Attribute patching:
-        torch_compile_disable(SomeClass, "method", reason="...", recursive=False) -> bool
-    """
     if attr is not None:
         if target is None or (not hasattr(target, attr)):
             return False
@@ -673,15 +627,6 @@ def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) 
 
 
 def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
-    """Patch known Python-side helpers to be eager under torch.compile.
-
-    This function is intentionally best-effort and idempotent.
-
-    Why this exists:
-    - Some modules (e.g., Scaler) keep small Python caches guarded by locks.
-      Those are great for eager execution, but tend to confuse Dynamo/AOT.
-    - We prefer compiling the pure tensor math while keeping bookkeeping eager.
-    """
 
     if not torch_compile_supported():
         return

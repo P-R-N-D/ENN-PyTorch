@@ -21,7 +21,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **torchao**: >= 0.14.0
 
 ## Features
-- **Typed configuration** (`stnet.core.config`): dataclass-based configs with sensible defaults and validation/coercion.
+- **Typed configuration** (`stnet.config`): dataclass-based configs with sensible defaults and validation/coercion.
 - **API** (`stnet.api`): create models, save/load checkpoints, and provide train/predict entrypoints. Low-level exporters and native checkpoint writers live in `stnet.runtime.io`.
 - **Runtime utilities** (`stnet.runtime.main`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
 - **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
@@ -81,7 +81,7 @@ import torch
 
 import stnet
 
-from stnet.core.config import ModelConfig
+from stnet.config import ModelConfig
 from stnet.core.losses import StudentsTLoss
 from stnet.core.system import optimize_threads
 
@@ -209,7 +209,7 @@ stnet/
 
 ### ModelConfig string options
 
-`stnet.core.config.coerce_model_config()` normalizes common separator variants in a few string fields
+`stnet.config.coerce_model_config()` normalizes common separator variants in a few string fields
 to reduce "almost-right" config bugs:
 
 - `modeling_type`: canonical values `{ss, tt, st}`.

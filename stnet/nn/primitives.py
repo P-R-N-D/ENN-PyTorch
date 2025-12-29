@@ -5,20 +5,22 @@ import contextlib
 import math
 import threading
 from collections import OrderedDict
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
+                    Tuple)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _checkpoint
 
-from ..core.compat import StochasticDepth
 from ..core.casting import env_bool, env_int, env_str
+from ..core.compat import StochasticDepth
 
 _Norm = nn.LayerNorm
 
 try:
-    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+    from torch.nn.attention.flex_attention import (create_block_mask,
+                                                   flex_attention)
 
     _HAS_FLEX_ATTENTION = True
 except Exception:
@@ -49,11 +51,6 @@ _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
 
 
 def _device_key(device: torch.device) -> Tuple[str, int]:
-    """Return a hashable (type, index) key for caches.
-
-    Kept as a tiny helper to avoid repeating defensive device.index handling
-    in multiple hot-path caches.
-    """
 
     idx = -1
     with contextlib.suppress(Exception):
@@ -80,12 +77,8 @@ _STNET_CHECKPOINT_MODE = _stnet_checkpoint_mode()
 
 from ..core.profiler import FLOP_PROFILER
 from ..core.system import empty_device_cache
-from .kernels import (
-    DotProductAttention,
-    MultiHeadAttention,
-    MultiScaleRetention,
-    reshape_for_mha,
-)
+from .kernels import (DotProductAttention, MultiHeadAttention,
+                      MultiScaleRetention, reshape_for_mha)
 
 
 def norm_layer(norm_type: str, dim: int) -> nn.Module:
@@ -107,16 +100,6 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
 
 
 class _FlexBoolMaskMod:
-    """Callable mask adapter for torch flex_attention block masks.
-
-    The project uses boolean attention masks with semantics:
-        True = masked/disallowed
-
-    flex_attention / create_block_mask expects:
-        True = allowed
-
-    So we invert (~) the supplied mask.
-    """
 
     __slots__ = ("m", "mode")
 
@@ -141,10 +124,6 @@ class _FlexBoolMaskMod:
 
 
 class _FlexScoreMod:
-    """Callable score modifier for torch flex_attention.
-
-    Adds a coordinate-dependent relative bias + optional additive attn_mask bias.
-    """
 
     __slots__ = ("coord_proj", "mask_bias", "mask_bias_kind")
 
@@ -187,11 +166,6 @@ class _FlexScoreMod:
 
 
 class _FlexDilatedMaskMod:
-    """Callable mask for create_block_mask used by DilatedAttention.
-
-    This replaces an inner-function closure to reduce per-call allocations
-    and to keep the hot path friendlier to free-threaded / no-GIL builds.
-    """
 
     __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
 
@@ -845,9 +819,6 @@ class DilatedAttention(nn.Module):
         dropout_p: float,
         is_causal: bool,
     ) -> torch.Tensor:
-        """
-        Call DotProductAttention with best-effort kwarg compatibility.
-        """
         attn = getattr(self, "_dot_attn", None)
         if attn is None:
             attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
@@ -1966,12 +1937,6 @@ class Scaler(nn.Module):
         self.affine_b.zero_()
 
     def _piecewise(self, z_raw: torch.Tensor) -> torch.Tensor:
-        """Piecewise-linear calibration without mutating module buffers.
-
-        Previous code resized/sliced/reassigned self.pw_x/self.pw_y inside forward,
-        which is unsafe under multithreading and can break torch.compile assumptions.
-        This implementation treats saved knots as read-only and uses local views.
-        """
         if self.pw_x.numel() == 0 or self.pw_y.numel() == 0:
             return z_raw
         if self.pw_x.dim() != 2 or self.pw_y.dim() != 2:
@@ -2020,23 +1985,7 @@ class Scaler(nn.Module):
         return out
 
 
-class ResidualGate(nn.Module):
-    """Learned, bounded gate `p` for residual mixing.
-
-    Computes `z_hat = base + p * residue` with `p` constrained to a user-specified
-    range. Optionally tightens the allowed `p` interval per-sample so that the
-    mixed output stays within provided (z_min, z_max) bounds.
-
-    Supports two modes:
-      - Scalar p (default): one `p` per sample, returned as shape (B, 1).
-      - Tile-wise p: one `p` per *output tile* along the flattened y dimension,
-        expanded to (B, D) for elementwise mixing and compatibility with TiledLoss.
-
-    This module is intentionally simple and torch.compile friendly:
-    - No torch.distributions objects
-    - No python-side randomness in forward
-    - All math is vectorized
-    """
+class SigmoidGate(nn.Module):
 
     def __init__(
         self,
@@ -2132,15 +2081,6 @@ class ResidualGate(nn.Module):
 
     @torch.no_grad()
     def consume_fallback_stats(self) -> torch.Tensor:
-        """Return and reset fallback-bound diagnostics.
-
-        Returns a float32 tensor of shape (6,):
-            [count, active_low_sum, active_high_sum, width_sum, edge_low_sum, edge_high_sum]
-
-        Notes:
-          - In scalar mode, `count` is the number of samples.
-          - In tile-wise mode, `count` is the number of tiles (B * n_tiles).
-        """
         stats = torch.stack(
             [
                 self._fb_count.detach(),
@@ -2160,9 +2100,8 @@ class ResidualGate(nn.Module):
         return stats
 
     def _expand_tiles(self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
-        """Expand (B, T) -> (B, dim) by repeating per-tile values."""
         if self.tile_size <= 0:
-            raise RuntimeError("ResidualGate._expand_tiles called with tile_size<=0")
+            raise RuntimeError("SigmoidGate._expand_tiles called with tile_size<=0")
         b = int(p_tile.shape[0])
         tile = int(self.tile_size)
         n_tiles = int(p_tile.shape[1])
@@ -2557,6 +2496,10 @@ class ResidualGate(nn.Module):
                 edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
             return out_full, edge_reg.to(dtype=out_dtype)
         return out_full
+
+
+# Backward compatibility: old checkpoints may reference ResidualGate.
+ResidualGate = SigmoidGate
 
 
 class Recorder(nn.Module):

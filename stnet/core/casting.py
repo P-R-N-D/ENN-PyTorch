@@ -14,11 +14,6 @@ _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
 
 
 def parse_bool(value: object) -> bool | None:
-    """Parse common boolean env tokens.
-
-    Returns:
-        True/False for recognized tokens, otherwise None.
-    """
 
     if value is None:
         return None
@@ -76,15 +71,6 @@ def env_float(name: str, default: float = 0.0) -> float:
 
 
 def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
-    """Return the first non-empty env value among keys.
-
-    Args:
-        keys: environment variable names in priority order.
-        default: value returned when none of the keys are set (or all are empty).
-
-    Notes:
-        This keeps call-sites compact and avoids sprinkling `or <default>` everywhere.
-    """
 
     for k in keys:
         s = _env_clean(os.getenv(k))
@@ -94,11 +80,6 @@ def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
 
 
 def env_flag(*keys: str, default: bool = False) -> bool:
-    """Parse a boolean-ish environment flag across multiple keys.
-
-    - Recognized boolean tokens follow `parse_bool()`
-    - Any other non-empty value is treated as True (legacy-compatible behavior)
-    """
     if not keys:
         return bool(default)
 
@@ -287,15 +268,6 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
 
 
 def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
-    """Best-effort torch dtype parser.
-
-    Accepts:
-      - torch.dtype
-      - strings like "float32", "torch.float32", "fp32", "long", ...
-      - numpy dtypes / dtype-like objects
-
-    Returns None when parsing fails (caller can fall back to a default).
-    """
 
     if src is None:
         return None
@@ -324,7 +296,6 @@ def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
 
 
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
-    """Parse a torch dtype from a name-like input; fall back to `default`."""
 
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default

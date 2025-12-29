@@ -47,15 +47,6 @@ def _strip_ip_expr(value: Any) -> str:
 
 
 def _strip_ipv6_expr(value: str) -> tuple[str, bool, str | None]:
-    """
-    Normalize an IPv6-ish text expression.
-
-    Returns:
-        (base, bracketed, zone)
-        - base: address without brackets and without zone id
-        - bracketed: whether the input used [addr] style
-        - zone: the zone-id (e.g. "eth0") if present (addr%zone), else None
-    """
     stripped = value.strip()
     bracketed = False
     if stripped.startswith("[") and stripped.endswith("]"):
@@ -91,9 +82,6 @@ def _canonize_ip_expr(
     allow_link_local: bool = False,
     **kwargs: Any,
 ) -> str | None:
-    """
-    Return a canonical IP literal (possibly with %zone for IPv6 link-local), or None.
-    """
     candidate_text = _strip_ip_expr(value)
     if not candidate_text:
         return None
@@ -138,18 +126,6 @@ def _format_endpoint(host: str, port: int) -> str:
 
 
 def _parse_endpoint(endpoint: str) -> tuple[str, int]:
-    """
-    Parse an endpoint expression into (host, port).
-
-    Supports:
-      - IPv4: "1.2.3.4" or "1.2.3.4:29500"
-      - IPv6: "2001:db8::1" or "[2001:db8::1]:29500"
-      - hostnames: "example.com" or "example.com:29500"
-
-    Note: unbracketed IPv6 with a port (e.g. "2001:db8::1:29500") is ambiguous.
-    We treat it as a host-only address unless the full string is not a valid IPv6 literal
-    and the suffix is a valid port.
-    """
     text = _strip_ip_expr(endpoint)
     if not text:
         return "", 0
@@ -320,13 +296,6 @@ def validate_ip_expr(
     allow_link_local: bool | None = None,
     **kwargs: Any,
 ) -> str:
-    """
-    Validate an IP/hostname expression.
-
-    - If the input looks like an IP literal, enforce allow_loopback/allow_link_local rules.
-    - If it's not an IP and allow_hostname=True, return the stripped hostname.
-    - Otherwise try fallback, then default.
-    """
     if allow_link_local is None:
         allow_link_local = env_bool("STNET_ALLOW_LINK_LOCAL", False)
 
@@ -731,17 +700,6 @@ def distributed_broadcast(
     strict: bool | None = None,
     **kwargs: Any,
 ) -> None:
-    """
-    Broadcast parameters + buffers from rank `src` to all ranks.
-
-    - Single pass over (buffers + params)
-    - torch.no_grad() to avoid autograd side effects
-    - Use torch's coalesced broadcast when available, with a safe fallback
-
-    Controls:
-      - STNET_BROADCAST_COALESCE_MB (default: 25)
-      - STNET_DISTRIBUTED_STRICT (default: False)
-    """
     if not is_distributed():
         return
 
@@ -894,7 +852,8 @@ def to_fsdp(
         sharded.set_requires_gradient_sync(True)
 
     try:
-        from torch.distributed.fsdp import register_fsdp_forward_method as _reg_fsdp_forward_method
+        from torch.distributed.fsdp import \
+            register_fsdp_forward_method as _reg_fsdp_forward_method
     except Exception:
         _reg_fsdp_forward_method = None
 

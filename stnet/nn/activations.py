@@ -8,20 +8,6 @@ from torch import nn
 
 
 class GLU(nn.Module):
-    """
-    Base class for gated MLP activations (e.g., GeGLU, SwiGLU).
-
-    This implements a common "gated" pattern:
-
-        a, b = Linear(in_dim -> 2*hidden_dim)(x).chunk(2, dim=-1)
-        y    = Linear(hidden_dim -> out_dim)( dropout( activation(a) * b ) )
-
-    Notes
-    -----
-    - Uses a single input projection (one matmul) and splits into (a, b) for efficiency.
-    - If dropout == 0, the dropout module becomes nn.Identity to avoid unnecessary overhead.
-    - Input shape checks are optional (enabled by default) to preserve safety and debuggability.
-    """
 
     def __init__(
         self,
@@ -69,7 +55,6 @@ class GLU(nn.Module):
 
     @property
     def hidden_dim(self) -> int:
-        """Alias for self.hid (more descriptive name)."""
         return self.hid
 
     def extra_repr(self) -> str:
@@ -93,7 +78,6 @@ class GLU(nn.Module):
 
 
 class GeGLU(GLU):
-    """Gated GELU (GeGLU): gelu(a) * b."""
 
     def __init__(
         self,
@@ -117,7 +101,6 @@ class GeGLU(GLU):
 
 
 class SwiGLU(GLU):
-    """Gated SiLU (SwiGLU): silu(a) * b."""
 
     def __init__(
         self,

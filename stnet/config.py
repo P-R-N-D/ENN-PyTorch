@@ -1,38 +1,15 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-"""
-stnet/core/config.py
-
-Configuration dataclasses + coercion/validation helpers.
-
-Design goals:
-- Avoid dataclasses.asdict() on potentially large objects (it recurses and deepcopy()'s
-  non-container values), to reduce memory peaks and improve thread scalability.
-  See Python docs for dataclasses.asdict() behavior.  (Ref: docs.python.org)
-- Provide strict, predictable coercion with clear error messages.
-- Enforce PatchConfig.is_square / is_cube as value constraints.
-"""
-
-from dataclasses import dataclass, field, fields
 import math
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    ClassVar,
-    Dict,
-    Literal,
-    Optional,
-    Sequence,
-    Tuple,
-    TypeAlias,
-    Union,
-)
+from dataclasses import dataclass, field, fields
+from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Literal, Optional,
+                    Sequence, Tuple, TypeAlias, Union)
 
 import torch
 
 if TYPE_CHECKING:
-    from ..data.nodes import Source  # pragma: no cover
+    from .data.nodes import Source  # pragma: no cover
 else:
     Source = Dict[str, Any]
 
@@ -42,16 +19,10 @@ else:
 # -----------------------------
 
 def _shallow_dataclass_dict(obj: Any) -> Dict[str, Any]:
-    """Shallow conversion of a dataclass instance to a dict (no recursion, no deepcopy)."""
     return {f.name: getattr(obj, f.name) for f in fields(obj.__class__)}
 
 
 def _shallow_copy_if_container(value: Any) -> Any:
-    """Shallow-copy common containers (no deep recursion).
-
-    This keeps the "no deepcopy" design goal, while avoiding surprising aliasing when a config
-    field happens to contain a mutable container (e.g. list).
-    """
     if isinstance(value, dict):
         return dict(value)
     if isinstance(value, list):
@@ -74,11 +45,6 @@ def _coerce_str(
     lower: bool = False,
     strip: bool = True,
 ) -> str:
-    """
-    Coerce to string.
-    - None or blank -> default
-    - optionally lower-case
-    """
     if value is None:
         return default
     s = str(value)
@@ -364,12 +330,6 @@ class ModelConfig:
     p_prior_beta: float = 2.0
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert this config into a JSON-friendly dict.
-
-        - Shallow conversion only (no recursion / deepcopy).
-        - Ensures `patch` is a plain dict.
-        - Ensures `device` is serializable (string) when it's a torch.device.
-        """
         data = _shallow_dataclass_dict(self)
         data["patch"] = patch_config_to_dict(getattr(self, "patch", None))
 
@@ -992,7 +952,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
 
 
 def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[str, Any]:
-    """Convert PatchConfig/dict/None into a JSON-friendly dict without dataclasses.asdict()."""
     cfg = coerce_patch_config(config)
     data = _shallow_dataclass_dict(cfg)
     # Copy list/dict/set containers one level deep (no recursion).
@@ -1000,10 +959,6 @@ def patch_config_to_dict(config: PatchConfig | Dict[str, Any] | None) -> Dict[st
 
 
 def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[str, Any]:
-    """Convert ModelConfig/dict/None into a JSON-friendly dict.
-
-    Prefer calling :meth:`ModelConfig.to_dict` directly.
-    """
     if config is None:
         return {}
     cfg = config if isinstance(config, ModelConfig) else coerce_model_config(config)
@@ -1148,13 +1103,6 @@ class RuntimeConfig:
 
     @staticmethod
     def from_partial(mode: OpsMode, *args: Any, **kwargs: Any) -> "RuntimeConfig":
-        """
-        Build RuntimeConfig from partial inputs.
-
-        Positional args are supported for backward compatibility:
-        - train: RuntimeConfig.TRAIN_POS_ORDER
-        - predict/infer: RuntimeConfig.PRED_POS_ORDER
-        """
         if "mode" in kwargs:
             raise TypeError("RuntimeConfig.from_partial() does not accept 'mode' in kwargs")
 
@@ -1358,12 +1306,6 @@ def coerce_runtime_config(config: RuntimeConfig | Dict[str, Any]) -> RuntimeConf
 
 
 def runtime_config(mode: OpsMode, base: Dict[str, Any] | None, /, *args: Any, **kwargs: Any) -> RuntimeConfig:
-    """
-    Convenience builder:
-    - Merge base + kwargs
-    - Determine mode (kwargs/base can override)
-    - Map positional args according to that mode
-    """
     data: Dict[str, Any] = dict(base or {})
     if kwargs:
         data.update(kwargs)

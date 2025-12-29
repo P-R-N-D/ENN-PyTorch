@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import os
 import tempfile
-import contextlib
 from typing import Any, Mapping, Optional, Tuple
 
 import torch
@@ -31,11 +31,6 @@ def _casefold_str(x: Any) -> Optional[str]:
 
 
 def resolve_feature_key(data: Any) -> str:
-    """Resolve the (unique) feature key in a mapping/TensorDict.
-
-    Accepted aliases (case-insensitive):
-      x, feature, features, input, inputs, in
-    """
     if not isinstance(data, (Mapping, TensorDictBase)):
         raise TypeError("resolve_feature_key expects a Mapping or TensorDict")
 
@@ -55,13 +50,6 @@ def resolve_feature_key(data: Any) -> str:
 
 
 def resolve_label_key(data: Any, *, required: bool = True) -> Optional[str]:
-    """Resolve the (unique) label key in a mapping/TensorDict.
-
-    Accepted aliases (case-insensitive):
-      y, label, labels, output, outputs, out
-
-    If required=False, returns None when no label key exists.
-    """
     if not isinstance(data, (Mapping, TensorDictBase)):
         raise TypeError("resolve_label_key expects a Mapping or TensorDict")
 
@@ -89,7 +77,6 @@ def extract_xy(
     *,
     labels_required: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Extract (X, Y) tensors from a mapping/TensorDict using alias resolution."""
     fkey = resolve_feature_key(data)
     lkey = resolve_label_key(data, required=labels_required)
     x = data[fkey]
@@ -119,7 +106,6 @@ def canonicalize_xy_keys_(
     y_key: str = "Y",
     allow_missing_labels: bool = False,
 ) -> TensorDictBase:
-    """Rename feature/label keys in-place to a canonical (X, Y) convention."""
     if not isinstance(td, TensorDictBase):
         raise TypeError("canonicalize_xy_keys_ expects a TensorDict")
 
@@ -141,16 +127,10 @@ def canonicalize_xy_keys_(
 # -----------------------------------------------------------------------------
 
 def mmt_meta_path(mmt_path: str) -> str:
-    """Sidecar metadata path for a MemoryMappedTensor file."""
     return str(mmt_path) + ".meta.json"
 
 
 def atomic_write_json(path: str, payload: Any, *, indent: int | None = 2) -> None:
-    """Atomically write JSON (best-effort).
-
-    Used for small sidecar metadata files that must not be left half-written
-    under multi-process or abrupt-interrupt scenarios.
-    """
     import json as _json
 
     p = os.fspath(path)
@@ -172,12 +152,6 @@ def atomic_write_json(path: str, payload: Any, *, indent: int | None = 2) -> Non
 
 
 def atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
-    """Atomically write a torch checkpoint file.
-
-    Writes to a temporary file in the same directory and then replaces
-    it into place. This avoids corrupting checkpoints if interrupted
-    mid-write.
-    """
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
     os.makedirs(parent, exist_ok=True)
@@ -200,12 +174,6 @@ _DEF_UNDERFLOW_ACTIONS = {"allow", "warn", "forbid"}
 
 
 def default_underflow_action() -> str:
-    """Return underflow policy used by precision negotiation.
-
-    - allow: underflow (flush-to-zero / subnormals) is allowed
-    - warn: allowed but may be logged
-    - forbid: treat underflow as unsafe for downcasting
-    """
     from ..core.casting import env_first
 
     raw = str(

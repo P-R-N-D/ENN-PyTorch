@@ -26,7 +26,8 @@ from typing import Any, Callable, Optional, Sequence, Tuple, Union
 import torch
 import torch.multiprocessing as mp
 
-from .casting import env_bool, env_first, env_first_float, env_first_int, env_float, env_str, parse_bool
+from .casting import (env_bool, env_first, env_first_float, env_first_int,
+                      env_float, env_str, parse_bool)
 
 try:
     from zoneinfo import ZoneInfo
@@ -64,7 +65,6 @@ _TORCH_INTEROP_LOCKED: bool = False
 
 
 def _log_info(logger: Optional[Any], msg: str) -> None:
-    """Best-effort info logging with an optional user-provided logger."""
     if logger is None:
         _LOGGER.info(msg)
         return
@@ -80,7 +80,6 @@ def _log_info(logger: Optional[Any], msg: str) -> None:
 
 
 def _log_debug(logger: Optional[Any], msg: str) -> None:
-    """Best-effort debug logging with an optional user-provided logger."""
     if logger is None:
         _LOGGER.debug(msg)
         return
@@ -98,11 +97,6 @@ def _log_debug(logger: Optional[Any], msg: str) -> None:
 def _empty_cache_device_key(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[str, int]:
-    """Return a stable (device_type, device_index) key for rate limiting.
-
-    If device is None, returns a dedicated ('all', -1) key (meaning: global cache clear).
-    If device is provided without an index, best-effort uses the backend's current device.
-    """
     if device is None:
         return ("all", -1)
 
@@ -133,13 +127,6 @@ def _empty_cache_device_key(
 
 
 def _linux_cgroup_cpu_quota() -> Optional[float]:
-    """Return cgroup CPU quota as a float CPU count (Linux only).
-
-    - cgroup v2: reads cpu.max (quota/period)
-    - cgroup v1: reads cpu.cfs_quota_us / cpu.cfs_period_us
-
-    Returns None when no quota is detected (unlimited) or on errors.
-    """
     if not sys.platform.startswith("linux"):
         return None
 
@@ -218,10 +205,6 @@ def _linux_cgroup_cpu_quota() -> Optional[float]:
 
 
 def _darwin_sysctl_cpu_count() -> Optional[int]:
-    """Best-effort logical CPU count on macOS via sysctl.
-
-    This is a fallback for cases where os.cpu_count() returns None.
-    """
     if platform.system() != "Darwin":
         return None
 
@@ -429,15 +412,6 @@ def device_mem_util_percent(device: torch.device) -> Optional[float]:
 
 
 def _windows_allowed_cpu_indices() -> Optional[list[int]]:
-    """Best-effort allowed CPU indices on Windows.
-
-    - Prefer process affinity mask (single processor group).
-    - Fall back to processor-group counts and process group affinity (multi-group).
-
-    Returned indices are *logical* indices usable by this process. For multi-group
-    systems we return a contiguous [0..N) index space, and later map it to
-    (group, within-group) inside the pinning routine.
-    """
     if platform.system() != "Windows":
         return None
 
@@ -515,13 +489,6 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
 
 
 def get_allowed_cpus() -> list[int]:
-    """Return CPU IDs usable by the current process.
-
-    Notes:
-      - On Linux, this respects affinity and cpuset restrictions.
-      - On Windows, this is best-effort and may be a synthetic contiguous index space
-        on systems with multiple processor groups.
-    """
     # 1) Native affinity (Linux, some Unix)
     with contextlib.suppress(Exception):
         cpus = os.sched_getaffinity(0)
@@ -569,21 +536,6 @@ def get_allowed_cpus() -> list[int]:
 
 
 def process_cpu_count() -> int:
-    """Best-effort CPU count usable by this process/thread.
-
-    Priority order:
-      1) Explicit overrides: STNET_CPU_COUNT / PYTHON_CPU_COUNT / -X cpu_count
-      2) Python 3.13+: os.process_cpu_count() (respects affinity and Python overrides)
-      3) os.sched_getaffinity(0) / psutil affinity / Windows groups via get_allowed_cpus()
-      4) os.cpu_count()
-
-    Linux containers note:
-      - If no explicit override is provided, we additionally clamp the result by the
-        cgroup CPU quota (v1/v2). This prevents severe oversubscription when the
-        host CPU count is visible but the container has a smaller quota.
-
-    The cgroup clamp uses *floor* semantics (e.g., 1.9 -> 1) and always returns >= 1.
-    """
     # Explicit per-project override (highest priority).
     for key in ("STNET_CPU_COUNT", "STNET_EFFECTIVE_CPU_COUNT"):
         v = os.environ.get(key)
@@ -651,12 +603,6 @@ def _read_thread_cap_multiplier(default: int) -> int:
 
 
 def _default_cap_mult(ncpu_raw: int, *, is_accel: bool, nogil: bool) -> int:
-    """Heuristic oversubscription multiplier.
-
-    - Accelerator: allow modest oversubscription to keep input pipeline busy.
-    - CPU-only: avoid oversubscription by default (hurts CPU-bound work).
-    - no-GIL: allow slightly more oversubscription when thread parallelism is real.
-    """
     cap_mult = 3 if (nogil and is_accel) else (2 if is_accel else 1)
 
     # Be conservative on small CPU budgets (common in containers / CI).
@@ -911,12 +857,6 @@ class WorkerPolicy:
         }
 
     def apply_torch_threads(self) -> None:
-        """Apply torch intra/inter-op thread settings (best-effort).
-
-        Notes:
-          - torch.set_num_interop_threads() can only be called once per process.
-          - Keep idempotent to avoid repeated overhead and noisy exceptions.
-        """
         global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
 
         intra = max(1, int(self.intra_ops))
@@ -948,15 +888,6 @@ def empty_device_cache(
     do_gc: bool = True,
     min_interval_s: Optional[float] = None,
 ) -> None:
-    """Best-effort device cache clearing with rate limiting.
-
-    Centralizes cache clearing across CUDA/XPU/MPS/accelerator backends and avoids
-    `empty_cache()` storms (which can become very expensive on fast/no-GIL loops).
-
-    Env:
-      - STNET_EMPTY_CACHE=0/false/off to disable
-      - STNET_EMPTY_CACHE_MIN_INTERVAL_S (default: 0.5)
-    """
     if not env_bool("STNET_EMPTY_CACHE", True):
         return
 
@@ -1032,11 +963,6 @@ def empty_device_cache(
 
 @lru_cache(maxsize=8)
 def accel_backend_for_device_type(dev_type: str) -> Optional[ModuleType]:
-    """Return the torch backend module for the given device type.
-
-    This intentionally centralizes backend discovery so other modules don't
-    duplicate fragile `getattr(torch, "cuda")` / `getattr(torch, "xpu")` logic.
-    """
 
     dt = str(dev_type or "cpu").strip().lower()
     if dt in {"cuda", "xpu", "mps"}:
@@ -1048,13 +974,6 @@ def accel_backend_for_device_type(dev_type: str) -> Optional[ModuleType]:
 
 @lru_cache(maxsize=8)
 def accel_is_available(dev_type: str) -> bool:
-    """Return True if the given accelerator backend is available.
-
-    Notes:
-        - CUDA: `torch.cuda.is_available()`
-        - XPU: `torch.xpu.is_available()` (when present)
-        - MPS: `torch.backends.mps.is_available()` (preferred), else `torch.mps.is_available()` when present
-    """
     dt = str(dev_type or "cpu").strip().lower()
 
     if dt == "cuda":
@@ -1091,7 +1010,6 @@ def accel_is_available(dev_type: str) -> bool:
 
 @lru_cache(maxsize=8)
 def accel_device_count(dev_type: str) -> int:
-    """Return the number of devices for an accelerator backend (0 if unavailable)."""
     dt = str(dev_type or "cpu").strip().lower()
 
     if dt == "cuda":
@@ -1118,7 +1036,6 @@ def accel_device_count(dev_type: str) -> int:
 
 
 def accel_current_device_index(dev_type: str) -> int:
-    """Return the current device index for CUDA/XPU (or 0 for MPS)."""
     dt = str(dev_type or "cpu").strip().lower()
 
     if dt == "cuda":
@@ -1145,7 +1062,6 @@ def accel_current_device_index(dev_type: str) -> int:
 
 
 def accel_set_device_index(dev_type: str, idx: int) -> None:
-    """Best-effort set current device for CUDA/XPU (no-op for others)."""
     dt = str(dev_type or "cpu").strip().lower()
     i = int(idx)
 
@@ -1168,7 +1084,6 @@ def accel_set_device_index(dev_type: str, idx: int) -> None:
 
 
 def accel_manual_seed_all(seed: int) -> None:
-    """Best-effort seed all devices for the active accelerators."""
     s = int(seed)
     # CUDA
     if accel_is_available("cuda"):
@@ -1184,7 +1099,6 @@ def accel_manual_seed_all(seed: int) -> None:
 
 
 def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]:
-    """Return device memory utilization percentage for CUDA/XPU/MPS when possible."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1237,7 +1151,6 @@ def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]
 
 
 def accel_device_total_memory_bytes(device: Union[torch.device, str]) -> Optional[int]:
-    """Return total device memory in bytes for CUDA/XPU/MPS when possible."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1283,7 +1196,6 @@ def accel_device_total_memory_bytes(device: Union[torch.device, str]) -> Optiona
 
 
 def accel_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
-    """Best-effort allocated memory in bytes for CUDA/XPU/MPS."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1326,7 +1238,6 @@ def accel_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
 
 
 def accel_reset_peak_memory_stats(device: Union[torch.device, str]) -> None:
-    """Best-effort reset of peak memory stats for CUDA/XPU/MPS."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1372,7 +1283,6 @@ def accel_reset_peak_memory_stats(device: Union[torch.device, str]) -> None:
 
 
 def accel_max_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
-    """Best-effort peak allocated memory in bytes for CUDA/XPU/MPS."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1415,7 +1325,6 @@ def accel_max_memory_allocated(device: Union[torch.device, str]) -> Optional[int
 
 
 def accel_ipc_collect() -> None:
-    """Best-effort CUDA IPC cache collection (no-op on non-CUDA builds)."""
     if not accel_is_available("cuda"):
         return
     with contextlib.suppress(Exception):
@@ -1425,7 +1334,6 @@ def accel_ipc_collect() -> None:
 
 
 def accel_device_context(device: torch.device) -> contextlib.AbstractContextManager[None]:
-    """Best-effort device context manager (e.g., torch.cuda.device)."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1455,14 +1363,6 @@ def accel_device_context(device: torch.device) -> contextlib.AbstractContextMana
 
 
 def accel_synchronize(device: Union[torch.device, str]) -> None:
-    """Best-effort device synchronize.
-
-    - Uses torch.accelerator.synchronize when present (preferred common API).
-    - Falls back to torch.<backend>.synchronize in a backend-agnostic way.
-
-    This is intentionally conservative: it avoids raising even when the backend
-    is missing or the synchronize signature differs.
-    """
 
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
@@ -1534,7 +1434,6 @@ def accel_synchronize(device: Union[torch.device, str]) -> None:
 
 @lru_cache(maxsize=8)
 def accel_timing_events_supported_for_device_type(dev_type: str) -> bool:
-    """Return True if backend timing events are supported for device type."""
     dt = str(dev_type or "cpu").strip().lower()
     backend = accel_backend_for_device_type(dt)
     if backend is None:
@@ -1570,7 +1469,6 @@ def accel_timing_events_supported_for_device_type(dev_type: str) -> bool:
 
 
 def accel_make_event(device: torch.device, *, enable_timing: bool = False) -> object | None:
-    """Create a backend event (CUDA/XPU) when available."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1595,7 +1493,6 @@ def accel_make_event(device: torch.device, *, enable_timing: bool = False) -> ob
 
 @lru_cache(maxsize=8)
 def accel_streaming_supported_for_device_type(dev_type: str) -> bool:
-    """Return True if Stream/Event/stream() APIs are available for device type."""
     dt = str(dev_type or "cpu").strip().lower()
     if dt not in {"cuda", "xpu"}:
         return False
@@ -1619,7 +1516,6 @@ def accel_streaming_supported_for_device_type(dev_type: str) -> bool:
 
 @lru_cache(maxsize=8)
 def accel_pinned_h2d_supported_for_device_type(dev_type: str) -> bool:
-    """Return True when pinned + non_blocking transfers can be overlapped safely."""
     dt = str(dev_type or "cpu").strip().lower()
     if dt not in {"cuda", "xpu"}:
         return False
@@ -1639,7 +1535,6 @@ def accel_pinned_h2d_supported_for_device_type(dev_type: str) -> bool:
 
 
 def accel_stream_context(stream: object, dev_type: str) -> contextlib.AbstractContextManager[None]:
-    """Return a backend stream context manager when available."""
     backend = accel_backend_for_device_type(str(dev_type or "cpu"))
     fn = getattr(backend, "stream", None) if backend is not None else None
     if not callable(fn):
@@ -1651,7 +1546,6 @@ def accel_stream_context(stream: object, dev_type: str) -> contextlib.AbstractCo
 
 
 def accel_new_stream(device: torch.device) -> object | None:
-    """Create a backend stream for CUDA/XPU when supported."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1675,7 +1569,6 @@ def accel_new_stream(device: torch.device) -> object | None:
 
 
 def accel_current_stream(device: torch.device) -> object | None:
-    """Return the backend current stream for the device (CUDA/XPU)."""
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1703,10 +1596,6 @@ def set_float32_precision(
     autocast_dtype: Optional[torch.dtype] = None,
     enable_tf32: bool = True,
 ) -> None:
-    """Best-effort FP32 precision tuning for CUDA matmul/cudnn.
-
-    Note: These backend knobs are effectively process-global, so we only cache by device type.
-    """
     if device.type != "cuda":
         return
 
@@ -1749,10 +1638,6 @@ _TZ_ALIASES = {
 
 
 def resolve_timezone(name: Optional[str] = None) -> Optional[tzinfo]:
-    """Resolve a tz database name into a tzinfo.
-
-    Returns None if zoneinfo is unavailable or the zone can't be resolved.
-    """
     resolved = (name or "GMT").strip()
     alias = _TZ_ALIASES.get(resolved.upper(), resolved)
     if alias.upper() == "UTC":
@@ -1765,15 +1650,10 @@ def resolve_timezone(name: Optional[str] = None) -> Optional[tzinfo]:
 
 
 def epoch_time_ns() -> int:
-    """Nanoseconds since the Unix epoch as an int."""
     return int(time.time_ns())
 
 
 def posix_time(tz_name: Optional[str] = None) -> int:
-    """Backward-compatible wrapper returning epoch ns.
-
-    `tz_name` is accepted for compatibility but does not affect epoch time.
-    """
     _ = tz_name
     return epoch_time_ns()
 
@@ -2053,7 +1933,6 @@ def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]
 
 
 def is_cpu_bf16_supported() -> bool:
-    """Return True when BF16 ops are supported on CPU (best-effort)."""
     try:
         mkldnn = getattr(torch.backends, "mkldnn", None)
         if mkldnn is None:
@@ -2070,7 +1949,6 @@ def is_cpu_bf16_supported() -> bool:
 
 
 def is_cuda_bf16_supported(device: Optional[Union[torch.device, str]] = None) -> bool:
-    """Return True when BF16 ops are supported on CUDA device (best-effort)."""
     try:
         if not torch.cuda.is_available():
             return False
@@ -2146,10 +2024,6 @@ def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
 
 @dataclass(slots=True)
 class Device:
-    """Device capability snapshot used for precision negotiation.
-
-    This intentionally lives in core.system to avoid core->data imports.
-    """
 
     device: torch.device
     device_type: str
@@ -2165,7 +2039,6 @@ _DEVICE_STATS_LOCK = threading.Lock()
 
 
 def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Device:
-    """Return a cached Device for the given device."""
     dev = _resolve_device(device)
     key = (str(dev.type), int(dev.index) if dev.index is not None else -1)
     with _DEVICE_STATS_LOCK:
@@ -2228,10 +2101,6 @@ def get_device(
     te_first: Optional[bool] = None,
     **kwargs: Any,
 ) -> torch.device:
-    """Select a default device and configure global runtime knobs.
-
-    The runtime configuration is global and must be protected under no-GIL.
-    """
     del args, kwargs  # compatibility with older call sites
 
     with _RUNTIME_CFG_LOCK:
@@ -2383,11 +2252,6 @@ def optimize_threads(
     intra: Optional[int] = None,
     inter: Optional[int] = None,
 ) -> dict[str, Union[int, bool]]:
-    """Autotune and apply torch thread settings.
-
-    Torch thread configuration is process-global; this helper centralizes the
-    policy and optionally allows overriding intra/inter-op thread counts.
-    """
     wp = WorkerPolicy.autotune()
     if intra is not None:
         wp = replace(wp, intra_ops=int(intra))
@@ -2398,7 +2262,6 @@ def optimize_threads(
 
 
 class Thread:
-    """Lightweight CPU affinity pinning + telemetry-based retuning for IO-heavy pipelines."""
 
     __slots__ = (
         "_psutil",
@@ -2464,7 +2327,6 @@ class Thread:
 
     @staticmethod
     def is_free_threaded_build() -> bool:
-        """True if the *interpreter build* supports free-threading."""
         try:
             v = sysconfig.get_config_var("Py_GIL_DISABLED")
             return bool(int(v)) if v is not None else False
@@ -2473,7 +2335,6 @@ class Thread:
 
     @staticmethod
     def is_gil_enabled() -> bool:
-        """True if the GIL is enabled in the current process."""
         fn = getattr(sys, "_is_gil_enabled", None)
         if callable(fn):
             with contextlib.suppress(Exception):
@@ -2484,17 +2345,10 @@ class Thread:
 
     @staticmethod
     def nogil_active() -> bool:
-        """True only when this is a free-threaded build *and* the GIL is disabled."""
         return Thread.is_free_threaded_build() and (not Thread.is_gil_enabled())
 
     @staticmethod
     def nogil_optimizations_enabled() -> bool:
-        """Whether STNet should enable no-GIL specific optimizations.
-
-        Default: follow runtime state (nogil_active()).
-        Override env:
-          - STNET_NOGIL_OPT / STNET_NO_GIL_OPT / STNET_FREE_THREADING_OPT
-        """
         for key in ("STNET_NOGIL_OPT", "STNET_NO_GIL_OPT", "STNET_FREE_THREADING_OPT"):
             override = parse_bool(os.environ.get(key))
             if override is not None:
@@ -2508,7 +2362,6 @@ class Thread:
         return None
 
     def total_procs(self) -> list[int]:
-        """Backward-compatible API: returns the process-usable CPU IDs."""
         return list(self._allowed_cpus)
 
     @staticmethod
@@ -2550,7 +2403,6 @@ class Thread:
 
     @staticmethod
     def _windows_group_segments(k32: Any) -> Tuple[list[Tuple[int, int]], int]:
-        """Return allowed (group, count) segments and total count."""
         get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
         if not (callable(get_group_cnt) and callable(get_group_procs)):
@@ -2804,7 +2656,7 @@ class Thread:
             return
 
         with self._lock:
-            cpu_ns, wall_ns = self._cpu_ns, self._wall_ns
+            wall_ns = self._wall_ns
             self._cpu_ns = self._wall_ns = self._samples = 0
         self._last_retune_ts = now
 

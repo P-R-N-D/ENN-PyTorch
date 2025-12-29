@@ -15,15 +15,9 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from .system import (
-    get_device,
-    get_device_stats,
-    is_cuda_bf16_supported,
-    is_float8_supported,
-    is_int8_supported,
-)
-
 from ..data.schemas import default_underflow_action, normalize_underflow_action
+from .system import (get_device, get_device_stats, is_cuda_bf16_supported,
+                     is_float8_supported, is_int8_supported)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -44,7 +38,6 @@ def _log_negotiate_once(
     *,
     level: str = "debug",
 ) -> None:
-    """Log a structured negotiation decision once per key."""
     lg = logger if logger is not None else _LOGGER
     lvl = logging.INFO if str(level).lower() == "info" else logging.DEBUG
     try:
@@ -129,7 +122,6 @@ def _scale_safety_check(
     underflow_action: Optional[str] = None,
     **kwargs: Any,
 ) -> Tuple[bool, str]:
-    """Return (ok, reason) for whether dtype can represent dataset scale."""
     if meta is None or not getattr(meta, "has_scale", False):
         return True, "no-scale"
     if not isinstance(dtype, torch.dtype):
@@ -228,7 +220,6 @@ def is_scale_safe(
     underflow_action: Optional[str] = None,
     **kwargs: Any,
 ) -> bool:
-    """Return True if `dtype` can represent the dataset scale without overflow."""
     ok, _ = _scale_safety_check(dtype, meta, safety_margin=safety_margin, underflow_action=underflow_action)
     return ok
 
@@ -240,11 +231,6 @@ def is_scale_safe(
 
 @dataclass(slots=True)
 class DeviceMeta:
-    """Minimal metadata object used when a full Dataset is not available.
-
-    This mirrors the subset of attributes/methods used by Autocast/PrecisionPolicy
-    without importing stnet.data.pipeline.Dataset (avoids backend->data cycles).
-    """
 
     device: torch.device
     device_type: str = "cpu"
@@ -330,7 +316,6 @@ class Autocast:
 
     @classmethod
     def metadata(cls) -> Any | None:
-        """Thread-local metadata accessor (preferred over `Autocast._metadata`)."""
         return cls._get_tls_metadata()
 
     @staticmethod
@@ -1059,7 +1044,6 @@ class Autocast:
 
 @dataclass(slots=True)
 class PrecisionPolicy:
-    """End-to-end precision policy used by runtime."""
 
     master_float: torch.dtype = torch.float32
     amp_dtype: Optional[torch.dtype] = None
