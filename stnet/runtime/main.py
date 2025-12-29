@@ -8,6 +8,7 @@ import logging
 import math
 import os
 import platform
+import re
 import sys
 import threading
 import time
@@ -34,7 +35,7 @@ from torch.distributed.fsdp import MixedPrecisionPolicy
 from tqdm.auto import tqdm
 
 from ..core.casting import env_bool, env_first, env_first_int, env_float, env_int, env_str
-from ..core.graph import inference_mode
+from ..core.graph import cudagraph_step_begin, inference_mode
 from ..core.precision import Autocast, PrecisionPolicy
 from ..data.pipeline import BatchIO, extract_xy
 from ..nn.architecture import ModelPolicy
@@ -209,6 +210,23 @@ from ..nn.architecture import Model
 from ..nn.primitives import Recorder, resize_scaler_buffer
 
 _LOGGER = logging.getLogger(__name__)
+
+
+_IGNORED_WARNING_SENTENCES = [
+    "TypedStorage is deprecated. It will be removed in the future",
+    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
+]
+
+
+@contextlib.contextmanager
+def _filtered_warnings(ignored_sentences=_IGNORED_WARNING_SENTENCES):
+    if not ignored_sentences:
+        yield
+        return
+    with warnings.catch_warnings():
+        for _s in ignored_sentences:
+            warnings.filterwarnings("ignore", message=f".*{re.escape(str(_s))}.*")
+        yield
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = threading.Lock()
 
@@ -2520,7 +2538,7 @@ def epochs(
                 feats, labs = extract_xy(batch, labels_required=True)
                 if feats.ndim > 2:
                     feats = feats.reshape(feats.shape[0], -1)
-                with torch.inference_mode():
+                with inference_mode(torch.nn.Identity()):
                     xf = feats.to(device=scaler_x_device, dtype=scaler_x_dtype)
                     if xf.ndim > 2:
                         xf = xf.reshape(xf.shape[0], -1)
@@ -2616,7 +2634,7 @@ def epochs(
             if y_q_samples is None:
                 for batch in train_loader:
                     _, labs = extract_xy(batch, labels_required=True)
-                    with torch.inference_mode():
+                    with inference_mode(torch.nn.Identity()):
                         yf = labs.to(device=scaler_y_device, dtype=torch.float64)
                         if yf.ndim > 2:
                             yf = yf.reshape(yf.shape[0], -1)
@@ -2874,14 +2892,7 @@ def epochs(
                                 t_comp_s = time.perf_counter_ns()
                             with no_sync(model, enable=grad_accum_steps > 1 and (not should_sync)):
                                 with flop_counter_train.step(display=False) as train_counter:
-                                    with contextlib.suppress(Exception):
-                                        mark_step = getattr(
-                                            getattr(torch, "compiler", None),
-                                            "cudagraph_mark_step_begin",
-                                            None,
-                                        )
-                                        if callable(mark_step):
-                                            mark_step()
+                                    cudagraph_step_begin()
                                     with Autocast.float(device):
                                         Y_flat = Y.reshape(Y.shape[0], -1)
                                         if Y_flat.device != device or Y_flat.dtype != param_dtype:
@@ -3216,14 +3227,7 @@ def epochs(
                                     else:
                                         t_comp_s = time.perf_counter_ns()
                                     with flop_counter_val.step(display=False) as val_counter:
-                                        with contextlib.suppress(Exception):
-                                            mark_step = getattr(
-                                                getattr(torch, "compiler", None),
-                                                "cudagraph_mark_step_begin",
-                                                None,
-                                            )
-                                            if callable(mark_step):
-                                                mark_step()
+                                        cudagraph_step_begin()
                                         with Autocast.float(device):
                                             Yv_flat = Y.reshape(Y.shape[0], -1).to(
                                                 device,
@@ -3628,7 +3632,13 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             )
         ),
     )
-    cache = Cache(chunk_dir, max_queue=cache_q)
+    dev_type = str(getattr(device, "type", "cpu"))
+    # Async writer is typically fine on CPU too; allow opt-out via env.
+    use_async_write = bool(_rt_env_flag("STNET_PRED_ASYNC_WRITE", True))
+    use_mmt_pred_parts = bool(_rt_env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu"))
+    if not use_async_write:
+        use_mmt_pred_parts = False
+    cache = Cache(chunk_dir, max_queue=cache_q) if use_async_write else None
     target_rows = int(_rt_env_int("STNET_PRED_CHUNK_ROWS", 0))
     if target_rows <= 0:
         out_shape = tuple((int(x) for x in ops.out_shape or ()))
@@ -3642,7 +3652,6 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     run_model.eval()
     module_eval = run_model.module if hasattr(run_model, "module") else run_model
     distributed_sync(module_eval, device=device)
-    dev_type = str(getattr(device, "type", "cpu"))
     non_blocking_ok = bool(dev_type in ("cuda", "xpu"))
     pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
     backend = _accel_backend_for_device_type(dev_type)
@@ -3741,13 +3750,17 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             local_handle = None
             need_wait_evt = False
         rows_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-rows.pt")
-        if use_buffer:
+        if use_buffer and use_mmt_pred_parts:
             pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.mmt")
         else:
             pred_path = os.path.join(chunk_dir, f"part-r{rank:05d}-c{chunk_idx:06d}-pred.pt")
-        cache.submit(rows, path=rows_path)
+        if cache is not None:
+            cache.submit(rows, path=rows_path)
+        else:
+            BatchIO.atomic_torch_save(rows_path, rows)
+        wait_evt = None
+        release_cb = None
         if use_buffer:
-            wait_evt = None
             if need_wait_evt:
                 try:
                     if local_handle is not None and pred_pool is not None:
@@ -3762,12 +3775,18 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                 except Exception:
                     wait_evt = None
 
-            release_cb = None
             if local_handle is not None and pred_pool is not None:
                 release_cb = partial(pred_pool.release, local_handle)
+        if cache is not None:
             cache.submit(preds, path=pred_path, wait_event=wait_evt, release_cb=release_cb)
         else:
-            cache.submit(preds, path=pred_path)
+            preds_cpu = preds.detach()
+            if getattr(preds_cpu, "device", None) is not None and preds_cpu.device.type != "cpu":
+                preds_cpu = preds_cpu.to(device="cpu")
+            BatchIO.atomic_torch_save(pred_path, preds_cpu)
+            if release_cb is not None:
+                with contextlib.suppress(Exception):
+                    release_cb()
         chunk_idx += 1
         if not use_buffer:
             pending_rows.clear()
@@ -3988,16 +4007,25 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             _rt_log_torch_profiler_summary(
                 torch_prof, device=device, logger=_LOGGER, header="infer"
             )
-        cache.close()
+        if cache is not None:
+            cache.close()
         exc_type, _, _ = sys.exc_info()
-        if exc_type is None:
+        if exc_type is None and cache is not None:
+            had_error = False
             with contextlib.suppress(Exception):
-                if getattr(cache, "had_error", None) and cache.had_error():
-                    raise RuntimeError("infer: prediction writer encountered an error")
+                had_error = bool(getattr(cache, "had_error", None) and cache.had_error())
+            if had_error:
+                err = getattr(cache, "_err", None)
+                if isinstance(err, BaseException):
+                    raise RuntimeError(
+                        f"infer: prediction writer encountered an error: {type(err).__name__}: {err}"
+                    ) from err
+                raise RuntimeError("infer: prediction writer encountered an error")
         if status_bar is not None:
             status_bar.close()
-        distributed_barrier(device)
-        if rank == 0:
+        with contextlib.suppress(Exception):
+            distributed_barrier(device)
+        if exc_type is None and rank == 0:
             parts = []
             for rows_path in sorted(glob.glob(os.path.join(chunk_dir, "part-r*-c*-rows.pt"))):
                 base = rows_path[: -len("-rows.pt")]
@@ -4030,7 +4058,9 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
             BatchIO.atomic_write_json(man_path, manifest, indent=2)
-        distributed_barrier(device)
+        if exc_type is None:
+            with contextlib.suppress(Exception):
+                distributed_barrier(device)
     return None
 
 
@@ -4060,6 +4090,26 @@ def process(*args: Any, **kwargs: Any):
     det = bool(getattr(ops, "deterministic", False))
     seed_base = int(getattr(ops, "seed", 42))
     seed_value = int(seed_base) + int(local_rank)
+    ignored_sentences = [
+        "torch.distributed is disabled, unavailable or uninitialized",
+        "TypedStorage is deprecated",
+        # Flop counter / Triton noise (CPU or non-Triton environments)
+        "triton not found; flop counting will not work",
+        # DTensor / distributed broadcast noise (CPU or single-rank runs)
+        "Found a non-scalar tensor with numel=1 and ndim!=0",
+        "distributed_broadcast: coalesced broadcast failed",
+        "distributed_broadcast: per-tensor broadcast failed",
+        "found no DeviceMesh from dtensor args",
+        # CPU AMP / fused-kernel informational notices
+        "mixed precision.*may be unavailable",
+    ]
+    for msg in ignored_sentences:
+        with contextlib.suppress(Exception):
+            warnings.filterwarnings(
+                "ignore",
+                message=f".*{msg}.*",
+                category=UserWarning,
+            )
     with contextlib.suppress(Exception):
         import random as _random
 
@@ -4108,7 +4158,8 @@ def process(*args: Any, **kwargs: Any):
                     model, options=StateDictOptions(full_state_dict=True, cpu_offload=False)
                 )
                 m_sd = _trim_dcp_keys(m_sd)
-                load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
+                with _filtered_warnings():
+                    load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
                 resize_scaler_buffer(model, m_sd)
                 set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         if ops.sources is None:
@@ -4196,66 +4247,70 @@ def process(*args: Any, **kwargs: Any):
             Autocast.configure(model, metadata=metadata)
         if disable_note:
             _float8_log(f"[FP8] disabled: {disable_note}")
-    _cast_model_fp_dtype(model, param_dtype)
-    model.train()
-    mesh = None
-    fsdp_mp_dtype = precision.fsdp_reduce_dtype
-    if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
-        fsdp_mp_dtype = torch.float32
-    amp_buffers_dtype = precision.bn_buffers_dtype
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=fsdp_mp_dtype,
-        output_dtype=fsdp_mp_dtype,
-        cast_forward_inputs=False,
-    )
-    _m_pre = model.module if hasattr(model, "module") else model
-    _preload_layers(_m_pre, device)
-    _assert_unified_layer_dtype(_m_pre, device)
-    _assert_no_meta_tensors(_m_pre)
-    _assert_no_fake_dtensor(_m_pre)
-    wrapped = set()
-    try:
-        for submodule in _get_layers(getattr(model, "processor", None)):
-            _wrap_fsdp(submodule, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped)
-        for submodule in _get_layers(getattr(model, "controller", None)):
-            _wrap_fsdp(submodule, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped)
-        model = (
-            _wrap_fsdp(model, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped) or model
+        _cast_model_fp_dtype(model, param_dtype)
+        model.train()
+        mesh = None
+        fsdp_mp_dtype = precision.fsdp_reduce_dtype
+        if device.type == "cpu" and fsdp_mp_dtype is not torch.float64:
+            fsdp_mp_dtype = torch.float32
+        amp_buffers_dtype = precision.bn_buffers_dtype
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype,
+            reduce_dtype=fsdp_mp_dtype,
+            output_dtype=fsdp_mp_dtype,
+            cast_forward_inputs=False,
         )
-    except (RuntimeError, ValueError, TypeError):
-        model = to_fsdp(
-            model,
-            mesh=mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
-            sync_module_states=True,
-        )
-    _m_post = model.module if hasattr(model, "module") else model
-    _assert_unified_layer_dtype(_m_post, device)
-    _assert_no_meta_tensors(_m_post)
-    _assert_no_fake_dtensor(_m_post)
-    _enable_meta_monitor(_m_post)
-    distributed_sync(_m_post, device=device)
-    net_params = [p for p in model.parameters()]
-    optimizer = AdamW.float(
-        net_params, lr=ops.base_lr, weight_decay=ops.weight_decay, metadata=metadata, logger=None
-    )
-    if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-        _initialize_adamw(optimizer)
-        optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+        _m_pre = model.module if hasattr(model, "module") else model
+        _preload_layers(_m_pre, device)
+        _assert_unified_layer_dtype(_m_pre, device)
+        _assert_no_meta_tensors(_m_pre)
+        _assert_no_fake_dtensor(_m_pre)
+        wrapped = set()
         try:
-            load(
-                state_dict={"optimizer": optim_sd},
-                storage_reader=FileSystemReader(ops.init_ckpt_dir),
+            for submodule in _get_layers(getattr(model, "processor", None)):
+                _wrap_fsdp(submodule, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped)
+            for submodule in _get_layers(getattr(model, "controller", None)):
+                _wrap_fsdp(submodule, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped)
+            model = (
+                _wrap_fsdp(model, mesh, mp_policy, reshard_after_forward=True, wrapped=wrapped)
+                or model
             )
-        except (FileNotFoundError, ValueError, KeyError, RuntimeError, CheckpointException) as exc:
-            if "optimizer" not in str(exc).lower():
-                raise
-            else:
-                set_optimizer_state_dict(
-                    model, optimizer, optim_sd, options=StateDictOptions(strict=False)
+        except (RuntimeError, ValueError, TypeError):
+            model = to_fsdp(
+                model,
+                mesh=mesh,
+                mp_policy=mp_policy,
+                reshard_after_forward=False,
+                sync_module_states=True,
+            )
+        _m_post = model.module if hasattr(model, "module") else model
+        _assert_unified_layer_dtype(_m_post, device)
+        _assert_no_meta_tensors(_m_post)
+        _assert_no_fake_dtensor(_m_post)
+        _enable_meta_monitor(_m_post)
+        distributed_sync(_m_post, device=device)
+        net_params = [p for p in model.parameters()]
+        optimizer = AdamW.float(
+            net_params,
+            lr=ops.base_lr,
+            weight_decay=ops.weight_decay,
+            metadata=metadata,
+            logger=None,
+        )
+        _initialize_adamw(optimizer)
+        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
+            # init_ckpt_dir is primarily a *model* initializer. Optimizer state may be absent.
+            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
+            try:
+                with _filtered_warnings():
+                    load(state_dict={"optimizer": optim_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
+            except Exception as exc:
+                warnings.warn(
+                    f"optimizer state load skipped (non-fatal): {type(exc).__name__}: {exc}",
+                    RuntimeWarning,
                 )
+            else:
+                set_optimizer_state_dict(model, optimizer, optim_sd, options=StateDictOptions(strict=False))
                 _initialize_adamw(optimizer)
         top_df = DataFidelityLoss(out_shape=ops.out_shape, reduction="mean")
         top_z = StandardNormalLoss(
@@ -4473,7 +4528,8 @@ def process(*args: Any, **kwargs: Any):
             )
             optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
             writer = FileSystemWriter(ops.ckpt_dir or "", sync_files=True, overwrite=True)
-            save(state_dict={"model": model_sd, "optimizer": optim_sd}, storage_writer=writer)
+            with _filtered_warnings():
+                save(state_dict={"model": model_sd, "optimizer": optim_sd}, storage_writer=writer)
             if ops.ckpt_dir:
                 fallback_path = os.path.join(ops.ckpt_dir, "model.pt")
                 model_fallback = dict(model_sd)

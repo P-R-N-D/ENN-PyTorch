@@ -140,24 +140,25 @@ Prediction outputs:
 ```python
 import stnet
 
-# Eager: returns an in-memory TensorDict with keys {"X", "Y"}
-td = stnet.predict(model, my_data, lazy=False)
+# In-memory (default): returns a CPU TensorDict with keys {"X", "Y"}.
+# NOTE: output='eager' is accepted as an alias of output='memory'.
+td = stnet.predict(model, my_data, output="memory", path=None)
 print(td[0]["X"], td[0]["Y"])
 
-# Lazy (default): returns a memmap-backed TensorDict (MemoryMappedTensor leaves)
-td_lazy = stnet.predict(model, my_data)  # same as lazy=True, persist_path=None
-print(td_lazy[0]["X"], td_lazy[0]["Y"])
-
-# Persistent: writes an HDF5 PersistentTensorDict to `persist_path` and returns it
-td_persistent = stnet.predict(model, my_data, persist_path="predictions.h5")  # lazy defaults to True
+# Persistent: writes an HDF5 file and returns a PersistentTensorDict.
+# NOTE: output='lazy' is accepted as an alias of output='file'.
+td_persistent = stnet.predict(
+    model,
+    my_data,
+    output="file",
+    path="predictions.h5",
+    overwrite="replace",
+)
 print(td_persistent[0]["X"], td_persistent[0]["Y"])
 
 # IMPORTANT: PersistentTensorDict does not auto-close. Close it when you're done.
 td_persistent.close()
 ```
-
-When `lazy=True` and `persist_path` is provided, results are streamed to disk and returned as a `PersistentTensorDict`.
-When `lazy=True` and `persist_path` is `None`/invalid, results are returned as a `memmap-backed TensorDict` with underlying `MemoryMappedTensor` files stored in an auto-created run directory.
 
 Notebook demo:
 - Open `notebook.ipynb` for an end-to-end workflow using `raw_data.xlsx`.
@@ -170,6 +171,7 @@ Notebook demo:
 stnet/
   __init__.py
   api.py
+  config.py
   runtime/
     __init__.py
     io.py
@@ -177,7 +179,6 @@ stnet/
   core/
     __init__.py
     compat.py
-    config.py
     distributed.py
     casting.py
     graph.py

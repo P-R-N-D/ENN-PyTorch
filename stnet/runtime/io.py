@@ -139,28 +139,10 @@ def _json_sanitize(obj):
 
 
 def _load_model_config(model):
-    cfg_obj = None
-    with contextlib.suppress(Exception):
-        cfg_obj = getattr(model, "config", None)
-    if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_instance_config__", None)
-    if cfg_obj is None:
-        with contextlib.suppress(Exception):
-            for submodule in model.modules():
-                with contextlib.suppress(Exception):
-                    cfg_obj = getattr(submodule, "config", None)
-                if cfg_obj is None:
-                    cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
-                if cfg_obj is not None:
-                    break
     try:
-        from ..config import ModelConfig, coerce_model_config
+        from ..config import _extract_model_config_dict
 
-        candidate = cfg_obj if isinstance(cfg_obj, (ModelConfig, dict)) else None
-        if candidate is None:
-            return {}
-        cfg = candidate if isinstance(candidate, ModelConfig) else coerce_model_config(candidate)
-        return cfg.to_dict()
+        return _extract_model_config_dict(model)
     except Exception:
         return {}
 
@@ -168,6 +150,13 @@ def _load_model_config(model):
 def _to_cpu(value, *, materialize_meta=True, make_contiguous=True):
     if isinstance(value, torch.Tensor):
         t = value
+        # DTensor is a subclass of Tensor but is not directly serializable / portable.
+        # Convert to its local shard before any device transfers.
+        with contextlib.suppress(Exception):
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(t, DTensor):
+                t = t.to_local()
         if materialize_meta and is_meta_or_fake_tensor(t):
             t = torch.zeros(tuple(t.shape), dtype=t.dtype, device="cpu")
         if t.device.type != "cpu":

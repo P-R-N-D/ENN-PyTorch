@@ -2147,6 +2147,15 @@ class Dataset(Generic[TExtra]):
 
 # Late import: avoid circular dependency (nodes.py imports Dataset from this module).
 try:
-    from .nodes import (BatchScaler, Disposable, Loader, Mapper, Multiplexer, Sampler, Source)
+    from .nodes import (
+        BatchIO,
+        BatchScaler,
+        Disposable,
+        Loader,
+        Mapper,
+        Multiplexer,
+        Sampler,
+        Source,
+    )
 except Exception as _e:
     _NODES_IMPORT_ERROR = _e
