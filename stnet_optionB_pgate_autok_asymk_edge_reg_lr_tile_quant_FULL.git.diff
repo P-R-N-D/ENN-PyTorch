@@ -1,0 +1,2629 @@
+diff --git a/stnet/core/config.py b/stnet/core/config.py
+index b797002..26d9436 100644
+--- a/stnet/core/config.py
++++ b/stnet/core/config.py
+@@ -262,6 +262,92 @@ class ModelConfig:
+     compile_mode: str = "disabled"
+     safety_margin_pow2: int = 3
+ 
++
++    # Residual gating: z_hat = base + p * residue
++    p_gate_enabled: bool = False
++    p_gate_hidden_dim: int = 64
++    p_gate_detach_inputs: bool = True
++    p_gate_p_floor: float = 0.0
++    p_gate_p_ceil: float = 1.0
++    # If y_min/y_max bounds are unavailable (legacy scaler stats), fall back to
++    # mean ± k * std bounds (in y-space). Set <=0 to disable fallback.
++    p_gate_fallback_k: float = 6.0
++    # Optional asymmetric fallback bounds: mean - k_low*std, mean + k_high*std.
++    # When None, defaults to p_gate_fallback_k.
++    p_gate_fallback_k_low: Optional[float] = None
++    p_gate_fallback_k_high: Optional[float] = None
++
++    # Optional auto-tuning for p_gate_fallback_k when y_min/y_max are missing.
++    # Uses simple moving average (SMA) over a recent interval and an EMA
++    # smoother to detect when the fallback bounds are overly restrictive.
++    p_gate_auto_k_enabled: bool = False
++    # Update cadence in *optimizer steps* (not micro-steps). Set <=0 to disable.
++    p_gate_auto_k_interval: int = 100
++    # Warmup steps before the first tuning update.
++    p_gate_auto_k_warmup: int = 100
++    # EMA smoothing factor for the constraint-activation metric.
++    p_gate_auto_k_ema_alpha: float = 0.1
++    # Target fraction of samples considered "tight" (i.e., fallback bounds
++    # meaningfully clip the allowed [p_floor, p_ceil] interval on either side).
++    p_gate_auto_k_target_tight: float = 0.02
++    # Relative tolerance around the target (e.g., 0.5 -> [0.5x, 1.5x]).
++    p_gate_auto_k_tolerance: float = 0.5
++    # Multiplicative adjustment rates (symmetric default).
++    p_gate_auto_k_step_up: float = 0.1
++    p_gate_auto_k_step_down: float = 0.02
++    # Optional per-side adjustment rates (override when provided).
++    p_gate_auto_k_step_up_low: float = 0.1
++    p_gate_auto_k_step_down_low: float = 0.02
++    p_gate_auto_k_step_up_high: float = 0.1
++    p_gate_auto_k_step_down_high: float = 0.02
++
++    # Optional edge-based tuning: when constraint activation is within target,
++    # but p frequently hugs dynamic endpoints, shrink bounds by reducing k.
++    p_gate_auto_k_edge_enabled: bool = False
++    p_gate_auto_k_target_edge: float = 0.05
++    p_gate_auto_k_edge_tolerance: float = 0.5
++    p_gate_auto_k_edge_ema_alpha: float = 0.1
++    p_gate_auto_k_edge_step_down_low: float = 0.01
++    p_gate_auto_k_edge_step_down_high: float = 0.01
++
++    # Hard clamp for fallback_k.
++    p_gate_auto_k_min: float = 1.0
++    p_gate_auto_k_max: float = 16.0
++    # A sample is "tight" when either side trims at least
++    # width_frac * (p_ceil - p_floor), i.e.:
++    #   (p_low - p_floor) >= width_frac * (p_ceil - p_floor)  OR
++    #   (p_ceil - p_high) >= width_frac * (p_ceil - p_floor)
++    p_gate_auto_k_width_frac: float = 0.05
++    # For diagnostics: count samples where p is near the dynamic endpoints
++    # [p_low, p_high] ("boundary hugging").
++    p_gate_auto_k_edge_frac: float = 0.02
++    # Log cadence (optimizer steps). Set <=0 to log only on actual k changes.
++    p_gate_auto_k_log_interval: int = 200
++    p_gate_clip_eps: float = 1e-6
++    p_gate_eps: float = 1e-6
++
++    # Optional edge-hugging regularizer for p: discourages p from sticking to
++    # dynamic endpoints [p_low, p_high] when the allowed interval is wide enough.
++    p_gate_edge_reg_weight: float = 0.0
++    # Optional per-side weights (if None, use p_gate_edge_reg_weight).
++    p_gate_edge_reg_weight_low: Optional[float] = None
++    p_gate_edge_reg_weight_high: Optional[float] = None
++    # If True, apply edge regularizer only when using fallback bounds (mean±kσ),
++    # not when true y_min/y_max bounds are available.
++    p_gate_edge_reg_fallback_only: bool = False
++    p_gate_edge_reg_frac: float = 0.02
++    p_gate_edge_reg_min_width_frac: float = 0.05
++    p_gate_edge_reg_power: float = 2.0
++
++    # Auxiliary losses (added to total loss inside Model.forward)
++    unsup_xx_weight: float = 0.0
++    unsup_yy_weight: float = 0.0
++
++    # Prior regularization for p (optional; Beta prior on [0,1])
++    p_prior_weight: float = 0.0
++    p_prior_alpha: float = 2.0
++    p_prior_beta: float = 2.0
++
+     def to_dict(self) -> Dict[str, Any]:
+         """Convert this config into a JSON-friendly dict.
+ 
+@@ -513,6 +599,273 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
+         maximum=30,
+     )
+ 
++
++    p_gate_enabled = _coerce_bool(
++        get("p_gate_enabled", _MODEL_DEFAULTS.p_gate_enabled),
++        name="p_gate_enabled",
++    )
++    p_gate_hidden_dim = _coerce_int(
++        get("p_gate_hidden_dim", _MODEL_DEFAULTS.p_gate_hidden_dim),
++        name="p_gate_hidden_dim",
++        minimum=1,
++    )
++    p_gate_detach_inputs = _coerce_bool(
++        get("p_gate_detach_inputs", _MODEL_DEFAULTS.p_gate_detach_inputs),
++        name="p_gate_detach_inputs",
++    )
++    p_gate_p_floor = _coerce_float(
++        get("p_gate_p_floor", _MODEL_DEFAULTS.p_gate_p_floor),
++        name="p_gate_p_floor",
++        minimum=0.0,
++        maximum=100.0,
++    )
++    p_gate_p_ceil = _coerce_float(
++        get("p_gate_p_ceil", _MODEL_DEFAULTS.p_gate_p_ceil),
++        name="p_gate_p_ceil",
++        minimum=0.0,
++        maximum=100.0,
++    )
++    if p_gate_p_ceil < p_gate_p_floor:
++        p_gate_p_ceil = p_gate_p_floor
++
++    p_gate_fallback_k = _coerce_float(
++        get("p_gate_fallback_k", _MODEL_DEFAULTS.p_gate_fallback_k),
++        name="p_gate_fallback_k",
++    )
++
++    _raw_k_low = get("p_gate_fallback_k_low", None)
++    p_gate_fallback_k_low = None if _raw_k_low is None else _coerce_float(
++        _raw_k_low,
++        name="p_gate_fallback_k_low",
++    )
++    _raw_k_high = get("p_gate_fallback_k_high", None)
++    p_gate_fallback_k_high = None if _raw_k_high is None else _coerce_float(
++        _raw_k_high,
++        name="p_gate_fallback_k_high",
++    )
++
++    p_gate_auto_k_enabled = _coerce_bool(
++        get("p_gate_auto_k_enabled", _MODEL_DEFAULTS.p_gate_auto_k_enabled),
++        name="p_gate_auto_k_enabled",
++    )
++    p_gate_auto_k_interval = _coerce_int(
++        get("p_gate_auto_k_interval", _MODEL_DEFAULTS.p_gate_auto_k_interval),
++        name="p_gate_auto_k_interval",
++    )
++    p_gate_auto_k_warmup = _coerce_int(
++        get("p_gate_auto_k_warmup", _MODEL_DEFAULTS.p_gate_auto_k_warmup),
++        name="p_gate_auto_k_warmup",
++        minimum=0,
++    )
++    p_gate_auto_k_ema_alpha = _coerce_float(
++        get("p_gate_auto_k_ema_alpha", _MODEL_DEFAULTS.p_gate_auto_k_ema_alpha),
++        name="p_gate_auto_k_ema_alpha",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_target_tight = _coerce_float(
++        get("p_gate_auto_k_target_tight", _MODEL_DEFAULTS.p_gate_auto_k_target_tight),
++        name="p_gate_auto_k_target_tight",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_tolerance = _coerce_float(
++        get("p_gate_auto_k_tolerance", _MODEL_DEFAULTS.p_gate_auto_k_tolerance),
++        name="p_gate_auto_k_tolerance",
++        minimum=0.0,
++        maximum=10.0,
++    )
++    p_gate_auto_k_step_up = _coerce_float(
++        get("p_gate_auto_k_step_up", _MODEL_DEFAULTS.p_gate_auto_k_step_up),
++        name="p_gate_auto_k_step_up",
++        minimum=0.0,
++        maximum=10.0,
++    )
++    p_gate_auto_k_step_down = _coerce_float(
++        get("p_gate_auto_k_step_down", _MODEL_DEFAULTS.p_gate_auto_k_step_down),
++        name="p_gate_auto_k_step_down",
++        minimum=0.0,
++        maximum=1.0,
++    )
++
++    # Optional per-side step sizes (default to symmetric step_up/step_down).
++    p_gate_auto_k_step_up_low = _coerce_float(
++        get("p_gate_auto_k_step_up_low", p_gate_auto_k_step_up),
++        name="p_gate_auto_k_step_up_low",
++        minimum=0.0,
++        maximum=10.0,
++    )
++    p_gate_auto_k_step_down_low = _coerce_float(
++        get("p_gate_auto_k_step_down_low", p_gate_auto_k_step_down),
++        name="p_gate_auto_k_step_down_low",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_step_up_high = _coerce_float(
++        get("p_gate_auto_k_step_up_high", p_gate_auto_k_step_up),
++        name="p_gate_auto_k_step_up_high",
++        minimum=0.0,
++        maximum=10.0,
++    )
++    p_gate_auto_k_step_down_high = _coerce_float(
++        get("p_gate_auto_k_step_down_high", p_gate_auto_k_step_down),
++        name="p_gate_auto_k_step_down_high",
++        minimum=0.0,
++        maximum=1.0,
++    )
++
++    p_gate_auto_k_edge_enabled = _coerce_bool(
++        get("p_gate_auto_k_edge_enabled", _MODEL_DEFAULTS.p_gate_auto_k_edge_enabled),
++        name="p_gate_auto_k_edge_enabled",
++    )
++    p_gate_auto_k_target_edge = _coerce_float(
++        get("p_gate_auto_k_target_edge", _MODEL_DEFAULTS.p_gate_auto_k_target_edge),
++        name="p_gate_auto_k_target_edge",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_edge_tolerance = _coerce_float(
++        get("p_gate_auto_k_edge_tolerance", _MODEL_DEFAULTS.p_gate_auto_k_edge_tolerance),
++        name="p_gate_auto_k_edge_tolerance",
++        minimum=0.0,
++        maximum=10.0,
++    )
++    p_gate_auto_k_edge_ema_alpha = _coerce_float(
++        get("p_gate_auto_k_edge_ema_alpha", _MODEL_DEFAULTS.p_gate_auto_k_edge_ema_alpha),
++        name="p_gate_auto_k_edge_ema_alpha",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_edge_step_down_low = _coerce_float(
++        get("p_gate_auto_k_edge_step_down_low", _MODEL_DEFAULTS.p_gate_auto_k_edge_step_down_low),
++        name="p_gate_auto_k_edge_step_down_low",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_edge_step_down_high = _coerce_float(
++        get("p_gate_auto_k_edge_step_down_high", _MODEL_DEFAULTS.p_gate_auto_k_edge_step_down_high),
++        name="p_gate_auto_k_edge_step_down_high",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_min = _coerce_float(
++        get("p_gate_auto_k_min", _MODEL_DEFAULTS.p_gate_auto_k_min),
++        name="p_gate_auto_k_min",
++        minimum=0.0,
++    )
++    p_gate_auto_k_max = _coerce_float(
++        get("p_gate_auto_k_max", _MODEL_DEFAULTS.p_gate_auto_k_max),
++        name="p_gate_auto_k_max",
++        minimum=0.0,
++    )
++    if p_gate_auto_k_max < p_gate_auto_k_min:
++        p_gate_auto_k_max = p_gate_auto_k_min
++    p_gate_auto_k_width_frac = _coerce_float(
++        get("p_gate_auto_k_width_frac", _MODEL_DEFAULTS.p_gate_auto_k_width_frac),
++        name="p_gate_auto_k_width_frac",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_edge_frac = _coerce_float(
++        get("p_gate_auto_k_edge_frac", _MODEL_DEFAULTS.p_gate_auto_k_edge_frac),
++        name="p_gate_auto_k_edge_frac",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_auto_k_log_interval = _coerce_int(
++        get("p_gate_auto_k_log_interval", _MODEL_DEFAULTS.p_gate_auto_k_log_interval),
++        name="p_gate_auto_k_log_interval",
++    )
++
++    p_gate_clip_eps = _coerce_float(
++        get("p_gate_clip_eps", _MODEL_DEFAULTS.p_gate_clip_eps),
++        name="p_gate_clip_eps",
++        minimum=0.0,
++        maximum=0.49,
++    )
++    p_gate_eps = _coerce_float(
++        get("p_gate_eps", _MODEL_DEFAULTS.p_gate_eps),
++        name="p_gate_eps",
++        minimum=0.0,
++        maximum=1.0,
++    )
++
++    p_gate_edge_reg_weight = _coerce_float(
++        get("p_gate_edge_reg_weight", _MODEL_DEFAULTS.p_gate_edge_reg_weight),
++        name="p_gate_edge_reg_weight",
++        minimum=0.0,
++    )
++
++    raw_edge_w_low = get("p_gate_edge_reg_weight_low", _MODEL_DEFAULTS.p_gate_edge_reg_weight_low)
++    if raw_edge_w_low is None:
++        p_gate_edge_reg_weight_low = None
++    else:
++        p_gate_edge_reg_weight_low = _coerce_float(
++            raw_edge_w_low,
++            name="p_gate_edge_reg_weight_low",
++            minimum=0.0,
++        )
++
++    raw_edge_w_high = get("p_gate_edge_reg_weight_high", _MODEL_DEFAULTS.p_gate_edge_reg_weight_high)
++    if raw_edge_w_high is None:
++        p_gate_edge_reg_weight_high = None
++    else:
++        p_gate_edge_reg_weight_high = _coerce_float(
++            raw_edge_w_high,
++            name="p_gate_edge_reg_weight_high",
++            minimum=0.0,
++        )
++
++    p_gate_edge_reg_fallback_only = _coerce_bool(
++        get("p_gate_edge_reg_fallback_only", _MODEL_DEFAULTS.p_gate_edge_reg_fallback_only),
++        name="p_gate_edge_reg_fallback_only",
++    )
++    p_gate_edge_reg_frac = _coerce_float(
++        get("p_gate_edge_reg_frac", _MODEL_DEFAULTS.p_gate_edge_reg_frac),
++        name="p_gate_edge_reg_frac",
++        minimum=0.0,
++        maximum=0.49,
++    )
++    p_gate_edge_reg_min_width_frac = _coerce_float(
++        get("p_gate_edge_reg_min_width_frac", _MODEL_DEFAULTS.p_gate_edge_reg_min_width_frac),
++        name="p_gate_edge_reg_min_width_frac",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_edge_reg_power = _coerce_float(
++        get("p_gate_edge_reg_power", _MODEL_DEFAULTS.p_gate_edge_reg_power),
++        name="p_gate_edge_reg_power",
++        minimum=1.0,
++        maximum=8.0,
++    )
++
++    unsup_xx_weight = _coerce_float(
++        get("unsup_xx_weight", _MODEL_DEFAULTS.unsup_xx_weight),
++        name="unsup_xx_weight",
++        minimum=0.0,
++    )
++    unsup_yy_weight = _coerce_float(
++        get("unsup_yy_weight", _MODEL_DEFAULTS.unsup_yy_weight),
++        name="unsup_yy_weight",
++        minimum=0.0,
++    )
++
++    p_prior_weight = _coerce_float(
++        get("p_prior_weight", _MODEL_DEFAULTS.p_prior_weight),
++        name="p_prior_weight",
++        minimum=0.0,
++    )
++    p_prior_alpha = _coerce_float(
++        get("p_prior_alpha", _MODEL_DEFAULTS.p_prior_alpha),
++        name="p_prior_alpha",
++        minimum=0.0,
++    )
++    p_prior_beta = _coerce_float(
++        get("p_prior_beta", _MODEL_DEFAULTS.p_prior_beta),
++        name="p_prior_beta",
++        minimum=0.0,
++    )
++
+     # Keep ModelConfig.device type compatible with original annotation (device|str|None)
+     device_out: Optional[torch.device | str] = device
+ 
+@@ -533,6 +886,51 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
+         use_linear_branch=use_linear_branch,
+         compile_mode=compile_mode,
+         safety_margin_pow2=safety_margin_pow2,
++        p_gate_enabled=p_gate_enabled,
++        p_gate_hidden_dim=p_gate_hidden_dim,
++        p_gate_detach_inputs=p_gate_detach_inputs,
++        p_gate_p_floor=p_gate_p_floor,
++        p_gate_p_ceil=p_gate_p_ceil,
++        p_gate_fallback_k=p_gate_fallback_k,
++        p_gate_fallback_k_low=p_gate_fallback_k_low,
++        p_gate_fallback_k_high=p_gate_fallback_k_high,
++        p_gate_auto_k_enabled=p_gate_auto_k_enabled,
++        p_gate_auto_k_interval=p_gate_auto_k_interval,
++        p_gate_auto_k_warmup=p_gate_auto_k_warmup,
++        p_gate_auto_k_ema_alpha=p_gate_auto_k_ema_alpha,
++        p_gate_auto_k_target_tight=p_gate_auto_k_target_tight,
++        p_gate_auto_k_tolerance=p_gate_auto_k_tolerance,
++        p_gate_auto_k_step_up=p_gate_auto_k_step_up,
++        p_gate_auto_k_step_down=p_gate_auto_k_step_down,
++        p_gate_auto_k_step_up_low=p_gate_auto_k_step_up_low,
++        p_gate_auto_k_step_down_low=p_gate_auto_k_step_down_low,
++        p_gate_auto_k_step_up_high=p_gate_auto_k_step_up_high,
++        p_gate_auto_k_step_down_high=p_gate_auto_k_step_down_high,
++        p_gate_auto_k_edge_enabled=p_gate_auto_k_edge_enabled,
++        p_gate_auto_k_target_edge=p_gate_auto_k_target_edge,
++        p_gate_auto_k_edge_tolerance=p_gate_auto_k_edge_tolerance,
++        p_gate_auto_k_edge_ema_alpha=p_gate_auto_k_edge_ema_alpha,
++        p_gate_auto_k_edge_step_down_low=p_gate_auto_k_edge_step_down_low,
++        p_gate_auto_k_edge_step_down_high=p_gate_auto_k_edge_step_down_high,
++        p_gate_auto_k_min=p_gate_auto_k_min,
++        p_gate_auto_k_max=p_gate_auto_k_max,
++        p_gate_auto_k_width_frac=p_gate_auto_k_width_frac,
++        p_gate_auto_k_edge_frac=p_gate_auto_k_edge_frac,
++        p_gate_auto_k_log_interval=p_gate_auto_k_log_interval,
++        p_gate_clip_eps=p_gate_clip_eps,
++        p_gate_eps=p_gate_eps,
++        p_gate_edge_reg_weight=p_gate_edge_reg_weight,
++        p_gate_edge_reg_weight_low=p_gate_edge_reg_weight_low,
++        p_gate_edge_reg_weight_high=p_gate_edge_reg_weight_high,
++        p_gate_edge_reg_fallback_only=p_gate_edge_reg_fallback_only,
++        p_gate_edge_reg_frac=p_gate_edge_reg_frac,
++        p_gate_edge_reg_min_width_frac=p_gate_edge_reg_min_width_frac,
++        p_gate_edge_reg_power=p_gate_edge_reg_power,
++        unsup_xx_weight=unsup_xx_weight,
++        unsup_yy_weight=unsup_yy_weight,
++        p_prior_weight=p_prior_weight,
++        p_prior_alpha=p_prior_alpha,
++        p_prior_beta=p_prior_beta,
+     )
+ 
+ 
+diff --git a/stnet/data/nodes.py b/stnet/data/nodes.py
+index 247cdd9..ed81a90 100644
+--- a/stnet/data/nodes.py
++++ b/stnet/data/nodes.py
+@@ -1582,6 +1582,14 @@ class BatchIO:
+         y_sum_sq: Optional[torch.Tensor] = None
+         y_tmp: Optional[torch.Tensor] = None
+         y2_tmp: Optional[torch.Tensor] = None
++        x_min: Optional[torch.Tensor] = None
++        x_max: Optional[torch.Tensor] = None
++        x_min_tmp: Optional[torch.Tensor] = None
++        x_max_tmp: Optional[torch.Tensor] = None
++        y_min: Optional[torch.Tensor] = None
++        y_max: Optional[torch.Tensor] = None
++        y_min_tmp: Optional[torch.Tensor] = None
++        y_max_tmp: Optional[torch.Tensor] = None
+ 
+         if compute_scaler_stats and int(train_end) > 0:
+             x_sum = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
+@@ -1593,6 +1601,14 @@ class BatchIO:
+             y_sum_sq = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
+             y_tmp = torch.empty_like(y_sum)
+             y2_tmp = torch.empty_like(y_sum)
++            x_min = torch.full((int(in_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
++            x_max = torch.full((int(in_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
++            x_min_tmp = torch.empty_like(x_sum)
++            x_max_tmp = torch.empty_like(x_sum)
++            y_min = torch.full((int(out_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
++            y_max = torch.full((int(out_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
++            y_min_tmp = torch.empty_like(y_sum)
++            y_max_tmp = torch.empty_like(y_sum)
+ 
+         written = 0
+         features_cast_copy_ok: Optional[bool] = None
+@@ -1632,6 +1648,11 @@ class BatchIO:
+                     x_sum.add_(x_tmp)
+                     x2_tmp.copy_(torch.einsum("ni,ni->i", fx_stats, fx_stats))
+                     x_sum_sq.add_(x2_tmp)
++                    if x_min is not None and x_max is not None and x_min_tmp is not None and x_max_tmp is not None:
++                        torch.amin(fx_stats, dim=0, out=x_min_tmp)
++                        torch.minimum(x_min, x_min_tmp, out=x_min)
++                        torch.amax(fx_stats, dim=0, out=x_max_tmp)
++                        torch.maximum(x_max, x_max_tmp, out=x_max)
+ 
+             # Write directly; prefer casting via copy_ to avoid extra buffers,
+             # but fall back to explicit conversion if the memmap tensor enforces dtype.
+@@ -1688,6 +1709,11 @@ class BatchIO:
+                             y_sum.add_(y_tmp)
+                             y2_tmp.copy_(torch.einsum("ni,ni->i", lb_stats, lb_stats))
+                             y_sum_sq.add_(y2_tmp)
++                            if y_min is not None and y_max is not None and y_min_tmp is not None and y_max_tmp is not None:
++                                torch.amin(lb_stats, dim=0, out=y_min_tmp)
++                                torch.minimum(y_min, y_min_tmp, out=y_min)
++                                torch.amax(lb_stats, dim=0, out=y_max_tmp)
++                                torch.maximum(y_max, y_max_tmp, out=y_max)
+ 
+             written += int(n)
+ 
+@@ -1708,8 +1734,12 @@ class BatchIO:
+                 "train_count": int(train_end),
+                 "x_sum": x_sum,
+                 "x_sum_sq": x_sum_sq,
++                "x_min": x_min,
++                "x_max": x_max,
+                 "y_sum": y_sum,
+                 "y_sum_sq": y_sum_sq,
++                "y_min": y_min,
++                "y_max": y_max,
+             }
+             scaler_stats_path = "scaler_stats.pt"
+             try:
+@@ -1950,6 +1980,7 @@ class BatchIO:
+             return {}
+         return dict(BatchIO.merge_meta_dicts(metas))
+ 
++
+     @staticmethod
+     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
+         expanded = BatchIO.expand_sources(sources)
+@@ -1959,6 +1990,13 @@ class BatchIO:
+         y_sum: Optional[torch.Tensor] = None
+         y_sum_sq: Optional[torch.Tensor] = None
+ 
++        # Optional min/max bounds (available in newer scaler_stats.pt payloads).
++        x_min: Optional[torch.Tensor] = None
++        x_max: Optional[torch.Tensor] = None
++        y_min: Optional[torch.Tensor] = None
++        y_max: Optional[torch.Tensor] = None
++        have_bounds: Optional[bool] = None
++
+         for path in BatchIO.iter_source_paths(expanded):
+             try:
+                 meta = BatchIO.from_meta(path)
+@@ -1997,11 +2035,40 @@ class BatchIO:
+             ys = ys.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys, torch.Tensor) else torch.as_tensor(ys, dtype=torch.float64)
+             ys2 = ys2.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys2, torch.Tensor) else torch.as_tensor(ys2, dtype=torch.float64)
+ 
++            # Optional bounds.
++            local_xmin = payload.get("x_min")
++            local_xmax = payload.get("x_max")
++            local_ymin = payload.get("y_min")
++            local_ymax = payload.get("y_max")
++            local_have_bounds = (
++                local_xmin is not None
++                and local_xmax is not None
++                and local_ymin is not None
++                and local_ymax is not None
++            )
++            if have_bounds is None:
++                have_bounds = bool(local_have_bounds)
++            elif have_bounds and not local_have_bounds:
++                # Mixing old/new payload formats -> drop bounds (incomplete).
++                have_bounds = False
++                x_min = x_max = y_min = y_max = None
++
++            if have_bounds:
++                local_xmin = local_xmin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmin, torch.Tensor) else torch.as_tensor(local_xmin, dtype=torch.float64)
++                local_xmax = local_xmax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmax, torch.Tensor) else torch.as_tensor(local_xmax, dtype=torch.float64)
++                local_ymin = local_ymin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymin, torch.Tensor) else torch.as_tensor(local_ymin, dtype=torch.float64)
++                local_ymax = local_ymax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymax, torch.Tensor) else torch.as_tensor(local_ymax, dtype=torch.float64)
++
+             if x_sum is None:
+                 x_sum = xs.clone()
+                 x_sum_sq = xs2.clone()
+                 y_sum = ys.clone()
+                 y_sum_sq = ys2.clone()
++                if have_bounds:
++                    x_min = local_xmin.clone()
++                    x_max = local_xmax.clone()
++                    y_min = local_ymin.clone()
++                    y_max = local_ymax.clone()
+             else:
+                 if xs.shape != x_sum.shape or xs2.shape != x_sum_sq.shape:
+                     return None
+@@ -2012,18 +2079,37 @@ class BatchIO:
+                 y_sum += ys
+                 y_sum_sq += ys2
+ 
++                if have_bounds:
++                    assert x_min is not None and x_max is not None and y_min is not None and y_max is not None
++                    if local_xmin.shape != x_min.shape or local_xmax.shape != x_max.shape:
++                        return None
++                    if local_ymin.shape != y_min.shape or local_ymax.shape != y_max.shape:
++                        return None
++                    torch.minimum(x_min, local_xmin, out=x_min)
++                    torch.maximum(x_max, local_xmax, out=x_max)
++                    torch.minimum(y_min, local_ymin, out=y_min)
++                    torch.maximum(y_max, local_ymax, out=y_max)
++
+             total += c
+ 
+         if total <= 0 or x_sum is None or x_sum_sq is None or y_sum is None or y_sum_sq is None:
+             return None
+ 
+-        return {
++        out: Dict[str, Any] = {
+             "train_count": int(total),
+             "x_sum": x_sum,
+             "x_sum_sq": x_sum_sq,
+             "y_sum": y_sum,
+             "y_sum_sq": y_sum_sq,
+         }
++        if have_bounds and x_min is not None and x_max is not None and y_min is not None and y_max is not None:
++            out.update({
++                "x_min": x_min,
++                "x_max": x_max,
++                "y_min": y_min,
++                "y_max": y_max,
++            })
++        return out
+ 
+     @staticmethod
+     def expand_sources(sources: Any) -> Any:
+diff --git a/stnet/nn/architecture.py b/stnet/nn/architecture.py
+index 25979df..f402729 100644
+--- a/stnet/nn/architecture.py
++++ b/stnet/nn/architecture.py
+@@ -30,7 +30,7 @@ from ..core.graph import (
+     torch_compile_disable,
+ )
+ from ..core.precision import Autocast, is_scale_safe
+-from .primitives import Recorder, Scaler
++from .primitives import Recorder, Scaler, ResidualGate
+ from .blocks import (
+     LongNet,
+     PointTransformer,
+@@ -933,6 +933,180 @@ class Model(nn.Module):
+             length_bucket_multiple=bucket,
+         ).to(self._device)
+ 
++        # Residual gating: z_hat = base + p * residue
++        self.p_gate: Optional[ResidualGate]
++        # Fallback bounds: when scaler.y_min/y_max are unavailable, use mean ± k*std.
++        # `fallback_k` is stored as a buffer so it can be checkpointed and (optionally)
++        # tuned during training.
++        k_default = float(getattr(config, 'p_gate_fallback_k', 6.0))
++        k_low_cfg = getattr(config, 'p_gate_fallback_k_low', None)
++        k_high_cfg = getattr(config, 'p_gate_fallback_k_high', None)
++        # Keep the legacy symmetric k for compatibility; allow asymmetric overrides.
++        self.p_gate_fallback_k: float = float(k_default)
++        self.p_gate_fallback_k_low: float = float(k_default if k_low_cfg is None else float(k_low_cfg))
++        self.p_gate_fallback_k_high: float = float(k_default if k_high_cfg is None else float(k_high_cfg))
++        self.p_gate_auto_k_enabled: bool = bool(getattr(config, 'p_gate_auto_k_enabled', False))
++        self.p_gate_auto_k_interval: int = int(getattr(config, 'p_gate_auto_k_interval', 100) or 0)
++        self.p_gate_auto_k_warmup: int = int(getattr(config, 'p_gate_auto_k_warmup', 0) or 0)
++        self.p_gate_auto_k_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_ema_alpha', 0.1))
++        self.p_gate_auto_k_target_tight: float = float(getattr(config, 'p_gate_auto_k_target_tight', 0.02))
++        self.p_gate_auto_k_tolerance: float = float(getattr(config, 'p_gate_auto_k_tolerance', 0.5))
++        self.p_gate_auto_k_step_up: float = float(getattr(config, 'p_gate_auto_k_step_up', 0.1))
++        self.p_gate_auto_k_step_down: float = float(getattr(config, 'p_gate_auto_k_step_down', 0.02))
++        # Optional per-side step sizes (default to symmetric step_up/step_down).
++        self.p_gate_auto_k_step_up_low: float = float(getattr(config, 'p_gate_auto_k_step_up_low', self.p_gate_auto_k_step_up))
++        self.p_gate_auto_k_step_down_low: float = float(getattr(config, 'p_gate_auto_k_step_down_low', self.p_gate_auto_k_step_down))
++        self.p_gate_auto_k_step_up_high: float = float(getattr(config, 'p_gate_auto_k_step_up_high', self.p_gate_auto_k_step_up))
++        self.p_gate_auto_k_step_down_high: float = float(getattr(config, 'p_gate_auto_k_step_down_high', self.p_gate_auto_k_step_down))
++
++        # Optional edge-based tuning: when constraint activation is in-range but p frequently
++        # hugs dynamic endpoints, shrink fallback bounds by reducing k.
++        self.p_gate_auto_k_edge_enabled: bool = bool(getattr(config, 'p_gate_auto_k_edge_enabled', False))
++        self.p_gate_auto_k_target_edge: float = float(getattr(config, 'p_gate_auto_k_target_edge', 0.05))
++        self.p_gate_auto_k_edge_tolerance: float = float(getattr(config, 'p_gate_auto_k_edge_tolerance', 0.5))
++        self.p_gate_auto_k_edge_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_edge_ema_alpha', self.p_gate_auto_k_ema_alpha))
++        self.p_gate_auto_k_edge_step_down_low: float = float(getattr(config, 'p_gate_auto_k_edge_step_down_low', 0.01))
++        self.p_gate_auto_k_edge_step_down_high: float = float(getattr(config, 'p_gate_auto_k_edge_step_down_high', 0.01))
++        self.p_gate_auto_k_min: float = float(getattr(config, 'p_gate_auto_k_min', 1.0))
++        self.p_gate_auto_k_max: float = float(getattr(config, 'p_gate_auto_k_max', 16.0))
++        self.p_gate_auto_k_width_frac: float = float(getattr(config, 'p_gate_auto_k_width_frac', 0.05))
++        self.p_gate_auto_k_edge_frac: float = float(getattr(config, 'p_gate_auto_k_edge_frac', 0.02))
++        self.p_gate_auto_k_log_interval: int = int(getattr(config, 'p_gate_auto_k_log_interval', 200) or 0)
++        # If auto-k is enabled, ensure fallback ks are positive (otherwise we'd disable fallback entirely).
++        if self.p_gate_auto_k_enabled:
++            if self.p_gate_fallback_k_low <= 0.0:
++                self.p_gate_fallback_k_low = max(float(self.p_gate_auto_k_min), 1e-6)
++            if self.p_gate_fallback_k_high <= 0.0:
++                self.p_gate_fallback_k_high = max(float(self.p_gate_auto_k_min), 1e-6)
++        self.p_gate_fallback_enabled: bool = bool(
++            self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
++        )
++
++        try:
++            # Asymmetric fallback ks (lower/upper) for mean±kσ bounds.
++            self.register_buffer(
++                "p_gate_fallback_k_low_buf",
++                torch.tensor(float(self.p_gate_fallback_k_low), dtype=torch.float32),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_fallback_k_high_buf",
++                torch.tensor(float(self.p_gate_fallback_k_high), dtype=torch.float32),
++                persistent=True,
++            )
++            # Legacy: keep an average as a convenience for older tooling.
++            self.register_buffer(
++                "p_gate_fallback_k_buf",
++                torch.tensor(
++                    float(0.5 * (self.p_gate_fallback_k_low + self.p_gate_fallback_k_high)),
++                    dtype=torch.float32,
++                ),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_auto_k_step_buf",
++                torch.tensor(0, dtype=torch.int64),
++                persistent=True,
++            )
++            # Per-side EMAs for constraint activation.
++            self.register_buffer(
++                "p_gate_auto_k_ema_low_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_auto_k_ema_high_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            # Per-side EMAs for boundary hugging (edge-based tuning/diagnostics).
++            self.register_buffer(
++                "p_gate_auto_k_edge_ema_low_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_auto_k_edge_ema_high_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_auto_k_edge_ema_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            # Overall EMA retained for backwards compatibility/logging.
++            self.register_buffer(
++                "p_gate_auto_k_ema_buf",
++                torch.tensor(0.0, dtype=torch.float32),
++                persistent=True,
++            )
++            self.register_buffer(
++                "p_gate_auto_k_updates_buf",
++                torch.tensor(0, dtype=torch.int64),
++                persistent=True,
++            )
++        except Exception:
++            pass
++        if bool(getattr(config, 'p_gate_enabled', False)):
++            self.p_gate = ResidualGate(
++                d_model=int(config.d_model),
++                hidden_dim=int(getattr(config, 'p_gate_hidden_dim', 64)),
++                detach_inputs=bool(getattr(config, 'p_gate_detach_inputs', True)),
++                p_floor=float(getattr(config, 'p_gate_p_floor', 0.0)),
++                p_ceil=float(getattr(config, 'p_gate_p_ceil', 1.0)),
++                clip_eps=float(getattr(config, 'p_gate_clip_eps', 1e-6)),
++                eps=float(getattr(config, 'p_gate_eps', 1e-6)),
++                stat_width_frac=float(getattr(config, 'p_gate_auto_k_width_frac', 0.05)),
++                stat_edge_frac=float(getattr(config, 'p_gate_auto_k_edge_frac', 0.02)),
++            ).to(self._device)
++        else:
++            self.p_gate = None
++
++        # Auxiliary losses (added to total loss inside Model.forward)
++        self.unsup_xx_weight = float(getattr(config, 'unsup_xx_weight', 0.0))
++        self.unsup_yy_weight = float(getattr(config, 'unsup_yy_weight', 0.0))
++        self.p_prior_weight = float(getattr(config, 'p_prior_weight', 0.0))
++        self.p_prior_alpha = float(getattr(config, 'p_prior_alpha', 2.0))
++        self.p_prior_beta = float(getattr(config, 'p_prior_beta', 2.0))
++        # Optional p edge-hugging regularizer (added to total loss in forward).
++        self.p_gate_edge_reg_weight = float(getattr(config, 'p_gate_edge_reg_weight', 0.0))
++        self.p_gate_edge_reg_frac = float(
++            getattr(config, 'p_gate_edge_reg_frac', getattr(config, 'p_gate_auto_k_edge_frac', 0.02))
++        )
++        self.p_gate_edge_reg_min_width_frac = float(
++            getattr(config, 'p_gate_edge_reg_min_width_frac', getattr(config, 'p_gate_auto_k_width_frac', 0.05))
++        )
++        self.p_gate_edge_reg_power = float(getattr(config, 'p_gate_edge_reg_power', 2.0))
++        # Optional per-side weights and fallback-only mode for edge regularizer.
++        try:
++            w_low_cfg = getattr(config, 'p_gate_edge_reg_weight_low', None)
++            w_high_cfg = getattr(config, 'p_gate_edge_reg_weight_high', None)
++            self.p_gate_edge_reg_weight_low = (
++                float(self.p_gate_edge_reg_weight) if w_low_cfg is None else float(w_low_cfg)
++            )
++            self.p_gate_edge_reg_weight_high = (
++                float(self.p_gate_edge_reg_weight) if w_high_cfg is None else float(w_high_cfg)
++            )
++        except Exception:
++            self.p_gate_edge_reg_weight_low = float(self.p_gate_edge_reg_weight)
++            self.p_gate_edge_reg_weight_high = float(self.p_gate_edge_reg_weight)
++        self.p_gate_edge_reg_fallback_only = bool(getattr(config, 'p_gate_edge_reg_fallback_only', False))
++
++
++
++        self.x_recon_head: Optional[nn.Module]
++        if self.unsup_xx_weight > 0.0:
++            hid = max(8, int(int(config.d_model) // 2))
++            self.x_recon_head = nn.Sequential(
++                nn.LayerNorm(int(config.d_model)),
++                nn.Linear(int(config.d_model), hid),
++                nn.SiLU(),
++                nn.Linear(hid, int(in_dim)),
++            ).to(self._device)
++        else:
++            self.x_recon_head = None
++
+         # Encoder-stage microbatch.
+         self.microbatch: int = 0
+         self._auto_microbatch_pending: bool = True
+@@ -1494,7 +1668,82 @@ class Model(nn.Module):
+             residual = residual_context.reshape(b, -1)
+             if residual.dtype != assembled.dtype:
+                 residual = residual.to(dtype=assembled.dtype)
+-            y_hat = assembled + residual
++
++            p: Optional[torch.Tensor] = None
++            edge_reg_low: Optional[torch.Tensor] = None
++            edge_reg_high: Optional[torch.Tensor] = None
++            if self.p_gate is not None:
++                z_min: Optional[torch.Tensor] = None
++                z_max: Optional[torch.Tensor] = None
++                fallback_bounds = False
++                try:
++                    ymin = getattr(self.scaler, 'y_min', None)
++                    ymax = getattr(self.scaler, 'y_max', None)
++                    if isinstance(ymin, torch.Tensor) and isinstance(ymax, torch.Tensor):
++                        mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
++                        std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
++                        denom = std + float(self.scaler.eps)
++
++                        if bool(torch.isfinite(ymin).all().item()) and bool(torch.isfinite(ymax).all().item()):
++                            ymin_t = ymin.to(device=assembled.device, dtype=assembled.dtype)
++                            ymax_t = ymax.to(device=assembled.device, dtype=assembled.dtype)
++                            z_min = (ymin_t - mean) / denom
++                            z_max = (ymax_t - mean) / denom
++                        else:
++                            # Legacy/unknown bounds: fall back to mean ± k * std.
++                            # This corresponds to z in [-k*std/(std+eps), +k*std/(std+eps)].
++                            if bool(getattr(self, 'p_gate_fallback_enabled', False)):
++                                k_low_buf = getattr(self, 'p_gate_fallback_k_low_buf', None)
++                                k_high_buf = getattr(self, 'p_gate_fallback_k_high_buf', None)
++                                if isinstance(k_low_buf, torch.Tensor):
++                                    k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
++                                else:
++                                    k_low = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_low', getattr(self, 'p_gate_fallback_k', 0.0))))
++                                if isinstance(k_high_buf, torch.Tensor):
++                                    k_high = k_high_buf.to(device=assembled.device, dtype=assembled.dtype)
++                                else:
++                                    k_high = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_high', getattr(self, 'p_gate_fallback_k', 0.0))))
++                                z_scale = std / denom
++                                z_min = (-k_low) * z_scale
++                                z_max = (k_high) * z_scale
++                                fallback_bounds = True
++                except Exception:
++                    z_min = None
++                    z_max = None
++                do_edge_reg = (
++                    self.training
++                    and grad_enabled
++                    and ((self.p_gate_edge_reg_weight_low > 0.0) or (self.p_gate_edge_reg_weight_high > 0.0))
++                    and (z_min is not None)
++                    and (z_max is not None)
++                    and ((not self.p_gate_edge_reg_fallback_only) or bool(fallback_bounds))
++                )
++                if do_edge_reg:
++                    p, edge_reg_low, edge_reg_high = self.p_gate(
++                        tokens=tokens,
++                        refined_tokens=refined_tokens,
++                        base=assembled,
++                        residue=residual,
++                        z_min=z_min,
++                        z_max=z_max,
++                        fallback_bounds=bool(fallback_bounds),
++                        return_edge_reg_lr=True,
++                        edge_reg_frac=float(self.p_gate_edge_reg_frac),
++                        edge_reg_min_width_frac=float(self.p_gate_edge_reg_min_width_frac),
++                        edge_reg_power=float(self.p_gate_edge_reg_power),
++                    )
++                else:
++                    p = self.p_gate(
++                        tokens=tokens,
++                        refined_tokens=refined_tokens,
++                        base=assembled,
++                        residue=residual,
++                        z_min=z_min,
++                        z_max=z_max,
++                        fallback_bounds=bool(fallback_bounds),
++                    )
++
++            y_hat = assembled + (residual if p is None else p * residual)
+             y_hat = _sanitize_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
+ 
+             pred = y_hat.reshape(b, *self.out_shape)
+@@ -1540,7 +1789,7 @@ class Model(nn.Module):
+                     )
+                     z_top = (
+                         _sanitize_tensor(
+-                            assembled.detach() + residual,
++                            assembled.detach() + (residual if p is None else p * residual),
+                             enabled=sanitize_enabled,
+                             inplace=sanitize_inplace,
+                         )
+@@ -1573,6 +1822,54 @@ class Model(nn.Module):
+             if loss_val is not None and not isinstance(loss_val, torch.Tensor):
+                 loss_val = torch.as_tensor(loss_val, device=y_hat.device, dtype=y_hat.dtype)
+ 
++            # --- Auxiliary losses (unsupervised / regularization) ---
++            if self.training and grad_enabled:
++                aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
++                aux_used = False
++
++                if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
++                    x_recon = self.x_recon_head(tokens.mean(dim=1))
++                    loss_xx = F.smooth_l1_loss(
++                        x_recon.to(dtype=torch.float32),
++                        features_t.to(dtype=torch.float32),
++                        reduction="mean",
++                    )
++                    aux_total = aux_total + self.unsup_xx_weight * loss_xx.to(dtype=aux_total.dtype)
++                    aux_used = True
++
++                if self.unsup_yy_weight > 0.0:
++                    teacher = y_hat.detach()
++                    student = assembled
++                    if p is not None:
++                        w = p.detach().squeeze(-1).clamp(min=0.0)
++                        per = F.smooth_l1_loss(student, teacher, reduction="none").mean(dim=1)
++                        loss_yy = (per * w).mean()
++                    else:
++                        loss_yy = F.smooth_l1_loss(student, teacher, reduction="mean")
++                    aux_total = aux_total + self.unsup_yy_weight * loss_yy.to(dtype=aux_total.dtype)
++                    aux_used = True
++
++                if self.p_prior_weight > 0.0 and p is not None:
++                    # Beta prior on p (encourage non-extreme gating); supports skew when alpha!=beta.
++                    clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6)) if self.p_gate is not None else 1e-6
++                    p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
++                    a = float(self.p_prior_alpha)
++                    b = float(self.p_prior_beta)
++                    loss_p = -(((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))).mean()
++                    aux_total = aux_total + self.p_prior_weight * loss_p.to(dtype=aux_total.dtype)
++                    aux_used = True
++
++                if edge_reg_low is not None and self.p_gate_edge_reg_weight_low > 0.0:
++                    aux_total = aux_total + self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
++                    aux_used = True
++
++                if edge_reg_high is not None and self.p_gate_edge_reg_weight_high > 0.0:
++                    aux_total = aux_total + self.p_gate_edge_reg_weight_high * edge_reg_high.to(dtype=aux_total.dtype)
++                    aux_used = True
++
++                if aux_used:
++                    loss_val = aux_total if loss_val is None else (loss_val + aux_total)
++
+             # --- Inference-time calibration (regression only) ---
+             if infer_mode and calibrate_output and (not is_cls_loss):
+                 z_cal = self.scaler.calibrate(y_hat)
+@@ -1591,11 +1888,15 @@ class Model(nn.Module):
+                 if return_aux:
+                     out_td.set("refined_tokens", refined_tokens)
+                     out_td.set("residual_context", residual_context)
++                    if p is not None:
++                        out_td.set("p_gate", p)
+                 else:
+                     with contextlib.suppress(KeyError):
+                         out_td.del_("refined_tokens")
+                     with contextlib.suppress(KeyError):
+                         out_td.del_("residual_context")
++                    with contextlib.suppress(KeyError):
++                        out_td.del_("p_gate")
+ 
+                 if loss_val is not None:
+                     loss_td = loss_val
+diff --git a/stnet/nn/primitives.py b/stnet/nn/primitives.py
+index 2b6c4ba..c0a578f 100644
+--- a/stnet/nn/primitives.py
++++ b/stnet/nn/primitives.py
+@@ -1550,6 +1550,8 @@ class Scaler(nn.Module):
+         self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
+         self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
+         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
++        self.register_buffer("y_min", torch.full((1,), float("-inf"), dtype=torch.float64))
++        self.register_buffer("y_max", torch.full((1,), float("inf"), dtype=torch.float64))
+         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
+         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
+         self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
+@@ -2015,6 +2017,309 @@ class Scaler(nn.Module):
+         return out
+ 
+ 
++class ResidualGate(nn.Module):
++    """Learned, bounded scalar gate `p` for residual mixing.
++
++    Computes `z_hat = base + p * residue` with `p` constrained to a user-specified
++    range. Optionally tightens the allowed `p` interval per-sample so that the
++    mixed output stays within provided (z_min, z_max) bounds.
++
++    This module is intentionally simple and torch.compile friendly:
++    - No torch.distributions objects
++    - No python-side randomness
++    - All math is vectorized
++    """
++
++    def __init__(
++        self,
++        d_model: int,
++        hidden_dim: int = 64,
++        *,
++        eps: float = 1e-6,
++        clip_eps: float = 1e-6,
++        p_floor: float = 0.0,
++        p_ceil: float = 1.0,
++        # Stats collection (used for fallback_k auto-tuning).
++        stat_width_frac: float = 0.05,
++        stat_edge_frac: float = 0.02,
++        detach_inputs: bool = True,
++        use_tokens: bool = True,
++        use_refined: bool = True,
++        use_stats: bool = True,
++    ) -> None:
++        super().__init__()
++        self.eps = float(eps)
++        self.clip_eps = float(clip_eps)
++        self.p_floor = float(p_floor)
++        self.p_ceil = float(p_ceil)
++        self.stat_width_frac = float(stat_width_frac)
++        self.stat_edge_frac = float(stat_edge_frac)
++        self.detach_inputs = bool(detach_inputs)
++        self.use_tokens = bool(use_tokens)
++        self.use_refined = bool(use_refined)
++        self.use_stats = bool(use_stats)
++
++        in_dim = 0
++        if self.use_tokens:
++            in_dim += int(d_model)
++        if self.use_refined:
++            in_dim += int(d_model)
++        if self.use_stats:
++            in_dim += 2
++        in_dim = max(1, int(in_dim))
++
++        self.net = nn.Sequential(
++            nn.LayerNorm(in_dim),
++            nn.Linear(in_dim, int(hidden_dim)),
++            nn.SiLU(),
++            nn.Linear(int(hidden_dim), 1),
++        )
++
++        # Initialize near p ~= 0.5 for stability (logit ~= 0).
++        with contextlib.suppress(Exception):
++            last = self.net[-1]
++            if isinstance(last, nn.Linear):
++                nn.init.zeros_(last.weight)
++                nn.init.zeros_(last.bias)
++
++        # Fallback-bound diagnostics (not persisted in checkpoints).
++        # These are accumulated on-device and consumed by the runtime at a
++        # configurable interval. Keeping them as buffers avoids Python-side
++        # synchronization in the hot path.
++        self.register_buffer("_fb_count", torch.zeros((), dtype=torch.float32), persistent=False)
++        # Per-side "constraint activation" sums: how often fallback bounds clip away
++        # a meaningful fraction of the user [p_floor, p_ceil] interval.
++        self.register_buffer("_fb_active_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
++        self.register_buffer("_fb_active_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
++        # Sum of dynamic interval widths (p_high - p_low) for diagnostics.
++        self.register_buffer("_fb_width_sum", torch.zeros((), dtype=torch.float32), persistent=False)
++        # Per-side "boundary hugging" sums: how often p is near the dynamic endpoints.
++        self.register_buffer("_fb_edge_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
++        self.register_buffer("_fb_edge_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
++
++    @torch.no_grad()
++    def consume_fallback_stats(self) -> torch.Tensor:
++        """Return and reset fallback-bound diagnostics.
++
++        Returns a float32 tensor of shape (6,):
++            [count, active_low_sum, active_high_sum, width_sum, edge_low_sum, edge_high_sum]
++
++        Where:
++          - count: number of samples seen under fallback bounds
++          - active_low_sum: number of samples where fallback bounds meaningfully clipped the low side
++            of the allowed [p_floor, p_ceil] interval
++          - active_high_sum: same for the high side
++          - width_sum: sum of (p_high - p_low) across samples
++          - edge_low_sum: number of samples where p was near the *dynamic* low endpoint p_low
++          - edge_high_sum: number of samples where p was near the *dynamic* high endpoint p_high
++        """
++        stats = torch.stack(
++            [
++                self._fb_count.detach(),
++                self._fb_active_low_sum.detach(),
++                self._fb_active_high_sum.detach(),
++                self._fb_width_sum.detach(),
++                self._fb_edge_low_sum.detach(),
++                self._fb_edge_high_sum.detach(),
++            ]
++        )
++        self._fb_count.zero_()
++        self._fb_active_low_sum.zero_()
++        self._fb_active_high_sum.zero_()
++        self._fb_width_sum.zero_()
++        self._fb_edge_low_sum.zero_()
++        self._fb_edge_high_sum.zero_()
++        return stats
++
++    def forward(
++        self,
++        *,
++        tokens: torch.Tensor,
++        refined_tokens: Optional[torch.Tensor] = None,
++        base: Optional[torch.Tensor] = None,
++        residue: Optional[torch.Tensor] = None,
++        z_min: Optional[torch.Tensor] = None,
++        z_max: Optional[torch.Tensor] = None,
++        # When True, record diagnostics assuming (z_min, z_max) came from the
++        # fallback mean±kσ bounds (not true y_min/y_max).
++        fallback_bounds: bool = False,
++        # Optional edge-hugging regularizer (discourage p near dynamic bounds).
++        return_edge_reg: bool = False,
++        return_edge_reg_lr: bool = False,
++        edge_reg_frac: float = 0.02,
++        edge_reg_min_width_frac: float = 0.05,
++        edge_reg_power: float = 2.0,
++    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        # Pool token streams.
++        feats: list[torch.Tensor] = []
++        if self.use_tokens:
++            t = tokens.mean(dim=1)
++            if self.detach_inputs:
++                t = t.detach()
++            feats.append(t)
++        if self.use_refined and refined_tokens is not None:
++            r = refined_tokens.mean(dim=1)
++            if self.detach_inputs:
++                r = r.detach()
++            feats.append(r)
++
++        if self.use_stats and base is not None and residue is not None:
++            b = base.detach() if self.detach_inputs else base
++            res = residue.detach() if self.detach_inputs else residue
++            # RMS stats in FP32 for stability
++            b32 = b.to(dtype=torch.float32)
++            r32 = res.to(dtype=torch.float32)
++            b_rms = torch.sqrt(torch.mean(b32 * b32, dim=1, keepdim=True) + self.eps)
++            r_rms = torch.sqrt(torch.mean(r32 * r32, dim=1, keepdim=True) + self.eps)
++            feats.append(b_rms.to(dtype=tokens.dtype))
++            feats.append(r_rms.to(dtype=tokens.dtype))
++
++        x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
++        logit = self.net(x).squeeze(-1)
++        sig = torch.sigmoid(logit)
++
++        # Default range.
++        p_low = sig.new_full(sig.shape, float(self.p_floor))
++        p_high = sig.new_full(sig.shape, float(self.p_ceil))
++
++        # Optionally tighten p-range so z_hat stays within [z_min, z_max].
++        if (
++            z_min is not None
++            and z_max is not None
++            and base is not None
++            and residue is not None
++        ):
++            b = base.detach() if self.detach_inputs else base
++            r = residue.detach() if self.detach_inputs else residue
++            b32 = b.to(dtype=torch.float32)
++            r32 = r.to(dtype=torch.float32)
++
++            zmin = z_min.to(device=b32.device, dtype=torch.float32)
++            zmax = z_max.to(device=b32.device, dtype=torch.float32)
++            if zmin.numel() != 1:
++                zmin = zmin.reshape(1, -1)
++            if zmax.numel() != 1:
++                zmax = zmax.reshape(1, -1)
++
++            # Stabilize division by small residuals.
++            sign = torch.where(r32 >= 0, 1.0, -1.0)
++            r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
++
++            p_a = (zmin - b32) / r_safe
++            p_b = (zmax - b32) / r_safe
++            p_min_dim = torch.minimum(p_a, p_b)
++            p_max_dim = torch.maximum(p_a, p_b)
++
++            # Intersection across dimensions -> scalar [p_low, p_high] per sample.
++            p_low_bound = p_min_dim.max(dim=1).values
++            p_high_bound = p_max_dim.min(dim=1).values
++
++            # Clamp to user range.
++            p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
++            p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
++
++            # Ensure non-empty interval.
++            p_high = torch.maximum(p_high, p_low + float(self.eps))
++
++        # Map sigmoid into [p_low, p_high].
++        p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
++
++        # Clip away exact endpoints if requested.
++        clip = float(self.clip_eps)
++        lo = float(self.p_floor) + clip
++        hi = float(self.p_ceil) - clip
++        if hi > lo:
++            p = torch.clamp(p, min=lo, max=hi)
++        else:
++            p = torch.clamp(p, min=float(self.p_floor), max=float(self.p_ceil))
++
++        # Diagnostics for fallback bounds (mean±kσ).
++        if bool(fallback_bounds):
++            try:
++                width = (p_high - p_low).to(dtype=torch.float32)
++                denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
++
++                # "Constraint activation" metric (per-side):
++                # For each side, count a sample as active when the fallback bounds clip away a
++                # meaningful fraction of the user-specified [p_floor, p_ceil] interval.
++                tthr = float(self.stat_width_frac) * denom
++                tthr = float(max(tthr, self.eps))
++                trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
++                trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
++                active_low = trim_low >= tthr
++                active_high = trim_high >= tthr
++
++                # "Boundary hugging" diagnostic (per-side):
++                # Count samples where p is near the dynamic [p_low, p_high] endpoints.
++                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
++                ethr = float(self.stat_edge_frac)
++                ethr = float(max(ethr, 0.0))
++                edge_thr = w_safe * float(ethr)
++                edge_low = (p - p_low) <= edge_thr
++                edge_high = (p_high - p) <= edge_thr
++
++                with torch.no_grad():
++                    # Use sums (not means) so runtime can all-reduce reliably.
++                    self._fb_count.add_(float(p.shape[0]))
++                    self._fb_width_sum.add_(width.sum())
++                    self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
++                    self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
++                    self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
++                    self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
++            except Exception:
++                pass
++
++        edge_reg: Optional[torch.Tensor] = None
++        edge_reg_low: Optional[torch.Tensor] = None
++        edge_reg_high: Optional[torch.Tensor] = None
++        if bool(return_edge_reg) or bool(return_edge_reg_lr):
++            try:
++                width = (p_high - p_low).to(dtype=torch.float32)
++                full = max(float(self.p_ceil - self.p_floor), float(self.eps))
++                min_w = float(edge_reg_min_width_frac) * full
++                min_w = float(max(min_w, self.eps))
++                mask = (width >= min_w).to(dtype=torch.float32)
++
++                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
++                q = (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
++                q = torch.clamp(q, 0.0, 1.0)
++
++                m = float(edge_reg_frac)
++                m = float(min(max(m, self.eps), 0.49))
++                inv_m = 1.0 / m
++
++                # Per-side normalized distances to the dynamic endpoints.
++                d_low = F.relu(m - q) * inv_m
++                d_high = F.relu(q - (1.0 - m)) * inv_m
++
++                pen_low = d_low.pow(float(edge_reg_power)) * mask
++                pen_high = d_high.pow(float(edge_reg_power)) * mask
++
++                denom = mask.sum() + float(self.eps)
++                edge_reg_low = pen_low.sum() / denom
++                edge_reg_high = pen_high.sum() / denom
++                edge_reg = edge_reg_low + edge_reg_high
++            except Exception:
++                edge_reg = None
++                edge_reg_low = None
++                edge_reg_high = None
++
++        # Return shape (B, 1) for broadcast.
++        out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
++        out = p.to(dtype=out_dtype).unsqueeze(-1)
++        if bool(return_edge_reg_lr):
++            if edge_reg_low is None:
++                edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
++            if edge_reg_high is None:
++                edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
++            return out, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
++        if bool(return_edge_reg):
++            if edge_reg is None:
++                edge_reg = out.new_tensor(0.0, dtype=torch.float32)
++            return out, edge_reg.to(dtype=out_dtype)
++        return out
++
++
+ class Recorder(nn.Module):
+     def __init__(self) -> None:
+         super().__init__()
+@@ -2386,7 +2691,7 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
+     else:
+         view = state
+ 
+-    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
++    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "y_min", "y_max", "affine_a", "affine_b", "pw_x", "pw_y")
+     prefixes = ("scaler.", "module.scaler.")
+ 
+     for prefix in prefixes:
+diff --git a/stnet/runtime/main.py b/stnet/runtime/main.py
+index 5c8fbc7..c83fb52 100644
+--- a/stnet/runtime/main.py
++++ b/stnet/runtime/main.py
+@@ -1591,6 +1591,241 @@ def _all_reduce_sum_in_pg(t, pg):
+     else:
+         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=pg)
+ 
++
++@torch.no_grad()
++def _maybe_autotune_p_gate_fallback_k(target_module, *, step, pg=None, local_rank=0):
++    """Auto-tune Model.p_gate_fallback_k_low_buf / p_gate_fallback_k_high_buf.
++
++    This is intentionally runtime-side (not in forward) so:
++      - no distributed collectives appear in compiled graphs
++      - updates happen on optimizer-step boundaries (safe with grad accumulation)
++
++    Expected per-batch stats are accumulated inside ResidualGate when
++    fallback_bounds=True and consumed here at a configurable interval.
++
++    Stats layout (float32):
++        [count,
++         active_low_sum, active_high_sum,
++         width_sum,
++         edge_low_sum, edge_high_sum]
++
++    Where "active" measures per-side constraint activation caused by the
++    fallback bounds (mean±kσ) clipping away a meaningful fraction of the user
++    [p_floor, p_ceil] interval.
++    """
++    if target_module is None:
++        return
++    if not bool(getattr(target_module, 'p_gate_auto_k_enabled', False)):
++        return
++    gate = getattr(target_module, 'p_gate', None)
++    if gate is None or not hasattr(gate, 'consume_fallback_stats'):
++        return
++
++    interval = int(getattr(target_module, 'p_gate_auto_k_interval', 0) or 0)
++    if interval <= 0:
++        return
++    warmup = int(getattr(target_module, 'p_gate_auto_k_warmup', 0) or 0)
++    if int(step) < int(warmup):
++        # Still consume+reset occasionally to prevent unbounded accumulation.
++        if int(step) % max(1, int(interval)) == 0:
++            with contextlib.suppress(Exception):
++                gate.consume_fallback_stats()
++        return
++    if int(step) % int(interval) != 0:
++        return
++
++    # Persist the step counter for checkpoint/resume (cheap device-side fill).
++    step_buf = getattr(target_module, 'p_gate_auto_k_step_buf', None)
++    if isinstance(step_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            step_buf.fill_(int(step))
++
++    stats = gate.consume_fallback_stats()
++    if not isinstance(stats, torch.Tensor) or stats.numel() < 6:
++        return
++
++    if bool(is_distributed()):
++        with contextlib.suppress(Exception):
++            _all_reduce_sum_in_pg(stats, pg)
++
++    count = float(stats[0].item())
++    if not math.isfinite(count) or count <= 0.0:
++        return
++
++    active_low_rate = float((stats[1] / stats[0]).item())
++    active_high_rate = float((stats[2] / stats[0]).item())
++    width_mean = float((stats[3] / stats[0]).item())
++    edge_low_rate = float((stats[4] / stats[0]).item())
++    edge_high_rate = float((stats[5] / stats[0]).item())
++
++    # Update per-side EMA.
++    alpha = float(getattr(target_module, 'p_gate_auto_k_ema_alpha', 0.1))
++    alpha = max(0.0, min(1.0, alpha))
++
++    ema_low_buf = getattr(target_module, 'p_gate_auto_k_ema_low_buf', None)
++    ema_high_buf = getattr(target_module, 'p_gate_auto_k_ema_high_buf', None)
++
++    ema_low_prev = float(ema_low_buf.item()) if isinstance(ema_low_buf, torch.Tensor) else 0.0
++    ema_high_prev = float(ema_high_buf.item()) if isinstance(ema_high_buf, torch.Tensor) else 0.0
++
++    ema_low_new = (1.0 - alpha) * ema_low_prev + alpha * active_low_rate
++    ema_high_new = (1.0 - alpha) * ema_high_prev + alpha * active_high_rate
++
++    if isinstance(ema_low_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            ema_low_buf.fill_(float(ema_low_new))
++    if isinstance(ema_high_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            ema_high_buf.fill_(float(ema_high_new))
++
++    # Keep an overall EMA for backwards-compatible logging/tooling.
++    ema_overall = 0.5 * (float(ema_low_new) + float(ema_high_new))
++    ema_buf = getattr(target_module, 'p_gate_auto_k_ema_buf', None)
++    if isinstance(ema_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            ema_buf.fill_(float(ema_overall))
++
++    # Optional edge-based EMA (boundary hugging).
++    edge_enabled = bool(getattr(target_module, 'p_gate_auto_k_edge_enabled', False))
++    edge_alpha = float(getattr(target_module, 'p_gate_auto_k_edge_ema_alpha', alpha))
++    edge_alpha = max(0.0, min(1.0, edge_alpha))
++
++    edge_ema_low_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_low_buf', None)
++    edge_ema_high_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_high_buf', None)
++    edge_ema_buf = getattr(target_module, 'p_gate_auto_k_edge_ema_buf', None)
++
++    edge_ema_low_prev = float(edge_ema_low_buf.item()) if isinstance(edge_ema_low_buf, torch.Tensor) else 0.0
++    edge_ema_high_prev = float(edge_ema_high_buf.item()) if isinstance(edge_ema_high_buf, torch.Tensor) else 0.0
++    edge_ema_low_new = (1.0 - edge_alpha) * edge_ema_low_prev + edge_alpha * edge_low_rate
++    edge_ema_high_new = (1.0 - edge_alpha) * edge_ema_high_prev + edge_alpha * edge_high_rate
++
++    if isinstance(edge_ema_low_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            edge_ema_low_buf.fill_(float(edge_ema_low_new))
++    if isinstance(edge_ema_high_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            edge_ema_high_buf.fill_(float(edge_ema_high_new))
++    if isinstance(edge_ema_buf, torch.Tensor):
++        with contextlib.suppress(Exception):
++            edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
++
++    # Fallback-k buffers (prefer per-side when present).
++    k_low_buf = getattr(target_module, 'p_gate_fallback_k_low_buf', None)
++    k_high_buf = getattr(target_module, 'p_gate_fallback_k_high_buf', None)
++    k_legacy_buf = getattr(target_module, 'p_gate_fallback_k_buf', None)
++
++    use_legacy = not (isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor))
++    if use_legacy:
++        # Backwards compatibility: treat a single k as symmetric.
++        if not isinstance(k_legacy_buf, torch.Tensor):
++            return
++        k_low_buf = k_legacy_buf
++        k_high_buf = k_legacy_buf
++
++    k_low_prev = float(k_low_buf.item()) if isinstance(k_low_buf, torch.Tensor) else 0.0
++    k_high_prev = float(k_high_buf.item()) if isinstance(k_high_buf, torch.Tensor) else 0.0
++    k_low_new = k_low_prev
++    k_high_new = k_high_prev
++
++    target = float(getattr(target_module, 'p_gate_auto_k_target_tight', 0.02))
++    tol = float(getattr(target_module, 'p_gate_auto_k_tolerance', 0.5))
++    hi = target * (1.0 + tol)
++    lo = max(0.0, target * (1.0 - tol))
++
++    step_up = float(getattr(target_module, 'p_gate_auto_k_step_up', 0.1))
++    step_down = float(getattr(target_module, 'p_gate_auto_k_step_down', 0.02))
++
++    step_up_low = float(getattr(target_module, 'p_gate_auto_k_step_up_low', step_up))
++    step_down_low = float(getattr(target_module, 'p_gate_auto_k_step_down_low', step_down))
++    step_up_high = float(getattr(target_module, 'p_gate_auto_k_step_up_high', step_up))
++    step_down_high = float(getattr(target_module, 'p_gate_auto_k_step_down_high', step_down))
++
++    edge_target = float(getattr(target_module, 'p_gate_auto_k_target_edge', 0.05))
++    edge_tol = float(getattr(target_module, 'p_gate_auto_k_edge_tolerance', 0.5))
++    edge_hi = edge_target * (1.0 + edge_tol)
++    edge_lo = max(0.0, edge_target * (1.0 - edge_tol))
++    edge_step_down_low = float(getattr(target_module, 'p_gate_auto_k_edge_step_down_low', 0.01))
++    edge_step_down_high = float(getattr(target_module, 'p_gate_auto_k_edge_step_down_high', 0.01))
++
++    k_min = float(getattr(target_module, 'p_gate_auto_k_min', 1.0))
++    k_max = float(getattr(target_module, 'p_gate_auto_k_max', 16.0))
++    if k_max < k_min:
++        k_max = k_min
++
++    # One-sided by default (grow fast, shrink slowly). Both directions are supported.
++    # Additionally, when constraint activation is within the target band but p frequently hugs
++    # dynamic endpoints, shrink bounds (reduce k) to prevent pathological always/never gating.
++
++    edge_low_eff = float(edge_ema_low_new) if math.isfinite(edge_ema_low_new) else float(edge_low_rate)
++    edge_high_eff = float(edge_ema_high_new) if math.isfinite(edge_ema_high_new) else float(edge_high_rate)
++
++    if math.isfinite(ema_low_new):
++        if ema_low_new > hi and step_up_low > 0.0:
++            k_low_new = k_low_prev * (1.0 + step_up_low)
++        elif ema_low_new < lo and step_down_low > 0.0:
++            k_low_new = k_low_prev * max(0.0, (1.0 - step_down_low))
++        elif edge_enabled and math.isfinite(edge_low_eff) and edge_low_eff > edge_hi and edge_step_down_low > 0.0:
++            k_low_new = k_low_prev * max(0.0, (1.0 - edge_step_down_low))
++    if math.isfinite(ema_high_new):
++        if ema_high_new > hi and step_up_high > 0.0:
++            k_high_new = k_high_prev * (1.0 + step_up_high)
++        elif ema_high_new < lo and step_down_high > 0.0:
++            k_high_new = k_high_prev * max(0.0, (1.0 - step_down_high))
++        elif edge_enabled and math.isfinite(edge_high_eff) and edge_high_eff > edge_hi and edge_step_down_high > 0.0:
++            k_high_new = k_high_prev * max(0.0, (1.0 - edge_step_down_high))
++
++    if math.isfinite(k_low_new):
++        k_low_new = max(k_min, min(k_max, k_low_new))
++    if math.isfinite(k_high_new):
++        k_high_new = max(k_min, min(k_max, k_high_new))
++
++    k_low_changed = bool(math.isfinite(k_low_new) and abs(k_low_new - k_low_prev) > 1e-12)
++    k_high_changed = bool(math.isfinite(k_high_new) and abs(k_high_new - k_high_prev) > 1e-12)
++    k_changed = bool(k_low_changed or k_high_changed)
++
++    if k_changed:
++        with contextlib.suppress(Exception):
++            if isinstance(k_low_buf, torch.Tensor):
++                k_low_buf.fill_(float(k_low_new))
++            if isinstance(k_high_buf, torch.Tensor):
++                k_high_buf.fill_(float(k_high_new))
++
++        # Keep legacy average buffer in sync when present (even if unused).
++        if isinstance(k_legacy_buf, torch.Tensor) and not use_legacy:
++            with contextlib.suppress(Exception):
++                k_legacy_buf.fill_(float(0.5 * (k_low_new + k_high_new)))
++
++        # Keep the boolean fallback flag consistent (used in forward without .item()).
++        with contextlib.suppress(Exception):
++            setattr(target_module, 'p_gate_fallback_enabled', bool(k_low_new > 0.0 and k_high_new > 0.0))
++
++        upd_buf = getattr(target_module, 'p_gate_auto_k_updates_buf', None)
++        if isinstance(upd_buf, torch.Tensor):
++            with contextlib.suppress(Exception):
++                upd_buf.add_(1)
++
++    # Logging (rank0 only).
++    log_interval = int(getattr(target_module, 'p_gate_auto_k_log_interval', 0) or 0)
++    log_due = bool(k_changed) if log_interval <= 0 else bool(int(step) % int(log_interval) == 0)
++    if int(local_rank) == 0 and log_due:
++        _LOGGER.info(
++            "[p_gate] auto_k step=%d seen=%d activeL_sma=%.4f activeH_sma=%.4f width_mean=%.4f edgeL_sma=%.4f edgeH_sma=%.4f activeL_ema=%.4f activeH_ema=%.4f edgeL_ema=%.4f edgeH_ema=%.4f kL=%.4f -> %.4f kH=%.4f -> %.4f",
++            int(step),
++            int(count),
++            float(active_low_rate),
++            float(active_high_rate),
++            float(width_mean),
++            float(edge_low_rate),
++            float(edge_high_rate),
++            float(ema_low_new),
++            float(ema_high_new),
++            float(edge_ema_low_new),
++            float(edge_ema_high_new),
++            float(k_low_prev),
++            float(k_low_new),
++            float(k_high_prev),
++            float(k_high_new),
++        )
+ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler, sched, loss_controller, top_loss, bottom_loss, train_loader, val_loader, total_epochs, scheduler_step_per_batch=True, swa_helper=None, swa_start_epoch=0, buffers_dtype=None, dataset=None, **kwargs):
+     from ..data.nodes import Sampler
+     if train_loader is None:
+@@ -1778,6 +2013,14 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+     mem_util_ema = None
+     util_alpha = 0.2
+     global_step = 0
++    # Separate from per-epoch global_step: persists across epochs so p-gate
++    # fallback_k auto-tuning does not reset every epoch.
++    p_gate_auto_step_total = 0
++    with contextlib.suppress(Exception):
++        target_for_autok = model.module if hasattr(model, 'module') else model
++        step_buf = getattr(target_for_autok, 'p_gate_auto_k_step_buf', None)
++        if isinstance(step_buf, torch.Tensor):
++            p_gate_auto_step_total = int(step_buf.item())
+     util_adjust_interval = 0
+     util_warmup_steps = 0
+ 
+@@ -1879,6 +2122,8 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+         y_count = 0
+         y_sum = None
+         y_sum_sq = None
++        y_min = None
++        y_max = None
+         scaler_stats = None
+         with contextlib.suppress(Exception):
+             scaler_stats = BatchIO.load_scaler_stats(ops.sources)
+@@ -1890,11 +2135,18 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+             x_sum_sq = scaler_stats['x_sum_sq'].to(device=scaler_x_device)
+             y_sum = scaler_stats['y_sum'].to(device=scaler_y_device)
+             y_sum_sq = scaler_stats['y_sum_sq'].to(device=scaler_y_device)
++            y_min = scaler_stats.get('y_min')
++            y_max = scaler_stats.get('y_max')
++            if y_min is not None and y_max is not None:
++                y_min = y_min.to(device=scaler_y_device)
++                y_max = y_max.to(device=scaler_y_device)
+         else:
+             sx_tmp = None
+             sx2_tmp = None
+             sy_tmp = None
+             sy2_tmp = None
++            sy_min_tmp = None
++            sy_max_tmp = None
+             for batch in train_loader:
+                 feats, labs = extract_xy(batch, labels_required=True)
+                 if feats.ndim > 2:
+@@ -1928,12 +2180,22 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                             y_sum_sq = torch.zeros_like(y_sum)
+                             sy_tmp = torch.empty_like(y_sum)
+                             sy2_tmp = torch.empty_like(y_sum)
++                            sy_min_tmp = torch.empty_like(y_sum)
++                            sy_max_tmp = torch.empty_like(y_sum)
++                            y_min = torch.full_like(y_sum, float('inf'))
++                            y_max = torch.full_like(y_sum, float('-inf'))
+                         assert y_sum is not None and y_sum_sq is not None
+                         assert sy_tmp is not None and sy2_tmp is not None
+                         torch.sum(yf, dim=0, out=sy_tmp)
+                         y_sum.add_(sy_tmp)
+                         sy2_tmp.copy_(torch.einsum('ni,ni->i', yf, yf))
+                         y_sum_sq.add_(sy2_tmp)
++                        if y_min is not None and y_max is not None:
++                            assert sy_min_tmp is not None and sy_max_tmp is not None
++                            torch.amin(yf, dim=0, out=sy_min_tmp)
++                            torch.minimum(y_min, sy_min_tmp, out=y_min)
++                            torch.amax(yf, dim=0, out=sy_max_tmp)
++                            torch.maximum(y_max, sy_max_tmp, out=y_max)
+             if is_distributed() and (not used_memmap_stats):
+                 x_count_t = torch.tensor(float(x_count), device=scaler_x_device, dtype=torch.float64)
+                 torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
+@@ -1949,6 +2211,10 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                     torch.distributed.all_reduce(y_sum, op=torch.distributed.ReduceOp.SUM)
+                 if y_sum_sq is not None:
+                     torch.distributed.all_reduce(y_sum_sq, op=torch.distributed.ReduceOp.SUM)
++                if y_min is not None:
++                    torch.distributed.all_reduce(y_min, op=torch.distributed.ReduceOp.MIN)
++                if y_max is not None:
++                    torch.distributed.all_reduce(y_max, op=torch.distributed.ReduceOp.MAX)
+         eps = float(model_for_scaler.scaler.eps)
+         if x_count > 0 and x_sum is not None and (x_sum_sq is not None):
+             mean_x = x_sum / float(x_count)
+@@ -1970,6 +2236,13 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                 model_for_scaler.scaler.y_std.resize_(std_y.shape)
+             model_for_scaler.scaler.y_mean.copy_(mean_y)
+             model_for_scaler.scaler.y_std.copy_(std_y)
++            if y_min is not None and y_max is not None:
++                if model_for_scaler.scaler.y_min.shape != y_min.shape:
++                    model_for_scaler.scaler.y_min.resize_(y_min.shape)
++                if model_for_scaler.scaler.y_max.shape != y_max.shape:
++                    model_for_scaler.scaler.y_max.resize_(y_max.shape)
++                model_for_scaler.scaler.y_min.copy_(y_min)
++                model_for_scaler.scaler.y_max.copy_(y_max)
+     in_dim = int(ops.in_dim)
+     dev_type = str(getattr(device, 'type', 'cpu'))
+     non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
+@@ -2164,6 +2437,16 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                                                 flop_breakdown_epoch[name] = flop_breakdown_epoch.get(name, 0.0) + float(value)
+                             if should_sync:
+                                 global_step += 1
++                                # p-gate fallback_k auto-tuning (SMA+EMA of fallback-bound tightness).
++                                p_gate_auto_step_total += 1
++                                with contextlib.suppress(Exception):
++                                    target_for_autok = model.module if hasattr(model, 'module') else model
++                                    _maybe_autotune_p_gate_fallback_k(
++                                        target_for_autok,
++                                        step=p_gate_auto_step_total,
++                                        pg=train_pg,
++                                        local_rank=local_rank,
++                                    )
+                                 match device.type:
+                                     case 'cuda':
+                                         util_now, mem_now = _gpu_nvml_utils(device)
+diff --git a/stnet/core/config.py b/stnet/core/config.py
+index 26d9436..9fa00e4 100644
+--- a/stnet/core/config.py
++++ b/stnet/core/config.py
+@@ -267,6 +267,21 @@ class ModelConfig:
+     p_gate_enabled: bool = False
+     p_gate_hidden_dim: int = 64
+     p_gate_detach_inputs: bool = True
++
++    # Tile-wise p gating (optional). When set, p is predicted per output tile
++    # along the flattened y dimension, matching TiledLoss slicing.
++    # - None or <=0: scalar p per sample (default).
++    # - >0: tile size (number of y dims per tile).
++    p_gate_tile_size: Optional[int] = None
++
++    # Optional quantile-based bounds for p tightening. When enabled and
++    # y_quantile bounds are available, p is constrained so z_hat stays within
++    # the chosen per-dimension quantile range (more robust than min/max).
++    p_gate_bounds_use_quantile: bool = False
++    p_gate_bounds_q_low: float = 0.005
++    p_gate_bounds_q_high: float = 0.995
++    p_gate_bounds_q_max_samples: int = 8192
++    p_gate_bounds_clip_to_minmax: bool = True
+     p_gate_p_floor: float = 0.0
+     p_gate_p_ceil: float = 1.0
+     # If y_min/y_max bounds are unavailable (legacy scaler stats), fall back to
+@@ -613,6 +628,42 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
+         get("p_gate_detach_inputs", _MODEL_DEFAULTS.p_gate_detach_inputs),
+         name="p_gate_detach_inputs",
+     )
++
++    _raw_tile = get("p_gate_tile_size", None)
++    p_gate_tile_size = None if _raw_tile is None else _coerce_int(
++        _raw_tile,
++        name="p_gate_tile_size",
++        minimum=1,
++    )
++
++    p_gate_bounds_use_quantile = _coerce_bool(
++        get("p_gate_bounds_use_quantile", _MODEL_DEFAULTS.p_gate_bounds_use_quantile),
++        name="p_gate_bounds_use_quantile",
++    )
++    p_gate_bounds_q_low = _coerce_float(
++        get("p_gate_bounds_q_low", _MODEL_DEFAULTS.p_gate_bounds_q_low),
++        name="p_gate_bounds_q_low",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    p_gate_bounds_q_high = _coerce_float(
++        get("p_gate_bounds_q_high", _MODEL_DEFAULTS.p_gate_bounds_q_high),
++        name="p_gate_bounds_q_high",
++        minimum=0.0,
++        maximum=1.0,
++    )
++    if p_gate_bounds_q_high < p_gate_bounds_q_low:
++        p_gate_bounds_q_high = p_gate_bounds_q_low
++
++    p_gate_bounds_q_max_samples = _coerce_int(
++        get("p_gate_bounds_q_max_samples", _MODEL_DEFAULTS.p_gate_bounds_q_max_samples),
++        name="p_gate_bounds_q_max_samples",
++        minimum=0,
++    )
++    p_gate_bounds_clip_to_minmax = _coerce_bool(
++        get("p_gate_bounds_clip_to_minmax", _MODEL_DEFAULTS.p_gate_bounds_clip_to_minmax),
++        name="p_gate_bounds_clip_to_minmax",
++    )
+     p_gate_p_floor = _coerce_float(
+         get("p_gate_p_floor", _MODEL_DEFAULTS.p_gate_p_floor),
+         name="p_gate_p_floor",
+@@ -889,6 +940,12 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
+         p_gate_enabled=p_gate_enabled,
+         p_gate_hidden_dim=p_gate_hidden_dim,
+         p_gate_detach_inputs=p_gate_detach_inputs,
++        p_gate_tile_size=p_gate_tile_size,
++        p_gate_bounds_use_quantile=p_gate_bounds_use_quantile,
++        p_gate_bounds_q_low=p_gate_bounds_q_low,
++        p_gate_bounds_q_high=p_gate_bounds_q_high,
++        p_gate_bounds_q_max_samples=p_gate_bounds_q_max_samples,
++        p_gate_bounds_clip_to_minmax=p_gate_bounds_clip_to_minmax,
+         p_gate_p_floor=p_gate_p_floor,
+         p_gate_p_ceil=p_gate_p_ceil,
+         p_gate_fallback_k=p_gate_fallback_k,
+diff --git a/stnet/data/nodes.py b/stnet/data/nodes.py
+index ed81a90..81c58ef 100644
+--- a/stnet/data/nodes.py
++++ b/stnet/data/nodes.py
+@@ -1997,6 +1997,11 @@ class BatchIO:
+         y_max: Optional[torch.Tensor] = None
+         have_bounds: Optional[bool] = None
+ 
++        # Optional y quantile bounds (y_q_low / y_q_high) for robust p_gate bounding.
++        y_q_low: Optional[torch.Tensor] = None
++        y_q_high: Optional[torch.Tensor] = None
++        have_qbounds: Optional[bool] = None
++
+         for path in BatchIO.iter_source_paths(expanded):
+             try:
+                 meta = BatchIO.from_meta(path)
+@@ -2040,6 +2045,8 @@ class BatchIO:
+             local_xmax = payload.get("x_max")
+             local_ymin = payload.get("y_min")
+             local_ymax = payload.get("y_max")
++            local_yq_low = payload.get("y_q_low")
++            local_yq_high = payload.get("y_q_high")
+             local_have_bounds = (
+                 local_xmin is not None
+                 and local_xmax is not None
+@@ -2053,12 +2060,24 @@ class BatchIO:
+                 have_bounds = False
+                 x_min = x_max = y_min = y_max = None
+ 
++            local_have_q = (local_yq_low is not None and local_yq_high is not None)
++            if have_qbounds is None:
++                have_qbounds = bool(local_have_q)
++            elif have_qbounds and not local_have_q:
++                # Mixing old/new payload formats -> drop quantile bounds (incomplete).
++                have_qbounds = False
++                y_q_low = y_q_high = None
++
+             if have_bounds:
+                 local_xmin = local_xmin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmin, torch.Tensor) else torch.as_tensor(local_xmin, dtype=torch.float64)
+                 local_xmax = local_xmax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmax, torch.Tensor) else torch.as_tensor(local_xmax, dtype=torch.float64)
+                 local_ymin = local_ymin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymin, torch.Tensor) else torch.as_tensor(local_ymin, dtype=torch.float64)
+                 local_ymax = local_ymax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymax, torch.Tensor) else torch.as_tensor(local_ymax, dtype=torch.float64)
+ 
++            if have_qbounds:
++                local_yq_low = local_yq_low.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_low, torch.Tensor) else torch.as_tensor(local_yq_low, dtype=torch.float64)
++                local_yq_high = local_yq_high.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_high, torch.Tensor) else torch.as_tensor(local_yq_high, dtype=torch.float64)
++
+             if x_sum is None:
+                 x_sum = xs.clone()
+                 x_sum_sq = xs2.clone()
+@@ -2069,6 +2088,9 @@ class BatchIO:
+                     x_max = local_xmax.clone()
+                     y_min = local_ymin.clone()
+                     y_max = local_ymax.clone()
++                if have_qbounds:
++                    y_q_low = local_yq_low.clone()
++                    y_q_high = local_yq_high.clone()
+             else:
+                 if xs.shape != x_sum.shape or xs2.shape != x_sum_sq.shape:
+                     return None
+@@ -2090,6 +2112,14 @@ class BatchIO:
+                     torch.minimum(y_min, local_ymin, out=y_min)
+                     torch.maximum(y_max, local_ymax, out=y_max)
+ 
++                if have_qbounds:
++                    assert y_q_low is not None and y_q_high is not None
++                    if local_yq_low.shape != y_q_low.shape or local_yq_high.shape != y_q_high.shape:
++                        return None
++                    # Conservative merge: widen to cover all sources.
++                    torch.minimum(y_q_low, local_yq_low, out=y_q_low)
++                    torch.maximum(y_q_high, local_yq_high, out=y_q_high)
++
+             total += c
+ 
+         if total <= 0 or x_sum is None or x_sum_sq is None or y_sum is None or y_sum_sq is None:
+@@ -2109,6 +2139,11 @@ class BatchIO:
+                 "y_min": y_min,
+                 "y_max": y_max,
+             })
++        if have_qbounds and y_q_low is not None and y_q_high is not None:
++            out.update({
++                "y_q_low": y_q_low,
++                "y_q_high": y_q_high,
++            })
+         return out
+ 
+     @staticmethod
+diff --git a/stnet/nn/architecture.py b/stnet/nn/architecture.py
+index f402729..d969e13 100644
+--- a/stnet/nn/architecture.py
++++ b/stnet/nn/architecture.py
+@@ -982,6 +982,18 @@ class Model(nn.Module):
+             self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
+         )
+ 
++        # Tile-wise p gating (optional). When set, p is predicted per output tile
++        # along the flattened y dimension; set this to the same value as ops.loss_tile_size
++        # if you want tight coupling with TiledLoss slicing.
++        self.p_gate_tile_size: Optional[int] = getattr(config, 'p_gate_tile_size', None)
++
++        # Optional quantile bounds for p tightening (requires scaler.y_q_low/y_q_high).
++        self.p_gate_bounds_use_quantile: bool = bool(getattr(config, 'p_gate_bounds_use_quantile', False))
++        self.p_gate_bounds_q_low: float = float(getattr(config, 'p_gate_bounds_q_low', 0.005))
++        self.p_gate_bounds_q_high: float = float(getattr(config, 'p_gate_bounds_q_high', 0.995))
++        self.p_gate_bounds_q_max_samples: int = int(getattr(config, 'p_gate_bounds_q_max_samples', 8192) or 0)
++        self.p_gate_bounds_clip_to_minmax: bool = bool(getattr(config, 'p_gate_bounds_clip_to_minmax', True))
++
+         try:
+             # Asymmetric fallback ks (lower/upper) for mean±kσ bounds.
+             self.register_buffer(
+@@ -1055,6 +1067,7 @@ class Model(nn.Module):
+                 detach_inputs=bool(getattr(config, 'p_gate_detach_inputs', True)),
+                 p_floor=float(getattr(config, 'p_gate_p_floor', 0.0)),
+                 p_ceil=float(getattr(config, 'p_gate_p_ceil', 1.0)),
++                tile_size=getattr(config, 'p_gate_tile_size', None),
+                 clip_eps=float(getattr(config, 'p_gate_clip_eps', 1e-6)),
+                 eps=float(getattr(config, 'p_gate_eps', 1e-6)),
+                 stat_width_frac=float(getattr(config, 'p_gate_auto_k_width_frac', 0.05)),
+@@ -1677,36 +1690,66 @@ class Model(nn.Module):
+                 z_max: Optional[torch.Tensor] = None
+                 fallback_bounds = False
+                 try:
+-                    ymin = getattr(self.scaler, 'y_min', None)
+-                    ymax = getattr(self.scaler, 'y_max', None)
+-                    if isinstance(ymin, torch.Tensor) and isinstance(ymax, torch.Tensor):
+-                        mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
+-                        std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
+-                        denom = std + float(self.scaler.eps)
+-
+-                        if bool(torch.isfinite(ymin).all().item()) and bool(torch.isfinite(ymax).all().item()):
+-                            ymin_t = ymin.to(device=assembled.device, dtype=assembled.dtype)
+-                            ymax_t = ymax.to(device=assembled.device, dtype=assembled.dtype)
+-                            z_min = (ymin_t - mean) / denom
+-                            z_max = (ymax_t - mean) / denom
+-                        else:
+-                            # Legacy/unknown bounds: fall back to mean ± k * std.
+-                            # This corresponds to z in [-k*std/(std+eps), +k*std/(std+eps)].
+-                            if bool(getattr(self, 'p_gate_fallback_enabled', False)):
+-                                k_low_buf = getattr(self, 'p_gate_fallback_k_low_buf', None)
+-                                k_high_buf = getattr(self, 'p_gate_fallback_k_high_buf', None)
+-                                if isinstance(k_low_buf, torch.Tensor):
+-                                    k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
+-                                else:
+-                                    k_low = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_low', getattr(self, 'p_gate_fallback_k', 0.0))))
+-                                if isinstance(k_high_buf, torch.Tensor):
+-                                    k_high = k_high_buf.to(device=assembled.device, dtype=assembled.dtype)
+-                                else:
+-                                    k_high = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_high', getattr(self, 'p_gate_fallback_k', 0.0))))
+-                                z_scale = std / denom
+-                                z_min = (-k_low) * z_scale
+-                                z_max = (k_high) * z_scale
+-                                fallback_bounds = True
++                    y_min = getattr(self.scaler, 'y_min', None)
++                    y_max = getattr(self.scaler, 'y_max', None)
++                    y_q_low = getattr(self.scaler, 'y_q_low', None)
++                    y_q_high = getattr(self.scaler, 'y_q_high', None)
++
++                    mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
++                    std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
++                    denom = std + float(self.scaler.eps)
++
++                    def _finite_pair(lo: object, hi: object) -> bool:
++                        if not (isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor)):
++                            return False
++                        try:
++                            return bool(torch.isfinite(lo).all().item()) and bool(torch.isfinite(hi).all().item())
++                        except Exception:
++                            return False
++
++                    have_minmax = _finite_pair(y_min, y_max)
++                    have_quant = _finite_pair(y_q_low, y_q_high)
++
++                    use_quant = bool(getattr(self, 'p_gate_bounds_use_quantile', False))
++                    clip_quant = bool(getattr(self, 'p_gate_bounds_clip_to_minmax', True))
++
++                    ylo_t: Optional[torch.Tensor] = None
++                    yhi_t: Optional[torch.Tensor] = None
++
++                    if use_quant and have_quant:
++                        ylo_t = cast(torch.Tensor, y_q_low).to(device=assembled.device, dtype=assembled.dtype)
++                        yhi_t = cast(torch.Tensor, y_q_high).to(device=assembled.device, dtype=assembled.dtype)
++                        # Optionally clip quantile bounds within min/max bounds when available.
++                        if clip_quant and have_minmax:
++                            ymin_t = cast(torch.Tensor, y_min).to(device=assembled.device, dtype=assembled.dtype)
++                            ymax_t = cast(torch.Tensor, y_max).to(device=assembled.device, dtype=assembled.dtype)
++                            ylo_t = torch.maximum(ylo_t, ymin_t)
++                            yhi_t = torch.minimum(yhi_t, ymax_t)
++                    elif have_minmax:
++                        ylo_t = cast(torch.Tensor, y_min).to(device=assembled.device, dtype=assembled.dtype)
++                        yhi_t = cast(torch.Tensor, y_max).to(device=assembled.device, dtype=assembled.dtype)
++
++                    if ylo_t is not None and yhi_t is not None:
++                        z_min = (ylo_t - mean) / denom
++                        z_max = (yhi_t - mean) / denom
++                    else:
++                        # Legacy/unknown bounds: fall back to mean ± k * std.
++                        # This corresponds to z in [-k*std/(std+eps), +k*std/(std+eps)].
++                        if bool(getattr(self, 'p_gate_fallback_enabled', False)):
++                            k_low_buf = getattr(self, 'p_gate_fallback_k_low_buf', None)
++                            k_high_buf = getattr(self, 'p_gate_fallback_k_high_buf', None)
++                            if isinstance(k_low_buf, torch.Tensor):
++                                k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
++                            else:
++                                k_low = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_low', getattr(self, 'p_gate_fallback_k', 0.0))))
++                            if isinstance(k_high_buf, torch.Tensor):
++                                k_high = k_high_buf.to(device=assembled.device, dtype=assembled.dtype)
++                            else:
++                                k_high = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_high', getattr(self, 'p_gate_fallback_k', 0.0))))
++                            z_scale = std / denom
++                            z_min = (-k_low) * z_scale
++                            z_max = (k_high) * z_scale
++                            fallback_bounds = True
+                 except Exception:
+                     z_min = None
+                     z_max = None
+@@ -1841,7 +1884,13 @@ class Model(nn.Module):
+                     teacher = y_hat.detach()
+                     student = assembled
+                     if p is not None:
+-                        w = p.detach().squeeze(-1).clamp(min=0.0)
++                        w = p.detach()
++                        # p can be (B, 1) (scalar gate) or (B, D) (tile-wise-expanded).
++                        if w.dim() == 2 and int(w.shape[1]) != 1:
++                            w = w.mean(dim=1)
++                        else:
++                            w = w.squeeze(-1)
++                        w = w.clamp(min=0.0)
+                         per = F.smooth_l1_loss(student, teacher, reduction="none").mean(dim=1)
+                         loss_yy = (per * w).mean()
+                     else:
+diff --git a/stnet/nn/primitives.py b/stnet/nn/primitives.py
+index c0a578f..a00c5be 100644
+--- a/stnet/nn/primitives.py
++++ b/stnet/nn/primitives.py
+@@ -1552,6 +1552,9 @@ class Scaler(nn.Module):
+         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
+         self.register_buffer("y_min", torch.full((1,), float("-inf"), dtype=torch.float64))
+         self.register_buffer("y_max", torch.full((1,), float("inf"), dtype=torch.float64))
++        # Optional quantile bounds for y (used by p_gate when enabled).
++        self.register_buffer("y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64))
++        self.register_buffer("y_q_high", torch.full((1,), float("inf"), dtype=torch.float64))
+         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
+         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
+         self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
+@@ -2018,15 +2021,20 @@ class Scaler(nn.Module):
+ 
+ 
+ class ResidualGate(nn.Module):
+-    """Learned, bounded scalar gate `p` for residual mixing.
++    """Learned, bounded gate `p` for residual mixing.
+ 
+     Computes `z_hat = base + p * residue` with `p` constrained to a user-specified
+     range. Optionally tightens the allowed `p` interval per-sample so that the
+     mixed output stays within provided (z_min, z_max) bounds.
+ 
++    Supports two modes:
++      - Scalar p (default): one `p` per sample, returned as shape (B, 1).
++      - Tile-wise p: one `p` per *output tile* along the flattened y dimension,
++        expanded to (B, D) for elementwise mixing and compatibility with TiledLoss.
++
+     This module is intentionally simple and torch.compile friendly:
+     - No torch.distributions objects
+-    - No python-side randomness
++    - No python-side randomness in forward
+     - All math is vectorized
+     """
+ 
+@@ -2039,6 +2047,9 @@ class ResidualGate(nn.Module):
+         clip_eps: float = 1e-6,
+         p_floor: float = 0.0,
+         p_ceil: float = 1.0,
++        # Tile-wise p: number of y dims per tile (along flattened output dim).
++        # None/<=0 -> scalar p per sample.
++        tile_size: Optional[int] = None,
+         # Stats collection (used for fallback_k auto-tuning).
+         stat_width_frac: float = 0.05,
+         stat_edge_frac: float = 0.02,
+@@ -2059,6 +2070,10 @@ class ResidualGate(nn.Module):
+         self.use_refined = bool(use_refined)
+         self.use_stats = bool(use_stats)
+ 
++        ts = 0 if tile_size is None else int(tile_size)
++        self.tile_size = int(ts) if ts > 0 else 0
++
++        # Global context -> global logit (shared by all tiles).
+         in_dim = 0
+         if self.use_tokens:
+             in_dim += int(d_model)
+@@ -2075,12 +2090,30 @@ class ResidualGate(nn.Module):
+             nn.Linear(int(hidden_dim), 1),
+         )
+ 
++        # Optional tile MLP: local stats per tile -> tile logit.
++        # We keep this small and share weights across tiles.
++        self.tile_net: Optional[nn.Module] = None
++        if self.tile_size > 0:
++            tile_in = 3  # [base_rms, res_rms, res/base]
++            self.tile_net = nn.Sequential(
++                nn.LayerNorm(tile_in),
++                nn.Linear(tile_in, int(hidden_dim)),
++                nn.SiLU(),
++                nn.Linear(int(hidden_dim), 1),
++            )
++
+         # Initialize near p ~= 0.5 for stability (logit ~= 0).
+         with contextlib.suppress(Exception):
+             last = self.net[-1]
+             if isinstance(last, nn.Linear):
+                 nn.init.zeros_(last.weight)
+                 nn.init.zeros_(last.bias)
++        with contextlib.suppress(Exception):
++            if self.tile_net is not None:
++                last = self.tile_net[-1]
++                if isinstance(last, nn.Linear):
++                    nn.init.zeros_(last.weight)
++                    nn.init.zeros_(last.bias)
+ 
+         # Fallback-bound diagnostics (not persisted in checkpoints).
+         # These are accumulated on-device and consumed by the runtime at a
+@@ -2104,14 +2137,9 @@ class ResidualGate(nn.Module):
+         Returns a float32 tensor of shape (6,):
+             [count, active_low_sum, active_high_sum, width_sum, edge_low_sum, edge_high_sum]
+ 
+-        Where:
+-          - count: number of samples seen under fallback bounds
+-          - active_low_sum: number of samples where fallback bounds meaningfully clipped the low side
+-            of the allowed [p_floor, p_ceil] interval
+-          - active_high_sum: same for the high side
+-          - width_sum: sum of (p_high - p_low) across samples
+-          - edge_low_sum: number of samples where p was near the *dynamic* low endpoint p_low
+-          - edge_high_sum: number of samples where p was near the *dynamic* high endpoint p_high
++        Notes:
++          - In scalar mode, `count` is the number of samples.
++          - In tile-wise mode, `count` is the number of tiles (B * n_tiles).
+         """
+         stats = torch.stack(
+             [
+@@ -2131,6 +2159,17 @@ class ResidualGate(nn.Module):
+         self._fb_edge_high_sum.zero_()
+         return stats
+ 
++    def _expand_tiles(self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
++        """Expand (B, T) -> (B, dim) by repeating per-tile values."""
++        if self.tile_size <= 0:
++            raise RuntimeError("ResidualGate._expand_tiles called with tile_size<=0")
++        b = int(p_tile.shape[0])
++        tile = int(self.tile_size)
++        n_tiles = int(p_tile.shape[1])
++        d_pad = int(n_tiles * tile)
++        p_full = p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
++        return p_full[:, : int(dim)]
++
+     def forward(
+         self,
+         *,
+@@ -2163,6 +2202,7 @@ class ResidualGate(nn.Module):
+                 r = r.detach()
+             feats.append(r)
+ 
++        # Global RMS stats.
+         if self.use_stats and base is not None and residue is not None:
+             b = base.detach() if self.detach_inputs else base
+             res = residue.detach() if self.detach_inputs else residue
+@@ -2175,73 +2215,277 @@ class ResidualGate(nn.Module):
+             feats.append(r_rms.to(dtype=tokens.dtype))
+ 
+         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
+-        logit = self.net(x).squeeze(-1)
++        global_logit = self.net(x).squeeze(-1)  # (B,)
++
++        use_tile = (
++            self.tile_size > 0
++            and self.tile_net is not None
++            and base is not None
++            and residue is not None
++            and base.dim() == 2
++            and residue.dim() == 2
++            and int(base.shape[0]) == int(residue.shape[0])
++        )
++
++        # Scalar mode: original behavior.
++        if not use_tile:
++            sig = torch.sigmoid(global_logit)
++
++            # Default range.
++            p_low = sig.new_full(sig.shape, float(self.p_floor))
++            p_high = sig.new_full(sig.shape, float(self.p_ceil))
++
++            # Optionally tighten p-range so z_hat stays within [z_min, z_max].
++            if (
++                z_min is not None
++                and z_max is not None
++                and base is not None
++                and residue is not None
++            ):
++                b = base.detach() if self.detach_inputs else base
++                r = residue.detach() if self.detach_inputs else residue
++                b32 = b.to(dtype=torch.float32)
++                r32 = r.to(dtype=torch.float32)
++
++                zmin = z_min.to(device=b32.device, dtype=torch.float32)
++                zmax = z_max.to(device=b32.device, dtype=torch.float32)
++                if zmin.numel() != 1:
++                    zmin = zmin.reshape(1, -1)
++                if zmax.numel() != 1:
++                    zmax = zmax.reshape(1, -1)
++
++                # Stabilize division by small residuals.
++                sign = torch.where(r32 >= 0, 1.0, -1.0)
++                r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
++
++                p_a = (zmin - b32) / r_safe
++                p_b = (zmax - b32) / r_safe
++                p_min_dim = torch.minimum(p_a, p_b)
++                p_max_dim = torch.maximum(p_a, p_b)
++
++                # Intersection across dimensions -> scalar [p_low, p_high] per sample.
++                p_low_bound = p_min_dim.max(dim=1).values
++                p_high_bound = p_max_dim.min(dim=1).values
++
++                # Clamp to user range.
++                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
++                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
++
++                # Ensure non-empty interval.
++                p_high = torch.maximum(p_high, p_low + float(self.eps))
++
++            # Map sigmoid into [p_low, p_high].
++            p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
++
++            # Clip away exact endpoints if requested.
++            clip = float(self.clip_eps)
++            lo = float(self.p_floor) + clip
++            hi = float(self.p_ceil) - clip
++            if hi > lo:
++                p = torch.clamp(p, min=lo, max=hi)
++            else:
++                p = torch.clamp(p, min=float(self.p_floor), max=float(self.p_ceil))
++
++            edge_reg: Optional[torch.Tensor] = None
++            edge_reg_low: Optional[torch.Tensor] = None
++            edge_reg_high: Optional[torch.Tensor] = None
++
++            # Diagnostics for fallback bounds (mean±kσ).
++            if bool(fallback_bounds):
++                try:
++                    width = (p_high - p_low).to(dtype=torch.float32)
++                    denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
++
++                    tthr = float(self.stat_width_frac) * denom
++                    tthr = float(max(tthr, self.eps))
++                    trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
++                    trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
++                    active_low = trim_low >= tthr
++                    active_high = trim_high >= tthr
++
++                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
++                    ethr = float(max(float(self.stat_edge_frac), 0.0))
++                    edge_thr = w_safe * float(ethr)
++                    edge_low = (p - p_low) <= edge_thr
++                    edge_high = (p_high - p) <= edge_thr
++
++                    with torch.no_grad():
++                        self._fb_count.add_(float(p.shape[0]))
++                        self._fb_width_sum.add_(width.sum())
++                        self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
++                        self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
++                        self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
++                        self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
++                except Exception:
++                    pass
++
++            if bool(return_edge_reg) or bool(return_edge_reg_lr):
++                try:
++                    width = (p_high - p_low).to(dtype=torch.float32)
++                    full = max(float(self.p_ceil - self.p_floor), float(self.eps))
++                    min_w = float(edge_reg_min_width_frac) * full
++                    min_w = float(max(min_w, self.eps))
++                    mask = (width >= min_w).to(dtype=torch.float32)
++
++                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
++                    q = (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
++                    q = torch.clamp(q, 0.0, 1.0)
++
++                    m = float(edge_reg_frac)
++                    m = float(min(max(m, self.eps), 0.49))
++                    inv_m = 1.0 / m
++
++                    d_low = F.relu(m - q) * inv_m
++                    d_high = F.relu(q - (1.0 - m)) * inv_m
++
++                    pen_low = d_low.pow(float(edge_reg_power)) * mask
++                    pen_high = d_high.pow(float(edge_reg_power)) * mask
++
++                    denom = mask.sum() + float(self.eps)
++                    edge_reg_low = pen_low.sum() / denom
++                    edge_reg_high = pen_high.sum() / denom
++                    edge_reg = edge_reg_low + edge_reg_high
++                except Exception:
++                    edge_reg = None
++                    edge_reg_low = None
++                    edge_reg_high = None
++
++            out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
++            out = p.to(dtype=out_dtype).unsqueeze(-1)  # (B, 1)
++            if bool(return_edge_reg_lr):
++                if edge_reg_low is None:
++                    edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
++                if edge_reg_high is None:
++                    edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
++                return out, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
++            if bool(return_edge_reg):
++                if edge_reg is None:
++                    edge_reg = out.new_tensor(0.0, dtype=torch.float32)
++                return out, edge_reg.to(dtype=out_dtype)
++            return out
++
++        # --- Tile-wise mode ---
++        assert base is not None and residue is not None
++        b = base.detach() if self.detach_inputs else base
++        r = residue.detach() if self.detach_inputs else residue
++        b32 = b.to(dtype=torch.float32)
++        r32 = r.to(dtype=torch.float32)
++        B = int(b32.shape[0])
++        D = int(b32.shape[1])
++        tile = int(self.tile_size)
++        n_tiles = int((D + tile - 1) // tile)
++        d_pad = int(n_tiles * tile)
++        pad = int(d_pad - D)
++
++        if pad > 0:
++            b32p = F.pad(b32, (0, pad))
++            r32p = F.pad(r32, (0, pad))
++        else:
++            b32p = b32
++            r32p = r32
++
++        b_tile = b32p.reshape(B, n_tiles, tile)
++        r_tile = r32p.reshape(B, n_tiles, tile)
++
++        # Valid-mask for last (partial) tile.
++        if pad > 0:
++            ar = torch.arange(d_pad, device=b_tile.device)
++            mask_bool = (ar < D).reshape(1, n_tiles, tile)
++            mask = mask_bool.to(dtype=torch.float32)
++        else:
++            mask_bool = None
++            mask = None
++
++        # Tile features.
++        if mask is None:
++            denom = float(tile)
++            b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=2) + self.eps)
++            r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=2) + self.eps)
++        else:
++            denom = torch.clamp(mask.sum(dim=2), min=1.0)
++            b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=2) / denom + self.eps)
++            r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=2) / denom + self.eps)
++
++        ratio = r_rms_t / (b_rms_t + float(self.eps))
++        tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
++
++        tile_logit = self.tile_net(tile_feats).squeeze(-1)  # type: ignore[operator]
++        logit = global_logit.unsqueeze(1) + tile_logit
+         sig = torch.sigmoid(logit)
+ 
+         # Default range.
+         p_low = sig.new_full(sig.shape, float(self.p_floor))
+         p_high = sig.new_full(sig.shape, float(self.p_ceil))
+ 
+-        # Optionally tighten p-range so z_hat stays within [z_min, z_max].
+-        if (
+-            z_min is not None
+-            and z_max is not None
+-            and base is not None
+-            and residue is not None
+-        ):
+-            b = base.detach() if self.detach_inputs else base
+-            r = residue.detach() if self.detach_inputs else residue
+-            b32 = b.to(dtype=torch.float32)
+-            r32 = r.to(dtype=torch.float32)
+-
+-            zmin = z_min.to(device=b32.device, dtype=torch.float32)
+-            zmax = z_max.to(device=b32.device, dtype=torch.float32)
++        # Optionally tighten p-range so z_hat stays within [z_min, z_max], per tile.
++        if z_min is not None and z_max is not None:
++            zmin = z_min.to(device=b_tile.device, dtype=torch.float32)
++            zmax = z_max.to(device=b_tile.device, dtype=torch.float32)
+             if zmin.numel() != 1:
+                 zmin = zmin.reshape(1, -1)
+             if zmax.numel() != 1:
+                 zmax = zmax.reshape(1, -1)
+ 
+-            # Stabilize division by small residuals.
+-            sign = torch.where(r32 >= 0, 1.0, -1.0)
+-            r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
++            if zmin.numel() != 1 and int(zmin.shape[-1]) != int(D):
++                # Dimension mismatch -> skip tightening.
++                zmin = None
++                zmax = None
++            elif zmin is not None and zmax is not None:
++                if zmin.numel() == 1:
++                    zminp = zmin.expand(1, d_pad)
++                    zmaxp = zmax.expand(1, d_pad)
++                else:
++                    if pad > 0:
++                        zminp = F.pad(zmin, (0, pad))
++                        zmaxp = F.pad(zmax, (0, pad))
++                    else:
++                        zminp = zmin
++                        zmaxp = zmax
++
++                zmin_t = zminp.reshape(1, n_tiles, tile)
++                zmax_t = zmaxp.reshape(1, n_tiles, tile)
++
++                # Stabilize division by small residuals.
++                sign = torch.where(r_tile >= 0, 1.0, -1.0)
++                r_safe = torch.where(r_tile.abs() < self.eps, sign * self.eps, r_tile)
+ 
+-            p_a = (zmin - b32) / r_safe
+-            p_b = (zmax - b32) / r_safe
+-            p_min_dim = torch.minimum(p_a, p_b)
+-            p_max_dim = torch.maximum(p_a, p_b)
++                p_a = (zmin_t - b_tile) / r_safe
++                p_b = (zmax_t - b_tile) / r_safe
++                p_min_dim = torch.minimum(p_a, p_b)
++                p_max_dim = torch.maximum(p_a, p_b)
+ 
+-            # Intersection across dimensions -> scalar [p_low, p_high] per sample.
+-            p_low_bound = p_min_dim.max(dim=1).values
+-            p_high_bound = p_max_dim.min(dim=1).values
++                if mask_bool is not None:
++                    neg_inf = torch.finfo(p_min_dim.dtype).min
++                    pos_inf = torch.finfo(p_max_dim.dtype).max
++                    p_min_dim = torch.where(mask_bool, p_min_dim, p_min_dim.new_full((), neg_inf))
++                    p_max_dim = torch.where(mask_bool, p_max_dim, p_max_dim.new_full((), pos_inf))
+ 
+-            # Clamp to user range.
+-            p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
+-            p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
++                # Intersection inside each tile -> [p_low, p_high] per (B, tile).
++                p_low_bound = p_min_dim.max(dim=2).values
++                p_high_bound = p_max_dim.min(dim=2).values
+ 
+-            # Ensure non-empty interval.
+-            p_high = torch.maximum(p_high, p_low + float(self.eps))
++                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
++                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
++                p_high = torch.maximum(p_high, p_low + float(self.eps))
+ 
+         # Map sigmoid into [p_low, p_high].
+-        p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
++        p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
+ 
+         # Clip away exact endpoints if requested.
+         clip = float(self.clip_eps)
+         lo = float(self.p_floor) + clip
+         hi = float(self.p_ceil) - clip
+         if hi > lo:
+-            p = torch.clamp(p, min=lo, max=hi)
++            p_tile = torch.clamp(p_tile, min=lo, max=hi)
+         else:
+-            p = torch.clamp(p, min=float(self.p_floor), max=float(self.p_ceil))
++            p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
+ 
+-        # Diagnostics for fallback bounds (mean±kσ).
++        # Diagnostics for fallback bounds (mean±kσ) — count per tile.
+         if bool(fallback_bounds):
+             try:
+                 width = (p_high - p_low).to(dtype=torch.float32)
+                 denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
+ 
+-                # "Constraint activation" metric (per-side):
+-                # For each side, count a sample as active when the fallback bounds clip away a
+-                # meaningful fraction of the user-specified [p_floor, p_ceil] interval.
+                 tthr = float(self.stat_width_frac) * denom
+                 tthr = float(max(tthr, self.eps))
+                 trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
+@@ -2249,18 +2493,14 @@ class ResidualGate(nn.Module):
+                 active_low = trim_low >= tthr
+                 active_high = trim_high >= tthr
+ 
+-                # "Boundary hugging" diagnostic (per-side):
+-                # Count samples where p is near the dynamic [p_low, p_high] endpoints.
+                 w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+-                ethr = float(self.stat_edge_frac)
+-                ethr = float(max(ethr, 0.0))
++                ethr = float(max(float(self.stat_edge_frac), 0.0))
+                 edge_thr = w_safe * float(ethr)
+-                edge_low = (p - p_low) <= edge_thr
+-                edge_high = (p_high - p) <= edge_thr
++                edge_low = (p_tile - p_low) <= edge_thr
++                edge_high = (p_high - p_tile) <= edge_thr
+ 
+                 with torch.no_grad():
+-                    # Use sums (not means) so runtime can all-reduce reliably.
+-                    self._fb_count.add_(float(p.shape[0]))
++                    self._fb_count.add_(float(p_tile.numel()))
+                     self._fb_width_sum.add_(width.sum())
+                     self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
+                     self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
+@@ -2278,24 +2518,23 @@ class ResidualGate(nn.Module):
+                 full = max(float(self.p_ceil - self.p_floor), float(self.eps))
+                 min_w = float(edge_reg_min_width_frac) * full
+                 min_w = float(max(min_w, self.eps))
+-                mask = (width >= min_w).to(dtype=torch.float32)
++                mask_w = (width >= min_w).to(dtype=torch.float32)
+ 
+                 w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+-                q = (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
++                q = (p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                 q = torch.clamp(q, 0.0, 1.0)
+ 
+                 m = float(edge_reg_frac)
+                 m = float(min(max(m, self.eps), 0.49))
+                 inv_m = 1.0 / m
+ 
+-                # Per-side normalized distances to the dynamic endpoints.
+                 d_low = F.relu(m - q) * inv_m
+                 d_high = F.relu(q - (1.0 - m)) * inv_m
+ 
+-                pen_low = d_low.pow(float(edge_reg_power)) * mask
+-                pen_high = d_high.pow(float(edge_reg_power)) * mask
++                pen_low = d_low.pow(float(edge_reg_power)) * mask_w
++                pen_high = d_high.pow(float(edge_reg_power)) * mask_w
+ 
+-                denom = mask.sum() + float(self.eps)
++                denom = mask_w.sum() + float(self.eps)
+                 edge_reg_low = pen_low.sum() / denom
+                 edge_reg_high = pen_high.sum() / denom
+                 edge_reg = edge_reg_low + edge_reg_high
+@@ -2304,23 +2543,24 @@ class ResidualGate(nn.Module):
+                 edge_reg_low = None
+                 edge_reg_high = None
+ 
+-        # Return shape (B, 1) for broadcast.
+         out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+-        out = p.to(dtype=out_dtype).unsqueeze(-1)
++        out_full = self._expand_tiles(p_tile.to(dtype=out_dtype), dim=D)  # (B, D)
++
+         if bool(return_edge_reg_lr):
+             if edge_reg_low is None:
+-                edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
++                edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
+             if edge_reg_high is None:
+-                edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
+-            return out, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
++                edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
++            return out_full, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+         if bool(return_edge_reg):
+             if edge_reg is None:
+-                edge_reg = out.new_tensor(0.0, dtype=torch.float32)
+-            return out, edge_reg.to(dtype=out_dtype)
+-        return out
++                edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
++            return out_full, edge_reg.to(dtype=out_dtype)
++        return out_full
+ 
+ 
+ class Recorder(nn.Module):
++
+     def __init__(self) -> None:
+         super().__init__()
+         # Precision-exempt: history/logging buffers must remain FP64/INT64.
+@@ -2691,7 +2931,7 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
+     else:
+         view = state
+ 
+-    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "y_min", "y_max", "affine_a", "affine_b", "pw_x", "pw_y")
++    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "y_min", "y_max", "y_q_low", "y_q_high", "affine_a", "affine_b", "pw_x", "pw_y")
+     prefixes = ("scaler.", "module.scaler.")
+ 
+     for prefix in prefixes:
+diff --git a/stnet/runtime/main.py b/stnet/runtime/main.py
+index c83fb52..ddc3ad7 100644
+--- a/stnet/runtime/main.py
++++ b/stnet/runtime/main.py
+@@ -2124,6 +2124,15 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+         y_sum_sq = None
+         y_min = None
+         y_max = None
++        y_q_low = None
++        y_q_high = None
++        # Optional quantile bounds for y (used by p_gate when enabled).
++        want_y_quantiles = bool(getattr(model_for_scaler, 'p_gate_bounds_use_quantile', False))
++        q_low = float(getattr(model_for_scaler, 'p_gate_bounds_q_low', 0.005))
++        q_high = float(getattr(model_for_scaler, 'p_gate_bounds_q_high', 0.995))
++        q_max = int(getattr(model_for_scaler, 'p_gate_bounds_q_max_samples', 8192) or 0)
++        want_y_quantiles = bool(want_y_quantiles and q_max > 0 and (0.0 < q_low < q_high < 1.0))
++        y_q_samples = None
+         scaler_stats = None
+         with contextlib.suppress(Exception):
+             scaler_stats = BatchIO.load_scaler_stats(ops.sources)
+@@ -2137,9 +2146,14 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+             y_sum_sq = scaler_stats['y_sum_sq'].to(device=scaler_y_device)
+             y_min = scaler_stats.get('y_min')
+             y_max = scaler_stats.get('y_max')
++            y_q_low = scaler_stats.get('y_q_low')
++            y_q_high = scaler_stats.get('y_q_high')
+             if y_min is not None and y_max is not None:
+                 y_min = y_min.to(device=scaler_y_device)
+                 y_max = y_max.to(device=scaler_y_device)
++            if y_q_low is not None and y_q_high is not None:
++                y_q_low = y_q_low.to(device=scaler_y_device)
++                y_q_high = y_q_high.to(device=scaler_y_device)
+         else:
+             sx_tmp = None
+             sx2_tmp = None
+@@ -2196,6 +2210,19 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                             torch.minimum(y_min, sy_min_tmp, out=y_min)
+                             torch.amax(yf, dim=0, out=sy_max_tmp)
+                             torch.maximum(y_max, sy_max_tmp, out=y_max)
++                        if want_y_quantiles and q_max > 0:
++                            # Keep an approximately-uniform sample of rows for per-dim quantile estimation.
++                            y_take = yf
++                            if int(y_take.shape[0]) > int(q_max):
++                                idx = torch.randperm(int(y_take.shape[0]), device=y_take.device)[: int(q_max)]
++                                y_take = y_take.index_select(0, idx)
++                            if y_q_samples is None:
++                                y_q_samples = y_take
++                            else:
++                                y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
++                            if int(y_q_samples.shape[0]) > int(q_max):
++                                idx = torch.randperm(int(y_q_samples.shape[0]), device=y_q_samples.device)[: int(q_max)]
++                                y_q_samples = y_q_samples.index_select(0, idx)
+             if is_distributed() and (not used_memmap_stats):
+                 x_count_t = torch.tensor(float(x_count), device=scaler_x_device, dtype=torch.float64)
+                 torch.distributed.all_reduce(x_count_t, op=torch.distributed.ReduceOp.SUM)
+@@ -2215,6 +2242,64 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                     torch.distributed.all_reduce(y_min, op=torch.distributed.ReduceOp.MIN)
+                 if y_max is not None:
+                     torch.distributed.all_reduce(y_max, op=torch.distributed.ReduceOp.MAX)
++        # Compute y quantile bounds (per-dimension) if requested and not available from memmap stats.
++        if want_y_quantiles and (y_q_low is None or y_q_high is None):
++            # If we didn't collect samples yet (e.g., memmap scaler stats were used),
++            # do a lightweight pass over train_loader to sample y rows.
++            if y_q_samples is None:
++                for batch in train_loader:
++                    _, labs = extract_xy(batch, labels_required=True)
++                    with torch.inference_mode():
++                        yf = labs.to(device=scaler_y_device, dtype=torch.float64)
++                        if yf.ndim > 2:
++                            yf = yf.reshape(yf.shape[0], -1)
++                        if int(yf.shape[0]) <= 0:
++                            continue
++                        y_take = yf
++                        if int(y_take.shape[0]) > int(q_max):
++                            idx2 = torch.randperm(int(y_take.shape[0]), device=y_take.device)[: int(q_max)]
++                            y_take = y_take.index_select(0, idx2)
++                        if y_q_samples is None:
++                            y_q_samples = y_take
++                        else:
++                            y_q_samples = torch.cat([y_q_samples, y_take], dim=0)
++                        if int(y_q_samples.shape[0]) > int(q_max):
++                            idx2 = torch.randperm(int(y_q_samples.shape[0]), device=y_q_samples.device)[: int(q_max)]
++                            y_q_samples = y_q_samples.index_select(0, idx2)
++
++            if y_q_samples is not None and int(y_q_samples.shape[0]) > 0:
++                y_all = y_q_samples
++                if is_distributed():
++                    # All-gather variable number of samples across ranks (pad to max first-dim).
++                    world = int(torch.distributed.get_world_size())
++                    n_local = torch.tensor([int(y_all.shape[0])], device=y_all.device, dtype=torch.int64)
++                    counts = [torch.zeros_like(n_local) for _ in range(world)]
++                    torch.distributed.all_gather(counts, n_local)
++                    counts_i = [int(c.item()) for c in counts]
++                    n_max = int(max(counts_i) if counts_i else 0)
++                    if n_max > 0:
++                        if int(y_all.shape[0]) < n_max:
++                            pad = torch.zeros((n_max - int(y_all.shape[0]), int(y_all.shape[1])), device=y_all.device, dtype=y_all.dtype)
++                            y_pad = torch.cat([y_all, pad], dim=0)
++                        else:
++                            y_pad = y_all
++                        gathered = [torch.empty_like(y_pad) for _ in range(world)]
++                        torch.distributed.all_gather(gathered, y_pad)
++                        parts = []
++                        for gi, c in zip(gathered, counts_i):
++                            if int(c) > 0:
++                                parts.append(gi[: int(c)])
++                        if len(parts) > 0:
++                            y_all = torch.cat(parts, dim=0)
++
++                # Per-dim quantiles in original y scale.
++                try:
++                    y_q_low = torch.quantile(y_all, float(q_low), dim=0)
++                    y_q_high = torch.quantile(y_all, float(q_high), dim=0)
++                except Exception:
++                    y_q_low = None
++                    y_q_high = None
++
+         eps = float(model_for_scaler.scaler.eps)
+         if x_count > 0 and x_sum is not None and (x_sum_sq is not None):
+             mean_x = x_sum / float(x_count)
+@@ -2243,6 +2328,13 @@ def epochs(model, device, local_rank, ops, *args, param_dtype, optimizer, scaler
+                     model_for_scaler.scaler.y_max.resize_(y_max.shape)
+                 model_for_scaler.scaler.y_min.copy_(y_min)
+                 model_for_scaler.scaler.y_max.copy_(y_max)
++            if y_q_low is not None and y_q_high is not None:
++                if model_for_scaler.scaler.y_q_low.shape != y_q_low.shape:
++                    model_for_scaler.scaler.y_q_low.resize_(y_q_low.shape)
++                if model_for_scaler.scaler.y_q_high.shape != y_q_high.shape:
++                    model_for_scaler.scaler.y_q_high.resize_(y_q_high.shape)
++                model_for_scaler.scaler.y_q_low.copy_(y_q_low)
++                model_for_scaler.scaler.y_q_high.copy_(y_q_high)
+     in_dim = int(ops.in_dim)
+     dev_type = str(getattr(device, 'type', 'cpu'))
+     non_blocking_ok = bool(dev_type in ('cuda', 'xpu'))
