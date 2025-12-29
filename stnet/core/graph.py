@@ -474,6 +474,13 @@ def torch_compile_supported() -> bool:
     return callable(getattr(torch, "compile", None))
 
 
+def cudagraph_step_begin() -> None:
+    mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_begin", None)
+    if callable(mark_step):
+        with suppress(Exception):
+            mark_step()
+
+
 def cudagraph_step_end() -> None:
     mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
     if callable(mark_step):

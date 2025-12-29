@@ -724,6 +724,14 @@ def distributed_broadcast(
         seen.add(tid)
         tensors.append(t)
 
+    # DTensor is a Tensor subclass but distributed ops may not accept mixtures of
+    # DTensor and regular Tensor in the same call.
+    # For our broadcast use-case (syncing model buffers/params), skip DTensor objects.
+    with contextlib.suppress(Exception):
+        from torch.distributed.tensor import DTensor
+
+        tensors = [t for t in tensors if not isinstance(t, DTensor)]
+
     if not tensors:
         return
 

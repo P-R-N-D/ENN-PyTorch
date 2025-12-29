@@ -1544,6 +1544,12 @@ class Scaler(nn.Module):
 
     def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Scaler":
         super()._apply(fn)
+        # Enforce invariant: scaler stats are always stored in float64 regardless of model dtype.
+        with contextlib.suppress(Exception):
+            for name in ("scale", "min_value", "max_value", "max_abs", "min_positive"):
+                t = getattr(self, name, None)
+                if isinstance(t, torch.Tensor) and t.is_floating_point() and t.dtype != torch.float64:
+                    setattr(self, name, t.to(dtype=torch.float64))
         self._invalidate_stats_cache()
         return self
 
@@ -2499,6 +2505,7 @@ class SigmoidGate(nn.Module):
 
 
 class Recorder(nn.Module):
+    __stnet_precision_exempt__: bool = True
 
     def __init__(self) -> None:
         super().__init__()
@@ -2851,6 +2858,22 @@ class Recorder(nn.Module):
     def clear(self) -> None:
         self._records.clear()
         self._global_step = 0
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> "Recorder":
+        super()._apply(fn)
+        # Enforce invariant: recorder stats are always kept in float64/int64 regardless of model dtype.
+        with contextlib.suppress(Exception):
+            for name, buf in self._buffers.items():
+                if buf is None or (not isinstance(buf, torch.Tensor)):
+                    continue
+                if buf.is_floating_point():
+                    if buf.dtype != torch.float64:
+                        setattr(self, name, buf.to(dtype=torch.float64))
+                else:
+                    if buf.dtype in (torch.int8, torch.int16, torch.int32, torch.int64):
+                        if buf.dtype != torch.int64:
+                            setattr(self, name, buf.to(dtype=torch.int64))
+        return self
 
 
 def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:

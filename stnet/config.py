@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import math
 from dataclasses import dataclass, field, fields
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, Literal, Optional,
@@ -963,6 +964,31 @@ def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[st
         return {}
     cfg = config if isinstance(config, ModelConfig) else coerce_model_config(config)
     return cfg.to_dict()
+
+
+def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
+    """Best-effort extraction of a serializable ModelConfig mapping from a model instance."""
+
+    cfg_obj = None
+    with contextlib.suppress(Exception):
+        cfg_obj = getattr(model, "config", None)
+    if cfg_obj is None:
+        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+    if cfg_obj is None:
+        with contextlib.suppress(Exception):
+            for submodule in model.modules():
+                with contextlib.suppress(Exception):
+                    cfg_obj = getattr(submodule, "config", None)
+                if cfg_obj is None:
+                    cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
+                if cfg_obj is not None:
+                    break
+
+    if isinstance(cfg_obj, ModelConfig):
+        return cfg_obj.to_dict()
+    if isinstance(cfg_obj, dict):
+        return coerce_model_config(cfg_obj).to_dict()
+    return {}
 
 
 def patch_config(base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any) -> PatchConfig:

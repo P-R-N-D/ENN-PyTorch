@@ -10,6 +10,8 @@ import random
 import shutil
 import threading
 import time
+import warnings
+import re
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -30,7 +32,13 @@ try:
 except ImportError:  # pragma: no cover
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
-from .config import ModelConfig, RuntimeConfig, coerce_model_config, runtime_config
+from .config import (
+    ModelConfig,
+    RuntimeConfig,
+    _extract_model_config_dict,
+    coerce_model_config,
+    runtime_config,
+)
 from .core.casting import dtype_from_name, env_bool, env_int, parse_torch_dtype
 from .core.distributed import get_available_host, get_preferred_ip, initialize_master_addr
 from .core.graph import inference_mode
@@ -55,6 +63,25 @@ from .runtime.io import _to_cpu, _torch_load_checkpoint, is_required
 from .runtime.main import _trim_dcp_keys, process
 
 logger = logging.getLogger(__name__)
+_IGNORED_WARNING_SENTENCES = [
+    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
+    "TypedStorage is deprecated. It will be removed in the future",
+]
+
+
+@contextlib.contextmanager
+def _filtered_warnings(ignored_sentences=None):
+    """Suppress known-benign warnings from third-party libraries."""
+
+    sentences = _IGNORED_WARNING_SENTENCES if ignored_sentences is None else list(ignored_sentences)
+    if not sentences:
+        yield
+        return
+    with warnings.catch_warnings():
+        for s in sentences:
+            with contextlib.suppress(Exception):
+                warnings.filterwarnings("ignore", message=f".*{re.escape(str(s))}.*")
+        yield
 _PRED_ASSEMBLE_MAX_SEGMENTS = int(env_int("STNET_PRED_ASSEMBLE_MAX_SEGMENTS", default=64))
 _PRED_ASSEMBLE_TUNE = env_bool("STNET_PRED_ASSEMBLE_TUNE", default=True)
 _PRED_ASSEMBLE_TUNE_LOG_ONCE = env_bool("STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE", default=True)
@@ -340,6 +367,16 @@ def _reset_process_group():
         pass
 
 
+def _prepare_distributed_launch_env() -> None:
+    """Common launch prep used by train() and predict()."""
+
+    _reset_process_group()
+    initialize_python_path()
+    with contextlib.suppress(Exception):
+        mp.allow_connection_pickling()
+    set_multiprocessing_env()
+
+
 def _clear_device_caches():
     with contextlib.suppress(Exception):
         import gc
@@ -395,10 +432,11 @@ def _maybe_save_model_checkpoint(model, out_dir, *, save_dcp, save_pt, overwrite
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
     if save_dcp and m_sd is not None:
-        save(
-            state_dict={"model": m_sd},
-            storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)),
-        )
+        with _filtered_warnings():
+            save(
+                state_dict={"model": m_sd},
+                storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)),
+            )
     if save_pt:
         if m_sd is not None:
             pt_state = dict(m_sd)
@@ -672,7 +710,7 @@ def train(
     loss_mask_value: Any = None,
     **kwargs: Any,
 ):
-    _reset_process_group()
+    _prepare_distributed_launch_env()
     try:
         val_frac = float(val_frac)
         val_frac = 0.0 if val_frac < 0.0 else 1.0 if val_frac > 1.0 else val_frac
@@ -687,9 +725,6 @@ def train(
         "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
     )
     ds_meta.underflow_action = underflow_action
-    initialize_python_path()
-    mp.allow_connection_pickling()
-    set_multiprocessing_env()
     memmap_dir = new_dir("memmap_ds")
     num_samples_dataset = 0
     first_in_dim = None
@@ -740,24 +775,8 @@ def train(
         _wp = WorkerPolicy.autotune()
         _wp.apply_torch_threads()
         nprocs = int(_wp.nproc_per_node)
-        cfg_obj = None
-        with contextlib.suppress(Exception):
-            cfg_obj = getattr(model, "config", None)
-        if cfg_obj is None:
-            cfg_obj = getattr(model, "__stnet_instance_config__", None)
-        if cfg_obj is None:
-            with contextlib.suppress(Exception):
-                for submodule in model.modules():
-                    with contextlib.suppress(Exception):
-                        cfg_obj = getattr(submodule, "config", None)
-                    if cfg_obj is None:
-                        cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
-                    if cfg_obj is not None:
-                        break
-        if isinstance(cfg_obj, (ModelConfig, dict)):
-            cfg_model = coerce_model_config(cfg_obj)
-        else:
-            cfg_model = ModelConfig()
+        cfg_dict = _extract_model_config_dict(model)
+        cfg_model = coerce_model_config(cfg_dict) if cfg_dict else ModelConfig()
         cfg_dict = cfg_model.to_dict()
         lc = LaunchConfig(
             min_nodes=1,
@@ -1657,7 +1676,7 @@ def _write_predictions_h5_from_memmaps(
     out_path, *, memmap_dir, pred_path, count=None, chunk_size=8192
 ):
     if not _is_writable_file_path(out_path):
-        raise ValueError(f"persist_path is not a writable file path: {out_path}")
+        raise ValueError(f"output path is not a writable file path: {out_path}")
     import h5py
     import numpy as _np
 
@@ -1793,9 +1812,7 @@ def predict(
 ):
     if model is None:
         raise ValueError("predict: model must not be None")
-    _reset_process_group()
-    initialize_python_path()
-    set_multiprocessing_env()
+    _prepare_distributed_launch_env()
 
     out_shape = kwargs.pop("out_shape", getattr(model, "out_shape", None))
     if out_shape is None:

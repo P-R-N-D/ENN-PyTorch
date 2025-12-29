@@ -518,6 +518,13 @@ class Cache:
             tensor = torch.as_tensor(tensor)
 
         buf = tensor.detach()
+        # DTensor is a Tensor subclass but not directly serializable / portable.
+        # Convert to its local shard before any device transfers.
+        with contextlib.suppress(Exception):
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(buf, DTensor):
+                buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
 
@@ -556,6 +563,13 @@ class Cache:
             tensor = torch.as_tensor(tensor)
 
         buf = tensor.detach()
+        # DTensor is a Tensor subclass but not directly serializable / portable.
+        # Convert to its local shard before any device transfers.
+        with contextlib.suppress(Exception):
+            from torch.distributed.tensor import DTensor
+
+            if isinstance(buf, DTensor):
+                buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
         if not bool(buf.is_contiguous()):
@@ -593,7 +607,7 @@ class Cache:
         if str(path).endswith((".pt", ".pth")):
             from ..data.pipeline import BatchIO
 
-            BatchIO.atomic_torch_save(buf, path)
+            BatchIO.atomic_torch_save(path, buf)
         else:
             torch.save(buf, path)
 

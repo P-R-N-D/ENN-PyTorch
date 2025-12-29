@@ -1220,8 +1220,10 @@ class BatchIO:
         if count_i <= 0:
             raise ValueError("count must be > 0")
 
-        env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), None)
-        if env_chunk is not None and int(env_chunk) > 0:
+        # Optional override: allow forcing the streaming chunk size via env vars.
+        # Note: env_first_int() requires a non-None default.
+        env_chunk = env_first_int(("STNET_MEMMAP_CHUNK_SIZE", "STNET_MEMMAP_CHUNK"), 0)
+        if int(env_chunk) > 0:
             chunk_size = int(env_chunk)
 
         req_chunk = int(chunk_size or 0)
