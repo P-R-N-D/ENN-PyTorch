@@ -1582,6 +1582,14 @@ class BatchIO:
         y_sum_sq: Optional[torch.Tensor] = None
         y_tmp: Optional[torch.Tensor] = None
         y2_tmp: Optional[torch.Tensor] = None
+        x_min: Optional[torch.Tensor] = None
+        x_max: Optional[torch.Tensor] = None
+        x_min_tmp: Optional[torch.Tensor] = None
+        x_max_tmp: Optional[torch.Tensor] = None
+        y_min: Optional[torch.Tensor] = None
+        y_max: Optional[torch.Tensor] = None
+        y_min_tmp: Optional[torch.Tensor] = None
+        y_max_tmp: Optional[torch.Tensor] = None
 
         if compute_scaler_stats and int(train_end) > 0:
             x_sum = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
@@ -1593,6 +1601,14 @@ class BatchIO:
             y_sum_sq = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
             y_tmp = torch.empty_like(y_sum)
             y2_tmp = torch.empty_like(y_sum)
+            x_min = torch.full((int(in_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
+            x_max = torch.full((int(in_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
+            x_min_tmp = torch.empty_like(x_sum)
+            x_max_tmp = torch.empty_like(x_sum)
+            y_min = torch.full((int(out_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
+            y_max = torch.full((int(out_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
+            y_min_tmp = torch.empty_like(y_sum)
+            y_max_tmp = torch.empty_like(y_sum)
 
         written = 0
         features_cast_copy_ok: Optional[bool] = None
@@ -1632,6 +1648,11 @@ class BatchIO:
                     x_sum.add_(x_tmp)
                     x2_tmp.copy_(torch.einsum("ni,ni->i", fx_stats, fx_stats))
                     x_sum_sq.add_(x2_tmp)
+                    if x_min is not None and x_max is not None and x_min_tmp is not None and x_max_tmp is not None:
+                        torch.amin(fx_stats, dim=0, out=x_min_tmp)
+                        torch.minimum(x_min, x_min_tmp, out=x_min)
+                        torch.amax(fx_stats, dim=0, out=x_max_tmp)
+                        torch.maximum(x_max, x_max_tmp, out=x_max)
 
             # Write directly; prefer casting via copy_ to avoid extra buffers,
             # but fall back to explicit conversion if the memmap tensor enforces dtype.
@@ -1688,6 +1709,11 @@ class BatchIO:
                             y_sum.add_(y_tmp)
                             y2_tmp.copy_(torch.einsum("ni,ni->i", lb_stats, lb_stats))
                             y_sum_sq.add_(y2_tmp)
+                            if y_min is not None and y_max is not None and y_min_tmp is not None and y_max_tmp is not None:
+                                torch.amin(lb_stats, dim=0, out=y_min_tmp)
+                                torch.minimum(y_min, y_min_tmp, out=y_min)
+                                torch.amax(lb_stats, dim=0, out=y_max_tmp)
+                                torch.maximum(y_max, y_max_tmp, out=y_max)
 
             written += int(n)
 
@@ -1708,8 +1734,12 @@ class BatchIO:
                 "train_count": int(train_end),
                 "x_sum": x_sum,
                 "x_sum_sq": x_sum_sq,
+                "x_min": x_min,
+                "x_max": x_max,
                 "y_sum": y_sum,
                 "y_sum_sq": y_sum_sq,
+                "y_min": y_min,
+                "y_max": y_max,
             }
             scaler_stats_path = "scaler_stats.pt"
             try:
@@ -1950,6 +1980,7 @@ class BatchIO:
             return {}
         return dict(BatchIO.merge_meta_dicts(metas))
 
+
     @staticmethod
     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
         expanded = BatchIO.expand_sources(sources)
@@ -1958,6 +1989,18 @@ class BatchIO:
         x_sum_sq: Optional[torch.Tensor] = None
         y_sum: Optional[torch.Tensor] = None
         y_sum_sq: Optional[torch.Tensor] = None
+
+        # Optional min/max bounds (available in newer scaler_stats.pt payloads).
+        x_min: Optional[torch.Tensor] = None
+        x_max: Optional[torch.Tensor] = None
+        y_min: Optional[torch.Tensor] = None
+        y_max: Optional[torch.Tensor] = None
+        have_bounds: Optional[bool] = None
+
+        # Optional y quantile bounds (y_q_low / y_q_high) for robust p_gate bounding.
+        y_q_low: Optional[torch.Tensor] = None
+        y_q_high: Optional[torch.Tensor] = None
+        have_qbounds: Optional[bool] = None
 
         for path in BatchIO.iter_source_paths(expanded):
             try:
@@ -1997,11 +2040,57 @@ class BatchIO:
             ys = ys.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys, torch.Tensor) else torch.as_tensor(ys, dtype=torch.float64)
             ys2 = ys2.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys2, torch.Tensor) else torch.as_tensor(ys2, dtype=torch.float64)
 
+            # Optional bounds.
+            local_xmin = payload.get("x_min")
+            local_xmax = payload.get("x_max")
+            local_ymin = payload.get("y_min")
+            local_ymax = payload.get("y_max")
+            local_yq_low = payload.get("y_q_low")
+            local_yq_high = payload.get("y_q_high")
+            local_have_bounds = (
+                local_xmin is not None
+                and local_xmax is not None
+                and local_ymin is not None
+                and local_ymax is not None
+            )
+            if have_bounds is None:
+                have_bounds = bool(local_have_bounds)
+            elif have_bounds and not local_have_bounds:
+                # Mixing old/new payload formats -> drop bounds (incomplete).
+                have_bounds = False
+                x_min = x_max = y_min = y_max = None
+
+            local_have_q = (local_yq_low is not None and local_yq_high is not None)
+            if have_qbounds is None:
+                have_qbounds = bool(local_have_q)
+            elif have_qbounds and not local_have_q:
+                # Mixing old/new payload formats -> drop quantile bounds (incomplete).
+                have_qbounds = False
+                y_q_low = y_q_high = None
+
+            if have_bounds:
+                local_xmin = local_xmin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmin, torch.Tensor) else torch.as_tensor(local_xmin, dtype=torch.float64)
+                local_xmax = local_xmax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmax, torch.Tensor) else torch.as_tensor(local_xmax, dtype=torch.float64)
+                local_ymin = local_ymin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymin, torch.Tensor) else torch.as_tensor(local_ymin, dtype=torch.float64)
+                local_ymax = local_ymax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymax, torch.Tensor) else torch.as_tensor(local_ymax, dtype=torch.float64)
+
+            if have_qbounds:
+                local_yq_low = local_yq_low.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_low, torch.Tensor) else torch.as_tensor(local_yq_low, dtype=torch.float64)
+                local_yq_high = local_yq_high.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_high, torch.Tensor) else torch.as_tensor(local_yq_high, dtype=torch.float64)
+
             if x_sum is None:
                 x_sum = xs.clone()
                 x_sum_sq = xs2.clone()
                 y_sum = ys.clone()
                 y_sum_sq = ys2.clone()
+                if have_bounds:
+                    x_min = local_xmin.clone()
+                    x_max = local_xmax.clone()
+                    y_min = local_ymin.clone()
+                    y_max = local_ymax.clone()
+                if have_qbounds:
+                    y_q_low = local_yq_low.clone()
+                    y_q_high = local_yq_high.clone()
             else:
                 if xs.shape != x_sum.shape or xs2.shape != x_sum_sq.shape:
                     return None
@@ -2012,18 +2101,50 @@ class BatchIO:
                 y_sum += ys
                 y_sum_sq += ys2
 
+                if have_bounds:
+                    assert x_min is not None and x_max is not None and y_min is not None and y_max is not None
+                    if local_xmin.shape != x_min.shape or local_xmax.shape != x_max.shape:
+                        return None
+                    if local_ymin.shape != y_min.shape or local_ymax.shape != y_max.shape:
+                        return None
+                    torch.minimum(x_min, local_xmin, out=x_min)
+                    torch.maximum(x_max, local_xmax, out=x_max)
+                    torch.minimum(y_min, local_ymin, out=y_min)
+                    torch.maximum(y_max, local_ymax, out=y_max)
+
+                if have_qbounds:
+                    assert y_q_low is not None and y_q_high is not None
+                    if local_yq_low.shape != y_q_low.shape or local_yq_high.shape != y_q_high.shape:
+                        return None
+                    # Conservative merge: widen to cover all sources.
+                    torch.minimum(y_q_low, local_yq_low, out=y_q_low)
+                    torch.maximum(y_q_high, local_yq_high, out=y_q_high)
+
             total += c
 
         if total <= 0 or x_sum is None or x_sum_sq is None or y_sum is None or y_sum_sq is None:
             return None
 
-        return {
+        out: Dict[str, Any] = {
             "train_count": int(total),
             "x_sum": x_sum,
             "x_sum_sq": x_sum_sq,
             "y_sum": y_sum,
             "y_sum_sq": y_sum_sq,
         }
+        if have_bounds and x_min is not None and x_max is not None and y_min is not None and y_max is not None:
+            out.update({
+                "x_min": x_min,
+                "x_max": x_max,
+                "y_min": y_min,
+                "y_max": y_max,
+            })
+        if have_qbounds and y_q_low is not None and y_q_high is not None:
+            out.update({
+                "y_q_low": y_q_low,
+                "y_q_high": y_q_high,
+            })
+        return out
 
     @staticmethod
     def expand_sources(sources: Any) -> Any:

@@ -1550,6 +1550,11 @@ class Scaler(nn.Module):
         self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
         self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
+        self.register_buffer("y_min", torch.full((1,), float("-inf"), dtype=torch.float64))
+        self.register_buffer("y_max", torch.full((1,), float("inf"), dtype=torch.float64))
+        # Optional quantile bounds for y (used by p_gate when enabled).
+        self.register_buffer("y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64))
+        self.register_buffer("y_q_high", torch.full((1,), float("inf"), dtype=torch.float64))
         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
@@ -2015,7 +2020,547 @@ class Scaler(nn.Module):
         return out
 
 
+class ResidualGate(nn.Module):
+    """Learned, bounded gate `p` for residual mixing.
+
+    Computes `z_hat = base + p * residue` with `p` constrained to a user-specified
+    range. Optionally tightens the allowed `p` interval per-sample so that the
+    mixed output stays within provided (z_min, z_max) bounds.
+
+    Supports two modes:
+      - Scalar p (default): one `p` per sample, returned as shape (B, 1).
+      - Tile-wise p: one `p` per *output tile* along the flattened y dimension,
+        expanded to (B, D) for elementwise mixing and compatibility with TiledLoss.
+
+    This module is intentionally simple and torch.compile friendly:
+    - No torch.distributions objects
+    - No python-side randomness in forward
+    - All math is vectorized
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        hidden_dim: int = 64,
+        *,
+        eps: float = 1e-6,
+        clip_eps: float = 1e-6,
+        p_floor: float = 0.0,
+        p_ceil: float = 1.0,
+        # Tile-wise p: number of y dims per tile (along flattened output dim).
+        # None/<=0 -> scalar p per sample.
+        tile_size: Optional[int] = None,
+        # Stats collection (used for fallback_k auto-tuning).
+        stat_width_frac: float = 0.05,
+        stat_edge_frac: float = 0.02,
+        detach_inputs: bool = True,
+        use_tokens: bool = True,
+        use_refined: bool = True,
+        use_stats: bool = True,
+    ) -> None:
+        super().__init__()
+        self.eps = float(eps)
+        self.clip_eps = float(clip_eps)
+        self.p_floor = float(p_floor)
+        self.p_ceil = float(p_ceil)
+        self.stat_width_frac = float(stat_width_frac)
+        self.stat_edge_frac = float(stat_edge_frac)
+        self.detach_inputs = bool(detach_inputs)
+        self.use_tokens = bool(use_tokens)
+        self.use_refined = bool(use_refined)
+        self.use_stats = bool(use_stats)
+
+        ts = 0 if tile_size is None else int(tile_size)
+        self.tile_size = int(ts) if ts > 0 else 0
+
+        # Global context -> global logit (shared by all tiles).
+        in_dim = 0
+        if self.use_tokens:
+            in_dim += int(d_model)
+        if self.use_refined:
+            in_dim += int(d_model)
+        if self.use_stats:
+            in_dim += 2
+        in_dim = max(1, int(in_dim))
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+
+        # Optional tile MLP: local stats per tile -> tile logit.
+        # We keep this small and share weights across tiles.
+        self.tile_net: Optional[nn.Module] = None
+        if self.tile_size > 0:
+            tile_in = 3  # [base_rms, res_rms, res/base]
+            self.tile_net = nn.Sequential(
+                nn.LayerNorm(tile_in),
+                nn.Linear(tile_in, int(hidden_dim)),
+                nn.SiLU(),
+                nn.Linear(int(hidden_dim), 1),
+            )
+
+        # Initialize near p ~= 0.5 for stability (logit ~= 0).
+        with contextlib.suppress(Exception):
+            last = self.net[-1]
+            if isinstance(last, nn.Linear):
+                nn.init.zeros_(last.weight)
+                nn.init.zeros_(last.bias)
+        with contextlib.suppress(Exception):
+            if self.tile_net is not None:
+                last = self.tile_net[-1]
+                if isinstance(last, nn.Linear):
+                    nn.init.zeros_(last.weight)
+                    nn.init.zeros_(last.bias)
+
+        # Fallback-bound diagnostics (not persisted in checkpoints).
+        # These are accumulated on-device and consumed by the runtime at a
+        # configurable interval. Keeping them as buffers avoids Python-side
+        # synchronization in the hot path.
+        self.register_buffer("_fb_count", torch.zeros((), dtype=torch.float32), persistent=False)
+        # Per-side "constraint activation" sums: how often fallback bounds clip away
+        # a meaningful fraction of the user [p_floor, p_ceil] interval.
+        self.register_buffer("_fb_active_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_fb_active_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        # Sum of dynamic interval widths (p_high - p_low) for diagnostics.
+        self.register_buffer("_fb_width_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        # Per-side "boundary hugging" sums: how often p is near the dynamic endpoints.
+        self.register_buffer("_fb_edge_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer("_fb_edge_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+
+    @torch.no_grad()
+    def consume_fallback_stats(self) -> torch.Tensor:
+        """Return and reset fallback-bound diagnostics.
+
+        Returns a float32 tensor of shape (6,):
+            [count, active_low_sum, active_high_sum, width_sum, edge_low_sum, edge_high_sum]
+
+        Notes:
+          - In scalar mode, `count` is the number of samples.
+          - In tile-wise mode, `count` is the number of tiles (B * n_tiles).
+        """
+        stats = torch.stack(
+            [
+                self._fb_count.detach(),
+                self._fb_active_low_sum.detach(),
+                self._fb_active_high_sum.detach(),
+                self._fb_width_sum.detach(),
+                self._fb_edge_low_sum.detach(),
+                self._fb_edge_high_sum.detach(),
+            ]
+        )
+        self._fb_count.zero_()
+        self._fb_active_low_sum.zero_()
+        self._fb_active_high_sum.zero_()
+        self._fb_width_sum.zero_()
+        self._fb_edge_low_sum.zero_()
+        self._fb_edge_high_sum.zero_()
+        return stats
+
+    def _expand_tiles(self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
+        """Expand (B, T) -> (B, dim) by repeating per-tile values."""
+        if self.tile_size <= 0:
+            raise RuntimeError("ResidualGate._expand_tiles called with tile_size<=0")
+        b = int(p_tile.shape[0])
+        tile = int(self.tile_size)
+        n_tiles = int(p_tile.shape[1])
+        d_pad = int(n_tiles * tile)
+        p_full = p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
+        return p_full[:, : int(dim)]
+
+    def forward(
+        self,
+        *,
+        tokens: torch.Tensor,
+        refined_tokens: Optional[torch.Tensor] = None,
+        base: Optional[torch.Tensor] = None,
+        residue: Optional[torch.Tensor] = None,
+        z_min: Optional[torch.Tensor] = None,
+        z_max: Optional[torch.Tensor] = None,
+        # When True, record diagnostics assuming (z_min, z_max) came from the
+        # fallback mean±kσ bounds (not true y_min/y_max).
+        fallback_bounds: bool = False,
+        # Optional edge-hugging regularizer (discourage p near dynamic bounds).
+        return_edge_reg: bool = False,
+        return_edge_reg_lr: bool = False,
+        edge_reg_frac: float = 0.02,
+        edge_reg_min_width_frac: float = 0.05,
+        edge_reg_power: float = 2.0,
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Pool token streams.
+        feats: list[torch.Tensor] = []
+        if self.use_tokens:
+            t = tokens.mean(dim=1)
+            if self.detach_inputs:
+                t = t.detach()
+            feats.append(t)
+        if self.use_refined and refined_tokens is not None:
+            r = refined_tokens.mean(dim=1)
+            if self.detach_inputs:
+                r = r.detach()
+            feats.append(r)
+
+        # Global RMS stats.
+        if self.use_stats and base is not None and residue is not None:
+            b = base.detach() if self.detach_inputs else base
+            res = residue.detach() if self.detach_inputs else residue
+            # RMS stats in FP32 for stability
+            b32 = b.to(dtype=torch.float32)
+            r32 = res.to(dtype=torch.float32)
+            b_rms = torch.sqrt(torch.mean(b32 * b32, dim=1, keepdim=True) + self.eps)
+            r_rms = torch.sqrt(torch.mean(r32 * r32, dim=1, keepdim=True) + self.eps)
+            feats.append(b_rms.to(dtype=tokens.dtype))
+            feats.append(r_rms.to(dtype=tokens.dtype))
+
+        x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
+        global_logit = self.net(x).squeeze(-1)  # (B,)
+
+        use_tile = (
+            self.tile_size > 0
+            and self.tile_net is not None
+            and base is not None
+            and residue is not None
+            and base.dim() == 2
+            and residue.dim() == 2
+            and int(base.shape[0]) == int(residue.shape[0])
+        )
+
+        # Scalar mode: original behavior.
+        if not use_tile:
+            sig = torch.sigmoid(global_logit)
+
+            # Default range.
+            p_low = sig.new_full(sig.shape, float(self.p_floor))
+            p_high = sig.new_full(sig.shape, float(self.p_ceil))
+
+            # Optionally tighten p-range so z_hat stays within [z_min, z_max].
+            if (
+                z_min is not None
+                and z_max is not None
+                and base is not None
+                and residue is not None
+            ):
+                b = base.detach() if self.detach_inputs else base
+                r = residue.detach() if self.detach_inputs else residue
+                b32 = b.to(dtype=torch.float32)
+                r32 = r.to(dtype=torch.float32)
+
+                zmin = z_min.to(device=b32.device, dtype=torch.float32)
+                zmax = z_max.to(device=b32.device, dtype=torch.float32)
+                if zmin.numel() != 1:
+                    zmin = zmin.reshape(1, -1)
+                if zmax.numel() != 1:
+                    zmax = zmax.reshape(1, -1)
+
+                # Stabilize division by small residuals.
+                sign = torch.where(r32 >= 0, 1.0, -1.0)
+                r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
+
+                p_a = (zmin - b32) / r_safe
+                p_b = (zmax - b32) / r_safe
+                p_min_dim = torch.minimum(p_a, p_b)
+                p_max_dim = torch.maximum(p_a, p_b)
+
+                # Intersection across dimensions -> scalar [p_low, p_high] per sample.
+                p_low_bound = p_min_dim.max(dim=1).values
+                p_high_bound = p_max_dim.min(dim=1).values
+
+                # Clamp to user range.
+                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
+
+                # Ensure non-empty interval.
+                p_high = torch.maximum(p_high, p_low + float(self.eps))
+
+            # Map sigmoid into [p_low, p_high].
+            p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
+
+            # Clip away exact endpoints if requested.
+            clip = float(self.clip_eps)
+            lo = float(self.p_floor) + clip
+            hi = float(self.p_ceil) - clip
+            if hi > lo:
+                p = torch.clamp(p, min=lo, max=hi)
+            else:
+                p = torch.clamp(p, min=float(self.p_floor), max=float(self.p_ceil))
+
+            edge_reg: Optional[torch.Tensor] = None
+            edge_reg_low: Optional[torch.Tensor] = None
+            edge_reg_high: Optional[torch.Tensor] = None
+
+            # Diagnostics for fallback bounds (mean±kσ).
+            if bool(fallback_bounds):
+                try:
+                    width = (p_high - p_low).to(dtype=torch.float32)
+                    denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
+
+                    tthr = float(self.stat_width_frac) * denom
+                    tthr = float(max(tthr, self.eps))
+                    trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
+                    trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
+                    active_low = trim_low >= tthr
+                    active_high = trim_high >= tthr
+
+                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                    ethr = float(max(float(self.stat_edge_frac), 0.0))
+                    edge_thr = w_safe * float(ethr)
+                    edge_low = (p - p_low) <= edge_thr
+                    edge_high = (p_high - p) <= edge_thr
+
+                    with torch.no_grad():
+                        self._fb_count.add_(float(p.shape[0]))
+                        self._fb_width_sum.add_(width.sum())
+                        self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
+                        self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
+                        self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
+                        self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
+                except Exception:
+                    pass
+
+            if bool(return_edge_reg) or bool(return_edge_reg_lr):
+                try:
+                    width = (p_high - p_low).to(dtype=torch.float32)
+                    full = max(float(self.p_ceil - self.p_floor), float(self.eps))
+                    min_w = float(edge_reg_min_width_frac) * full
+                    min_w = float(max(min_w, self.eps))
+                    mask = (width >= min_w).to(dtype=torch.float32)
+
+                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                    q = (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                    q = torch.clamp(q, 0.0, 1.0)
+
+                    m = float(edge_reg_frac)
+                    m = float(min(max(m, self.eps), 0.49))
+                    inv_m = 1.0 / m
+
+                    d_low = F.relu(m - q) * inv_m
+                    d_high = F.relu(q - (1.0 - m)) * inv_m
+
+                    pen_low = d_low.pow(float(edge_reg_power)) * mask
+                    pen_high = d_high.pow(float(edge_reg_power)) * mask
+
+                    denom = mask.sum() + float(self.eps)
+                    edge_reg_low = pen_low.sum() / denom
+                    edge_reg_high = pen_high.sum() / denom
+                    edge_reg = edge_reg_low + edge_reg_high
+                except Exception:
+                    edge_reg = None
+                    edge_reg_low = None
+                    edge_reg_high = None
+
+            out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            out = p.to(dtype=out_dtype).unsqueeze(-1)  # (B, 1)
+            if bool(return_edge_reg_lr):
+                if edge_reg_low is None:
+                    edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
+                if edge_reg_high is None:
+                    edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
+                return out, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+            if bool(return_edge_reg):
+                if edge_reg is None:
+                    edge_reg = out.new_tensor(0.0, dtype=torch.float32)
+                return out, edge_reg.to(dtype=out_dtype)
+            return out
+
+        # --- Tile-wise mode ---
+        assert base is not None and residue is not None
+        b = base.detach() if self.detach_inputs else base
+        r = residue.detach() if self.detach_inputs else residue
+        b32 = b.to(dtype=torch.float32)
+        r32 = r.to(dtype=torch.float32)
+        B = int(b32.shape[0])
+        D = int(b32.shape[1])
+        tile = int(self.tile_size)
+        n_tiles = int((D + tile - 1) // tile)
+        d_pad = int(n_tiles * tile)
+        pad = int(d_pad - D)
+
+        if pad > 0:
+            b32p = F.pad(b32, (0, pad))
+            r32p = F.pad(r32, (0, pad))
+        else:
+            b32p = b32
+            r32p = r32
+
+        b_tile = b32p.reshape(B, n_tiles, tile)
+        r_tile = r32p.reshape(B, n_tiles, tile)
+
+        # Valid-mask for last (partial) tile.
+        if pad > 0:
+            ar = torch.arange(d_pad, device=b_tile.device)
+            mask_bool = (ar < D).reshape(1, n_tiles, tile)
+            mask = mask_bool.to(dtype=torch.float32)
+        else:
+            mask_bool = None
+            mask = None
+
+        # Tile features.
+        if mask is None:
+            denom = float(tile)
+            b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=2) + self.eps)
+            r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=2) + self.eps)
+        else:
+            denom = torch.clamp(mask.sum(dim=2), min=1.0)
+            b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=2) / denom + self.eps)
+            r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=2) / denom + self.eps)
+
+        ratio = r_rms_t / (b_rms_t + float(self.eps))
+        tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
+
+        tile_logit = self.tile_net(tile_feats).squeeze(-1)  # type: ignore[operator]
+        logit = global_logit.unsqueeze(1) + tile_logit
+        sig = torch.sigmoid(logit)
+
+        # Default range.
+        p_low = sig.new_full(sig.shape, float(self.p_floor))
+        p_high = sig.new_full(sig.shape, float(self.p_ceil))
+
+        # Optionally tighten p-range so z_hat stays within [z_min, z_max], per tile.
+        if z_min is not None and z_max is not None:
+            zmin = z_min.to(device=b_tile.device, dtype=torch.float32)
+            zmax = z_max.to(device=b_tile.device, dtype=torch.float32)
+            if zmin.numel() != 1:
+                zmin = zmin.reshape(1, -1)
+            if zmax.numel() != 1:
+                zmax = zmax.reshape(1, -1)
+
+            if zmin.numel() != 1 and int(zmin.shape[-1]) != int(D):
+                # Dimension mismatch -> skip tightening.
+                zmin = None
+                zmax = None
+            elif zmin is not None and zmax is not None:
+                if zmin.numel() == 1:
+                    zminp = zmin.expand(1, d_pad)
+                    zmaxp = zmax.expand(1, d_pad)
+                else:
+                    if pad > 0:
+                        zminp = F.pad(zmin, (0, pad))
+                        zmaxp = F.pad(zmax, (0, pad))
+                    else:
+                        zminp = zmin
+                        zmaxp = zmax
+
+                zmin_t = zminp.reshape(1, n_tiles, tile)
+                zmax_t = zmaxp.reshape(1, n_tiles, tile)
+
+                # Stabilize division by small residuals.
+                sign = torch.where(r_tile >= 0, 1.0, -1.0)
+                r_safe = torch.where(r_tile.abs() < self.eps, sign * self.eps, r_tile)
+
+                p_a = (zmin_t - b_tile) / r_safe
+                p_b = (zmax_t - b_tile) / r_safe
+                p_min_dim = torch.minimum(p_a, p_b)
+                p_max_dim = torch.maximum(p_a, p_b)
+
+                if mask_bool is not None:
+                    neg_inf = torch.finfo(p_min_dim.dtype).min
+                    pos_inf = torch.finfo(p_max_dim.dtype).max
+                    p_min_dim = torch.where(mask_bool, p_min_dim, p_min_dim.new_full((), neg_inf))
+                    p_max_dim = torch.where(mask_bool, p_max_dim, p_max_dim.new_full((), pos_inf))
+
+                # Intersection inside each tile -> [p_low, p_high] per (B, tile).
+                p_low_bound = p_min_dim.max(dim=2).values
+                p_high_bound = p_max_dim.min(dim=2).values
+
+                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                p_high = torch.maximum(p_high, p_low + float(self.eps))
+
+        # Map sigmoid into [p_low, p_high].
+        p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
+
+        # Clip away exact endpoints if requested.
+        clip = float(self.clip_eps)
+        lo = float(self.p_floor) + clip
+        hi = float(self.p_ceil) - clip
+        if hi > lo:
+            p_tile = torch.clamp(p_tile, min=lo, max=hi)
+        else:
+            p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
+
+        # Diagnostics for fallback bounds (mean±kσ) — count per tile.
+        if bool(fallback_bounds):
+            try:
+                width = (p_high - p_low).to(dtype=torch.float32)
+                denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
+
+                tthr = float(self.stat_width_frac) * denom
+                tthr = float(max(tthr, self.eps))
+                trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
+                trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
+                active_low = trim_low >= tthr
+                active_high = trim_high >= tthr
+
+                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                ethr = float(max(float(self.stat_edge_frac), 0.0))
+                edge_thr = w_safe * float(ethr)
+                edge_low = (p_tile - p_low) <= edge_thr
+                edge_high = (p_high - p_tile) <= edge_thr
+
+                with torch.no_grad():
+                    self._fb_count.add_(float(p_tile.numel()))
+                    self._fb_width_sum.add_(width.sum())
+                    self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
+                    self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
+                    self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
+                    self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
+            except Exception:
+                pass
+
+        edge_reg: Optional[torch.Tensor] = None
+        edge_reg_low: Optional[torch.Tensor] = None
+        edge_reg_high: Optional[torch.Tensor] = None
+        if bool(return_edge_reg) or bool(return_edge_reg_lr):
+            try:
+                width = (p_high - p_low).to(dtype=torch.float32)
+                full = max(float(self.p_ceil - self.p_floor), float(self.eps))
+                min_w = float(edge_reg_min_width_frac) * full
+                min_w = float(max(min_w, self.eps))
+                mask_w = (width >= min_w).to(dtype=torch.float32)
+
+                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                q = (p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                q = torch.clamp(q, 0.0, 1.0)
+
+                m = float(edge_reg_frac)
+                m = float(min(max(m, self.eps), 0.49))
+                inv_m = 1.0 / m
+
+                d_low = F.relu(m - q) * inv_m
+                d_high = F.relu(q - (1.0 - m)) * inv_m
+
+                pen_low = d_low.pow(float(edge_reg_power)) * mask_w
+                pen_high = d_high.pow(float(edge_reg_power)) * mask_w
+
+                denom = mask_w.sum() + float(self.eps)
+                edge_reg_low = pen_low.sum() / denom
+                edge_reg_high = pen_high.sum() / denom
+                edge_reg = edge_reg_low + edge_reg_high
+            except Exception:
+                edge_reg = None
+                edge_reg_low = None
+                edge_reg_high = None
+
+        out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+        out_full = self._expand_tiles(p_tile.to(dtype=out_dtype), dim=D)  # (B, D)
+
+        if bool(return_edge_reg_lr):
+            if edge_reg_low is None:
+                edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
+            if edge_reg_high is None:
+                edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
+            return out_full, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+        if bool(return_edge_reg):
+            if edge_reg is None:
+                edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
+            return out_full, edge_reg.to(dtype=out_dtype)
+        return out_full
+
+
 class Recorder(nn.Module):
+
     def __init__(self) -> None:
         super().__init__()
         # Precision-exempt: history/logging buffers must remain FP64/INT64.
@@ -2386,7 +2931,7 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
     else:
         view = state
 
-    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "affine_a", "affine_b", "pw_x", "pw_y")
+    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "y_min", "y_max", "y_q_low", "y_q_high", "affine_a", "affine_b", "pw_x", "pw_y")
     prefixes = ("scaler.", "module.scaler.")
 
     for prefix in prefixes:

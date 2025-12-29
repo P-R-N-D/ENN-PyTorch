@@ -262,6 +262,107 @@ class ModelConfig:
     compile_mode: str = "disabled"
     safety_margin_pow2: int = 3
 
+
+    # Residual gating: z_hat = base + p * residue
+    p_gate_enabled: bool = False
+    p_gate_hidden_dim: int = 64
+    p_gate_detach_inputs: bool = True
+
+    # Tile-wise p gating (optional). When set, p is predicted per output tile
+    # along the flattened y dimension, matching TiledLoss slicing.
+    # - None or <=0: scalar p per sample (default).
+    # - >0: tile size (number of y dims per tile).
+    p_gate_tile_size: Optional[int] = None
+
+    # Optional quantile-based bounds for p tightening. When enabled and
+    # y_quantile bounds are available, p is constrained so z_hat stays within
+    # the chosen per-dimension quantile range (more robust than min/max).
+    p_gate_bounds_use_quantile: bool = False
+    p_gate_bounds_q_low: float = 0.005
+    p_gate_bounds_q_high: float = 0.995
+    p_gate_bounds_q_max_samples: int = 8192
+    p_gate_bounds_clip_to_minmax: bool = True
+    p_gate_p_floor: float = 0.0
+    p_gate_p_ceil: float = 1.0
+    # If y_min/y_max bounds are unavailable (legacy scaler stats), fall back to
+    # mean ± k * std bounds (in y-space). Set <=0 to disable fallback.
+    p_gate_fallback_k: float = 6.0
+    # Optional asymmetric fallback bounds: mean - k_low*std, mean + k_high*std.
+    # When None, defaults to p_gate_fallback_k.
+    p_gate_fallback_k_low: Optional[float] = None
+    p_gate_fallback_k_high: Optional[float] = None
+
+    # Optional auto-tuning for p_gate_fallback_k when y_min/y_max are missing.
+    # Uses simple moving average (SMA) over a recent interval and an EMA
+    # smoother to detect when the fallback bounds are overly restrictive.
+    p_gate_auto_k_enabled: bool = False
+    # Update cadence in *optimizer steps* (not micro-steps). Set <=0 to disable.
+    p_gate_auto_k_interval: int = 100
+    # Warmup steps before the first tuning update.
+    p_gate_auto_k_warmup: int = 100
+    # EMA smoothing factor for the constraint-activation metric.
+    p_gate_auto_k_ema_alpha: float = 0.1
+    # Target fraction of samples considered "tight" (i.e., fallback bounds
+    # meaningfully clip the allowed [p_floor, p_ceil] interval on either side).
+    p_gate_auto_k_target_tight: float = 0.02
+    # Relative tolerance around the target (e.g., 0.5 -> [0.5x, 1.5x]).
+    p_gate_auto_k_tolerance: float = 0.5
+    # Multiplicative adjustment rates (symmetric default).
+    p_gate_auto_k_step_up: float = 0.1
+    p_gate_auto_k_step_down: float = 0.02
+    # Optional per-side adjustment rates (override when provided).
+    p_gate_auto_k_step_up_low: float = 0.1
+    p_gate_auto_k_step_down_low: float = 0.02
+    p_gate_auto_k_step_up_high: float = 0.1
+    p_gate_auto_k_step_down_high: float = 0.02
+
+    # Optional edge-based tuning: when constraint activation is within target,
+    # but p frequently hugs dynamic endpoints, shrink bounds by reducing k.
+    p_gate_auto_k_edge_enabled: bool = False
+    p_gate_auto_k_target_edge: float = 0.05
+    p_gate_auto_k_edge_tolerance: float = 0.5
+    p_gate_auto_k_edge_ema_alpha: float = 0.1
+    p_gate_auto_k_edge_step_down_low: float = 0.01
+    p_gate_auto_k_edge_step_down_high: float = 0.01
+
+    # Hard clamp for fallback_k.
+    p_gate_auto_k_min: float = 1.0
+    p_gate_auto_k_max: float = 16.0
+    # A sample is "tight" when either side trims at least
+    # width_frac * (p_ceil - p_floor), i.e.:
+    #   (p_low - p_floor) >= width_frac * (p_ceil - p_floor)  OR
+    #   (p_ceil - p_high) >= width_frac * (p_ceil - p_floor)
+    p_gate_auto_k_width_frac: float = 0.05
+    # For diagnostics: count samples where p is near the dynamic endpoints
+    # [p_low, p_high] ("boundary hugging").
+    p_gate_auto_k_edge_frac: float = 0.02
+    # Log cadence (optimizer steps). Set <=0 to log only on actual k changes.
+    p_gate_auto_k_log_interval: int = 200
+    p_gate_clip_eps: float = 1e-6
+    p_gate_eps: float = 1e-6
+
+    # Optional edge-hugging regularizer for p: discourages p from sticking to
+    # dynamic endpoints [p_low, p_high] when the allowed interval is wide enough.
+    p_gate_edge_reg_weight: float = 0.0
+    # Optional per-side weights (if None, use p_gate_edge_reg_weight).
+    p_gate_edge_reg_weight_low: Optional[float] = None
+    p_gate_edge_reg_weight_high: Optional[float] = None
+    # If True, apply edge regularizer only when using fallback bounds (mean±kσ),
+    # not when true y_min/y_max bounds are available.
+    p_gate_edge_reg_fallback_only: bool = False
+    p_gate_edge_reg_frac: float = 0.02
+    p_gate_edge_reg_min_width_frac: float = 0.05
+    p_gate_edge_reg_power: float = 2.0
+
+    # Auxiliary losses (added to total loss inside Model.forward)
+    unsup_xx_weight: float = 0.0
+    unsup_yy_weight: float = 0.0
+
+    # Prior regularization for p (optional; Beta prior on [0,1])
+    p_prior_weight: float = 0.0
+    p_prior_alpha: float = 2.0
+    p_prior_beta: float = 2.0
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert this config into a JSON-friendly dict.
 
@@ -513,6 +614,309 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         maximum=30,
     )
 
+
+    p_gate_enabled = _coerce_bool(
+        get("p_gate_enabled", _MODEL_DEFAULTS.p_gate_enabled),
+        name="p_gate_enabled",
+    )
+    p_gate_hidden_dim = _coerce_int(
+        get("p_gate_hidden_dim", _MODEL_DEFAULTS.p_gate_hidden_dim),
+        name="p_gate_hidden_dim",
+        minimum=1,
+    )
+    p_gate_detach_inputs = _coerce_bool(
+        get("p_gate_detach_inputs", _MODEL_DEFAULTS.p_gate_detach_inputs),
+        name="p_gate_detach_inputs",
+    )
+
+    _raw_tile = get("p_gate_tile_size", None)
+    p_gate_tile_size = None if _raw_tile is None else _coerce_int(
+        _raw_tile,
+        name="p_gate_tile_size",
+        minimum=1,
+    )
+
+    p_gate_bounds_use_quantile = _coerce_bool(
+        get("p_gate_bounds_use_quantile", _MODEL_DEFAULTS.p_gate_bounds_use_quantile),
+        name="p_gate_bounds_use_quantile",
+    )
+    p_gate_bounds_q_low = _coerce_float(
+        get("p_gate_bounds_q_low", _MODEL_DEFAULTS.p_gate_bounds_q_low),
+        name="p_gate_bounds_q_low",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_bounds_q_high = _coerce_float(
+        get("p_gate_bounds_q_high", _MODEL_DEFAULTS.p_gate_bounds_q_high),
+        name="p_gate_bounds_q_high",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    if p_gate_bounds_q_high < p_gate_bounds_q_low:
+        p_gate_bounds_q_high = p_gate_bounds_q_low
+
+    p_gate_bounds_q_max_samples = _coerce_int(
+        get("p_gate_bounds_q_max_samples", _MODEL_DEFAULTS.p_gate_bounds_q_max_samples),
+        name="p_gate_bounds_q_max_samples",
+        minimum=0,
+    )
+    p_gate_bounds_clip_to_minmax = _coerce_bool(
+        get("p_gate_bounds_clip_to_minmax", _MODEL_DEFAULTS.p_gate_bounds_clip_to_minmax),
+        name="p_gate_bounds_clip_to_minmax",
+    )
+    p_gate_p_floor = _coerce_float(
+        get("p_gate_p_floor", _MODEL_DEFAULTS.p_gate_p_floor),
+        name="p_gate_p_floor",
+        minimum=0.0,
+        maximum=100.0,
+    )
+    p_gate_p_ceil = _coerce_float(
+        get("p_gate_p_ceil", _MODEL_DEFAULTS.p_gate_p_ceil),
+        name="p_gate_p_ceil",
+        minimum=0.0,
+        maximum=100.0,
+    )
+    if p_gate_p_ceil < p_gate_p_floor:
+        p_gate_p_ceil = p_gate_p_floor
+
+    p_gate_fallback_k = _coerce_float(
+        get("p_gate_fallback_k", _MODEL_DEFAULTS.p_gate_fallback_k),
+        name="p_gate_fallback_k",
+    )
+
+    _raw_k_low = get("p_gate_fallback_k_low", None)
+    p_gate_fallback_k_low = None if _raw_k_low is None else _coerce_float(
+        _raw_k_low,
+        name="p_gate_fallback_k_low",
+    )
+    _raw_k_high = get("p_gate_fallback_k_high", None)
+    p_gate_fallback_k_high = None if _raw_k_high is None else _coerce_float(
+        _raw_k_high,
+        name="p_gate_fallback_k_high",
+    )
+
+    p_gate_auto_k_enabled = _coerce_bool(
+        get("p_gate_auto_k_enabled", _MODEL_DEFAULTS.p_gate_auto_k_enabled),
+        name="p_gate_auto_k_enabled",
+    )
+    p_gate_auto_k_interval = _coerce_int(
+        get("p_gate_auto_k_interval", _MODEL_DEFAULTS.p_gate_auto_k_interval),
+        name="p_gate_auto_k_interval",
+    )
+    p_gate_auto_k_warmup = _coerce_int(
+        get("p_gate_auto_k_warmup", _MODEL_DEFAULTS.p_gate_auto_k_warmup),
+        name="p_gate_auto_k_warmup",
+        minimum=0,
+    )
+    p_gate_auto_k_ema_alpha = _coerce_float(
+        get("p_gate_auto_k_ema_alpha", _MODEL_DEFAULTS.p_gate_auto_k_ema_alpha),
+        name="p_gate_auto_k_ema_alpha",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_target_tight = _coerce_float(
+        get("p_gate_auto_k_target_tight", _MODEL_DEFAULTS.p_gate_auto_k_target_tight),
+        name="p_gate_auto_k_target_tight",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_tolerance = _coerce_float(
+        get("p_gate_auto_k_tolerance", _MODEL_DEFAULTS.p_gate_auto_k_tolerance),
+        name="p_gate_auto_k_tolerance",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    p_gate_auto_k_step_up = _coerce_float(
+        get("p_gate_auto_k_step_up", _MODEL_DEFAULTS.p_gate_auto_k_step_up),
+        name="p_gate_auto_k_step_up",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    p_gate_auto_k_step_down = _coerce_float(
+        get("p_gate_auto_k_step_down", _MODEL_DEFAULTS.p_gate_auto_k_step_down),
+        name="p_gate_auto_k_step_down",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    # Optional per-side step sizes (default to symmetric step_up/step_down).
+    p_gate_auto_k_step_up_low = _coerce_float(
+        get("p_gate_auto_k_step_up_low", p_gate_auto_k_step_up),
+        name="p_gate_auto_k_step_up_low",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    p_gate_auto_k_step_down_low = _coerce_float(
+        get("p_gate_auto_k_step_down_low", p_gate_auto_k_step_down),
+        name="p_gate_auto_k_step_down_low",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_step_up_high = _coerce_float(
+        get("p_gate_auto_k_step_up_high", p_gate_auto_k_step_up),
+        name="p_gate_auto_k_step_up_high",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    p_gate_auto_k_step_down_high = _coerce_float(
+        get("p_gate_auto_k_step_down_high", p_gate_auto_k_step_down),
+        name="p_gate_auto_k_step_down_high",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    p_gate_auto_k_edge_enabled = _coerce_bool(
+        get("p_gate_auto_k_edge_enabled", _MODEL_DEFAULTS.p_gate_auto_k_edge_enabled),
+        name="p_gate_auto_k_edge_enabled",
+    )
+    p_gate_auto_k_target_edge = _coerce_float(
+        get("p_gate_auto_k_target_edge", _MODEL_DEFAULTS.p_gate_auto_k_target_edge),
+        name="p_gate_auto_k_target_edge",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_edge_tolerance = _coerce_float(
+        get("p_gate_auto_k_edge_tolerance", _MODEL_DEFAULTS.p_gate_auto_k_edge_tolerance),
+        name="p_gate_auto_k_edge_tolerance",
+        minimum=0.0,
+        maximum=10.0,
+    )
+    p_gate_auto_k_edge_ema_alpha = _coerce_float(
+        get("p_gate_auto_k_edge_ema_alpha", _MODEL_DEFAULTS.p_gate_auto_k_edge_ema_alpha),
+        name="p_gate_auto_k_edge_ema_alpha",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_edge_step_down_low = _coerce_float(
+        get("p_gate_auto_k_edge_step_down_low", _MODEL_DEFAULTS.p_gate_auto_k_edge_step_down_low),
+        name="p_gate_auto_k_edge_step_down_low",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_edge_step_down_high = _coerce_float(
+        get("p_gate_auto_k_edge_step_down_high", _MODEL_DEFAULTS.p_gate_auto_k_edge_step_down_high),
+        name="p_gate_auto_k_edge_step_down_high",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_min = _coerce_float(
+        get("p_gate_auto_k_min", _MODEL_DEFAULTS.p_gate_auto_k_min),
+        name="p_gate_auto_k_min",
+        minimum=0.0,
+    )
+    p_gate_auto_k_max = _coerce_float(
+        get("p_gate_auto_k_max", _MODEL_DEFAULTS.p_gate_auto_k_max),
+        name="p_gate_auto_k_max",
+        minimum=0.0,
+    )
+    if p_gate_auto_k_max < p_gate_auto_k_min:
+        p_gate_auto_k_max = p_gate_auto_k_min
+    p_gate_auto_k_width_frac = _coerce_float(
+        get("p_gate_auto_k_width_frac", _MODEL_DEFAULTS.p_gate_auto_k_width_frac),
+        name="p_gate_auto_k_width_frac",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_edge_frac = _coerce_float(
+        get("p_gate_auto_k_edge_frac", _MODEL_DEFAULTS.p_gate_auto_k_edge_frac),
+        name="p_gate_auto_k_edge_frac",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_auto_k_log_interval = _coerce_int(
+        get("p_gate_auto_k_log_interval", _MODEL_DEFAULTS.p_gate_auto_k_log_interval),
+        name="p_gate_auto_k_log_interval",
+    )
+
+    p_gate_clip_eps = _coerce_float(
+        get("p_gate_clip_eps", _MODEL_DEFAULTS.p_gate_clip_eps),
+        name="p_gate_clip_eps",
+        minimum=0.0,
+        maximum=0.49,
+    )
+    p_gate_eps = _coerce_float(
+        get("p_gate_eps", _MODEL_DEFAULTS.p_gate_eps),
+        name="p_gate_eps",
+        minimum=0.0,
+        maximum=1.0,
+    )
+
+    p_gate_edge_reg_weight = _coerce_float(
+        get("p_gate_edge_reg_weight", _MODEL_DEFAULTS.p_gate_edge_reg_weight),
+        name="p_gate_edge_reg_weight",
+        minimum=0.0,
+    )
+
+    raw_edge_w_low = get("p_gate_edge_reg_weight_low", _MODEL_DEFAULTS.p_gate_edge_reg_weight_low)
+    if raw_edge_w_low is None:
+        p_gate_edge_reg_weight_low = None
+    else:
+        p_gate_edge_reg_weight_low = _coerce_float(
+            raw_edge_w_low,
+            name="p_gate_edge_reg_weight_low",
+            minimum=0.0,
+        )
+
+    raw_edge_w_high = get("p_gate_edge_reg_weight_high", _MODEL_DEFAULTS.p_gate_edge_reg_weight_high)
+    if raw_edge_w_high is None:
+        p_gate_edge_reg_weight_high = None
+    else:
+        p_gate_edge_reg_weight_high = _coerce_float(
+            raw_edge_w_high,
+            name="p_gate_edge_reg_weight_high",
+            minimum=0.0,
+        )
+
+    p_gate_edge_reg_fallback_only = _coerce_bool(
+        get("p_gate_edge_reg_fallback_only", _MODEL_DEFAULTS.p_gate_edge_reg_fallback_only),
+        name="p_gate_edge_reg_fallback_only",
+    )
+    p_gate_edge_reg_frac = _coerce_float(
+        get("p_gate_edge_reg_frac", _MODEL_DEFAULTS.p_gate_edge_reg_frac),
+        name="p_gate_edge_reg_frac",
+        minimum=0.0,
+        maximum=0.49,
+    )
+    p_gate_edge_reg_min_width_frac = _coerce_float(
+        get("p_gate_edge_reg_min_width_frac", _MODEL_DEFAULTS.p_gate_edge_reg_min_width_frac),
+        name="p_gate_edge_reg_min_width_frac",
+        minimum=0.0,
+        maximum=1.0,
+    )
+    p_gate_edge_reg_power = _coerce_float(
+        get("p_gate_edge_reg_power", _MODEL_DEFAULTS.p_gate_edge_reg_power),
+        name="p_gate_edge_reg_power",
+        minimum=1.0,
+        maximum=8.0,
+    )
+
+    unsup_xx_weight = _coerce_float(
+        get("unsup_xx_weight", _MODEL_DEFAULTS.unsup_xx_weight),
+        name="unsup_xx_weight",
+        minimum=0.0,
+    )
+    unsup_yy_weight = _coerce_float(
+        get("unsup_yy_weight", _MODEL_DEFAULTS.unsup_yy_weight),
+        name="unsup_yy_weight",
+        minimum=0.0,
+    )
+
+    p_prior_weight = _coerce_float(
+        get("p_prior_weight", _MODEL_DEFAULTS.p_prior_weight),
+        name="p_prior_weight",
+        minimum=0.0,
+    )
+    p_prior_alpha = _coerce_float(
+        get("p_prior_alpha", _MODEL_DEFAULTS.p_prior_alpha),
+        name="p_prior_alpha",
+        minimum=0.0,
+    )
+    p_prior_beta = _coerce_float(
+        get("p_prior_beta", _MODEL_DEFAULTS.p_prior_beta),
+        name="p_prior_beta",
+        minimum=0.0,
+    )
+
     # Keep ModelConfig.device type compatible with original annotation (device|str|None)
     device_out: Optional[torch.device | str] = device
 
@@ -533,6 +937,57 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         use_linear_branch=use_linear_branch,
         compile_mode=compile_mode,
         safety_margin_pow2=safety_margin_pow2,
+        p_gate_enabled=p_gate_enabled,
+        p_gate_hidden_dim=p_gate_hidden_dim,
+        p_gate_detach_inputs=p_gate_detach_inputs,
+        p_gate_tile_size=p_gate_tile_size,
+        p_gate_bounds_use_quantile=p_gate_bounds_use_quantile,
+        p_gate_bounds_q_low=p_gate_bounds_q_low,
+        p_gate_bounds_q_high=p_gate_bounds_q_high,
+        p_gate_bounds_q_max_samples=p_gate_bounds_q_max_samples,
+        p_gate_bounds_clip_to_minmax=p_gate_bounds_clip_to_minmax,
+        p_gate_p_floor=p_gate_p_floor,
+        p_gate_p_ceil=p_gate_p_ceil,
+        p_gate_fallback_k=p_gate_fallback_k,
+        p_gate_fallback_k_low=p_gate_fallback_k_low,
+        p_gate_fallback_k_high=p_gate_fallback_k_high,
+        p_gate_auto_k_enabled=p_gate_auto_k_enabled,
+        p_gate_auto_k_interval=p_gate_auto_k_interval,
+        p_gate_auto_k_warmup=p_gate_auto_k_warmup,
+        p_gate_auto_k_ema_alpha=p_gate_auto_k_ema_alpha,
+        p_gate_auto_k_target_tight=p_gate_auto_k_target_tight,
+        p_gate_auto_k_tolerance=p_gate_auto_k_tolerance,
+        p_gate_auto_k_step_up=p_gate_auto_k_step_up,
+        p_gate_auto_k_step_down=p_gate_auto_k_step_down,
+        p_gate_auto_k_step_up_low=p_gate_auto_k_step_up_low,
+        p_gate_auto_k_step_down_low=p_gate_auto_k_step_down_low,
+        p_gate_auto_k_step_up_high=p_gate_auto_k_step_up_high,
+        p_gate_auto_k_step_down_high=p_gate_auto_k_step_down_high,
+        p_gate_auto_k_edge_enabled=p_gate_auto_k_edge_enabled,
+        p_gate_auto_k_target_edge=p_gate_auto_k_target_edge,
+        p_gate_auto_k_edge_tolerance=p_gate_auto_k_edge_tolerance,
+        p_gate_auto_k_edge_ema_alpha=p_gate_auto_k_edge_ema_alpha,
+        p_gate_auto_k_edge_step_down_low=p_gate_auto_k_edge_step_down_low,
+        p_gate_auto_k_edge_step_down_high=p_gate_auto_k_edge_step_down_high,
+        p_gate_auto_k_min=p_gate_auto_k_min,
+        p_gate_auto_k_max=p_gate_auto_k_max,
+        p_gate_auto_k_width_frac=p_gate_auto_k_width_frac,
+        p_gate_auto_k_edge_frac=p_gate_auto_k_edge_frac,
+        p_gate_auto_k_log_interval=p_gate_auto_k_log_interval,
+        p_gate_clip_eps=p_gate_clip_eps,
+        p_gate_eps=p_gate_eps,
+        p_gate_edge_reg_weight=p_gate_edge_reg_weight,
+        p_gate_edge_reg_weight_low=p_gate_edge_reg_weight_low,
+        p_gate_edge_reg_weight_high=p_gate_edge_reg_weight_high,
+        p_gate_edge_reg_fallback_only=p_gate_edge_reg_fallback_only,
+        p_gate_edge_reg_frac=p_gate_edge_reg_frac,
+        p_gate_edge_reg_min_width_frac=p_gate_edge_reg_min_width_frac,
+        p_gate_edge_reg_power=p_gate_edge_reg_power,
+        unsup_xx_weight=unsup_xx_weight,
+        unsup_yy_weight=unsup_yy_weight,
+        p_prior_weight=p_prior_weight,
+        p_prior_alpha=p_prior_alpha,
+        p_prior_beta=p_prior_beta,
     )
 
 

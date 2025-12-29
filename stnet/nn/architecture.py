@@ -30,7 +30,7 @@ from ..core.graph import (
     torch_compile_disable,
 )
 from ..core.precision import Autocast, is_scale_safe
-from .primitives import Recorder, Scaler
+from .primitives import Recorder, Scaler, ResidualGate
 from .blocks import (
     LongNet,
     PointTransformer,
@@ -933,6 +933,193 @@ class Model(nn.Module):
             length_bucket_multiple=bucket,
         ).to(self._device)
 
+        # Residual gating: z_hat = base + p * residue
+        self.p_gate: Optional[ResidualGate]
+        # Fallback bounds: when scaler.y_min/y_max are unavailable, use mean ± k*std.
+        # `fallback_k` is stored as a buffer so it can be checkpointed and (optionally)
+        # tuned during training.
+        k_default = float(getattr(config, 'p_gate_fallback_k', 6.0))
+        k_low_cfg = getattr(config, 'p_gate_fallback_k_low', None)
+        k_high_cfg = getattr(config, 'p_gate_fallback_k_high', None)
+        # Keep the legacy symmetric k for compatibility; allow asymmetric overrides.
+        self.p_gate_fallback_k: float = float(k_default)
+        self.p_gate_fallback_k_low: float = float(k_default if k_low_cfg is None else float(k_low_cfg))
+        self.p_gate_fallback_k_high: float = float(k_default if k_high_cfg is None else float(k_high_cfg))
+        self.p_gate_auto_k_enabled: bool = bool(getattr(config, 'p_gate_auto_k_enabled', False))
+        self.p_gate_auto_k_interval: int = int(getattr(config, 'p_gate_auto_k_interval', 100) or 0)
+        self.p_gate_auto_k_warmup: int = int(getattr(config, 'p_gate_auto_k_warmup', 0) or 0)
+        self.p_gate_auto_k_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_ema_alpha', 0.1))
+        self.p_gate_auto_k_target_tight: float = float(getattr(config, 'p_gate_auto_k_target_tight', 0.02))
+        self.p_gate_auto_k_tolerance: float = float(getattr(config, 'p_gate_auto_k_tolerance', 0.5))
+        self.p_gate_auto_k_step_up: float = float(getattr(config, 'p_gate_auto_k_step_up', 0.1))
+        self.p_gate_auto_k_step_down: float = float(getattr(config, 'p_gate_auto_k_step_down', 0.02))
+        # Optional per-side step sizes (default to symmetric step_up/step_down).
+        self.p_gate_auto_k_step_up_low: float = float(getattr(config, 'p_gate_auto_k_step_up_low', self.p_gate_auto_k_step_up))
+        self.p_gate_auto_k_step_down_low: float = float(getattr(config, 'p_gate_auto_k_step_down_low', self.p_gate_auto_k_step_down))
+        self.p_gate_auto_k_step_up_high: float = float(getattr(config, 'p_gate_auto_k_step_up_high', self.p_gate_auto_k_step_up))
+        self.p_gate_auto_k_step_down_high: float = float(getattr(config, 'p_gate_auto_k_step_down_high', self.p_gate_auto_k_step_down))
+
+        # Optional edge-based tuning: when constraint activation is in-range but p frequently
+        # hugs dynamic endpoints, shrink fallback bounds by reducing k.
+        self.p_gate_auto_k_edge_enabled: bool = bool(getattr(config, 'p_gate_auto_k_edge_enabled', False))
+        self.p_gate_auto_k_target_edge: float = float(getattr(config, 'p_gate_auto_k_target_edge', 0.05))
+        self.p_gate_auto_k_edge_tolerance: float = float(getattr(config, 'p_gate_auto_k_edge_tolerance', 0.5))
+        self.p_gate_auto_k_edge_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_edge_ema_alpha', self.p_gate_auto_k_ema_alpha))
+        self.p_gate_auto_k_edge_step_down_low: float = float(getattr(config, 'p_gate_auto_k_edge_step_down_low', 0.01))
+        self.p_gate_auto_k_edge_step_down_high: float = float(getattr(config, 'p_gate_auto_k_edge_step_down_high', 0.01))
+        self.p_gate_auto_k_min: float = float(getattr(config, 'p_gate_auto_k_min', 1.0))
+        self.p_gate_auto_k_max: float = float(getattr(config, 'p_gate_auto_k_max', 16.0))
+        self.p_gate_auto_k_width_frac: float = float(getattr(config, 'p_gate_auto_k_width_frac', 0.05))
+        self.p_gate_auto_k_edge_frac: float = float(getattr(config, 'p_gate_auto_k_edge_frac', 0.02))
+        self.p_gate_auto_k_log_interval: int = int(getattr(config, 'p_gate_auto_k_log_interval', 200) or 0)
+        # If auto-k is enabled, ensure fallback ks are positive (otherwise we'd disable fallback entirely).
+        if self.p_gate_auto_k_enabled:
+            if self.p_gate_fallback_k_low <= 0.0:
+                self.p_gate_fallback_k_low = max(float(self.p_gate_auto_k_min), 1e-6)
+            if self.p_gate_fallback_k_high <= 0.0:
+                self.p_gate_fallback_k_high = max(float(self.p_gate_auto_k_min), 1e-6)
+        self.p_gate_fallback_enabled: bool = bool(
+            self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
+        )
+
+        # Tile-wise p gating (optional). When set, p is predicted per output tile
+        # along the flattened y dimension; set this to the same value as ops.loss_tile_size
+        # if you want tight coupling with TiledLoss slicing.
+        self.p_gate_tile_size: Optional[int] = getattr(config, 'p_gate_tile_size', None)
+
+        # Optional quantile bounds for p tightening (requires scaler.y_q_low/y_q_high).
+        self.p_gate_bounds_use_quantile: bool = bool(getattr(config, 'p_gate_bounds_use_quantile', False))
+        self.p_gate_bounds_q_low: float = float(getattr(config, 'p_gate_bounds_q_low', 0.005))
+        self.p_gate_bounds_q_high: float = float(getattr(config, 'p_gate_bounds_q_high', 0.995))
+        self.p_gate_bounds_q_max_samples: int = int(getattr(config, 'p_gate_bounds_q_max_samples', 8192) or 0)
+        self.p_gate_bounds_clip_to_minmax: bool = bool(getattr(config, 'p_gate_bounds_clip_to_minmax', True))
+
+        try:
+            # Asymmetric fallback ks (lower/upper) for mean±kσ bounds.
+            self.register_buffer(
+                "p_gate_fallback_k_low_buf",
+                torch.tensor(float(self.p_gate_fallback_k_low), dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_fallback_k_high_buf",
+                torch.tensor(float(self.p_gate_fallback_k_high), dtype=torch.float32),
+                persistent=True,
+            )
+            # Legacy: keep an average as a convenience for older tooling.
+            self.register_buffer(
+                "p_gate_fallback_k_buf",
+                torch.tensor(
+                    float(0.5 * (self.p_gate_fallback_k_low + self.p_gate_fallback_k_high)),
+                    dtype=torch.float32,
+                ),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_auto_k_step_buf",
+                torch.tensor(0, dtype=torch.int64),
+                persistent=True,
+            )
+            # Per-side EMAs for constraint activation.
+            self.register_buffer(
+                "p_gate_auto_k_ema_low_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_auto_k_ema_high_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            # Per-side EMAs for boundary hugging (edge-based tuning/diagnostics).
+            self.register_buffer(
+                "p_gate_auto_k_edge_ema_low_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_auto_k_edge_ema_high_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_auto_k_edge_ema_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            # Overall EMA retained for backwards compatibility/logging.
+            self.register_buffer(
+                "p_gate_auto_k_ema_buf",
+                torch.tensor(0.0, dtype=torch.float32),
+                persistent=True,
+            )
+            self.register_buffer(
+                "p_gate_auto_k_updates_buf",
+                torch.tensor(0, dtype=torch.int64),
+                persistent=True,
+            )
+        except Exception:
+            pass
+        if bool(getattr(config, 'p_gate_enabled', False)):
+            self.p_gate = ResidualGate(
+                d_model=int(config.d_model),
+                hidden_dim=int(getattr(config, 'p_gate_hidden_dim', 64)),
+                detach_inputs=bool(getattr(config, 'p_gate_detach_inputs', True)),
+                p_floor=float(getattr(config, 'p_gate_p_floor', 0.0)),
+                p_ceil=float(getattr(config, 'p_gate_p_ceil', 1.0)),
+                tile_size=getattr(config, 'p_gate_tile_size', None),
+                clip_eps=float(getattr(config, 'p_gate_clip_eps', 1e-6)),
+                eps=float(getattr(config, 'p_gate_eps', 1e-6)),
+                stat_width_frac=float(getattr(config, 'p_gate_auto_k_width_frac', 0.05)),
+                stat_edge_frac=float(getattr(config, 'p_gate_auto_k_edge_frac', 0.02)),
+            ).to(self._device)
+        else:
+            self.p_gate = None
+
+        # Auxiliary losses (added to total loss inside Model.forward)
+        self.unsup_xx_weight = float(getattr(config, 'unsup_xx_weight', 0.0))
+        self.unsup_yy_weight = float(getattr(config, 'unsup_yy_weight', 0.0))
+        self.p_prior_weight = float(getattr(config, 'p_prior_weight', 0.0))
+        self.p_prior_alpha = float(getattr(config, 'p_prior_alpha', 2.0))
+        self.p_prior_beta = float(getattr(config, 'p_prior_beta', 2.0))
+        # Optional p edge-hugging regularizer (added to total loss in forward).
+        self.p_gate_edge_reg_weight = float(getattr(config, 'p_gate_edge_reg_weight', 0.0))
+        self.p_gate_edge_reg_frac = float(
+            getattr(config, 'p_gate_edge_reg_frac', getattr(config, 'p_gate_auto_k_edge_frac', 0.02))
+        )
+        self.p_gate_edge_reg_min_width_frac = float(
+            getattr(config, 'p_gate_edge_reg_min_width_frac', getattr(config, 'p_gate_auto_k_width_frac', 0.05))
+        )
+        self.p_gate_edge_reg_power = float(getattr(config, 'p_gate_edge_reg_power', 2.0))
+        # Optional per-side weights and fallback-only mode for edge regularizer.
+        try:
+            w_low_cfg = getattr(config, 'p_gate_edge_reg_weight_low', None)
+            w_high_cfg = getattr(config, 'p_gate_edge_reg_weight_high', None)
+            self.p_gate_edge_reg_weight_low = (
+                float(self.p_gate_edge_reg_weight) if w_low_cfg is None else float(w_low_cfg)
+            )
+            self.p_gate_edge_reg_weight_high = (
+                float(self.p_gate_edge_reg_weight) if w_high_cfg is None else float(w_high_cfg)
+            )
+        except Exception:
+            self.p_gate_edge_reg_weight_low = float(self.p_gate_edge_reg_weight)
+            self.p_gate_edge_reg_weight_high = float(self.p_gate_edge_reg_weight)
+        self.p_gate_edge_reg_fallback_only = bool(getattr(config, 'p_gate_edge_reg_fallback_only', False))
+
+
+
+        self.x_recon_head: Optional[nn.Module]
+        if self.unsup_xx_weight > 0.0:
+            hid = max(8, int(int(config.d_model) // 2))
+            self.x_recon_head = nn.Sequential(
+                nn.LayerNorm(int(config.d_model)),
+                nn.Linear(int(config.d_model), hid),
+                nn.SiLU(),
+                nn.Linear(hid, int(in_dim)),
+            ).to(self._device)
+        else:
+            self.x_recon_head = None
+
         # Encoder-stage microbatch.
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
@@ -1494,7 +1681,112 @@ class Model(nn.Module):
             residual = residual_context.reshape(b, -1)
             if residual.dtype != assembled.dtype:
                 residual = residual.to(dtype=assembled.dtype)
-            y_hat = assembled + residual
+
+            p: Optional[torch.Tensor] = None
+            edge_reg_low: Optional[torch.Tensor] = None
+            edge_reg_high: Optional[torch.Tensor] = None
+            if self.p_gate is not None:
+                z_min: Optional[torch.Tensor] = None
+                z_max: Optional[torch.Tensor] = None
+                fallback_bounds = False
+                try:
+                    y_min = getattr(self.scaler, 'y_min', None)
+                    y_max = getattr(self.scaler, 'y_max', None)
+                    y_q_low = getattr(self.scaler, 'y_q_low', None)
+                    y_q_high = getattr(self.scaler, 'y_q_high', None)
+
+                    mean = self.scaler.y_mean.to(device=assembled.device, dtype=assembled.dtype)
+                    std = self.scaler.y_std.to(device=assembled.device, dtype=assembled.dtype)
+                    denom = std + float(self.scaler.eps)
+
+                    def _finite_pair(lo: object, hi: object) -> bool:
+                        if not (isinstance(lo, torch.Tensor) and isinstance(hi, torch.Tensor)):
+                            return False
+                        try:
+                            return bool(torch.isfinite(lo).all().item()) and bool(torch.isfinite(hi).all().item())
+                        except Exception:
+                            return False
+
+                    have_minmax = _finite_pair(y_min, y_max)
+                    have_quant = _finite_pair(y_q_low, y_q_high)
+
+                    use_quant = bool(getattr(self, 'p_gate_bounds_use_quantile', False))
+                    clip_quant = bool(getattr(self, 'p_gate_bounds_clip_to_minmax', True))
+
+                    ylo_t: Optional[torch.Tensor] = None
+                    yhi_t: Optional[torch.Tensor] = None
+
+                    if use_quant and have_quant:
+                        ylo_t = cast(torch.Tensor, y_q_low).to(device=assembled.device, dtype=assembled.dtype)
+                        yhi_t = cast(torch.Tensor, y_q_high).to(device=assembled.device, dtype=assembled.dtype)
+                        # Optionally clip quantile bounds within min/max bounds when available.
+                        if clip_quant and have_minmax:
+                            ymin_t = cast(torch.Tensor, y_min).to(device=assembled.device, dtype=assembled.dtype)
+                            ymax_t = cast(torch.Tensor, y_max).to(device=assembled.device, dtype=assembled.dtype)
+                            ylo_t = torch.maximum(ylo_t, ymin_t)
+                            yhi_t = torch.minimum(yhi_t, ymax_t)
+                    elif have_minmax:
+                        ylo_t = cast(torch.Tensor, y_min).to(device=assembled.device, dtype=assembled.dtype)
+                        yhi_t = cast(torch.Tensor, y_max).to(device=assembled.device, dtype=assembled.dtype)
+
+                    if ylo_t is not None and yhi_t is not None:
+                        z_min = (ylo_t - mean) / denom
+                        z_max = (yhi_t - mean) / denom
+                    else:
+                        # Legacy/unknown bounds: fall back to mean ± k * std.
+                        # This corresponds to z in [-k*std/(std+eps), +k*std/(std+eps)].
+                        if bool(getattr(self, 'p_gate_fallback_enabled', False)):
+                            k_low_buf = getattr(self, 'p_gate_fallback_k_low_buf', None)
+                            k_high_buf = getattr(self, 'p_gate_fallback_k_high_buf', None)
+                            if isinstance(k_low_buf, torch.Tensor):
+                                k_low = k_low_buf.to(device=assembled.device, dtype=assembled.dtype)
+                            else:
+                                k_low = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_low', getattr(self, 'p_gate_fallback_k', 0.0))))
+                            if isinstance(k_high_buf, torch.Tensor):
+                                k_high = k_high_buf.to(device=assembled.device, dtype=assembled.dtype)
+                            else:
+                                k_high = mean.new_tensor(float(getattr(self, 'p_gate_fallback_k_high', getattr(self, 'p_gate_fallback_k', 0.0))))
+                            z_scale = std / denom
+                            z_min = (-k_low) * z_scale
+                            z_max = (k_high) * z_scale
+                            fallback_bounds = True
+                except Exception:
+                    z_min = None
+                    z_max = None
+                do_edge_reg = (
+                    self.training
+                    and grad_enabled
+                    and ((self.p_gate_edge_reg_weight_low > 0.0) or (self.p_gate_edge_reg_weight_high > 0.0))
+                    and (z_min is not None)
+                    and (z_max is not None)
+                    and ((not self.p_gate_edge_reg_fallback_only) or bool(fallback_bounds))
+                )
+                if do_edge_reg:
+                    p, edge_reg_low, edge_reg_high = self.p_gate(
+                        tokens=tokens,
+                        refined_tokens=refined_tokens,
+                        base=assembled,
+                        residue=residual,
+                        z_min=z_min,
+                        z_max=z_max,
+                        fallback_bounds=bool(fallback_bounds),
+                        return_edge_reg_lr=True,
+                        edge_reg_frac=float(self.p_gate_edge_reg_frac),
+                        edge_reg_min_width_frac=float(self.p_gate_edge_reg_min_width_frac),
+                        edge_reg_power=float(self.p_gate_edge_reg_power),
+                    )
+                else:
+                    p = self.p_gate(
+                        tokens=tokens,
+                        refined_tokens=refined_tokens,
+                        base=assembled,
+                        residue=residual,
+                        z_min=z_min,
+                        z_max=z_max,
+                        fallback_bounds=bool(fallback_bounds),
+                    )
+
+            y_hat = assembled + (residual if p is None else p * residual)
             y_hat = _sanitize_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
 
             pred = y_hat.reshape(b, *self.out_shape)
@@ -1540,7 +1832,7 @@ class Model(nn.Module):
                     )
                     z_top = (
                         _sanitize_tensor(
-                            assembled.detach() + residual,
+                            assembled.detach() + (residual if p is None else p * residual),
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
                         )
@@ -1573,6 +1865,60 @@ class Model(nn.Module):
             if loss_val is not None and not isinstance(loss_val, torch.Tensor):
                 loss_val = torch.as_tensor(loss_val, device=y_hat.device, dtype=y_hat.dtype)
 
+            # --- Auxiliary losses (unsupervised / regularization) ---
+            if self.training and grad_enabled:
+                aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
+                aux_used = False
+
+                if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
+                    x_recon = self.x_recon_head(tokens.mean(dim=1))
+                    loss_xx = F.smooth_l1_loss(
+                        x_recon.to(dtype=torch.float32),
+                        features_t.to(dtype=torch.float32),
+                        reduction="mean",
+                    )
+                    aux_total = aux_total + self.unsup_xx_weight * loss_xx.to(dtype=aux_total.dtype)
+                    aux_used = True
+
+                if self.unsup_yy_weight > 0.0:
+                    teacher = y_hat.detach()
+                    student = assembled
+                    if p is not None:
+                        w = p.detach()
+                        # p can be (B, 1) (scalar gate) or (B, D) (tile-wise-expanded).
+                        if w.dim() == 2 and int(w.shape[1]) != 1:
+                            w = w.mean(dim=1)
+                        else:
+                            w = w.squeeze(-1)
+                        w = w.clamp(min=0.0)
+                        per = F.smooth_l1_loss(student, teacher, reduction="none").mean(dim=1)
+                        loss_yy = (per * w).mean()
+                    else:
+                        loss_yy = F.smooth_l1_loss(student, teacher, reduction="mean")
+                    aux_total = aux_total + self.unsup_yy_weight * loss_yy.to(dtype=aux_total.dtype)
+                    aux_used = True
+
+                if self.p_prior_weight > 0.0 and p is not None:
+                    # Beta prior on p (encourage non-extreme gating); supports skew when alpha!=beta.
+                    clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6)) if self.p_gate is not None else 1e-6
+                    p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
+                    a = float(self.p_prior_alpha)
+                    b = float(self.p_prior_beta)
+                    loss_p = -(((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))).mean()
+                    aux_total = aux_total + self.p_prior_weight * loss_p.to(dtype=aux_total.dtype)
+                    aux_used = True
+
+                if edge_reg_low is not None and self.p_gate_edge_reg_weight_low > 0.0:
+                    aux_total = aux_total + self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
+                    aux_used = True
+
+                if edge_reg_high is not None and self.p_gate_edge_reg_weight_high > 0.0:
+                    aux_total = aux_total + self.p_gate_edge_reg_weight_high * edge_reg_high.to(dtype=aux_total.dtype)
+                    aux_used = True
+
+                if aux_used:
+                    loss_val = aux_total if loss_val is None else (loss_val + aux_total)
+
             # --- Inference-time calibration (regression only) ---
             if infer_mode and calibrate_output and (not is_cls_loss):
                 z_cal = self.scaler.calibrate(y_hat)
@@ -1591,11 +1937,15 @@ class Model(nn.Module):
                 if return_aux:
                     out_td.set("refined_tokens", refined_tokens)
                     out_td.set("residual_context", residual_context)
+                    if p is not None:
+                        out_td.set("p_gate", p)
                 else:
                     with contextlib.suppress(KeyError):
                         out_td.del_("refined_tokens")
                     with contextlib.suppress(KeyError):
                         out_td.del_("residual_context")
+                    with contextlib.suppress(KeyError):
+                        out_td.del_("p_gate")
 
                 if loss_val is not None:
                     loss_td = loss_val
