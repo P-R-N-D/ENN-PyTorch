@@ -2498,6 +2498,10 @@ class SigmoidGate(nn.Module):
         return out_full
 
 
+# Backward compatibility: old checkpoints may reference ResidualGate.
+ResidualGate = SigmoidGate
+
+
 class Recorder(nn.Module):
 
     def __init__(self) -> None:
