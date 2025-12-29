@@ -9,46 +9,35 @@ import multiprocessing as mp
 import os
 import queue
 import threading
-from functools import lru_cache
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Iterator,
-    Literal,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-    TypedDict,
-)
+from functools import lru_cache
+from typing import (Any, Callable, Dict, Iterator, Literal, Mapping, Optional,
+                    Sequence, Tuple, TypedDict)
 
-import torch
 import numpy as np
+import torch
 
-from ..core.compat import ensure_torchdata
 from ..core.casting import dtype_from_name, env_bool, env_first_int
+from ..core.compat import ensure_torchdata
 from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
-from ..core.system import (
-    Thread,
-    Memory,
-    accel_is_available as _accel_is_available,
-    accel_backend_for_device_type as _accel_backend_for_device_type,
-    accel_current_stream as _accel_current_stream,
-    accel_make_event as _accel_make_event,
-    accel_new_stream as _accel_new_stream,
-    accel_stream_context as _accel_stream_context,
-    accel_streaming_supported_for_device_type as _accel_streaming_supported_for_device_type,
-)
+from ..core.system import Memory, Thread
+from ..core.system import \
+    accel_backend_for_device_type as _accel_backend_for_device_type
+from ..core.system import accel_current_stream as _accel_current_stream
+from ..core.system import accel_is_available as _accel_is_available
+from ..core.system import accel_make_event as _accel_make_event
+from ..core.system import accel_new_stream as _accel_new_stream
+from ..core.system import accel_stream_context as _accel_stream_context
+from ..core.system import \
+    accel_streaming_supported_for_device_type as \
+    _accel_streaming_supported_for_device_type
 from . import schemas as _schemas
 from .pipeline import Dataset
-from .schemas import _FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, default_underflow_action, normalize_underflow_action
+from .schemas import (_FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES,
+                      default_underflow_action, normalize_underflow_action)
 
 _LOGGER = logging.getLogger(__name__)
-
-TensorLike = Any
 
 def _rebuild_tuple_like(proto: tuple[Any, ...], items: tuple[Any, ...]) -> Any:
     # Namedtuple-safe tuple reconstruction.
@@ -69,7 +58,7 @@ _TORCHDATA_AVAILABLE = False
 
 
 class _MissingTorchDataBaseNode:
-    """Placeholder type to avoid NameError/TypeError cascades when torchdata is missing."""
+    pass
 
 
 BaseNode: type = _MissingTorchDataBaseNode  # will be overwritten if torchdata imports
@@ -97,7 +86,8 @@ except Exception as _e:
 
 try:
     from torchdata.nodes import Batcher as _TDBatcher
-    from torchdata.nodes import MultiNodeWeightedSampler as _TDMultiNodeWeightedSampler
+    from torchdata.nodes import \
+        MultiNodeWeightedSampler as _TDMultiNodeWeightedSampler
     from torchdata.nodes import PinMemory as _TDPinMemory
     from torchdata.nodes import Prefetcher as _TDPrefetcher
     from torchdata.nodes import SamplerWrapper as _TDSamplerWrapper
@@ -128,7 +118,6 @@ except Exception:  # pragma: no cover
 
 
 def _is_accelerator_available() -> bool:
-    """Best-effort check for an available accelerator backend (CUDA/XPU/MPS)."""
     return bool(
         _accel_is_available("cuda")
         or _accel_is_available("xpu")
@@ -137,7 +126,6 @@ def _is_accelerator_available() -> bool:
 
 
 def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
-    """Return True if device free-memory guard is satisfied (or guard disabled)."""
     if int(guard_bytes) <= 0:
         return True
     try:
@@ -151,7 +139,6 @@ def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
 
 
 def _host_guard_ok(guard_bytes: int) -> bool:
-    """Return True if host available-memory guard is satisfied (or guard disabled)."""
     if int(guard_bytes) <= 0:
         return True
     try:
@@ -162,13 +149,6 @@ def _host_guard_ok(guard_bytes: int) -> bool:
 
 @lru_cache(maxsize=1)
 def _accel_event_poll_params() -> tuple[float, float, float]:
-    """Return (base_sleep_s, max_sleep_s, stop_min_sleep_s) for accelerator event polling.
-
-    These can be tuned via environment variables (generic first, legacy fallback):
-      - STNET_ACCEL_EVENT_POLL_START_US (default: 500; legacy: STNET_CUDA_EVENT_POLL_START_US)
-      - STNET_ACCEL_EVENT_POLL_MAX_MS (default: 50; legacy: STNET_CUDA_EVENT_POLL_MAX_MS)
-      - STNET_ACCEL_EVENT_POLL_STOP_MIN_MS (default: 5; legacy: STNET_CUDA_EVENT_POLL_STOP_MIN_MS)
-    """
 
     start_us = int(env_first_int(("STNET_ACCEL_EVENT_POLL_START_US", "STNET_CUDA_EVENT_POLL_START_US"), default=500) or 500)
     max_ms = int(env_first_int(("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"), default=50) or 50)
@@ -188,13 +168,6 @@ def _wait_accel_event_done(
     max_sleep_s: float | None = None,
     stop_min_sleep_s: float | None = None,
 ) -> None:
-    """Wait for an accelerator event to complete using query()+backoff.
-
-    This avoids a hard blocking synchronize() call in the hot path, while still
-    guaranteeing the event is complete before reuse.
-
-    If `ev.query()` is unavailable or raises, falls back to `ev.synchronize()`.
-    """
     import time
 
     stop_fn = stopped if stopped is not None else (lambda: False)
@@ -229,11 +202,6 @@ def _wait_accel_event_done(
 
 
 class BatchScaler:
-    """Per-session (or per-loader) scaling factor for auto batch sizing.
-
-    - Cross-process safe: uses multiprocessing.Value so updates propagate to loader workers.
-    - Thread-safe: Value has an internal lock; we also guard bounds carefully.
-    """
 
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
@@ -270,14 +238,6 @@ class BatchScaler:
             self._v = mp.Value("d", 1.0, lock=True)
 
     def get(self) -> float:
-        """Return the current scaling factor.
-
-        This is a hot-path call (can happen once per batch). Acquiring the
-        multiprocessing.Value lock on every read adds measurable overhead.
-
-        We therefore use a lock-free fast path and fall back to a locked read
-        only if the observed value looks invalid/out-of-bounds.
-        """
         mn = float(self._min_scale)
         mx = float(self._max_scale)
 
@@ -554,7 +514,6 @@ class Sampler(_Sampler):
         return max(1, int(eff))
 
     def _len_batch_size(self) -> int:
-        """Epoch-local snapshot for __len__ stability."""
         epoch = int(getattr(self, "_S_epoch", 0) or 0)
         snap_epoch = int(getattr(self, "_len_epoch", -1) or -1)
         snap = getattr(self, "_len_B_snapshot", None)
@@ -580,7 +539,6 @@ class Sampler(_Sampler):
         setattr(self, "_S_B_base", int(v))
 
     def __getstate__(self):
-        """Make the Sampler picklable (spawn-based multiprocessing)."""
         state = dict(self.__dict__)
         for key in (
             "_features",
@@ -626,11 +584,6 @@ class Sampler(_Sampler):
         self._Y = self._memmap_labels
 
     def _get_mmaps(self):
-        """Return (features, labels) handles for the current thread.
-
-        On free-threading / no-GIL builds, some extension types may internally rely
-        on per-object state. Thread-local handles avoid sharing that state across threads.
-        """
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
 
@@ -745,7 +698,6 @@ class Sampler(_Sampler):
         return out
 
     def _gather(self, idx_tensor: torch.Tensor, features: Any, labels: Any) -> Mapping[str, torch.Tensor]:
-        """Gather rows by index tensor (host indices)."""
         idx_tensor = idx_tensor.to(dtype=torch.long, copy=False)
         try:
             x = features.index_select(0, idx_tensor)
@@ -768,7 +720,6 @@ class Sampler(_Sampler):
         return out
 
     def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor) -> Mapping[str, torch.Tensor]:
-        """Index into the memmap dataset."""
         features, labels = self._get_mmaps()
         base = int(self._start)
 
@@ -969,11 +920,6 @@ class Sampler(_Sampler):
 # -----------------------------------------------------------------------------
 
 def _preload_len0(obj: Any) -> int:
-    """Return the number of samples for common tensor/array/sequence inputs.
-
-    This is intentionally permissive: we prefer best-effort coercion over failing
-    early when users pass array-likes.
-    """
     if isinstance(obj, torch.Tensor):
         return int(obj.shape[0]) if getattr(obj, "ndim", 0) > 0 else 1
     try:
@@ -984,7 +930,6 @@ def _preload_len0(obj: Any) -> int:
 
 
 def _preload_slice_any(obj: Any, s: int, e: int, *, name: str) -> Any:
-    """Slice a heterogeneous container in the range [s:e]."""
     if obj is None:
         return None
     s_i = int(s)
@@ -1004,7 +949,6 @@ def _preload_slice_any(obj: Any, s: int, e: int, *, name: str) -> Any:
 
 
 def _preload_gather_any(obj: Any, idx: torch.Tensor, *, name: str) -> Any:
-    """Gather a heterogeneous container by integer indices."""
     if obj is None:
         return None
     idx_cpu = BatchIO._idx_to_cpu_int64(idx)
@@ -1028,11 +972,6 @@ def _preload_gather_any_preconverted(
     *,
     name: str,
 ) -> Any:
-    """Gather a heterogeneous container by pre-converted indices.
-
-    This avoids converting the same `idx` multiple times when gathering both
-    features and labels during memmap materialization (shuffle path).
-    """
     if obj is None:
         return None
     if torch.is_tensor(obj):
@@ -1054,7 +993,6 @@ def _preload_gather_any_preconverted(
 
 
 class _PreloadMemmapBatchGetter:
-    """Callable used by memmap writers (batch slicing)."""
 
     __slots__ = ("raw_X", "raw_Y", "features_only")
 
@@ -1071,7 +1009,6 @@ class _PreloadMemmapBatchGetter:
 
 
 class _PreloadMemmapIndexGetter:
-    """Callable used by memmap writers (index-based gather)."""
 
     __slots__ = ("raw_X", "raw_Y", "features_only")
 
@@ -1097,10 +1034,8 @@ class _PreloadMemmapIndexGetter:
 # -----------------------------------------------------------------------------
 
 class BatchIO:
-    """Centralized memmap/streaming/chunking utilities."""
 
     class KeyIndexMappingView(_abc.Mapping):
-        """A mapping-view over `data` that iterates in the provided `keys` order."""
 
         __slots__ = ("_data", "_keys")
 
@@ -1123,15 +1058,6 @@ class BatchIO:
         *,
         keys: Optional[Sequence[Any]] = None,
     ) -> Tuple[int, Any]:
-        """Build (count, get_batch) helpers for key-index mappings.
-
-        IMPORTANT: This intentionally does *not* provide random access or writer-side shuffling.
-        Shuffling should be handled by the sampler at read time.
-
-        The returned get_batch() is optimized for sequential access patterns:
-        - expects monotonically increasing (s, e) windows within a pass
-        - supports automatic reset when s==0 (used by two-pass writers)
-        """
 
         if keys is None:
             count = int(len(data))
@@ -1190,17 +1116,6 @@ class BatchIO:
 
     @staticmethod
     def is_feature_label_batch_mapping(obj: Any) -> bool:
-        """True if the object looks like a {features, labels} style batch mapping.
-
-        The project historically accepted a mix of key names (e.g. X/Y, features/labels).
-        We now treat feature/label column names case-insensitively and recognize:
-
-        - features: x, feature, features, input, inputs, in
-        - labels:   y, label, labels, output, outputs, out
-
-        If the mapping uses non-string keys (e.g. {tuple_feature: label}), this returns False
-        so it can fall back to the compact-dataset heuristic.
-        """
         if not isinstance(obj, Mapping) or not obj:
             return False
 
@@ -1263,15 +1178,10 @@ class BatchIO:
 
     @staticmethod
     def mmt_meta_path(mmt_path: str) -> str:
-        """Sidecar metadata path for a MemoryMappedTensor file."""
         return _schemas.mmt_meta_path(mmt_path)
 
     @staticmethod
     def atomic_write_json(path: str, payload: Any, *, indent: int | None = 2) -> None:
-        """Atomically write JSON (best-effort).
-
-        Delegates to stnet.data.schemas.atomic_write_json().
-        """
         _schemas.atomic_write_json(path, payload, indent=indent)
 
     @staticmethod
@@ -1280,10 +1190,6 @@ class BatchIO:
 
     @staticmethod
     def atomic_torch_save(path: str, payload: Any, **opts: Any) -> None:
-        """Atomically write a torch checkpoint file.
-
-        Delegates to stnet.data.schemas.atomic_torch_save().
-        """
         _schemas.atomic_torch_save(path, payload, **opts)
 
     @staticmethod
@@ -1307,11 +1213,6 @@ class BatchIO:
         features_only: bool = False,
         chunk_size: int = 32,
     ) -> Tuple[int, Tuple[int, ...]]:
-        """Write a memmap dataset in two passes.
-
-        Pass 1: infer shapes and collect scale stats (for dtype negotiation).
-        Pass 2: write contiguous memmaps (optionally shuffled).
-        """
         out_dir = os.fspath(out_dir)
         os.makedirs(out_dir, exist_ok=True)
 
@@ -1794,7 +1695,6 @@ class BatchIO:
         features_only: bool = False,
         default_label_shape: Optional[Tuple[int, ...]] = None,
     ) -> None:
-        """Materialize an in-memory dataset into a memmap directory."""
         if not isinstance(data, Mapping):
             raise TypeError("preload_memmap expects a Mapping with at least 'features'")
         if "features" not in data:
@@ -2237,7 +2137,6 @@ class Multiplexer:
         self._source_keys: list[str] = []
 
     def set_epoch(self, epoch: int) -> None:
-        """Per-epoch reseed for multi-source mixing (torchdata MultiNodeWeightedSampler)."""
         self._epoch = int(epoch)
         node = getattr(self, "_node", None)
         if node is None:
@@ -2300,7 +2199,6 @@ class Multiplexer:
 
 @dataclass(frozen=True)
 class _MapBatch:
-    """Picklable adapter for prebatch mapping (avoid nested closures)."""
 
     fn: Callable[[Any], Any]
 
@@ -2568,7 +2466,8 @@ class Loader:
 
     def _local_device_index(self) -> int:
         try:
-            from ..core.system import accel_current_device_index, accel_is_available
+            from ..core.system import (accel_current_device_index,
+                                       accel_is_available)
 
             if accel_is_available("cuda"):
                 return int(accel_current_device_index("cuda"))
@@ -2580,7 +2479,6 @@ class Loader:
 
 
 class BatchQueue(Buffer):
-    """Bounded in-memory backpressure wrapper for any iterable/loader (session-based)."""
 
     def __init__(
         self,
@@ -2687,13 +2585,6 @@ class BatchQueue(Buffer):
 
 
 class Prefetcher(Buffer):
-    """Prefetch batches onto the target device with bounded buffering.
-
-    - ``depth`` bounds the number of in-flight batches.
-    - On CUDA/XPU with ``non_blocking=True``, a dedicated stream + backend events are
-      used to overlap H2D copies while safely releasing pinned staging buffers.
-    - Optional memory guards can pause production to reduce OOM risk.
-    """
 
     def __init__(
         self,

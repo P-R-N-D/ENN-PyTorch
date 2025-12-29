@@ -7,47 +7,29 @@ import math
 import threading
 import weakref
 from functools import lru_cache
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union, cast
+from typing import (Any, Callable, Dict, List, Mapping, Optional, Sequence,
+                    Tuple, Union, cast)
 
 import torch
 import torch.nn as nn
 
-from ..core.config import ModelConfig
-from ..core.compat import is_meta_or_fake_tensor
-from ..core.system import _log_debug, _log_info, empty_device_cache, get_device
+from ..config import ModelConfig
 from ..core.casting import env_first_int, env_int
-from ..data.pipeline import (
-    Dataset,
-    resolve_feature_key,
-    resolve_label_key,
-)
-from ..core.profiler import FLOP_PROFILER
-from ..core.graph import (
-    compile,
-    graph_break,
-    inference_mode,
-    invalidate_model_introspection_caches,
-    torch_compile_disable,
-)
+from ..core.compat import is_meta_or_fake_tensor
+from ..core.graph import (compile, graph_break, inference_mode,
+                          invalidate_model_introspection_caches,
+                          torch_compile_disable)
 from ..core.precision import Autocast, is_scale_safe
-from .primitives import Recorder, Scaler, ResidualGate
-from .blocks import (
-    LongNet,
-    PointTransformer,
-    RetNet,
-    TensorDictBase,
-    _ControllerChunkRunner,
-    _auto_microbatch,
-    _coerce_modeling_types,
-    _infer_module_device,
-    _microbatch_prealloc,
-    _sanitize_tensor,
-    _serialize_z_index,
-    stochastic_depth_schedule,
-    CrossTransformer,
-    LossWeightPolicy,
-    norm_layer,
-)
+from ..core.profiler import FLOP_PROFILER
+from ..core.system import _log_debug, _log_info, empty_device_cache, get_device
+from ..data.pipeline import Dataset, resolve_feature_key, resolve_label_key
+from .blocks import (CrossTransformer, LongNet, LossWeightPolicy,
+                     PointTransformer, RetNet, TensorDictBase,
+                     _auto_microbatch, _coerce_modeling_types,
+                     _ControllerChunkRunner, _infer_module_device,
+                     _microbatch_prealloc, _sanitize_tensor,
+                     _serialize_z_index, norm_layer, stochastic_depth_schedule)
+from .primitives import Recorder, Scaler, SigmoidGate
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -587,12 +569,6 @@ class TemporalExtractor(nn.Module):
 
 
 class Enhancer(nn.Module):
-    """Controller backbone wrapper.
-
-    Originally a thin wrapper around LongNet. This module now also owns
-    controller-stage microbatch sizing/execution, so Model.forward doesn't
-    have to manage controller microbatching details.
-    """
 
     def __init__(
         self,
@@ -658,11 +634,6 @@ class Enhancer(nn.Module):
         auto_microbatch_fn: Callable[[torch.Tensor], int],
         graph_break_fn: Optional[Callable[[], None]] = None,
     ) -> torch.Tensor:
-        """Run controller stage on tokens with internal microbatching.
-
-        Returns:
-            refined_tokens: Tensor with same shape as tokens
-        """
         if tokens.ndim != 3:
             raise ValueError(
                 f"Enhancer.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
@@ -934,7 +905,7 @@ class Model(nn.Module):
         ).to(self._device)
 
         # Residual gating: z_hat = base + p * residue
-        self.p_gate: Optional[ResidualGate]
+        self.p_gate: Optional[SigmoidGate]
         # Fallback bounds: when scaler.y_min/y_max are unavailable, use mean ± k*std.
         # `fallback_k` is stored as a buffer so it can be checkpointed and (optionally)
         # tuned during training.
@@ -1061,7 +1032,7 @@ class Model(nn.Module):
         except Exception:
             pass
         if bool(getattr(config, 'p_gate_enabled', False)):
-            self.p_gate = ResidualGate(
+            self.p_gate = SigmoidGate(
                 d_model=int(config.d_model),
                 hidden_dim=int(getattr(config, 'p_gate_hidden_dim', 64)),
                 detach_inputs=bool(getattr(config, 'p_gate_detach_inputs', True)),
@@ -1303,17 +1274,9 @@ class Model(nn.Module):
 
     @property
     def config(self) -> ModelConfig:
-        """The :class:`~stnet.core.config.ModelConfig` used to construct this instance."""
         return self.__config
 
     def to(self, *args: Any, **kwargs: Any) -> "Model":
-        """Move the model to a device/dtype while keeping Recorder on CPU.
-
-        Model owns device placement for the core model, but Recorder is runtime
-        metadata/logging and should remain on CPU (especially important for
-        CUDA/XPU where moving it would allocate device memory and can trigger
-        unnecessary device syncs).
-        """
         out = super().to(*args, **kwargs)
         with contextlib.suppress(Exception):
             if isinstance(getattr(self, "logger", None), Recorder):
@@ -2430,9 +2393,7 @@ class ModelPolicy:
         try:
             from torchao.quantization import (
                 Float8DynamicActivationFloat8WeightConfig,
-                Float8WeightOnlyConfig,
-                quantize_,
-            )
+                Float8WeightOnlyConfig, quantize_)
 
             cfg = (
                 Float8DynamicActivationFloat8WeightConfig()
@@ -2595,11 +2556,12 @@ _Int8WeightOnlyConfig: Any | None
 _PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
 
 try:
-    from torchao.quantization.quant_api import (
-        Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
-        Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
-        quantize_ as _quantize,
-    )
+    from torchao.quantization.quant_api import \
+        Int8DynamicActivationInt8WeightConfig as \
+        _Int8DynamicActivationInt8WeightConfig
+    from torchao.quantization.quant_api import \
+        Int8WeightOnlyConfig as _Int8WeightOnlyConfig
+    from torchao.quantization.quant_api import quantize_ as _quantize
 
     try:
         from torchao.quantization import quant_primitives as _qp
@@ -2615,13 +2577,6 @@ except Exception:  # pragma: no cover
 
 
 class Quantization:
-    """Best-effort quantization utilities.
-
-    - QAT: prepare model for fake-quant aware training
-    - PTQ: apply post-training quantization where available
-
-    This lives in model space because it fundamentally changes the module graph.
-    """
 
     @staticmethod
     def is_qat_available() -> bool:
@@ -2650,12 +2605,11 @@ class Quantization:
         # NOTE: This intentionally does not attempt to calibrate.
         try:
             # Some versions expose `FakeQuantize` in torchao.
-            from torchao.quantization.fake_quant import (
-                FakeQuantizeConfig,
-                Int8ActivationConfig,
-                Int8WeightConfig,
-                prepare_qat_ as _prepare_qat,
-            )
+            from torchao.quantization.fake_quant import (FakeQuantizeConfig,
+                                                         Int8ActivationConfig,
+                                                         Int8WeightConfig)
+            from torchao.quantization.fake_quant import \
+                prepare_qat_ as _prepare_qat
 
             cfg = FakeQuantizeConfig(
                 activation=Int8ActivationConfig(dynamic=bool(dynamic_activations)),
@@ -2753,10 +2707,6 @@ class Quantization:
         logger: Optional[Callable[[str], None]] = None,
         **kwargs: Any,
     ) -> tuple[nn.Module, bool, str]:
-        """Enable INT8 training.
-
-        Prefer QAT when available; fall back to PTQ if possible.
-        """
         if getattr(model, "__int8_training_qat__", False) or getattr(
             model, "__int8_training_ptq__", False
         ):

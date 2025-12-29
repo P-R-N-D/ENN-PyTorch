@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import contextlib
@@ -7,23 +6,19 @@ import math
 import os
 import random
 from dataclasses import dataclass, field, replace
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    Generic,
-    Mapping,
-    MutableMapping,
-    Optional,
-    Sequence,
-    Tuple,
-    TypeVar,
-    Union,
-)
+from typing import (Any, Callable, Dict, Generic, Mapping, MutableMapping,
+                    Optional, Sequence, Tuple, TypeVar, Union)
 
 import torch
-
-TensorLike = Any
+from ..core.casting import env_first, env_first_float, env_first_int
+from ..core.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
+from ..core.system import Memory, WorkerPolicy
+from ..core.system import accel_device_context as _accel_device_context
+from ..core.system import accel_is_available as _accel_is_available
+from ..core.system import accel_make_event as _accel_make_event
+from ..core.system import \
+    accel_pinned_h2d_supported_for_device_type as \
+    _accel_pinned_h2d_supported_for_device_type
 
 TExtra = TypeVar("TExtra")
 
@@ -37,49 +32,31 @@ except Exception:
         pass
 
 
-from .schemas import (
-    _FEATURE_KEY_ALIASES,
-    _LABEL_KEY_ALIASES,
-    _casefold_str,
-    canonicalize_xy_keys_,
-    default_underflow_action,
-    extract_xy,
-    normalize_underflow_action,
-    resolve_feature_key,
-    resolve_label_key,
-)
-
+from .schemas import (_FEATURE_KEY_ALIASES, _LABEL_KEY_ALIASES, _casefold_str,
+                      canonicalize_xy_keys_, default_underflow_action,
+                      extract_xy, normalize_underflow_action,
+                      resolve_feature_key, resolve_label_key)
 
 def _is_lazy_tensor(x: Any) -> bool:
-    """Return True if x is a lazy/streaming tensor (e.g., MemoryMappedTensor)."""
     if MemoryMappedTensor is None:
         return False
     try:
         return isinstance(x, MemoryMappedTensor)
     except Exception:
         return False
-
-from ..core.compat import MIN_TORCHDATA_VERSION, ensure_torchdata
-from ..core.casting import env_first, env_first_float, env_first_int
-from ..core.system import (
-    Memory,
-    WorkerPolicy,
-    accel_device_context as _accel_device_context,
-    accel_is_available as _accel_is_available,
-    accel_make_event as _accel_make_event,
-    accel_pinned_h2d_supported_for_device_type as _accel_pinned_h2d_supported_for_device_type,
-    accel_synchronize as _accel_synchronize,
-    accel_timing_events_supported_for_device_type as _accel_timing_events_supported_for_device_type,
-    cuda_compute_capability as _sys_cuda_compute_capability,
-    get_device as _sys_get_device,
-    get_device_stats,
-    get_tlb,
-    is_cpu_bf16_supported as _sys_is_cpu_bf16_supported,
-    is_cuda_bf16_supported as _sys_is_cuda_bf16_supported,
-    is_float8_supported as _sys_is_float8_supported,
-    is_int4_supported as _sys_is_int4_supported,
-    is_int8_supported as _sys_is_int8_supported,
-)
+from ..core.system import accel_synchronize as _accel_synchronize
+from ..core.system import \
+    accel_timing_events_supported_for_device_type as \
+    _accel_timing_events_supported_for_device_type
+from ..core.system import \
+    cuda_compute_capability as _sys_cuda_compute_capability
+from ..core.system import get_device as _sys_get_device
+from ..core.system import get_device_stats, get_tlb
+from ..core.system import is_cpu_bf16_supported as _sys_is_cpu_bf16_supported
+from ..core.system import is_cuda_bf16_supported as _sys_is_cuda_bf16_supported
+from ..core.system import is_float8_supported as _sys_is_float8_supported
+from ..core.system import is_int4_supported as _sys_is_int4_supported
+from ..core.system import is_int8_supported as _sys_is_int8_supported
 
 
 @dataclass(slots=True)
@@ -95,12 +72,6 @@ class LoaderPolicy:
         return max(1, int(self.max_batches_cpu))
 
     def apply_soft_limits(self, wp: WorkerPolicy, device: torch.device | str) -> WorkerPolicy:
-        """Clamp worker-policy settings to avoid pathological inflight buffering.
-
-        IMPORTANT:
-        - num_workers=0 is valid and must be preserved (single-process / fork-avoid / debug).
-        - prefetch_factor/prebatch remain >= 1 to keep pipeline semantics stable.
-        """
         hard = int(self.hard_inflight_batches(device))
         soft_cap = max(1, int(hard * max(1, int(self.soft_cap_multiplier))))
 
@@ -332,10 +303,6 @@ def _require_nodes() -> None:
 
 
 def _sync_device(device: torch.device) -> None:
-    """Best-effort device synchronize.
-
-    Centralized in core.system to keep backend-specific edge cases in one place.
-    """
     _accel_synchronize(device)
 
 
@@ -855,7 +822,6 @@ def _process(
 
 
 def _td_batch_size_from_X(x: Any) -> list[int]:
-    """Infer TensorDict batch_size from an 'X' field."""
     if isinstance(x, torch.Tensor) and x.ndim >= 1:
         return [int(x.shape[0])]
     return []
@@ -863,10 +829,6 @@ def _td_batch_size_from_X(x: Any) -> list[int]:
 
 @dataclass(slots=True)
 class Collate:
-    """Reusable collate function (callable object).
-
-    Avoids per-batch closure/partial allocation in hot dataloading loops.
-    """
 
     labels_dtype: Optional[torch.dtype] = None
     sanitize: bool = False
@@ -1173,7 +1135,6 @@ def fetch(
         return _auto_batch_size(_datasets, pf=pf, fallback=int(_bs))
 
     def _cap_pf_depth(_datasets: Mapping[str, Sampler], _pf: int, _bs: int) -> int:
-        """Cap prefetch depth based on host/device memory and inflight policy."""
         try:
             host_avail = int(Memory.available())
             if host_avail <= 0:
@@ -1504,10 +1465,6 @@ class Session:
         self.close()
 
 def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype] = None) -> Optional[torch.Tensor]:
-    """Convert `obj` to a tensor and (best-effort) cast dtype only when needed.
-
-    Returns None when obj is None (used for optional labels).
-    """
     if obj is None:
         return None
 
@@ -1520,7 +1477,6 @@ def _to_tensor_safe(obj: Any, dtype: Optional[torch.dtype] = None) -> Optional[t
 
 
 def _feature_size_hint(obj: Any) -> Optional[int]:
-    """Best-effort feature-size heuristic for nested mapping inputs."""
     if isinstance(obj, torch.Tensor):
         if obj.ndim == 0:
             return 1
@@ -1540,11 +1496,6 @@ def _stack_sequence(
     dtype: Optional[torch.dtype],
     reshape_1d: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Stack a sequence into a tensor without building an intermediate list of tensors.
-
-    This avoids a potentially large transient allocation of Python objects + tensor views
-    (common with `torch.stack([to_tensor(x) for x in seq])`).
-    """
     if not seq:
         return None
 
@@ -1609,7 +1560,6 @@ class Dataset(Generic[TExtra]):
 
     @property
     def device_stats(self):
-        """Backend device capability snapshot (separate from Dataset data stats)."""
         return get_device_stats(self.device)
 
     def ensure_device_info(self) -> "Dataset[TExtra]":
@@ -1830,7 +1780,6 @@ class Dataset(Generic[TExtra]):
 
     @property
     def scale_min_abs(self) -> Optional[float]:
-        """Backward-compatible alias for scale_min_positive."""
         return self.scale_min_positive
 
     @staticmethod
@@ -2198,21 +2147,6 @@ class Dataset(Generic[TExtra]):
 
 # Late import: avoid circular dependency (nodes.py imports Dataset from this module).
 try:
-    from .nodes import (
-        BatchIO,
-        Mapper,
-        Disposable,
-        Loader,
-        Sampler,
-        Source,
-        Multiplexer,
-        BatchQueue,
-        BatchScaler,
-        FeatureEngineering,
-        Bootstrap,
-        GraphModel,
-        CompiledGraphModel,
-        Prefetch,
-    )
+    from .nodes import (BatchScaler, Disposable, Loader, Mapper, Multiplexer, Sampler, Source)
 except Exception as _e:
     _NODES_IMPORT_ERROR = _e

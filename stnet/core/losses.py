@@ -21,11 +21,6 @@ TensorLike = Union[Number, torch.Tensor]
 def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
 ) -> Tuple[int, ...]:
-    """Return a sorted, unique tuple of valid positive dims.
-
-    - Filters out invalid dims.
-    - When keep_batch=False, dimension 0 is excluded (when possible).
-    """
     nd = int(x.ndim)
     if dims is None:
         return tuple(range(1, nd)) if nd > 1 else (0,)
@@ -57,7 +52,6 @@ def _median_over_dims(x: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
 
 
 def _mad_std(x: torch.Tensor, dims: Tuple[int, ...], eps: float) -> torch.Tensor:
-    """Robust std estimate via MAD."""
     mu = _median_over_dims(x, dims)
     dev = (x - mu).abs()
     mad = _median_over_dims(dev, dims)
@@ -74,14 +68,6 @@ def _master_float_dtype(x: torch.Tensor) -> torch.dtype:
 def _coerce_std(
     x: torch.Tensor, dim: Tuple[int, ...] | int | None, ddof: int, eps: float
 ) -> torch.Tensor:
-    """Compute a numerically safe std with keepdim=True.
-
-    Policy:
-      - Use float64 only when input is float64; otherwise compute in float32.
-      - Integer inputs are computed in float32.
-      - Avoid implicit promotion to float64 (let AMP/master policy decide upstream).
-      - Support ddof>1 even on older torch versions that lack `correction=`.
-    """
     if dim is None:
         dim_tuple: Tuple[int, ...] = tuple()
     elif isinstance(dim, int):
@@ -187,14 +173,6 @@ def _nufft_nd(
     eps: float = 1e-06,
     **kwargs: Any,
 ) -> torch.Tensor:
-    """Batched N-D NUFFT via cuFINUFFT (CUDA only).
-
-    Optimizations:
-      - Reuse a single plan when `omega` is shared across the batch (omega.ndim == 2).
-      - Attempt a vectorized `n_trans=B` execution path (falls back safely).
-      - When `omega` is per-sample (omega.ndim == 3), attempt to reuse the plan and
-        update points via `setpts()` (falls back to per-sample plans).
-    """
     _ = args, kwargs
     try:
         import cufinufft
@@ -464,7 +442,6 @@ class CRPSLoss(nn.Module):
     def _crps_normal_analytic(
         self, err: torch.Tensor, sigma: torch.Tensor
     ) -> torch.Tensor:
-        """CRPS of Normal(0, sigma) evaluated at err, analytic."""
         z = err / torch.clamp(sigma, min=self.eps)
         if self.max_z > 0.0:
             z = torch.clamp(z, min=-self.max_z, max=self.max_z)
@@ -479,11 +456,6 @@ class CRPSLoss(nn.Module):
     def _crps_normal_skew_sampled(
         self, err: torch.Tensor, sigma: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
-        """Sampling-based skew-normal-like correction.
-
-        This matches the intent of the prior implementation but avoids allocating
-        (n_samples, *shape) tensors permanently by chunking the sampling.
-        """
         # Standardized residuals for skew estimation.
         z_obs = err / torch.clamp(sigma, min=self.eps)
         if self.max_z > 0.0:
@@ -566,7 +538,6 @@ class CRPSLoss(nn.Module):
 
     @staticmethod
     def _move_sample_dim_to_1(pred: torch.Tensor, sample_dim: int) -> torch.Tensor:
-        """Move `sample_dim` to dim=1, preserving the relative order of other dims."""
         nd = int(pred.ndim)
         sd = sample_dim if sample_dim >= 0 else sample_dim + nd
         if not (0 <= sd < nd):
@@ -589,14 +560,6 @@ class CRPSLoss(nn.Module):
     def _recommend_energy_cdist_max_bytes(
         self, B: int, S: int, device: torch.device, out_elem_size: int
     ) -> int:
-        """Recommend a `torch.cdist` chunk budget among {32,64,128} MiB.
-
-        Heuristic goals:
-          - Keep peak memory bounded on small VRAM devices.
-          - Reduce Python-loop overhead when possible (larger chunk rows).
-          - Incorporate the actual (B,S) so the same model scales sensibly
-            across different batch/sample configurations.
-        """
         _MIB = 1024 * 1024
         candidates = (32 * _MIB, 64 * _MIB, 128 * _MIB)
 
@@ -661,7 +624,6 @@ class CRPSLoss(nn.Module):
         return int(allowed[-1])
 
     def _energy_cdist_budget_bytes(self, B: int, S: int, samples: torch.Tensor) -> int:
-        """Return the max-bytes budget used to chunk `torch.cdist` in energy mode."""
         if self.energy_cdist_max_bytes is not None:
             return int(self.energy_cdist_max_bytes)
 
@@ -1361,23 +1323,6 @@ class LinearCombinationLoss(nn.Module):
 
 
 class TiledLoss(nn.Module):
-    """Apply a base loss in tiles to reduce peak memory.
-
-    This wrapper supports masking and produces a *globally correct* reduction
-    even when the base loss returns a reduced scalar (e.g., reduction='mean').
-
-    Args:
-        base: loss module taking (pred, target) -> loss tensor (elementwise or reduced).
-        mask_mode: 'none' | 'finite' | 'neq'
-        mask_value: for 'neq' mode
-        tile_dim: dimension to tile along (default: no tiling)
-        tile_size: tile length (default: no tiling)
-        reduction: 'mean' | 'sum' | 'none' (wrapper reduction)
-        base_reduction: 'auto' | 'none' | 'mean' | 'sum'
-            - 'auto' uses `base.reduction` if present, otherwise:
-              * elementwise if base output shape matches tile shape
-              * 'mean' if base output is scalar
-    """
 
     def __init__(
         self,

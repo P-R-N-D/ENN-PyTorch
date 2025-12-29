@@ -9,10 +9,10 @@ import torch
 import torch._dynamo
 from torch import nn
 
+from ..core.casting import env_str
+from ..core.graph import torch_compile_disable
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
-from ..core.graph import torch_compile_disable
-from ..core.casting import env_str
 
 try:
     import triton
@@ -55,13 +55,6 @@ def _flatten_attn_mask4(
     L: int,
     S: int,
 ) -> tuple[torch.Tensor, int, int, int]:
-    """Normalize a mask/bias into a compact 4D (B?, H?, L?, S) tensor.
-
-    Supports broadcast on batch/head and *query length* (L? can be 1 or L).
-    Returns (mask4, batch_dim, head_dim, q_dim).
-
-    Kept at module scope to avoid per-forward nested function creation.
-    """
     if mask.dim() == 0:
         # Scalar mask: broadcast to all positions (rare; keep it simple).
         m = mask.to(device=device).view(1, 1, 1, 1)
@@ -224,7 +217,6 @@ def reshape_for_mha(
     heads: int,
     head_dim: int,
 ) -> torch.Tensor:
-    """Reshape (B, N, H*Dh) into (B, H, N, Dh) for attention kernels."""
     if x.dim() != 3:
         raise ValueError(f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}")
     return (
@@ -854,11 +846,6 @@ class MultiScaleRetention(nn.Module):
         self._decay_range = 1.0
 
     def _decay_lambda(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """Compute per-head decay λ as a length-H tensor on (device,dtype).
-
-        This replaces the previous O(L^2) coordinate/decay construction and preserves
-        the effective λ used before (decay[:, 1, 0] == gamma).
-        """
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
         heads = torch.arange(H, device=device, dtype=calc_dtype)

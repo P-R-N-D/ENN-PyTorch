@@ -26,12 +26,12 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 try:
-    from torch.distributed.run import LaunchConfig, Std, elastic_launch
+    from torch.distributed.run import LaunchConfig, elastic_launch
 except ImportError:  # pragma: no cover
-    from torch.distributed.launcher.api import LaunchConfig, Std, elastic_launch
+    from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
+from .config import ModelConfig, RuntimeConfig, coerce_model_config, runtime_config
 from .core.casting import dtype_from_name, env_bool, env_int, parse_torch_dtype
-from .core.config import ModelConfig, RuntimeConfig, coerce_model_config, runtime_config
 from .core.distributed import get_available_host, get_preferred_ip, initialize_master_addr
 from .core.graph import inference_mode
 from .core.system import (
@@ -55,19 +55,15 @@ from .runtime.io import _to_cpu, _torch_load_checkpoint, is_required
 from .runtime.main import _trim_dcp_keys, process
 
 logger = logging.getLogger(__name__)
-_PRED_ASSEMBLE_MAX_SEGMENTS = int(env_int('STNET_PRED_ASSEMBLE_MAX_SEGMENTS', default=64))
-_PRED_ASSEMBLE_TUNE = env_bool('STNET_PRED_ASSEMBLE_TUNE', default=True)
-_PRED_ASSEMBLE_TUNE_LOG_ONCE = env_bool('STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE', default=True)
-_PRED_ASSEMBLE_TUNE_MIN_PARTS = int(env_int('STNET_PRED_ASSEMBLE_TUNE_MIN_PARTS', default=4))
+_PRED_ASSEMBLE_MAX_SEGMENTS = int(env_int("STNET_PRED_ASSEMBLE_MAX_SEGMENTS", default=64))
+_PRED_ASSEMBLE_TUNE = env_bool("STNET_PRED_ASSEMBLE_TUNE", default=True)
+_PRED_ASSEMBLE_TUNE_LOG_ONCE = env_bool("STNET_PRED_ASSEMBLE_TUNE_LOG_ONCE", default=True)
+_PRED_ASSEMBLE_TUNE_MIN_PARTS = int(env_int("STNET_PRED_ASSEMBLE_TUNE_MIN_PARTS", default=4))
 _PRED_ASSEMBLE_TUNE_LOGGED = False
 _PRED_ASSEMBLE_TUNE_LOG_LOCK = threading.Lock()
 
-def _maybe_log_pred_assemble_tuning(stats, *, kind):
-    """Log tuning hints when prediction chunks are highly noncontiguous.
 
-    This is primarily useful for selecting STNET_PRED_ASSEMBLE_MAX_SEGMENTS.
-    Uses a lock to remain safe on free-threaded/no-GIL builds.
-    """
+def _maybe_log_pred_assemble_tuning(stats, *, kind):
     global _PRED_ASSEMBLE_TUNE_LOGGED
 
     if not bool(_PRED_ASSEMBLE_TUNE):
@@ -132,16 +128,8 @@ def _maybe_log_pred_assemble_tuning(stats, *, kind):
     with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
         _PRED_ASSEMBLE_TUNE_LOGGED = True
 
+
 def _strip_legacy_wrapped_keys(sd):
-    """Strip legacy wrapper prefixes from state-dict keys.
-
-    Older multi-process training runs may save keys like:
-        m.<rank>.module.<...>
-
-    We remove that prefix and return a dict of the same type, but avoid allocating
-    a new mapping unless at least one key actually changes.
-    """
-
     def _rewrite(k: str) -> str:
         # Fast path: most keys are already clean.
         if not (k.startswith("m.") and ".module." in k):
@@ -165,69 +153,79 @@ def _strip_legacy_wrapped_keys(sd):
         new_sd[_rewrite(k)] = v
     return new_sd
 
+
 def _read_checkpoint_dir_meta(p):
-    meta_path = p / 'meta.json'
+    meta_path = p / "meta.json"
     if not meta_path.exists():
         return {}
     try:
-        return json.loads(meta_path.read_text(encoding='utf-8'))
+        return json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise RuntimeError(f'Failed to parse checkpoint metadata at {str(meta_path)!r}') from exc
+        raise RuntimeError(f"Failed to parse checkpoint metadata at {str(meta_path)!r}") from exc
+
 
 def new_model(in_dim, out_shape, config):
     cfg = coerce_model_config(config)
     core = Model(in_dim, tuple((int(x) for x in out_shape)), config=cfg)
     return core
 
-def load_model(checkpoint_path, in_dim=None, out_shape=None, config=None, map_location=None, weights_only=True):
+
+def load_model(
+    checkpoint_path, in_dim=None, out_shape=None, config=None, map_location=None, weights_only=True
+):
     p = Path(checkpoint_path)
-    load_dev = torch.device(map_location) if map_location is not None else torch.device('cpu')
+    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
     if p.is_dir():
         meta = _read_checkpoint_dir_meta(p)
-        use_in_dim = int(in_dim if in_dim is not None else meta.get('in_dim') or 0)
-        out_shape_meta = out_shape if out_shape is not None else meta.get('out_shape') or ()
+        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
+        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
         use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
         user_provided_config = config is not None
-        raw_cfg = config if user_provided_config else meta.get('config')
+        raw_cfg = config if user_provided_config else meta.get("config")
         use_config = coerce_model_config(raw_cfg)
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
             use_config.device = load_dev
         if use_in_dim <= 0 or not use_out_shape:
-            raise ValueError('Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory.')
+            raise ValueError(
+                "Loading from a checkpoint directory requires in_dim and out_shape, or a valid meta.json inside the directory."
+            )
         model = new_model(use_in_dim, use_out_shape, use_config)
         opts = StateDictOptions(full_state_dict=True)
         m_sd = get_model_state_dict(model, options=opts)
-        load(state_dict={'model': m_sd}, storage_reader=FileSystemReader(str(p)))
+        load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(str(p)))
         resize_scaler_buffer(model, m_sd)
         set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         return model
     if not p.exists():
-        raise FileNotFoundError(f'Checkpoint file not found: {str(p)!r}')
+        raise FileNotFoundError(f"Checkpoint file not found: {str(p)!r}")
     suffix = p.suffix.lower()
-    if suffix == '.safetensors':
-        meta_path = p.with_suffix('.json')
+    if suffix == ".safetensors":
+        meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError('Missing sidecar JSON file for the safetensors checkpoint.')
-        meta = json.loads(meta_path.read_text(encoding='utf-8'))
-        use_in_dim = int(in_dim if in_dim is not None else meta.get('in_dim'))
-        out_shape_meta = out_shape if out_shape is not None else meta.get('out_shape') or ()
+            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
+        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
         use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
         user_provided_config = config is not None
-        use_config = coerce_model_config(config if user_provided_config else meta.get('config'))
+        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
             use_config.device = load_dev
         if use_in_dim <= 0 or not use_out_shape:
-            raise RuntimeError(f'Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}')
+            raise RuntimeError(
+                f"Invalid in_dim/out_shape metadata in {str(meta_path)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
+            )
         model = new_model(use_in_dim, use_out_shape, use_config)
-        is_required('safetensors', 'pip install safetensors')
+        is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
+
         dev = None
         if map_location is None:
-            dev = 'cpu'
+            dev = "cpu"
         elif isinstance(map_location, torch.device):
             dev = str(map_location)
         else:
@@ -237,12 +235,12 @@ def load_model(checkpoint_path, in_dim=None, out_shape=None, config=None, map_lo
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    obj = _torch_load_checkpoint(p, map_location=map_location or 'cpu', weights_only=weights_only)
+    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
     if isinstance(obj, dict):
-        meta_in_dim = obj.get('in_dim')
-        meta_out_shape = obj.get('out_shape')
-        meta_cfg = obj.get('config')
-        sd = obj['state_dict'] if 'state_dict' in obj else obj
+        meta_in_dim = obj.get("in_dim")
+        meta_out_shape = obj.get("out_shape")
+        meta_cfg = obj.get("config")
+        sd = obj["state_dict"] if "state_dict" in obj else obj
     else:
         meta_in_dim = None
         meta_out_shape = None
@@ -258,7 +256,9 @@ def load_model(checkpoint_path, in_dim=None, out_shape=None, config=None, map_lo
     elif map_location is not None and use_config.device is None:
         use_config.device = load_dev
     if use_in_dim <= 0 or not use_out_shape:
-        raise RuntimeError(f'Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}')
+        raise RuntimeError(
+            f"Invalid or missing in_dim/out_shape when loading checkpoint {str(p)!r}: in_dim={use_in_dim}, out_shape={use_out_shape}"
+        )
     model = new_model(use_in_dim, use_out_shape, use_config)
     sd = _strip_legacy_wrapped_keys(sd) if isinstance(sd, dict) else sd
     with contextlib.suppress(Exception):
@@ -266,19 +266,32 @@ def load_model(checkpoint_path, in_dim=None, out_shape=None, config=None, map_lo
     model.load_state_dict(sd, strict=False)
     return model
 
-def save_model(model, path, optimizer=None, extra=None, *args, ema_averager=None, swa_averager=None, **kwargs):
-    from .runtime.io import TorchIO, OnnxIO
+
+def save_model(
+    model: Any,
+    path: str | Path,
+    optimizer: Any = None,
+    extra: Any = None,
+    *args: Any,
+    ema_averager: Any = None,
+    swa_averager: Any = None,
+    **kwargs: Any,
+):
+    from .runtime.io import OnnxIO, TorchIO
+
     p = Path(path)
     if TorchIO.is_native_target(p):
         if args:
-            raise TypeError('Positional args are only supported for export converters; use keyword arguments for TorchIO.save().')
+            raise TypeError(
+                "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
+            )
         merged_extra = dict(extra or {})
-        if ema_averager is not None and hasattr(ema_averager, 'state_dict'):
+        if ema_averager is not None and hasattr(ema_averager, "state_dict"):
             with contextlib.suppress(Exception):
-                merged_extra['ema_averager_state'] = ema_averager.state_dict()
-        if swa_averager is not None and hasattr(swa_averager, 'state_dict'):
+                merged_extra["ema_averager_state"] = ema_averager.state_dict()
+        if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
-                merged_extra['swa_averager_state'] = swa_averager.state_dict()
+                merged_extra["swa_averager_state"] = swa_averager.state_dict()
         out = TorchIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
         return str(out)
     conv = OnnxIO.for_export(p.suffix)
@@ -287,17 +300,18 @@ def save_model(model, path, optimizer=None, extra=None, *args, ema_averager=None
     conv.save(model, p, *args, **kwargs)
     return str(p)
 
+
 @lru_cache(maxsize=1)
 def _timing_logs_enabled():
-    return env_bool(('STNET_LOG_TIMINGS', 'STNET_TIMINGS', 'STNET_DEBUG_TIMINGS'), default=False)
+    return env_bool(("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False)
+
 
 def catchtime(log, *, fn_name=None):
-
     def deco(fn):
-        name = fn_name or getattr(fn, '__name__', '<fn>')
+        name = fn_name or getattr(fn, "__name__", "<fn>")
 
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any):
             if not _timing_logs_enabled():
                 return fn(*args, **kwargs)
             t0 = time.perf_counter()
@@ -306,13 +320,17 @@ def catchtime(log, *, fn_name=None):
             finally:
                 dt = time.perf_counter() - t0
                 with contextlib.suppress(Exception):
-                    log.info('%s took %.3fs', name, float(dt))
+                    log.info("%s took %.3fs", name, float(dt))
+
         return wrapper
+
     return deco
+
 
 def _reset_process_group():
     try:
         import torch.distributed as _dist
+
         if _dist.is_available() and _dist.is_initialized():
             with contextlib.suppress(Exception):
                 _dist.barrier()
@@ -321,18 +339,22 @@ def _reset_process_group():
     except Exception:
         pass
 
+
 def _clear_device_caches():
     with contextlib.suppress(Exception):
         import gc
+
         gc.collect()
     with contextlib.suppress(Exception):
         from .core.system import empty_device_cache, get_device
+
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
     # CUDA IPC cache can still benefit from explicit collection in some workloads.
     with contextlib.suppress(Exception):
         from .core.system import accel_ipc_collect
 
         accel_ipc_collect()
+
 
 def _ensure_seed(seed):
     if seed is None:
@@ -341,6 +363,7 @@ def _ensure_seed(seed):
         return int(seed)
     except (TypeError, ValueError):
         return None
+
 
 def _seed_everything(seed_value):
     if seed_value is None:
@@ -362,6 +385,7 @@ def _seed_everything(seed_value):
     except (TypeError, ValueError):
         pass
 
+
 def _maybe_save_model_checkpoint(model, out_dir, *, save_dcp, save_pt, overwrite=True):
     m_sd = None
     if not (save_dcp or save_pt):
@@ -371,19 +395,24 @@ def _maybe_save_model_checkpoint(model, out_dir, *, save_dcp, save_pt, overwrite
         opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
         m_sd = get_model_state_dict(model, options=opts)
     if save_dcp and m_sd is not None:
-        save(state_dict={'model': m_sd}, storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)))
+        save(
+            state_dict={"model": m_sd},
+            storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)),
+        )
     if save_pt:
         if m_sd is not None:
             pt_state = dict(m_sd)
             _trim_dcp_keys(pt_state)
         else:
             pt_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-        torch.save(pt_state, os.path.join(out_dir, 'model.pt'))
+        torch.save(pt_state, os.path.join(out_dir, "model.pt"))
     return m_sd
 
+
 def read_json(path):
-    with open(path, 'r', encoding='utf-8-sig') as f:
+    with open(path, "r", encoding="utf-8-sig") as f:
         return json.load(f)
+
 
 def _is_contiguous_row_range(rows):
     rows = rows.reshape(-1)
@@ -400,26 +429,35 @@ def _is_contiguous_row_range(rows):
         return (False, 0, 0)
     return (True, start, start + n)
 
+
 def _open_pred_memmap(mmt_path):
     meta_path = BatchIO.mmt_meta_path(mmt_path)
     if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
         return None
     try:
-        with open(meta_path, 'r', encoding='utf-8') as f:
+        with open(meta_path, "r", encoding="utf-8") as f:
             meta = json.load(f) or {}
-        dtype = parse_torch_dtype(meta.get('dtype')) or torch.float32
-        shape = tuple((int(x) for x in meta.get('shape') or ()))
+        dtype = parse_torch_dtype(meta.get("dtype")) or torch.float32
+        shape = tuple((int(x) for x in meta.get("shape") or ()))
         if not isinstance(dtype, torch.dtype) or not shape:
             return None
-        return MemoryMappedTensor.from_filename(filename=mmt_path, dtype=dtype, shape=torch.Size(shape))
+        return MemoryMappedTensor.from_filename(
+            filename=mmt_path, dtype=dtype, shape=torch.Size(shape)
+        )
     except Exception:
         return None
 
+
 def _iter_datasets(data):
     from collections.abc import Mapping as _Mapping
+
     if isinstance(data, TensorDictBase):
-        return ([('0', data)], None)
-    elif isinstance(data, _Mapping) and data and all((isinstance(v, _Mapping) for v in data.values())):
+        return ([("0", data)], None)
+    elif (
+        isinstance(data, _Mapping)
+        and data
+        and all((isinstance(v, _Mapping) for v in data.values()))
+    ):
         man = {}
         items = []
         for k, d in data.items():
@@ -435,44 +473,86 @@ def _iter_datasets(data):
             items2.append((key, d))
             man2.append(key)
         return (items2, man2)
-    return ([('0', data)], None)
+    return ([("0", data)], None)
+
 
 def _check_shapes(first_in_dim, in_dim, first_label_shape, lshape):
     if first_in_dim is None:
         return (int(in_dim), tuple(lshape))
     if int(in_dim) != int(first_in_dim) or tuple(lshape) != tuple(first_label_shape):
-        raise RuntimeError(f'Shape mismatch across datasets: expected X_dim={first_in_dim}, y_shape={first_label_shape}, got X_dim={in_dim}, y_shape={lshape}')
+        raise RuntimeError(
+            f"Shape mismatch across datasets: expected X_dim={first_in_dim}, y_shape={first_label_shape}, got X_dim={in_dim}, y_shape={lshape}"
+        )
     return (first_in_dim, first_label_shape)
+
 
 def _mat_one(d, out_dir, *, ds, val_frac, seed_value, underflow_action, shuffle):
     from collections.abc import Mapping as _Mapping
+
     if isinstance(d, TensorDictBase):
         td = d
         if td.batch_size is None or len(td.batch_size) == 0:
-            raise ValueError('TensorDict input to train() must have a batch dimension.')
+            raise ValueError("TensorDict input to train() must have a batch dimension.")
         count = int(td.batch_size[0])
         if count <= 0:
-            raise ValueError('Empty TensorDict provided to train().')
-        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=out_dir, count=count, get_batch=lambda s, e: td[s:e], get_by_indices=lambda idx: td[idx], val_frac=float(val_frac), seed_value=seed_value, underflow_action=underflow_action, shuffle=bool(shuffle), allow_missing_labels=False, chunk_size=0)
+            raise ValueError("Empty TensorDict provided to train().")
+        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(
+            ds=ds,
+            out_dir=out_dir,
+            count=count,
+            get_batch=lambda s, e: td[s:e],
+            get_by_indices=lambda idx: td[idx],
+            val_frac=float(val_frac),
+            seed_value=seed_value,
+            underflow_action=underflow_action,
+            shuffle=bool(shuffle),
+            allow_missing_labels=False,
+            chunk_size=0,
+        )
         return (int(in_dim), tuple(label_shape), int(count))
-    if isinstance(d, _Mapping) and d and all((not isinstance(v, _Mapping) for v in d.values())) and (not BatchIO.is_feature_label_batch_mapping(d)):
+    if (
+        isinstance(d, _Mapping)
+        and d
+        and all((not isinstance(v, _Mapping) for v in d.values()))
+        and (not BatchIO.is_feature_label_batch_mapping(d))
+    ):
         count, _get_batch = BatchIO.key_index_mapping_getters(d)
         if count <= 0:
-            raise ValueError('Empty dataset provided to train().')
-        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(ds=ds, out_dir=out_dir, count=count, get_batch=_get_batch, get_by_indices=None, val_frac=float(val_frac), seed_value=seed_value, underflow_action=underflow_action, shuffle=False, allow_missing_labels=False, chunk_size=0)
+            raise ValueError("Empty dataset provided to train().")
+        in_dim, label_shape = BatchIO.write_memmap_streaming_two_pass(
+            ds=ds,
+            out_dir=out_dir,
+            count=count,
+            get_batch=_get_batch,
+            get_by_indices=None,
+            val_frac=float(val_frac),
+            seed_value=seed_value,
+            underflow_action=underflow_action,
+            shuffle=False,
+            allow_missing_labels=False,
+            chunk_size=0,
+        )
         return (int(in_dim), tuple(label_shape), int(count))
     fx, lb, _, lshape = ds.preprocess(d, return_keys=False)
     if not fx.is_contiguous():
         fx = fx.contiguous()
     if lb is None:
-        raise ValueError('train() requires labels')
+        raise ValueError("train() requires labels")
     count = int(fx.shape[0])
     if count <= 0:
-        raise ValueError('Empty dataset provided to train().')
+        raise ValueError("Empty dataset provided to train().")
     in_dim = int(fx.reshape(count, -1).shape[1])
-    BatchIO.preload_memmap({'features': fx, 'labels': lb}, memmap_dir=out_dir, val_frac=float(val_frac), shuffle=bool(shuffle), seed=seed_value, underflow_action=underflow_action)
+    BatchIO.preload_memmap(
+        {"features": fx, "labels": lb},
+        memmap_dir=out_dir,
+        val_frac=float(val_frac),
+        shuffle=bool(shuffle),
+        seed=seed_value,
+        underflow_action=underflow_action,
+    )
     del fx, lb
     return (int(in_dim), tuple(lshape), int(count))
+
 
 def _aggregate_run_stats(recs):
     if not isinstance(recs, list) or not recs:
@@ -482,24 +562,24 @@ def _aggregate_run_stats(recs):
     sum_x2 = 0.0
     sum_y = 0.0
     sum_y2 = 0.0
-    x_min = float('inf')
-    x_max = float('-inf')
-    y_min = float('inf')
-    y_max = float('-inf')
+    x_min = float("inf")
+    x_max = float("-inf")
+    y_min = float("inf")
+    y_max = float("-inf")
     for r in recs:
         if not isinstance(r, Mapping):
             continue
-        bs = int(r.get('batch_size', 0))
+        bs = int(r.get("batch_size", 0))
         if bs <= 0:
             continue
-        bxm = float(r.get('batch_x_mean', 0.0))
-        bxv = float(r.get('batch_x_var', 0.0))
-        bym = float(r.get('batch_y_mean', 0.0))
-        byv = float(r.get('batch_y_var', 0.0))
-        bxmin = float(r.get('batch_x_min', float('inf')))
-        bxmax = float(r.get('batch_x_max', float('-inf')))
-        bymin = float(r.get('batch_y_min', float('inf')))
-        bymax = float(r.get('batch_y_max', float('-inf')))
+        bxm = float(r.get("batch_x_mean", 0.0))
+        bxv = float(r.get("batch_x_var", 0.0))
+        bym = float(r.get("batch_y_mean", 0.0))
+        byv = float(r.get("batch_y_var", 0.0))
+        bxmin = float(r.get("batch_x_min", float("inf")))
+        bxmax = float(r.get("batch_x_max", float("-inf")))
+        bymin = float(r.get("batch_y_min", float("inf")))
+        bymax = float(r.get("batch_y_max", float("-inf")))
         total_bs += bs
         sum_x += bxm * bs
         sum_x2 += (bxv + bxm * bxm) * bs
@@ -515,7 +595,18 @@ def _aggregate_run_stats(recs):
     mean_y = sum_y / total_bs
     var_x = max(sum_x2 / total_bs - mean_x * mean_x, 0.0)
     var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
-    return {'processed_n': float(total_bs), 'sampled_x_mean': mean_x, 'sampled_x_var': var_x, 'sampled_x_min': x_min, 'sampled_x_max': x_max, 'sampled_y_mean': mean_y, 'sampled_y_var': var_y, 'sampled_y_min': y_min, 'sampled_y_max': y_max}
+    return {
+        "processed_n": float(total_bs),
+        "sampled_x_mean": mean_x,
+        "sampled_x_var": var_x,
+        "sampled_x_min": x_min,
+        "sampled_x_max": x_max,
+        "sampled_y_mean": mean_y,
+        "sampled_y_var": var_y,
+        "sampled_y_min": y_min,
+        "sampled_y_max": y_max,
+    }
+
 
 def _update_cum_stats(prev, n_prev, inc, n_inc):
     if inc is None or n_inc <= 0:
@@ -523,23 +614,23 @@ def _update_cum_stats(prev, n_prev, inc, n_inc):
     if prev is None or n_prev <= 0:
         out = {}
         for key, val in inc.items():
-            if key.startswith('sampled_'):
-                out['reduced_' + key[len('sampled_'):]] = float(val)
+            if key.startswith("sampled_"):
+                out["reduced_" + key[len("sampled_") :]] = float(val)
         return out
     out = {}
-    for axis in ('x', 'y'):
-        m_key = f'{axis}_mean'
-        v_key = f'{axis}_var'
-        lo_key = f'{axis}_min'
-        hi_key = f'{axis}_max'
-        m_prev = float(prev.get('reduced_' + m_key, 0.0))
-        v_prev = float(prev.get('reduced_' + v_key, 0.0))
-        lo_prev = float(prev.get('reduced_' + lo_key, float('inf')))
-        hi_prev = float(prev.get('reduced_' + hi_key, float('-inf')))
-        m_inc = float(inc.get(f'sampled_{m_key}', 0.0))
-        v_inc = float(inc.get(f'sampled_{v_key}', 0.0))
-        lo_inc = float(inc.get(f'sampled_{lo_key}', float('inf')))
-        hi_inc = float(inc.get(f'sampled_{hi_key}', float('-inf')))
+    for axis in ("x", "y"):
+        m_key = f"{axis}_mean"
+        v_key = f"{axis}_var"
+        lo_key = f"{axis}_min"
+        hi_key = f"{axis}_max"
+        m_prev = float(prev.get("reduced_" + m_key, 0.0))
+        v_prev = float(prev.get("reduced_" + v_key, 0.0))
+        lo_prev = float(prev.get("reduced_" + lo_key, float("inf")))
+        hi_prev = float(prev.get("reduced_" + hi_key, float("-inf")))
+        m_inc = float(inc.get(f"sampled_{m_key}", 0.0))
+        v_inc = float(inc.get(f"sampled_{v_key}", 0.0))
+        lo_inc = float(inc.get(f"sampled_{lo_key}", float("inf")))
+        hi_inc = float(inc.get(f"sampled_{hi_key}", float("-inf")))
         sum_prev = m_prev * n_prev
         sum2_prev = (v_prev + m_prev * m_prev) * n_prev
         sum_inc = m_inc * n_inc
@@ -551,13 +642,36 @@ def _update_cum_stats(prev, n_prev, inc, n_inc):
         v_new = max(sum2_new / n_new - m_new * m_new, 0.0)
         lo_new = min(lo_prev, lo_inc)
         hi_new = max(hi_prev, hi_inc)
-        out['reduced_' + m_key] = m_new
-        out['reduced_' + v_key] = v_new
-        out['reduced_' + lo_key] = lo_new
-        out['reduced_' + hi_key] = hi_new
+        out["reduced_" + m_key] = m_new
+        out["reduced_" + v_key] = v_new
+        out["reduced_" + lo_key] = lo_new
+        out["reduced_" + hi_key] = hi_new
     return out
 
-def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministic=False, base_lr=0.001, weight_decay=0.0001, warmup_ratio=0.0, eta_min=0.0, run_id='torch', seed=42, max_nodes=1, rdzv_backend='c10d', rdzv_endpoint=None, loss_tile_dim=None, loss_tile_size=None, loss_mask_mode='none', loss_mask_value=None, **kwargs):
+
+def train(
+    model: Any,
+    data: Any,
+    *args: Any,
+    epochs: int = 5,
+    val_frac: float = 0.1,
+    shuffle: bool = True,
+    deterministic: bool = False,
+    base_lr: float = 0.001,
+    weight_decay: float = 0.0001,
+    warmup_ratio: float = 0.0,
+    eta_min: float = 0.0,
+    run_id: str = "torch",
+    seed: int = 42,
+    max_nodes: int = 1,
+    rdzv_backend: str = "c10d",
+    rdzv_endpoint: str | None = None,
+    loss_tile_dim: Any = None,
+    loss_tile_size: Any = None,
+    loss_mask_mode: str = "none",
+    loss_mask_value: Any = None,
+    **kwargs: Any,
+):
     _reset_process_group()
     try:
         val_frac = float(val_frac)
@@ -566,13 +680,17 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
         val_frac = 0.1
     seed_value = _ensure_seed(seed)
     _seed_everything(seed_value)
-    underflow_action = normalize_underflow_action(kwargs.pop('underflow_action', None), default=default_underflow_action())
-    ds_meta = Dataset.for_device('cpu', feature_dtype=torch.float64, label_float_dtype=torch.float64)
+    underflow_action = normalize_underflow_action(
+        kwargs.pop("underflow_action", None), default=default_underflow_action()
+    )
+    ds_meta = Dataset.for_device(
+        "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
+    )
     ds_meta.underflow_action = underflow_action
     initialize_python_path()
     mp.allow_connection_pickling()
     set_multiprocessing_env()
-    memmap_dir = new_dir('memmap_ds')
+    memmap_dir = new_dir("memmap_ds")
     num_samples_dataset = 0
     first_in_dim = None
     label_shape = ()
@@ -586,24 +704,36 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
             sub = memmap_dir if not multi else os.path.join(memmap_dir, key)
             if multi:
                 os.makedirs(sub, exist_ok=True)
-            in_dim, lshape, n = _mat_one(d, sub, ds=ds_meta, val_frac=float(val_frac), seed_value=seed_value, underflow_action=underflow_action, shuffle=bool(shuffle))
+            in_dim, lshape, n = _mat_one(
+                d,
+                sub,
+                ds=ds_meta,
+                val_frac=float(val_frac),
+                seed_value=seed_value,
+                underflow_action=underflow_action,
+                shuffle=bool(shuffle),
+            )
             first_in_dim, label_shape = _check_shapes(first_in_dim, in_dim, label_shape, lshape)
             num_samples_dataset += int(n)
         if first_in_dim is None or not label_shape:
-            raise RuntimeError('no training data provided to train()')
+            raise RuntimeError("no training data provided to train()")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            BatchIO.atomic_write_json(os.path.join(memmap_dir, 'multinode.json'), payload, indent=None)
-        ckpt_dir = new_dir('ckpt_dcp')
-        save_dcp = env_bool('STNET_SAVE_DCP', True)
-        save_pt = env_bool('STNET_SAVE_MODEL_PT', True)
+            BatchIO.atomic_write_json(
+                os.path.join(memmap_dir, "multinode.json"), payload, indent=None
+            )
+        ckpt_dir = new_dir("ckpt_dcp")
+        save_dcp = env_bool("STNET_SAVE_DCP", True)
+        save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
         if not (save_dcp or save_pt):
             save_pt = True
         m_sd = None
         if save_dcp or save_pt:
-            init_dir = new_dir('init_dcp')
-            m_sd = _maybe_save_model_checkpoint(model, init_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True)
-        default_rdzv_host = get_preferred_ip(allow_loopback=True) or '127.0.0.1'
+            init_dir = new_dir("init_dcp")
+            m_sd = _maybe_save_model_checkpoint(
+                model, init_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True
+            )
+        default_rdzv_host = get_preferred_ip(allow_loopback=True) or "127.0.0.1"
         resolved_rdzv = rdzv_endpoint if rdzv_endpoint else default_rdzv_host
         rdzv_endpoint = get_available_host(resolved_rdzv)
         master_addr, _master_port = initialize_master_addr(rdzv_endpoint)
@@ -612,16 +742,16 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
         nprocs = int(_wp.nproc_per_node)
         cfg_obj = None
         with contextlib.suppress(Exception):
-            cfg_obj = getattr(model, 'config', None)
+            cfg_obj = getattr(model, "config", None)
         if cfg_obj is None:
-            cfg_obj = getattr(model, '__stnet_instance_config__', None)
+            cfg_obj = getattr(model, "__stnet_instance_config__", None)
         if cfg_obj is None:
             with contextlib.suppress(Exception):
                 for submodule in model.modules():
                     with contextlib.suppress(Exception):
-                        cfg_obj = getattr(submodule, 'config', None)
+                        cfg_obj = getattr(submodule, "config", None)
                     if cfg_obj is None:
-                        cfg_obj = getattr(submodule, '__stnet_instance_config__', None)
+                        cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
                     if cfg_obj is not None:
                         break
         if isinstance(cfg_obj, (ModelConfig, dict)):
@@ -629,23 +759,54 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
         else:
             cfg_model = ModelConfig()
         cfg_dict = cfg_model.to_dict()
-        lc = LaunchConfig(min_nodes=1, max_nodes=max_nodes, nproc_per_node=nprocs, rdzv_backend=rdzv_backend, rdzv_endpoint=rdzv_endpoint, run_id=run_id, max_restarts=0, monitor_interval=5, start_method=optimal_start_method(), local_addr=master_addr)
-        base = dict(sources={'kind': 'memmap', 'path': memmap_dir}, ckpt_dir=ckpt_dir, in_dim=int(first_in_dim), out_shape=tuple(label_shape), cfg_dict=cfg_dict)
+        lc = LaunchConfig(
+            min_nodes=1,
+            max_nodes=max_nodes,
+            nproc_per_node=nprocs,
+            rdzv_backend=rdzv_backend,
+            rdzv_endpoint=rdzv_endpoint,
+            run_id=run_id,
+            max_restarts=0,
+            monitor_interval=5,
+            start_method=optimal_start_method(),
+            local_addr=master_addr,
+        )
+        base = dict(
+            sources={"kind": "memmap", "path": memmap_dir},
+            ckpt_dir=ckpt_dir,
+            in_dim=int(first_in_dim),
+            out_shape=tuple(label_shape),
+            cfg_dict=cfg_dict,
+        )
         if init_dir is not None:
-            base['init_ckpt_dir'] = init_dir
-        default_kwargs = {'epochs': epochs, 'val_frac': val_frac, 'shuffle': shuffle, 'deterministic': deterministic, 'base_lr': base_lr, 'weight_decay': weight_decay, 'warmup_ratio': warmup_ratio, 'eta_min': eta_min, 'seed': seed, 'loss_tile_dim': loss_tile_dim, 'loss_tile_size': loss_tile_size, 'loss_mask_mode': loss_mask_mode, 'loss_mask_value': loss_mask_value}
-        positional_names = RuntimeConfig.TRAIN_POS_ORDER[:len(args)]
+            base["init_ckpt_dir"] = init_dir
+        default_kwargs = {
+            "epochs": epochs,
+            "val_frac": val_frac,
+            "shuffle": shuffle,
+            "deterministic": deterministic,
+            "base_lr": base_lr,
+            "weight_decay": weight_decay,
+            "warmup_ratio": warmup_ratio,
+            "eta_min": eta_min,
+            "seed": seed,
+            "loss_tile_dim": loss_tile_dim,
+            "loss_tile_size": loss_tile_size,
+            "loss_mask_mode": loss_mask_mode,
+            "loss_mask_value": loss_mask_value,
+        }
+        positional_names = RuntimeConfig.TRAIN_POS_ORDER[: len(args)]
         for key in list(default_kwargs):
             if key in positional_names or key in kwargs:
                 default_kwargs.pop(key, None)
-        ops = runtime_config('train', base, *args, **default_kwargs, **kwargs)
+        ops = runtime_config("train", base, *args, **default_kwargs, **kwargs)
         with contextlib.suppress(Exception):
-            model.to('cpu')
+            model.to("cpu")
         _clear_device_caches()
         elastic_launch(lc, process)(ops)
-        fallback = os.path.join(ckpt_dir, 'model.pt')
+        fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
-            cpu_state = _torch_load_checkpoint(fallback, map_location='cpu', weights_only=True)
+            cpu_state = _torch_load_checkpoint(fallback, map_location="cpu", weights_only=True)
             cpu_state = _to_cpu(cpu_state)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
@@ -653,49 +814,66 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
             opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
             m_sd = get_model_state_dict(model, options=opts)
             m_sd = _trim_dcp_keys(m_sd)
-            load(state_dict={'model': m_sd}, storage_reader=FileSystemReader(ckpt_dir))
+            load(state_dict={"model": m_sd}, storage_reader=FileSystemReader(ckpt_dir))
             resize_scaler_buffer(model, m_sd)
             set_model_state_dict(model, m_sd, options=StateDictOptions(strict=False))
         try:
             if ckpt_dir is not None:
-                history_path = os.path.join(ckpt_dir, 'history.json')
+                history_path = os.path.join(ckpt_dir, "history.json")
                 if os.path.isfile(history_path):
-                    with open(history_path, 'r', encoding='utf-8') as f:
+                    with open(history_path, "r", encoding="utf-8") as f:
                         raw = json.load(f)
                     if isinstance(raw, dict):
-                        records = raw.get('records', []) or []
-                        meta = raw.get('meta', {}) or {}
+                        records = raw.get("records", []) or []
+                        meta = raw.get("meta", {}) or {}
                     else:
                         records = raw if isinstance(raw, list) else []
                         meta = {}
-                    logger = getattr(model, 'logger', None)
+                    logger = getattr(model, "logger", None)
                     if isinstance(meta, dict):
-                        setattr(model, '_train_history_meta', dict(meta))
-                    run_stats = _aggregate_run_stats(records) if isinstance(records, list) and records else None
-                    prev_total = int(getattr(model, '_history_total_samples', 0))
-                    inc_samples = int(run_stats.get('processed_n', 0)) if run_stats else int(num_samples_dataset)
+                        setattr(model, "_train_history_meta", dict(meta))
+                    run_stats = (
+                        _aggregate_run_stats(records)
+                        if isinstance(records, list) and records
+                        else None
+                    )
+                    prev_total = int(getattr(model, "_history_total_samples", 0))
+                    inc_samples = (
+                        int(run_stats.get("processed_n", 0))
+                        if run_stats
+                        else int(num_samples_dataset)
+                    )
                     if inc_samples <= 0:
                         inc_samples = int(num_samples_dataset)
                     new_total = prev_total + inc_samples
-                    prev_cum = getattr(model, '_history_cum_stats', None)
+                    prev_cum = getattr(model, "_history_cum_stats", None)
                     cum_stats = _update_cum_stats(prev_cum, prev_total, run_stats, inc_samples)
-                    setattr(model, '_history_total_samples', new_total)
-                    setattr(model, '_history_dataset_n', int(num_samples_dataset))
+                    setattr(model, "_history_total_samples", new_total)
+                    setattr(model, "_history_dataset_n", int(num_samples_dataset))
                     if cum_stats is not None:
-                        setattr(model, '_history_cum_stats', cum_stats)
-                    run_hist_prev = getattr(model, '_train_history', None)
+                        setattr(model, "_history_cum_stats", cum_stats)
+                    run_hist_prev = getattr(model, "_train_history", None)
                     run_index = len(run_hist_prev) if isinstance(run_hist_prev, list) else 0
-                    run_record = {'run_index': run_index, 'dataset_n': int(num_samples_dataset), 'processed_n': int(inc_samples), 'reduced_n': new_total}
+                    run_record = {
+                        "run_index": run_index,
+                        "dataset_n": int(num_samples_dataset),
+                        "processed_n": int(inc_samples),
+                        "reduced_n": new_total,
+                    }
                     if run_stats is not None:
                         for k, v in run_stats.items():
-                            if k != 'processed_n':
+                            if k != "processed_n":
                                 run_record[k] = v
                     if cum_stats is not None:
                         run_record.update(cum_stats)
                     if isinstance(meta, dict) and meta:
-                        run_record['env'] = dict(meta)
-                    new_run_hist = run_hist_prev + [run_record] if isinstance(run_hist_prev, list) else [run_record]
-                    setattr(model, '_train_history', new_run_hist)
+                        run_record["env"] = dict(meta)
+                    new_run_hist = (
+                        run_hist_prev + [run_record]
+                        if isinstance(run_hist_prev, list)
+                        else [run_record]
+                    )
+                    setattr(model, "_train_history", new_run_hist)
                     if isinstance(logger, Recorder):
                         logger._records = new_run_hist
         except Exception:
@@ -708,54 +886,73 @@ def train(model, data, *args, epochs=5, val_frac=0.1, shuffle=True, deterministi
         if init_dir is not None:
             shutil.rmtree(init_dir, ignore_errors=True)
 
+
 def _normalize_path(path):
     if path is None:
         return None
     p = str(path).strip()
     if not p:
         return None
-    if p.lower() in ('none', 'null', 'nil'):
+    if p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))
 
+
 def _torch_dtype_to_numpy(dtype):
     import numpy as _np
-    np_bfloat16 = getattr(_np, 'bfloat16', _np.float32)
-    mapping = {torch.float16: _np.float16, torch.float32: _np.float32, torch.float64: _np.float64, torch.bfloat16: np_bfloat16, torch.int8: _np.int8, torch.uint8: _np.uint8, torch.int16: _np.int16, torch.int32: _np.int32, torch.int64: _np.int64, torch.bool: _np.bool_}
+
+    np_bfloat16 = getattr(_np, "bfloat16", _np.float32)
+    mapping = {
+        torch.float16: _np.float16,
+        torch.float32: _np.float32,
+        torch.float64: _np.float64,
+        torch.bfloat16: np_bfloat16,
+        torch.int8: _np.int8,
+        torch.uint8: _np.uint8,
+        torch.int16: _np.int16,
+        torch.int32: _np.int32,
+        torch.int64: _np.int64,
+        torch.bool: _np.bool_,
+    }
     return mapping.get(dtype, _np.float32)
 
+
 def _read_memmap_meta(memmap_dir):
-    meta_path = os.path.join(memmap_dir, 'meta.json')
+    meta_path = os.path.join(memmap_dir, "meta.json")
     if not os.path.isfile(meta_path):
-        raise FileNotFoundError(f'memmap meta.json not found: {meta_path}')
+        raise FileNotFoundError(f"memmap meta.json not found: {meta_path}")
     meta = read_json(meta_path)
     if not isinstance(meta, dict):
-        raise ValueError(f'memmap meta.json malformed: {meta_path}')
+        raise ValueError(f"memmap meta.json malformed: {meta_path}")
     return meta
+
 
 def _open_features_mmt(memmap_dir):
     if MemoryMappedTensor is None:
-        raise ImportError("tensordict is required for MemoryMappedTensor-backed inference outputs. Please install 'tensordict'.")
+        raise ImportError(
+            "tensordict is required for MemoryMappedTensor-backed inference outputs. Please install 'tensordict'."
+        )
     meta = _read_memmap_meta(memmap_dir)
-    N = int(meta.get('N', 0))
+    N = int(meta.get("N", 0))
     if N <= 0:
-        raise ValueError(f'memmap meta.json under {memmap_dir} has non-positive N={N}')
-    feat_rel = str(meta.get('features_path', 'features.mmt'))
+        raise ValueError(f"memmap meta.json under {memmap_dir} has non-positive N={N}")
+    feat_rel = str(meta.get("features_path", "features.mmt"))
     feat_path = os.path.join(memmap_dir, feat_rel)
-    fdim = int(meta.get('feature_dim', 0))
+    fdim = int(meta.get("feature_dim", 0))
     if fdim <= 0:
-        raise ValueError(f'memmap meta.json under {memmap_dir} has non-positive feature_dim={fdim}')
-    f_dtype = dtype_from_name(meta.get('features_dtype', 'float64'), torch.float64)
+        raise ValueError(f"memmap meta.json under {memmap_dir} has non-positive feature_dim={fdim}")
+    f_dtype = dtype_from_name(meta.get("features_dtype", "float64"), torch.float64)
     return MemoryMappedTensor.from_filename(feat_path, dtype=f_dtype, shape=torch.Size([N, fdim]))
+
 
 def _is_writable_file_path(path):
     try:
         path = os.path.abspath(os.path.expanduser(path))
         parent = os.path.dirname(path) or os.getcwd()
         os.makedirs(parent, exist_ok=True)
-        test_path = path + '.__stnet_write_test__'
-        with open(test_path, 'wb') as f:
-            f.write(b'0')
+        test_path = path + ".__stnet_write_test__"
+        with open(test_path, "wb") as f:
+            f.write(b"0")
         os.remove(test_path)
         return True
     except Exception:
@@ -763,60 +960,49 @@ def _is_writable_file_path(path):
 
 
 def _normalize_prediction_output(output):
-    """Normalize the output mode for predict/get_prediction.
-
-    Accepted values:
-      - 'eager', 'memory' -> return a TensorDict with materialized torch.Tensor buffers.
-      - 'lazy', 'file'    -> return a PersistentTensorDict backed by an on-disk HDF5 file.
-
-    Internally we collapse these into two effective modes: {'memory', 'file'}.
-    """
     if output is None:
-        return 'memory'
+        return "memory"
     out = str(output).strip().lower()
     aliases = {
-        'ram': 'memory',
-        'mem': 'memory',
-        'in_memory': 'memory',
-        'inmemory': 'memory',
-        'persist': 'file',
-        'persistent': 'file',
-        'h5': 'file',
-        'hdf5': 'file',
+        "ram": "memory",
+        "mem": "memory",
+        "in_memory": "memory",
+        "inmemory": "memory",
+        "persist": "file",
+        "persistent": "file",
+        "h5": "file",
+        "hdf5": "file",
     }
     out = aliases.get(out, out)
-    valid = ('eager', 'memory', 'lazy', 'file')
+    valid = ("eager", "memory", "lazy", "file")
     if out not in valid:
-        raise ValueError(f"predict/get_prediction: invalid output={output!r} (expected one of {valid})")
-    return 'memory' if out in ('eager', 'memory') else 'file'
+        raise ValueError(
+            f"predict/get_prediction: invalid output={output!r} (expected one of {valid})"
+        )
+    return "memory" if out in ("eager", "memory") else "file"
 
 
 def _normalize_prediction_overwrite(overwrite):
-    """Normalize overwrite policy for file outputs.
-
-    Policies:
-      - 'error'   : refuse to overwrite an existing destination.
-      - 'replace' : atomically replace destination if it exists.
-      - 'resume'  : if destination exists, skip writing and open it.
-    """
     if overwrite is None:
-        return 'error'
+        return "error"
     ow = str(overwrite).strip().lower()
     aliases = {
-        'err': 'error',
-        'raise': 'error',
-        'fail': 'error',
-        'overwrite': 'replace',
-        'over': 'replace',
-        'clobber': 'replace',
-        'skip': 'resume',
-        'reuse': 'resume',
-        'keep': 'resume',
+        "err": "error",
+        "raise": "error",
+        "fail": "error",
+        "overwrite": "replace",
+        "over": "replace",
+        "clobber": "replace",
+        "skip": "resume",
+        "reuse": "resume",
+        "keep": "resume",
     }
     ow = aliases.get(ow, ow)
-    valid = ('error', 'replace', 'resume')
+    valid = ("error", "replace", "resume")
     if ow not in valid:
-        raise ValueError(f"predict/get_prediction: invalid overwrite={overwrite!r} (expected one of {valid})")
+        raise ValueError(
+            f"predict/get_prediction: invalid overwrite={overwrite!r} (expected one of {valid})"
+        )
     return ow
 
 
@@ -829,30 +1015,28 @@ def _resolve_prediction_output_path(path, *, run_id):
     if p.endswith(os.sep) or os.path.isdir(p):
         return None
     _root, ext = os.path.splitext(p)
-    if str(ext).lower() not in ('.h5', '.hdf5'):
+    if str(ext).lower() not in (".h5", ".hdf5"):
         return None
-    os.makedirs(os.path.dirname(p) or '.', exist_ok=True)
+    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
     return p
 
 
 def _copy_mmt_to_cpu_tensor(mmt, *, count=None, chunk_size=8192):
-    """Materialize a MemoryMappedTensor (or tensor-like) into a CPU torch.Tensor.
-
-    This copies in chunks to keep peak memory bounded. The returned tensor owns
-    its storage (no views into the underlying mmap), which is important for
-    pipeline boundary safety (e.g., Fuser -> Enhancer).
-    """
     if mmt is None:
-        raise ValueError('copy_mmt_to_cpu_tensor: mmt must not be None')
-    n = int(count) if count is not None else int(getattr(mmt, 'shape', [0])[0] or 0)
+        raise ValueError("copy_mmt_to_cpu_tensor: mmt must not be None")
+    n = int(count) if count is not None else int(getattr(mmt, "shape", [0])[0] or 0)
     if n < 0:
-        raise ValueError(f'copy_mmt_to_cpu_tensor: invalid count={count!r}')
-    shape = tuple(int(x) for x in getattr(mmt, 'shape', (n,)))
+        raise ValueError(f"copy_mmt_to_cpu_tensor: invalid count={count!r}")
+    shape = tuple(int(x) for x in getattr(mmt, "shape", (n,)))
     if not shape:
-        raise ValueError('copy_mmt_to_cpu_tensor: failed to infer shape')
+        raise ValueError("copy_mmt_to_cpu_tensor: failed to infer shape")
     out_shape = (n,) + tuple(shape[1:])
-    dtype = getattr(mmt, 'dtype', None)
-    out = torch.empty(out_shape, dtype=dtype, device='cpu') if dtype is not None else torch.empty(out_shape, device='cpu')
+    dtype = getattr(mmt, "dtype", None)
+    out = (
+        torch.empty(out_shape, dtype=dtype, device="cpu")
+        if dtype is not None
+        else torch.empty(out_shape, device="cpu")
+    )
 
     step = max(1, int(chunk_size))
     for s in range(0, n, step):
@@ -861,7 +1045,7 @@ def _copy_mmt_to_cpu_tensor(mmt, *, count=None, chunk_size=8192):
         if not bool(torch.is_tensor(chunk)):
             chunk = torch.as_tensor(chunk)
         # Keep a stable CPU copy for the output buffer.
-        chunk_cpu = chunk.detach().to(device='cpu', dtype=out.dtype)
+        chunk_cpu = chunk.detach().to(device="cpu", dtype=out.dtype)
         out[s:e].copy_(chunk_cpu)
     return out
 
@@ -871,87 +1055,85 @@ def _read_predictions_h5_to_tensordict(path):
     try:
         import h5py
     except Exception as e:
-        raise ImportError('h5py is required to read predictions from .h5') from e
+        raise ImportError("h5py is required to read predictions from .h5") from e
 
     p = _normalize_path(path)
     if p is None or not os.path.isfile(p):
-        raise FileNotFoundError(f'predictions .h5 not found: {path!r}')
+        raise FileNotFoundError(f"predictions .h5 not found: {path!r}")
 
-    with h5py.File(p, 'r') as f:
-        if 'X' not in f or 'Y' not in f:
-            raise KeyError(f'predictions file missing X/Y datasets: {p!r}')
-        X_np = f['X'][...]
-        Y_np = f['Y'][...]
+    with h5py.File(p, "r") as f:
+        if "X" not in f or "Y" not in f:
+            raise KeyError(f"predictions file missing X/Y datasets: {p!r}")
+        X_np = f["X"][...]
+        Y_np = f["Y"][...]
     # Ensure torch owns the memory (avoid relying on numpy object lifetime).
     X_t = torch.as_tensor(X_np).clone()
     Y_t = torch.as_tensor(Y_np).clone()
-    return TensorDict({'X': X_t, 'Y': Y_t}, batch_size=[int(X_t.shape[0])])
+    return TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(X_t.shape[0])])
 
 
 def _validate_predictions_h5(path, *, out_shape=None, in_dim=None):
-    """Validate a predictions .h5/.hdf5 file before returning/resuming.
-
-    We only validate lightweight metadata (dataset presence + shapes), to avoid
-    pulling full arrays into memory. This helps avoid returning partially-written
-    or incompatible files when overwrite='resume' is used.
-    """
     try:
         import h5py
     except Exception as e:
-        raise ImportError('h5py is required to validate predictions .h5/.hdf5 files') from e
+        raise ImportError("h5py is required to validate predictions .h5/.hdf5 files") from e
 
     p = _normalize_path(path)
     if p is None or not os.path.isfile(p):
-        raise FileNotFoundError(f'predictions file not found: {path!r}')
+        raise FileNotFoundError(f"predictions file not found: {path!r}")
 
-    with h5py.File(p, 'r') as f:
-        if 'X' not in f or 'Y' not in f:
-            raise KeyError(f'predictions file missing X/Y datasets: {p!r}')
-        dX = f['X']
-        dY = f['Y']
-        x_shape = tuple(int(x) for x in getattr(dX, 'shape', ()) or ())
-        y_shape = tuple(int(x) for x in getattr(dY, 'shape', ()) or ())
+    with h5py.File(p, "r") as f:
+        if "X" not in f or "Y" not in f:
+            raise KeyError(f"predictions file missing X/Y datasets: {p!r}")
+        dX = f["X"]
+        dY = f["Y"]
+        x_shape = tuple(int(x) for x in getattr(dX, "shape", ()) or ())
+        y_shape = tuple(int(x) for x in getattr(dY, "shape", ()) or ())
         # Basic dtype sanity: reject object/string datasets.
         try:
-            x_kind = getattr(getattr(dX, 'dtype', None), 'kind', '')
-            y_kind = getattr(getattr(dY, 'dtype', None), 'kind', '')
+            x_kind = getattr(getattr(dX, "dtype", None), "kind", "")
+            y_kind = getattr(getattr(dY, "dtype", None), "kind", "")
         except Exception:
-            x_kind = ''
-            y_kind = ''
-        if x_kind in ('O', 'S', 'U', 'V') or y_kind in ('O', 'S', 'U', 'V'):
+            x_kind = ""
+            y_kind = ""
+        if x_kind in ("O", "S", "U", "V") or y_kind in ("O", "S", "U", "V"):
             raise ValueError(
-                f'predictions file has unsupported dtypes: X.dtype={getattr(dX, "dtype", None)!r}, '
-                f'Y.dtype={getattr(dY, "dtype", None)!r} ({p!r})'
+                f"predictions file has unsupported dtypes: X.dtype={getattr(dX, 'dtype', None)!r}, "
+                f"Y.dtype={getattr(dY, 'dtype', None)!r} ({p!r})"
             )
 
         # We require X to be a 2D table of features [N, in_dim].
         if len(x_shape) != 2 or len(y_shape) < 1:
-            raise ValueError(f'predictions file has invalid shapes: X={x_shape}, Y={y_shape} ({p!r})')
+            raise ValueError(
+                f"predictions file has invalid shapes: X={x_shape}, Y={y_shape} ({p!r})"
+            )
         if in_dim is not None and int(x_shape[1]) != int(in_dim):
             raise ValueError(
-                f'predictions file has unexpected X feature_dim: got {int(x_shape[1])}, expected {int(in_dim)} ({p!r})'
+                f"predictions file has unexpected X feature_dim: got {int(x_shape[1])}, expected {int(in_dim)} ({p!r})"
             )
         if int(x_shape[0]) != int(y_shape[0]):
-            raise ValueError(f'predictions file has mismatched row counts: X[0]={x_shape[0]}, Y[0]={y_shape[0]} ({p!r})')
+            raise ValueError(
+                f"predictions file has mismatched row counts: X[0]={x_shape[0]}, Y[0]={y_shape[0]} ({p!r})"
+            )
         n = int(x_shape[0])
         if n <= 0:
-            raise ValueError(f'predictions file has non-positive row count: {n} ({p!r})')
+            raise ValueError(f"predictions file has non-positive row count: {n} ({p!r})")
 
         if out_shape is None:
             # We at least expect a dense Y with a feature dimension.
             if len(y_shape) < 2:
-                raise ValueError(f'predictions file has invalid Y shape: Y={y_shape} ({p!r})')
+                raise ValueError(f"predictions file has invalid Y shape: Y={y_shape} ({p!r})")
         else:
             out_shape_t = tuple(int(d) for d in out_shape)
             if not out_shape_t or any(int(d) <= 0 for d in out_shape_t):
-                raise ValueError(f'_validate_predictions_h5: invalid out_shape={out_shape!r}')
+                raise ValueError(f"_validate_predictions_h5: invalid out_shape={out_shape!r}")
             if len(y_shape) != 1 + len(out_shape_t):
                 raise ValueError(
-                    f'predictions file has unexpected Y rank: got {len(y_shape)}, expected {1 + len(out_shape_t)} ({p!r})'
+                    f"predictions file has unexpected Y rank: got {len(y_shape)}, expected {1 + len(out_shape_t)} ({p!r})"
                 )
             if tuple(int(d) for d in y_shape[1:]) != out_shape_t:
                 raise ValueError(
-                    f'predictions file has unexpected Y shape: got {tuple(int(d) for d in y_shape[1:])}, expected {out_shape_t} ({p!r})'
+                    f"predictions file has unexpected Y shape: got {tuple(int(d) for d in y_shape[1:])}, expected {out_shape_t} ({p!r})"
                 )
 
     return n
@@ -967,14 +1149,14 @@ def _safe_unlink(path):
     except Exception as e:
         # Best-effort cleanup; do not fail the whole prediction on a cleanup error.
         with contextlib.suppress(Exception):
-            logger.debug('safe_unlink: failed to remove %s (%s)', path, e)
+            logger.debug("safe_unlink: failed to remove %s (%s)", path, e)
 
 
 def _delete_prediction_memmaps(*, memmap_dir, pred_path):
     # Delete intermediate MemoryMappedTensor artifacts only when it is safe to do so.
     try:
         meta = _read_memmap_meta(memmap_dir)
-        feat_rel = str(meta.get('features_path', 'features.mmt'))
+        feat_rel = str(meta.get("features_path", "features.mmt"))
         feat_path = os.path.join(memmap_dir, feat_rel)
     except Exception:
         feat_path = None
@@ -989,31 +1171,35 @@ def _delete_prediction_memmaps(*, memmap_dir, pred_path):
         _safe_unlink(BatchIO.mmt_meta_path(pred_path))
 
     # Best-effort cleanup of associated metadata.
-    _safe_unlink(os.path.join(memmap_dir, 'meta.json'))
+    _safe_unlink(os.path.join(memmap_dir, "meta.json"))
 
     # Best-effort: remove empty directories (ignore if not empty).
     with contextlib.suppress(OSError):
         os.rmdir(memmap_dir)
 
 
-def _write_predictions_h5_atomic(out_path, *, memmap_dir, pred_path, chunk_size=8192, overwrite='replace'):
+def _write_predictions_h5_atomic(
+    out_path, *, memmap_dir, pred_path, chunk_size=8192, overwrite="replace"
+):
     # Write to a temp file first, then commit according to overwrite policy.
     import tempfile
 
     out_path_n = _normalize_path(out_path)
     if out_path_n is None:
-        raise ValueError('write_predictions_h5_atomic: out_path must be a non-empty string')
+        raise ValueError("write_predictions_h5_atomic: out_path must be a non-empty string")
 
-    parent = os.path.dirname(out_path_n) or '.'
+    parent = os.path.dirname(out_path_n) or "."
     os.makedirs(parent, exist_ok=True)
 
-    ow = str(overwrite or 'replace').strip().lower()
-    if ow == 'resume' and os.path.isfile(out_path_n):
-        return PersistentTensorDict(filename=out_path_n, mode='r')
-    if ow == 'error' and os.path.exists(out_path_n):
+    ow = str(overwrite or "replace").strip().lower()
+    if ow == "resume" and os.path.isfile(out_path_n):
+        return PersistentTensorDict(filename=out_path_n, mode="r")
+    if ow == "error" and os.path.exists(out_path_n):
         raise FileExistsError(f"destination already exists: {out_path_n!r}")
 
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(out_path_n) + '.', suffix='.tmp', dir=parent)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=os.path.basename(out_path_n) + ".", suffix=".tmp", dir=parent
+    )
     os.close(fd)
 
     try:
@@ -1024,13 +1210,13 @@ def _write_predictions_h5_atomic(out_path, *, memmap_dir, pred_path, chunk_size=
             chunk_size=int(chunk_size),
         )
         # Commit: replace, or create-without-overwrite.
-        if ow == 'replace':
+        if ow == "replace":
             os.replace(tmp_path, out_path_n)
-        elif ow == 'error':
+        elif ow == "error":
             # Atomic create without overwriting an existing destination.
             os.link(tmp_path, out_path_n)
             os.remove(tmp_path)
-        elif ow == 'resume':
+        elif ow == "resume":
             # Destination may have appeared since the early check; keep it.
             if not os.path.exists(out_path_n):
                 os.link(tmp_path, out_path_n)
@@ -1043,31 +1229,21 @@ def _write_predictions_h5_atomic(out_path, *, memmap_dir, pred_path, chunk_size=
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
 
-    return PersistentTensorDict(filename=out_path_n, mode='r')
+    return PersistentTensorDict(filename=out_path_n, mode="r")
 
 
-
-def _atomic_h5_link_or_copy(src_path, dst_path, *, overwrite='replace', out_shape=None):
-    """Create dst_path from src_path via a full copy (crash/power-loss safe).
-
-    This is used by get_prediction() when the source is already a persistent .h5/.hdf5.
-    We validate lightweight metadata (X/Y presence + shapes) and commit atomically.
-
-    Note: We intentionally avoid hardlinking src->dst to prevent inode aliasing
-    surprises (e.g., tools that de-duplicate by hardlinks, quota accounting, or
-    later accidental modifications). We always copy the file content.
-    """
-    import tempfile
+def _atomic_h5_link_or_copy(src_path, dst_path, *, overwrite="replace", out_shape=None):
     import shutil
+    import tempfile
 
     src_n = _normalize_path(src_path)
     dst_n = _normalize_path(dst_path)
     if src_n is None or not os.path.isfile(src_n):
         raise FileNotFoundError(f"source .h5/.hdf5 not found: {src_path!r}")
     if dst_n is None:
-        raise ValueError('destination path must be a non-empty string')
+        raise ValueError("destination path must be a non-empty string")
 
-    ow = str(overwrite or 'replace').strip().lower()
+    ow = str(overwrite or "replace").strip().lower()
 
     # Validate source (avoid propagating a broken/partial file).
     _validate_predictions_h5(src_n, out_shape=out_shape)
@@ -1075,30 +1251,30 @@ def _atomic_h5_link_or_copy(src_path, dst_path, *, overwrite='replace', out_shap
     # Same file: nothing to do.
     with contextlib.suppress(Exception):
         if os.path.samefile(src_n, dst_n):
-            return PersistentTensorDict(filename=src_n, mode='r')
+            return PersistentTensorDict(filename=src_n, mode="r")
 
-    parent = os.path.dirname(dst_n) or '.'
+    parent = os.path.dirname(dst_n) or "."
     os.makedirs(parent, exist_ok=True)
 
     if os.path.exists(dst_n):
-        if ow == 'resume' and os.path.isfile(dst_n):
+        if ow == "resume" and os.path.isfile(dst_n):
             _validate_predictions_h5(dst_n, out_shape=out_shape)
-            return PersistentTensorDict(filename=dst_n, mode='r')
-        if ow == 'error':
+            return PersistentTensorDict(filename=dst_n, mode="r")
+        if ow == "error":
             raise FileExistsError(f"destination already exists: {dst_n!r}")
 
-    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(dst_n) + '.', suffix='.tmp', dir=parent)
+    fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(dst_n) + ".", suffix=".tmp", dir=parent)
     os.close(fd)
 
     try:
         shutil.copy2(src_n, tmp_path)
 
-        if ow == 'replace':
+        if ow == "replace":
             os.replace(tmp_path, dst_n)
-        elif ow == 'error':
+        elif ow == "error":
             os.link(tmp_path, dst_n)
             os.remove(tmp_path)
-        elif ow == 'resume':
+        elif ow == "resume":
             if not os.path.exists(dst_n):
                 os.link(tmp_path, dst_n)
             os.remove(tmp_path)
@@ -1110,27 +1286,28 @@ def _atomic_h5_link_or_copy(src_path, dst_path, *, overwrite='replace', out_shap
                 os.remove(tmp_path)
 
     _validate_predictions_h5(dst_n, out_shape=out_shape)
-    return PersistentTensorDict(filename=dst_n, mode='r')
+    return PersistentTensorDict(filename=dst_n, mode="r")
+
 
 def _infer_pred_master_dtype(chunks_dir, *, default=torch.float32):
-    manifest_path = os.path.join(chunks_dir, 'manifest.json')
+    manifest_path = os.path.join(chunks_dir, "manifest.json")
     if not os.path.isfile(manifest_path):
         return default
     try:
         manifest = read_json(manifest_path)
     except Exception:
         return default
-    parts = manifest.get('parts') if isinstance(manifest, dict) else None
+    parts = manifest.get("parts") if isinstance(manifest, dict) else None
     if not isinstance(parts, list) or not parts:
         return default
     for part in parts:
         if not isinstance(part, dict):
             continue
-        pred_rel = part.get('pred')
+        pred_rel = part.get("pred")
         if not pred_rel:
             continue
         pred_path = os.path.join(chunks_dir, str(pred_rel))
-        if pred_path.endswith('.mmt'):
+        if pred_path.endswith(".mmt"):
             meta_path = BatchIO.mmt_meta_path(pred_path)
             if os.path.isfile(meta_path):
                 try:
@@ -1138,12 +1315,12 @@ def _infer_pred_master_dtype(chunks_dir, *, default=torch.float32):
                 except Exception:
                     meta = None
                 if isinstance(meta, dict):
-                    dt = parse_torch_dtype(meta.get('dtype'))
+                    dt = parse_torch_dtype(meta.get("dtype"))
                     if isinstance(dt, torch.dtype):
                         return dt
         if os.path.isfile(pred_path):
             try:
-                preds_t = _torch_load_checkpoint(pred_path, map_location='cpu', weights_only=True)
+                preds_t = _torch_load_checkpoint(pred_path, map_location="cpu", weights_only=True)
             except Exception:
                 preds_t = None
             if isinstance(preds_t, torch.Tensor):
@@ -1164,17 +1341,17 @@ def _pred_assemble_tune_stats_init():
             if bool(_PRED_ASSEMBLE_TUNE_LOGGED):
                 return None
     return {
-        'parts': 0,
-        'contig': 0,
-        'noncontig': 0,
-        'inc_noncontig': 0,
-        'seg_used': 0,
-        'seg_skipped_threshold': 0,
-        'seg_disabled': 0,
-        'segs_sum': 0.0,
-        'segs_min': 0,
-        'segs_max': 0,
-        'skipped_segs_max': 0,
+        "parts": 0,
+        "contig": 0,
+        "noncontig": 0,
+        "inc_noncontig": 0,
+        "seg_used": 0,
+        "seg_skipped_threshold": 0,
+        "seg_disabled": 0,
+        "segs_sum": 0.0,
+        "segs_min": 0,
+        "segs_max": 0,
+        "skipped_segs_max": 0,
     }
 
 
@@ -1182,43 +1359,43 @@ def _pred_assemble_tune_stats_update_segments(tune_stats, segs):
     # Update segment statistics used for logging/tuning.
     if tune_stats is None:
         return
-    tune_stats['inc_noncontig'] += 1
-    tune_stats['segs_sum'] += float(segs)
-    mn = int(tune_stats.get('segs_min', 0) or 0)
-    mx = int(tune_stats.get('segs_max', 0) or 0)
-    tune_stats['segs_min'] = segs if mn <= 0 else min(mn, segs)
-    tune_stats['segs_max'] = max(mx, segs)
+    tune_stats["inc_noncontig"] += 1
+    tune_stats["segs_sum"] += float(segs)
+    mn = int(tune_stats.get("segs_min", 0) or 0)
+    mx = int(tune_stats.get("segs_max", 0) or 0)
+    tune_stats["segs_min"] = segs if mn <= 0 else min(mn, segs)
+    tune_stats["segs_max"] = max(mx, segs)
     thr = int(_PRED_ASSEMBLE_MAX_SEGMENTS)
     if thr <= 0:
-        tune_stats['seg_disabled'] += 1
+        tune_stats["seg_disabled"] += 1
     elif segs <= thr:
-        tune_stats['seg_used'] += 1
+        tune_stats["seg_used"] += 1
     else:
-        tune_stats['seg_skipped_threshold'] += 1
-        tune_stats['skipped_segs_max'] = max(int(tune_stats.get('skipped_segs_max', 0) or 0), segs)
+        tune_stats["seg_skipped_threshold"] += 1
+        tune_stats["skipped_segs_max"] = max(int(tune_stats.get("skipped_segs_max", 0) or 0), segs)
 
 
 def _load_rows_cpu_int64(rows_file):
-    rows_t = _torch_load_checkpoint(rows_file, map_location='cpu', weights_only=True)
+    rows_t = _torch_load_checkpoint(rows_file, map_location="cpu", weights_only=True)
     if not isinstance(rows_t, torch.Tensor):
-        rows_t = torch.as_tensor(rows_t, device='cpu')
-    rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device='cpu', copy=False)
+        rows_t = torch.as_tensor(rows_t, device="cpu")
+    rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
     if not bool(rows_t.is_contiguous()):
         rows_t = rows_t.contiguous()
     return rows_t
 
 
 def _load_preds_cpu_tensor(pred_file, *, dtype):
-    if pred_file.endswith('.mmt'):
+    if pred_file.endswith(".mmt"):
         preds_t = _open_pred_memmap(pred_file)
         if preds_t is None:
-            raise FileNotFoundError(f'missing prediction memmap or meta: {pred_file!r}')
+            raise FileNotFoundError(f"missing prediction memmap or meta: {pred_file!r}")
     else:
-        preds_t = _torch_load_checkpoint(pred_file, map_location='cpu', weights_only=True)
+        preds_t = _torch_load_checkpoint(pred_file, map_location="cpu", weights_only=True)
     if not isinstance(preds_t, torch.Tensor):
-        preds_t = torch.as_tensor(preds_t, device='cpu')
-    if preds_t.device.type != 'cpu':
-        preds_t = preds_t.to(device='cpu')
+        preds_t = torch.as_tensor(preds_t, device="cpu")
+    if preds_t.device.type != "cpu":
+        preds_t = preds_t.to(device="cpu")
     preds_t = preds_t.to(dtype=dtype, copy=False)
     return preds_t
 
@@ -1226,19 +1403,21 @@ def _load_preds_cpu_tensor(pred_file, *, dtype):
 def _scatter_rows_torch(dst, rows_t, preds_t, *, count, tune_stats=None):
     # Write predictions into a tensor-like dst using the most efficient strategy.
     if preds_t.shape[0] != rows_t.shape[0]:
-        raise ValueError(f'Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}')
+        raise ValueError(
+            f"Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
+        )
 
     is_contig, start, end = _is_contiguous_row_range(rows_t)
     if is_contig:
         if tune_stats is not None:
-            tune_stats['contig'] += 1
+            tune_stats["contig"] += 1
         if start < 0 or end > int(count):
-            raise ValueError(f'Row indices out of bounds: [{start}, {end}) vs count={int(count)}')
+            raise ValueError(f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}")
         dst[start:end].copy_(preds_t)
         return
 
     if tune_stats is not None:
-        tune_stats['noncontig'] += 1
+        tune_stats["noncontig"] += 1
 
     did_segment_copy = False
     n_rows = int(rows_t.numel())
@@ -1256,13 +1435,17 @@ def _scatter_rows_torch(dst, rows_t, preds_t, *, count, tune_stats=None):
                     r0 = int(rows_t[seg_start].item())
                     r1 = int(rows_t[seg_end - 1].item()) + 1
                     if r0 < 0 or r1 > int(count):
-                        raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                        raise ValueError(
+                            f"Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}"
+                        )
                     dst[r0:r1].copy_(preds_t[seg_start:seg_end])
                     seg_start = seg_end
                 r0 = int(rows_t[seg_start].item())
                 r1 = int(rows_t[-1].item()) + 1
                 if r0 < 0 or r1 > int(count):
-                    raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                    raise ValueError(
+                        f"Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}"
+                    )
                 dst[r0:r1].copy_(preds_t[seg_start:])
                 did_segment_copy = True
 
@@ -1271,7 +1454,9 @@ def _scatter_rows_torch(dst, rows_t, preds_t, *, count, tune_stats=None):
             rmin = int(rows_t.min().item())
             rmax = int(rows_t.max().item())
             if rmin < 0 or rmax >= int(count):
-                raise ValueError(f'Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}')
+                raise ValueError(
+                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
+                )
         dst.index_copy_(0, rows_t, preds_t)
 
 
@@ -1280,14 +1465,14 @@ def _scatter_rows_h5(dset_Y, rows_t, preds_np, *, count, tune_stats=None):
     is_contig, start, end = _is_contiguous_row_range(rows_t)
     if is_contig:
         if tune_stats is not None:
-            tune_stats['contig'] += 1
+            tune_stats["contig"] += 1
         if start < 0 or end > int(count):
-            raise ValueError(f'Row indices out of bounds: [{start}, {end}) vs count={int(count)}')
+            raise ValueError(f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}")
         dset_Y[start:end] = preds_np
         return
 
     if tune_stats is not None:
-        tune_stats['noncontig'] += 1
+        tune_stats["noncontig"] += 1
 
     did_segment_write = False
     n_rows = int(rows_t.numel())
@@ -1305,95 +1490,114 @@ def _scatter_rows_h5(dset_Y, rows_t, preds_np, *, count, tune_stats=None):
                     r0 = int(rows_t[seg_start].item())
                     r1 = int(rows_t[seg_end - 1].item()) + 1
                     if r0 < 0 or r1 > int(count):
-                        raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                        raise ValueError(
+                            f"Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}"
+                        )
                     dset_Y[r0:r1] = preds_np[seg_start:seg_end]
                     seg_start = seg_end
                 r0 = int(rows_t[seg_start].item())
                 r1 = int(rows_t[-1].item()) + 1
                 if r0 < 0 or r1 > int(count):
-                    raise ValueError(f'Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}')
+                    raise ValueError(
+                        f"Row indices out of bounds: [{r0}, {r1}) vs count={int(count)}"
+                    )
                 dset_Y[r0:r1] = preds_np[seg_start:]
                 did_segment_write = True
 
     if not did_segment_write:
-        rows_np = rows_t.detach().to(device='cpu', dtype=torch.int64).numpy()
+        rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
         if rows_np.size:
             rmin = int(rows_np.min())
             rmax = int(rows_np.max())
             if rmin < 0 or rmax >= int(count):
-                raise ValueError(f'Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}')
+                raise ValueError(
+                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
+                )
         dset_Y[rows_np] = preds_np
+
 
 def _assemble_predictions_to_memmap(chunks_dir, out_path, *, count, out_shape, store_float):
     if MemoryMappedTensor is None:
-        raise ImportError("tensordict is required for MemoryMappedTensor-backed prediction assembly. Please install 'tensordict'.")
+        raise ImportError(
+            "tensordict is required for MemoryMappedTensor-backed prediction assembly. Please install 'tensordict'."
+        )
     out_shape_t = tuple((int(x) for x in out_shape))
     full_shape = torch.Size([int(count), *out_shape_t])
-    Y_out = MemoryMappedTensor.empty(full_shape, dtype=store_float, filename=out_path, existsok=True)
+    Y_out = MemoryMappedTensor.empty(
+        full_shape, dtype=store_float, filename=out_path, existsok=True
+    )
 
-    manifest_path = os.path.join(chunks_dir, 'manifest.json')
+    manifest_path = os.path.join(chunks_dir, "manifest.json")
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
-        raise ValueError(f'Invalid manifest: {manifest_path}')
-    if bool(manifest.get('variable_shape', False)):
+        raise ValueError(f"Invalid manifest: {manifest_path}")
+    if bool(manifest.get("variable_shape", False)):
         raise NotImplementedError(
-            'Variable-shaped predictions cannot be assembled into a single dense MemoryMappedTensor. '
-            'Please rerun with a fixed output shape. Dense outputs (eager/memory/lazy/file) require fixed shapes.'
+            "Variable-shaped predictions cannot be assembled into a single dense MemoryMappedTensor. "
+            "Please rerun with a fixed output shape. Dense outputs (eager/memory/lazy/file) require fixed shapes."
         )
 
-    parts = list(manifest.get('parts', []) or [])
+    parts = list(manifest.get("parts", []) or [])
     tune_stats = _pred_assemble_tune_stats_init()
 
     for part in parts:
         if tune_stats is not None:
-            tune_stats['parts'] += 1
-        rows_file = os.path.join(chunks_dir, str(part['rows']))
-        pred_file = os.path.join(chunks_dir, str(part['pred']))
+            tune_stats["parts"] += 1
+        rows_file = os.path.join(chunks_dir, str(part["rows"]))
+        pred_file = os.path.join(chunks_dir, str(part["pred"]))
         rows_t = _load_rows_cpu_int64(rows_file)
         preds_t = _load_preds_cpu_tensor(pred_file, dtype=store_float)
         _scatter_rows_torch(Y_out, rows_t, preds_t, count=int(count), tune_stats=tune_stats)
 
     if tune_stats is not None:
-        _maybe_log_pred_assemble_tuning(tune_stats, kind='memmap')
+        _maybe_log_pred_assemble_tuning(tune_stats, kind="memmap")
 
     pred_meta_path = BatchIO.mmt_meta_path(out_path)
     BatchIO.atomic_write_json(
         pred_meta_path,
-        {'dtype': str(store_float).replace('torch.', ''), 'shape': list(map(int, full_shape))},
+        {"dtype": str(store_float).replace("torch.", ""), "shape": list(map(int, full_shape))},
         indent=None,
     )
     return Y_out
 
+
 def _assemble_predictions_to_tensor(chunks_dir, *, count, out_shape, dtype):
     out_shape_t = tuple((int(x) for x in out_shape))
-    Y_out = torch.empty((int(count), *out_shape_t), dtype=dtype, device='cpu')
+    Y_out = torch.empty((int(count), *out_shape_t), dtype=dtype, device="cpu")
 
-    manifest_path = os.path.join(chunks_dir, 'manifest.json')
+    manifest_path = os.path.join(chunks_dir, "manifest.json")
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
-        raise ValueError(f'Invalid manifest: {manifest_path}')
-    if bool(manifest.get('variable_shape', False)):
-        raise NotImplementedError('Variable-shaped predictions cannot be returned as a single dense Tensor. Please rerun with a fixed output shape.')
+        raise ValueError(f"Invalid manifest: {manifest_path}")
+    if bool(manifest.get("variable_shape", False)):
+        raise NotImplementedError(
+            "Variable-shaped predictions cannot be returned as a single dense Tensor. Please rerun with a fixed output shape."
+        )
 
-    parts = list(manifest.get('parts', []) or [])
+    parts = list(manifest.get("parts", []) or [])
     tune_stats = _pred_assemble_tune_stats_init()
 
     for part in parts:
         if tune_stats is not None:
-            tune_stats['parts'] += 1
-        rows_file = os.path.join(chunks_dir, str(part['rows']))
-        pred_file = os.path.join(chunks_dir, str(part['pred']))
+            tune_stats["parts"] += 1
+        rows_file = os.path.join(chunks_dir, str(part["rows"]))
+        pred_file = os.path.join(chunks_dir, str(part["pred"]))
         rows_t = _load_rows_cpu_int64(rows_file)
         preds_t = _load_preds_cpu_tensor(pred_file, dtype=dtype)
         _scatter_rows_torch(Y_out, rows_t, preds_t, count=int(count), tune_stats=tune_stats)
 
     if tune_stats is not None:
-        _maybe_log_pred_assemble_tuning(tune_stats, kind='tensor')
+        _maybe_log_pred_assemble_tuning(tune_stats, kind="tensor")
     return Y_out
 
-def _write_predictions_h5_from_chunks(out_path, *, memmap_dir, chunks_dir, count, out_shape, store_float, chunk_size=8192):
+
+def _write_predictions_h5_from_chunks(
+    out_path, *, memmap_dir, chunks_dir, count, out_shape, store_float, chunk_size=8192
+):
     if PersistentTensorDict is None:
-        raise ImportError("tensordict is required for PersistentTensorDict outputs. Please install 'tensordict'.")
+        raise ImportError(
+            "tensordict is required for PersistentTensorDict outputs. Please install 'tensordict'."
+        )
     import h5py
     import numpy as np
 
@@ -1406,69 +1610,90 @@ def _write_predictions_h5_from_chunks(out_path, *, memmap_dir, chunks_dir, count
     if store_float == torch.bfloat16 and np_float == np.float32:
         cast_dtype = torch.float32
 
-    with h5py.File(out_path, 'w') as f:
-        dset_X = f.create_dataset('X', shape=tuple(X_mmt.shape), dtype=_torch_dtype_to_numpy(X_mmt.dtype))
-        dset_Y = f.create_dataset('Y', shape=(int(count), *out_shape_t), dtype=np_float)
+    with h5py.File(out_path, "w") as f:
+        dset_X = f.create_dataset(
+            "X", shape=tuple(X_mmt.shape), dtype=_torch_dtype_to_numpy(X_mmt.dtype)
+        )
+        dset_Y = f.create_dataset("Y", shape=(int(count), *out_shape_t), dtype=np_float)
 
         chunk = int(chunk_size)
         for s in range(0, int(count), chunk):
             e = min(int(count), s + chunk)
             x_slice = X_mmt[s:e]
-            dset_X[s:e] = x_slice.detach().to(device='cpu').numpy()
+            dset_X[s:e] = x_slice.detach().to(device="cpu").numpy()
 
-        manifest = read_json(os.path.join(chunks_dir, 'manifest.json'))
+        manifest = read_json(os.path.join(chunks_dir, "manifest.json"))
         if not isinstance(manifest, dict):
-            raise ValueError(f'Invalid manifest under: {chunks_dir}')
-        if bool(manifest.get('variable_shape', False)):
-            raise NotImplementedError('Variable-shaped predictions cannot be stored as a dense HDF5 dataset. Please rerun with a fixed output shape.')
+            raise ValueError(f"Invalid manifest under: {chunks_dir}")
+        if bool(manifest.get("variable_shape", False)):
+            raise NotImplementedError(
+                "Variable-shaped predictions cannot be stored as a dense HDF5 dataset. Please rerun with a fixed output shape."
+            )
 
-        parts = list(manifest.get('parts', []) or [])
+        parts = list(manifest.get("parts", []) or [])
         tune_stats = _pred_assemble_tune_stats_init()
 
         for part in parts:
             if tune_stats is not None:
-                tune_stats['parts'] += 1
-            rows_file = os.path.join(chunks_dir, str(part['rows']))
-            pred_file = os.path.join(chunks_dir, str(part['pred']))
+                tune_stats["parts"] += 1
+            rows_file = os.path.join(chunks_dir, str(part["rows"]))
+            pred_file = os.path.join(chunks_dir, str(part["pred"]))
             rows_t = _load_rows_cpu_int64(rows_file)
             preds_t = _load_preds_cpu_tensor(pred_file, dtype=cast_dtype)
-            preds_np = preds_t.detach().to(device='cpu', dtype=cast_dtype).numpy()
+            preds_np = preds_t.detach().to(device="cpu", dtype=cast_dtype).numpy()
             if preds_np.shape[0] != int(rows_t.numel()):
-                raise ValueError(f'Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={int(rows_t.numel())}')
+                raise ValueError(
+                    f"Pred/rows mismatch in {pred_file}: preds[0]={preds_np.shape[0]} vs rows={int(rows_t.numel())}"
+                )
             _scatter_rows_h5(dset_Y, rows_t, preds_np, count=int(count), tune_stats=tune_stats)
 
         if tune_stats is not None:
-            _maybe_log_pred_assemble_tuning(tune_stats, kind='h5')
+            _maybe_log_pred_assemble_tuning(tune_stats, kind="h5")
 
-    return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode='r')
+    return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
 
-def _write_predictions_h5_from_memmaps(out_path, *, memmap_dir, pred_path, count=None, chunk_size=8192):
+
+def _write_predictions_h5_from_memmaps(
+    out_path, *, memmap_dir, pred_path, count=None, chunk_size=8192
+):
     if not _is_writable_file_path(out_path):
-        raise ValueError(f'persist_path is not a writable file path: {out_path}')
-    import numpy as _np
+        raise ValueError(f"persist_path is not a writable file path: {out_path}")
     import h5py
+    import numpy as _np
+
     X_mmt = _open_features_mmt(memmap_dir)
     Y_mmt = _open_pred_memmap(pred_path)
     if Y_mmt is None:
-        raise FileNotFoundError(f'missing prediction memmap: {pred_path}')
+        raise FileNotFoundError(f"missing prediction memmap: {pred_path}")
     n = int(Y_mmt.shape[0]) if count is None else int(count)
     if n <= 0:
-        raise ValueError(f'non-positive prediction count: {n}')
+        raise ValueError(f"non-positive prediction count: {n}")
     x_np_dtype = _torch_dtype_to_numpy(X_mmt.dtype)
     y_np_dtype = _torch_dtype_to_numpy(Y_mmt.dtype)
     y_cast_dtype = Y_mmt.dtype
     if Y_mmt.dtype == torch.bfloat16 and y_np_dtype == _np.float32:
         y_cast_dtype = torch.float32
-    out_parent = os.path.dirname(out_path) or '.'
+    out_parent = os.path.dirname(out_path) or "."
     os.makedirs(out_parent, exist_ok=True)
-    with h5py.File(out_path, 'w') as f:
-        dset_X = f.create_dataset('X', shape=(n, int(X_mmt.shape[1])), dtype=x_np_dtype, chunks=(min(n, int(chunk_size)), int(X_mmt.shape[1])))
-        dset_Y = f.create_dataset('Y', shape=(n, *[int(x) for x in Y_mmt.shape[1:]]), dtype=y_np_dtype, chunks=(min(n, int(chunk_size)), *[int(x) for x in Y_mmt.shape[1:]]))
+    with h5py.File(out_path, "w") as f:
+        dset_X = f.create_dataset(
+            "X",
+            shape=(n, int(X_mmt.shape[1])),
+            dtype=x_np_dtype,
+            chunks=(min(n, int(chunk_size)), int(X_mmt.shape[1])),
+        )
+        dset_Y = f.create_dataset(
+            "Y",
+            shape=(n, *[int(x) for x in Y_mmt.shape[1:]]),
+            dtype=y_np_dtype,
+            chunks=(min(n, int(chunk_size)), *[int(x) for x in Y_mmt.shape[1:]]),
+        )
         for s in range(0, n, int(chunk_size)):
             e = min(n, s + int(chunk_size))
-            dset_X[s:e] = X_mmt[s:e].detach().to(device='cpu', dtype=X_mmt.dtype).numpy()
-            dset_Y[s:e] = Y_mmt[s:e].detach().to(device='cpu', dtype=y_cast_dtype).numpy()
-    return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode='r')
+            dset_X[s:e] = X_mmt[s:e].detach().to(device="cpu", dtype=X_mmt.dtype).numpy()
+            dset_Y[s:e] = Y_mmt[s:e].detach().to(device="cpu", dtype=y_cast_dtype).numpy()
+    return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode="r")
+
 
 def _coerce_float_dtype_like_to_torch(dt):
     try:
@@ -1487,6 +1712,7 @@ def _coerce_float_dtype_like_to_torch(dt):
         return None
     return None
 
+
 def _infer_master_float_dtype_for_predict_input(obj):
     try:
         if TensorDictBase is not None and isinstance(obj, TensorDictBase):
@@ -1495,23 +1721,23 @@ def _infer_master_float_dtype_for_predict_input(obj):
                 return torch.float32
             if not bool(torch.is_tensor(X_td)):
                 X_td = torch.as_tensor(X_td)
-            dt = _coerce_float_dtype_like_to_torch(getattr(X_td, 'dtype', None))
+            dt = _coerce_float_dtype_like_to_torch(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
         if isinstance(obj, Mapping) and BatchIO.is_feature_label_batch_mapping(obj):
             f_key = resolve_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
-                dt = _coerce_float_dtype_like_to_torch(getattr(X_all, 'dtype', None))
+                dt = _coerce_float_dtype_like_to_torch(getattr(X_all, "dtype", None))
                 if dt is not None:
                     return torch.float64 if dt == torch.float64 else torch.float32
                 if isinstance(X_all, (list, tuple)) and X_all:
-                    dt0 = _coerce_float_dtype_like_to_torch(getattr(X_all[0], 'dtype', None))
+                    dt0 = _coerce_float_dtype_like_to_torch(getattr(X_all[0], "dtype", None))
                     return torch.float64 if dt0 == torch.float64 else torch.float32
         if torch.is_tensor(obj):
-            dt = _coerce_float_dtype_like_to_torch(getattr(obj, 'dtype', None))
+            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
         if isinstance(obj, np.ndarray):
-            dt = _coerce_float_dtype_like_to_torch(getattr(obj, 'dtype', None))
+            dt = _coerce_float_dtype_like_to_torch(getattr(obj, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
     except Exception:
         pass
@@ -1548,32 +1774,49 @@ class _MappingSliceGetter:
                 batch[k] = v
         return batch
 
-@catchtime(logger, fn_name='predict')
-def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes=None, rdzv_endpoint=None, rdzv_backend=None, output='memory', path=None, overwrite='error', **kwargs):
+
+@catchtime(logger, fn_name="predict")
+def predict(
+    model: Any,
+    data: Any,
+    *args: Any,
+    mode: str = "predict",
+    seed: int = 7,
+    shuffle: bool = False,
+    max_nodes: Any = None,
+    rdzv_endpoint: Any = None,
+    rdzv_backend: Any = None,
+    output: str = "memory",
+    path: Any = None,
+    overwrite: str = "error",
+    **kwargs: Any,
+):
     if model is None:
-        raise ValueError('predict: model must not be None')
+        raise ValueError("predict: model must not be None")
     _reset_process_group()
     initialize_python_path()
     set_multiprocessing_env()
 
-    out_shape = kwargs.pop('out_shape', getattr(model, 'out_shape', None))
+    out_shape = kwargs.pop("out_shape", getattr(model, "out_shape", None))
     if out_shape is None:
-        raise ValueError('predict: out_shape is required (pass out_shape=... or set model.out_shape)')
+        raise ValueError(
+            "predict: out_shape is required (pass out_shape=... or set model.out_shape)"
+        )
     out_shape_t = tuple((int(x) for x in out_shape))
     if not out_shape_t or any((int(x) <= 0 for x in out_shape_t)):
-        raise ValueError(f'predict: invalid out_shape={out_shape!r}')
+        raise ValueError(f"predict: invalid out_shape={out_shape!r}")
 
-    underflow_action = kwargs.pop('underflow_action', default_underflow_action())
-    chunk_size = kwargs.pop('chunk_size', None)
+    underflow_action = kwargs.pop("underflow_action", default_underflow_action())
+    chunk_size = kwargs.pop("chunk_size", None)
 
     output_mode = _normalize_prediction_output(output)
     overwrite_mode = _normalize_prediction_overwrite(overwrite)
-    run_id = str(kwargs.pop('run_id', f'predict-{os.getpid()}-{int(seed)}'))
+    run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
 
     # Resolve output file path (only meaningful when output_mode == 'file').
     out_path = None
     path_n = _normalize_path(path) if path is not None else None
-    if output_mode == 'file':
+    if output_mode == "file":
         if path_n is not None:
             out_path = _resolve_prediction_output_path(path_n, run_id=run_id)
             if out_path is None:
@@ -1582,7 +1825,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     output,
                     path,
                 )
-                output_mode = 'memory'
+                output_mode = "memory"
             elif not _is_writable_file_path(out_path):
                 logger.warning(
                     "predict: output=%r path is not writable: %r; falling back to output='memory'.",
@@ -1590,31 +1833,31 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     out_path,
                 )
                 out_path = None
-                output_mode = 'memory'
+                output_mode = "memory"
         else:
-            output_mode = 'memory'
+            output_mode = "memory"
 
     # If persistence was requested but the path is invalid, fall back to in-memory output.
-    if output_mode == 'file' and out_path is None:
-        output_mode = 'memory'
+    if output_mode == "file" and out_path is None:
+        output_mode = "memory"
 
     # If destination exists, honor overwrite policy early (before doing any work).
-    if output_mode == 'file' and out_path is not None and os.path.exists(out_path):
-        if overwrite_mode == 'resume' and os.path.isfile(out_path):
+    if output_mode == "file" and out_path is not None and os.path.exists(out_path):
+        if overwrite_mode == "resume" and os.path.isfile(out_path):
             _validate_predictions_h5(out_path, out_shape=out_shape_t)
-            return PersistentTensorDict(filename=out_path, mode='r')
-        if overwrite_mode == 'error':
+            return PersistentTensorDict(filename=out_path, mode="r")
+        if overwrite_mode == "error":
             raise FileExistsError(f"predict: destination already exists: {out_path!r}")
 
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
 
     master_dtype = _infer_master_float_dtype_for_predict_input(data)
-    ds = Dataset.for_device('cpu', feature_dtype=master_dtype, label_float_dtype=master_dtype)
+    ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
     ds.underflow_action = underflow_action
 
-    tmp_dir = new_dir('infer')
-    ckpt_dir = os.path.join(tmp_dir, 'ckpt')
-    memmap_dir = os.path.join(tmp_dir, 'memmap')
+    tmp_dir = new_dir("infer")
+    ckpt_dir = os.path.join(tmp_dir, "ckpt")
+    memmap_dir = os.path.join(tmp_dir, "memmap")
     os.makedirs(ckpt_dir, exist_ok=True)
     os.makedirs(memmap_dir, exist_ok=True)
 
@@ -1622,12 +1865,14 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
     inference_ctx = inference_mode(model)
     with inference_ctx:
         try:
-            save_dcp = kwargs.pop('save_dcp', False)
-            save_pt = kwargs.pop('save_pt', False)
-            dcp_dir = os.path.join(ckpt_dir, 'dcp')
+            save_dcp = kwargs.pop("save_dcp", False)
+            save_pt = kwargs.pop("save_pt", False)
+            dcp_dir = os.path.join(ckpt_dir, "dcp")
             if not (save_dcp or save_pt):
                 save_pt = True
-            _maybe_save_model_checkpoint(model, dcp_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True)
+            _maybe_save_model_checkpoint(
+                model, dcp_dir, save_dcp=save_dcp, save_pt=save_pt, overwrite=True
+            )
 
             count = None
             in_dim = None
@@ -1638,13 +1883,13 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             if TensorDictBase is not None and isinstance(data, TensorDictBase):
                 X_td, _ = extract_xy(data, labels_required=False)
                 if X_td is None:
-                    raise ValueError('predict: failed to extract features from TensorDict')
+                    raise ValueError("predict: failed to extract features from TensorDict")
                 try:
-                    count = int(getattr(X_td, 'shape', [0])[0] or 0)
+                    count = int(getattr(X_td, "shape", [0])[0] or 0)
                 except Exception:
-                    count = int(len(X_td)) if hasattr(X_td, '__len__') else 0
+                    count = int(len(X_td)) if hasattr(X_td, "__len__") else 0
                 if count <= 0:
-                    raise ValueError('predict: empty input')
+                    raise ValueError("predict: empty input")
 
                 get_batch = _TensorDictSliceGetter(data)
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
@@ -1665,14 +1910,14 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             elif isinstance(data, Mapping) and BatchIO.is_feature_label_batch_mapping(data):
                 f_key = resolve_feature_key(data)
                 if f_key is None:
-                    raise ValueError('predict: could not resolve feature key from mapping')
+                    raise ValueError("predict: could not resolve feature key from mapping")
                 X_all = data.get(f_key)
                 try:
                     count = int(len(X_all))
                 except Exception:
-                    count = int(getattr(X_all, 'shape', [0])[0] or 0)
+                    count = int(getattr(X_all, "shape", [0])[0] or 0)
                 if count <= 0:
-                    raise ValueError('predict: empty input')
+                    raise ValueError("predict: empty input")
 
                 slice_items = []
                 const_items = {}
@@ -1680,7 +1925,9 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     if isinstance(v, (str, bytes, bytearray)):
                         const_items[k] = v
                         continue
-                    if isinstance(v, Mapping) and (not (TensorDictBase is not None and isinstance(v, TensorDictBase))):
+                    if isinstance(v, Mapping) and (
+                        not (TensorDictBase is not None and isinstance(v, TensorDictBase))
+                    ):
                         const_items[k] = v
                         continue
                     try:
@@ -1711,7 +1958,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 # Mapping of sample_id -> item (or similar). Use the KeyIndexMappingView helpers.
                 count, get_batch = BatchIO.key_index_mapping_getters(data)
                 if int(count) <= 0:
-                    raise ValueError('predict: empty input')
+                    raise ValueError("predict: empty input")
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
                     ds=ds,
                     out_dir=memmap_dir,
@@ -1733,10 +1980,10 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     count = int(len(data))
                 except Exception as e:
                     raise TypeError(
-                        'predict: unsupported data type. Expected TensorDict, Mapping, or sized sequence.'
+                        "predict: unsupported data type. Expected TensorDict, Mapping, or sized sequence."
                     ) from e
                 if count <= 0:
-                    raise ValueError('predict: empty input')
+                    raise ValueError("predict: empty input")
 
                 def _seq_get_batch(s, e):
                     s_i = int(s)
@@ -1746,7 +1993,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     except Exception:
                         sl = [data[i] for i in range(s_i, e_i)]
                     # Wrap in a mapping so Dataset.preprocess can resolve the feature key.
-                    return {'features': sl}
+                    return {"features": sl}
 
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
                     ds=ds,
@@ -1764,20 +2011,20 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 )
 
             if count is None or in_dim is None:
-                raise RuntimeError('predict: failed to infer count/in_dim from input data')
+                raise RuntimeError("predict: failed to infer count/in_dim from input data")
 
             cfg_obj = None
             with contextlib.suppress(Exception):
-                cfg_obj = getattr(model, 'config', None)
+                cfg_obj = getattr(model, "config", None)
             if cfg_obj is None:
                 with contextlib.suppress(Exception):
-                    cfg_obj = getattr(model, '__stnet_instance_config__', None)
+                    cfg_obj = getattr(model, "__stnet_instance_config__", None)
             if cfg_obj is None:
                 for submodule in model.modules():
                     with contextlib.suppress(Exception):
-                        cfg_obj = getattr(submodule, 'config', None)
+                        cfg_obj = getattr(submodule, "config", None)
                     if cfg_obj is None:
-                        cfg_obj = getattr(submodule, '__stnet_instance_config__', None)
+                        cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
                     if cfg_obj is not None:
                         break
 
@@ -1789,17 +2036,17 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 cfg_dict = {}
 
             base = {
-                'sources': {'kind': 'memmap', 'path': memmap_dir},
-                'ckpt_dir': ckpt_dir,
-                'model_ckpt_dir': dcp_dir,
-                'in_dim': int(in_dim),
-                'out_shape': out_shape_t,
-                'cfg_dict': cfg_dict,
+                "sources": {"kind": "memmap", "path": memmap_dir},
+                "ckpt_dir": ckpt_dir,
+                "model_ckpt_dir": dcp_dir,
+                "in_dim": int(in_dim),
+                "out_shape": out_shape_t,
+                "cfg_dict": cfg_dict,
             }
 
             ops_kwargs = dict(kwargs)
-            ops_kwargs.setdefault('seed', seed)
-            ops_kwargs.setdefault('shuffle', shuffle)
+            ops_kwargs.setdefault("seed", seed)
+            ops_kwargs.setdefault("shuffle", shuffle)
             ops = runtime_config(mode, base, *args, **ops_kwargs)
             _wp = WorkerPolicy.autotune()
             _wp.apply_torch_threads()
@@ -1812,7 +2059,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 min_nodes=1,
                 max_nodes=max_nodes_i,
                 nproc_per_node=nprocs,
-                rdzv_backend=str(rdzv_backend or 'c10d'),
+                rdzv_backend=str(rdzv_backend or "c10d"),
                 rdzv_endpoint=resolved_rdzv,
                 run_id=run_id,
                 max_restarts=0,
@@ -1822,21 +2069,21 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             )
 
             with contextlib.suppress(Exception):
-                model.to('cpu')
+                model.to("cpu")
             _clear_device_caches()
 
             # NOTE: Do not short-circuit distributed execution even when nprocs==1.
             # Keep DDP/FSDP code paths consistent.
             elastic_launch(lc, process)(ops)
 
-            chunks_dir = os.path.join(ckpt_dir, 'pred_chunks')
+            chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
             if not os.path.isdir(chunks_dir):
-                raise RuntimeError(f'predict: missing pred_chunks at {chunks_dir!r}')
+                raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
             store_float = _infer_pred_master_dtype(chunks_dir)
 
             # Always assemble to a single pred.mmt first. This provides a stable intermediate
             # representation and enables correct deletion ordering for crash/power-loss safety.
-            pred_mmt_path = os.path.join(tmp_dir, 'pred.mmt')
+            pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
             _assemble_predictions_to_memmap(
                 chunks_dir=chunks_dir,
                 out_path=pred_mmt_path,
@@ -1847,16 +2094,16 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             X_mmt = _open_features_mmt(memmap_dir)
             Y_mmt = _open_pred_memmap(pred_mmt_path)
             if Y_mmt is None:
-                raise RuntimeError('predict: failed to open assembled pred.mmt')
+                raise RuntimeError("predict: failed to open assembled pred.mmt")
 
             if out_path is not None:
                 # Persistent output (output in {"lazy", "file"} with a valid path).
                 # Re-check existence right before writing to honor overwrite policy in racy environments.
                 if os.path.exists(out_path):
-                    if overwrite_mode == 'resume' and os.path.isfile(out_path):
+                    if overwrite_mode == "resume" and os.path.isfile(out_path):
                         _validate_predictions_h5(out_path, out_shape=out_shape_t)
-                        return PersistentTensorDict(filename=out_path, mode='r')
-                    if overwrite_mode == 'error':
+                        return PersistentTensorDict(filename=out_path, mode="r")
+                    if overwrite_mode == "error":
                         raise FileExistsError(f"predict: destination already exists: {out_path!r}")
                 out_td = _write_predictions_h5_atomic(
                     out_path,
@@ -1866,8 +2113,14 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                     overwrite=overwrite_mode,
                 )
                 if not os.path.isfile(out_path):
-                    raise RuntimeError(f'predict: persistent output missing after write: {out_path!r}')
-                _validate_predictions_h5(out_path, out_shape=out_shape_t, in_dim=(int(in_dim) if in_dim is not None else None))
+                    raise RuntimeError(
+                        f"predict: persistent output missing after write: {out_path!r}"
+                    )
+                _validate_predictions_h5(
+                    out_path,
+                    out_shape=out_shape_t,
+                    in_dim=(int(in_dim) if in_dim is not None else None),
+                )
 
                 # Delete intermediate memmap artifacts *only after* the persistent file is ready.
                 _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_mmt_path)
@@ -1878,7 +2131,7 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
             X_t = _copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
             Y_t = _copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
 
-            td_out = TensorDict({'X': X_t, 'Y': Y_t}, batch_size=[int(count)])
+            td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
 
             # Delete intermediate memmap artifacts *only after* the TensorDict is fully materialized.
             _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_mmt_path)
@@ -1892,8 +2145,9 @@ def predict(model, data, *args, mode='predict', seed=7, shuffle=False, max_nodes
                 with contextlib.suppress(Exception):
                     logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
 
-@catchtime(logger, fn_name='get_prediction')
-def get_prediction(source, *, output='memory', path=None, overwrite='error'):
+
+@catchtime(logger, fn_name="get_prediction")
+def get_prediction(source, *, output="memory", path=None, overwrite="error"):
     with inference_mode(torch.nn.Identity()):
         if not bool(source):
             raise ValueError("get_prediction: 'source' must be a non-empty path")
@@ -1907,9 +2161,9 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
         # Resolve output file path (only meaningful when output_mode == 'file').
         out_path = None
         path_n = _normalize_path(path) if path is not None else None
-        if output_mode == 'file':
+        if output_mode == "file":
             if path_n is not None:
-                run_id = os.path.basename(src.rstrip(os.sep)) or f'prediction-{os.getpid()}'
+                run_id = os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
                 out_path = _resolve_prediction_output_path(path_n, run_id=run_id)
                 if out_path is None:
                     logger.warning(
@@ -1917,7 +2171,7 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
                         output,
                         path,
                     )
-                    output_mode = 'memory'
+                    output_mode = "memory"
                 elif not _is_writable_file_path(out_path):
                     logger.warning(
                         "get_prediction: output=%r path is not writable: %r; falling back to output='memory'.",
@@ -1925,47 +2179,47 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
                         out_path,
                     )
                     out_path = None
-                    output_mode = 'memory'
+                    output_mode = "memory"
             else:
-                output_mode = 'memory'
+                output_mode = "memory"
 
         # If destination exists, honor overwrite policy early.
-        if output_mode == 'file' and out_path is not None and os.path.exists(out_path):
-            if overwrite_mode == 'resume' and os.path.isfile(out_path):
+        if output_mode == "file" and out_path is not None and os.path.exists(out_path):
+            if overwrite_mode == "resume" and os.path.isfile(out_path):
                 _validate_predictions_h5(out_path)
-                return PersistentTensorDict(filename=out_path, mode='r')
-            if overwrite_mode == 'error':
+                return PersistentTensorDict(filename=out_path, mode="r")
+            if overwrite_mode == "error":
                 raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
 
         # Source is already a persistent file.
-        if (src.endswith('.h5') or src.endswith('.hdf5')) and os.path.isfile(src):
-            if output_mode == 'file':
+        if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
+            if output_mode == "file":
                 # If the caller requested a new destination, link/copy it atomically.
                 if out_path is None:
-                    return PersistentTensorDict(filename=src, mode='r')
+                    return PersistentTensorDict(filename=src, mode="r")
                 return _atomic_h5_link_or_copy(src, out_path, overwrite=overwrite_mode)
             # Materialize into memory.
             return _read_predictions_h5_to_tensordict(src)
 
         if not os.path.isdir(src):
-            raise FileNotFoundError(f'source must be a directory or .h5 file: {src!r}')
-        memmap_dir = os.path.join(src, 'memmap')
-        chunks_dir = os.path.join(src, 'pred_chunks')
-        pred_path = os.path.join(src, 'pred.mmt')
+            raise FileNotFoundError(f"source must be a directory or .h5 file: {src!r}")
+        memmap_dir = os.path.join(src, "memmap")
+        chunks_dir = os.path.join(src, "pred_chunks")
+        pred_path = os.path.join(src, "pred.mmt")
         if not os.path.isdir(memmap_dir):
-            raise FileNotFoundError(f'missing memmap dir: {memmap_dir!r}')
+            raise FileNotFoundError(f"missing memmap dir: {memmap_dir!r}")
 
         # Load manifest (required when we need to assemble pred.mmt).
         count = None
         out_shape = None
         if os.path.isdir(chunks_dir):
-            man_path = os.path.join(chunks_dir, 'manifest.json')
+            man_path = os.path.join(chunks_dir, "manifest.json")
             if os.path.isfile(man_path):
                 try:
-                    man = json.load(open(man_path, 'r', encoding='utf-8'))
+                    man = json.load(open(man_path, "r", encoding="utf-8"))
                     if isinstance(man, dict):
-                        count = man.get('count', None)
-                        out_shape = man.get('out_shape', None)
+                        count = man.get("count", None)
+                        out_shape = man.get("out_shape", None)
                 except Exception:
                     pass
 
@@ -1974,13 +2228,17 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
             pass
         else:
             if not os.path.isdir(chunks_dir):
-                raise FileNotFoundError(f'missing pred_chunks dir: {chunks_dir!r}')
+                raise FileNotFoundError(f"missing pred_chunks dir: {chunks_dir!r}")
             if count is None or out_shape is None:
-                raise FileNotFoundError(f'missing/invalid manifest.json in pred_chunks: {chunks_dir!r}')
+                raise FileNotFoundError(
+                    f"missing/invalid manifest.json in pred_chunks: {chunks_dir!r}"
+                )
             count = int(count)
             out_shape_t = tuple(int(x) for x in (out_shape or ()))
             if count <= 0 or (not out_shape_t) or any(int(d) <= 0 for d in out_shape_t):
-                raise ValueError(f'get_prediction: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}')
+                raise ValueError(
+                    f"get_prediction: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
+                )
             store_float = _infer_pred_master_dtype(chunks_dir)
             _assemble_predictions_to_memmap(
                 chunks_dir=chunks_dir,
@@ -1993,7 +2251,7 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
         X_mmt = _open_features_mmt(memmap_dir)
         Y_mmt = _open_pred_memmap(pred_path)
         if Y_mmt is None:
-            raise RuntimeError('get_prediction: failed to open pred.mmt')
+            raise RuntimeError("get_prediction: failed to open pred.mmt")
 
         # If we still don't know count (missing manifest but pred.mmt exists), infer from tensors.
         if count is None:
@@ -2002,16 +2260,26 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
             except Exception:
                 count = None
         if count is None:
-            raise RuntimeError('get_prediction: failed to infer count')
+            raise RuntimeError("get_prediction: failed to infer count")
 
         if out_path is not None:
             # Honor overwrite policy as late as possible (avoid clobbering a completed file).
             if os.path.exists(out_path):
-                if overwrite_mode == 'resume' and os.path.isfile(out_path):
-                    _validate_predictions_h5(out_path, out_shape=tuple(int(d) for d in Y_mmt.shape[1:]), in_dim=(int(X_mmt.shape[1]) if hasattr(X_mmt, 'shape') and len(X_mmt.shape) > 1 else None))
-                    return PersistentTensorDict(filename=out_path, mode='r')
-                if overwrite_mode == 'error':
-                    raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
+                if overwrite_mode == "resume" and os.path.isfile(out_path):
+                    _validate_predictions_h5(
+                        out_path,
+                        out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
+                        in_dim=(
+                            int(X_mmt.shape[1])
+                            if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
+                            else None
+                        ),
+                    )
+                    return PersistentTensorDict(filename=out_path, mode="r")
+                if overwrite_mode == "error":
+                    raise FileExistsError(
+                        f"get_prediction: destination already exists: {out_path!r}"
+                    )
 
             out_td = _write_predictions_h5_atomic(
                 out_path,
@@ -2021,8 +2289,18 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
                 overwrite=overwrite_mode,
             )
             if not os.path.isfile(out_path):
-                raise RuntimeError(f'get_prediction: persistent output missing after write: {out_path!r}')
-            _validate_predictions_h5(out_path, out_shape=tuple(int(d) for d in Y_mmt.shape[1:]), in_dim=(int(X_mmt.shape[1]) if hasattr(X_mmt, 'shape') and len(X_mmt.shape) > 1 else None))
+                raise RuntimeError(
+                    f"get_prediction: persistent output missing after write: {out_path!r}"
+                )
+            _validate_predictions_h5(
+                out_path,
+                out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
+                in_dim=(
+                    int(X_mmt.shape[1])
+                    if hasattr(X_mmt, "shape") and len(X_mmt.shape) > 1
+                    else None
+                ),
+            )
 
             # Delete intermediate memmap artifacts *only after* the persistent file is ready.
             _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_path)
@@ -2031,7 +2309,7 @@ def get_prediction(source, *, output='memory', path=None, overwrite='error'):
         # In-memory output.
         X_t = _copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
         Y_t = _copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
-        td_out = TensorDict({'X': X_t, 'Y': Y_t}, batch_size=[int(count)])
+        td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
 
         # Delete intermediate memmap artifacts *only after* the TensorDict is fully materialized.
         _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_path)

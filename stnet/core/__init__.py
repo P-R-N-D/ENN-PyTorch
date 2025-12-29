@@ -7,7 +7,6 @@ from types import ModuleType
 __all__ = [
     "casting",
     "compat",
-    "config",
     "distributed",
     "graph",
     "losses",

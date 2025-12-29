@@ -9,6 +9,7 @@ from typing import Any, Iterator, NoReturn
 
 import torch
 from torch import nn
+
 from .graph import torch_safe_distributed
 
 # -----------------------------------------------------------------------------
@@ -89,11 +90,6 @@ def _parse_version(v: str) -> tuple[int, int, int]:
 def ensure_torchdata(
     *, min_version: str = MIN_TORCHDATA_VERSION, err: Exception | None = None, context: str = "stnet"
 ) -> NoReturn:
-    """Fail-fast if torchdata is missing/too old, or torchdata.nodes API is unavailable.
-
-    Intended usage: call inside an `except Exception as _e:` that failed to import torchdata.nodes APIs.
-    This function ALWAYS raises ImportError.
-    """
     try:
         import torchdata  # type: ignore
 

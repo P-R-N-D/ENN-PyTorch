@@ -7,18 +7,19 @@ import inspect
 import json
 import logging
 import threading
-from functools import lru_cache
 from collections import OrderedDict
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from functools import lru_cache
+from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
+                    Sequence, Tuple, Union)
 
 import torch
 from tensordict import TensorDict, TensorDictBase
 from torch import nn, optim
 
+from ..core.precision import Autocast, PrecisionPolicy, is_scale_safe
 from ..core.system import get_device, optimal_optimizer_params
 from ..data.pipeline import Dataset
 from ..nn.architecture import ModelPolicy
-from ..core.precision import Autocast, PrecisionPolicy, is_scale_safe
 
 try:
     from torch.optim.swa_utils import SWALR
@@ -47,7 +48,6 @@ def _is_hashable(x: object) -> bool:
 
 
 def _safe_key(x: Any) -> Any:
-    """Best-effort conversion of a value into a stable, hashable form."""
     if x is None or isinstance(x, (bool, int, float, str)):
         return x
     if isinstance(x, torch.dtype):
@@ -77,10 +77,6 @@ def _log_opt_decision_once(
     *,
     level: str = "info",
 ) -> None:
-    """Deduped structured logging for optimizer selection decisions.
-
-    Thread-safe and best-effort: in free-threaded/no-GIL Python, we guard the shared cache.
-    """
     # Avoid expensive serialization if module logger isn't enabled and no custom logger was given.
     if logger is None:
         lvl = logging.DEBUG if str(level).lower() == "debug" else logging.INFO
@@ -127,11 +123,6 @@ def _log_opt_decision_once(
 
 @lru_cache(maxsize=256)
 def _ctor_allowed_keys(ctor: Any) -> Optional[frozenset[str]]:
-    """Return allowed kwarg keys for `ctor`, or None when filtering is unnecessary.
-
-    - Returns None when `ctor` accepts **kwargs or when introspection fails.
-    - Cached to avoid repeated `inspect.signature()` overhead during optimizer backend probing.
-    """
     try:
         sig = inspect.signature(ctor)
     except (TypeError, ValueError):
@@ -145,7 +136,6 @@ def _ctor_allowed_keys(ctor: Any) -> Optional[frozenset[str]]:
 
 
 def _filter_kwargs(ctor: Any, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Filter kwargs to match ctor signature (best-effort, cached)."""
     if not kwargs:
         return {}
 
@@ -177,13 +167,6 @@ def _resolve_device_and_metadata(
     model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]],
     metadata: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.device, "Dataset[Any]"]:
-    """Resolve (device, metadata) from model/params + optional Dataset metadata.
-
-    Notes:
-      - When `metadata` is provided, it wins.
-      - For non-module inputs, we only "peek" the first param when the container is indexable
-        (to avoid consuming one-shot iterators).
-    """
     ref_tensor: Optional[torch.Tensor] = None
 
     if isinstance(model_or_params, nn.Module):
@@ -224,16 +207,6 @@ def _resolve_device_and_metadata(
 def _coerce_params(
     model_or_params: Union[nn.Module, Iterable[nn.Parameter], Sequence[Dict[str, Any]]]
 ) -> Union[List[nn.Parameter], List[Dict[str, Any]]]:
-    """Materialize `model_or_params` to a re-iterable container.
-
-    Motivation:
-      - Some optimizer backends (or our probing logic) may iterate parameters multiple times.
-      - Generators / one-shot iterators would be exhausted, leading to missing params.
-
-    Returns:
-      - List[nn.Parameter] when given a Module or iterable of parameters.
-      - List[Dict[str, Any]] when given param groups.
-    """
     if isinstance(model_or_params, nn.Module):
         return list(model_or_params.parameters())
 
@@ -262,14 +235,6 @@ def _master_cpu_dtypes(
     device: torch.device,
     meta: Optional["Dataset[Any]"] = None,
 ) -> Tuple[torch.dtype, torch.dtype]:
-    """Return (master_float, master_int) to use for CPU master copies.
-
-    master_float follows PrecisionPolicy.from_metadata when available:
-    - fp64 when dataset cannot be negotiated to fp32 safely
-    - otherwise fp32
-
-    master_int is int64.
-    """
     master_int = torch.int64
     if PrecisionPolicy is None:
         return (torch.float32, master_int)
@@ -293,16 +258,6 @@ def _cpu_master_tensor(
     pin_memory: bool = False,
     non_blocking: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Detach and copy tensor to CPU in master dtype.
-
-    - Floating tensors -> master_float
-    - Complex tensors -> complex64/complex128 derived from master_float
-    - All other tensors -> master_int (int64)
-
-    Implementation notes:
-      - Avoid a redundant CPU->CPU clone for non-CPU sources (GPU->CPU already creates a copy).
-      - When `pin_memory=True`, allocate pinned CPU storage directly (avoids `.pin_memory()` extra copy).
-    """
     if not torch.is_tensor(t):
         raise TypeError("Expected a torch.Tensor")
 
@@ -350,11 +305,6 @@ def _to_cpu_detached(
     pin_memory: bool,
     non_blocking: bool,
 ) -> torch.Tensor:
-    """Detach `t` and return a CPU tensor in `dtype` (best-effort).
-
-    When `pin_memory=True` and the source is CUDA, this attempts a pinned CPU destination
-    plus `copy_(non_blocking=...)` to reduce synchronization overhead.
-    """
     if not torch.is_tensor(t):
         raise TypeError("Expected a torch.Tensor")
 
@@ -376,7 +326,6 @@ def _to_cpu_detached(
 
 
 def _copy_tensor_into_(dst: torch.Tensor, src: torch.Tensor) -> None:
-    """Copy src into dst, handling device/dtype differences best-effort."""
     if not (torch.is_tensor(dst) and torch.is_tensor(src)):
         return
     if dst.data_ptr() == src.data_ptr():
@@ -395,7 +344,6 @@ def _copy_tensor_into_(dst: torch.Tensor, src: torch.Tensor) -> None:
 
 
 def _optimizer_state_to_param_device_(optimizer: optim.Optimizer) -> None:
-    """Move optimizer.state tensors to the device/dtype of their owning param (best-effort)."""
     try:
         state = optimizer.state
     except Exception:
@@ -428,13 +376,6 @@ def _optimizer_state_to_param_device_(optimizer: optim.Optimizer) -> None:
 
 
 class ExponentialMovingAverage(nn.Module):
-    """EMA for model (and optional optimizer state) with CPU master offload.
-
-    Key guarantees:
-    - No aliasing: non-float buffers are not stored as references.
-    - CPU master shadow uses (fp32/fp64/int64) based on dataset negotiability.
-    - Optimizer EMA shadow is stored on CPU and is moved back to param device on apply/restore.
-    """
 
     def __init__(
         self,
@@ -645,7 +586,6 @@ class ExponentialMovingAverage(nn.Module):
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
     ) -> None:
-        """Apply EMA weights (and optional optimizer EMA shadow) to the given objects."""
         model_state = model.state_dict()
         for name, buf in self.shadow.items():
             dst = model_state.get(name)
@@ -662,7 +602,6 @@ class ExponentialMovingAverage(nn.Module):
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
     ) -> None:
-        """Store current model/optimizer state (CPU master copies)."""
         collected: Dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for k, v in model.state_dict().items():
@@ -709,7 +648,6 @@ class ExponentialMovingAverage(nn.Module):
         model: nn.Module,
         optimizer: Optional[optim.Optimizer] = None,
     ) -> None:
-        """Restore model/optimizer state from the last store()."""
         if self.collected:
             # load_state_dict copies tensors into module buffers/params; CPU tensors are fine.
             model.load_state_dict(self.collected, strict=False)
@@ -720,7 +658,6 @@ class ExponentialMovingAverage(nn.Module):
 
 
 class _TensorDictCompat(nn.Module):
-    """Adapter to make AveragedModel accept a single Tensor by wrapping it in a TensorDict."""
 
     def __init__(self, averaged_module: nn.Module, key: str) -> None:
         super().__init__()
@@ -747,7 +684,6 @@ def stochastic_weight_average(
 
 
 class AdamW:
-    """Backend-selecting AdamW factory."""
 
     @staticmethod
     def float(
@@ -783,7 +719,8 @@ class AdamW:
         # 1) Transformer Engine fused AdamW (float)
         if getattr(dev, "type", None) == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
+                from transformer_engine.pytorch.optimizers import \
+                    FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, **_filter_kwargs(TEFusedAdam, common_kwargs))
                 attempts.append({"backend": "te.FusedAdam", "ok": True})
@@ -831,7 +768,8 @@ class AdamW:
                     with contextlib.suppress(Exception):
                         from torchao.optim import AdamWFp8  # type: ignore
                     if AdamWFp8 is None:
-                        from torchao.prototype.float8.optim import AdamWFp8  # type: ignore
+                        from torchao.prototype.float8.optim import \
+                            AdamWFp8  # type: ignore
 
                     opt = AdamWFp8(params, **_filter_kwargs(AdamWFp8, common_kwargs))
                     attempts.append({"backend": "torchao.AdamWFp8", "ok": True, "reason": str(fp8_hw_reason)})
@@ -870,9 +808,11 @@ class AdamW:
         if quant_bits in (4, 8):
             try:
                 try:
-                    from torchao.optim import AdamW4bit, AdamW8bit  # type: ignore
+                    from torchao.optim import (AdamW4bit,  # type: ignore
+                                               AdamW8bit)
                 except ImportError:
-                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit  # type: ignore
+                    from torchao.prototype.low_bit_optim import (  # type: ignore
+                        AdamW4bit, AdamW8bit)
 
                 if int(quant_bits) == 8:
                     opt = AdamW8bit(params, **_filter_kwargs(AdamW8bit, common_kwargs))
@@ -973,7 +913,8 @@ class AdamW:
         # 1) Prefer Transformer Engine fused optimizer when available.
         if getattr(dev, "type", None) == "cuda":
             try:
-                from transformer_engine.pytorch.optimizers import FusedAdam as TEFusedAdam
+                from transformer_engine.pytorch.optimizers import \
+                    FusedAdam as TEFusedAdam
 
                 opt = TEFusedAdam(params, **_filter_kwargs(TEFusedAdam, common_kwargs))
                 selected = "transformer_engine.FusedAdam"
@@ -1037,9 +978,11 @@ class AdamW:
         if opt is None and quant_choice in {"int8", "int4"}:
             try:
                 try:
-                    from torchao.optim import AdamW4bit, AdamW8bit  # type: ignore
+                    from torchao.optim import (AdamW4bit,  # type: ignore
+                                               AdamW8bit)
                 except ImportError:
-                    from torchao.prototype.low_bit_optim import AdamW4bit, AdamW8bit  # type: ignore
+                    from torchao.prototype.low_bit_optim import (  # type: ignore
+                        AdamW4bit, AdamW8bit)
 
                 if quant_choice == "int8":
                     opt = AdamW8bit(params, **_filter_kwargs(AdamW8bit, common_kwargs))
@@ -1101,7 +1044,6 @@ class StochasticWeightAverage:
 
     @contextlib.contextmanager
     def reduction(self, model: nn.Module) -> Iterator[None]:
-        """Temporarily swap `model` params to SWA averaged params (name-safe)."""
         avg_params = dict(self.module.named_parameters())
         backup: Dict[str, torch.Tensor] = {}
 

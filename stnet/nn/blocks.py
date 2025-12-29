@@ -2,16 +2,7 @@
 from __future__ import annotations
 
 import logging
-from typing import (
-    Any,
-    Callable,
-    List,
-    Optional,
-    Protocol,
-    Tuple,
-    Union,
-    cast,
-)
+from typing import Any, Callable, List, Optional, Protocol, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -27,21 +18,14 @@ _LOGGER = logging.getLogger(__name__)
 
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
 from ..core.precision import Autocast
-from .primitives import (
-    CrossAttention,
-    DilatedAttention,
-    PatchAttention,
-    Retention,
-    norm_layer,
-)
-
+from .primitives import (CrossAttention, DilatedAttention, PatchAttention,
+                         Retention, norm_layer)
 
 # -------------------------
 # Small internal utilities
 # -------------------------
 
 def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.device:
-    """Best-effort device inference that follows .to() / DDP moves."""
     try:
         p0 = next(module.parameters(), None)
         if p0 is not None:
@@ -58,11 +42,6 @@ def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.dev
 
 
 class _ControllerChunkRunner:
-    """Callable used by Enhancer.run microbatch executor.
-
-    Kept at module scope to avoid nested function definitions (cleaner pickling
-    and friendlier to free-threaded/no-GIL builds).
-    """
 
     __slots__ = ("backbone", "device", "meta", "amp_enabled")
 
@@ -104,7 +83,6 @@ def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 @torch.no_grad()
 def _expand_morton_bits_3d(v: torch.Tensor) -> torch.Tensor:
-    """Interleave bits for 3D Morton (Z-order) encoding."""
     v = (v | (v << 16)) & 0x030000FF
     v = (v | (v << 8)) & 0x0300F00F
     v = (v | (v << 4)) & 0x030C30C3
@@ -206,11 +184,6 @@ def _sanitize_tensor(
     enabled: bool,
     inplace: bool,
 ) -> torch.Tensor:
-    """Best-effort NaN/Inf sanitization.
-
-    Kept as a module-level helper to avoid per-forward nested function creation
-    in hot paths.
-    """
     if not bool(enabled):
         return t
     if not (t.is_floating_point() or t.is_complex()):
@@ -231,12 +204,6 @@ def _microbatch_prealloc(
     cast_slice: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     stage: str = "microbatch",
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-    """Generic microbatch runner that preallocates output buffers.
-
-    Notes:
-        - When autograd is on, padding buffers are not reused to avoid corrupting saved tensors.
-        - Shapes must remain consistent across slices.
-    """
     if inp.ndim < 1:
         raise ValueError(
             f"{stage}: expected batched input with ndim>=1, got shape={tuple(inp.shape)}"
@@ -511,13 +478,6 @@ class RetNet(nn.Module):
 
 
 class CrossTransformer(nn.Module):
-    """Symmetric cross-axis fusion.
-
-    Important:
-        Mixed modes (ts/st/spatiotemporal/temporospatial/...) are treated identically:
-        - Inputs are always (spatial_tokens, temporal_tokens)
-        - Output token order is always [spatial_part, temporal_part]
-    """
 
     def __init__(
         self,

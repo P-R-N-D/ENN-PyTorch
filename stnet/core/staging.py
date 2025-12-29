@@ -7,12 +7,11 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Any, Optional, Tuple, Protocol, runtime_checkable, Callable
+from typing import Any, Callable, Optional, Protocol, Tuple, runtime_checkable
 
 import torch
 
-from .casting import env_flag, env_first, env_first_float
-
+from .casting import env_first, env_first_float, env_flag
 
 # -----------------------------------------------------------------------------
 # Small helpers
@@ -50,7 +49,6 @@ class _WaitEvent(Protocol):
 # -----------------------------------------------------------------------------
 
 class Page:
-    """Resizable pinned (or regular) CPU buffer used for staging."""
 
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
@@ -96,12 +94,6 @@ class Page:
 
 
 class Pool:
-    """Small reusable CPU staging pool.
-
-    - Reuses pinned CPU buffers for fast H2D.
-    - Avoids unbounded pinned allocations under contention by falling back to
-      one-off **unpinned** buffers when capacity is exhausted (unless block=True).
-    """
 
     @dataclass(slots=True)
     class Token:
@@ -163,16 +155,6 @@ class Pool:
         block: bool = False,
         timeout: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
-        """Get a CPU staging tensor.
-
-        If the pool is exhausted:
-          - block=False (default): return an untracked **unpinned** tensor.
-          - block=True: wait for a page to become available (with periodic fence checks).
-
-        Returns:
-          - tensor (default)
-          - (tensor, Token|None) when return_handle=True
-        """
         import time
 
         shape_t = tuple(int(s) for s in shape)
@@ -293,16 +275,6 @@ class Pool:
         token: Pool.Token | None,
         factory: Callable[[], object] | None,
     ) -> object | None:
-        """Return a reusable fence event associated with a pool token.
-
-        This helps avoid per-batch event allocations when the same pool pages are
-        reused repeatedly for asynchronous staging / I/O.
-
-        Notes:
-          - The returned event object may be recorded multiple times, but callers
-            must only reuse it once the corresponding pool page/token is no
-            longer in-flight (i.e., after the page has been released).
-        """
         if token is None or factory is None:
             return None
 
@@ -379,13 +351,6 @@ class Pool:
 
 @lru_cache(maxsize=1)
 def _cache_backpressure_mode() -> str:
-    """Backpressure behavior for Cache.submit() when the queue is full.
-
-    Modes:
-      - "block" (default): wait for the writer thread to catch up.
-      - "sync": fall back to synchronous saving in the caller thread.
-      - "raise": raise an error if the queue is full.
-    """
     raw = env_first(
         ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
         default="block",
@@ -411,33 +376,15 @@ def _cache_backpressure_timeout_s() -> float:
 
 @lru_cache(maxsize=1)
 def _cache_early_release_enabled() -> bool:
-    """Whether to release pool-backed pinned tensors before disk I/O."""
     return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
 
 
 @lru_cache(maxsize=1)
 def _cache_force_unpin_enabled() -> bool:
-    """Whether to always copy pinned CPU tensors into an unpinned buffer before saving."""
     return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
 
 
 class Cache:
-    """Asynchronous tensor writer with bounded backpressure.
-
-    Environment knobs (read once per Cache instance):
-
-      - STNET_CACHE_BACKPRESSURE_MODE: "block" (default) | "sync" | "raise"
-      - STNET_CACHE_BACKPRESSURE_TIMEOUT_S: initial acquire timeout in seconds (default: 0.05)
-      - STNET_CACHE_EARLY_RELEASE: when `release_cb` is provided for a pinned CPU tensor,
-        copy into an unpinned buffer and run `release_cb` *before* disk I/O (default: enabled)
-      - STNET_CACHE_FORCE_UNPIN: always copy pinned CPU tensors into an unpinned buffer before saving
-        (default: disabled)
-
-    Notes:
-      - `release_cb` is intended for pool token release (e.g. pinned staging buffers). When early
-        release is enabled, the writer thread copies the tensor first and only then calls `release_cb`,
-        so the pool page can be reused while disk I/O is still in progress.
-    """
 
     def __init__(self, root: str, max_queue: int = 8) -> None:
         import queue
@@ -471,7 +418,6 @@ class Cache:
         wait_event: Optional[object] = None,
         release_cb: Optional[object] = None,
     ) -> None:
-        """Submit a tensor for async saving."""
         import os as _os
 
         if self._err_event.is_set():
@@ -568,7 +514,6 @@ class Cache:
         early_release: bool | None = None,
         force_unpin: bool | None = None,
     ) -> tuple[torch.Tensor, bool]:
-        """Return (cpu_tensor, released_early)."""
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
 
@@ -712,14 +657,12 @@ class Cache:
 
 @dataclass(slots=True)
 class ProducerError:
-    """Payload wrapper used to forward producer exceptions to the consumer."""
 
     exc: BaseException
     tb: str
 
 
 def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
-    """Best-effort resource cleanup for common close/stop/join APIs."""
     for name in (
         "cleanup",
         "close",
@@ -753,7 +696,6 @@ def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
 # -----------------------------------------------------------------------------
 
 class Buffer:
-    """Bounded in-memory buffer with backpressure and stop notification."""
 
     def __init__(self, max_batches: int) -> None:
         import collections
@@ -766,7 +708,6 @@ class Buffer:
         self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
 
     def put(self, item: Any, *, timeout: float | None = None) -> bool:
-        """Put an item into the buffer."""
         import logging
         import time
 
@@ -803,7 +744,6 @@ class Buffer:
         return True
 
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
-        """Get an item from the buffer."""
         import queue
         import time
 
@@ -843,14 +783,6 @@ class Buffer:
             return int(len(self._buf))
 
     def wait_for_space(self, *, timeout: float | None = None) -> bool:
-        """Block until the buffer has capacity (or stop is requested).
-
-        This is useful for producers that want to avoid holding an extra "in-flight"
-        item outside the buffer when at capacity.
-
-        Returns:
-            True if space is available, False if timed out or stop is set.
-        """
         import time
 
         if self._stop.is_set():
@@ -870,10 +802,6 @@ class Buffer:
             return not bool(self._stop.is_set())
 
     def clear(self) -> None:
-        """Drop all buffered items (best-effort).
-
-        This is primarily a memory hygiene helper for early-abort scenarios.
-        """
         with self._cv:
             self._buf.clear()
             self._cv.notify_all()

@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+
 import importlib
-__all__ = ['core', 'data', 'nn', 'runtime', 'api', 'new_model', 'load_model', 'save_model', 'train', 'predict', 'get_prediction']
+
+__all__ = ['core', 'data', 'nn', 'runtime', 'api', 'config', 'new_model', 'load_model', 'save_model', 'train', 'predict', 'get_prediction']
 
 def __getattr__(name):
-    if name in {'core', 'data', 'nn', 'runtime', 'api'}:
+    if name in {'core', 'data', 'nn', 'runtime', 'api', 'config'}:
         return importlib.import_module(f'stnet.{name}')
     raise AttributeError(f"module 'stnet' has no attribute '{name}'")
 
