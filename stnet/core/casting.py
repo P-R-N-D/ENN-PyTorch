@@ -4,122 +4,14 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import Callable, Sequence
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
 
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
+
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
-
-
-def parse_bool(value: object) -> bool | None:
-
-    if value is None:
-        return None
-    s = str(value).strip().lower()
-    if not s:
-        return None
-    if s in _TRUE:
-        return True
-    if s in _FALSE:
-        return False
-    return None
-
-
-def _env_clean(value: object | None) -> str | None:
-    if value is None:
-        return None
-    s = str(value).strip()
-    return s or None
-
-
-def env_str(name: str, default: str | None = None) -> str | None:
-    s = _env_clean(os.getenv(name))
-    return s if s is not None else default
-
-
-def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
-    s = env_str(name)
-    if s is None:
-        return default
-    try:
-        return cast(s)
-    except (ValueError, TypeError):
-        return default
-
-
-def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
-    raw: object | None
-    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
-        raw = env_first(list(name), default=None)
-    else:
-        raw = os.environ.get(str(name))
-
-    v = parse_bool(raw)
-    if v is None:
-        return bool(default)
-    return bool(v)
-
-
-def env_int(name: str, default: int = 0) -> int:
-    return int(_env_cast(name, int, int(default)))
-
-
-def env_float(name: str, default: float = 0.0) -> float:
-    return float(_env_cast(name, float, float(default)))
-
-
-def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
-
-    for k in keys:
-        s = _env_clean(os.getenv(k))
-        if s is not None:
-            return s
-    return default
-
-
-def env_flag(*keys: str, default: bool = False) -> bool:
-    if not keys:
-        return bool(default)
-
-    raw = env_first(keys)
-    v = parse_bool(raw)
-    if v is not None:
-        return bool(v)
-
-    if raw is None:
-        return bool(default)
-
-    # Legacy behavior: any non-empty string => True
-    return bool(str(raw).strip())
-
-
-def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
-    v = parse_bool(env_first(keys))
-    if v is None:
-        return bool(default)
-    return bool(v)
-
-
-def env_first_int(keys: Sequence[str], default: int = 0) -> int:
-    v = env_first(keys)
-    if v is None:
-        return int(default)
-    try:
-        return int(v)
-    except (ValueError, TypeError):
-        return int(default)
-
-
-def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
-    v = env_first(keys)
-    if v is None:
-        return float(default)
-    try:
-        return float(v)
-    except (ValueError, TypeError):
-        return float(default)
 
 _CANONICAL_DTYPES: dict[str, dict[str, Any]] = {
     "float64": {
@@ -194,7 +86,6 @@ _DTYPE_ALIASES: dict[str, str] = {
     "f16": "float16",
     "f32": "float32",
     "f64": "float64",
-    # ints
     "long": "int64",
     "int": "int32",
     "short": "int16",
@@ -219,6 +110,108 @@ _PLATFORM_ALIASES: dict[str, str] = {
 }
 
 
+def _env_clean(value: object | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    return s or None
+
+
+def parse_bool(value: object) -> bool | None:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s in _TRUE:
+        return True
+    if s in _FALSE:
+        return False
+    return None
+
+
+def env_str(name: str, default: str | None = None) -> str | None:
+    s = _env_clean(os.getenv(name))
+    return s if s is not None else default
+
+
+def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
+    s = env_str(name)
+    if s is None:
+        return default
+    try:
+        return cast(s)
+    except (ValueError, TypeError):
+        return default
+
+
+def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
+    raw: object | None
+    if isinstance(name, Sequence) and not isinstance(name, (str, bytes, bytearray)):
+        raw = env_first(list(name), default=None)
+    else:
+        raw = os.environ.get(str(name))
+    v = parse_bool(raw)
+    if v is None:
+        return bool(default)
+    return bool(v)
+
+
+def env_int(name: str, default: int = 0) -> int:
+    return int(_env_cast(name, int, int(default)))
+
+
+def env_float(name: str, default: float = 0.0) -> float:
+    return float(_env_cast(name, float, float(default)))
+
+
+def env_first(keys: Sequence[str], default: str | None = None) -> str | None:
+    for k in keys:
+        s = _env_clean(os.getenv(k))
+        if s is not None:
+            return s
+    return default
+
+
+def env_flag(*keys: str, default: bool = False) -> bool:
+    if not keys:
+        return bool(default)
+    raw = env_first(keys)
+    v = parse_bool(raw)
+    if v is not None:
+        return bool(v)
+    if raw is None:
+        return bool(default)
+    return bool(str(raw).strip())
+
+
+def env_first_bool(keys: Sequence[str], default: bool = False) -> bool:
+    v = parse_bool(env_first(keys))
+    if v is None:
+        return bool(default)
+    return bool(v)
+
+
+def env_first_int(keys: Sequence[str], default: int = 0) -> int:
+    v = env_first(keys)
+    if v is None:
+        return int(default)
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return int(default)
+
+
+def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
+    v = env_first(keys)
+    if v is None:
+        return float(default)
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return float(default)
+
+
 def _canonical_dtype(src: Any) -> str:
     if src is None:
         raise TypeError("dtype cannot be None")
@@ -238,7 +231,6 @@ def _canonical_dtype(src: Any) -> str:
         key = key.split(".", 1)[1]
     if key.startswith("numpy."):
         key = key.split(".", 1)[1]
-    # Handle representations like dtype('float32') or dtype(float32)
     if key.startswith("dtype(") and key.endswith(")"):
         inner = key[5:].strip("()").strip().strip("'\"")
         if inner:
@@ -267,8 +259,7 @@ def to_platform_dtype(src: Any, platform: str) -> Any:
         raise TypeError(f"unsupported dtype conversion: {src!r} -> {platform!r}") from e
 
 
-def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
-
+def parse_torch_dtype(src: Any) -> torch.dtype | None:
     if src is None:
         return None
     if isinstance(src, torch.dtype):
@@ -277,13 +268,10 @@ def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
         return to_platform_dtype(src, "torch")
     except Exception:
         pass
-
-    # Fallback: torch.<name> attribute lookup.
     try:
         key = str(src).strip()
     except Exception:
         return None
-
     if not key:
         return None
     if key.startswith("torch."):
@@ -296,7 +284,6 @@ def parse_torch_dtype(src: Any) -> Optional[torch.dtype]:
 
 
 def dtype_from_name(name: Any, default: torch.dtype) -> torch.dtype:
-
     dt = parse_torch_dtype(name)
     return dt if isinstance(dt, torch.dtype) else default
 
@@ -310,10 +297,8 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
             try:
                 out = method()
             except TypeError:
-                # exists but requires args / incompatible signature
                 continue
             except Exception:
-                # best-effort: ignore custom conversion failures
                 continue
             if isinstance(out, torch.Tensor):
                 return out
@@ -325,4 +310,3 @@ def to_torch_tensor(obj: Any) -> torch.Tensor:
         return torch.as_tensor(obj)
     except Exception as e:
         raise TypeError(f"cannot convert to torch.Tensor: {type(obj)}") from e
-
