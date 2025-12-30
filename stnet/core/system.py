@@ -31,7 +31,7 @@ from .casting import (env_bool, env_first, env_first_float, env_first_int,
 
 try:
     from zoneinfo import ZoneInfo
-except Exception:  # pragma: no cover
+except Exception:
     ZoneInfo = None
 
 
@@ -45,8 +45,6 @@ _RUNTIME_CFG = SimpleNamespace(
 )
 _RUNTIME_CFG_LOCK = threading.Lock()
 
-# fp32_precision is (effectively) process-global; keep a small cache to avoid
-# repeated writes in tight loops.
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _FP32_PRECISION_LOCK = threading.Lock()
 
@@ -56,8 +54,6 @@ _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
 _LOGGER = logging.getLogger(__name__)
 
 
-# Torch thread configuration is process-global. In particular,
-# torch.set_num_interop_threads() can only be called once per process.
 _TORCH_THREAD_CFG_LOCK = threading.Lock()
 _TORCH_NUM_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_THREADS_SET: Optional[int] = None
@@ -94,6 +90,30 @@ def _log_debug(logger: Optional[Any], msg: str) -> None:
         _LOGGER.debug(msg)
 
 
+def _try_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    if not callable(fn):
+        return None
+    with contextlib.suppress(Exception):
+        return fn(*args, **kwargs)
+    return None
+
+
+def _try_call_variants(
+    fn: Any,
+    variants: Sequence[tuple[tuple[Any, ...], dict[str, Any]]],
+) -> Any:
+    if not callable(fn):
+        return None
+    for a, k in variants:
+        try:
+            return fn(*a, **k)
+        except TypeError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
 def _empty_cache_device_key(
     device: Optional[Union[torch.device, str]] = None,
 ) -> Tuple[str, int]:
@@ -107,7 +127,6 @@ def _empty_cache_device_key(
 
     idx = int(dev.index) if dev.index is not None else -1
 
-    # Best-effort fill-in for "cuda"/"xpu" when index is omitted.
     if dev.type == "cuda" and idx < 0:
         try:
             if torch.cuda.is_available():
@@ -146,7 +165,6 @@ def _linux_cgroup_cpu_quota() -> Optional[float]:
         except Exception:
             return None
 
-    # cgroup v2
     try:
         root = "/sys/fs/cgroup"
         if os.path.exists(os.path.join(root, "cgroup.controllers")):
@@ -170,7 +188,6 @@ def _linux_cgroup_cpu_quota() -> Optional[float]:
     except Exception:
         pass
 
-    # cgroup v1
     try:
         cpu_rel: Optional[str] = None
         with open("/proc/self/cgroup", "r", encoding="utf-8", errors="ignore") as fh:
@@ -243,174 +260,6 @@ def _darwin_sysctl_cpu_count() -> Optional[int]:
     return None
 
 
-def accel_backend_for_device_type(device_type: Union[str, torch.device, None]) -> Optional[Any]:
-    dev = str(getattr(device_type, "type", device_type) or "").lower()
-    if dev == "cuda":
-        return getattr(torch, "cuda", None)
-    if dev == "xpu":
-        return getattr(torch, "xpu", None)
-    if dev == "mps":
-        return getattr(torch, "mps", None)
-    acc = getattr(torch, "accelerator", None)
-    if acc is not None:
-        dt = getattr(acc, "device_type", None)
-        if dt == dev:
-            return acc
-    return None
-
-
-def accel_is_available(device_type: Union[str, torch.device, None]) -> bool:
-    backend = accel_backend_for_device_type(device_type)
-    fn = getattr(backend, "is_available", None) if backend is not None else None
-    if callable(fn):
-        try:
-            return bool(fn())
-        except Exception:
-            return False
-    return False
-
-
-def accel_device_count(device_type: Union[str, torch.device, None]) -> int:
-    backend = accel_backend_for_device_type(device_type)
-    fn = getattr(backend, "device_count", None) if backend is not None else None
-    if callable(fn):
-        try:
-            return int(fn())
-        except Exception:
-            return 0
-    return 0
-
-
-def accel_current_device_index(device_type: Union[str, torch.device, None]) -> Optional[int]:
-    backend = accel_backend_for_device_type(device_type)
-    fn = getattr(backend, "current_device", None) if backend is not None else None
-    if callable(fn):
-        try:
-            return int(fn())
-        except Exception:
-            return None
-    return None
-
-
-def accel_set_device_index(device_type: Union[str, torch.device, None], index: int) -> None:
-    backend = accel_backend_for_device_type(device_type)
-    fn = getattr(backend, "set_device", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            fn(index)
-
-
-def accel_manual_seed_all(device_type: Union[str, torch.device, None], seed: int) -> None:
-    backend = accel_backend_for_device_type(device_type)
-    fn = getattr(backend, "manual_seed_all", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            fn(seed)
-
-
-def accel_make_event(device: torch.device, enable_timing: bool = True) -> Optional[Any]:
-    backend = accel_backend_for_device_type(getattr(device, "type", None))
-    Event = getattr(backend, "Event", None) if backend is not None else None
-    if Event is None:
-        return None
-    try:
-        return Event(enable_timing=bool(enable_timing))
-    except TypeError:
-        with contextlib.suppress(Exception):
-            return Event()
-    except Exception:
-        return None
-
-
-def accel_stream_context(stream: Any, device_type: Union[str, torch.device, None] = None) -> contextlib.AbstractContextManager:
-    backend = accel_backend_for_device_type(device_type)
-    stream_ctx = getattr(backend, "stream", None) if backend is not None else None
-    if callable(stream_ctx):
-        try:
-            return stream_ctx(stream)
-        except Exception:
-            return contextlib.nullcontext()
-    return contextlib.nullcontext()
-
-
-def accel_synchronize(device: torch.device) -> None:
-    backend = accel_backend_for_device_type(getattr(device, "type", None))
-    fn = getattr(backend, "synchronize", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            try:
-                fn(device=device)
-                return
-            except TypeError:
-                fn(device)
-
-
-def accel_timing_events_supported_for_device_type(device_type: Union[str, torch.device, None]) -> bool:
-    backend = accel_backend_for_device_type(device_type)
-    Event = getattr(backend, "Event", None) if backend is not None else None
-    return callable(Event)
-
-
-def accel_memory_allocated(device: torch.device) -> Optional[int]:
-    backend = accel_backend_for_device_type(getattr(device, "type", None))
-    fn = getattr(backend, "memory_allocated", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            try:
-                val = fn(device=device)
-            except TypeError:
-                val = fn(device)
-            except Exception:
-                val = fn()
-            if val is not None:
-                return max(0, int(val))
-    return None
-
-
-def accel_max_memory_allocated(device: torch.device) -> Optional[int]:
-    backend = accel_backend_for_device_type(getattr(device, "type", None))
-    fn = getattr(backend, "max_memory_allocated", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            try:
-                val = fn(device=device)
-            except TypeError:
-                val = fn(device)
-            except Exception:
-                val = fn()
-            if val is not None:
-                return max(0, int(val))
-    return None
-
-
-def accel_reset_peak_memory_stats(device: torch.device) -> None:
-    backend = accel_backend_for_device_type(getattr(device, "type", None))
-    fn = getattr(backend, "reset_peak_memory_stats", None) if backend is not None else None
-    if callable(fn):
-        with contextlib.suppress(Exception):
-            try:
-                fn(device=device)
-            except TypeError:
-                fn(device)
-            except Exception:
-                fn()
-
-
-def accel_pinned_h2d_supported_for_device_type(device_type: Union[str, torch.device, None]) -> bool:
-    dev = str(getattr(device_type, "type", device_type) or "").lower()
-    if dev in {"cuda", "xpu"}:
-        return accel_is_available(dev)
-    return False
-
-
-def device_mem_util_percent(device: torch.device) -> Optional[float]:
-    free, total = Memory.device_mem_get_info(device)
-    if free is None or total is None or total <= 0:
-        return None
-    used = max(0, int(total) - int(free))
-    return float(used) * 100.0 / float(total) if total > 0 else None
-
-
 def _windows_allowed_cpu_indices() -> Optional[list[int]]:
     if platform.system() != "Windows":
         return None
@@ -420,7 +269,6 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
     except Exception:
         return None
 
-    # 1) Process affinity mask (covers current group).
     try:
         get_proc = getattr(k32, "GetCurrentProcess", None)
         get_mask = getattr(k32, "GetProcessAffinityMask", None)
@@ -436,7 +284,6 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
     except Exception:
         pass
 
-    # 2) Processor groups: build a contiguous index space for allowed groups.
     try:
         get_group_cnt = getattr(k32, "GetActiveProcessorGroupCount", None)
         get_group_procs = getattr(k32, "GetActiveProcessorCount", None)
@@ -457,7 +304,6 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
                     c = int(get_group_procs(int(i)))
             counts.append(max(0, int(c)))
 
-        # Restrict to groups this process is allowed to run on (if supported).
         groups: list[int] | None = None
         get_pg_aff = getattr(k32, "GetProcessGroupAffinity", None)
         if callable(get_pg_aff):
@@ -489,7 +335,6 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
 
 
 def get_allowed_cpus() -> list[int]:
-    # 1) Native affinity (Linux, some Unix)
     with contextlib.suppress(Exception):
         cpus = os.sched_getaffinity(0)
         if cpus:
@@ -497,7 +342,6 @@ def get_allowed_cpus() -> list[int]:
             if out:
                 return out
 
-    # 2) psutil per-process affinity (Windows/Linux)
     try:
         import psutil  # type: ignore
 
@@ -512,7 +356,6 @@ def get_allowed_cpus() -> list[int]:
     except Exception:
         pass
 
-    # 3) Windows-specific fallbacks
     with contextlib.suppress(Exception):
         cpus = _windows_allowed_cpu_indices()
         if cpus:
@@ -520,7 +363,6 @@ def get_allowed_cpus() -> list[int]:
             if out:
                 return out
 
-    # 4) Last resort
     n: Optional[int] = None
     with contextlib.suppress(Exception):
         v = os.cpu_count()
@@ -562,7 +404,6 @@ def process_cpu_count() -> int:
 
     n: Optional[int] = None
 
-    # Python 3.13+: respects affinity/cgroup and -X cpu_count / PYTHON_CPU_COUNT override.
     with contextlib.suppress(Exception):
         fn = getattr(os, "process_cpu_count", None)
         if callable(fn):
@@ -571,7 +412,6 @@ def process_cpu_count() -> int:
                 n = int(v)
 
     if n is None:
-        # Cross-platform affinity best-effort.
         with contextlib.suppress(Exception):
             n = max(1, int(len(get_allowed_cpus())))
 
@@ -583,7 +423,6 @@ def process_cpu_count() -> int:
 
     n = int(n) if isinstance(n, int) and n > 0 else 1
 
-    # Clamp by cgroup CPU quota (Linux) unless the user explicitly overrode.
     quota = None
     with contextlib.suppress(Exception):
         quota = _linux_cgroup_cpu_quota()
@@ -631,257 +470,6 @@ def _effective_thread_cap(*, ncpu: int, cap_mult: int, local_world: int, distrib
     return int(node_thread_cap)
 
 
-@dataclass(slots=True)
-class WorkerPolicy:
-    nproc_per_node: int = 1
-    device: str = "cpu"
-    local_world_size: int = 1
-
-    intra_ops: int = 1
-    inter_ops: int = 1
-
-    num_workers: int = 1
-    prebatch: int = 1
-    prefetch_factor: int = 1
-    max_concurrency: int = 1
-    h2d_streams: int = 1
-
-    @staticmethod
-    def _cpu_count() -> int:
-        return process_cpu_count()
-
-    @staticmethod
-    def _detect_accelerator() -> Tuple[str, int]:
-        dev_type = "cpu"
-        n = 0
-
-        try:
-            accel = getattr(torch, "accelerator", None)
-            if accel is not None and hasattr(accel, "is_available") and accel.is_available():
-                current = getattr(accel, "current_accelerator", None)
-                if callable(current):
-                    dev = current(False)
-                    if isinstance(dev, torch.device):
-                        dev_type = dev.type
-                dc = getattr(accel, "device_count", None)
-                if callable(dc):
-                    n = int(dc())
-        except Exception:
-            dev_type, n = "cpu", 0
-
-        try:
-            if n <= 0:
-                if torch.cuda.is_available():
-                    dev_type = "cuda"
-                    n = int(torch.cuda.device_count())
-                else:
-                    xpu = getattr(torch, "xpu", None)
-                    if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
-                        dev_type = "xpu"
-                        n = int(getattr(xpu, "device_count", lambda: 1)())
-                    else:
-                        mps_backend = getattr(torch.backends, "mps", None)
-                        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
-                            dev_type = "mps"
-                            n = 1
-        except Exception:
-            pass
-
-        if n <= 0:
-            dev_type, n = "cpu", 0
-        return dev_type, max(0, n)
-
-    @classmethod
-    def autotune(cls) -> "WorkerPolicy":
-        ncpu_raw = max(1, int(cls._cpu_count() or 1))
-        dev_type, nacc = cls._detect_accelerator()
-        is_accel = bool(nacc and int(nacc) > 0)
-
-        local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
-        local_world_guess = max(1, int(env_first_int(
-            ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
-            local_world_guess,
-        )))
-
-        # Free-threading/No-GIL: enable more aggressive defaults only when actually beneficial.
-        _nogil = False
-        with contextlib.suppress(Exception):
-            _nogil = bool(CPUAffinity.nogil_optimizations_enabled())
-
-        cap_mult = _default_cap_mult(ncpu_raw, is_accel=is_accel, nogil=_nogil)
-
-        distribute_default = int(local_world_guess) > 1
-        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
-
-        thread_cap = _effective_thread_cap(
-            ncpu=ncpu_raw,
-            cap_mult=cap_mult,
-            local_world=int(local_world_guess),
-            distribute=bool(distribute),
-        )
-
-        eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
-
-        soft_inflight = 8 if is_accel else 4
-        with contextlib.suppress(Exception):
-            from ..data.pipeline import LoaderPolicy
-
-            lp = LoaderPolicy()
-            hard = int(lp.hard_inflight_batches(dev_type))
-            soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
-
-        soft_auto_enabled = bool(env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1))
-        soft_inflight_max_default = (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
-        soft_inflight_max = max(8, env_first_int(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
-        soft_inflight_explicit = env_first_int(("STNET_SOFT_INFLIGHT_CAP",), 0)
-        if soft_inflight_explicit > 0:
-            soft_inflight = max(1, int(soft_inflight_explicit))
-        elif soft_auto_enabled:
-            soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
-            soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
-            auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
-            soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
-
-        soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
-
-        if is_accel:
-            if eff_cores <= 4:
-                model_ratio = 1.00
-            elif eff_cores <= 8:
-                model_ratio = 0.90
-            elif eff_cores <= 16:
-                model_ratio = 0.80
-            elif eff_cores <= 32:
-                model_ratio = 0.70
-            else:
-                model_ratio = 0.60
-        else:
-            if eff_cores <= 4:
-                model_ratio = 1.00
-            elif eff_cores <= 8:
-                model_ratio = 0.95
-            elif eff_cores <= 16:
-                model_ratio = 0.90
-            else:
-                model_ratio = 0.85
-
-        with contextlib.suppress(Exception):
-            env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
-            model_ratio = float(env_float(env_key, float(model_ratio)))
-        model_ratio = float(max(0.25, min(1.0, model_ratio)))
-
-        model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
-
-        if model_budget <= 2:
-            inter_ops = 1
-        elif model_budget <= 8:
-            inter_ops = max(1, model_budget // 4)
-        else:
-            inter_ops = max(2, min(8, model_budget // 6))
-        inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
-        intra_ops = max(1, int(model_budget) - int(inter_ops))
-
-        data_budget = max(1, int(thread_cap) - (int(intra_ops) + int(inter_ops)))
-
-        prebatch = 1
-        prefetch_factor = 1
-
-        env_pre = env_str("STNET_PREBATCH")
-        if env_pre:
-            with contextlib.suppress(Exception):
-                prebatch = max(1, int(env_pre))
-        elif _nogil:
-            prebatch = 2
-
-        env_pf = env_str("STNET_PREFETCH_FACTOR")
-        if env_pf:
-            with contextlib.suppress(Exception):
-                prefetch_factor = max(1, int(env_pf))
-        elif _nogil:
-            prefetch_factor = 2
-
-        prebatch = max(1, int(prebatch))
-        prefetch_factor = max(1, int(prefetch_factor))
-
-        base_workers = max(1, int(data_budget))
-        base_workers = min(int(base_workers), int(thread_cap), int(soft_inflight))
-
-        max_workers = max(
-            1,
-            int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
-        )
-        num_workers = max(1, min(int(base_workers), int(max_workers), int(soft_inflight)))
-
-        max_concurrency = max(1, int(num_workers))
-
-        total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
-        if total_threads > int(thread_cap):
-            overflow = int(total_threads) - int(thread_cap)
-            if dev_type == "cpu":
-                num_workers = max(1, int(num_workers) - int(overflow))
-            else:
-                intra_ops = max(1, int(intra_ops) - int(overflow))
-
-            intra_ops = max(1, int(thread_cap) - int(inter_ops) - int(num_workers))
-            max_concurrency = max(1, min(int(max_concurrency), int(num_workers)))
-
-        local_world = int(local_world_guess)
-
-        return cls(
-            nproc_per_node=local_world,
-            device=dev_type,
-            local_world_size=local_world,
-            intra_ops=int(intra_ops),
-            inter_ops=int(inter_ops),
-            num_workers=int(num_workers),
-            prebatch=int(prebatch),
-            prefetch_factor=int(prefetch_factor),
-            max_concurrency=int(max_concurrency),
-            h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
-        )
-
-    def as_threads_dict(self) -> dict[str, int]:
-        return {
-            "intra_ops": int(self.intra_ops),
-            "inter_ops": int(self.inter_ops),
-            "num_workers": int(self.num_workers),
-            "max_concurrency": int(self.max_concurrency),
-            "prebatch": int(self.prebatch),
-            "prefetch_factor": int(self.prefetch_factor),
-        }
-
-    def as_procs_dict(self) -> dict[str, Union[int, str]]:
-        return {
-            "nproc_per_node": int(self.nproc_per_node),
-            "device": str(self.device),
-        }
-
-    def apply_torch_threads(self) -> None:
-        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
-
-        intra = max(1, int(self.intra_ops))
-        inter = max(1, int(self.inter_ops))
-
-        with _TORCH_THREAD_CFG_LOCK:
-            if _TORCH_NUM_THREADS_SET != int(intra):
-                with contextlib.suppress(Exception):
-                    torch.set_num_threads(int(intra))
-                    _TORCH_NUM_THREADS_SET = int(intra)
-
-            if hasattr(torch, "set_num_interop_threads") and not bool(_TORCH_INTEROP_LOCKED):
-                if _TORCH_INTEROP_THREADS_SET is None:
-                    try:
-                        torch.set_num_interop_threads(int(inter))
-                        _TORCH_INTEROP_THREADS_SET = int(inter)
-                    except Exception:
-                        # Per PyTorch docs, inter-op threads can be set only once
-                        # and before parallel work starts. Avoid retry storms.
-                        _TORCH_INTEROP_LOCKED = True
-                elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
-                    # Keep the first value.
-                    pass
-
-
 def empty_device_cache(
     *,
     device: Optional[Union[torch.device, str]] = None,
@@ -919,183 +507,145 @@ def empty_device_cache(
         if callable(empty_cache):
             empty_cache()
 
-    # Backend-specific clearing:
-    # - If device is provided, clear only that backend (avoid cross-backend blast radius).
-    # - If device is None, keep the previous "clear everything best-effort" behavior.
     target = None
     with contextlib.suppress(Exception):
         if device is not None:
             target = device if isinstance(device, torch.device) else torch.device(str(device))
 
-    with contextlib.suppress(Exception):
-        if target is None or target.type == "cuda":
+    dt = getattr(target, "type", None) if target is not None else None
+    match str(dt or "all"):
+        case "cuda" | "all":
             if torch.cuda.is_available():
                 if target is not None and target.index is not None:
                     with torch.cuda.device(int(target.index)):
-                        torch.cuda.empty_cache()
+                        _try_call(getattr(torch.cuda, "empty_cache", None))
                 else:
-                    torch.cuda.empty_cache()
-
-    with contextlib.suppress(Exception):
-        if target is None or getattr(target, "type", None) == "mps":
+                    _try_call(getattr(torch.cuda, "empty_cache", None))
+        case "mps" | "all":
             mps_mod = getattr(torch, "mps", None)
-            empty_cache = getattr(mps_mod, "empty_cache", None) if mps_mod is not None else None
-            if callable(empty_cache):
-                empty_cache()
-
-    with contextlib.suppress(Exception):
-        if target is None or getattr(target, "type", None) == "xpu":
+            _try_call(getattr(mps_mod, "empty_cache", None))
+        case "xpu" | "all":
             xpu_mod = getattr(torch, "xpu", None)
-            empty_cache = getattr(xpu_mod, "empty_cache", None) if xpu_mod is not None else None
-            if callable(empty_cache):
-                empty_cache()
-            else:
+            if _try_call(getattr(xpu_mod, "empty_cache", None)) is None:
                 memory_mod = getattr(xpu_mod, "memory", None) if xpu_mod is not None else None
-                empty_cache = getattr(memory_mod, "empty_cache", None) if memory_mod is not None else None
-                if callable(empty_cache):
-                    empty_cache()
-
-
-# -----------------------------------------------------------------------------
-# Accelerator helpers (CUDA/XPU/MPS + torch.accelerator)
-# -----------------------------------------------------------------------------
+                _try_call(getattr(memory_mod, "empty_cache", None))
+        case _:
+            pass
 
 
 @lru_cache(maxsize=8)
 def accel_backend_for_device_type(dev_type: str) -> Optional[ModuleType]:
-
     dt = str(dev_type or "cpu").strip().lower()
-    if dt in {"cuda", "xpu", "mps"}:
-        return getattr(torch, dt, None)
-    return None
-
-
+    match dt:
+        case "cuda" | "xpu" | "mps":
+            return getattr(torch, dt, None)
+        case _:
+            acc = getattr(torch, "accelerator", None)
+            if acc is not None and getattr(acc, "device_type", None) == dt:
+                return acc
+            return None
 
 
 @lru_cache(maxsize=8)
 def accel_is_available(dev_type: str) -> bool:
     dt = str(dev_type or "cpu").strip().lower()
 
-    if dt == "cuda":
-        with contextlib.suppress(Exception):
-            return bool(torch.cuda.is_available())
-        return False
-
-    if dt == "xpu":
-        xpu = getattr(torch, "xpu", None)
-        fn = getattr(xpu, "is_available", None) if xpu is not None else None
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                return bool(fn())
-        return False
-
-    if dt == "mps":
-        # Prefer the official availability API in torch.backends.
-        with contextlib.suppress(Exception):
+    match dt:
+        case "cuda":
+            v = _try_call(getattr(torch.cuda, "is_available", None))
+            return bool(v) if v is not None else False
+        case "xpu":
+            xpu = getattr(torch, "xpu", None)
+            v = _try_call(getattr(xpu, "is_available", None))
+            return bool(v) if v is not None else False
+        case "mps":
             mps_backend = getattr(torch.backends, "mps", None)
-            fn = getattr(mps_backend, "is_available", None) if mps_backend is not None else None
-            if callable(fn):
-                return bool(fn())
-
-        # Fallback (older/alternate builds).
-        mps_mod = getattr(torch, "mps", None)
-        fn2 = getattr(mps_mod, "is_available", None) if mps_mod is not None else None
-        if callable(fn2):
-            with contextlib.suppress(Exception):
-                return bool(fn2())
-        return False
-
-    return False
+            v = _try_call(getattr(mps_backend, "is_available", None))
+            if v is not None:
+                return bool(v)
+            mps_mod = getattr(torch, "mps", None)
+            v2 = _try_call(getattr(mps_mod, "is_available", None))
+            return bool(v2) if v2 is not None else False
+        case _:
+            backend = accel_backend_for_device_type(dt)
+            v = _try_call(getattr(backend, "is_available", None))
+            return bool(v) if v is not None else False
 
 
 @lru_cache(maxsize=8)
 def accel_device_count(dev_type: str) -> int:
     dt = str(dev_type or "cpu").strip().lower()
 
-    if dt == "cuda":
-        if not accel_is_available("cuda"):
-            return 0
-        with contextlib.suppress(Exception):
-            return int(torch.cuda.device_count())
-        return 0
+    match dt:
+        case "cuda":
+            if not accel_is_available("cuda"):
+                return 0
+            return int(_try_call(getattr(torch.cuda, "device_count", None)) or 0)
 
-    if dt == "xpu":
-        if not accel_is_available("xpu"):
-            return 0
-        xpu = getattr(torch, "xpu", None)
-        dc = getattr(xpu, "device_count", None) if xpu is not None else None
-        if callable(dc):
-            with contextlib.suppress(Exception):
-                return max(0, int(dc()))
-        return 0
+        case "xpu":
+            if not accel_is_available("xpu"):
+                return 0
+            xpu = getattr(torch, "xpu", None)
+            dc = getattr(xpu, "device_count", None) if xpu is not None else None
+            v = _try_call(dc)
+            return max(0, int(v)) if v is not None else 0
 
-    if dt == "mps":
-        return 1 if accel_is_available("mps") else 0
-
-    return 0
+        case "mps":
+            return 1 if accel_is_available("mps") else 0
+        case _:
+            backend = accel_backend_for_device_type(dt)
+            v = _try_call(getattr(backend, "device_count", None))
+            return int(v) if v is not None else 0
 
 
 def accel_current_device_index(dev_type: str) -> int:
     dt = str(dev_type or "cpu").strip().lower()
 
-    if dt == "cuda":
-        if not accel_is_available("cuda"):
-            return -1
-        with contextlib.suppress(Exception):
-            return int(torch.cuda.current_device())
-        return 0
-
-    if dt == "xpu":
-        if not accel_is_available("xpu"):
-            return -1
-        xpu = getattr(torch, "xpu", None)
-        cur = getattr(xpu, "current_device", None) if xpu is not None else None
-        if callable(cur):
-            with contextlib.suppress(Exception):
-                return int(cur())
-        return 0
-
-    if dt == "mps":
-        return 0 if accel_is_available("mps") else -1
-
-    return -1
+    match dt:
+        case "cuda":
+            if not accel_is_available("cuda"):
+                return -1
+            v = _try_call(getattr(torch.cuda, "current_device", None))
+            return int(v) if v is not None else 0
+        case "xpu":
+            if not accel_is_available("xpu"):
+                return -1
+            xpu = getattr(torch, "xpu", None)
+            v = _try_call(getattr(xpu, "current_device", None))
+            return int(v) if v is not None else 0
+        case "mps":
+            return 0 if accel_is_available("mps") else -1
+        case _:
+            backend = accel_backend_for_device_type(dt)
+            v = _try_call(getattr(backend, "current_device", None))
+            return int(v) if v is not None else -1
 
 
 def accel_set_device_index(dev_type: str, idx: int) -> None:
     dt = str(dev_type or "cpu").strip().lower()
     i = int(idx)
 
-    if dt == "cuda":
-        if not accel_is_available("cuda"):
-            return
-        with contextlib.suppress(Exception):
-            torch.cuda.set_device(i)
-        return
-
-    if dt == "xpu":
-        if not accel_is_available("xpu"):
-            return
-        xpu = getattr(torch, "xpu", None)
-        fn = getattr(xpu, "set_device", None) if xpu is not None else None
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                fn(i)
-        return
+    match dt:
+        case "cuda":
+            if accel_is_available("cuda"):
+                _try_call(getattr(torch.cuda, "set_device", None), i)
+        case "xpu":
+            if accel_is_available("xpu"):
+                xpu = getattr(torch, "xpu", None)
+                _try_call(getattr(xpu, "set_device", None), i)
+        case _:
+            backend = accel_backend_for_device_type(dt)
+            _try_call(getattr(backend, "set_device", None), i)
 
 
 def accel_manual_seed_all(seed: int) -> None:
     s = int(seed)
-    # CUDA
     if accel_is_available("cuda"):
-        with contextlib.suppress(Exception):
-            torch.cuda.manual_seed_all(s)
-    # XPU
+        _try_call(getattr(torch.cuda, "manual_seed_all", None), s)
     if accel_is_available("xpu"):
         xpu = getattr(torch, "xpu", None)
         fn = getattr(xpu, "manual_seed_all", None) if xpu is not None else None
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                fn(s)
+        _try_call(fn, s)
 
 
 def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]:
@@ -1107,7 +657,6 @@ def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]
     if dev.type not in {"cuda", "xpu", "mps"}:
         return None
 
-    # Prefer the common free/total query (also works for MPS via recommended_max_memory).
     try:
         free_b, total_b = Memory.device_mem_get_info(dev)
         if total_b is not None and int(total_b) > 0 and free_b is not None:
@@ -1116,7 +665,6 @@ def device_mem_util_percent(device: Union[torch.device, str]) -> Optional[float]
     except Exception:
         pass
 
-    # Backend fallbacks.
     if dev.type == "cuda" and accel_is_available("cuda"):
         try:
             idx = int(dev.index) if dev.index is not None else int(torch.cuda.current_device())
@@ -1159,40 +707,44 @@ def accel_device_total_memory_bytes(device: Union[torch.device, str]) -> Optiona
     if dev.type not in {"cuda", "xpu", "mps"}:
         return None
 
-    # Preferred common free/total query (also works for MPS via recommended_max_memory).
-    with contextlib.suppress(Exception):
-        free_b, total_b = Memory.device_mem_get_info(dev)
-        if total_b is not None and int(total_b) > 0:
-            return int(total_b)
-
-    # Total-only backend fallbacks.
-    if dev.type == "cuda" and accel_is_available("cuda"):
+    v = _try_call(getattr(Memory, "device_mem_get_info", None), dev)
+    if isinstance(v, tuple) and len(v) >= 2:
+        total_b = v[1]
         with contextlib.suppress(Exception):
-            idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("cuda"))
-            total = int(torch.cuda.get_device_properties(idx).total_memory)
-            return int(total) if int(total) > 0 else None
-        return None
+            if total_b is not None and int(total_b) > 0:
+                return int(total_b)
 
-    if dev.type == "xpu" and accel_is_available("xpu"):
-        xpu = getattr(torch, "xpu", None)
-        props = getattr(xpu, "get_device_properties", None) if xpu is not None else None
-        with contextlib.suppress(Exception):
-            if callable(props):
-                idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("xpu"))
-                total = int(getattr(props(int(idx)), "total_memory", 0) or 0)
-                return int(total) if int(total) > 0 else None
-        return None
-
-    if dev.type == "mps" and accel_is_available("mps"):
-        mps = getattr(torch, "mps", None)
-        fn = getattr(mps, "recommended_max_memory", None) if mps is not None else None
-        with contextlib.suppress(Exception):
-            if callable(fn):
-                total = int(fn())
-                return int(total) if int(total) > 0 else None
-        return None
-
-    return None
+    match dev.type:
+        case "cuda":
+            if not accel_is_available("cuda"):
+                return None
+            idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("cuda") or 0)
+            props = _try_call(getattr(torch.cuda, "get_device_properties", None), idx)
+            total = getattr(props, "total_memory", None) if props is not None else None
+            with contextlib.suppress(Exception):
+                return int(total) if total is not None and int(total) > 0 else None
+            return None
+        case "xpu":
+            if not accel_is_available("xpu"):
+                return None
+            xpu = getattr(torch, "xpu", None)
+            props_fn = getattr(xpu, "get_device_properties", None) if xpu is not None else None
+            idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("xpu") or 0)
+            props = _try_call(props_fn, int(idx))
+            total = getattr(props, "total_memory", None) if props is not None else None
+            with contextlib.suppress(Exception):
+                return int(total) if total is not None and int(total) > 0 else None
+            return None
+        case "mps":
+            if not accel_is_available("mps"):
+                return None
+            mps = getattr(torch, "mps", None)
+            total = _try_call(getattr(mps, "recommended_max_memory", None))
+            with contextlib.suppress(Exception):
+                return int(total) if total is not None and int(total) > 0 else None
+            return None
+        case _:
+            return None
 
 
 def accel_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
@@ -1205,35 +757,36 @@ def accel_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
     if dt not in {"cuda", "xpu", "mps"}:
         return None
 
-    # Prefer the (emerging) torch.accelerator common API when present.
-    with contextlib.suppress(Exception):
-        acc = getattr(torch, "accelerator", None)
-        mem_mod = getattr(acc, "memory", None) if acc is not None else None
-        alloc_fn = getattr(mem_mod, "allocated", None) if mem_mod is not None else None
-        if callable(alloc_fn):
-            try:
-                return int(alloc_fn(device=dev))
-            except TypeError:
-                return int(alloc_fn(dev))
-
-    if dt == "cuda" and accel_is_available("cuda"):
+    acc = getattr(torch, "accelerator", None)
+    mem_mod = getattr(acc, "memory", None) if acc is not None else None
+    alloc_fn = getattr(mem_mod, "allocated", None) if mem_mod is not None else None
+    v = _try_call_variants(alloc_fn, [((dev,), {}), ((), {"device": dev})])
+    if v is not None:
         with contextlib.suppress(Exception):
-            return int(torch.cuda.memory_allocated(dev))
+            return max(0, int(v))
 
-    if dt == "xpu" and accel_is_available("xpu"):
-        xpu = getattr(torch, "xpu", None)
-        alloc_fn = getattr(xpu, "memory_allocated", None) if xpu is not None else None
-        if callable(alloc_fn):
-            with contextlib.suppress(Exception):
-                return int(alloc_fn(dev))
+    match dt:
+        case "cuda":
+            if not accel_is_available("cuda"):
+                return None
+            v = _try_call(getattr(torch.cuda, "memory_allocated", None), dev)
+        case "xpu":
+            if not accel_is_available("xpu"):
+                return None
+            xpu = getattr(torch, "xpu", None)
+            v = _try_call(getattr(xpu, "memory_allocated", None), dev)
+        case "mps":
+            if not accel_is_available("mps"):
+                return None
+            mps = getattr(torch, "mps", None)
+            v = _try_call(getattr(mps, "current_allocated_memory", None))
+        case _:
+            v = None
 
-    if dt == "mps" and accel_is_available("mps"):
-        mps = getattr(torch, "mps", None)
-        alloc_fn = getattr(mps, "current_allocated_memory", None) if mps is not None else None
-        if callable(alloc_fn):
-            with contextlib.suppress(Exception):
-                return int(alloc_fn())
-
+    if v is None:
+        return None
+    with contextlib.suppress(Exception):
+        return max(0, int(v))
     return None
 
 
@@ -1247,39 +800,26 @@ def accel_reset_peak_memory_stats(device: Union[torch.device, str]) -> None:
     if dt not in {"cuda", "xpu", "mps"}:
         return
 
-    # Prefer common API.
-    with contextlib.suppress(Exception):
-        acc = getattr(torch, "accelerator", None)
-        mem_mod = getattr(acc, "memory", None) if acc is not None else None
-        reset_fn = getattr(mem_mod, "reset_peak_memory_stats", None) if mem_mod is not None else None
-        if callable(reset_fn):
-            try:
-                reset_fn(device=dev)
-                return
-            except TypeError:
-                reset_fn(dev)
-                return
-
-    if dt == "cuda" and accel_is_available("cuda"):
-        with contextlib.suppress(Exception):
-            torch.cuda.reset_peak_memory_stats(dev)
+    acc = getattr(torch, "accelerator", None)
+    mem_mod = getattr(acc, "memory", None) if acc is not None else None
+    reset_fn = getattr(mem_mod, "reset_peak_memory_stats", None) if mem_mod is not None else None
+    if _try_call_variants(reset_fn, [((dev,), {}), ((), {"device": dev})]) is not None:
         return
 
-    if dt == "xpu" and accel_is_available("xpu"):
-        xpu = getattr(torch, "xpu", None)
-        reset_fn = getattr(xpu, "reset_peak_memory_stats", None) if xpu is not None else None
-        if callable(reset_fn):
-            with contextlib.suppress(Exception):
-                reset_fn(dev)
-        return
-
-    if dt == "mps" and accel_is_available("mps"):
-        mps = getattr(torch, "mps", None)
-        reset_fn = getattr(mps, "reset_peak_memory_stats", None) if mps is not None else None
-        if callable(reset_fn):
-            with contextlib.suppress(Exception):
-                reset_fn()
-        return
+    match dt:
+        case "cuda":
+            if accel_is_available("cuda"):
+                _try_call(getattr(torch.cuda, "reset_peak_memory_stats", None), dev)
+        case "xpu":
+            if accel_is_available("xpu"):
+                xpu = getattr(torch, "xpu", None)
+                _try_call(getattr(xpu, "reset_peak_memory_stats", None), dev)
+        case "mps":
+            if accel_is_available("mps"):
+                mps = getattr(torch, "mps", None)
+                _try_call(getattr(mps, "reset_peak_memory_stats", None))
+        case _:
+            return
 
 
 def accel_max_memory_allocated(device: Union[torch.device, str]) -> Optional[int]:
@@ -1292,45 +832,43 @@ def accel_max_memory_allocated(device: Union[torch.device, str]) -> Optional[int
     if dt not in {"cuda", "xpu", "mps"}:
         return None
 
-    # Prefer common API.
-    with contextlib.suppress(Exception):
-        acc = getattr(torch, "accelerator", None)
-        mem_mod = getattr(acc, "memory", None) if acc is not None else None
-        peak_fn = getattr(mem_mod, "max_memory_allocated", None) if mem_mod is not None else None
-        if callable(peak_fn):
-            try:
-                return int(peak_fn(device=dev))
-            except TypeError:
-                return int(peak_fn(dev))
-
-    if dt == "cuda" and accel_is_available("cuda"):
+    acc = getattr(torch, "accelerator", None)
+    mem_mod = getattr(acc, "memory", None) if acc is not None else None
+    peak_fn = getattr(mem_mod, "max_memory_allocated", None) if mem_mod is not None else None
+    v = _try_call_variants(peak_fn, [((dev,), {}), ((), {"device": dev})])
+    if v is not None:
         with contextlib.suppress(Exception):
-            return int(torch.cuda.max_memory_allocated(dev))
+            return max(0, int(v))
 
-    if dt == "xpu" and accel_is_available("xpu"):
-        xpu = getattr(torch, "xpu", None)
-        peak_fn = getattr(xpu, "max_memory_allocated", None) if xpu is not None else None
-        if callable(peak_fn):
-            with contextlib.suppress(Exception):
-                return int(peak_fn(dev))
+    match dt:
+        case "cuda":
+            if not accel_is_available("cuda"):
+                return None
+            v = _try_call(getattr(torch.cuda, "max_memory_allocated", None), dev)
+        case "xpu":
+            if not accel_is_available("xpu"):
+                return None
+            xpu = getattr(torch, "xpu", None)
+            v = _try_call(getattr(xpu, "max_memory_allocated", None), dev)
+        case "mps":
+            if not accel_is_available("mps"):
+                return None
+            mps = getattr(torch, "mps", None)
+            v = _try_call(getattr(mps, "max_memory_allocated", None))
+        case _:
+            v = None
 
-    if dt == "mps" and accel_is_available("mps"):
-        mps = getattr(torch, "mps", None)
-        peak_fn = getattr(mps, "max_memory_allocated", None) if mps is not None else None
-        if callable(peak_fn):
-            with contextlib.suppress(Exception):
-                return int(peak_fn())
-
+    if v is None:
+        return None
+    with contextlib.suppress(Exception):
+        return max(0, int(v))
     return None
 
 
 def accel_ipc_collect() -> None:
     if not accel_is_available("cuda"):
         return
-    with contextlib.suppress(Exception):
-        fn = getattr(torch.cuda, "ipc_collect", None)
-        if callable(fn):
-            fn()
+    _try_call(getattr(torch.cuda, "ipc_collect", None))
 
 
 def accel_device_context(device: torch.device) -> contextlib.AbstractContextManager[None]:
@@ -1344,26 +882,18 @@ def accel_device_context(device: torch.device) -> contextlib.AbstractContextMana
     if not callable(ctx_fn):
         return contextlib.nullcontext()
 
-    # Prefer passing the actual torch.device when supported.
-    try:
-        return ctx_fn(dev)
-    except TypeError:
-        pass
-    except Exception:
-        return contextlib.nullcontext()
-
-    # Some backends accept an int index.
     idx = getattr(dev, "index", None)
-    if idx is None:
-        return contextlib.nullcontext()
-    try:
-        return ctx_fn(int(idx))
-    except Exception:
-        return contextlib.nullcontext()
+    ctx = _try_call_variants(
+        ctx_fn,
+        [
+            ((dev,), {}),
+            (((int(idx),), {}) if idx is not None else ((), {})),
+        ],
+    )
+    return ctx if ctx is not None else contextlib.nullcontext()
 
 
 def accel_synchronize(device: Union[torch.device, str]) -> None:
-
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1373,63 +903,27 @@ def accel_synchronize(device: Union[torch.device, str]) -> None:
     if dev_type not in {"cuda", "xpu", "mps"}:
         return
 
-    # Prefer the (emerging) torch.accelerator common API when available.
-    with contextlib.suppress(Exception):
-        acc = getattr(torch, "accelerator", None)
-        sync = getattr(acc, "synchronize", None) if acc is not None else None
-        if callable(sync):
-            try:
-                sync(device=dev)
-                return
-            except TypeError:
-                pass
-            try:
-                sync(dev)
-                return
-            except TypeError:
-                pass
-            with contextlib.suppress(Exception):
-                sync()
-                return
+    acc = getattr(torch, "accelerator", None)
+    sync = getattr(acc, "synchronize", None) if acc is not None else None
+    if callable(sync):
+        if _try_call_variants(sync, [((dev,), {}), ((), {"device": dev}), ((), {})]) is not None:
+            return
 
     backend = accel_backend_for_device_type(dev_type)
     sync = getattr(backend, "synchronize", None) if backend is not None else None
     if not callable(sync):
         return
 
-    # Prefer the cheapest signature per backend to avoid TypeError overhead.
-    if dev_type == "mps":
-        with contextlib.suppress(Exception):
-            sync()
-        return
-
-    if dev_type == "xpu":
-        # Common: torch.xpu.synchronize() with no args.
-        try:
-            sync()
-            return
-        except TypeError:
-            pass
-        except Exception:
-            return
-
-    # CUDA: try synchronize(device=...)
-    try:
-        sync(device=dev)
-        return
-    except TypeError:
-        pass
-    except Exception:
-        return
-    try:
-        sync(dev)
-        return
-    except TypeError:
-        pass
-    except Exception:
-        return
-    with contextlib.suppress(Exception):
-        sync()
+    match dev_type:
+        case "mps":
+            _try_call(sync)
+        case "xpu":
+            if _try_call(sync) is None:
+                _try_call(sync, dev)
+        case _:
+            if _try_call(sync, device=dev) is None:
+                if _try_call(sync, dev) is None:
+                    _try_call(sync)
 
 
 @lru_cache(maxsize=8)
@@ -1440,26 +934,20 @@ def accel_timing_events_supported_for_device_type(dev_type: str) -> bool:
         return False
     avail = getattr(backend, "is_available", None)
     if callable(avail):
-        with contextlib.suppress(Exception):
-            if not bool(avail()):
-                return False
+        v = _try_call(avail)
+        if v is not None and not bool(v):
+            return False
     Event = getattr(backend, "Event", None)
     if Event is None:
         return False
-    try:
-        ev0 = Event(enable_timing=True)
-        ev1 = Event(enable_timing=True)
-    except TypeError:
-        # Some backends omit enable_timing.
-        try:
-            ev0 = Event()
-            ev1 = Event()
-        except Exception:
+    ev0 = _try_call(Event, enable_timing=True)
+    ev1 = _try_call(Event, enable_timing=True)
+    if ev0 is None or ev1 is None:
+        ev0 = _try_call(Event)
+        ev1 = _try_call(Event)
+        if ev0 is None or ev1 is None:
             return False
-    except Exception:
-        return False
 
-    # We rely on record()/synchronize()/elapsed_time() in the hot path.
     need = ("record", "synchronize", "elapsed_time")
     for ev in (ev0, ev1):
         for name in need:
@@ -1481,14 +969,13 @@ def accel_make_event(device: torch.device, *, enable_timing: bool = False) -> ob
         return None
 
     if enable_timing:
-        with contextlib.suppress(Exception):
-            return Event(enable_timing=True)
-    # default / no-timing
-    with contextlib.suppress(Exception):
-        return Event(enable_timing=False)
-    with contextlib.suppress(Exception):
-        return Event()
-    return None
+        ev = _try_call(Event, enable_timing=True)
+        if ev is not None:
+            return ev
+    ev = _try_call(Event, enable_timing=False)
+    if ev is not None:
+        return ev
+    return _try_call(Event)
 
 
 @lru_cache(maxsize=8)
@@ -1500,12 +987,11 @@ def accel_streaming_supported_for_device_type(dev_type: str) -> bool:
     if backend is None:
         return False
 
-    # Avoid claiming support on CPU-only builds where torch.cuda exists but is unavailable.
     avail = getattr(backend, "is_available", None)
     if callable(avail):
-        with contextlib.suppress(Exception):
-            if not bool(avail()):
-                return False
+        v = _try_call(avail)
+        if v is not None and not bool(v):
+            return False
 
     Stream = getattr(backend, "Stream", None)
     Event = getattr(backend, "Event", None)
@@ -1517,21 +1003,21 @@ def accel_streaming_supported_for_device_type(dev_type: str) -> bool:
 @lru_cache(maxsize=8)
 def accel_pinned_h2d_supported_for_device_type(dev_type: str) -> bool:
     dt = str(dev_type or "cpu").strip().lower()
-    if dt not in {"cuda", "xpu"}:
-        return False
-    backend = accel_backend_for_device_type(dt)
-    if backend is None:
-        return False
-    avail = getattr(backend, "is_available", None)
-    if callable(avail):
-        with contextlib.suppress(Exception):
-            if not bool(avail()):
+    match dt:
+        case "cuda" | "xpu":
+            backend = accel_backend_for_device_type(dt)
+            if backend is None:
                 return False
-    if not callable(getattr(backend, "current_stream", None)):
-        return False
-    if getattr(backend, "Event", None) is None:
-        return False
-    return True
+            avail = getattr(backend, "is_available", None)
+            v = _try_call(avail)
+            if v is not None and not bool(v):
+                return False
+            return bool(
+                callable(getattr(backend, "current_stream", None))
+                and getattr(backend, "Event", None) is not None
+            )
+        case _:
+            return False
 
 
 def accel_stream_context(stream: object, dev_type: str) -> contextlib.AbstractContextManager[None]:
@@ -1539,10 +1025,8 @@ def accel_stream_context(stream: object, dev_type: str) -> contextlib.AbstractCo
     fn = getattr(backend, "stream", None) if backend is not None else None
     if not callable(fn):
         return contextlib.nullcontext()
-    try:
-        return fn(stream)
-    except Exception:
-        return contextlib.nullcontext()
+    ctx = _try_call(fn, stream)
+    return ctx if ctx is not None else contextlib.nullcontext()
 
 
 def accel_new_stream(device: torch.device) -> object | None:
@@ -1557,15 +1041,15 @@ def accel_new_stream(device: torch.device) -> object | None:
     if not callable(Stream):
         return None
 
-    with contextlib.suppress(Exception):
-        return Stream(device=dev)
     idx = getattr(dev, "index", None)
-    if idx is not None:
-        with contextlib.suppress(Exception):
-            return Stream(int(idx))
-    with contextlib.suppress(Exception):
-        return Stream()
-    return None
+    return _try_call_variants(
+        Stream,
+        [
+            ((), {"device": dev}),
+            (((int(idx),), {}) if idx is not None else ((), {})),
+            ((), {}),
+        ],
+    )
 
 
 def accel_current_stream(device: torch.device) -> object | None:
@@ -1580,14 +1064,14 @@ def accel_current_stream(device: torch.device) -> object | None:
     if not callable(fn):
         return None
 
-    # CUDA commonly accepts device=device.
-    with contextlib.suppress(TypeError):
-        return fn(device=dev)
-    with contextlib.suppress(TypeError):
-        return fn(dev)
-    with contextlib.suppress(Exception):
-        return fn()
-    return None
+    return _try_call_variants(
+        fn,
+        [
+            ((), {"device": dev}),
+            ((dev,), {}),
+            ((), {}),
+        ],
+    )
 
 
 def set_float32_precision(
@@ -1615,19 +1099,18 @@ def set_float32_precision(
             return
         _FP32_PRECISION_CACHE[key] = precision
 
-    with contextlib.suppress(Exception):
-        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
-            if hasattr(torch.backends.cuda.matmul, "fp32_precision"):
-                torch.backends.cuda.matmul.fp32_precision = precision
+    cuda_b = getattr(torch.backends, "cuda", None)
+    matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
+    if matmul is not None and hasattr(matmul, "fp32_precision"):
+        _try_call(setattr, matmul, "fp32_precision", precision)
 
-    with contextlib.suppress(Exception):
-        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "conv"):
-            if hasattr(torch.backends.cudnn.conv, "fp32_precision"):
-                torch.backends.cudnn.conv.fp32_precision = precision
-    with contextlib.suppress(Exception):
-        if hasattr(torch.backends, "cudnn") and hasattr(torch.backends.cudnn, "rnn"):
-            if hasattr(torch.backends.cudnn.rnn, "fp32_precision"):
-                torch.backends.cudnn.rnn.fp32_precision = precision
+    cudnn = getattr(torch.backends, "cudnn", None)
+    conv = getattr(cudnn, "conv", None) if cudnn is not None else None
+    rnn = getattr(cudnn, "rnn", None) if cudnn is not None else None
+    if conv is not None and hasattr(conv, "fp32_precision"):
+        _try_call(setattr, conv, "fp32_precision", precision)
+    if rnn is not None and hasattr(rnn, "fp32_precision"):
+        _try_call(setattr, rnn, "fp32_precision", precision)
 
 
 _TZ_ALIASES = {
@@ -1663,42 +1146,48 @@ def system_info() -> Tuple[str, str, str, str]:
     release = platform.release() or ""
     kernel = f"{sysname} {release}".strip()
     os_name = sysname
-    with contextlib.suppress(Exception):
-        if sysname == "Linux" and hasattr(platform, "freedesktop_os_release"):
-            info = platform.freedesktop_os_release()
+    if sysname == "Linux" and hasattr(platform, "freedesktop_os_release"):
+        info = _try_call(getattr(platform, "freedesktop_os_release", None))
+        if isinstance(info, dict):
             name = info.get("NAME") or "Linux"
             version = info.get("VERSION_ID") or ""
             os_name = (name if not version else f"{name} {version}").strip()
-        elif sysname == "Windows":
-            win = platform.win32_ver()
+    elif sysname == "Windows":
+        win = _try_call(getattr(platform, "win32_ver", None))
+        if isinstance(win, (list, tuple)) and win:
             os_name = f"Windows {win[0] or ''}".strip()
-        elif sysname == "Darwin":
-            mac = platform.mac_ver()[0]
-            os_name = f"macOS {mac or ''}".strip()
+    elif sysname == "Darwin":
+        mac = _try_call(getattr(platform, "mac_ver", None))
+        if isinstance(mac, (list, tuple)) and mac:
+            os_name = f"macOS {mac[0] or ''}".strip()
     arch = platform.machine() or ""
     accelerators: list[str] = []
 
-    with contextlib.suppress(Exception):
-        if torch.cuda.is_available():
-            for idx in range(torch.cuda.device_count()):
-                accelerators.append(f"cuda:{idx}={torch.cuda.get_device_name(idx)}")
+    if bool(_try_call(getattr(torch.cuda, "is_available", None)) or False):
+        n = int(_try_call(getattr(torch.cuda, "device_count", None)) or 0)
+        get_name = getattr(torch.cuda, "get_device_name", None)
+        for idx in range(max(0, n)):
+            name = _try_call(get_name, int(idx))
+            if name is None:
+                name = "cuda"
+            accelerators.append(f"cuda:{idx}={name}")
 
-    with contextlib.suppress(Exception):
-        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            accelerators.append("mps=Apple MPS")
+    mps_backend = getattr(torch.backends, "mps", None)
+    if bool(_try_call(getattr(mps_backend, "is_available", None)) or False):
+        accelerators.append("mps=Apple MPS")
 
-    with contextlib.suppress(Exception):
-        if hasattr(torch, "xpu") and hasattr(torch.xpu, "device_count"):
-            count = torch.xpu.device_count()
-            if count and count > 0:
-                get_name = getattr(torch.xpu, "get_device_name", None)
-                for idx in range(count):
-                    name = get_name(idx) if callable(get_name) else "XPU"
-                    accelerators.append(f"xpu:{idx}={name}")
+    xpu = getattr(torch, "xpu", None)
+    xpu_count = _try_call(getattr(xpu, "device_count", None))
+    if isinstance(xpu_count, int) and xpu_count > 0:
+        get_name = getattr(xpu, "get_device_name", None)
+        for idx in range(int(xpu_count)):
+            name = _try_call(get_name, int(idx))
+            if name is None:
+                name = "XPU"
+            accelerators.append(f"xpu:{idx}={name}")
 
-    with contextlib.suppress(Exception):
-        if hasattr(torch, "is_vulkan_available") and torch.is_vulkan_available():
-            accelerators.append("vulkan=available")
+    if bool(_try_call(getattr(torch, "is_vulkan_available", None)) or False):
+        accelerators.append("vulkan=available")
 
     return os_name, kernel, arch, ";".join(accelerators)
 
@@ -1707,33 +1196,42 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
     names: list[str] = []
     total = process_cpu_count()
     brand = ""
-    with contextlib.suppress(Exception):
+    try:
         import cpuinfo  # type: ignore
-
-        info = cpuinfo.get_cpu_info() or {}
-        brand = info.get("brand_raw") or info.get("brand") or ""
+        info = _try_call(getattr(cpuinfo, "get_cpu_info", None)) or {}
+        if isinstance(info, dict):
+            brand = info.get("brand_raw") or info.get("brand") or ""
+    except Exception:
+        pass
     if not brand and os.path.exists("/proc/cpuinfo"):
-        with contextlib.suppress(Exception):
+        try:
             with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as handle:
                 lines = [ln.strip() for ln in handle.readlines() if "model name" in ln]
             if lines:
                 names = [ln.split(":", 1)[1].strip() for ln in lines]
+        except Exception:
+            pass
     if not names and platform.system() == "Darwin":
-        with contextlib.suppress(Exception):
+        try:
             import subprocess
-
-            output = subprocess.check_output(["sysctl", "-n", "machdep.cpu.brand_string"])
-            brand = output.decode("utf-8", "ignore").strip()
+            output = _try_call(getattr(subprocess, "check_output", None), ["sysctl", "-n", "machdep.cpu.brand_string"])
+            if isinstance(output, (bytes, bytearray)):
+                brand = bytes(output).decode("utf-8", "ignore").strip()
+        except Exception:
+            pass
     if not names and platform.system() == "Windows":
         brand = platform.processor()
         if not brand:
-            with contextlib.suppress(Exception):
+            try:
                 import subprocess
-
-                output = subprocess.check_output(
-                    ["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"]
+                output = _try_call(
+                    getattr(subprocess, "check_output", None),
+                    ["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"],
                 )
-                brand = output.decode("utf-8", "ignore").strip()
+                if isinstance(output, (bytes, bytearray)):
+                    brand = bytes(output).decode("utf-8", "ignore").strip()
+            except Exception:
+                pass
     if not names:
         fallback = brand or platform.processor() or "CPU"
         names = [fallback] * total
@@ -2154,40 +1652,36 @@ def get_device(
         cudnn_bench_val = bool(cfg.cudnn_benchmark)
         matmul_prec = str(cfg.matmul_precision)
 
-    # Apply global matmul precision if supported.
-    with contextlib.suppress(Exception):
-        if hasattr(torch, "set_float32_matmul_precision"):
-            torch.set_float32_matmul_precision(matmul_prec)
+    _try_call(getattr(torch, "set_float32_matmul_precision", None), matmul_prec)
 
     if accel_is_available("cuda"):
         idx = 0
+        idx_env = env_first_int(("LOCAL_RANK",), default=0)
+        ndev = max(1, int(accel_device_count("cuda") or 1))
         with contextlib.suppress(Exception):
-            idx_env = env_first_int(("LOCAL_RANK",), default=0)
-            ndev = max(1, int(accel_device_count("cuda") or 1))
             idx = int(idx_env) % int(ndev)
 
         accel_set_device_index("cuda", int(idx))
         device = torch.device(f"cuda:{idx}")
 
-        # Configure CuDNN determinism/benchmark.
-        with contextlib.suppress(Exception):
-            torch.backends.cudnn.deterministic = bool(det)
-        with contextlib.suppress(Exception):
-            torch.backends.cudnn.benchmark = bool(cudnn_bench_val)
+        cudnn = getattr(torch.backends, "cudnn", None)
+        if cudnn is not None:
+            _try_call(setattr, cudnn, "deterministic", bool(det))
+            _try_call(setattr, cudnn, "benchmark", bool(cudnn_bench_val))
 
-        # Apply TF32 policy (best-effort).
-        with contextlib.suppress(Exception):
-            if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
-                torch.backends.cuda.matmul.allow_tf32 = bool(allow_tf32_val)
-        with contextlib.suppress(Exception):
-            if hasattr(torch.backends.cudnn, "allow_tf32"):
-                torch.backends.cudnn.allow_tf32 = bool(allow_tf32_val)
+        cuda_b = getattr(torch.backends, "cuda", None)
+        matmul = getattr(cuda_b, "matmul", None) if cuda_b is not None else None
+        if matmul is not None and hasattr(matmul, "allow_tf32"):
+            _try_call(setattr, matmul, "allow_tf32", bool(allow_tf32_val))
+        cudnn_b = getattr(torch.backends, "cudnn", None)
+        if cudnn_b is not None and hasattr(cudnn_b, "allow_tf32"):
+            _try_call(setattr, cudnn_b, "allow_tf32", bool(allow_tf32_val))
 
     elif accel_is_available("xpu"):
         idx = 0
+        idx_env = env_first_int(("LOCAL_RANK",), default=0)
+        ndev = max(1, int(accel_device_count("xpu") or 1))
         with contextlib.suppress(Exception):
-            idx_env = env_first_int(("LOCAL_RANK",), default=0)
-            ndev = max(1, int(accel_device_count("xpu") or 1))
             idx = int(idx_env) % int(ndev)
         accel_set_device_index("xpu", int(idx))
         device = torch.device(f"xpu:{idx}")
@@ -2589,7 +2083,6 @@ class Thread:
 
     @staticmethod
     def optimize_threads(intra: Optional[int] = None, inter: Optional[int] = None) -> None:
-        # Backward-compatible alias; canonical implementation lives at module scope.
         optimize_threads(intra=intra, inter=inter)
 
     def tune_threads(
@@ -3214,3 +2707,248 @@ class Memory:
         except Exception:
             return False
         return False
+
+
+@dataclass(slots=True)
+class WorkerPolicy:
+    nproc_per_node: int = 1
+    device: str = "cpu"
+    local_world_size: int = 1
+
+    intra_ops: int = 1
+    inter_ops: int = 1
+
+    num_workers: int = 1
+    prebatch: int = 1
+    prefetch_factor: int = 1
+    max_concurrency: int = 1
+    h2d_streams: int = 1
+
+    @staticmethod
+    def _cpu_count() -> int:
+        return process_cpu_count()
+
+    @staticmethod
+    def _detect_accelerator() -> Tuple[str, int]:
+        dev_type = "cpu"
+        n = 0
+
+        try:
+            accel = getattr(torch, "accelerator", None)
+            if accel is not None and hasattr(accel, "is_available") and accel.is_available():
+                current = getattr(accel, "current_accelerator", None)
+                if callable(current):
+                    dev = current(False)
+                    if isinstance(dev, torch.device):
+                        dev_type = dev.type
+                dc = getattr(accel, "device_count", None)
+                if callable(dc):
+                    n = int(dc())
+        except Exception:
+            dev_type, n = "cpu", 0
+
+        try:
+            if n <= 0:
+                if torch.cuda.is_available():
+                    dev_type = "cuda"
+                    n = int(torch.cuda.device_count())
+                else:
+                    xpu = getattr(torch, "xpu", None)
+                    if xpu is not None and callable(getattr(xpu, "is_available", None)) and xpu.is_available():
+                        dev_type = "xpu"
+                        n = int(getattr(xpu, "device_count", lambda: 1)())
+                    else:
+                        mps_backend = getattr(torch.backends, "mps", None)
+                        if mps_backend is not None and callable(getattr(mps_backend, "is_available", None)) and mps_backend.is_available():
+                            dev_type = "mps"
+                            n = 1
+        except Exception:
+            pass
+
+        if n <= 0:
+            dev_type, n = "cpu", 0
+        return dev_type, max(0, n)
+
+    @classmethod
+    def autotune(cls) -> "WorkerPolicy":
+        ncpu_raw = max(1, int(cls._cpu_count() or 1))
+        dev_type, nacc = cls._detect_accelerator()
+        is_accel = bool(nacc and int(nacc) > 0)
+
+        local_world_guess = max(1, int(nacc or 1)) if is_accel else 1
+        local_world_guess = max(1, int(env_first_int(
+            ("STNET_LOCAL_WORLD_SIZE", "LOCAL_WORLD_SIZE", "SLURM_NTASKS_PER_NODE"),
+            local_world_guess,
+        )))
+
+        _nogil = False
+        with contextlib.suppress(Exception):
+            _nogil = bool(Thread.nogil_optimizations_enabled())
+
+        cap_mult = _default_cap_mult(ncpu_raw, is_accel=is_accel, nogil=_nogil)
+
+        distribute_default = int(local_world_guess) > 1
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
+
+        thread_cap = _effective_thread_cap(
+            ncpu=ncpu_raw,
+            cap_mult=cap_mult,
+            local_world=int(local_world_guess),
+            distribute=bool(distribute),
+        )
+
+        eff_cores = max(1, int(thread_cap) // max(1, int(cap_mult)))
+
+        soft_inflight = 8 if is_accel else 4
+        with contextlib.suppress(Exception):
+            from ..data.pipeline import LoaderPolicy
+            lp = LoaderPolicy()
+            hard = int(lp.hard_inflight_batches(dev_type))
+            soft_inflight = max(1, int(hard * max(1, int(lp.soft_cap_multiplier))))
+
+        soft_auto_enabled = bool(env_first_int(("STNET_SOFT_INFLIGHT_AUTO",), 1))
+        soft_inflight_max_default = (32 if is_accel else 24) if _nogil else (16 if is_accel else 12)
+        soft_inflight_max = max(8, env_first_int(("STNET_SOFT_INFLIGHT_MAX",), soft_inflight_max_default))
+        soft_inflight_explicit = env_first_int(("STNET_SOFT_INFLIGHT_CAP",), 0)
+        if soft_inflight_explicit > 0:
+            soft_inflight = max(1, int(soft_inflight_explicit))
+        elif soft_auto_enabled:
+            soft_base = max(0, env_first_int(("STNET_SOFT_INFLIGHT_BASE",), 2))
+            soft_div = max(1, env_first_int(("STNET_SOFT_INFLIGHT_DIV",), 4))
+            auto_soft = int(soft_base) + max(0, int(eff_cores) // int(soft_div))
+            soft_inflight = max(int(soft_inflight), min(int(auto_soft), int(soft_inflight_max)))
+
+        soft_inflight = max(1, min(int(soft_inflight), int(thread_cap)))
+
+        if is_accel:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.90
+            elif eff_cores <= 16:
+                model_ratio = 0.80
+            elif eff_cores <= 32:
+                model_ratio = 0.70
+            else:
+                model_ratio = 0.60
+        else:
+            if eff_cores <= 4:
+                model_ratio = 1.00
+            elif eff_cores <= 8:
+                model_ratio = 0.95
+            elif eff_cores <= 16:
+                model_ratio = 0.90
+            else:
+                model_ratio = 0.85
+
+        with contextlib.suppress(Exception):
+            env_key = "STNET_MODEL_CORE_RATIO_ACCEL" if is_accel else "STNET_MODEL_CORE_RATIO"
+            model_ratio = float(env_float(env_key, float(model_ratio)))
+        model_ratio = float(max(0.25, min(1.0, model_ratio)))
+
+        model_budget = max(2, int(round(float(eff_cores) * model_ratio)))
+
+        if model_budget <= 2:
+            inter_ops = 1
+        elif model_budget <= 8:
+            inter_ops = max(1, model_budget // 4)
+        else:
+            inter_ops = max(2, min(8, model_budget // 6))
+        inter_ops = max(1, min(int(inter_ops), max(1, int(model_budget) - 1)))
+        intra_ops = max(1, int(model_budget) - int(inter_ops))
+
+        data_budget = max(1, int(thread_cap) - (int(intra_ops) + int(inter_ops)))
+
+        prebatch = 1
+        prefetch_factor = 1
+
+        env_pre = env_str("STNET_PREBATCH")
+        if env_pre:
+            with contextlib.suppress(Exception):
+                prebatch = max(1, int(env_pre))
+        elif _nogil:
+            prebatch = 2
+
+        env_pf = env_str("STNET_PREFETCH_FACTOR")
+        if env_pf:
+            with contextlib.suppress(Exception):
+                prefetch_factor = max(1, int(env_pf))
+        elif _nogil:
+            prefetch_factor = 2
+
+        prebatch = max(1, int(prebatch))
+        prefetch_factor = max(1, int(prefetch_factor))
+
+        base_workers = max(1, int(data_budget))
+        base_workers = min(int(base_workers), int(thread_cap), int(soft_inflight))
+
+        max_workers = max(
+            1,
+            int((int(soft_inflight) - int(prebatch)) // max(1, int(prefetch_factor))),
+        )
+        num_workers = max(1, min(int(base_workers), int(max_workers), int(soft_inflight)))
+
+        max_concurrency = max(1, int(num_workers))
+
+        total_threads = int(intra_ops) + int(inter_ops) + int(num_workers)
+        if total_threads > int(thread_cap):
+            overflow = int(total_threads) - int(thread_cap)
+            if dev_type == "cpu":
+                num_workers = max(1, int(num_workers) - int(overflow))
+            else:
+                intra_ops = max(1, int(intra_ops) - int(overflow))
+
+            intra_ops = max(1, int(thread_cap) - int(inter_ops) - int(num_workers))
+            max_concurrency = max(1, min(int(max_concurrency), int(num_workers)))
+
+        local_world = int(local_world_guess)
+
+        return cls(
+            nproc_per_node=local_world,
+            device=dev_type,
+            local_world_size=local_world,
+            intra_ops=int(intra_ops),
+            inter_ops=int(inter_ops),
+            num_workers=int(num_workers),
+            prebatch=int(prebatch),
+            prefetch_factor=int(prefetch_factor),
+            max_concurrency=int(max_concurrency),
+            h2d_streams=2 if dev_type in ("cuda", "xpu") else 1,
+        )
+
+    def as_threads_dict(self) -> dict[str, int]:
+        return {
+            "intra_ops": int(self.intra_ops),
+            "inter_ops": int(self.inter_ops),
+            "num_workers": int(self.num_workers),
+            "max_concurrency": int(self.max_concurrency),
+            "prebatch": int(self.prebatch),
+            "prefetch_factor": int(self.prefetch_factor),
+        }
+
+    def as_procs_dict(self) -> dict[str, Union[int, str]]:
+        return {
+            "nproc_per_node": int(self.nproc_per_node),
+            "device": str(self.device),
+        }
+
+    def apply_torch_threads(self) -> None:
+        global _TORCH_NUM_THREADS_SET, _TORCH_INTEROP_THREADS_SET, _TORCH_INTEROP_LOCKED
+
+        intra = max(1, int(self.intra_ops))
+        inter = max(1, int(self.inter_ops))
+
+        with _TORCH_THREAD_CFG_LOCK:
+            if _TORCH_NUM_THREADS_SET != int(intra):
+                _try_call(getattr(torch, "set_num_threads", None), int(intra))
+                _TORCH_NUM_THREADS_SET = int(intra)
+
+            if hasattr(torch, "set_num_interop_threads") and not bool(_TORCH_INTEROP_LOCKED):
+                if _TORCH_INTEROP_THREADS_SET is None:
+                    try:
+                        torch.set_num_interop_threads(int(inter))
+                        _TORCH_INTEROP_THREADS_SET = int(inter)
+                    except Exception:
+                        _TORCH_INTEROP_LOCKED = True
+                elif int(_TORCH_INTEROP_THREADS_SET) != int(inter):
+                    pass
