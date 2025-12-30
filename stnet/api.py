@@ -27,7 +27,7 @@ from torch.distributed.checkpoint.state_dict import (
 
 try:
     from torch.distributed.run import LaunchConfig, elastic_launch
-except ImportError:  # pragma: no cover
+except ImportError:
     from torch.distributed.launcher.api import LaunchConfig, elastic_launch
 
 from .config import (
@@ -60,9 +60,9 @@ from .nn.primitives import Recorder, resize_scaler_buffer
 from .runtime.io import _filtered_warnings, _to_cpu, _torch_load_checkpoint, is_required
 from .runtime.main import _trim_dcp_keys, process
 
-# -----------------------------------------------------------------------------
-# Typing helpers
-# -----------------------------------------------------------------------------
+
+
+
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -73,8 +73,8 @@ JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"
 
 TorchDeviceLike: TypeAlias = torch.device | str | int
 
-# Data accepted by the high-level API. It's intentionally permissive because users
-# pass feature/label mappings, TensorDicts, or collections of those.
+
+
 TrainData: TypeAlias = (
     TensorDictBase
     | Mapping[str, object]
@@ -101,7 +101,7 @@ def _maybe_log_pred_assemble_tuning(stats: object, *, kind: object) -> None:
     if not bool(_PRED_ASSEMBLE_TUNE):
         return
 
-    # If we only log once per process, avoid racy "check then log" on no-GIL builds.
+
     if bool(_PRED_ASSEMBLE_TUNE_LOG_ONCE):
         with _PRED_ASSEMBLE_TUNE_LOG_LOCK:
             if bool(_PRED_ASSEMBLE_TUNE_LOGGED):
@@ -239,7 +239,6 @@ def _reset_process_group() -> None:
 
 
 def _prepare_distributed_launch_env() -> None:
-    """Common launch prep used by train() and predict()."""
 
     _reset_process_group()
     initialize_python_path()
@@ -257,7 +256,7 @@ def _clear_device_caches() -> None:
         from .core.system import empty_device_cache, get_device
 
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
-    # CUDA IPC cache can still benefit from explicit collection in some workloads.
+
     with contextlib.suppress(Exception):
         from .core.system import accel_ipc_collect
 
@@ -697,8 +696,8 @@ def _resolve_prediction_output_path(path: PathLike, *, run_id: object) -> object
     p = _normalize_path(path)
     if p is None:
         return None
-    # Only accept explicit .h5/.hdf5 file paths for output='file' / 'lazy'.
-    # If a directory is passed by mistake, we fall back to in-memory output.
+
+
     if p.endswith(os.sep) or os.path.isdir(p):
         return None
     _root, ext = os.path.splitext(p)
@@ -736,7 +735,7 @@ def _copy_mmt_to_cpu_tensor(
         chunk = mmt[s:e]
         if not bool(torch.is_tensor(chunk)):
             chunk = torch.as_tensor(chunk)
-        # Keep a stable CPU copy for the output buffer.
+
         chunk_cpu = chunk.detach().to(device="cpu", dtype=out.dtype)
         out[s:e].copy_(chunk_cpu)
     return out
@@ -757,7 +756,7 @@ def _read_predictions_h5_to_tensordict(path: PathLike) -> object:
             raise KeyError(f"predictions file missing X/Y datasets: {p!r}")
         X_np = f["X"][...]
         Y_np = f["Y"][...]
-    # Ensure torch owns the memory (avoid relying on numpy object lifetime).
+
     X_t = torch.as_tensor(X_np).clone()
     Y_t = torch.as_tensor(Y_np).clone()
     return TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(X_t.shape[0])])
@@ -785,7 +784,7 @@ def _validate_predictions_h5(
         dY = f["Y"]
         x_shape = tuple(int(x) for x in getattr(dX, "shape", ()) or ())
         y_shape = tuple(int(x) for x in getattr(dY, "shape", ()) or ())
-        # Basic dtype sanity: reject object/string datasets.
+
         try:
             x_kind = getattr(getattr(dX, "dtype", None), "kind", "")
             y_kind = getattr(getattr(dY, "dtype", None), "kind", "")
@@ -798,7 +797,7 @@ def _validate_predictions_h5(
                 f"Y.dtype={getattr(dY, 'dtype', None)!r} ({p!r})"
             )
 
-        # We require X to be a 2D table of features [N, in_dim].
+
         if len(x_shape) != 2 or len(y_shape) < 1:
             raise ValueError(
                 f"predictions file has invalid shapes: X={x_shape}, Y={y_shape} ({p!r})"
@@ -816,7 +815,7 @@ def _validate_predictions_h5(
             raise ValueError(f"predictions file has non-positive row count: {n} ({p!r})")
 
         if out_shape is None:
-            # We at least expect a dense Y with a feature dimension.
+
             if len(y_shape) < 2:
                 raise ValueError(f"predictions file has invalid Y shape: Y={y_shape} ({p!r})")
         else:
@@ -843,7 +842,7 @@ def _safe_unlink(path: PathLike) -> None:
     except FileNotFoundError:
         return
     except Exception as e:
-        # Best-effort cleanup; do not fail the whole prediction on a cleanup error.
+
         with contextlib.suppress(Exception):
             logger.debug("safe_unlink: failed to remove %s (%s)", path, e)
 
@@ -865,10 +864,10 @@ def _delete_prediction_memmaps(*, memmap_dir: PathLike, pred_path: PathLike) -> 
     with contextlib.suppress(Exception):
         _safe_unlink(BatchIO.mmt_meta_path(pred_path))
 
-    # Best-effort cleanup of associated metadata.
+
     _safe_unlink(os.path.join(memmap_dir, "meta.json"))
 
-    # Best-effort: remove empty directories (ignore if not empty).
+
     with contextlib.suppress(OSError):
         os.rmdir(memmap_dir)
 
@@ -908,22 +907,22 @@ def _write_predictions_h5_atomic(
             pred_path=pred_path,
             chunk_size=int(chunk_size),
         )
-        # Commit: replace, or create-without-overwrite.
+
         if ow == "replace":
             os.replace(tmp_path, out_path_n)
         elif ow == "error":
-            # Atomic create without overwriting an existing destination.
+
             os.link(tmp_path, out_path_n)
             os.remove(tmp_path)
         elif ow == "resume":
-            # Destination may have appeared since the early check; keep it.
+
             if not os.path.exists(out_path_n):
                 os.link(tmp_path, out_path_n)
             os.remove(tmp_path)
         else:
             raise ValueError(f"write_predictions_h5_atomic: invalid overwrite={overwrite!r}")
     finally:
-        # Best-effort cleanup of the temp file.
+
         with contextlib.suppress(Exception):
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -950,10 +949,10 @@ def _atomic_h5_link_or_copy(
 
     ow = str(overwrite or "replace").strip().lower()
 
-    # Validate source (avoid propagating a broken/partial file).
+
     _validate_predictions_h5(src_n, out_shape=out_shape)
 
-    # Same file: nothing to do.
+
     with contextlib.suppress(Exception):
         if os.path.samefile(src_n, dst_n):
             return PersistentTensorDict(filename=src_n, mode="r")
@@ -1487,9 +1486,9 @@ def _infer_master_float_dtype_for_predict_input(obj: object) -> object:
         pass
     return torch.float32
 
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
+
+
+
 
 def new_model(
     in_dim: int,
@@ -1892,7 +1891,7 @@ def predict(
     overwrite_mode = _normalize_prediction_overwrite(overwrite)
     run_id = str(kwargs.pop("run_id", f"predict-{os.getpid()}-{int(seed)}"))
 
-    # Resolve output file path (only meaningful when output_mode == 'file').
+
     out_path = None
     path_n = _normalize_path(path) if path is not None else None
     if output_mode == "file":
@@ -1916,11 +1915,11 @@ def predict(
         else:
             output_mode = "memory"
 
-    # If persistence was requested but the path is invalid, fall back to in-memory output.
+
     if output_mode == "file" and out_path is None:
         output_mode = "memory"
 
-    # If destination exists, honor overwrite policy early (before doing any work).
+
     if output_mode == "file" and out_path is not None and os.path.exists(out_path):
         if overwrite_mode == "resume" and os.path.isfile(out_path):
             _validate_predictions_h5(out_path, out_shape=out_shape_t)
@@ -1956,9 +1955,9 @@ def predict(
             count = None
             in_dim = None
 
-            # --- Stream features to memmap (two-pass) to keep memory usage bounded.
-            # We avoid special-casing single-process paths here to keep distributed
-            # execution consistent (DDP/FSDP setup happens downstream).
+
+
+
             if TensorDictBase is not None and isinstance(data, TensorDictBase):
                 X_td, _ = extract_xy(data, labels_required=False)
                 if X_td is None:
@@ -2034,7 +2033,7 @@ def predict(
                 )
 
             elif isinstance(data, Mapping):
-                # Mapping of sample_id -> item (or similar). Use the KeyIndexMappingView helpers.
+
                 count, get_batch = BatchIO.key_index_mapping_getters(data)
                 if int(count) <= 0:
                     raise ValueError("predict: empty input")
@@ -2054,7 +2053,7 @@ def predict(
                 )
 
             else:
-                # Sequence/dataset-like input. We require it to be sized.
+
                 try:
                     count = int(len(data))
                 except Exception as e:
@@ -2071,7 +2070,7 @@ def predict(
                         sl = data[s_i:e_i]
                     except Exception:
                         sl = [data[i] for i in range(s_i, e_i)]
-                    # Wrap in a mapping so Dataset.preprocess can resolve the feature key.
+
                     return {"features": sl}
 
                 in_dim, _ = BatchIO.write_memmap_streaming_two_pass(
@@ -2151,8 +2150,8 @@ def predict(
                 model.to("cpu")
             _clear_device_caches()
 
-            # NOTE: Do not short-circuit distributed execution even when nprocs==1.
-            # Keep DDP/FSDP code paths consistent.
+
+
             elastic_launch(lc, process)(ops)
 
             chunks_dir = os.path.join(ckpt_dir, "pred_chunks")
@@ -2160,8 +2159,8 @@ def predict(
                 raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
             store_float = _infer_pred_master_dtype(chunks_dir)
 
-            # Always assemble to a single pred.mmt first. This provides a stable intermediate
-            # representation and enables correct deletion ordering for crash/power-loss safety.
+
+
             pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
             _assemble_predictions_to_memmap(
                 chunks_dir=chunks_dir,
@@ -2176,8 +2175,8 @@ def predict(
                 raise RuntimeError("predict: failed to open assembled pred.mmt")
 
             if out_path is not None:
-                # Persistent output (output in {"lazy", "file"} with a valid path).
-                # Re-check existence right before writing to honor overwrite policy in racy environments.
+
+
                 if os.path.exists(out_path):
                     if overwrite_mode == "resume" and os.path.isfile(out_path):
                         _validate_predictions_h5(out_path, out_shape=out_shape_t)
@@ -2201,18 +2200,18 @@ def predict(
                     in_dim=(int(in_dim) if in_dim is not None else None),
                 )
 
-                # Delete intermediate memmap artifacts *only after* the persistent file is ready.
+
                 _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_mmt_path)
                 cleanup_ok = True
                 return out_td
 
-            # In-memory output (eager/memory are identical): stream-copy + deep materialization.
+
             X_t = _copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
             Y_t = _copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
 
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
 
-            # Delete intermediate memmap artifacts *only after* the TensorDict is fully materialized.
+
             _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_mmt_path)
             cleanup_ok = True
             return td_out
@@ -2220,7 +2219,7 @@ def predict(
             if cleanup_ok:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
             else:
-                # Keep intermediates for post-mortem inspection / recovery.
+
                 with contextlib.suppress(Exception):
                     logger.info("predict debug: preserving tmp_dir=%s", tmp_dir)
 
@@ -2242,7 +2241,7 @@ def get_prediction(
         output_mode = _normalize_prediction_output(output)
         overwrite_mode = _normalize_prediction_overwrite(overwrite)
 
-        # Resolve output file path (only meaningful when output_mode == 'file').
+
         out_path = None
         path_n = _normalize_path(path) if path is not None else None
         if output_mode == "file":
@@ -2267,7 +2266,7 @@ def get_prediction(
             else:
                 output_mode = "memory"
 
-        # If destination exists, honor overwrite policy early.
+
         if output_mode == "file" and out_path is not None and os.path.exists(out_path):
             if overwrite_mode == "resume" and os.path.isfile(out_path):
                 _validate_predictions_h5(out_path)
@@ -2275,14 +2274,14 @@ def get_prediction(
             if overwrite_mode == "error":
                 raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
 
-        # Source is already a persistent file.
+
         if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
             if output_mode == "file":
-                # If the caller requested a new destination, link/copy it atomically.
+
                 if out_path is None:
                     return PersistentTensorDict(filename=src, mode="r")
                 return _atomic_h5_link_or_copy(src, out_path, overwrite=overwrite_mode)
-            # Materialize into memory.
+
             return _read_predictions_h5_to_tensordict(src)
 
         if not os.path.isdir(src):
@@ -2293,7 +2292,7 @@ def get_prediction(
         if not os.path.isdir(memmap_dir):
             raise FileNotFoundError(f"missing memmap dir: {memmap_dir!r}")
 
-        # Load manifest (required when we need to assemble pred.mmt).
+
         count = None
         out_shape = None
         if os.path.isdir(chunks_dir):
@@ -2308,7 +2307,7 @@ def get_prediction(
                     pass
 
         if os.path.isfile(pred_path):
-            # OK
+
             pass
         else:
             if not os.path.isdir(chunks_dir):
@@ -2337,7 +2336,7 @@ def get_prediction(
         if Y_mmt is None:
             raise RuntimeError("get_prediction: failed to open pred.mmt")
 
-        # If we still don't know count (missing manifest but pred.mmt exists), infer from tensors.
+
         if count is None:
             try:
                 count = int(X_mmt.shape[0])
@@ -2347,7 +2346,7 @@ def get_prediction(
             raise RuntimeError("get_prediction: failed to infer count")
 
         if out_path is not None:
-            # Honor overwrite policy as late as possible (avoid clobbering a completed file).
+
             if os.path.exists(out_path):
                 if overwrite_mode == "resume" and os.path.isfile(out_path):
                     _validate_predictions_h5(
@@ -2386,26 +2385,26 @@ def get_prediction(
                 ),
             )
 
-            # Delete intermediate memmap artifacts *only after* the persistent file is ready.
+
             _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_path)
             return out_td
 
-        # In-memory output.
+
         X_t = _copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
         Y_t = _copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
         td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
 
-        # Delete intermediate memmap artifacts *only after* the TensorDict is fully materialized.
+
         _delete_prediction_memmaps(memmap_dir=memmap_dir, pred_path=pred_path)
         return td_out
 
-# -----------------------------------------------------------------------------
-# Classes
-# -----------------------------------------------------------------------------
+
+
+
 
 class _TensorDictSliceGetter:
-    # Keep at module scope to remain picklable on spawn (Windows) and
-    # friendlier to free-threaded/no-GIL builds.
+
+
 
     __slots__ = ("td",)
 

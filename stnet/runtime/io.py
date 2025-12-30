@@ -28,10 +28,8 @@ if TYPE_CHECKING:
 else:
     try:
         from tensordict import TensorDictBase as TensorDictBase
-    except ImportError:  # pragma: no cover
-        # Use an empty tuple so isinstance(x, TensorDictBase) is always False
-        # when tensordict isn't installed.
-        TensorDictBase = ()  # type: ignore[assignment]
+    except ImportError:
+        TensorDictBase = ()
 
 
 try:
@@ -50,9 +48,6 @@ from ..core.graph import inference_mode
 from ..data.pipeline import BatchIO
 from ..nn.primitives import Recorder
 
-# -----------------------------------------------------------------------------
-# Typing helpers
-# -----------------------------------------------------------------------------
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
@@ -62,23 +57,18 @@ TorchDeviceLike: TypeAlias = torch.device | str | int
 
 _LOGGER = logging.getLogger(__name__)
 
-# Known-benign warnings we routinely suppress in the hot paths (saving/loading, DCP, etc.).
+
 _IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
     "TypedStorage is deprecated. It will be removed in the future",
 )
 
-
 _SAVE_LOCK_GUARD = threading.Lock()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 
 
-# -----------------------------------------------------------------------------
-
 @contextlib.contextmanager
 def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterator[None]:
-    """Suppress known-benign warnings from third-party libraries."""
-
     sentences = _IGNORED_WARNING_SENTENCES if ignored_sentences is None else tuple(ignored_sentences)
     if not sentences:
         yield
@@ -177,8 +167,8 @@ def _to_cpu(
 ) -> object:
     if isinstance(value, torch.Tensor):
         t = value
-        # DTensor is a subclass of Tensor but is not directly serializable / portable.
-        # Convert to its local shard before any device transfers.
+
+
         with contextlib.suppress(Exception):
             from torch.distributed.tensor import DTensor
 
@@ -321,7 +311,7 @@ def _extract_pred_tensor(out: object) -> torch.Tensor:
 @lru_cache(maxsize=256)
 def _forward_param_names(model_cls: object) -> object:
     try:
-        sig = inspect.signature(model_cls.forward)  # type: ignore[misc]
+        sig = inspect.signature(model_cls.forward)
     except Exception:
         return None
     names = set(sig.parameters.keys())
@@ -406,8 +396,8 @@ def is_required(module: str, pip_hint: str | None = None) -> None:
         hint = f" (try: {pip_hint})" if pip_hint else ""
         raise ImportError(f"{module} is required for this operation{hint}") from err
 
-# Classes
-# -----------------------------------------------------------------------------
+
+
 
 class Format(Protocol):
     name = None
