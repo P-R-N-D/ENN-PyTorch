@@ -780,6 +780,7 @@ def capture(
         include_softmax_scale_dropout=include_softmax_scale_dropout,
     )
 
+
 @dataclass
 class _HookConfig:
     include_bias: bool
