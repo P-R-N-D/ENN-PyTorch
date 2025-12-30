@@ -13,10 +13,6 @@ import torch
 
 from .casting import env_first, env_first_float, env_flag
 
-# -----------------------------------------------------------------------------
-# Small helpers
-# -----------------------------------------------------------------------------
-
 
 def _prod_int(shape: Sequence[int]) -> int:
     try:
@@ -43,16 +39,10 @@ class _WaitEvent(Protocol):
     def wait(self, timeout: float | None = None) -> Any: ...
 
 
-
-# -----------------------------------------------------------------------------
-# Pinned CPU page + pool
-# -----------------------------------------------------------------------------
-
 class Page:
-
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
-    def __init__(self, numel: int, dtype: torch.dtype, *, pin_memory: bool = True) -> None:
+    def __init__(self, numel: int, dtype: torch.dtype, *args: Any, pin_memory: bool = True) -> None:
         self._numel = int(max(1, int(numel)))
         self._dtype = dtype
         self._pinned = bool(pin_memory)
@@ -94,7 +84,6 @@ class Page:
 
 
 class Pool:
-
     @dataclass(slots=True)
     class Token:
         i: int
@@ -108,9 +97,8 @@ class Pool:
         fence_evt: object | None = None
         gen: int = 0
 
-    def __init__(self, capacity: int = 4, *, pin_memory: bool = True) -> None:
+    def __init__(self, capacity: int = 4, *args: Any, pin_memory: bool = True) -> None:
         import threading
-
         self._cap = max(1, int(capacity))
         self._pin = bool(pin_memory)
         self._pages: list[Pool._Entry] = []
@@ -150,34 +138,26 @@ class Pool:
         self,
         shape: Tuple[int, ...],
         dtype: torch.dtype,
-        *,
+        *args: Any,
         return_handle: bool = False,
         block: bool = False,
         timeout: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
         import time
-
         shape_t = tuple(int(s) for s in shape)
         dtype_t = dtype
         need = _prod_int(shape_t)
-
         deadline: float | None = None
         if timeout is not None:
             deadline = time.monotonic() + float(timeout)
-
-        # Periodic fence checks when blocking (CUDA events cannot notify us).
         check_interval = 0.01
-
         while True:
-            # Phase 1: select an entry or decide to grow/wait/overflow.
             idx: int | None = None
             need_new_page = False
             want_grow = False
-
             with self._cv:
                 self._scavenge_locked()
                 n = len(self._pages)
-
                 if n:
                     start = self._rr % n
                     for k in range(n):
@@ -188,11 +168,9 @@ class Pool:
                             e.fence = None
                             idx = j
                             self._rr = (j + 1) % max(1, n)
-                            # Decide if we must replace the page (dtype/size/pin mismatch).
                             if (e.page.dtype != dtype_t) or (e.page.numel < need) or (e.page.pinned != self._pin):
                                 need_new_page = True
                             break
-
                 if idx is None:
                     if n < self._cap:
                         want_grow = True
@@ -208,31 +186,23 @@ class Pool:
                                 self._cv.wait(timeout=check_interval)
                             continue
                         break
-
-            # Phase 2: materialize (possibly allocate) outside the lock.
             if idx is not None:
                 new_page: Page | None = None
                 if need_new_page:
                     new_page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
-
                 with self._cv:
-                    # Entry is still busy and reserved for us.
                     e = self._pages[idx]
                     if need_new_page and new_page is not None:
                         e.page = new_page
                         e.gen += 1
                     gen = int(e.gen)
-
                 view = e.page.view(*shape_t)
                 if return_handle:
                     return view, Pool.Token(int(idx), gen)
                 return view
-
             if want_grow:
-                # Allocate new page outside lock.
                 page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
                 entry = Pool._Entry(page=page, busy=True, fence=None, gen=0)
-
                 with self._cv:
                     if len(self._pages) < self._cap:
                         self._pages.append(entry)
@@ -242,13 +212,8 @@ class Pool:
                         if return_handle:
                             return view, Pool.Token(int(idx2), int(entry.gen))
                         return view
-                # Lost the race to grow; retry.
                 continue
-
-            # Overflow or timeout.
             break
-
-        # Overflow: allocate one-off **unpinned** tensor (untracked).
         view = torch.empty(need, dtype=dtype_t, device="cpu", pin_memory=False).view(*shape_t)
         if return_handle:
             return view, None
@@ -277,27 +242,21 @@ class Pool:
     ) -> object | None:
         if token is None or factory is None:
             return None
-
         i = int(getattr(token, "i", -1))
         g = int(getattr(token, "g", -1))
         if i < 0:
             return None
-
-        # Fast path: already created and still matches this generation.
         with self._cv:
             if 0 <= i < len(self._pages):
                 e = self._pages[i]
                 if e.gen == g and e.fence_evt is not None:
                     return e.fence_evt
-
-        # Create outside the lock (backend event creation can be slow).
         try:
             ev_new = factory()
         except Exception:
             return None
         if ev_new is None:
             return None
-
         with self._cv:
             if 0 <= i < len(self._pages):
                 e = self._pages[i]
@@ -306,8 +265,6 @@ class Pool:
                         e.fence_evt = ev_new
                         return ev_new
                     return e.fence_evt
-
-        # Token no longer matches a live entry; return the new event anyway.
         return ev_new
 
 
@@ -342,11 +299,6 @@ class Pool:
             freed = self._scavenge_locked()
             if freed:
                 self._cv.notify_all()
-
-
-# -----------------------------------------------------------------------------
-# Async on-disk cache writer
-# -----------------------------------------------------------------------------
 
 
 @lru_cache(maxsize=1)
@@ -385,25 +337,18 @@ def _cache_force_unpin_enabled() -> bool:
 
 
 class Cache:
-
     def __init__(self, root: str, max_queue: int = 8) -> None:
         import queue
         import threading
-
         self._root = os.fspath(root)
         os.makedirs(self._root, exist_ok=True)
-
-        # Always keep the queue bounded (max_queue<=0 is coerced to 1 to avoid OOM).
         max_q = max(1, int(max_queue))
         self._sem = threading.Semaphore(max_q)
         self._q: "queue.SimpleQueue[tuple[Any, Any, Any, Any]]" = queue.SimpleQueue()
-
-        # Cache env knobs at construction time (hot path should not repeatedly parse env vars).
         self._bp_mode = str(_cache_backpressure_mode() or "block")
         self._bp_timeout_s = float(_cache_backpressure_timeout_s() or 0.0)
         self._early_release = bool(_cache_early_release_enabled())
         self._force_unpin = bool(_cache_force_unpin_enabled())
-
         self._t = threading.Thread(target=self._run, daemon=True)
         self._err: BaseException | None = None
         self._err_event = threading.Event()
@@ -419,24 +364,20 @@ class Cache:
         release_cb: Optional[object] = None,
     ) -> None:
         import os as _os
-
         if self._err_event.is_set():
             raise RuntimeError(f"Async writer error: {self._err!r}")
         if self._closed.is_set():
             raise RuntimeError("Cache is closed")
-
         if path is None:
             if idx is None:
                 raise ValueError("either path or idx required")
             path = _os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
         path = _os.fspath(path)
-
         acquired = False
         sem = self._sem
         if sem is not None:
             mode = str(getattr(self, "_bp_mode", "block") or "block").lower()
             timeout_s = float(getattr(self, "_bp_timeout_s", 0.05) or 0.0)
-
             if mode == "sync":
                 acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
                 if not acquired:
@@ -453,14 +394,11 @@ class Cache:
                         with contextlib.suppress(Exception):
                             release_cb()
                     return
-
             elif mode == "raise":
                 acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
                 if not acquired:
                     raise RuntimeError("Cache queue is full")
-
             else:
-                # Block (default): wait for the writer thread to catch up.
                 if timeout_s > 0:
                     acquired = bool(sem.acquire(timeout=float(timeout_s)))
                 while not acquired:
@@ -469,7 +407,6 @@ class Cache:
                     if self._closed.is_set():
                         raise RuntimeError("Cache is closed")
                     acquired = bool(sem.acquire(timeout=0.1))
-
         try:
             self._q.put((tensor, path, wait_event, release_cb))
         except Exception:
@@ -509,35 +446,26 @@ class Cache:
     def _prepare_tensor_for_save(
         self,
         tensor: torch.Tensor,
-        *,
+        *args: Any,
         release_cb: Callable[[], Any] | None = None,
         early_release: bool | None = None,
         force_unpin: bool | None = None,
     ) -> tuple[torch.Tensor, bool]:
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
-
         buf = tensor.detach()
-        # DTensor is a Tensor subclass but not directly serializable / portable.
-        # Convert to its local shard before any device transfers.
         with contextlib.suppress(Exception):
             from torch.distributed.tensor import DTensor
-
             if isinstance(buf, DTensor):
                 buf = buf.to_local()
         if buf.device.type != "cpu":
             buf = buf.to(device="cpu", non_blocking=False)
-
         if early_release is None:
             early_release = bool(getattr(self, "_early_release", True))
         if force_unpin is None:
             force_unpin = bool(getattr(self, "_force_unpin", False))
-
         released = False
         pinned = Cache._is_pinned_cpu(buf)
-
-        # If a pool-backed pinned buffer is handed in, we can free it for reuse by copying into a
-        # pageable buffer and releasing the pool token before disk I/O.
         if pinned and (bool(force_unpin) or (bool(early_release) and callable(release_cb))):
             try:
                 tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
@@ -548,23 +476,16 @@ class Cache:
                         release_cb()
                     released = True
             except Exception:
-                # Best-effort fallback: keep the pinned buffer and release after saving.
                 released = False
-
         if not bool(buf.is_contiguous()):
             buf = buf.contiguous()
-
         return buf, released
 
     def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
         import os as _os
-
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
-
         buf = tensor.detach()
-        # DTensor is a Tensor subclass but not directly serializable / portable.
-        # Convert to its local shard before any device transfers.
         with contextlib.suppress(Exception):
             from torch.distributed.tensor import DTensor
 
@@ -574,16 +495,11 @@ class Cache:
             buf = buf.to(device="cpu", non_blocking=False)
         if not bool(buf.is_contiguous()):
             buf = buf.contiguous()
-
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
-
-            # Write to a temp file and atomically replace, so readers never see a half-written .mmt.
             parent = _os.path.dirname(path) or "."
             _os.makedirs(parent, exist_ok=True)
-
             import tempfile as _tempfile
-
             fd, tmp_name = _tempfile.mkstemp(prefix=_os.path.basename(path) + ".", suffix=".tmp", dir=parent)
             _os.close(fd)
             try:
@@ -592,21 +508,15 @@ class Cache:
             finally:
                 with contextlib.suppress(Exception):
                     _os.remove(tmp_name)
-
-            # Sidecar meta: keep the naming consistent across the codebase.
             from ..data.pipeline import BatchIO
-
             meta = {
                 "shape": [int(x) for x in buf.shape],
                 "dtype": str(buf.dtype).replace("torch.", ""),
             }
             BatchIO.atomic_write_json(BatchIO.mmt_meta_path(path), meta, indent=None)
             return
-
-        # torch.save pickles (rows.pt / pred.pt)
         if str(path).endswith((".pt", ".pth")):
             from ..data.pipeline import BatchIO
-
             BatchIO.atomic_torch_save(path, buf)
         else:
             torch.save(buf, path)
@@ -618,10 +528,10 @@ class Cache:
         self._q.put((None, None, None, None))
         self._t.join()
 
-    def __enter__(self):  # pragma: no cover
+    def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):  # pragma: no cover
+    def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
 
@@ -635,13 +545,10 @@ class Cache:
                     self._err = RuntimeError(f"Invalid cache queue item: {type(item)!r}")
                     self._err_event.set()
                     break
-
             if tensor is None:
                 break
-
             rel_cb = rel if callable(rel) else None
             released_early = False
-
             try:
                 self._wait(evt)
                 buf, released_early = self._prepare_tensor_for_save(
@@ -651,11 +558,9 @@ class Cache:
                     force_unpin=bool(getattr(self, "_force_unpin", False)),
                 )
                 self._save_tensor(buf, path)
-
                 if rel_cb is not None and not released_early:
                     with contextlib.suppress(Exception):
                         rel_cb()
-
             except Exception as e:
                 self._err = e
                 self._err_event.set()
@@ -671,12 +576,11 @@ class Cache:
 
 @dataclass(slots=True)
 class ProducerError:
-
     exc: BaseException
     tb: str
 
 
-def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
+def best_effort_close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
     for name in (
         "cleanup",
         "close",
@@ -697,7 +601,6 @@ def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
             except Exception:
                 pass
             return
-
     if callable(obj):
         try:
             obj()
@@ -705,35 +608,26 @@ def best_effort_close(obj: Any, *, join_timeout: float | None = 1.0) -> None:
             pass
 
 
-# -----------------------------------------------------------------------------
-# Buffer: bounded in-memory buffer with stop notification
-# -----------------------------------------------------------------------------
-
 class Buffer:
-
     def __init__(self, max_batches: int) -> None:
         import collections
         import threading
-
         self.max_batches = max(1, int(max_batches))
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
         self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
 
-    def put(self, item: Any, *, timeout: float | None = None) -> bool:
+    def put(self, item: Any, *args: Any, timeout: float | None = None) -> bool:
         import logging
         import time
-
         if self._stop.is_set():
             return False
-
         t0 = time.monotonic()
         deadline = None if timeout is None else (t0 + float(timeout))
         with self._cv:
             if self._stop.is_set():
                 return False
-
             while len(self._buf) >= self.max_batches and not self._stop.is_set():
                 if deadline is None:
                     self._cv.wait()
@@ -744,10 +638,8 @@ class Buffer:
                     self._cv.wait(timeout=remaining)
             if self._stop.is_set():
                 return False
-
             self._buf.append(item)
             self._cv.notify()
-
         elapsed = time.monotonic() - t0
         if self._warn_blocking and elapsed > 0.1:
             logging.warning(
@@ -760,7 +652,6 @@ class Buffer:
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
         import queue
         import time
-
         if not bool(block):
             with self._cv:
                 if not self._buf:
@@ -768,10 +659,8 @@ class Buffer:
                 item = self._buf.popleft()
                 self._cv.notify()
                 return item
-
         t0 = time.monotonic()
         deadline = None if timeout is None else (t0 + float(timeout))
-
         with self._cv:
             while not self._buf and not self._stop.is_set():
                 if deadline is None:
@@ -781,7 +670,6 @@ class Buffer:
                     if remaining <= 0:
                         raise queue.Empty
                     self._cv.wait(timeout=remaining)
-
             if not self._buf:
                 raise queue.Empty
             item = self._buf.popleft()
@@ -796,12 +684,10 @@ class Buffer:
         with self._cv:
             return int(len(self._buf))
 
-    def wait_for_space(self, *, timeout: float | None = None) -> bool:
+    def wait_for_space(self, *args: Any, timeout: float | None = None) -> bool:
         import time
-
         if self._stop.is_set():
             return False
-
         t0 = time.monotonic()
         deadline = None if timeout is None else (t0 + float(timeout))
         with self._cv:
@@ -828,5 +714,5 @@ class Buffer:
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
 
-    def __len__(self) -> int:  # pragma: no cover
+    def __len__(self) -> int:
         return self.size()
