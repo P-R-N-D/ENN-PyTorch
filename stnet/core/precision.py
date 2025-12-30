@@ -16,15 +16,15 @@ import torch
 from torch import nn
 
 from ..data.schemas import default_underflow_action, normalize_underflow_action
-from .system import (get_device, get_device_stats, is_cuda_bf16_supported,
-                     is_float8_supported, is_int8_supported)
+from .system import (
+    get_device,
+    get_device_stats,
+    is_cuda_bf16_supported,
+    is_float8_supported,
+    is_int8_supported,
+)
 
 _LOGGER = logging.getLogger(__name__)
-
-
-# -----------------------------------------------------------------------------
-# Negotiation logging (bounded dedupe)
-# -----------------------------------------------------------------------------
 
 _NEGO_LOGGED_KEYS: "OrderedDict[object, None]" = OrderedDict()
 _NEGO_LOGGED_MAX: int = 256
@@ -35,7 +35,7 @@ def _log_negotiate_once(
     logger: Optional[logging.Logger],
     key: object,
     payload: Dict[str, Any],
-    *,
+    *args: Any,
     level: str = "debug",
 ) -> None:
     lg = logger if logger is not None else _LOGGER
@@ -45,10 +45,8 @@ def _log_negotiate_once(
             return
     except Exception:
         pass
-
     if key is None:
         key = (payload.get("context"), payload.get("device"), payload.get("selected"))
-
     with _NEGO_LOGGED_LOCK:
         if key in _NEGO_LOGGED_KEYS:
             with contextlib.suppress(Exception):
@@ -58,7 +56,6 @@ def _log_negotiate_once(
         with contextlib.suppress(Exception):
             while len(_NEGO_LOGGED_KEYS) > int(_NEGO_LOGGED_MAX):
                 _NEGO_LOGGED_KEYS.popitem(last=False)
-
     try:
         msg = "[AMP][NEGOTIATE] " + json.dumps(payload, sort_keys=True, default=str)
     except Exception:
@@ -71,11 +68,6 @@ def _log_negotiate_once(
             lg.debug(msg)
 
 
-# -----------------------------------------------------------------------------
-# Scale safety checks
-# -----------------------------------------------------------------------------
-
-
 def _dtype_short(dtype: Any) -> str:
     if isinstance(dtype, torch.dtype):
         return str(dtype).split(".")[-1]
@@ -85,7 +77,6 @@ def _dtype_short(dtype: Any) -> str:
 def _meta_scale_summary(meta: Any | None) -> Dict[str, Any]:
     if meta is None:
         return {}
-
     def _safe(x: Any) -> Any:
         if x is None:
             return None
@@ -96,7 +87,6 @@ def _meta_scale_summary(meta: Any | None) -> Dict[str, Any]:
         with contextlib.suppress(Exception):
             return str(x)
         return None
-
     keys = (
         "has_scale",
         "has_nonfinite",
@@ -128,7 +118,6 @@ def _scale_safety_check(
         return False, "not-dtype"
     if bool(getattr(meta, "has_nonfinite", False)):
         return False, "nonfinite-data"
-
     max_abs = getattr(meta, "scale_max_abs", None)
     if max_abs is None:
         return True, "no-max-abs"
@@ -138,12 +127,10 @@ def _scale_safety_check(
         return False, "max-abs-not-float"
     if not math.isfinite(max_abs_f):
         return False, "max-abs-nonfinite"
-
     action = normalize_underflow_action(
         underflow_action if underflow_action is not None else getattr(meta, "underflow_action", None),
         default=default_underflow_action(),
     )
-
     if getattr(dtype, "is_complex", False):
         base_dtype = torch.float32 if dtype == torch.complex64 else torch.float64
         ok, why = _scale_safety_check(
@@ -153,13 +140,11 @@ def _scale_safety_check(
             underflow_action=action,
         )
         return (ok, f"complex-base:{why}" if ok else f"complex-base-unsafe:{why}")
-
     if getattr(dtype, "is_floating_point", False):
         info = torch.finfo(dtype)
         overflow_limit = float(info.max) / max(1.0, float(safety_margin))
         if max_abs_f > overflow_limit:
             return (False, f"overflow(max_abs={max_abs_f:.6g},limit={overflow_limit:.6g})")
-
         min_pos = getattr(meta, "scale_min_positive", None)
         if action == "forbid" and min_pos is not None:
             try:
@@ -171,7 +156,6 @@ def _scale_safety_check(
                 if min_pos_f < underflow_limit:
                     return (False, f"underflow(min_pos={min_pos_f:.6g},limit={underflow_limit:.6g})")
         return True, "ok"
-
     if dtype == torch.bool:
         is_integral = getattr(meta, "scale_is_integral", None)
         if is_integral is False:
@@ -179,16 +163,13 @@ def _scale_safety_check(
         if max_abs_f <= 1.0:
             return True, "ok"
         return False, f"bool-range(max_abs={max_abs_f:.6g})"
-
     try:
         info = torch.iinfo(dtype)
     except TypeError:
         return False, "not-integer-dtype"
-
     is_integral = getattr(meta, "scale_is_integral", None)
     if is_integral is False:
         return False, "nonintegral-data"
-
     min_v = getattr(meta, "scale_min_value", None)
     max_v = getattr(meta, "scale_max_value", None)
     if min_v is not None and max_v is not None:
@@ -206,7 +187,6 @@ def _scale_safety_check(
                 ),
             )
         return True, "ok"
-
     if max_abs_f <= float(info.max):
         return True, "ok"
     return False, f"int-max-abs(max_abs={max_abs_f:.6g},max={float(info.max):.6g})"
@@ -224,14 +204,8 @@ def is_scale_safe(
     return ok
 
 
-# -----------------------------------------------------------------------------
-# Lightweight metadata (backend-friendly fallback)
-# -----------------------------------------------------------------------------
-
-
 @dataclass(slots=True)
 class DeviceMeta:
-
     device: torch.device
     device_type: str = "cpu"
     cuda_cc: Optional[Tuple[int, int]] = None
@@ -239,8 +213,6 @@ class DeviceMeta:
     int_dtypes: Tuple[torch.dtype, ...] = tuple()
     float8_dtypes: Tuple[torch.dtype, ...] = tuple()
     int_quant_bits: Optional[int] = None
-
-    # Scale / negotiation metadata (optional)
     has_scale: bool = False
     has_nonfinite: bool = False
     scale_max_abs: Optional[float] = None
@@ -257,7 +229,6 @@ class DeviceMeta:
 
     def refresh(self) -> "DeviceMeta":
         self._refresh_device_info()
-        # Fill candidates from backend device stats if not explicitly set.
         ds = get_device_stats(self.device)
         if not self.float_dtypes:
             self.float_dtypes = tuple(ds.float_dtypes)
@@ -291,18 +262,13 @@ class DeviceMeta:
         )
 
 
-# -----------------------------------------------------------------------------
-# Autocast context helpers (moved from model.fused)
-# -----------------------------------------------------------------------------
-
-
 class Autocast:
     _preferred_fp8_backend: Optional[str] = None
     _preferred_int_backend: Optional[str] = None
     _last_float_dtype: torch.dtype = torch.float32
     _last_int_dtype: torch.dtype = torch.int64
-    _metadata: Any | None = None  # best-effort legacy snapshot
-    _metadata_tls = threading.local()  # per-thread metadata to avoid cross-thread mutation
+    _metadata: Any | None = None
+    _metadata_tls = threading.local()
 
     @classmethod
     def _get_tls_metadata(cls) -> Any | None:
@@ -311,7 +277,6 @@ class Autocast:
     @classmethod
     def _set_tls_metadata(cls, meta: Any | None) -> None:
         setattr(cls._metadata_tls, "meta", meta)
-        # Keep a best-effort snapshot for any legacy access paths.
         cls._metadata = meta
 
     @classmethod
@@ -335,40 +300,41 @@ class Autocast:
         **kwargs: Any,
     ) -> Optional[str]:
         dev = device if device is not None else cls._device(None)
-        if preferred == "te":
-            order = ("te", "ao")
-        elif preferred == "ao":
-            order = ("ao", "te")
-        else:
-            order = ("te", "ao")
-
+        match preferred:
+            case "ao":
+                order = ("ao", "te")
+            case "te" | None:
+                order = ("te", "ao")
+            case _:
+                order = ("te", "ao")
         for backend in order:
-            if backend == "te":
-                ok, reason = is_float8_supported(dev)
-                if not ok:
-                    _LOGGER.debug("Autocast FP8 TE unavailable: %s", reason)
+            match backend:
+                case "te":
+                    ok, reason = is_float8_supported(dev)
+                    if not ok:
+                        _LOGGER.debug("Autocast FP8 TE unavailable: %s", reason)
+                        continue
+                    try:
+                        te = importlib.import_module("transformer_engine.pytorch")
+                        if getattr(te, "fp8_autocast", None) is None:
+                            raise AttributeError("transformer_engine.fp8_autocast missing")
+                    except Exception as exc:
+                        _LOGGER.debug("Autocast FP8 TE import failed: %s", exc)
+                        continue
+                    cls._preferred_fp8_backend = "te"
+                    return "te"
+                case "ao":
+                    try:
+                        _float8_mod = importlib.import_module("torchao.float8")
+                        if getattr(_float8_mod, "fp8_autocast", None) is None:
+                            raise AttributeError("torchao.float8.fp8_autocast missing")
+                    except Exception as exc:
+                        _LOGGER.debug("Autocast FP8 torchao import failed: %s", exc)
+                        continue
+                    cls._preferred_fp8_backend = "ao"
+                    return "ao"
+                case _:
                     continue
-                try:
-                    te = importlib.import_module("transformer_engine.pytorch")
-                    if getattr(te, "fp8_autocast", None) is None:
-                        raise AttributeError("transformer_engine.fp8_autocast missing")
-                except Exception as exc:
-                    _LOGGER.debug("Autocast FP8 TE import failed: %s", exc)
-                    continue
-                cls._preferred_fp8_backend = "te"
-                return "te"
-
-            if backend == "ao":
-                try:
-                    _float8_mod = importlib.import_module("torchao.float8")
-                    if getattr(_float8_mod, "fp8_autocast", None) is None:
-                        raise AttributeError("torchao.float8.fp8_autocast missing")
-                except Exception as exc:
-                    _LOGGER.debug("Autocast FP8 torchao import failed: %s", exc)
-                    continue
-                cls._preferred_fp8_backend = "ao"
-                return "ao"
-
         cls._preferred_fp8_backend = None
         return None
 
@@ -381,47 +347,47 @@ class Autocast:
         **kwargs: Any,
     ) -> Optional[str]:
         dev = device if device is not None else cls._device(None)
-        if preferred == "te":
-            order = ("te", "ao")
-        elif preferred == "ao":
-            order = ("ao", "te")
-        else:
-            order = ("te", "ao")
-
+        match preferred:
+            case "ao":
+                order = ("ao", "te")
+            case "te" | None:
+                order = ("te", "ao")
+            case _:
+                order = ("te", "ao")
         for backend in order:
-            if backend == "te":
-                ok, reason = is_int8_supported(dev)
-                if not ok:
-                    _LOGGER.debug("Autocast INT8 TE unavailable: %s", reason)
+            match backend:
+                case "te":
+                    ok, reason = is_int8_supported(dev)
+                    if not ok:
+                        _LOGGER.debug("Autocast INT8 TE unavailable: %s", reason)
+                        continue
+                    try:
+                        te = importlib.import_module("transformer_engine.pytorch")
+                        if getattr(te, "int8_autocast", None) is None:
+                            raise AttributeError("transformer_engine.int8_autocast missing")
+                    except Exception as exc:
+                        _LOGGER.debug("Autocast INT8 TE import failed: %s", exc)
+                        continue
+                    cls._preferred_int_backend = "te"
+                    return "te"
+                case "ao":
+                    try:
+                        quant_mod = importlib.import_module("torchao.quantization")
+                        int8_autocast = getattr(quant_mod, "int8_autocast", None)
+                        if not callable(int8_autocast):
+                            raise AttributeError("torchao.quantization.int8_autocast missing")
+                    except Exception as exc:
+                        _LOGGER.debug("Autocast INT8 torchao import failed: %s", exc)
+                        continue
+                    cls._preferred_int_backend = "ao"
+                    return "ao"
+                case _:
                     continue
-                try:
-                    te = importlib.import_module("transformer_engine.pytorch")
-                    if getattr(te, "int8_autocast", None) is None:
-                        raise AttributeError("transformer_engine.int8_autocast missing")
-                except Exception as exc:
-                    _LOGGER.debug("Autocast INT8 TE import failed: %s", exc)
-                    continue
-                cls._preferred_int_backend = "te"
-                return "te"
-
-            if backend == "ao":
-                try:
-                    quant_mod = importlib.import_module("torchao.quantization")
-                    int8_autocast = getattr(quant_mod, "int8_autocast", None)
-                    if not callable(int8_autocast):
-                        raise AttributeError("torchao.quantization.int8_autocast missing")
-                except Exception as exc:
-                    _LOGGER.debug("Autocast INT8 torchao import failed: %s", exc)
-                    continue
-                cls._preferred_int_backend = "ao"
-                return "ao"
-
         cls._preferred_int_backend = None
         return None
 
     @staticmethod
     def float8_formats() -> Tuple[torch.dtype, ...]:
-        # Prefer native dtypes when present.
         out: List[torch.dtype] = []
         for name in (
             "float8_e4m3fn",
@@ -432,7 +398,6 @@ class Autocast:
             dt = getattr(torch, name, None)
             if isinstance(dt, torch.dtype):
                 out.append(dt)
-        # De-dupe while preserving order.
         return tuple(dict.fromkeys(out))
 
     @classmethod
@@ -449,7 +414,6 @@ class Autocast:
             with contextlib.suppress(Exception):
                 device_hint = torch.device(getattr(meta, "device"))
         dev = cls._device(device_hint)
-
         if meta is None:
             meta = DeviceMeta.for_device(dev)
         else:
@@ -466,8 +430,6 @@ class Autocast:
                 if callable(ensure):
                     with contextlib.suppress(Exception):
                         ensure()
-
-        # Ensure dtype lists exist.
         if not getattr(meta, "float_dtypes", ()):
             refresh = getattr(meta, "refresh", None)
             if callable(refresh):
@@ -483,7 +445,6 @@ class Autocast:
             if callable(ensure):
                 with contextlib.suppress(Exception):
                     ensure()
-
         cls._set_tls_metadata(meta)
         return meta
 
@@ -507,7 +468,7 @@ class Autocast:
     def configure(
         cls,
         model: Any | None = None,
-        *,
+        *args: Any,
         fp8_backend: Optional[str] = None,
         int_backend: Optional[str] = None,
         metadata: Any | None = None,
@@ -519,14 +480,11 @@ class Autocast:
                 backend = "te"
             elif any(getattr(model, attr, False) for attr in ("__fp8_training_ao__", "__fp8_inference_ao__")):
                 backend = "ao"
-
         if int_b is None and isinstance(model, nn.Module):
             if any(getattr(model, attr, False) for attr in ("__int8_training_qat__", "__int8_training_ptq__", "__int8_inference_ao__")):
                 int_b = "ao"
-
         cls._preferred_fp8_backend = backend
         cls._preferred_int_backend = int_b
-
         meta = metadata
         device: Optional[torch.device] = None
         if meta is not None:
@@ -541,7 +499,6 @@ class Autocast:
                     tensor = next(model.buffers())
             if tensor is not None:
                 device = tensor.device
-
         meta = cls.coerce_metadata(device, metadata=meta)
         cls._set_tls_metadata(meta)
 
@@ -558,7 +515,6 @@ class Autocast:
         decision_key: object = None,
         **kwargs: Any,
     ) -> torch.dtype:
-        # Safety margin: can be passed as safety_margin or safety_margin_pow2.
         raw_pow2 = kwargs.pop("safety_margin_pow2", None)
         safety_margin_pow2: Optional[int] = None
         if raw_pow2 is not None:
@@ -583,25 +539,21 @@ class Autocast:
                     ref = float(2 ** n)
                     if abs(ref - safety_margin) / max(abs(safety_margin), 1.0) < 1e-12:
                         safety_margin_pow2 = n
-
         raw_underflow = kwargs.pop("underflow_action", None)
         if raw_underflow is None:
             raw_underflow = kwargs.pop("underflow", None)
         underflow_override: Optional[str] = None
         if raw_underflow is not None:
             underflow_override = normalize_underflow_action(raw_underflow, default=default_underflow_action())
-
         collect_checks = False
         if logger is not None:
             try:
                 collect_checks = logger.isEnabledFor(logging.DEBUG) or logger.isEnabledFor(logging.INFO)
             except Exception:
                 collect_checks = True
-
         checks: List[Dict[str, Any]] = [] if collect_checks else []
         selected: Optional[torch.dtype] = None
         selected_from: str = "candidate"
-
         for dt in candidates:
             ok, why = _scale_safety_check(dt, meta, safety_margin=safety_margin, underflow_action=underflow_override)
             if collect_checks:
@@ -609,11 +561,9 @@ class Autocast:
             if ok:
                 selected = dt
                 break
-
         dev_type = str(getattr(device, "type", "")) if device is not None else ""
         dev_index = int(getattr(device, "index", -1)) if (device is not None and getattr(device, "index", None) is not None) else -1
         device_str = f"{dev_type}:{dev_index}" if dev_type else ""
-
         fallback_order: Tuple[torch.dtype, ...] = ()
         if selected is None:
             selected_from = "fallback"
@@ -631,7 +581,6 @@ class Autocast:
             if selected is None:
                 selected = fallback
                 selected_from = "unsafe-fallback"
-
         if logger is not None:
             level = "info" if selected_from != "candidate" else "debug"
             lvl = logging.INFO if level == "info" else logging.DEBUG
@@ -677,7 +626,6 @@ class Autocast:
                     "scale": _meta_scale_summary(meta),
                 }
                 _log_negotiate_once(logger, decision_key, payload, level=level)
-
         return selected
 
     @classmethod
@@ -689,7 +637,6 @@ class Autocast:
     ) -> Optional[torch.dtype]:
         dev = cls._device(device)
         meta = cls.coerce_metadata(device=dev, metadata=metadata)
-
         disable = False
         if meta is not None:
             fn = getattr(meta, "is_disabled", None)
@@ -713,7 +660,6 @@ class Autocast:
         if extra:
             with contextlib.suppress(Exception):
                 candidates = tuple(_coerce_dt(x, requested_dtype) for x in extra)
-
         chosen = cls.negotiate(candidates, fallback=requested_dtype, device=dev, meta=meta, context="autocast-float")
         return chosen
 
@@ -737,19 +683,15 @@ class Autocast:
             device=dev,
             meta=meta,
         )
-
         contexts: List[contextlib.AbstractContextManager[None]] = []
-
         debug = _LOGGER.isEnabledFor(logging.DEBUG)
         fp8_disable_reason: Optional[str] = None
         fp8_backend_requested: Optional[str] = None
         fp8_backend_used: Optional[str] = None
         fp8_checks: Dict[str, Any] = {}
-
         backend = cls._fp8_backend(cls._preferred_fp8_backend, device=dev)
         fp8_backend_requested = backend
         float8_dtypes = tuple(getattr(meta, "float8_dtypes", ())) if getattr(meta, "float8_dtypes", ()) else cls.float8_formats()
-
         wants_fp8 = backend is not None
         if wants_fp8 and getattr(meta, "has_scale", False):
             fp8_supported = False
@@ -763,7 +705,6 @@ class Autocast:
                 wants_fp8 = False
                 fp8_disable_reason = "scale-exceeds-fp8"
                 _LOGGER.debug("Autocast FP8 disabled on %s: data scale exceeds float8 range", dev.type)
-
         if wants_fp8:
             if backend == "te":
                 fp8_contexts = cls._nvidia_float8(dev, True)
@@ -790,21 +731,17 @@ class Autocast:
                 _LOGGER.debug("Autocast FP8 backend '%s' unsupported; disabling", backend)
                 cls._preferred_fp8_backend = None
                 fp8_disable_reason = "fp8-backend-unsupported"
-
         requested_dtype = amp_dtype
         if isinstance(cls._last_float_dtype, torch.dtype) and cls._last_float_dtype in amp_candidates and cls._last_float_dtype == amp_dtype:
             requested_dtype = cls._last_float_dtype
-
         if requested_dtype is torch.float64:
             wants_fp8 = False
             fp8_disable_reason = fp8_disable_reason or "master-fp64"
-
         if dev.type == "cuda" and requested_dtype is torch.bfloat16:
             bf16_ok = is_cuda_bf16_supported(dev)
             if not bf16_ok:
                 _LOGGER.debug("Autocast.float falling back to fp16 on CUDA device without bf16 support")
                 requested_dtype = torch.float16
-
         if dev.type == "cpu" and requested_dtype not in (torch.bfloat16, torch.float16):
             contexts.append(contextlib.nullcontext())
             cls._last_float_dtype = requested_dtype
@@ -818,9 +755,7 @@ class Autocast:
                 cls._last_float_dtype = requested_dtype
             else:
                 cls._last_float_dtype = requested_dtype
-
         cls._set_tls_metadata(meta)
-
         if debug:
             with contextlib.suppress(Exception):
                 _LOGGER.debug(
@@ -841,7 +776,6 @@ class Autocast:
                         default=str,
                     ),
                 )
-
         with contextlib.ExitStack() as stack:
             for ctx in contexts:
                 stack.enter_context(ctx)
@@ -871,18 +805,14 @@ class Autocast:
         meta = cls.coerce_metadata(dev, metadata=metadata)
         int_candidates = tuple(getattr(meta, "int_dtypes", ())) if getattr(meta, "int_dtypes", ()) else (torch.int64,)
         int_dtype = cls.negotiate(int_candidates, fallback=torch.int64, logger=_LOGGER, context="int", device=dev, meta=meta)
-
         quant_bits = getattr(meta, "int_quant_bits", None)
         wants_int4 = quant_bits == 4
         wants_int8 = (int_dtype == torch.int8) or (quant_bits == 8)
-
         debug = _LOGGER.isEnabledFor(logging.DEBUG)
         int_backend_requested: Optional[str] = None
         int_backend_used: Optional[str] = None
         int_disable_reason: Optional[str] = None
-
         contexts: List[contextlib.AbstractContextManager[None]] = []
-
         if wants_int4:
             try:
                 contexts = cls._torchao_int4(dev, True)
@@ -893,7 +823,6 @@ class Autocast:
                 _LOGGER.debug("Autocast INT4 enable failed: %s", exc)
                 contexts = []
                 int_disable_reason = "int4-backend-unavailable"
-
         if not contexts and wants_int8:
             backend = cls._int_backend(cls._preferred_int_backend, device=dev)
             int_backend_requested = backend
@@ -908,16 +837,13 @@ class Autocast:
                         int_backend_used = "ao"
             if (not contexts) and wants_int8:
                 int_disable_reason = "int8-backend-unavailable"
-
         if not contexts:
             contexts.append(contextlib.nullcontext())
-
         with contextlib.ExitStack() as stack:
             for ctx in contexts:
                 stack.enter_context(ctx)
             cls._last_int_dtype = int_dtype
             cls._set_tls_metadata(meta)
-
             if debug:
                 with contextlib.suppress(Exception):
                     _LOGGER.debug(
@@ -941,8 +867,6 @@ class Autocast:
                         ),
                     )
             yield
-
-    # ---- Backend-specific context constructors ----
 
     @classmethod
     def _nvidia_float8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
@@ -979,7 +903,7 @@ class Autocast:
         return contexts
 
     @classmethod
-    def _torchao_int8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+    def _torchao_int8_backend(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
         contexts: List[AbstractContextManager[None]] = []
         if not enabled:
             return contexts
@@ -1026,45 +950,35 @@ class Autocast:
 
     @classmethod
     def _torchao_int8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        # Alias to the internal helper; preserves historical behavior.
         return cls._torchao_int8_autocast(device, enabled)
 
     @classmethod
     def _torchao_int8_autocast(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        # Use preferred backend if set; otherwise try AO.
         if cls._preferred_int_backend is None:
             cls._preferred_int_backend = "ao"
-        return cls._torchao_int8(device, enabled)
-
-
-# -----------------------------------------------------------------------------
-# End-to-end precision policy
-# -----------------------------------------------------------------------------
+        return cls._torchao_int8_backend(device, enabled)
 
 
 @dataclass(slots=True)
 class PrecisionPolicy:
-
     master_float: torch.dtype = torch.float32
     amp_dtype: Optional[torch.dtype] = None
-
     fsdp_param_dtype: torch.dtype = torch.float32
     fsdp_reduce_dtype: torch.dtype = torch.float32
     fsdp_output_dtype: torch.dtype = torch.float32
-
     bn_buffers_dtype: torch.dtype = torch.float32
     underflow_action: str = "warn"
 
     @property
     def amp_float(self) -> Optional[torch.dtype]:
         return self.amp_dtype
-
+      
     @classmethod
     def from_metadata(
         cls,
         device: Union[torch.device, str],
         metadata: Any | None,
-        *,
+        *args: Any,
         logger: Optional[logging.Logger] = None,
         safety_margin: float = 8.0,
     ) -> "PrecisionPolicy":
@@ -1078,47 +992,40 @@ class PrecisionPolicy:
                 f = getattr(meta, "refresh", None)
                 if callable(f):
                     f()
-
         action = normalize_underflow_action(getattr(meta, "underflow_action", None), default=default_underflow_action())
         with contextlib.suppress(Exception):
             setattr(meta, "underflow_action", action)
-
         is_negotiable = bool(getattr(meta, "is_negotiable", False))
         safety = float(safety_margin)
-
         master_float = torch.float64
         amp_dtype: Optional[torch.dtype] = None
-
-        if dev.type == "cuda":
-            if is_negotiable and is_scale_safe(torch.float32, meta, safety_margin=safety):
-                master_float = torch.float32
-
-            if is_cuda_bf16_supported(dev) and is_scale_safe(torch.bfloat16, meta, safety_margin=safety):
+        match dev.type:
+            case "cuda":
+                if is_negotiable and is_scale_safe(torch.float32, meta, safety_margin=safety):
+                    master_float = torch.float32
+                if is_cuda_bf16_supported(dev) and is_scale_safe(torch.bfloat16, meta, safety_margin=safety):
+                    amp_dtype = torch.bfloat16
+                elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+                    amp_dtype = torch.float16
+            case "cpu":
+                master_float = torch.float32 if is_negotiable else torch.float64
+            case "xpu":
+                master_float = torch.float32 if is_negotiable else torch.float64
                 amp_dtype = torch.bfloat16
-            elif is_scale_safe(torch.float16, meta, safety_margin=safety):
+            case "mps":
+                master_float = torch.float32 if is_negotiable else torch.float64
                 amp_dtype = torch.float16
-        elif dev.type == "cpu":
-            master_float = torch.float32 if is_negotiable else torch.float64
-        elif dev.type == "xpu":
-            master_float = torch.float32 if is_negotiable else torch.float64
-            amp_dtype = torch.bfloat16
-        elif dev.type == "mps":
-            master_float = torch.float32 if is_negotiable else torch.float64
-            amp_dtype = torch.float16
-        else:
-            if is_scale_safe(torch.float32, meta, safety_margin=safety):
-                master_float = torch.float32
-
+            case _:
+                if is_scale_safe(torch.float32, meta, safety_margin=safety):
+                    master_float = torch.float32
         bn_dtype = master_float
         fsdp_param_dtype = master_float
         fsdp_reduce_dtype = master_float
         fsdp_output_dtype = master_float
-
         if master_float == torch.float32 and amp_dtype is not None:
             fsdp_param_dtype = amp_dtype
             fsdp_reduce_dtype = amp_dtype
             fsdp_output_dtype = amp_dtype
-
         if logger is not None:
             with contextlib.suppress(Exception):
                 logger.info(
@@ -1134,7 +1041,6 @@ class PrecisionPolicy:
                     str(is_negotiable),
                     str(safety_margin),
                 )
-
         return cls(
             master_float=master_float,
             amp_dtype=amp_dtype,
@@ -1147,7 +1053,6 @@ class PrecisionPolicy:
 
     def to_fsdp_policy(self):
         from torch.distributed.fsdp import MixedPrecisionPolicy
-
         return MixedPrecisionPolicy(
             param_dtype=self.fsdp_param_dtype,
             reduce_dtype=self.fsdp_reduce_dtype,
