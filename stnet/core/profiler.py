@@ -694,7 +694,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any,
                 if cfg.include_bias and b2:
                     fwd2 += float(m_dim) * float(n2)
                 lin2 = float(fwd2 * (1.0 + max(0.0, cfg.effective_bwd)))
-
         total = float(ln + lin1 + act + lin2)
         if total > 0.0:
             profiler.add(f"TE.{type(mod).__name__}", total)
