@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -13,20 +14,24 @@ import tempfile
 import threading
 import warnings
 import weakref
+from types import ModuleType
 from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Protocol
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Mapping, Sequence, TypeAlias, Protocol
 
 import torch
 from torch import nn
 
-try:
-    from tensordict import TensorDictBase
-except ImportError:
-
-    class TensorDictBase:
-        pass
+if TYPE_CHECKING:
+    from tensordict import TensorDictBase as TensorDictBase
+else:
+    try:
+        from tensordict import TensorDictBase as TensorDictBase
+    except ImportError:  # pragma: no cover
+        # Use an empty tuple so isinstance(x, TensorDictBase) is always False
+        # when tensordict isn't installed.
+        TensorDictBase = ()  # type: ignore[assignment]
 
 
 try:
@@ -45,22 +50,46 @@ from ..core.graph import inference_mode
 from ..data.pipeline import BatchIO
 from ..nn.primitives import Recorder
 
+# -----------------------------------------------------------------------------
+# Typing helpers
+# -----------------------------------------------------------------------------
+PathLike: TypeAlias = str | os.PathLike[str] | Path
+
+JsonPrimitive: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+
+TorchDeviceLike: TypeAlias = torch.device | str | int
+
 _LOGGER = logging.getLogger(__name__)
 
-
-def is_required(module, pip_hint=None):
-    try:
-        __import__(module)
-    except ImportError as err:
-        hint = f" (try: {pip_hint})" if pip_hint else ""
-        raise ImportError(f"{module} is required for this operation{hint}") from err
+# Known-benign warnings we routinely suppress in the hot paths (saving/loading, DCP, etc.).
+_IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
+    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
+    "TypedStorage is deprecated. It will be removed in the future",
+)
 
 
 _SAVE_LOCK_GUARD = threading.Lock()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 
 
-def _save_lock_for(path=None):
+# -----------------------------------------------------------------------------
+
+@contextlib.contextmanager
+def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterator[None]:
+    """Suppress known-benign warnings from third-party libraries."""
+
+    sentences = _IGNORED_WARNING_SENTENCES if ignored_sentences is None else tuple(ignored_sentences)
+    if not sentences:
+        yield
+        return
+    with warnings.catch_warnings():
+        for s in sentences:
+            with contextlib.suppress(Exception):
+                warnings.filterwarnings("ignore", message=f".*{re.escape(str(s))}.*")
+        yield
+
+def _save_lock_for(path: PathLike | None = None) -> threading.RLock:
     if path is None:
         key = "__global__"
     else:
@@ -75,16 +104,14 @@ def _save_lock_for(path=None):
             _SAVE_PATH_LOCKS[key] = lk
         return lk
 
-
-def _get_dist():
+def _get_dist() -> ModuleType | None:
     try:
         import torch.distributed as dist
     except Exception:
         return None
     return dist
 
-
-def _is_rank0_global():
+def _is_rank0_global() -> bool:
     dist = _get_dist()
     if dist is None:
         return True
@@ -95,8 +122,7 @@ def _is_rank0_global():
         pass
     return True
 
-
-def _dist_barrier():
+def _dist_barrier() -> None:
     dist = _get_dist()
     if dist is None:
         return
@@ -106,9 +132,8 @@ def _dist_barrier():
     except Exception:
         pass
 
-
 @contextlib.contextmanager
-def _save_sync(path=None, *, barrier=False):
+def _save_sync(path: PathLike | None = None, *, barrier: bool = False) -> None:
     with _save_lock_for(path):
         if barrier:
             _dist_barrier()
@@ -118,8 +143,7 @@ def _save_sync(path=None, *, barrier=False):
             if barrier:
                 _dist_barrier()
 
-
-def _json_sanitize(obj):
+def _json_sanitize(obj: object) -> JsonValue:
     if obj is None or isinstance(obj, (str, int, float, bool)):
         return obj
     if isinstance(obj, (torch.device, Path, torch.dtype)):
@@ -137,8 +161,7 @@ def _json_sanitize(obj):
         return [_json_sanitize(v) for v in obj]
     return str(obj)
 
-
-def _load_model_config(model):
+def _load_model_config(model: object) -> object:
     try:
         from ..config import _extract_model_config_dict
 
@@ -146,8 +169,12 @@ def _load_model_config(model):
     except Exception:
         return {}
 
-
-def _to_cpu(value, *, materialize_meta=True, make_contiguous=True):
+def _to_cpu(
+    value: object,
+    *,
+    materialize_meta: bool = True,
+    make_contiguous: bool = True,
+) -> object:
     if isinstance(value, torch.Tensor):
         t = value
         # DTensor is a subclass of Tensor but is not directly serializable / portable.
@@ -197,8 +224,12 @@ def _to_cpu(value, *, materialize_meta=True, make_contiguous=True):
         return seq
     return value
 
-
-def _torch_load_checkpoint(path, *, map_location=None, weights_only=True):
+def _torch_load_checkpoint(
+    path: PathLike,
+    *,
+    map_location: TorchDeviceLike | None = None,
+    weights_only: bool = True,
+) -> object:
     p = Path(path)
     try:
         return torch.load(
@@ -213,16 +244,14 @@ def _torch_load_checkpoint(path, *, map_location=None, weights_only=True):
             ) from exc
         raise
 
-
-def _in_console(cmd, desc):
+def _in_console(cmd: object, desc: object) -> None:
     try:
         subprocess.run(list(cmd), check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise RuntimeError(f"{desc} failed with error: {exc}") from exc
 
-
 @contextlib.contextmanager
-def _serving_model(model):
+def _serving_model(model: object) -> None:
     was_training = bool(getattr(model, "training", False))
     candidate_attrs = (
         "optimizer",
@@ -271,8 +300,7 @@ def _serving_model(model):
             with contextlib.suppress(Exception):
                 model.train(True)
 
-
-def _extract_pred_tensor(out):
+def _extract_pred_tensor(out: object) -> torch.Tensor:
     if isinstance(out, TensorDictBase):
         y = out.get("pred", None)
         if not isinstance(y, torch.Tensor):
@@ -290,9 +318,8 @@ def _extract_pred_tensor(out):
                 return v
     raise RuntimeError("Model forward did not return a tensor output.")
 
-
 @lru_cache(maxsize=256)
-def _forward_param_names(model_cls):
+def _forward_param_names(model_cls: object) -> object:
     try:
         sig = inspect.signature(model_cls.forward)  # type: ignore[misc]
     except Exception:
@@ -300,8 +327,7 @@ def _forward_param_names(model_cls):
     names = set(sig.parameters.keys())
     return names
 
-
-def _forward_model(model, x):
+def _forward_model(model: object, x: object) -> object:
     names = _forward_param_names(type(model))
     if names is None:
         return model(x)
@@ -318,8 +344,7 @@ def _forward_model(model, x):
         kwargs["net_loss"] = None
     return model(x, **kwargs) if kwargs else model(x)
 
-
-def _get_tensor_shape(model, sample_input):
+def _get_tensor_shape(model: object, sample_input: object) -> object:
     in_dim = None
     out_shape = None
     if hasattr(model, "in_dim"):
@@ -350,8 +375,7 @@ def _get_tensor_shape(model, sample_input):
         raise RuntimeError("Failed to infer input and output shapes.")
     return (int(in_dim), tuple(out_shape))
 
-
-def _pad_sample(model, sample_input):
+def _pad_sample(model: object, sample_input: object) -> object:
     if sample_input is not None:
         return sample_input
     in_dim, _ = _get_tensor_shape(model, sample_input)
@@ -362,39 +386,51 @@ def _pad_sample(model, sample_input):
         dtype, device = (torch.float32, torch.device("cpu"))
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
-
-def _onnx_options(kwargs):
+def _onnx_options(kwargs: object) -> object:
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": int(kwargs.get("opset_version", 18)),
         "dynamic_batch": bool(kwargs.get("dynamic_batch", True)),
     }
 
-
-def _resolve_onnx_path(dst, kwargs):
+def _resolve_onnx_path(dst: PathLike, kwargs: object) -> object:
     override = kwargs.get("onnx_path")
     if override:
         return Path(override)
     return dst.with_suffix(".onnx")
 
+def is_required(module: str, pip_hint: str | None = None) -> None:
+    try:
+        __import__(module)
+    except ImportError as err:
+        hint = f" (try: {pip_hint})" if pip_hint else ""
+        raise ImportError(f"{module} is required for this operation{hint}") from err
+
+# Classes
+# -----------------------------------------------------------------------------
 
 class Format(Protocol):
     name = None
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any): ...
-
+    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
 
 class TorchIO:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
-    def is_native_target(path):
+    def is_native_target(path: PathLike) -> bool:
         p = Path(path)
         suffix = p.suffix.lower()
         return not suffix or suffix in TorchIO.NATIVE_EXTS
 
     @staticmethod
-    def save(model, path, optimizer=None, extra=None, **opts):
+    def save(
+        model: object,
+        path: PathLike,
+        optimizer: object | None = None,
+        extra: object | None = None,
+        **opts: Any,
+    ) -> object:
         p = Path(path)
         suffix = p.suffix.lower()
         if not suffix and p.exists() and p.is_dir():
@@ -470,29 +506,38 @@ class TorchIO:
             BatchIO.atomic_torch_save(p, payload, **opts)
             return p
 
-
 class _CompatLayer(nn.Module):
-    def __init__(self, net):
+    def __init__(self, net: object) -> None:
         super().__init__()
         self.net = net
 
-    def forward(self, x):
+    def forward(self, x: object) -> object:
         return _extract_pred_tensor(_forward_model(self.net, x))
-
 
 class Onnx(Format):
     name = "onnx"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving:
             out = OnnxIO._OnnxLayer.export(serving, dst, **_onnx_options(kwargs))
         return (out,)
 
-
 class Ort(Format):
     name = "ort"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving:
             onnx_path = OnnxIO._OnnxLayer.coerce(
                 serving, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
@@ -507,11 +552,16 @@ class Ort(Format):
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
-
 class TensorRT(Format):
     name = "tensorrt"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving_model:
             onnx_path = OnnxIO._OnnxLayer.coerce(
                 serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
@@ -569,11 +619,16 @@ class TensorRT(Format):
                     handle.write(engine_bytes)
         return (dst,)
 
-
 class Nnef(Format):
     name = "nnef"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving_model:
             onnx_path = OnnxIO._OnnxLayer.coerce(
                 serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
@@ -616,11 +671,16 @@ class Nnef(Format):
             _in_console(cmd, "nnef convert")
         return (dst,)
 
-
 class CoreML(Format):
     name = "coreml"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         is_required("coremltools", "pip install coremltools")
         import coremltools as ct
 
@@ -654,11 +714,16 @@ class CoreML(Format):
             mlmodel.save(str(dst))
         return (dst,)
 
-
 class LiteRT(Format):
     name = "litert"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving_model:
             onnx_path = OnnxIO._OnnxLayer.coerce(
                 serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
@@ -718,11 +783,16 @@ class LiteRT(Format):
                     handle.write(tflite_model)
         return (dst,)
 
-
 class TorchScript(Format):
     name = "torchscript"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         method = str(kwargs.get("method", "script")).lower()
         with _serving_model(model) as serving_model:
             sample = kwargs.get("sample_input")
@@ -751,11 +821,16 @@ class TorchScript(Format):
             scripted.save(str(dst))
         return (dst,)
 
-
 class ExecuTorch(Format):
     name = "executorch"
 
-    def save(self, model: nn.Module, dst: Any, *args: Any, **kwargs: Any):
+    def save(
+        self,
+        model: nn.Module,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         is_required("executorch", "pip install executorch")
         try:
             from torch.export import export as torch_export
@@ -778,11 +853,16 @@ class ExecuTorch(Format):
                 exec_prog.write_to_file(fh)
         return (dst,)
 
-
 class TensorFlow(Format):
     name = "tensorflow"
 
-    def save(self, model, dst, *args, **kwargs):
+    def save(
+        self,
+        model: object,
+        dst: PathLike,
+        *args: Any,
+        **kwargs: Any,
+    ) -> object:
         with _serving_model(model) as serving_model:
             onnx_path = OnnxIO._OnnxLayer.coerce(
                 serving_model, _resolve_onnx_path(dst, kwargs), **_onnx_options(kwargs)
@@ -798,13 +878,14 @@ class TensorFlow(Format):
             prepare(model_onnx).export_graph(str(saved_model_dir))
         return (saved_model_dir,)
 
-
 class OnnxIO:
-    _by_name = {}
-    _ext_map = {}
+    _by_name: dict[str, Format] = {}
+    _ext_map: dict[str, str] = {}
+    _defaults_registered: bool = False
+    _defaults_lock = threading.Lock()
 
     @lru_cache(maxsize=1)
-    def _export_sig():
+    def _export_sig() -> object:
         try:
             return inspect.signature(torch.onnx.export)
         except Exception:
@@ -814,13 +895,13 @@ class OnnxIO:
         @staticmethod
         def export(
             model: nn.Module,
-            onnx_path: Any,
+            onnx_path: PathLike,
             *args: Any,
-            sample_input: Any = None,
+            sample_input: object | None = None,
             opset_version: int = 18,
             dynamic_batch: bool = True,
             **kwargs: Any,
-        ):
+        ) -> object:
             is_required("onnx", "pip install onnx")
             wrapper = _CompatLayer(model).eval()
             sample = _pad_sample(model, sample_input)
@@ -859,7 +940,7 @@ class OnnxIO:
             return onnx_path
 
         @staticmethod
-        def coerce(model: nn.Module, onnx_path: Any, *args: Any, **kwargs: Any):
+        def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
             if not onnx_path.exists():
                 return OnnxIO._OnnxLayer.export(model, onnx_path, **kwargs)
             return onnx_path
@@ -867,15 +948,15 @@ class OnnxIO:
     class _OrtLayer:
         @staticmethod
         def to_ort(
-            onnx_path: Any,
-            ort_path: Any,
+            onnx_path: PathLike,
+            ort_path: PathLike,
             *args: Any,
             optimization_level: str = "all",
             optimization_style: str = "fixed",
-            target_platform: Any = None,
+            target_platform: object | None = None,
             save_optimized_onnx_model: bool = False,
             **kwargs: Any,
-        ):
+        ) -> object:
             is_required("onnxruntime", "pip install onnxruntime")
             import onnxruntime as ort
 
@@ -926,23 +1007,31 @@ class OnnxIO:
             return (ort_path, optimized_onnx_path)
 
     @classmethod
-    def register(cls, name, exts, impl):
+    def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:
         cls._by_name[name] = impl
         for ext in exts:
             cls._ext_map[ext.lower()] = name
 
     @classmethod
-    def for_export(cls, ext):
+    def _ensure_defaults_registered(cls) -> None:
+        if cls._defaults_registered:
+            return
+        with cls._defaults_lock:
+            if cls._defaults_registered:
+                return
+            cls.register("onnx", (".onnx",), Onnx())
+            cls.register("ort", (".ort",), Ort())
+            cls.register("tensorrt", (".engine",), TensorRT())
+            cls.register("nnef", (".nnef",), Nnef())
+            cls.register("coreml", (".mlmodel",), CoreML())
+            cls.register("litert", (".tflite",), LiteRT())
+            cls.register("torchscript", (".ts", ".torchscript"), TorchScript())
+            cls.register("executorch", (".pte",), ExecuTorch())
+            cls.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
+            cls._defaults_registered = True
+
+    @classmethod
+    def for_export(cls, ext: str) -> Format | None:
+        cls._ensure_defaults_registered()
         name = cls._ext_map.get(ext.lower())
         return cls._by_name.get(name) if name else None
-
-
-OnnxIO.register("onnx", (".onnx",), Onnx())
-OnnxIO.register("ort", (".ort",), Ort())
-OnnxIO.register("tensorrt", (".engine",), TensorRT())
-OnnxIO.register("nnef", (".nnef",), Nnef())
-OnnxIO.register("coreml", (".mlmodel",), CoreML())
-OnnxIO.register("litert", (".tflite",), LiteRT())
-OnnxIO.register("torchscript", (".ts", ".torchscript"), TorchScript())
-OnnxIO.register("executorch", (".pte",), ExecuTorch())
-OnnxIO.register("tensorflow", (".savedmodel", ".pb", ".tf"), TensorFlow())
