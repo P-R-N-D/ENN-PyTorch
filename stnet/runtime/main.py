@@ -16,7 +16,7 @@ import warnings
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import lru_cache, partial
-from typing import Any
+from typing import Any, Callable, Iterator, Literal, Mapping, MutableMapping, Sequence, TypeAlias, TypeVar, overload
 
 import torch
 import torch.distributed
@@ -54,109 +54,12 @@ _NVML_BACKOFF_S = None
 _NVML_FAIL_MAX = None
 
 
-@lru_cache(maxsize=4)
-def _nvml_disabled() -> bool:
-    if env_bool("STNET_NVML_DISABLE", False):
-        return True
-    if not env_bool("STNET_NVML", True):
-        return True
-    return False
-
-
-def _nvml_fail_max():
-    global _NVML_FAIL_MAX
-    if _NVML_FAIL_MAX is not None:
-        return int(_NVML_FAIL_MAX)
-    v = env_first_int(("STNET_NVML_FAIL_MAX", "STNET_NVML_FAILURES"), default=3)
-    _NVML_FAIL_MAX = max(1, int(v))
-    return int(_NVML_FAIL_MAX)
-
-
-def _nvml_backoff_s():
-    global _NVML_BACKOFF_S
-    if _NVML_BACKOFF_S is not None:
-        return float(_NVML_BACKOFF_S)
-    raw = env_first(("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"))
-    if raw is not None:
-        with contextlib.suppress(Exception):
-            _NVML_BACKOFF_S = max(0.0, float(raw))
-            return float(_NVML_BACKOFF_S)
-    try:
-        from ..core.system import Thread
-
-        _NVML_BACKOFF_S = 30.0 if bool(Thread.nogil_optimizations_enabled()) else 10.0
-    except Exception:
-        _NVML_BACKOFF_S = 10.0
-    return float(_NVML_BACKOFF_S)
-
-
-def _nvml_in_backoff(now=None):
-    if now is None:
-        now = float(time.perf_counter())
-    with _NVML_LOCK:
-        until = float(_NVML_BACKOFF_UNTIL or 0.0)
-    return bool(until > 0.0 and float(now) < until)
-
-
-def _nvml_min_interval_s():
-    global _NVML_MIN_INTERVAL_S
-    if _NVML_MIN_INTERVAL_S is not None:
-        return float(_NVML_MIN_INTERVAL_S)
-    raw = env_first(("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"))
-    if raw is not None:
-        with contextlib.suppress(Exception):
-            _NVML_MIN_INTERVAL_S = max(0.0, float(raw))
-            return float(_NVML_MIN_INTERVAL_S)
-    try:
-        from ..core.system import Thread
-
-        _NVML_MIN_INTERVAL_S = 0.1 if bool(Thread.nogil_optimizations_enabled()) else 0.0
-    except Exception:
-        _NVML_MIN_INTERVAL_S = 0.0
-    return float(_NVML_MIN_INTERVAL_S)
-
-
-def _ensure_nvml():
-    global _nvml, _NVML_READY, _NVML_TRIED
-    if _nvml_in_backoff():
-        return False
-    if _nvml_disabled():
-        _NVML_TRIED = True
-        _NVML_READY = False
-        _nvml = None
-        return False
-    if _NVML_READY:
-        return True
-    if _NVML_TRIED:
-        return False
-    with _NVML_LOCK:
-        if _nvml_in_backoff():
-            return False
-        if _NVML_READY:
-            return True
-        if _NVML_TRIED:
-            return False
-        _NVML_TRIED = True
-        try:
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore", category=FutureWarning)
-                import pynvml as _pynvml
-            _nvml = _pynvml
-            _nvml.nvmlInit()
-            _NVML_READY = True
-        except Exception as exc:
-            _nvml = None
-            _NVML_READY = False
-            if env_bool("STNET_DEBUG", False):
-                logging.getLogger(__name__).debug("NVML init failed: %s", exc, exc_info=True)
-    return bool(_NVML_READY)
-
-
 try:
     import psutil as _psutil
 except Exception:
     _psutil = None
 from ..config import RuntimeConfig, coerce_model_config
+from .io import _filtered_warnings, _torch_load_checkpoint
 from ..core.casting import to_torch_tensor
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.distributed import (
@@ -209,39 +112,23 @@ from ..data.pipeline import Dataset
 from ..nn.architecture import Model
 from ..nn.primitives import Recorder, resize_scaler_buffer
 
+# -----------------------------------------------------------------------------
+# Typing helpers
+# -----------------------------------------------------------------------------
+PathLike: TypeAlias = str | os.PathLike[str] | Path
+
+JsonPrimitive: TypeAlias = str | int | float | bool | None
+JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
+
+TorchDeviceLike: TypeAlias = torch.device | str | int
+
+ReturnSink: TypeAlias = MutableMapping[str, object]
+
 _LOGGER = logging.getLogger(__name__)
 
 
-_IGNORED_WARNING_SENTENCES = [
-    "TypedStorage is deprecated. It will be removed in the future",
-    "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
-]
-
-
-@contextlib.contextmanager
-def _filtered_warnings(ignored_sentences=_IGNORED_WARNING_SENTENCES):
-    if not ignored_sentences:
-        yield
-        return
-    with warnings.catch_warnings():
-        for _s in ignored_sentences:
-            warnings.filterwarnings("ignore", message=f".*{re.escape(str(_s))}.*")
-        yield
 _COMPILE_SAFE_DONE = False
 _COMPILE_SAFE_LOCK = threading.Lock()
-
-
-def _ensure_torch_compile_safe():
-    global _COMPILE_SAFE_DONE
-    if _COMPILE_SAFE_DONE:
-        return
-    # In no-GIL builds, make this idempotent under concurrency.
-    with _COMPILE_SAFE_LOCK:
-        if _COMPILE_SAFE_DONE:
-            return
-        _COMPILE_SAFE_DONE = True
-    with contextlib.suppress(Exception):
-        torch_compile_safe(runtime_module=sys.modules[__name__])
 
 
 torch_safe_distributed()
@@ -255,9 +142,117 @@ _TIMING_EVENT_TLS = threading.local()
 _TIMING_EVENTS_UNSUPPORTED = object()
 
 
+MB_DIV = 1024.0 * 1024.0
+_device_mem_get_info = Memory.device_mem_get_info
+_DL_STATE_FILE = "dataloader.json"
+
+
+@lru_cache(maxsize=4)
+def _nvml_disabled() -> bool:
+    if env_bool("STNET_NVML_DISABLE", False):
+        return True
+    if not env_bool("STNET_NVML", True):
+        return True
+    return False
+
+def _nvml_fail_max() -> object:
+    global _NVML_FAIL_MAX
+    if _NVML_FAIL_MAX is not None:
+        return int(_NVML_FAIL_MAX)
+    v = env_first_int(("STNET_NVML_FAIL_MAX", "STNET_NVML_FAILURES"), default=3)
+    _NVML_FAIL_MAX = max(1, int(v))
+    return int(_NVML_FAIL_MAX)
+
+def _nvml_backoff_s() -> object:
+    global _NVML_BACKOFF_S
+    if _NVML_BACKOFF_S is not None:
+        return float(_NVML_BACKOFF_S)
+    raw = env_first(("STNET_NVML_BACKOFF_S", "STNET_NVML_BACKOFF"))
+    if raw is not None:
+        with contextlib.suppress(Exception):
+            _NVML_BACKOFF_S = max(0.0, float(raw))
+            return float(_NVML_BACKOFF_S)
+    try:
+        from ..core.system import Thread
+
+        _NVML_BACKOFF_S = 30.0 if bool(Thread.nogil_optimizations_enabled()) else 10.0
+    except Exception:
+        _NVML_BACKOFF_S = 10.0
+    return float(_NVML_BACKOFF_S)
+
+def _nvml_in_backoff(now: object | None = None) -> object:
+    if now is None:
+        now = float(time.perf_counter())
+    with _NVML_LOCK:
+        until = float(_NVML_BACKOFF_UNTIL or 0.0)
+    return bool(until > 0.0 and float(now) < until)
+
+def _nvml_min_interval_s() -> object:
+    global _NVML_MIN_INTERVAL_S
+    if _NVML_MIN_INTERVAL_S is not None:
+        return float(_NVML_MIN_INTERVAL_S)
+    raw = env_first(("STNET_NVML_MIN_INTERVAL_S", "STNET_NVML_MIN_INTERVAL"))
+    if raw is not None:
+        with contextlib.suppress(Exception):
+            _NVML_MIN_INTERVAL_S = max(0.0, float(raw))
+            return float(_NVML_MIN_INTERVAL_S)
+    try:
+        from ..core.system import Thread
+
+        _NVML_MIN_INTERVAL_S = 0.1 if bool(Thread.nogil_optimizations_enabled()) else 0.0
+    except Exception:
+        _NVML_MIN_INTERVAL_S = 0.0
+    return float(_NVML_MIN_INTERVAL_S)
+
+def _ensure_nvml() -> object:
+    global _nvml, _NVML_READY, _NVML_TRIED
+    if _nvml_in_backoff():
+        return False
+    if _nvml_disabled():
+        _NVML_TRIED = True
+        _NVML_READY = False
+        _nvml = None
+        return False
+    if _NVML_READY:
+        return True
+    if _NVML_TRIED:
+        return False
+    with _NVML_LOCK:
+        if _nvml_in_backoff():
+            return False
+        if _NVML_READY:
+            return True
+        if _NVML_TRIED:
+            return False
+        _NVML_TRIED = True
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=FutureWarning)
+                import pynvml as _pynvml
+            _nvml = _pynvml
+            _nvml.nvmlInit()
+            _NVML_READY = True
+        except Exception as exc:
+            _nvml = None
+            _NVML_READY = False
+            if env_bool("STNET_DEBUG", False):
+                logging.getLogger(__name__).debug("NVML init failed: %s", exc, exc_info=True)
+    return bool(_NVML_READY)
+
+def _ensure_torch_compile_safe() -> None:
+    global _COMPILE_SAFE_DONE
+    if _COMPILE_SAFE_DONE:
+        return
+    # In no-GIL builds, make this idempotent under concurrency.
+    with _COMPILE_SAFE_LOCK:
+        if _COMPILE_SAFE_DONE:
+            return
+        _COMPILE_SAFE_DONE = True
+    with contextlib.suppress(Exception):
+        torch_compile_safe(runtime_module=sys.modules[__name__])
+
 @lru_cache(maxsize=8)
 def _wallclock_timer_sync_enabled_for_device_type(dev_type: str) -> bool:
-    # Global knob (applies to all device types)
     if _rt_env_flag("STNET_TIMER_SYNC", False) or _rt_env_flag("STNET_WALLCLOCK_TIMER_SYNC", False):
         return True
     dt = str(dev_type or "cpu")
@@ -271,15 +266,13 @@ def _wallclock_timer_sync_enabled_for_device_type(dev_type: str) -> bool:
         return bool(_rt_env_flag("STNET_CUDA_TIMER_SYNC", False))
     return False
 
-
 def _timing_events_supported(device: torch.device) -> bool:
     try:
         return bool(_timing_events_supported_for_device_type(str(getattr(device, "type", "cpu"))))
     except Exception:
         return False
 
-
-def _make_timing_event(device: torch.device):
+def _make_timing_event(device: torch.device) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
     except Exception:
@@ -288,8 +281,7 @@ def _make_timing_event(device: torch.device):
         return None
     return _accel_make_event(device, enable_timing=True)
 
-
-def _get_thread_timing_events(device: torch.device, slot: str):
+def _get_thread_timing_events(device: torch.device, slot: str) -> object:
     try:
         dev_type = str(getattr(device, "type", "cpu"))
     except Exception:
@@ -320,23 +312,26 @@ def _get_thread_timing_events(device: torch.device, slot: str):
         d[key] = cached
     return cached
 
-
 @lru_cache(maxsize=256)
-def _rt_env_flag(name, default):
+def _rt_env_flag(name: object, default: object) -> object:
     return env_bool(str(name), bool(default))
 
-
 @lru_cache(maxsize=256)
-def _rt_env_int(name, default):
+def _rt_env_int(name: object, default: object) -> object:
     return env_int(str(name), int(default))
 
-
 @lru_cache(maxsize=256)
-def _rt_env_float(name, default):
+def _rt_env_float(name: object, default: object) -> object:
     return env_float(str(name), float(default))
 
-
-def _rt_maybe_torch_profiler(*, enabled, tag, device, out_dir, rank=0):
+def _rt_maybe_torch_profiler(
+    *,
+    enabled: object,
+    tag: object,
+    device: TorchDeviceLike,
+    out_dir: PathLike,
+    rank: int = 0,
+) -> object:
     if not bool(enabled):
         return None
     try:
@@ -395,8 +390,13 @@ def _rt_maybe_torch_profiler(*, enabled, tag, device, out_dir, rank=0):
     except Exception:
         return None
 
-
-def _rt_log_torch_profiler_summary(prof, *, device, logger, header):
+def _rt_log_torch_profiler_summary(
+    prof: object,
+    *,
+    device: TorchDeviceLike,
+    logger: logging.Logger,
+    header: object,
+) -> None:
     if prof is None:
         return
     row_limit = int(getattr(prof, "_stnet_row_limit", 40) or 40)
@@ -425,22 +425,19 @@ def _rt_log_torch_profiler_summary(prof, *, device, logger, header):
             str(table),
         )
 
-
-def _oom_retry_inc(loader, phase, step):
+def _oom_retry_inc(loader: object, phase: object, step: int) -> object:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         cur = int(_OOM_RETRY_COUNT.get(key, 0)) + 1
         _OOM_RETRY_COUNT[key] = int(cur)
         return int(cur)
 
-
-def _oom_retry_clear(loader, phase, step):
+def _oom_retry_clear(loader: object, phase: object, step: int) -> None:
     key = (int(id(loader)), str(phase), int(step))
     with _OOM_RETRY_LOCK:
         _OOM_RETRY_COUNT.pop(key, None)
 
-
-def _oom_max_retries(phase):
+def _oom_max_retries(phase: object) -> object:
     phase = str(phase).strip().lower()
     if phase == "train":
         v = _rt_env_int(
@@ -454,8 +451,7 @@ def _oom_max_retries(phase):
         v = _rt_env_int("STNET_OOM_MAX_RETRIES_PER_BATCH", 3)
     return max(0, int(v))
 
-
-def _oom_skip_enabled(phase):
+def _oom_skip_enabled(phase: object) -> bool:
     phase = str(phase).strip().lower()
     if phase == "train":
         return _rt_env_flag("STNET_OOM_SKIP_TRAIN", _rt_env_flag("STNET_OOM_SKIP_BATCH", True))
@@ -463,8 +459,7 @@ def _oom_skip_enabled(phase):
         return _rt_env_flag("STNET_OOM_SKIP_VAL", _rt_env_flag("STNET_OOM_SKIP_BATCH", True))
     return _rt_env_flag("STNET_OOM_SKIP_BATCH", True)
 
-
-def _oom_scale_down_factor(attempt):
+def _oom_scale_down_factor(attempt: object) -> object:
     seq = (0.8, 0.7, 0.6, 0.5)
     i = max(1, int(attempt)) - 1
     if i < 0:
@@ -473,10 +468,15 @@ def _oom_scale_down_factor(attempt):
         i = len(seq) - 1
     return float(seq[i])
 
-
 def _log_sampler_scale_rate_limited(
-    *, logger, scale_ctl, tag, msg, level="info", min_interval_s=None
-):
+    *,
+    logger: logging.Logger,
+    scale_ctl: object,
+    tag: object,
+    msg: object,
+    level: str = "info",
+    min_interval_s: float | None = None,
+) -> None:
     if min_interval_s is None:
         min_interval_s = _rt_env_float("STNET_SAMPLER_SCALE_LOG_MIN_INTERVAL_S", 5.0)
     try:
@@ -500,8 +500,7 @@ def _log_sampler_scale_rate_limited(
     except Exception:
         pass
 
-
-def _find_sampler_scale_ctl(loader: Any, *, max_depth: int = 4):
+def _find_sampler_scale_ctl(loader: object, *, max_depth: int = 4) -> object:
     obj = loader
     try:
         depth = max(1, int(max_depth))
@@ -516,10 +515,7 @@ def _find_sampler_scale_ctl(loader: Any, *, max_depth: int = 4):
         obj = getattr(obj, "_src", None) or getattr(obj, "src", None)
     return None
 
-
 def _oom_backoff_sleep_s(oom_try: int, phase: str | None = None) -> float:
-    # Optional small sleep between retries to avoid immediate reallocation thrash.
-    # Defaults to 0 (disabled). Configure with STNET_OOM_BACKOFF_BASE_MS / _MAX_MS.
     try:
         base_ms = float(_rt_env_float("STNET_OOM_BACKOFF_BASE_MS", 0.0))
     except Exception:
@@ -540,14 +536,13 @@ def _oom_backoff_sleep_s(oom_try: int, phase: str | None = None) -> float:
         sleep_ms = float(base_ms)
     return max(0.0, float(sleep_ms) / 1000.0)
 
-
 def _handle_oom_recovery(
     *,
     phase: str,
-    loader: Any,
+    loader: object,
     step_idx: int,
     device: torch.device,
-    model: Any,
+    model: object,
     optimizer: Any | None = None,
     global_step: int | None = None,
     grad_accum_steps: int | None = None,
@@ -728,13 +723,7 @@ def _handle_oom_recovery(
 
     return ("retry", grad_accum_steps)
 
-
-MB_DIV = 1024.0 * 1024.0
-_device_mem_get_info = Memory.device_mem_get_info
-_DL_STATE_FILE = "dataloader.json"
-
-
-def _num_batches(loader):
+def _num_batches(loader: object) -> object:
     if loader is None:
         return 0
     try:
@@ -758,7 +747,6 @@ def _num_batches(loader):
             return count
     return 0
 
-
 def _float8_log(msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any) -> None:
     try:
         if (
@@ -772,8 +760,7 @@ def _float8_log(msg: str, *args: Any, only_main_rank: bool = True, **kwargs: Any
         pass
     _LOGGER.info(msg, *args)
 
-
-def _assert_no_meta_tensors(module):
+def _assert_no_meta_tensors(module: object) -> None:
     hits = []
     for name, param in module.named_parameters(recurse=True):
         if is_meta_or_fake_tensor(param):
@@ -784,8 +771,7 @@ def _assert_no_meta_tensors(module):
     if hits:
         raise RuntimeError("Found meta tensors in model:\n" + "\n".join(hits))
 
-
-def _meta_monitor_pre_hook(module, inputs, warn_only):
+def _meta_monitor_pre_hook(module: object, inputs: object, warn_only: object) -> None:
     for arg in inputs:
         if isinstance(arg, torch.Tensor) and is_meta_or_fake_tensor(arg):
             message = f"[META] {module.__class__.__name__} got meta input"
@@ -794,8 +780,7 @@ def _meta_monitor_pre_hook(module, inputs, warn_only):
                 return
             raise RuntimeError(message)
 
-
-def _enable_meta_monitor(model):
+def _enable_meta_monitor(model: object) -> None:
     hook_mode = (
         str(env_first(("STNET_META_MONITOR", "STNET_META_HOOK"), default="off") or "off")
         .strip()
@@ -808,7 +793,6 @@ def _enable_meta_monitor(model):
         submodule.register_forward_pre_hook(
             partial(_meta_monitor_pre_hook, warn_only=warn_only), with_kwargs=False
         )
-
 
 def _assert_no_fake_dtensor(root: nn.Module, *args: Any, **kwargs: Any) -> None:
     bad = []
@@ -828,14 +812,16 @@ def _assert_no_fake_dtensor(root: nn.Module, *args: Any, **kwargs: Any) -> None:
             "LayerNorm parameters must be materialized as a real Tensor: " + ", ".join(bad)
         )
 
-
 def _reset_layernorm_parameter(
-    module: nn.Module, name: str, data: torch.Tensor, *args: Any, requires_grad: bool
+    module: nn.Module,
+    name: str,
+    data: torch.Tensor,
+    *args: Any,
+    requires_grad: bool,
 ) -> None:
     setattr(module, name, nn.Parameter(data, requires_grad=requires_grad))
 
-
-def _cast_model_fp_dtype(model, dtype):
+def _cast_model_fp_dtype(model: object, dtype: torch.dtype) -> object:
     if not isinstance(dtype, torch.dtype):
         return
     try:
@@ -844,7 +830,7 @@ def _cast_model_fp_dtype(model, dtype):
     except Exception:
         return
 
-    def _is_exempt(mod):
+    def _is_exempt(mod: object) -> bool:
         return bool(getattr(mod, "__stnet_precision_exempt__", False))
 
     with torch.no_grad():
@@ -870,8 +856,7 @@ def _cast_model_fp_dtype(model, dtype):
                         continue
                     bufs[name] = b.detach().to(dtype)
 
-
-def _cpu_layernorm_param_dtype(device):
+def _cpu_layernorm_param_dtype(device: TorchDeviceLike) -> object:
     try:
         meta = Autocast.coerce_metadata(device)
         cands = tuple(getattr(meta, "float_dtypes", ())) if meta is not None else ()
@@ -884,8 +869,7 @@ def _cpu_layernorm_param_dtype(device):
     except Exception:
         return torch.float32
 
-
-def _preload_layers(model, device):
+def _preload_layers(model: object, device: TorchDeviceLike) -> None:
     for module in model.modules():
         if not isinstance(module, nn.LayerNorm):
             continue
@@ -933,8 +917,7 @@ def _preload_layers(model, device):
             _reset_layernorm_parameter(module, "bias", data, requires_grad=requires_grad_b)
             bias = module.bias
 
-
-def _assert_unified_layer_dtype(model, device):
+def _assert_unified_layer_dtype(model: object, device: TorchDeviceLike) -> None:
     mismatches = []
     for name, module in model.named_modules():
         if not isinstance(module, nn.LayerNorm):
@@ -970,8 +953,7 @@ def _assert_unified_layer_dtype(model, device):
     if mismatches:
         raise RuntimeError("LayerNorm parameter dtype mismatch detected:\n" + "\n".join(mismatches))
 
-
-def _trim_dcp_keys(state):
+def _trim_dcp_keys(state: object) -> object:
     if isinstance(state, dict):
         keys = []
         for key, value in state.items():
@@ -988,8 +970,7 @@ def _trim_dcp_keys(state):
             state.pop(key, None)
     return state
 
-
-def _backend_type(device):
+def _backend_type(device: TorchDeviceLike) -> object:
     match str(getattr(device, "type", "cpu")):
         case "cuda":
             return "nccl"
@@ -998,8 +979,7 @@ def _backend_type(device):
         case _:
             return "gloo"
 
-
-def _set_backend(device):
+def _set_backend(device: TorchDeviceLike) -> None:
     with contextlib.suppress(Exception):
         if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
             torch.backends.cudnn.benchmark = True
@@ -1054,8 +1034,7 @@ def _set_backend(device):
             os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
             os.environ.setdefault("TP_SOCKET_IFNAME", iface)
 
-
-def _unify_param_dtype(model, prefer=None):
+def _unify_param_dtype(model: object, prefer: object | None = None) -> object:
     dtypes = set((p.dtype for p in model.parameters() if p is not None))
     if len(dtypes) <= 1:
         return None
@@ -1078,8 +1057,7 @@ def _unify_param_dtype(model, prefer=None):
             setattr(mod, name, new_p)
     return tgt
 
-
-def _first_source_path(obj):
+def _first_source_path(obj: object) -> object:
     if isinstance(obj, dict):
         if "path" in obj and "kind" in obj:
             return os.fspath(obj["path"])
@@ -1090,26 +1068,23 @@ def _first_source_path(obj):
         return _first_source_path(obj[0])
     raise RuntimeError("sources is empty or invalid")
 
-
-def _merge_meta_infos(sources):
+def _merge_meta_infos(sources: object) -> object:
     return BatchIO.merge_meta_infos(sources)
 
-
-def _expand(sources):
+def _expand(sources: object) -> object:
     return BatchIO.expand_sources(sources)
 
-
 def _calibrate_per_sample_mem(
-    model,
-    device,
-    ops,
-    dataset=None,
-    max_probe_batch=32,
-    with_backward=False,
-    global_loss=None,
-    local_loss=None,
-    loss_weights=None,
-):
+    model: object,
+    device: TorchDeviceLike,
+    ops: object,
+    dataset: object | None = None,
+    max_probe_batch: int = 32,
+    with_backward: bool = False,
+    global_loss: object | None = None,
+    local_loss: object | None = None,
+    loss_weights: object | None = None,
+) -> object:
     from ..data.nodes import Sampler
 
     try:
@@ -1143,7 +1118,7 @@ def _calibrate_per_sample_mem(
         return
     B0 = max(1, min(int(max_probe_batch), N))
 
-    def _to_device(obj, dev):
+    def _to_device(obj: object, dev: object) -> object:
         if isinstance(obj, torch.Tensor):
             return obj.to(device=dev, non_blocking=_pinned_h2d_supported_for_device_type(dev.type))
         from collections.abc import Mapping
@@ -1230,7 +1205,7 @@ def _calibrate_per_sample_mem(
         if not forward_ran:
             batch_dev = _to_device(batch, device)
 
-            def _touch(obj):
+            def _touch(obj: object) -> None:
                 if isinstance(obj, torch.Tensor):
                     _ = obj.sum()
                 elif isinstance(obj, (list, tuple)):
@@ -1272,8 +1247,13 @@ def _calibrate_per_sample_mem(
     except Exception:
         return
 
-
-def _wrap_fsdp(target, mesh, mp_policy, reshard_after_forward, wrapped):
+def _wrap_fsdp(
+    target: PathLike,
+    mesh: object,
+    mp_policy: object,
+    reshard_after_forward: object,
+    wrapped: object,
+) -> object:
     if target is None or id(target) in wrapped:
         return target
     wrapped.add(id(target))
@@ -1285,8 +1265,7 @@ def _wrap_fsdp(target, mesh, mp_policy, reshard_after_forward, wrapped):
         sync_module_states=True,
     )
 
-
-def _get_layers(root):
+def _get_layers(root: object) -> object:
     if root is None:
         return []
     blocks = []
@@ -1300,9 +1279,13 @@ def _get_layers(root):
                     blocks.append(block)
     return blocks
 
-
 def _initialize_tensor(
-    value: Any, *args: Any, param: torch.Tensor, capturable: bool, fused: bool, **kwargs: Any
+    value: object,
+    *args: Any,
+    param: torch.Tensor,
+    capturable: bool,
+    fused: bool,
+    **kwargs: Any,
 ) -> torch.Tensor:
     desired_device = param.device if capturable or fused else torch.device("cpu")
     desired_dtype = param.dtype if torch.is_floating_point(param) else torch.float32
@@ -1319,8 +1302,7 @@ def _initialize_tensor(
         step_tensor = torch.tensor(base, dtype=desired_dtype, device=desired_device)
     return step_tensor
 
-
-def _initialize_adamw(optim):
+def _initialize_adamw(optim: object) -> None:
     for group in optim.param_groups:
         amsgrad = group.get("amsgrad", False)
         capturable = bool(group.get("capturable", False))
@@ -1342,7 +1324,6 @@ def _initialize_adamw(optim):
                 state["max_exp_avg_sq"] = torch.zeros_like(param)
             optim.state[param] = state
 
-
 def _scheduler(
     step: int,
     *args: Any,
@@ -1359,8 +1340,7 @@ def _scheduler(
     frac_min = emin / base if base > 0.0 else 0.0
     return frac_min + (1.0 - frac_min) * 0.5 * (1.0 + math.cos(math.pi * t / max(1, main_steps)))
 
-
-def _initialize_group(backend, device, local_rank):
+def _initialize_group(backend: object, device: TorchDeviceLike, local_rank: int) -> None:
     dev_id = None
     dev_type = getattr(device, "type", "cpu")
     if dev_type in ("cuda", "xpu", "mps"):
@@ -1381,35 +1361,7 @@ def _initialize_group(backend, device, local_rank):
     except TypeError:
         torch.distributed.init_process_group(backend=backend)
 
-
-def loader_state_path(directory):
-    return os.path.join(directory, _DL_STATE_FILE)
-
-
-def get_tqdm(*args: Any, title: str, total: int, device: torch.device, **kwargs: Any):
-    try:
-        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
-            return None
-    except Exception:
-        pass
-    if int(total) <= 0:
-        return None
-    bar = tqdm(
-        total=int(total),
-        desc=f"{title} ({device.type.upper()})",
-        unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
-        bar_format="{desc}"
-        + "{bar} {percentage:3.0f}% "
-        + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
-        colour="green",
-        position=0,
-        leave=False,
-        file=sys.stdout,
-    )
-    return bar
-
-
-def _gpu_nvml_utils(device):
+def _gpu_nvml_utils(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "cuda":
         return (None, None)
     idx = device.index if device.index is not None else _accel_current_device_index("cuda")
@@ -1483,24 +1435,21 @@ def _gpu_nvml_utils(device):
             mem_util = _device_mem_util_percent(torch.device("cuda", idx_i))
     return (gpu_util, mem_util)
 
-
-def _xpu_mem_util(device):
+def _xpu_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "xpu":
         return None
     with contextlib.suppress(Exception):
         return _device_mem_util_percent(device)
     return None
 
-
-def _mps_mem_util(device):
+def _mps_mem_util(device: TorchDeviceLike) -> object:
     if getattr(device, "type", "") != "mps":
         return None
     with contextlib.suppress(Exception):
         return _device_mem_util_percent(device)
     return None
 
-
-def _sync_int_across_ranks(value, device, src=0):
+def _sync_int_across_ranks(value: object, device: TorchDeviceLike, src: int = 0) -> object:
     if not is_distributed():
         return int(value)
     try:
@@ -1510,44 +1459,13 @@ def _sync_int_across_ranks(value, device, src=0):
     except Exception:
         return int(value)
 
-
-def _cpu_percent_now():
+def _cpu_percent_now() -> object:
     if _psutil is None:
         return None
     try:
         return float(_psutil.cpu_percent(interval=0.0))
     except Exception:
         return None
-
-
-def update_tqdm(
-    bar: Any,
-    finish: bool,
-    *args: Any,
-    mbps: float | None = None,
-    tflops: float | None = None,
-    **kwargs: Any,
-) -> None:
-    if bar is None:
-        return
-    try:
-        mbps_val = float(mbps) if mbps is not None else 0.0
-    except Exception:
-        mbps_val = 0.0
-    try:
-        tflops_val = float(tflops) if tflops is not None else 0.0
-    except Exception:
-        tflops_val = 0.0
-    io_expr = f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
-    com_expr = f"COM = {tflops_val:.2f} TFLOPS" if tflops_val >= 0.01 else "COM < 0.01 TFLOPS"
-    bar.unit = io_expr + ", " + com_expr
-    try:
-        inc = int(finish)
-    except Exception:
-        inc = 1
-    if inc > 0:
-        bar.update(inc)
-
 
 def _stage_tensor_with_cpu_pool(
     tensor: torch.Tensor,
@@ -1601,22 +1519,21 @@ def _stage_tensor_with_cpu_pool(
             pinned = bool(is_pinned())
     return out, None, pinned
 
-
 def _to_device_with_stream_and_pool(
-    tensor,
+    tensor: object,
     *,
-    device,
-    cpu_pool,
+    device: TorchDeviceLike,
+    cpu_pool: object,
     handle: Pool.Token | None = None,
     pinned: bool | None = None,
-    dev_type=None,
-    non_blocking_ok=None,
-    backend=None,
-    stream_fn=None,
-    Event=None,
-    fence_event_factory=None,
-    can_stream_release=None,
-):
+    dev_type: object | None = None,
+    non_blocking_ok: object | None = None,
+    backend: object | None = None,
+    stream_fn: object | None = None,
+    Event: object | None = None,
+    fence_event_factory: object | None = None,
+    can_stream_release: object | None = None,
+) -> object:
     if not torch.is_tensor(tensor):
         return tensor
 
@@ -1737,19 +1654,18 @@ def _to_device_with_stream_and_pool(
                 cpu_pool.release(handle)
         return out
 
-
 def _preprocess_pin_h2d(
-    meta,
-    raw,
+    meta: object,
+    raw: object,
     *,
-    device,
-    stage_tensor,
-    to_device,
-    cpu_pool,
-    use_timer,
+    device: TorchDeviceLike,
+    stage_tensor: object,
+    to_device: TorchDeviceLike,
+    cpu_pool: object,
+    use_timer: bool,
     timer_sync: bool = False,
     require_labels: bool = True,
-):
+) -> object:
     feat, label, *_ = meta.preprocess(raw, return_keys=False, cast=False)
 
     X_src = feat if torch.is_tensor(feat) else to_torch_tensor(feat)
@@ -1778,7 +1694,7 @@ def _preprocess_pin_h2d(
 
         t_ready = time.perf_counter_ns()
 
-        def _move():
+        def _move() -> object:
             nonlocal x_tok, y_tok
             X_dev = to_device(X_st, handle=x_tok, pinned=x_pinned)
             x_tok = None
@@ -1832,8 +1748,7 @@ def _preprocess_pin_h2d(
             with contextlib.suppress(Exception):
                 cpu_pool.release(y_tok)
 
-
-def _resolve_train_process_group(meta, model):
+def _resolve_train_process_group(meta: object, model: object) -> object:
     candidates = [(meta, "process_group"), (meta, "distributed_process_group")]
     tm = model.module if hasattr(model, "module") else model
     candidates.extend([(tm, "process_group"), (tm, "distributed_process_group")])
@@ -1846,8 +1761,7 @@ def _resolve_train_process_group(meta, model):
             return pg
     return None
 
-
-def _get_ws_for_pg(pg):
+def _get_ws_for_pg(pg: object) -> object:
     try:
         if pg is None:
             return max(1, int(get_world_size()))
@@ -1855,16 +1769,20 @@ def _get_ws_for_pg(pg):
     except Exception:
         return max(1, int(get_world_size()))
 
-
-def _all_reduce_sum_in_pg(t, pg):
+def _all_reduce_sum_in_pg(t: object, pg: object) -> None:
     if pg is None:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM)
     else:
         torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.SUM, group=pg)
 
-
 @torch.no_grad()
-def _maybe_autotune_p_gate_fallback_k(target_module, *, step, pg=None, local_rank=0):
+def _maybe_autotune_p_gate_fallback_k(
+    target_module: object,
+    *,
+    step: int,
+    pg: object | None = None,
+    local_rank: int = 0,
+) -> None:
     if target_module is None:
         return
     if not bool(getattr(target_module, "p_gate_auto_k_enabled", False)):
@@ -2098,30 +2016,99 @@ def _maybe_autotune_p_gate_fallback_k(target_module, *, step, pg=None, local_ran
             float(k_high_new),
         )
 
+def _unwrap_for_microbatch(model: object) -> object:
+    m = model
+    for _ in range(8):
+        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
+            return m
+        child = getattr(m, "module", None)
+        if child is None or child is m:
+            break
+        m = child
+    return None
+
+def loader_state_path(directory: PathLike) -> object:
+    return os.path.join(directory, _DL_STATE_FILE)
+
+def get_tqdm(
+    *args: Any,
+    title: str,
+    total: int,
+    device: torch.device,
+    **kwargs: Any,
+) -> object:
+    try:
+        if torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            return None
+    except Exception:
+        pass
+    if int(total) <= 0:
+        return None
+    bar = tqdm(
+        total=int(total),
+        desc=f"{title} ({device.type.upper()})",
+        unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
+        bar_format="{desc}"
+        + "{bar} {percentage:3.0f}% "
+        + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
+        colour="green",
+        position=0,
+        leave=False,
+        file=sys.stdout,
+    )
+    return bar
+
+def update_tqdm(
+    bar: object,
+    finish: bool,
+    *args: Any,
+    mbps: float | None = None,
+    tflops: float | None = None,
+    **kwargs: Any,
+) -> None:
+    if bar is None:
+        return
+    try:
+        mbps_val = float(mbps) if mbps is not None else 0.0
+    except Exception:
+        mbps_val = 0.0
+    try:
+        tflops_val = float(tflops) if tflops is not None else 0.0
+    except Exception:
+        tflops_val = 0.0
+    io_expr = f"I/O = {mbps_val:.2f} MB/s" if mbps_val >= 0.01 else "I/O < 0.01 MB/s"
+    com_expr = f"COM = {tflops_val:.2f} TFLOPS" if tflops_val >= 0.01 else "COM < 0.01 TFLOPS"
+    bar.unit = io_expr + ", " + com_expr
+    try:
+        inc = int(finish)
+    except Exception:
+        inc = 1
+    if inc > 0:
+        bar.update(inc)
 
 def epochs(
     model: nn.Module,
     device: torch.device,
     local_rank: int,
-    ops: Any,
+    ops: object,
     *args: Any,
     param_dtype: torch.dtype,
-    optimizer: Any,
-    scaler: Any,
-    sched: Any,
-    loss_controller: Any,
-    top_loss: Any,
-    bottom_loss: Any,
-    train_loader: Any,
-    val_loader: Any,
+    optimizer: object,
+    scaler: object,
+    sched: object,
+    loss_controller: object,
+    top_loss: object,
+    bottom_loss: object,
+    train_loader: object,
+    val_loader: object,
     total_epochs: int,
     scheduler_step_per_batch: bool = True,
-    swa_helper: Any = None,
+    swa_helper: object | None = None,
     swa_start_epoch: int = 0,
     buffers_dtype: torch.dtype | None = None,
-    dataset: Any = None,
+    dataset: object | None = None,
     **kwargs: Any,
-):
+) -> object:
     from ..data.nodes import Sampler
 
     if train_loader is None:
@@ -2163,11 +2150,11 @@ def epochs(
             est_bytes_per_sample = int(v)
     if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
 
-        def _accumulate_sample_bytes(obj):
+        def _accumulate_sample_bytes(obj: object) -> object:
             batch_dim = None
             bytes_per_sample = 0
 
-            def handle_tensor(t):
+            def handle_tensor(t: object) -> None:
                 nonlocal batch_dim, bytes_per_sample
                 if not isinstance(t, torch.Tensor) or t.numel() <= 0:
                     return
@@ -2180,7 +2167,7 @@ def epochs(
                     one = t.reshape(1, -1)
                 bytes_per_sample += int(one.nelement()) * int(one.element_size())
 
-            def walk(o):
+            def walk(o: object) -> None:
                 if isinstance(o, torch.Tensor):
                     handle_tensor(o)
                 elif isinstance(o, TensorDictBase):
@@ -2367,11 +2354,11 @@ def epochs(
     util_adjust_interval = 0
     util_warmup_steps = 0
 
-    def _cast_fp_buffers(module, dtype):
+    def _cast_fp_buffers(module: object, dtype: torch.dtype) -> object:
         if dtype is None:
             return
 
-        def _is_exempt(m):
+        def _is_exempt(m: object) -> bool:
             return bool(getattr(m, "__stnet_precision_exempt__", False))
 
         with torch.no_grad():
@@ -3586,8 +3573,16 @@ def epochs(
     except Exception:
         pass
 
-
-def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, dataset=None):
+def infer(
+    model: object,
+    device: TorchDeviceLike,
+    local_rank: int,
+    ops: object,
+    *,
+    data_loader: object | None = None,
+    chunk_dir: PathLike | None = None,
+    dataset: object | None = None,
+) -> object:
     import glob
 
     _ensure_torch_compile_safe()
@@ -3715,7 +3710,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
     pending_tail = None
     variable_shape = False
 
-    def _flush():
+    def _flush() -> None:
         nonlocal \
             chunk_idx, \
             pending_count, \
@@ -3795,7 +3790,7 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
             pending_tail = None
         del rows, preds
 
-    def _append(rows_cpu, preds):
+    def _append(rows_cpu: object, preds: object) -> None:
         nonlocal \
             use_buffer, \
             rows_buf, \
@@ -4063,8 +4058,13 @@ def infer(model, device, local_rank, ops, *, data_loader=None, chunk_dir=None, d
                 distributed_barrier(device)
     return None
 
+@overload
+def process(ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
 
-def process(*args: Any, **kwargs: Any):
+@overload
+def process(local_rank: int, ops: RuntimeConfig, ret_sink: ReturnSink | None = None) -> object: ...
+
+def process(*args: Any, **kwargs: Any) -> object:
     from ..data.pipeline import Session
 
     if not args:
@@ -4146,8 +4146,6 @@ def process(*args: Any, **kwargs: Any):
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
             fallback_init = os.path.join(ops.init_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_init):
-                from .io import _torch_load_checkpoint as _torch_load_checkpoint
-
                 cpu_state = _torch_load_checkpoint(
                     fallback_init, map_location="cpu", weights_only=True
                 )
@@ -4577,8 +4575,6 @@ def process(*args: Any, **kwargs: Any):
         if ops.model_ckpt_dir is not None and os.path.isdir(ops.model_ckpt_dir):
             fallback_model = os.path.join(ops.model_ckpt_dir, "model.pt")
             if os.path.isfile(fallback_model):
-                from .io import _torch_load_checkpoint as _torch_load_checkpoint
-
                 cpu_state = _torch_load_checkpoint(
                     fallback_model, map_location="cpu", weights_only=True
                 )
@@ -4667,15 +4663,3 @@ def process(*args: Any, **kwargs: Any):
         torch.distributed.destroy_process_group()
         return None
     raise ValueError(f"unsupported ops mode: {ops.mode}")
-
-
-def _unwrap_for_microbatch(model):
-    m = model
-    for _ in range(8):
-        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
-            return m
-        child = getattr(m, "module", None)
-        if child is None or child is m:
-            break
-        m = child
-    return None
