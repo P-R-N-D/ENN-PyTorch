@@ -181,7 +181,7 @@ def _resolve_graph_break_fn() -> Callable[[], None] | None:
 
 
 def _compile_disable_decorator(
-    *, reason: str | None = None, recursive: bool = True
+    *args: Any, reason: str | None = None, recursive: bool = True
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     if _resolve_compile_disable() is None:
         def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
@@ -497,7 +497,7 @@ def torch_compile_disable(
     target: Any | None = None,
     attr: str | None = None,
     /,
-    *,
+    *args: Any,
     reason: str | None = None,
     recursive: bool = True,
 ) -> Any:
@@ -525,7 +525,7 @@ def torch_compile_disable(
     return decorator
 
 
-def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
+def torch_safe_distributed(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -550,7 +550,7 @@ def torch_safe_distributed(*, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) 
     return updated
 
 
-def torch_compile_safe(*, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
+def torch_compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
     if not torch_compile_supported():
         return
     with suppress(Exception):
