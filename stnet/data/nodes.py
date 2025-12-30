@@ -21,7 +21,7 @@ import torch
 from ..core.casting import dtype_from_name, env_bool, env_first_int
 from ..core.compat import ensure_torchdata
 from ..core.staging import Buffer, Pool, ProducerError, best_effort_close
-from ..core.system import Memory, Thread
+from ..core.system import Memory, Thread, process_cpu_count
 from ..core.system import \
     accel_backend_for_device_type as _accel_backend_for_device_type
 from ..core.system import accel_current_stream as _accel_current_stream

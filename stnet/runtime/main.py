@@ -4304,13 +4304,16 @@ def process(*args: Any, **kwargs: Any):
             try:
                 with _filtered_warnings():
                     load(state_dict={"optimizer": optim_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
-            except Exception as exc:
+            except BaseException as exc:
+                if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+                    raise
                 warnings.warn(
                     f"optimizer state load skipped (non-fatal): {type(exc).__name__}: {exc}",
                     RuntimeWarning,
                 )
             else:
-                set_optimizer_state_dict(model, optimizer, optim_sd, options=StateDictOptions(strict=False))
+                with contextlib.suppress(Exception):
+                    set_optimizer_state_dict(model, optimizer, optim_sd, options=StateDictOptions(strict=False))
                 _initialize_adamw(optimizer)
         top_df = DataFidelityLoss(out_shape=ops.out_shape, reduction="mean")
         top_z = StandardNormalLoss(
