@@ -41,7 +41,7 @@ _ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)
-        return v if v == v else default  # NaN guard
+        return v if v == v else default
     except Exception:
         return default
 
@@ -142,7 +142,7 @@ def _flops_linear(
     inp: torch.Tensor,
     out: Any,
     weight: Optional[torch.Tensor],
-    *,
+    *args: Any,
     include_bias: bool,
     has_bias: bool,
     effective_bwd: float,
@@ -159,7 +159,7 @@ def _flops_conv(
     inp: torch.Tensor,
     out: Any,
     weight: Optional[torch.Tensor],
-    *,
+    *args: Any,
     groups: int,
     include_bias: bool,
     has_bias: bool,
@@ -187,7 +187,7 @@ def _flops_conv(
         return 0.0
 
 
-def _flops_elementwise(out: Any, *, coeff: float, effective_bwd: float) -> float:
+def _flops_elementwise(out: Any, *args: Any, coeff: float, effective_bwd: float) -> float:
     out_t = _get_out_tensor(out)
     if out_t is None or out_t.numel() == 0:
         return 0.0
@@ -195,7 +195,7 @@ def _flops_elementwise(out: Any, *, coeff: float, effective_bwd: float) -> float
     return float(fwd * (1.0 + max(0.0, _safe_float(effective_bwd, 0.0))))
 
 
-def _flops_softmax(inp: torch.Tensor, out: Any, *, dim: int, effective_bwd: float) -> float:
+def _flops_softmax(inp: torch.Tensor, out: Any, *args: Any, dim: int, effective_bwd: float) -> float:
     out_t = _get_out_tensor(out)
     if not isinstance(inp, torch.Tensor) or inp.numel() == 0:
         return 0.0
@@ -220,7 +220,7 @@ def _flops_softmax(inp: torch.Tensor, out: Any, *, dim: int, effective_bwd: floa
 def _flops_layernorm(
     inp: torch.Tensor,
     out: Any,
-    *,
+    *args: Any,
     normalized_shape: Sequence[int],
     elementwise_affine: bool,
     has_bias: bool,
@@ -244,7 +244,7 @@ def _flops_layernorm(
     return float(fwd * (1.0 + max(0.0, _safe_float(effective_bwd, 0.0))))
 
 def _flops_attention_general(
-    *,
+    *args: Any,
     batch: int,
     num_heads: int,
     q_len: int,
@@ -272,7 +272,7 @@ def _flops_attention_from_qkv(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
     v: Optional[torch.Tensor],
-    *,
+    *args: Any,
     effective_bwd: float,
     dropout_p: float,
     training: bool,
@@ -314,7 +314,7 @@ def _is_te_module(mod: nn.Module) -> bool:
     return "transformer_engine" in getattr(type(mod), "__module__", "")
 
 
-def _register_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     x = inp[0] if inp else None
     if not isinstance(x, torch.Tensor):
         return
@@ -333,7 +333,7 @@ def _register_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
         profiler.add(typ, val)
 
 
-def _register_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     x = inp[0] if inp else None
     if not isinstance(x, torch.Tensor):
         return
@@ -353,7 +353,7 @@ def _register_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: 
         profiler.add(type(mod).__name__, val)
 
 
-def _register_activation(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_activation(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not cfg.count_activations:
         return
     coeff = _act_coeff_for_type(type(mod))
@@ -364,7 +364,7 @@ def _register_activation(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, prof
         profiler.add(type(mod).__name__, val)
 
 
-def _register_dropout(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_dropout(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not cfg.count_dropout:
         return
     training = bool(getattr(mod, "training", False))
@@ -375,7 +375,7 @@ def _register_dropout(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profile
         profiler.add(type(mod).__name__, val)
 
 
-def _register_softmax(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_softmax(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not cfg.count_softmax:
         return
     x = inp[0] if inp else None
@@ -387,7 +387,7 @@ def _register_softmax(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profile
         profiler.add(type(mod).__name__, val)
 
 
-def _register_layernorm(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_layernorm(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not cfg.count_norms:
         return
     x = inp[0] if inp else None
@@ -407,11 +407,11 @@ def _register_layernorm(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profi
         profiler.add(type(mod).__name__, val)
 
 
-def _register_embedding(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_embedding(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     return
 
 
-def _register_mha(mod: nn.MultiheadAttention, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_mha(mod: nn.MultiheadAttention, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     if not inp:
         return
     q = inp[0]
@@ -562,7 +562,7 @@ def _te_cached_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, b
     try:
         cache = getattr(mod, "_stnet_te_weight_cache", None)
         if isinstance(cache, dict) and cache.get("v") == 1 and isinstance(cache.get("entries"), list):
-            return cache["entries"]  # type: ignore[return-value]
+            return cache["entries"]
     except Exception:
         cache = None
     entries = _find_2d_weight_entries(mod)
@@ -587,7 +587,7 @@ def _te_ln_affine(mod: nn.Module) -> Tuple[bool, bool]:
     return (has_weight or has_bias), has_bias
 
 
-def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
+def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *args: Any, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     x = inp[0] if inp else None
     cname = type(mod).__name__.lower()
     if "attention" in cname:
@@ -767,7 +767,7 @@ def _shape_propagate(gm: torch.fx.GraphModule, args: Tuple[Any, ...], kwargs: Di
 
 def capture(
     q: torch.Tensor,
-    *,
+    *args: Any,
     bwd_factor: float = 1.0,
     dropout_p: float = 0.0,
     training: bool = False,
@@ -781,7 +781,7 @@ def capture(
         include_softmax_scale_dropout=include_softmax_scale_dropout,
     )
 
-
+@dataclass
 class _HookConfig:
     include_bias: bool
     effective_bwd: float
@@ -796,7 +796,7 @@ class _OpFlopDispatchMode(TorchDispatchMode):
     def __init__(
         self,
         profiler: "_FlopProfiler",
-        *,
+        *args: Any,
         include_bias: bool,
         effective_bwd: float,
         count_elementwise: bool,
@@ -806,7 +806,7 @@ class _OpFlopDispatchMode(TorchDispatchMode):
         self._include_bias = bool(include_bias)
         self._effective_bwd = float(effective_bwd)
         self._count_elementwise = bool(count_elementwise)
-        self._aten = torch.ops.aten  # shorthand
+        self._aten = torch.ops.aten
         handlers: Dict[Any, Callable[[Tuple[Any, ...], Dict[str, Any], Any], float]] = {}
         self._tag_overrides: Dict[Any, str] = {}
 
@@ -1214,7 +1214,7 @@ class _OpFlopDispatchMode(TorchDispatchMode):
             include_softmax_scale_dropout=True,
         )
 
-    def _h_custom(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any, *, name: str) -> float:
+    def _h_custom(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any, name: str) -> float:
         ts = _first_tensors_from_args(args, max_n=4)
         for t in ts:
             if isinstance(t, torch.Tensor) and t.ndim == 4:
@@ -1251,7 +1251,7 @@ class _ShapeTensor:
 
 
 class _FxGraphFlopEstimator:
-    def __init__(self, *, include_bias: bool, effective_bwd: float, count_elementwise: bool) -> None:
+    def __init__(self, *args: Any, include_bias: bool, effective_bwd: float, count_elementwise: bool) -> None:
         self._include_bias = bool(include_bias)
         self._effective_bwd = float(effective_bwd)
         self._count_elementwise = bool(count_elementwise)
@@ -1688,7 +1688,7 @@ class _FxGraphFlopEstimator:
             include_softmax_scale_dropout=True,
         )
 
-    def _custom(self, args: Any, out: Any, *, name: str) -> float:
+    def _custom(self, args: Any, out: Any, *args: Any, name: str) -> float:
         if isinstance(args, (tuple, list)):
             ts = [a for a in args if _is_tensorlike(a)]
         else:
@@ -1778,7 +1778,7 @@ class _FlopProfiler:
         acc.by_type.clear()
         return (total, breakdown)
 
-    def sum(self, *, sort: bool = True) -> Tuple[float, Dict[str, float]]:
+    def sum(self, *args: Any, sort: bool = True) -> Tuple[float, Dict[str, float]]:
         stack = self._stack()
         if not stack:
             return (0.0, {})
@@ -1956,7 +1956,7 @@ class _FlopProfiler:
 
         return _TorchFlopsCompat(bool(display))
 
-    def start_hooks(self, model: nn.Module, *, cfg: _HookConfig) -> List[Any]:
+    def start_hooks(self, model: nn.Module, *args: Any, cfg: _HookConfig) -> List[Any]:
         handles: List[Any] = []
         skip: set[int] = set()
         for module in model.modules():
@@ -2001,7 +2001,7 @@ class _FlopProfiler:
     def monitoring(
         self,
         device: Optional[torch.device],
-        *,
+        *args: Any,
         display: bool = False,
         use_torch_profiler: bool = True,
         use_nvtx: bool = True,
@@ -2109,7 +2109,7 @@ class _FlopProfiler:
     def capture(
         self,
         q: torch.Tensor,
-        *,
+        *args: Any,
         bwd_factor: float = 2.0,
         dropout_p: float = 0.0,
         training: bool = False,
@@ -2172,7 +2172,7 @@ class _HybridFlops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self,
         inner: Any,
-        *,
+        *args: Any,
         static_total: float,
         static_breakdown: Dict[str, float],
         cache_slot: Optional[Dict[Any, Tuple[float, Dict[str, float]]]] = None,
@@ -2234,7 +2234,7 @@ class FlopCounter:
     def __init__(
         self,
         model: nn.Module,
-        *,
+        *args: Any,
         mode: str = "train",
         device: Optional[torch.device] = None,
         include_bias: bool = True,
@@ -2367,7 +2367,7 @@ class FlopCounter:
 
     def step(
         self,
-        *,
+        *args: Any,
         display: bool = False,
         example_args: Optional[Tuple[Any, ...]] = None,
         example_kwargs: Optional[Dict[str, Any]] = None,
