@@ -1824,9 +1824,6 @@ class _FlopProfiler:
             _LOGGER.debug("Failed to import NVTX getter %s: %s", hook, exc)
         self._nvtx_getter = getter
 
-    def coerce_flops_ntvx(self) -> None:
-        self.coerce_flops_nvtx()
-
     def new_flops_nvtx(self, device: Optional[torch.device] = None) -> Any:
         self.coerce_flops_nvtx()
         getter = self._nvtx_getter
@@ -1874,9 +1871,6 @@ class _FlopProfiler:
                     return 0.0
 
         return _NvtxScope(device)
-
-    def new_flops_ntvx(self, device: Optional[torch.device] = None) -> Any:
-        return self.new_flops_nvtx(device)
 
     def _capture_torch(self, display: bool = False) -> Any:
         try:
