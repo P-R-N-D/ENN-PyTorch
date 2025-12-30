@@ -265,7 +265,7 @@ def _windows_allowed_cpu_indices() -> Optional[list[int]]:
         return None
 
     try:
-        k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        k32 = ctypes.windll.kernel32
     except Exception:
         return None
 
@@ -343,7 +343,7 @@ def get_allowed_cpus() -> list[int]:
                 return out
 
     try:
-        import psutil  # type: ignore
+        import psutil
 
         proc = psutil.Process()
         fn = getattr(proc, "cpu_affinity", None)
@@ -378,7 +378,6 @@ def get_allowed_cpus() -> list[int]:
 
 
 def process_cpu_count() -> int:
-    # Explicit per-project override (highest priority).
     for key in ("STNET_CPU_COUNT", "STNET_EFFECTIVE_CPU_COUNT"):
         v = os.environ.get(key)
         if v is not None and str(v).strip():
@@ -387,7 +386,6 @@ def process_cpu_count() -> int:
                 if n > 0:
                     return int(n)
 
-    # Respect Python overrides (Python 3.13+: os.process_cpu_count() also honors these).
     v = os.environ.get("PYTHON_CPU_COUNT")
     if v is not None and str(v).strip():
         with contextlib.suppress(Exception):
@@ -443,8 +441,6 @@ def _read_thread_cap_multiplier(default: int) -> int:
 
 def _default_cap_mult(ncpu_raw: int, *, is_accel: bool, nogil: bool) -> int:
     cap_mult = 3 if (nogil and is_accel) else (2 if is_accel else 1)
-
-    # Be conservative on small CPU budgets (common in containers / CI).
     if ncpu_raw <= 4:
         cap_mult = 1
     elif ncpu_raw <= 8:
@@ -482,7 +478,7 @@ def empty_device_cache(
     if min_interval_s is None:
         min_interval_s = env_first_float(("STNET_EMPTY_CACHE_MIN_INTERVAL_S",), 0.5)
     with contextlib.suppress(Exception):
-        min_interval_s = float(min_interval_s)  # type: ignore[arg-type]
+        min_interval_s = float(min_interval_s)
     if not isinstance(min_interval_s, (int, float)):
         min_interval_s = 0.5
     if float(min_interval_s) < 0:
@@ -1128,7 +1124,7 @@ def resolve_timezone(name: Optional[str] = None) -> Optional[tzinfo]:
     if ZoneInfo is None:
         return None
     with contextlib.suppress(Exception):
-        return ZoneInfo(alias)  # type: ignore[return-value]
+        return ZoneInfo(alias)
     return None
 
 
@@ -1197,7 +1193,7 @@ def cpu_info(max_bytes: Optional[int] = None) -> str:
     total = process_cpu_count()
     brand = ""
     try:
-        import cpuinfo  # type: ignore
+        import cpuinfo
         info = _try_call(getattr(cpuinfo, "get_cpu_info", None)) or {}
         if isinstance(info, dict):
             brand = info.get("brand_raw") or info.get("brand") or ""
@@ -1388,7 +1384,7 @@ def get_sdpa_backends() -> list[object]:
     if not names:
         return []
     try:
-        from torch.nn.attention import SDPBackend  # type: ignore
+        from torch.nn.attention import SDPBackend
     except Exception:
         return []
     mapping = {
@@ -1407,7 +1403,6 @@ def get_sdpa_backends() -> list[object]:
     return backends
 
 
-# Backward-compatible alias (typo in historical name).
 get_dpa_backends = get_sdpa_backends
 
 
@@ -1544,20 +1539,15 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         if cached is not None:
             return cached
 
-    # Compute capabilities.
     device_type = str(dev.type)
     cc = None
     if device_type == "cuda" and torch.cuda.is_available():
         major, minor = cuda_compute_capability(dev)
         cc = (int(major), int(minor)) if (major > 0 or minor > 0) else None
-
-    # Dtypes from env (if present).
     float_env = env_first(("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES"))
     float_dtypes = _parse_dtypes_env(float_env) if float_env else tuple()
     int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
     int_dtypes = _parse_dtypes_env(int_env) if int_env else tuple()
-
-    # Defaults.
     if not float_dtypes:
         floats: list[torch.dtype] = [torch.float32]
         if device_type == "cuda" and torch.cuda.is_available():
@@ -1567,14 +1557,10 @@ def get_device_stats(device: Optional[Union[torch.device, str]] = None) -> Devic
         elif device_type == "cpu" and is_cpu_bf16_supported():
             floats.insert(0, torch.bfloat16)
         float_dtypes = tuple(dict.fromkeys(floats))
-
     if not int_dtypes:
         int_dtypes = (torch.int8, torch.int16, torch.int32, torch.int64)
-
-    # Quant bits.
     bits = env_first_int(("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0)
     quant_bits = int(bits) if int(bits) > 0 else 8
-
     stats = Device(
         device=dev,
         device_type=device_type,
@@ -1599,7 +1585,7 @@ def get_device(
     te_first: Optional[bool] = None,
     **kwargs: Any,
 ) -> torch.device:
-    del args, kwargs  # compatibility with older call sites
+    del args, kwargs
 
     with _RUNTIME_CFG_LOCK:
         cfg = _RUNTIME_CFG
@@ -1646,7 +1632,6 @@ def get_device(
         if te_first is not None:
             cfg.te_first = bool(te_first)
 
-        # Snapshot for use outside lock.
         det = bool(cfg.deterministic)
         allow_tf32_val = bool(cfg.allow_tf32)
         cudnn_bench_val = bool(cfg.cudnn_benchmark)
@@ -1793,7 +1778,6 @@ class Thread:
         self._omp_ok = self.spread_threads()
         self._enabled = (len(self._allowed_cpus) >= 2) or self._omp_ok
 
-        # Free-threading/No-GIL: reduce contention in telemetry and allow slightly higher caps.
         with contextlib.suppress(Exception):
             self._nogil = bool(Thread.nogil_optimizations_enabled())
         if not hasattr(self, "_nogil"):
@@ -1817,8 +1801,6 @@ class Thread:
         )
         self.tune_threads(io_workers, initial=True)
 
-    # --- Free-threading helpers (mirrors freethreading.py semantics) ---
-
     @staticmethod
     def is_free_threaded_build() -> bool:
         try:
@@ -1834,7 +1816,6 @@ class Thread:
             with contextlib.suppress(Exception):
                 return bool(fn())
             return True
-        # Python < 3.13: always GIL.
         return True
 
     @staticmethod
@@ -1947,13 +1928,12 @@ class Thread:
     @staticmethod
     def _pin_thread_windows(core: int) -> bool:
         try:
-            k32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            k32 = ctypes.windll.kernel32
             GetCurrentThread = k32.GetCurrentThread
             SetThreadAffinityMask = k32.SetThreadAffinityMask
             SetThreadGroupAffinity = k32.SetThreadGroupAffinity
             SetThreadIdealProcessorEx = getattr(k32, "SetThreadIdealProcessorEx", None)
 
-            # If we can get a precise process affinity mask, use it (single group).
             try:
                 get_proc = getattr(k32, "GetCurrentProcess", None)
                 get_mask = getattr(k32, "GetProcessAffinityMask", None)
@@ -1975,7 +1955,6 @@ class Thread:
             except Exception:
                 pass
 
-            # Multi-group / fallback mapping.
             segs, total = Thread._windows_group_segments(k32)
             if total <= 0 or not segs:
                 return False
@@ -2072,7 +2051,6 @@ class Thread:
                         )
                         == 0
                     )
-            # Other platforms: no pinning.
 
         self._tls.pinned = bool(ok)
         self._pin_attempts += 1
@@ -2290,7 +2268,7 @@ class Memory:
     @staticmethod
     def total() -> Optional[int]:
         try:
-            import psutil  # type: ignore
+            import psutil
 
             vm = psutil.virtual_memory()
             if getattr(vm, "total", None):
@@ -2322,7 +2300,7 @@ class Memory:
 
                 stat = MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
                     return int(stat.ullTotalPhys)
         except Exception:
             pass
@@ -2442,7 +2420,7 @@ class Memory:
     @staticmethod
     def _sys_available() -> Optional[int]:
         try:
-            import psutil  # type: ignore
+            import psutil
 
             vm = psutil.virtual_memory()
             if getattr(vm, "available", None) is not None:
@@ -2494,7 +2472,7 @@ class Memory:
 
                 stat = MEMORYSTATUSEX()
                 stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):  # type: ignore[attr-defined]
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
                     return int(stat.ullAvailPhys)
         except Exception:
             pass
@@ -2557,9 +2535,9 @@ class Memory:
         try:
             from ctypes import wintypes as wt
 
-            import psutil  # type: ignore
+            import psutil
 
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            kernel32 = ctypes.windll.kernel32
             IsProcessInJob = kernel32.IsProcessInJob
             IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
             IsProcessInJob.restype = wt.BOOL
@@ -2660,8 +2638,7 @@ class Memory:
     def _bsd_limit() -> Optional[int]:
         try:
             import resource
-
-            import psutil  # type: ignore
+            import psutil
 
             rss = psutil.Process(os.getpid()).memory_info().rss
             cand: list[int] = []
@@ -2680,7 +2657,7 @@ class Memory:
     @staticmethod
     def prefer_local_numa() -> bool:
         try:
-            import numa  # type: ignore
+            import numa
 
             if hasattr(numa, "available") and numa.available():
                 node = numa.current_node()
