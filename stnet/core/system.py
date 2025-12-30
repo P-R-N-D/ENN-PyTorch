@@ -44,15 +44,83 @@ _RUNTIME_CFG = SimpleNamespace(
     te_first=True,
 )
 _RUNTIME_CFG_LOCK = threading.Lock()
+
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _FP32_PRECISION_LOCK = threading.Lock()
+
 _EMPTY_CACHE_LOCK = threading.Lock()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
+
 _LOGGER = logging.getLogger(__name__)
+
 _TORCH_THREAD_CFG_LOCK = threading.Lock()
 _TORCH_NUM_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_THREADS_SET: Optional[int] = None
 _TORCH_INTEROP_LOCKED: bool = False
+
+_DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
+_DEVICE_STATS_LOCK = threading.Lock()
+
+_TLB_SINGLETON: Optional[Thread] = None
+_TLB_SINGLETON_LOCK = Lock()
+
+_TZ_ALIASES = {
+    "Z": "UTC",
+    "UTC": "UTC",
+    "GMT": "Etc/GMT",
+    "KST": "Asia/Seoul",
+    "JST": "Asia/Tokyo",
+    "HKT": "Asia/Hong_Kong",
+    "SGT": "Asia/Singapore",
+    "ICT": "Asia/Bangkok",
+    "WIB": "Asia/Jakarta",
+    "WITA": "Asia/Makassar",
+    "WIT": "Asia/Jayapura",
+    "PHT": "Asia/Manila",
+    "MYT": "Asia/Kuala_Lumpur",
+    "AEST": "Australia/Sydney",
+    "AEDT": "Australia/Sydney",
+    "ACST": "Australia/Adelaide",
+    "ACDT": "Australia/Adelaide",
+    "AWST": "Australia/Perth",
+    "NZST": "Pacific/Auckland",
+    "NZDT": "Pacific/Auckland",
+    "CET": "Europe/Berlin",
+    "CEST": "Europe/Berlin",
+    "EET": "Europe/Athens",
+    "EEST": "Europe/Athens",
+    "WET": "Europe/Lisbon",
+    "WEST": "Europe/Lisbon",
+    "BST": "Europe/London",
+    "IST": "Europe/Dublin",
+    "MSK": "Europe/Moscow",
+    "TRT": "Europe/Istanbul",
+    "ET": "America/New_York",
+    "CT": "America/Chicago",
+    "MT": "America/Denver",
+    "PT": "America/Los_Angeles",
+    "EST": "America/New_York",
+    "EDT": "America/New_York",
+    "CST": "America/Chicago",
+    "CDT": "America/Chicago",
+    "MST": "America/Denver",
+    "MDT": "America/Denver",
+    "PST": "America/Los_Angeles",
+    "PDT": "America/Los_Angeles",
+    "AKST": "America/Anchorage",
+    "AKDT": "America/Anchorage",
+    "HST": "Pacific/Honolulu",
+    "AST": "America/Halifax",
+    "ADT": "America/Halifax",
+    "NST": "America/St_Johns",
+    "NDT": "America/St_Johns",
+    "BRT": "America/Sao_Paulo",
+    "ART": "America/Argentina/Buenos_Aires",
+    "SAST": "Africa/Johannesburg",
+    "EAT": "Africa/Nairobi",
+    "CAT": "Africa/Maputo",
+    "WAT": "Africa/Lagos",
+}
 
 
 def _log_info(logger: Optional[Any], msg: str) -> None:
@@ -401,7 +469,7 @@ def _read_thread_cap_multiplier(default: int) -> int:
     return max(1, min(8, int(default)))
 
 
-def _default_cap_mult(ncpu_raw: int, *, is_accel: bool, nogil: bool) -> int:
+def _default_cap_mult(ncpu_raw: int, *args: Any, is_accel: bool, nogil: bool) -> int:
     cap_mult = 3 if (nogil and is_accel) else (2 if is_accel else 1)
     if ncpu_raw <= 4:
         cap_mult = 1
@@ -420,7 +488,7 @@ def _effective_local_world_size(default: int) -> int:
     )
 
 
-def _effective_thread_cap(*, ncpu: int, cap_mult: int, local_world: int, distribute: bool) -> int:
+def _effective_thread_cap(*args: Any, ncpu: int, cap_mult: int, local_world: int, distribute: bool) -> int:
     node_thread_cap = max(2, int(ncpu) * int(cap_mult))
     if distribute and int(local_world) > 1:
         return max(2, int(node_thread_cap) // max(1, int(local_world)))
@@ -428,7 +496,7 @@ def _effective_thread_cap(*, ncpu: int, cap_mult: int, local_world: int, distrib
 
 
 def empty_device_cache(
-    *,
+    *args: Any,
     device: Optional[Union[torch.device, str]] = None,
     do_gc: bool = True,
     min_interval_s: Optional[float] = None,
@@ -874,7 +942,7 @@ def accel_timing_events_supported_for_device_type(dev_type: str) -> bool:
     return True
 
 
-def accel_make_event(device: torch.device, *, enable_timing: bool = False) -> object | None:
+def accel_make_event(device: torch.device, *args: Any, enable_timing: bool = False) -> object | None:
     try:
         dev = device if isinstance(device, torch.device) else torch.device(str(device))
     except Exception:
@@ -1017,13 +1085,6 @@ def set_float32_precision(
         _try_call(setattr, conv, "fp32_precision", precision)
     if rnn is not None and hasattr(rnn, "fp32_precision"):
         _try_call(setattr, rnn, "fp32_precision", precision)
-
-
-_TZ_ALIASES = {
-    "KST": "Asia/Seoul",
-    "GMT": "Etc/GMT",
-    "UTC": "UTC",
-}
 
 
 def resolve_timezone(name: Optional[str] = None) -> Optional[tzinfo]:
@@ -1303,7 +1364,8 @@ def get_sdpa_backends() -> list[object]:
     return backends
 
 
-get_dpa_backends = get_sdpa_backends
+def get_dpa_backends() -> list[object]:
+    return get_sdpa_backends()
 
 
 def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
@@ -1635,10 +1697,6 @@ class Device:
     int_dtypes: Tuple[torch.dtype, ...]
     float8_dtypes: Tuple[torch.dtype, ...]
     int_quant_bits: int
-
-
-_DEVICE_STATS_CACHE: dict[Tuple[str, int], Device] = {}
-_DEVICE_STATS_LOCK = threading.Lock()
 
 
 @dataclass(slots=True)
@@ -2307,10 +2365,6 @@ class Thread:
         tuned = max(1, min(int(io_workers), cpus))
         self._io_workers = tuned
         return tuned
-
-
-_TLB_SINGLETON: Optional[Thread] = None
-_TLB_SINGLETON_LOCK = Lock()
 
 
 class Memory:
