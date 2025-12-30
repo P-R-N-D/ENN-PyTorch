@@ -14,6 +14,40 @@ import torch
 from .casting import env_first, env_first_float, env_flag
 
 
+def _cache_backpressure_mode() -> str:
+    raw = env_first(
+        ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
+        default="block",
+    )
+    s = str(raw or "block").strip().lower()
+    if s in {"sync", "synchronous"}:
+        return "sync"
+    if s in {"raise", "error"}:
+        return "raise"
+    return "block"
+
+
+@lru_cache(maxsize=1)
+def _cache_backpressure_timeout_s() -> float:
+    t = env_first_float(
+        ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"),
+        default=0.05,
+    )
+    with contextlib.suppress(Exception):
+        return max(0.0, float(t))
+    return 0.05
+
+
+@lru_cache(maxsize=1)
+def _cache_early_release_enabled() -> bool:
+    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
+
+
+@lru_cache(maxsize=1)
+def _cache_force_unpin_enabled() -> bool:
+    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
+
+
 def _prod_int(shape: Sequence[int]) -> int:
     try:
         n = int(math.prod(int(s) for s in shape))
@@ -24,7 +58,34 @@ def _prod_int(shape: Sequence[int]) -> int:
     return int(max(1, n))
 
 
-@runtime_checkable
+def best_effort_close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
+    for name in (
+        "cleanup",
+        "close",
+        "shutdown",
+        "stop",
+        "terminate",
+        "disconnect",
+        "release",
+        "join",
+    ):
+        fn = getattr(obj, name, None)
+        if callable(fn):
+            try:
+                if name == "join" and join_timeout is not None:
+                    fn(timeout=float(join_timeout))
+                else:
+                    fn()
+            except Exception:
+                pass
+            return
+    if callable(obj):
+        try:
+            obj()
+        except Exception:
+            pass
+
+
 class _QueryEvent(Protocol):
     def query(self) -> bool: ...
 
@@ -267,7 +328,6 @@ class Pool:
                     return e.fence_evt
         return ev_new
 
-
     def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
         if token is None:
             return
@@ -301,41 +361,6 @@ class Pool:
                 self._cv.notify_all()
 
 
-@lru_cache(maxsize=1)
-def _cache_backpressure_mode() -> str:
-    raw = env_first(
-        ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
-        default="block",
-    )
-    s = str(raw or "block").strip().lower()
-    if s in {"sync", "synchronous"}:
-        return "sync"
-    if s in {"raise", "error"}:
-        return "raise"
-    return "block"
-
-
-@lru_cache(maxsize=1)
-def _cache_backpressure_timeout_s() -> float:
-    t = env_first_float(
-        ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"),
-        default=0.05,
-    )
-    with contextlib.suppress(Exception):
-        return max(0.0, float(t))
-    return 0.05
-
-
-@lru_cache(maxsize=1)
-def _cache_early_release_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
-
-
-@lru_cache(maxsize=1)
-def _cache_force_unpin_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
-
-
 class Cache:
     def __init__(self, root: str, max_queue: int = 8) -> None:
         import queue
@@ -363,7 +388,6 @@ class Cache:
         wait_event: Optional[object] = None,
         release_cb: Optional[object] = None,
     ) -> None:
-        import os as _os
         if self._err_event.is_set():
             raise RuntimeError(f"Async writer error: {self._err!r}")
         if self._closed.is_set():
@@ -371,8 +395,8 @@ class Cache:
         if path is None:
             if idx is None:
                 raise ValueError("either path or idx required")
-            path = _os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
-        path = _os.fspath(path)
+            path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
+        path = os.fspath(path)
         acquired = False
         sem = self._sem
         if sem is not None:
@@ -381,7 +405,6 @@ class Cache:
             if mode == "sync":
                 acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
                 if not acquired:
-                    # Synchronous fallback: preserve correctness over throughput.
                     self._wait(wait_event)
                     buf, released = self._prepare_tensor_for_save(
                         tensor,
@@ -482,7 +505,6 @@ class Cache:
         return buf, released
 
     def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
-        import os as _os
         if not torch.is_tensor(tensor):
             tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
@@ -497,17 +519,17 @@ class Cache:
             buf = buf.contiguous()
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
-            parent = _os.path.dirname(path) or "."
-            _os.makedirs(parent, exist_ok=True)
+            parent = os.path.dirname(path) or "."
+            os.makedirs(parent, exist_ok=True)
             import tempfile as _tempfile
-            fd, tmp_name = _tempfile.mkstemp(prefix=_os.path.basename(path) + ".", suffix=".tmp", dir=parent)
-            _os.close(fd)
+            fd, tmp_name = _tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+            os.close(fd)
             try:
                 MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
-                _os.replace(tmp_name, path)
+                os.replace(tmp_name, path)
             finally:
                 with contextlib.suppress(Exception):
-                    _os.remove(tmp_name)
+                    os.remove(tmp_name)
             from ..data.pipeline import BatchIO
             meta = {
                 "shape": [int(x) for x in buf.shape],
@@ -574,38 +596,9 @@ class Cache:
         return bool(self._err_event.is_set())
 
 
-@dataclass(slots=True)
 class ProducerError:
     exc: BaseException
     tb: str
-
-
-def best_effort_close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
-    for name in (
-        "cleanup",
-        "close",
-        "shutdown",
-        "stop",
-        "terminate",
-        "disconnect",
-        "release",
-        "join",
-    ):
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            try:
-                if name == "join" and join_timeout is not None:
-                    fn(timeout=float(join_timeout))
-                else:
-                    fn()
-            except Exception:
-                pass
-            return
-    if callable(obj):
-        try:
-            obj()
-        except Exception:
-            pass
 
 
 class Buffer:
