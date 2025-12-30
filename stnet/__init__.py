@@ -23,29 +23,29 @@ def __getattr__(name: str) -> Optional[Any]:
 
 def new_model(*args: Any, **kwargs: Any) -> Model:
     from .api import new_model as _new_model
-    return _new_model(*args: Any, **kwargs: Any)
+    return _new_model(*args, **kwargs)
 
 
 def load_model(*args: Any, **kwargs: Any) -> Model:
     from .api import load_model as _load_model
-    return _load_model(*args: Any, **kwargs: Any)
+    return _load_model(*args, **kwargs)
 
 
 def save_model(*args: Any, **kwargs: Any) -> None:
     from .api import save_model as _save_model
-    return _save_model(*args: Any, **kwargs: Any)
+    return _save_model(*args, **kwargs)
 
 
 def train(*args: Any, **kwargs: Any) -> Model:
     from .api import train as _train
-    return _train(*args: Any, **kwargs: Any)
+    return _train(*args, **kwargs)
 
 
 def predict(*args: Any, **kwargs: Any) -> TensorDictBase:
     from .api import predict as _predict
-    return _predict(*args: Any, **kwargs: Any)
+    return _predict(*args, **kwargs)
 
 
 def get_prediction(*args: Any, **kwargs: Any) -> TensorDictBase:
     from .api import get_prediction as _get_prediction
-    return _get_prediction(*args: Any, **kwargs: Any)
+    return _get_prediction(*args, **kwargs)
