@@ -670,7 +670,7 @@ def distributed_broadcast(
         coalesced = getattr(dist, "_broadcast_coalesced", None)
         if callable(coalesced) and pg is not None:
             try:
-                coalesced(pg, tensors, buffer_size_bytes, src)  # type: ignore[misc]
+                coalesced(pg, tensors, buffer_size_bytes, src)
                 return
             except Exception as e:
                 if strict:
