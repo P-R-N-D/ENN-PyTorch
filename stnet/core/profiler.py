@@ -1007,11 +1007,9 @@ class _OpFlopDispatchMode(TorchDispatchMode):
             val = float(handler(args, kwargs, out))
         except Exception:
             val = 0.0
-
         if val > 0.0:
             tag = self._tag_overrides.get(func)
             self._profiler.add(tag if tag is not None else _op_name(func), val)
-
         return out
 
     def _h_binop(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
@@ -2060,7 +2058,6 @@ class _FlopProfiler:
                 base = float(max(self.torch_total, self.nvtx_total))
                 manual_total = float(self.manual_total)
                 self.total = float(max(base, manual_total, 0.0))
-
                 profiler.deactivate()
                 return False
 
