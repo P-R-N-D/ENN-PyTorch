@@ -33,7 +33,7 @@ def load_model(*args: Any, **kwargs: Any) -> Model:
 
 def save_model(*args: Any, **kwargs: Any) -> None:
     from .api import save_model as _save_model
-    return _save_model(*args, **kwargs)
+    _save_model(*args, **kwargs)
 
 
 def train(*args: Any, **kwargs: Any) -> Model:
