@@ -11,20 +11,17 @@ from torch import Tensor, nn
 from torch.distributions import Normal, StudentT
 from torch.nn import functional as F
 
+
 Number = Union[float, int]
 TensorLike = Union[Number, torch.Tensor]
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
 def _canonize_dims(
     x: torch.Tensor, dims: Any, keep_batch: bool = False
 ) -> Tuple[int, ...]:
     nd = int(x.ndim)
     if dims is None:
         return tuple(range(1, nd)) if nd > 1 else (0,)
-
     if isinstance(dims, int):
         dims = (dims,)
     pos: List[int] = []
@@ -36,7 +33,6 @@ def _canonize_dims(
         d0 = d_int + nd if d_int < 0 else d_int
         if 0 <= d0 < nd and (keep_batch or d0 != 0):
             pos.append(d0)
-
     out = tuple(sorted(set(pos)))
     if not out:
         return (1,) if nd > 1 else (0,)
@@ -55,13 +51,11 @@ def _mad_std(x: torch.Tensor, dims: Tuple[int, ...], eps: float) -> torch.Tensor
     mu = _median_over_dims(x, dims)
     dev = (x - mu).abs()
     mad = _median_over_dims(dev, dims)
-    # Consistency constant for normal distribution.
     c = 1.482602218505602
     return torch.clamp(mad * c, min=float(eps))
 
 
 def _master_float_dtype(x: torch.Tensor) -> torch.dtype:
-    # Master dtypes are float64/float32; ints are handled by casting to float32.
     return torch.float64 if x.dtype == torch.float64 else torch.float32
 
 
@@ -74,42 +68,31 @@ def _coerce_std(
         dim_tuple = (int(dim),)
     else:
         dim_tuple = tuple(int(d) for d in dim)
-
-    # Compute sample size over valid dims for ddof correction.
     nd = int(x.dim())
     dims_pos = tuple((d if d >= 0 else nd + d) for d in dim_tuple)
     sample = 1
     for d in dims_pos:
         if 0 <= d < nd:
             sample *= max(1, int(x.shape[d]))
-
-    # Degenerate: std undefined; return eps with correct broadcast shape.
     if sample <= 1:
         base = x.mean(dim=dim_tuple, keepdim=True)
         return torch.full_like(
             base, fill_value=float(eps), dtype=_master_float_dtype(base)
         )
-
     correction = min(int(ddof), max(sample - 1, 0))
     work_dtype = _master_float_dtype(x)
-
     x_work = x
     if (not torch.is_floating_point(x_work)) or (x_work.dtype != work_dtype):
         x_work = x_work.to(dtype=work_dtype)
-
     eps_f = float(eps)
     try:
-        # Newer PyTorch: `correction` supports general ddof.
         var = torch.var(x_work, dim=dim_tuple, correction=correction, keepdim=True)
     except TypeError:
-        # Older PyTorch: only unbiased (ddof=1) supported via `unbiased=True`.
-        # Compute var0 with ddof=0 and apply correction factor: n/(n-ddof).
         var0 = torch.var(x_work, dim=dim_tuple, unbiased=False, keepdim=True)
         if correction > 0 and sample > correction:
             var = var0 * (float(sample) / float(sample - correction))
         else:
             var = var0
-
     std = torch.sqrt(torch.clamp(var, min=eps_f * eps_f))
     return torch.clamp(std, min=eps_f)
 
@@ -138,7 +121,6 @@ def _students_t_cdf(
         b = torch.full_like(v, 0.5)
         ib = torch.special.betainc(a, b, x2)
         return torch.where(t >= 0, 1.0 - 0.5 * ib, 0.5 * ib)
-    # Approximate with normal CDF for df >= 3
     v_clamped = torch.clamp(v, min=3.0)
     z = t * torch.sqrt((v_clamped - 2.0) / v_clamped)
     return _normal_cdf(z)
@@ -178,24 +160,16 @@ def _nufft_nd(
         import cufinufft
     except ImportError as e:
         raise RuntimeError("cuFINUFFT not available") from e
-
     if not torch.is_complex(x_cplx):
         raise TypeError("x_cplx must be a complex-valued tensor")
-
     B = int(x_cplx.shape[0])
     ndim = len(shape)
-
     device = x_cplx.device
     if device.type != "cuda":
         raise RuntimeError(f"cuFINUFFT requires CUDA tensors, got device={device}")
-
     dtype_str = "complex128" if x_cplx.dtype == torch.complex128 else "complex64"
-
     if omega.dim() == 2:
-        # Shared points for all batch elements: setpts once, reuse plan.
         pts = [omega[i].contiguous() for i in range(ndim)]
-
-        # Best-effort vectorized path (n_trans=B).
         if B > 1:
             try:
                 plan = cufinufft.Plan(
@@ -208,17 +182,13 @@ def _nufft_nd(
                 plan.setpts(*pts)
                 fk = plan.execute(x_cplx.contiguous())
                 out = torch.as_tensor(fk, device=device)
-
-                # Normalize to (B, ...).
                 if out.ndim >= 1 and int(out.shape[0]) != B and int(out.shape[-1]) == B:
                     out = out.movedim(-1, 0)
                 if out.ndim == 0 or int(out.shape[0]) != B:
                     raise RuntimeError("unexpected cuFINUFFT output layout for n_trans")
-
                 return out
             except Exception:
                 pass
-
         plan = cufinufft.Plan(
             nufft_type,
             _to_tuple(shape),
@@ -227,14 +197,12 @@ def _nufft_nd(
             dtype=dtype_str,
         )
         plan.setpts(*pts)
-
         fk0 = torch.as_tensor(plan.execute(x_cplx[0].contiguous()), device=device)
         out = fk0.new_empty((B, *fk0.shape))
         out[0] = fk0
         for b in range(1, B):
             out[b] = torch.as_tensor(plan.execute(x_cplx[b].contiguous()), device=device)
         return out
-
     if omega.dim() == 3:
         try:
             plan = cufinufft.Plan(
@@ -244,18 +212,17 @@ def _nufft_nd(
                 eps=eps,
                 dtype=dtype_str,
             )
-
             pts0 = [omega[0, i].contiguous() for i in range(ndim)]
             plan.setpts(*pts0)
             fk0 = torch.as_tensor(plan.execute(x_cplx[0].contiguous()), device=device)
             out = fk0.new_empty((B, *fk0.shape))
             out[0] = fk0
-
             for b in range(1, B):
                 pts = [omega[b, i].contiguous() for i in range(ndim)]
                 plan.setpts(*pts)
-                out[b] = torch.as_tensor(plan.execute(x_cplx[b].contiguous()), device=device)
-
+                out[b] = torch.as_tensor(
+                    plan.execute(x_cplx[b].contiguous()), device=device
+                )
             return out
         except Exception:
             out_list: List[torch.Tensor] = []
@@ -272,7 +239,6 @@ def _nufft_nd(
                 fk = plan.execute(x_cplx[b].contiguous())
                 out_list.append(torch.as_tensor(fk, device=device).unsqueeze(0))
             return torch.cat(out_list, dim=0)
-
     raise ValueError(
         f"omega must have shape (ndim, npts) or (B, ndim, npts), got {omega.shape}"
     )
@@ -289,9 +255,6 @@ def expand_to_pred(mask: torch.Tensor, prediction: torch.Tensor) -> torch.Tensor
         ) from e
 
 
-# ----------------------------
-# Losses
-# ----------------------------
 class MultipleQuantileLoss(nn.Module):
     def __init__(
         self,
@@ -349,14 +312,11 @@ class MultipleQuantileLoss(nn.Module):
         if qdim != 0:
             preds = preds.transpose(0, qdim)
             target = target.transpose(0, qdim)
-
         errors = target - preds
         q = self.q.view(-1, *[1] * (errors.ndim - 1))
         losses = torch.maximum((q - 1) * errors, q * errors)
-
         if self.reduction == "none":
             return losses.transpose(0, qdim) if qdim != 0 else losses
-
         dims = tuple(range(1, losses.ndim))
         per_q = losses.mean(dim=dims) if self.reduction == "mean" else losses.sum(dim=dims)
         return (per_q * self.w).sum()
@@ -374,7 +334,6 @@ class CRPSLoss(nn.Module):
         mode: str = "normal",
         sample_dim: Optional[int] = None,
         max_z: float = 10.0,
-        # Skew correction is optional and sampling-based (best-effort).
         skew: bool = False,
         skew_samples: int = 32,
         skew_pair_samples: int = 8,
@@ -396,14 +355,9 @@ class CRPSLoss(nn.Module):
         self.mode = mode_l
         self.sample_dim = None if sample_dim is None else int(sample_dim)
         self.max_z = float(max_z)
-
         self.skew = bool(skew)
         self._skew_samples = max(0, int(skew_samples))
         self._skew_pair_samples = max(0, int(skew_pair_samples))
-
-        # Energy-mode pairwise term uses `torch.cdist` in chunks.
-        # If `energy_cdist_max_bytes` is None, auto-pick among {32,64,128} MiB
-        # based on (B,S) and device memory. Otherwise, use the provided budget.
         self.energy_cdist_max_bytes = (
             None if energy_cdist_max_bytes is None else int(energy_cdist_max_bytes)
         )
@@ -445,8 +399,6 @@ class CRPSLoss(nn.Module):
         z = err / torch.clamp(sigma, min=self.eps)
         if self.max_z > 0.0:
             z = torch.clamp(z, min=-self.max_z, max=self.max_z)
-
-        # CRPS = sigma * [ z(2Φ(z)-1) + 2φ(z) - 1/sqrt(pi) ]
         cdf = _normal_cdf(z)
         pdf = _normal_pdf(z)
         term = z * (2.0 * cdf - 1.0) + 2.0 * pdf - (1.0 / math.sqrt(math.pi))
@@ -456,38 +408,26 @@ class CRPSLoss(nn.Module):
     def _crps_normal_skew_sampled(
         self, err: torch.Tensor, sigma: torch.Tensor, dims: Tuple[int, ...]
     ) -> torch.Tensor:
-        # Standardized residuals for skew estimation.
         z_obs = err / torch.clamp(sigma, min=self.eps)
         if self.max_z > 0.0:
             z_obs = torch.clamp(z_obs, min=-self.max_z, max=self.max_z)
-
         z_mean = z_obs.mean(dim=dims, keepdim=True)
         z_centered = z_obs - z_mean
         m2 = (z_centered**2).mean(dim=dims, keepdim=True).clamp(min=self.eps)
         m3 = (z_centered**3).mean(dim=dims, keepdim=True)
         skew_emp = m3 / (m2.sqrt() ** 3 + self.eps)
-
         alpha = torch.clamp(skew_emp, min=-5.0, max=5.0)
         if self.detach_stats:
             alpha = alpha.detach()
-
         n_samples = int(self._skew_samples)
         if n_samples <= 0:
-            # Fallback to analytic when skew sampling disabled.
             return self._crps_normal_analytic(err, sigma)
-
-        # Skew-normal sampling parameter.
-        delta = alpha / torch.sqrt(1.0 + alpha * alpha)  # same shape as z_obs (keepdim)
-        # Ensure broadcast to z_obs.
+        delta = alpha / torch.sqrt(1.0 + alpha * alpha)
         delta = delta.expand_as(z_obs)
         tail = torch.sqrt(torch.clamp(1.0 - delta * delta, min=0.0))
-
         device, dtype = z_obs.device, z_obs.dtype
         z_obs0 = z_obs.unsqueeze(0)
-
-        # e1 = E|Z - z_obs|
         sum_abs = torch.zeros_like(z_obs)
-        # Chunked sampling to cap peak memory.
         chunk = 8
         for start in range(0, n_samples, chunk):
             k = min(chunk, n_samples - start)
@@ -496,14 +436,11 @@ class CRPSLoss(nn.Module):
             z_samp = delta.unsqueeze(0) * z0.abs() + tail.unsqueeze(0) * z1
             sum_abs = sum_abs + (z_samp - z_obs0).abs().sum(dim=0)
         e1 = sum_abs / float(n_samples)
-
-        # e2 = 0.5 E|Z - Z'| (estimated from a small subset)
         pair_k = min(int(self._skew_pair_samples), n_samples)
         if pair_k >= 2:
             z0 = torch.randn((pair_k, *z_obs.shape), device=device, dtype=dtype)
             z1 = torch.randn((pair_k, *z_obs.shape), device=device, dtype=dtype)
             z_pair = delta.unsqueeze(0) * z0.abs() + tail.unsqueeze(0) * z1
-            # Avoid O(pair_k^2) materialization: sample random pairs instead.
             m_pairs = min(int(pair_k * (pair_k - 1)), 64)
             idx_i = torch.randint(0, pair_k, (m_pairs,), device=device)
             idx_j = (idx_i + torch.randint(1, pair_k, (m_pairs,), device=device)) % pair_k
@@ -511,7 +448,6 @@ class CRPSLoss(nn.Module):
             e2 = 0.5 * diff.mean(dim=0)
         else:
             e2 = torch.zeros_like(e1)
-
         crps = sigma * (e1 - e2)
         return torch.clamp(crps, min=0.0)
 
@@ -520,7 +456,6 @@ class CRPSLoss(nn.Module):
             raise ValueError(f"shape mismatch: pred={pred.shape}, target={target.shape}")
         dims = self._dims(pred)
         err = target - pred
-
         if self.std_param is not None:
             sigma = self._expand_params(self.std_param, pred)
             if self.detach_stats:
@@ -528,12 +463,10 @@ class CRPSLoss(nn.Module):
             sigma = torch.clamp(sigma, min=self.eps)
         else:
             sigma = self._std_from_error(err, dims=dims)
-
         if not self.skew:
             crps = self._crps_normal_analytic(err, sigma)
         else:
             crps = self._crps_normal_skew_sampled(err, sigma, dims=dims)
-
         return self._reduce(crps)
 
     @staticmethod
@@ -547,12 +480,10 @@ class CRPSLoss(nn.Module):
         perm = [0, sd] + [i for i in range(1, nd) if i != sd]
         return pred.permute(*perm)
 
-
     @staticmethod
     def _is_compiling() -> bool:
         try:
-            import torch._dynamo  # type: ignore
-
+            import torch._dynamo
             return bool(torch._dynamo.is_compiling())
         except Exception:
             return False
@@ -562,47 +493,32 @@ class CRPSLoss(nn.Module):
     ) -> int:
         _MIB = 1024 * 1024
         candidates = (32 * _MIB, 64 * _MIB, 128 * _MIB)
-
-        # Determine a conservative cap from device memory.
         if device.type in {"cuda", "xpu", "mps"}:
             free: Optional[int] = None
             total: Optional[int] = None
-
             if not self._is_compiling():
                 with contextlib.suppress(Exception):
                     from .system import Memory
-
                     free_i, total_i = Memory.device_mem_get_info(device)
                     free = int(free_i) if free_i is not None else None
                     total = int(total_i) if total_i is not None else None
-
-            # Total-only fallback when mem_get_info is unavailable.
             if total is None or total <= 0:
                 with contextlib.suppress(Exception):
                     from .system import accel_device_total_memory_bytes
-
                     total = accel_device_total_memory_bytes(device)
-
             if total is None or total <= 0:
                 cap = candidates[0]
             else:
                 if free is None:
-                    # Use total as a proxy when free-memory query is unavailable.
                     free = total
                 cap = int(min(int(free) * 0.06, int(total) * 0.03))
                 if cap <= 0:
                     cap = candidates[0]
         else:
-            # CPU/other backends: default to the largest candidate.
             cap = candidates[-1]
-
         allowed = [c for c in candidates if c <= cap] or [candidates[0]]
         allowed.sort()
-
-        row_bytes = max(1, int(B) * int(S) * int(out_elem_size))  # bytes for chunk_rows=1 output
-
-        # Target number of Python-loop iterations over row chunks.
-        # (Larger chunks reduce loop overhead but increase peak memory.)
+        row_bytes = max(1, int(B) * int(S) * int(out_elem_size))
         if S <= 256:
             target_iters = 1
         elif S <= 512:
@@ -611,12 +527,8 @@ class CRPSLoss(nn.Module):
             target_iters = 4
         else:
             target_iters = 8
-
         required_rows = max(1, int((S + target_iters - 1) // target_iters))
         required_rows = min(required_rows, S)
-
-        # Pick the smallest allowed candidate that reaches required_rows,
-        # else fall back to the largest allowed.
         for budget in allowed:
             rows = max(1, min(S, int(budget // row_bytes)))
             if rows >= required_rows:
@@ -626,23 +538,22 @@ class CRPSLoss(nn.Module):
     def _energy_cdist_budget_bytes(self, B: int, S: int, samples: torch.Tensor) -> int:
         if self.energy_cdist_max_bytes is not None:
             return int(self.energy_cdist_max_bytes)
-
-        # Output of cdist is typically float32 for fp16/bf16 inputs; be conservative.
         out_elem_size = max(4, int(samples.element_size()))
         dev = samples.device
         dev_idx = -1
         if dev.type == "cuda":
             from .system import accel_current_device_index
-            dev_idx = int(dev.index) if dev.index is not None else int(accel_current_device_index("cuda"))
-
+            dev_idx = int(dev.index) if dev.index is not None else int(
+                accel_current_device_index("cuda")
+            )
         key = (dev.type, dev_idx, int(B), int(S), int(out_elem_size))
         if self._energy_cdist_cache_key == key and self._energy_cdist_cache_val is not None:
             return int(self._energy_cdist_cache_val)
-
         budget = self._recommend_energy_cdist_max_bytes(int(B), int(S), dev, out_elem_size)
         self._energy_cdist_cache_key = key
         self._energy_cdist_cache_val = int(budget)
         return int(budget)
+
     def _crps_energy(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if self.sample_dim is None:
             raise ValueError("CRPSLoss(mode='energy') requires sample_dim to be set")
@@ -650,37 +561,25 @@ class CRPSLoss(nn.Module):
             raise ValueError(
                 "In energy mode, target must be [B, ...] with the same tail shape as pred without sample_dim"
             )
-
         pred_m = self._move_sample_dim_to_1(pred, self.sample_dim)
-
-        # Align target to the same tail-dim order as pred_m.
         nd = int(pred.ndim)
         sd = self.sample_dim if self.sample_dim >= 0 else self.sample_dim + nd
         target_m = target.unsqueeze(sd)  # insert singleton sample dim
         if sd != 1:
             perm = [0, sd] + [i for i in range(1, nd) if i != sd]
             target_m = target_m.permute(*perm)
-
         B = int(pred_m.shape[0])
         S = int(pred_m.shape[1])
         if S <= 1:
             raise ValueError("energy mode requires at least 2 samples along sample_dim")
-
         samples = pred_m.reshape(B, S, -1)
         target_flat = target_m.reshape(B, 1, -1)
-
-        # term1 = E||X - y||
         dist1 = torch.linalg.vector_norm(samples - target_flat, dim=-1)
         term1 = dist1.mean(dim=1)
-
-        # term2 = E||X - X'||
-        # Use cdist to avoid allocating [B,S,S,V].
-        # Chunk rows based on an auto-tuned (or user-provided) max-bytes budget.
         budget_bytes = self._energy_cdist_budget_bytes(B, S, samples)
         out_elem_size = max(4, int(samples.element_size()))
         max_elems = max(1, int(budget_bytes // out_elem_size))
         chunk = max(1, min(S, int(max_elems // max(B * S, 1))))
-
         acc_dtype = (
             torch.float32
             if dist1.dtype in (torch.float16, torch.bfloat16)
@@ -692,10 +591,8 @@ class CRPSLoss(nn.Module):
             a = samples[:, i : i + chunk]
             d = torch.cdist(a, samples)  # [B,chunk,S]
             sum_d = sum_d + d.sum(dim=(1, 2)).to(acc_dtype)
-
         denom = float(S * (S - 1))
         term2 = sum_d / denom
-
         es = term1 - 0.5 * term2
         es = torch.clamp(es, min=0.0)
         return self._reduce(es)
@@ -737,7 +634,6 @@ class DistributionLoss(nn.Module):
             raise ValueError(f"invalid penalty={penalty}")
         if reduction.lower() not in {"mean", "sum", "none"}:
             raise ValueError(f"invalid reduction={reduction}")
-
         self.confidence = float(confidence)
         self.metric = metric.lower()
         self.penalty = penalty.lower()
@@ -822,7 +718,6 @@ class DistributionLoss(nn.Module):
                 return mu.detach() if self.detach_stats else mu
             case _:
                 raise ValueError("invalid mu_mode")
-
         mu = _median_over_dims(x, dims) if self.skew else reducer(x, dim=dims, keepdim=True)
         return mu.detach() if self.detach_stats else mu
 
@@ -930,7 +825,6 @@ class StandardNormalLoss(DistributionLoss):
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StandardNormalLoss: {self.metric}")
         self._std_normal = Normal(loc=0.0, scale=1.0)
-        # Cache scalar z-threshold once (device/dtype independent).
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
         try:
             self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q, dtype=torch.float64)).item())
@@ -965,7 +859,6 @@ class StandardNormalLoss(DistributionLoss):
             z_abs = z_eff.abs()
         else:
             z_abs = stat_abs
-
         match self.metric:
             case "z" | "z_score" | "z_value" | "zscore" | "zvalue":
                 return z_abs - self._z_threshold(pred.device, pred.dtype)
@@ -1030,15 +923,12 @@ class StudentsTLoss(DistributionLoss):
         valid = {"t", "t_score", "t_value", "tscore", "tvalue", "p", "p_value", "pvalue"}
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StudentsTLoss: {self.metric}")
-
-        # Cache scalar t-threshold for fixed df (avoids repeated icdf/bisection in forward).
         self._cached_t_threshold_f64: Optional[float] = None
         self._cached_t_df: Optional[float] = None
         self._cached_t_q: Optional[float] = None
 
     def _t_threshold(self, device: Any, dtype: Any) -> torch.Tensor:
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
-
         df_scalar: Optional[float] = None
         try:
             if torch.is_tensor(self.df):
@@ -1048,9 +938,7 @@ class StudentsTLoss(DistributionLoss):
                 df_scalar = float(self.df)
         except Exception:
             df_scalar = None
-
         df_requires_grad = torch.is_tensor(self.df) and self.df.requires_grad
-
         if (
             df_scalar is not None
             and not df_requires_grad
@@ -1059,7 +947,6 @@ class StudentsTLoss(DistributionLoss):
             and self._cached_t_q == float(q)
         ):
             return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
-
         df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
         try:
             dist = StudentT(df=df)
@@ -1076,8 +963,6 @@ class StudentsTLoss(DistributionLoss):
                 hi = torch.where(c >= target, mid, hi)
                 lo = torch.where(c < target, mid, lo)
             thr = 0.5 * (lo + hi)
-
-        # Cache only when df is a fixed scalar.
         if df_scalar is not None and not df_requires_grad and thr.numel() == 1:
             try:
                 self._cached_t_threshold_f64 = float(thr.detach().double().cpu().item())
@@ -1086,7 +971,6 @@ class StudentsTLoss(DistributionLoss):
                 return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
             except Exception:
                 pass
-
         return thr
 
     def _compute_margin(
@@ -1114,7 +998,6 @@ class StudentsTLoss(DistributionLoss):
             t_abs = t_eff.abs()
         else:
             t_abs = stat_abs
-
         match self.metric:
             case "t" | "t_score" | "t_value" | "tscore" | "tvalue":
                 return t_abs - self._t_threshold(pred.device, pred.dtype)
@@ -1184,11 +1067,8 @@ class DataFidelityLoss(nn.Module):
         shape = self.out_shape
         x = pred_flat.view(B, *shape)
         y = target_flat.view(B, *shape)
-
-        # Pick complex dtype based on master float.
         base_dtype = torch.float64 if (x.dtype == torch.float64 or y.dtype == torch.float64) else torch.float32
         cplx_dtype = torch.complex128 if base_dtype == torch.float64 else torch.complex64
-
         match self.mode:
             case "fft":
                 Xk = _fft_nd(x.to(cplx_dtype) if not torch.is_complex(x) else x, shape, real_input=False, inverse=False, norm=self.fft_norm)
@@ -1254,59 +1134,46 @@ class LinearCombinationLoss(nn.Module):
             raise ValueError(
                 f"invalid coefficient/loss length: len(coefficient)={len(coefficient)}, len(loss)={len(loss)}"
             )
-
         coeff_tensor = torch.as_tensor(coefficient, dtype=torch.float32)
         if coeff_tensor.ndim != 1 or int(coeff_tensor.numel()) != len(loss):
             raise ValueError(
                 f"coefficient must be 1D of length {len(loss)}, got shape {tuple(coeff_tensor.shape)}"
             )
-
         self.register_buffer("coefficient", coeff_tensor)
         self.losses = nn.ModuleList(list(loss))
         self.offset = float(offset)
         self.reduce_each = bool(reduce_each)
-
         self.auto_schedule = bool(auto_schedule)
         self.schedule_momentum = float(schedule_momentum)
         self.min_coeff = float(min_coeff)
         self.max_coeff = float(max_coeff)
         self.eps = float(eps)
-
         self.register_buffer("loss_avg", torch.full_like(coeff_tensor, fill_value=1.0))
 
     def _update_coefficients(self, per_loss_vals: List[torch.Tensor]) -> None:
         if (not self.auto_schedule) or (not per_loss_vals) or (not self.training):
             return
-
-        # Avoid compilation/tracing side-effects.
         with torch.no_grad():
-            # Keep updates on-device (avoid .item() GPU sync).
             device = self.loss_avg.device
             dtype = self.loss_avg.dtype
             vals_t = torch.stack([v.detach().abs().mean() for v in per_loss_vals]).to(device=device, dtype=dtype)
             vals_t = torch.clamp(vals_t, min=self.eps)
-
             m = float(max(0.0, min(1.0, self.schedule_momentum)))
             self.loss_avg.mul_(m).add_(vals_t * (1.0 - m))
-
             base = self.coefficient.detach().to(device=device, dtype=dtype)
             base = base / torch.clamp(base.sum(), min=self.eps)
-
             inv = base / torch.clamp(self.loss_avg, min=self.eps)
             new_w = inv / torch.clamp(inv.sum(), min=self.eps)
-
             if self.min_coeff > 0.0 or self.max_coeff < 1.0:
                 lo = float(self.min_coeff)
                 hi = float(self.max_coeff)
                 new_w = torch.clamp(new_w, min=lo, max=hi)
                 new_w = new_w / torch.clamp(new_w.sum(), min=self.eps)
-
             self.coefficient.copy_(new_w.to(self.coefficient.device, dtype=self.coefficient.dtype))
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
         weights = self.coefficient.detach().clone().to(device=pred.device, dtype=pred.dtype)
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
-
         per_loss_vals: List[torch.Tensor] = []
         for w, L in zip(weights, self.losses):
             v = L(pred, target)
@@ -1317,13 +1184,11 @@ class LinearCombinationLoss(nn.Module):
             v_eff = v.mean() if (self.reduce_each and v.dim() > 0) else v
             per_loss_vals.append(v_eff)
             total = total + w * v_eff
-
         self._update_coefficients(per_loss_vals)
         return total
 
 
 class TiledLoss(nn.Module):
-
     def __init__(
         self,
         base: nn.Module,
@@ -1343,12 +1208,10 @@ class TiledLoss(nn.Module):
         self.mask_value = mask_value
         self.tile_dim = tile_dim
         self.tile_size = int(tile_size) if tile_size is not None else None
-
         reduction_v = str(reduction).lower()
         if reduction_v not in ("mean", "sum", "none"):
             raise ValueError(f"reduction must be one of ('mean', 'sum', 'none'), got {reduction!r}")
         self.reduction = reduction_v
-
         base_red = str(base_reduction).lower()
         if base_red not in ("auto", "none", "mean", "sum"):
             raise ValueError(
@@ -1380,10 +1243,8 @@ class TiledLoss(nn.Module):
     def _masked_select_safe(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
         if mask is None:
             return x
-        # Only apply elementwise mask when shapes match.
         if x.shape == mask.shape:
             return x.masked_select(mask)
-        # If loss is scalar or per-sample, masking is ill-defined; leave unchanged.
         if x.numel() == 1 or x.ndim == 0:
             return x
         return x
@@ -1413,19 +1274,13 @@ class TiledLoss(nn.Module):
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         mask = self._mask(pred, target)
-
-        # Fast path: no tiling (still handle scalar base reductions correctly).
         if self.tile_dim is None or self.tile_size is None:
             v = self.base(pred, target)
             base_red = self._infer_base_reduction(v, pred)
-
             if self.reduction == "none":
                 return self._masked_select_safe(v, mask)
-
             if base_red == "none" or v.shape == pred.shape:
                 return self.reduce(v, mask)
-
-            # Reduced output: compute global sum/mean consistently.
             if mask is not None and mask.shape == pred.shape:
                 pv = pred[mask]
                 tv = target[mask]
@@ -1435,7 +1290,6 @@ class TiledLoss(nn.Module):
                 v = self.base(pv, tv)
             else:
                 n = int(pred.numel())
-
             if v.numel() == 1:
                 v_scalar = v.reshape(())
                 if base_red == "sum":
@@ -1445,37 +1299,27 @@ class TiledLoss(nn.Module):
                 if self.reduction == "sum":
                     return total_sum
                 return total_sum / float(max(n, 1))
-
-            # Fallback: treat as elementwise-ish.
             if self.reduction == "sum":
                 return v.sum()
             return v.mean()
-
-        # --- Tiled path ---
         nd = int(pred.ndim)
         td = int(self.tile_dim) + nd if int(self.tile_dim) < 0 else int(self.tile_dim)
         td = max(0, min(td, nd - 1))
         N = int(pred.shape[td])
-
-        # Accumulate in fp32 when inputs are low precision.
         acc_dtype = torch.float32 if pred.dtype in (torch.float16, torch.bfloat16) else pred.dtype
         total_sum = pred.new_tensor(0.0, dtype=acc_dtype)
         total_count: int = 0
         parts: List[torch.Tensor] = []
-
         start = 0
         while start < N:
             end = min(N, start + int(self.tile_size))
             sl = [slice(None)] * nd
             sl[td] = slice(start, end)
             sl_tuple = tuple(sl)
-
             pv = pred[sl_tuple]
             tv = target[sl_tuple]
             mv = mask[sl_tuple] if mask is not None else None
-
             elem = self.base(pv, tv)
-
             if self.reduction == "none":
                 flat = elem.reshape(-1)
                 if mv is not None and elem.shape == mv.shape:
@@ -1483,10 +1327,7 @@ class TiledLoss(nn.Module):
                 parts.append(flat)
                 start = end
                 continue
-
             base_red = self._infer_base_reduction(elem, pv)
-
-            # Elementwise loss: can be masked on the output.
             if base_red == "none" or elem.shape == pv.shape:
                 if mv is not None and elem.shape == mv.shape:
                     selected = elem.masked_select(mv)
@@ -1497,8 +1338,6 @@ class TiledLoss(nn.Module):
                     total_count += int(elem.numel())
                 start = end
                 continue
-
-            # Reduced loss (typically scalar). For correctness under masking, recompute on masked selection.
             if mv is not None and mv.shape == pv.shape:
                 pv2 = pv[mv]
                 tv2 = tv[mv]
@@ -1510,20 +1349,17 @@ class TiledLoss(nn.Module):
             else:
                 n = int(pv.numel())
                 elem2 = elem
-
             if elem2.numel() == 1:
                 v_scalar = elem2.reshape(())
                 if base_red == "sum":
                     total_sum = total_sum + v_scalar
-                else:  # assume mean
+                else:
                     total_sum = total_sum + v_scalar * float(n)
                 total_count += int(n)
             else:
                 total_sum = total_sum + elem2.sum()
                 total_count += int(elem2.numel())
-
             start = end
-
         match self.reduction:
             case "none":
                 return torch.cat(parts, dim=0) if parts else pred.new_zeros(())
@@ -1560,7 +1396,6 @@ class LossWeightController:
         return (ratio_top / norm, ratio_bottom / norm)
 
     def update(self, top_loss: Optional[torch.Tensor], bottom_loss: Optional[torch.Tensor]) -> None:
-        # Controller is pure-Python and expected to run on CPU-side scalars.
         if top_loss is not None:
             try:
                 top_val = float(top_loss.detach().abs().mean().item())
