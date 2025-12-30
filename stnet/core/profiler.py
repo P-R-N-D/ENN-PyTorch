@@ -824,7 +824,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):
         handlers[_maybe(self._aten.layer_norm.default)] = self._h_layer_norm
         if getattr(self._aten, "dropout", None) is not None:
             handlers[_maybe(self._aten.dropout.default)] = self._h_dropout
-
         if getattr(self._aten, "_softmax", None) is not None:
             handlers[_maybe(self._aten._softmax.default)] = self._h_softmax
         if getattr(self._aten, "softmax", None) is not None and hasattr(self._aten.softmax, "int"):
