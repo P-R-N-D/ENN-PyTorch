@@ -13,18 +13,30 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 from torch import nn
 
+try:
+    from torch.utils._python_dispatch import TorchDispatchMode
+except Exception:
+    TorchDispatchMode = None
+
+
 _LOGGER = logging.getLogger(__name__)
 
-__all__ = [
-    "FLOP_PROFILER",
-    "FlopCounter",
-    "capture",
-]
+FLOP_PROFILER: "_FlopProfiler" | None = None
 
+_ACT_COEFF: Dict[type, float] = {
+    nn.ReLU: 1.0,
+    nn.ReLU6: 1.0,
+    nn.Sigmoid: 4.0,
+    nn.Tanh: 4.0,
+    nn.GELU: 8.0,
+    nn.SiLU: 6.0,
+    nn.ELU: 4.0,
+    nn.LeakyReLU: 1.0,
+    nn.Hardswish: 6.0,
+    nn.Hardsigmoid: 4.0,
+}
+_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
 
-# ==============================================================================
-# Utilities
-# ==============================================================================
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -106,16 +118,10 @@ def _infer_bhsd_shape(shape: Tuple[int, ...]) -> Tuple[int, int, int, int]:
     return (b, h, s, d)
 
 
-# ==============================================================================
-# FLOP estimation primitives (approximate but consistent)
-# ==============================================================================
-
 def _linear_mkn(inp: torch.Tensor, out: Any, weight: Optional[torch.Tensor]) -> Tuple[int, int, int]:
     if not isinstance(inp, torch.Tensor) or inp.numel() == 0:
         return (0, 0, 0)
-
     if isinstance(weight, torch.Tensor) and weight.ndim >= 2:
-        # [out_features, in_features]
         n_dim = _safe_int(weight.shape[0], 0)
         k_dim = _safe_int(weight.shape[-1], 0)
     else:
@@ -124,10 +130,8 @@ def _linear_mkn(inp: torch.Tensor, out: Any, weight: Optional[torch.Tensor]) -> 
             n_dim = _safe_int(out.shape[-1], 0)
         else:
             n_dim = 0
-
     if k_dim <= 0 or n_dim <= 0:
         return (0, 0, 0)
-
     m_dim = _safe_int(inp.numel() // max(k_dim, 1), 0)
     if isinstance(out, torch.Tensor) and out.numel() > 0:
         m_dim = max(m_dim, _safe_int(out.numel() // max(n_dim, 1), 0))
@@ -166,19 +170,15 @@ def _flops_conv(
     out_t = _get_out_tensor(out)
     if out_t is None or out_t.numel() == 0:
         return 0.0
-
     try:
         out_elems = int(out_t.numel())
         g = max(1, int(groups))
-
         if isinstance(inp, torch.Tensor) and inp.ndim >= 2:
             cin_total = int(inp.shape[1])
         else:
             cin_total = int(weight.shape[1] * g)
-
         cin_per_group = max(1, cin_total // g)
         kernel_spatial = int(weight[0].numel()) // max(cin_per_group, 1)
-
         fwd = out_elems * (2.0 * cin_per_group * kernel_spatial)
         if include_bias and has_bias:
             fwd += float(out_elems)
@@ -204,20 +204,15 @@ def _flops_softmax(inp: torch.Tensor, out: Any, *, dim: int, effective_bwd: floa
     nd = int(inp.ndim)
     if nd <= 0:
         return 0.0
-
     d = int(dim)
     if d < 0:
         d += nd
     if d < 0 or d >= nd:
         return 0.0
-
     cols = int(inp.shape[d])
     if cols <= 0:
         return 0.0
     rows = int(inp.numel() // max(cols, 1))
-
-    # stable softmax approx per row:
-    # max-reduction (cols comps), sub (cols), exp (cols), sum (cols adds), div (cols)
     fwd = float(rows) * (5.0 * float(cols))
     return float(fwd * (1.0 + max(0.0, _safe_float(effective_bwd, 0.0))))
 
@@ -236,24 +231,17 @@ def _flops_layernorm(
         return 0.0
     if out_t is None or out_t.numel() == 0:
         return 0.0
-
     n_norm = _prod_int([int(x) for x in normalized_shape]) if normalized_shape else int(inp.shape[-1])
     if n_norm <= 0:
         return 0.0
     groups = int(out_t.numel() // max(n_norm, 1))
-
-    # Rough:
-    # mean ~ N, var ~ 3N, normalize ~ 2N => 6N
-    # affine: weight mul (N) + bias add (N if bias)
     affine = 0.0
     if elementwise_affine:
         affine += 1.0
         if has_bias:
             affine += 1.0
-
     fwd = float(groups) * float(n_norm) * (6.0 + affine)
     return float(fwd * (1.0 + max(0.0, _safe_float(effective_bwd, 0.0))))
-
 
 def _flops_attention_general(
     *,
@@ -269,17 +257,13 @@ def _flops_attention_general(
 ) -> float:
     if batch <= 0 or q_len <= 0 or k_len <= 0 or num_heads <= 0 or head_dim <= 0:
         return 0.0
-
-    # QK^T: 2*B*H*Q*K*D, AV: 2*B*H*Q*K*D => 4*...
     matmul = 4.0 * batch * num_heads * q_len * k_len * head_dim
-
     misc = 0.0
     if include_softmax_scale_dropout:
         misc_coeff = 6.0
         if training and dropout_p > 0.0:
             misc_coeff += 1.0
         misc = misc_coeff * (batch * num_heads * q_len * k_len)
-
     fwd = matmul + misc
     return float(fwd * (1.0 + max(0.0, _safe_float(effective_bwd, 0.0))))
 
@@ -313,43 +297,10 @@ def _flops_attention_from_qkv(
     )
 
 
-# ==============================================================================
-# Manual hook registry
-# ==============================================================================
-
-@dataclass(frozen=True)
-class _HookConfig:
-    include_bias: bool
-    effective_bwd: float
-    count_activations: bool
-    count_norms: bool
-    count_softmax: bool
-    count_dropout: bool
-    count_embedding: bool
-
-
-_ACT_COEFF: Dict[type, float] = {
-    nn.ReLU: 1.0,
-    nn.ReLU6: 1.0,
-    nn.Sigmoid: 4.0,
-    nn.Tanh: 4.0,
-    nn.GELU: 8.0,
-    nn.SiLU: 6.0,
-    nn.ELU: 4.0,
-    nn.LeakyReLU: 1.0,
-    nn.Hardswish: 6.0,
-    nn.Hardsigmoid: 4.0,
-}
-
-_ACT_CLASSES: Tuple[type, ...] = tuple(_ACT_COEFF.keys())
-
-
-@lru_cache(maxsize=128)
 def _act_coeff_for_type(t: type) -> Optional[float]:
     coeff = _ACT_COEFF.get(t)
     if coeff is not None:
         return float(coeff)
-    # Handle subclasses (rare, but possible).
     for cls, c in _ACT_COEFF.items():
         try:
             if issubclass(t, cls):
@@ -367,14 +318,12 @@ def _register_linear(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
     x = inp[0] if inp else None
     if not isinstance(x, torch.Tensor):
         return
-
     weight = getattr(mod, "weight", None)
     if weight is None:
         inner = getattr(mod, "linear", None)
         weight = getattr(inner, "weight", None)
     if not isinstance(weight, torch.Tensor):
         return
-
     has_bias = getattr(mod, "bias", None) is not None
     val = _flops_linear(x, out, weight, include_bias=cfg.include_bias, has_bias=has_bias, effective_bwd=cfg.effective_bwd)
     if val > 0.0:
@@ -391,7 +340,6 @@ def _register_conv(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: 
     weight = getattr(mod, "weight", None)
     if not isinstance(weight, torch.Tensor):
         return
-
     groups = getattr(mod, "groups", 1)
     has_bias = getattr(mod, "bias", None) is not None
     val = _flops_conv(
@@ -460,12 +408,10 @@ def _register_layernorm(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profi
 
 
 def _register_embedding(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
-    # Gather is mostly memory traffic; FLOPs ~ 0
     return
 
 
 def _register_mha(mod: nn.MultiheadAttention, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
-    # Best-effort: count in-proj + attention core + out-proj
     if not inp:
         return
     q = inp[0]
@@ -473,30 +419,24 @@ def _register_mha(mod: nn.MultiheadAttention, inp: Tuple[Any, ...], out: Any, *,
         return
     if q.ndim != 3:
         return
-
     batch_first = bool(getattr(mod, "batch_first", False))
     if batch_first:
         bsz, seq_len, embed_dim = q.shape
     else:
         seq_len, bsz, embed_dim = q.shape
-
     num_heads = int(getattr(mod, "num_heads", 0))
     if num_heads <= 0:
         return
     head_dim = int(embed_dim // num_heads) if int(embed_dim) % num_heads == 0 else int(getattr(mod, "head_dim", 0))
     if head_dim <= 0:
         return
-
     m = int(bsz) * int(seq_len)
     E = int(embed_dim)
-
-    # QKV projection
     inproj_has_bias = getattr(mod, "in_proj_bias", None) is not None
     inproj_fwd = 2.0 * m * E * (3.0 * E)
     if cfg.include_bias and inproj_has_bias:
         inproj_fwd += float(m * (3 * E))
     inproj = float(inproj_fwd * (1.0 + max(0.0, cfg.effective_bwd)))
-
     p = float(getattr(mod, "dropout", 0.0))
     training = bool(getattr(mod, "training", False))
     attn = _flops_attention_general(
@@ -510,18 +450,12 @@ def _register_mha(mod: nn.MultiheadAttention, inp: Tuple[Any, ...], out: Any, *,
         training=training,
         include_softmax_scale_dropout=True,
     )
-
     outproj_fwd = 2.0 * m * E * E
     outproj = float(outproj_fwd * (1.0 + max(0.0, cfg.effective_bwd)))
-
     total = float(inproj + attn + outproj)
     if total > 0.0:
         profiler.add(type(mod).__name__, total)
 
-
-# ==============================================================================
-# Aggressive TE weight discovery (cached)
-# ==============================================================================
 
 def _get_tensor_attr(mod: nn.Module, name: str) -> Optional[torch.Tensor]:
     try:
@@ -534,7 +468,6 @@ def _get_tensor_attr(mod: nn.Module, name: str) -> Optional[torch.Tensor]:
 def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, bool]]:
     entries: List[Tuple[str, torch.Tensor, bool]] = []
     seen: set[int] = set()
-
     params: Dict[str, torch.Tensor] = {}
     try:
         for n, p in mod.named_parameters(recurse=False):
@@ -542,7 +475,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
                 params[n] = p
     except Exception:
         pass
-
     buffers: Dict[str, torch.Tensor] = {}
     try:
         for n, b in mod.named_buffers(recurse=False):
@@ -570,12 +502,9 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
             return
         seen.add(tid)
         entries.append((name, t, bool(has_bias)))
-
-    # 1) named_parameters recurse=False
+        
     for n, p in params.items():
         add(f"param:{n}", p, has_bias=has_bias_for_weight_name(n))
-
-    # 2) attribute hints
     candidates = [
         "weight",
         "linear_weight",
@@ -595,8 +524,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
     for n in candidates:
         t = _get_tensor_attr(mod, n)
         add(f"attr:{n}", t, has_bias=has_bias_for_weight_name(n))
-
-    # 3) scan immediate children (recurse=True, capped)
     try:
         for name, sm in mod.named_modules():
             if name == "":
@@ -608,8 +535,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
                 break
     except Exception:
         pass
-
-    # 4) fallback: vars(mod) and dir(mod) lightly
     try:
         d = vars(mod)
         for n, v in d.items():
@@ -619,7 +544,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
                 break
     except Exception:
         pass
-
     try:
         for n in list(dir(mod))[:256]:
             if n.startswith("_"):
@@ -631,7 +555,6 @@ def _find_2d_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, boo
                 break
     except Exception:
         pass
-
     return entries
 
 
@@ -642,7 +565,6 @@ def _te_cached_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, b
             return cache["entries"]  # type: ignore[return-value]
     except Exception:
         cache = None
-
     entries = _find_2d_weight_entries(mod)
     try:
         setattr(mod, "_stnet_te_weight_cache", {"v": 1, "entries": entries})
@@ -652,7 +574,6 @@ def _te_cached_weight_entries(mod: nn.Module) -> List[Tuple[str, torch.Tensor, b
 
 
 def _te_ln_affine(mod: nn.Module) -> Tuple[bool, bool]:
-    # (elementwise_affine, has_bias)
     has_weight = False
     has_bias = False
     for n in ("weight", "ln_weight", "layer_norm_weight", "gamma"):
@@ -669,8 +590,6 @@ def _te_ln_affine(mod: nn.Module) -> Tuple[bool, bool]:
 def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler: "_FlopProfiler", cfg: _HookConfig) -> None:
     x = inp[0] if inp else None
     cname = type(mod).__name__.lower()
-
-    # Attention-ish
     if "attention" in cname:
         ts = _first_tensors_from_args(inp, max_n=3)
         q = ts[0] if len(ts) >= 1 else None
@@ -689,13 +608,9 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
             if val > 0.0:
                 profiler.add(f"TE.{type(mod).__name__}", val)
         return
-
     if not isinstance(x, torch.Tensor):
         return
-
     w_entries = _te_cached_weight_entries(mod)
-
-    # LayerNormLinear: LN + Linear
     if "layernormlinear" in cname or ("layernorm" in cname and "linear" in cname):
         elementwise_affine, ln_has_bias = _te_ln_affine(mod)
         ln = _flops_layernorm(
@@ -705,7 +620,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
             has_bias=ln_has_bias,
             effective_bwd=cfg.effective_bwd,
         )
-
         in_feat = int(x.shape[-1])
         hinted = [(n, w, hb) for (n, w, hb) in w_entries if ("linear" in n.lower() or "proj" in n.lower() or "fc" in n.lower())]
         candidates = hinted if hinted else list(w_entries)
@@ -715,7 +629,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
             return
         pick_from.sort(key=lambda t: int(t[1].numel()), reverse=True)
         _, lin_w, lin_has_bias = pick_from[0]
-
         lin = _flops_linear(
             x, out, lin_w,
             include_bias=cfg.include_bias,
@@ -726,8 +639,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
         if total > 0.0:
             profiler.add(f"TE.{type(mod).__name__}", total)
         return
-
-    # LayerNormMLP: LN + (Linear1 + Act + Linear2)
     if "layernormmlp" in cname or ("mlp" in cname and "layernorm" in cname):
         elementwise_affine, ln_has_bias = _te_ln_affine(mod)
         ln = _flops_layernorm(
@@ -737,10 +648,8 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
             has_bias=ln_has_bias,
             effective_bwd=cfg.effective_bwd,
         )
-
         if not w_entries:
             return
-
         in_feat = int(x.shape[-1])
 
         def hint_score(name: str, for_w2: bool) -> int:
@@ -761,28 +670,21 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
         match1 = [t for t in cand1 if int(t[1].shape[-1]) == in_feat]
         n1, w1, b1 = (match1[0] if match1 else cand1[0])
         hidden = int(w1.shape[0])
-
         rest = [t for t in w_entries if id(t[1]) != id(w1)]
         cand2 = sorted(rest, key=lambda t: (hint_score(t[0], True), int(t[1].numel())), reverse=True)
         match2 = [t for t in cand2 if int(t[1].shape[-1]) == hidden]
         w2_entry = (match2[0] if match2 else (cand2[0] if cand2 else None))
         w2 = w2_entry[1] if w2_entry is not None else None
         b2 = bool(w2_entry[2]) if w2_entry is not None else False
-
-        # linear1
         lin1 = _flops_linear(
             x, out, w1,
             include_bias=cfg.include_bias,
             has_bias=b1,
             effective_bwd=cfg.effective_bwd,
         )
-
-        # activation: assume GELU-ish on [m, hidden]
         m_dim = int(x.numel() // max(int(w1.shape[-1]), 1))
         act_out_elems = int(m_dim * max(hidden, 0))
         act = float(act_out_elems) * 8.0 * (1.0 + max(0.0, cfg.effective_bwd)) if act_out_elems > 0 else 0.0
-
-        # linear2 direct estimate
         lin2 = 0.0
         if isinstance(w2, torch.Tensor) and w2.ndim == 2 and hidden > 0 and m_dim > 0:
             n2 = int(w2.shape[0])
@@ -797,8 +699,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
         if total > 0.0:
             profiler.add(f"TE.{type(mod).__name__}", total)
         return
-
-    # Fallback: linear-like
     if w_entries:
         in_feat = int(x.shape[-1])
         matches = [t for t in w_entries if int(t[1].shape[-1]) == in_feat]
@@ -815,16 +715,6 @@ def _register_te_any(mod: nn.Module, inp: Tuple[Any, ...], out: Any, *, profiler
             profiler.add(f"TE.{type(mod).__name__}", val)
 
 
-# ==============================================================================
-# Operator-level (dispatch) mode
-# ==============================================================================
-
-try:
-    from torch.utils._python_dispatch import TorchDispatchMode
-except Exception:  # pragma: no cover
-    TorchDispatchMode = None  # type: ignore
-
-
 def _op_name(func: Any) -> str:
     try:
         return str(func).replace("torch.ops.aten.", "aten.")
@@ -832,8 +722,77 @@ def _op_name(func: Any) -> str:
         return "op"
 
 
-class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
+def _is_tensorlike(x: Any) -> bool:
+    return isinstance(x, (torch.Tensor, _ShapeTensor))
 
+
+def _shape_from_meta(meta: Any) -> Optional[Tuple[int, ...]]:
+    try:
+        if meta is None:
+            return None
+        shp = getattr(meta, "shape", None)
+        if shp is None:
+            return None
+        return tuple(int(s) for s in shp)
+    except Exception:
+        return None
+
+
+def _to_real_tensor(x: Any) -> torch.Tensor:
+    if isinstance(x, torch.Tensor):
+        return x
+    if isinstance(x, _ShapeTensor):
+        return torch.empty((1, 1), device="cpu")
+    return torch.empty((1, 1), device="cpu")
+
+
+def _export_fx(model: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[torch.fx.GraphModule]:
+    try:
+        import torch._dynamo as dynamo
+        exported = dynamo.export(model, aten_graph=True)
+        res = exported(*args, **kwargs)
+        return res.graph_module
+    except Exception as exc:
+        _LOGGER.debug("dynamo.export failed: %s", exc)
+        return None
+
+
+def _shape_propagate(gm: torch.fx.GraphModule, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
+    try:
+        from torch.fx.passes.shape_prop import ShapeProp
+        ShapeProp(gm).propagate(*args, **kwargs)
+    except Exception as exc:
+        _LOGGER.debug("ShapeProp failed: %s", exc)
+
+
+def capture(
+    q: torch.Tensor,
+    *,
+    bwd_factor: float = 1.0,
+    dropout_p: float = 0.0,
+    training: bool = False,
+    include_softmax_scale_dropout: bool = True,
+) -> float:
+    return FLOP_PROFILER.capture(
+        q,
+        bwd_factor=bwd_factor,
+        dropout_p=dropout_p,
+        training=training,
+        include_softmax_scale_dropout=include_softmax_scale_dropout,
+    )
+
+
+class _HookConfig:
+    include_bias: bool
+    effective_bwd: float
+    count_activations: bool
+    count_norms: bool
+    count_softmax: bool
+    count_dropout: bool
+    count_embedding: bool
+
+    
+class _OpFlopDispatchMode(TorchDispatchMode):
     def __init__(
         self,
         profiler: "_FlopProfiler",
@@ -847,18 +806,13 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
         self._include_bias = bool(include_bias)
         self._effective_bwd = float(effective_bwd)
         self._count_elementwise = bool(count_elementwise)
-
         self._aten = torch.ops.aten  # shorthand
-
         handlers: Dict[Any, Callable[[Tuple[Any, ...], Dict[str, Any], Any], float]] = {}
-
-        # Map specific ops to aggregated breakdown tags (e.g., Elementwise.exp)
         self._tag_overrides: Dict[Any, str] = {}
 
         def _maybe(op: Any) -> Any:
             return op if op is not None else None
 
-        # GEMM-like
         handlers[_maybe(self._aten.mm.default)] = self._h_mm
         handlers[_maybe(self._aten.bmm.default)] = self._h_bmm
         handlers[_maybe(self._aten.matmul.default)] = self._h_matmul
@@ -866,12 +820,8 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
         if getattr(self._aten, "linear", None) is not None:
             handlers[_maybe(self._aten.linear.default)] = self._h_linear
         handlers[_maybe(self._aten.convolution.default)] = self._h_convolution
-
-        # Norms
         handlers[_maybe(self._aten.native_layer_norm.default)] = self._h_native_layer_norm
         handlers[_maybe(self._aten.layer_norm.default)] = self._h_layer_norm
-
-        # Dropout / Softmax
         if getattr(self._aten, "dropout", None) is not None:
             handlers[_maybe(self._aten.dropout.default)] = self._h_dropout
 
@@ -879,8 +829,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
             handlers[_maybe(self._aten._softmax.default)] = self._h_softmax
         if getattr(self._aten, "softmax", None) is not None and hasattr(self._aten.softmax, "int"):
             handlers[_maybe(self._aten.softmax.int)] = self._h_softmax
-
-        # SDPA + attention variants (flash / efficient / cudnn)
         if getattr(self._aten, "scaled_dot_product_attention", None) is not None:
             handlers[_maybe(self._aten.scaled_dot_product_attention.default)] = self._h_sdpa
         for name in (
@@ -894,14 +842,9 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
             op = getattr(self._aten, name, None)
             if op is not None and hasattr(op, "default"):
                 handlers[_maybe(op.default)] = self._h_sdpa_like
-
-        # Embedding (FLOPs ~ 0)
         if getattr(self._aten, "embedding", None) is not None:
             handlers[_maybe(self._aten.embedding.default)] = lambda a, k, o: 0.0
-
-        # Elementwise ops
         if self._count_elementwise:
-            # binary ops: 1 flop/elem
             for base in ("add", "sub", "mul", "div"):
                 obj = getattr(self._aten, base, None)
                 obj_ = getattr(self._aten, base + "_", None)
@@ -921,8 +864,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                             handlers[op] = self._h_binop
                             if op is not None:
                                 self._tag_overrides[op] = f"Elementwise.{base}"
-
-            # ternary fused patterns (fma-like): ~3 flops/elem
             for base, handler in (("addcmul", self._h_addcmul), ("addcdiv", self._h_addcdiv)):
                 obj = getattr(self._aten, base, None)
                 obj_ = getattr(self._aten, base + "_", None)
@@ -942,13 +883,9 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                             handlers[op] = handler
                             if op is not None:
                                 self._tag_overrides[op] = f"Elementwise.{base}"
-
-            # unary coefficient table (rough relative cost)
             unary_coeff = {
-                # cheap-ish
                 "abs": 1.0,
                 "neg": 1.0,
-                # cheap rounding/sign
                 "floor": 1.0,
                 "ceil": 1.0,
                 "round": 1.0,
@@ -956,10 +893,8 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                 "frac": 1.0,
                 "sign": 1.0,
                 "reciprocal": 4.0,
-                # roots
                 "sqrt": 4.0,
                 "rsqrt": 6.0,
-                # exp/log family
                 "exp": 10.0,
                 "exp2": 10.0,
                 "expm1": 10.0,
@@ -967,7 +902,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                 "log2": 10.0,
                 "log10": 10.0,
                 "log1p": 10.0,
-                # trig/hyperbolic
                 "sin": 12.0,
                 "cos": 12.0,
                 "tan": 12.0,
@@ -980,12 +914,10 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                 "asinh": 14.0,
                 "acosh": 14.0,
                 "atanh": 14.0,
-                # special
                 "erf": 14.0,
                 "erfc": 14.0,
                 "erfinv": 18.0,
                 "sigmoid": 4.0,
-                # common fused activations
                 "relu": 1.0,
                 "gelu": 8.0,
                 "silu": 6.0,
@@ -1003,9 +935,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                     handlers[op] = (lambda a, k, o, c=coeff: _flops_elementwise(o, coeff=c, effective_bwd=self._effective_bwd))
                     if op is not None:
                         self._tag_overrides[op] = f"Elementwise.{name}"
-
-            
-            # binary special elementwise ops (coeff table)
             binary_coeff = {
                 "atan2": 14.0,
                 "minimum": 1.0,
@@ -1031,8 +960,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                             handlers[op] = (lambda a, k, o, c=coeff: _flops_elementwise(o, coeff=c, effective_bwd=self._effective_bwd))
                             if op is not None:
                                 self._tag_overrides[op] = f"Elementwise.{name}"
-
-# pow: heuristic based on exponent
             pow_obj = getattr(self._aten, "pow", None)
             pow_obj_ = getattr(self._aten, "pow_", None)
             for pobj in (pow_obj, pow_obj_):
@@ -1045,15 +972,12 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                         handlers[op] = self._h_pow
                         if op is not None:
                             self._tag_overrides[op] = "Elementwise.pow"
-
-            # fma: fused multiply-add (if present) ~2 flops/elem
             fma_obj = getattr(self._aten, "fma", None)
             if fma_obj is not None and hasattr(fma_obj, "default"):
                 op = _maybe(fma_obj.default)
                 handlers[op] = self._h_fma
                 if op is not None:
                     self._tag_overrides[op] = "Elementwise.fma"
-
         self._handlers = {k: v for k, v in handlers.items() if k is not None}
 
     def __torch_dispatch__(
@@ -1065,12 +989,9 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
     ) -> Any:
         if kwargs is None:
             kwargs = {}
-
         out = func(*args, **kwargs)
-
         handler = self._handlers.get(func, None)
         if handler is None:
-            # Best-effort for Triton / Flex / TE custom ops.
             name = _op_name(func).lower()
             val = 0.0
             if ("triton" in name) or ("flex" in name) or ("transformer_engine" in name) or ("xformers" in name):
@@ -1083,7 +1004,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                     )
                     self._profiler.add(tag, val)
             return out
-
         try:
             val = float(handler(args, kwargs, out))
         except Exception:
@@ -1095,17 +1015,13 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
 
         return out
 
-    # ---- handlers
-
     def _h_binop(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
         return _flops_elementwise(out, coeff=1.0, effective_bwd=self._effective_bwd)
 
     def _h_addcmul(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
-        # out = input + value * t1 * t2  (mul + mul + add)
         return _flops_elementwise(out, coeff=3.0, effective_bwd=self._effective_bwd)
 
     def _h_addcdiv(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
-        # out = input + value * t1 / t2  (div + mul + add)
         return _flops_elementwise(out, coeff=3.0, effective_bwd=self._effective_bwd)
 
     def _h_pow(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
@@ -1129,7 +1045,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
         return _flops_elementwise(out, coeff=float(coeff), effective_bwd=self._effective_bwd)
 
     def _h_fma(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
-        # fma(a, b, c) ~= a*b + c
         return _flops_elementwise(out, coeff=2.0, effective_bwd=self._effective_bwd)
 
     def _h_mm(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any) -> float:
@@ -1300,7 +1215,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
         )
 
     def _h_custom(self, args: Tuple[Any, ...], kwargs: Dict[str, Any], out: Any, *, name: str) -> float:
-        # Heuristic: attention if any 4D tensor, else GEMM if 2D+2D, else elementwise-ish.
         ts = _first_tensors_from_args(args, max_n=4)
         for t in ts:
             if isinstance(t, torch.Tensor) and t.ndim == 4:
@@ -1314,7 +1228,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
                     training=False,
                     include_softmax_scale_dropout=True,
                 )
-
         if len(ts) >= 2 and ts[0].ndim == 2 and ts[1].ndim == 2:
             a, b = ts[0], ts[1]
             m, k = a.shape
@@ -1322,16 +1235,10 @@ class _OpFlopDispatchMode(TorchDispatchMode):  # type: ignore[misc]
             if int(k) == int(k2):
                 fwd = 2.0 * int(m) * int(n) * int(k)
                 return float(fwd * (1.0 + max(0.0, self._effective_bwd)))
-
         return _flops_elementwise(out, coeff=1.0, effective_bwd=self._effective_bwd)
 
 
-# ==============================================================================
-# FX / Dynamo export estimator (compile-safe, CUDA graphs safe)
-# ==============================================================================
-
 class _ShapeTensor:
-
     def __init__(self, shape: Tuple[int, ...]) -> None:
         self.shape = tuple(int(x) for x in shape)
         self.ndim = len(self.shape)
@@ -1343,31 +1250,13 @@ class _ShapeTensor:
         return int(n)
 
 
-def _is_tensorlike(x: Any) -> bool:
-    return isinstance(x, (torch.Tensor, _ShapeTensor))
-
-
-def _shape_from_meta(meta: Any) -> Optional[Tuple[int, ...]]:
-    try:
-        if meta is None:
-            return None
-        shp = getattr(meta, "shape", None)
-        if shp is None:
-            return None
-        return tuple(int(s) for s in shp)
-    except Exception:
-        return None
-
-
 class _FxGraphFlopEstimator:
-
     def __init__(self, *, include_bias: bool, effective_bwd: float, count_elementwise: bool) -> None:
         self._include_bias = bool(include_bias)
         self._effective_bwd = float(effective_bwd)
         self._count_elementwise = bool(count_elementwise)
         self._aten = torch.ops.aten
 
-        # binary ops
         def _ops_for(base: str) -> List[Any]:
             ops: List[Any] = []
             obj = getattr(self._aten, base, None)
@@ -1395,8 +1284,6 @@ class _FxGraphFlopEstimator:
         self._clamp_max_ops = _ops_for("clamp_max")
         self._where_ops = _ops_for("where")
         self._lerp_ops = _ops_for("lerp")
-
-        # addcmul/addcdiv
         self._addcmul_ops: List[Any] = []
         self._addcdiv_ops: List[Any] = []
         for base, slot in (("addcmul", self._addcmul_ops), ("addcdiv", self._addcdiv_ops)):
@@ -1409,8 +1296,6 @@ class _FxGraphFlopEstimator:
                     f = getattr(pobj, o, None)
                     if f is not None:
                         slot.append(f)
-
-        # unary op table
         self._unary_ops: Dict[Any, Tuple[str, float]] = {}
         unary_coeff = {
             "abs": 1.0,
@@ -1458,8 +1343,6 @@ class _FxGraphFlopEstimator:
                 self._unary_ops[obj.default] = (name, float(coeff))
             if obj_ is not None and hasattr(obj_, "default"):
                 self._unary_ops[obj_.default] = (name, float(coeff))
-
-        # pow ops
         self._pow_ops: List[Any] = []
         for pobj in (getattr(self._aten, "pow", None), getattr(self._aten, "pow_", None)):
             if pobj is None:
@@ -1468,14 +1351,10 @@ class _FxGraphFlopEstimator:
                 f = getattr(pobj, o, None)
                 if f is not None:
                     self._pow_ops.append(f)
-
-        # fma ops
         self._fma_ops: List[Any] = []
         fma_obj = getattr(self._aten, "fma", None)
         if fma_obj is not None and hasattr(fma_obj, "default"):
             self._fma_ops.append(fma_obj.default)
-
-        # SDPA variants
         self._sdpa_like_ops: List[Any] = []
         for name in (
             "scaled_dot_product_attention",
@@ -1514,25 +1393,21 @@ class _FxGraphFlopEstimator:
                 except Exception:
                     return None
             return None
-
+            
         total = 0.0
         by: Dict[str, float] = {}
-
         for node in gm.graph.nodes:
             if node.op != "call_function":
                 continue
-
             target = node.target
             args = resolve(node.args)
             kwargs = resolve(node.kwargs or {})
             out = resolve_node(node)
-
             flops, typ = self._estimate_call(target, args, kwargs, out)
             if flops <= 0.0:
                 continue
             total += float(flops)
             by[typ] = by.get(typ, 0.0) + float(flops)
-
         return float(total), by
 
     def _as_tensor(self, out: Any) -> Any:
@@ -1601,7 +1476,6 @@ class _FxGraphFlopEstimator:
                 return self._softmax(args, out), "Softmax"
             if target in self._sdpa_like_ops:
                 return self._sdpa_like(args, kwargs), "Attention"
-
             if self._count_elementwise and target in self._unary_ops:
                 name, coeff = self._unary_ops[target]
                 return (self._eltwise(out, float(coeff)), f"Elementwise.{name}")
@@ -1644,11 +1518,9 @@ class _FxGraphFlopEstimator:
                 return (self._eltwise(out, 3.0), "Elementwise.addcdiv")
         except Exception:
             return (0.0, "Unknown")
-
         name = str(target).lower()
         if ("triton" in name) or ("flex" in name) or ("transformer_engine" in name) or ("xformers" in name):
             return (self._custom(args, out, name=name), "Custom")
-
         return (0.0, "Other")
 
     def _mm(self, args: Any) -> float:
@@ -1782,7 +1654,6 @@ class _FxGraphFlopEstimator:
         return _flops_softmax(x, self._as_tensor(out), dim=dim, effective_bwd=self._effective_bwd)
 
     def _sdpa_like(self, args: Any, kwargs: Dict[str, Any]) -> float:
-        # first 3 args usually q,k,v
         q = args[0] if isinstance(args, (tuple, list)) and len(args) >= 1 else None
         k = args[1] if isinstance(args, (tuple, list)) and len(args) >= 2 else None
         v = args[2] if isinstance(args, (tuple, list)) and len(args) >= 3 else None
@@ -1790,7 +1661,6 @@ class _FxGraphFlopEstimator:
             return 0.0
         dropout_p = float(kwargs.get("dropout_p", 0.0))
         training = True if dropout_p > 0.0 else False
-
         if isinstance(q, _ShapeTensor):
             b, h, s, d = _infer_bhsd_shape(q.shape)
             klen = s
@@ -1807,7 +1677,6 @@ class _FxGraphFlopEstimator:
                 training=training,
                 include_softmax_scale_dropout=True,
             )
-
         q_t = _to_real_tensor(q)
         k_t = _to_real_tensor(k) if _is_tensorlike(k) else None
         v_t = _to_real_tensor(v) if _is_tensorlike(v) else None
@@ -1820,7 +1689,6 @@ class _FxGraphFlopEstimator:
         )
 
     def _custom(self, args: Any, out: Any, *, name: str) -> float:
-        # attention if any 4D tensorlike, else GEMM if 2D+2D, else elementwise
         if isinstance(args, (tuple, list)):
             ts = [a for a in args if _is_tensorlike(a)]
         else:
@@ -1856,7 +1724,6 @@ class _FxGraphFlopEstimator:
                         training=False,
                         include_softmax_scale_dropout=True,
                     )
-
         if len(ts) >= 2 and int(getattr(ts[0], "ndim", 0)) == 2 and int(getattr(ts[1], "ndim", 0)) == 2:
             a, b = ts[0], ts[1]
             m, k = a.shape
@@ -1864,24 +1731,9 @@ class _FxGraphFlopEstimator:
             if int(k) == int(k2):
                 fwd = 2.0 * int(m) * int(n) * int(k)
                 return float(fwd * (1.0 + max(0.0, self._effective_bwd)))
-
         return self._eltwise(out, 1.0)
 
-
-def _to_real_tensor(x: Any) -> torch.Tensor:
-    if isinstance(x, torch.Tensor):
-        return x
-    if isinstance(x, _ShapeTensor):
-        # allocate smallest placeholder; only used for non-attention ops where shape doesn't matter much
-        return torch.empty((1, 1), device="cpu")
-    return torch.empty((1, 1), device="cpu")
-
-
-# ==============================================================================
-# Profiler core (nested-safe accumulator)
-# ==============================================================================
-
-@dataclass
+    
 class _Acc:
     total: float = 0.0
     by_type: Dict[str, float] = field(default_factory=dict)
@@ -1949,8 +1801,6 @@ class _FlopProfiler:
         for acc in stack:
             acc.total += fv
             acc.by_type[typ] = acc.by_type.get(typ, 0.0) + fv
-
-    # ---- NVTX getter (optional)
 
     def coerce_flops_nvtx(self) -> None:
         if self._nvtx_getter is not None:
@@ -2028,14 +1878,11 @@ class _FlopProfiler:
     def new_flops_ntvx(self, device: Optional[torch.device] = None) -> Any:
         return self.new_flops_nvtx(device)
 
-    # ---- torch.profiler capture (optional)
-
     def _capture_torch(self, display: bool = False) -> Any:
         try:
             from torch.profiler import profile as _profile
         except Exception:
             _profile = None
-
         if _profile is not None:
 
             class _TorchFlops(contextlib.AbstractContextManager[Any]):
@@ -2109,19 +1956,13 @@ class _FlopProfiler:
 
         return _TorchFlopsCompat(bool(display))
 
-    # ---- hook management
-
     def start_hooks(self, model: nn.Module, *, cfg: _HookConfig) -> List[Any]:
         handles: List[Any] = []
         skip: set[int] = set()
-
-        # Avoid double-counting under TE fused modules by skipping their children.
         for module in model.modules():
             if id(module) in skip:
                 continue
-
             hook = None
-
             if _is_te_module(module):
                 try:
                     children = list(module.modules())[1:]
@@ -2146,10 +1987,8 @@ class _FlopProfiler:
                 hook = module.register_forward_hook(partial(_register_activation, profiler=self, cfg=cfg))
             elif isinstance(module, nn.MultiheadAttention):
                 hook = module.register_forward_hook(partial(_register_mha, profiler=self, cfg=cfg))
-
             if hook is not None:
                 handles.append(hook)
-
         return handles
 
     def stop_hooks(self, handles: Sequence[Any]) -> None:
@@ -2158,8 +1997,6 @@ class _FlopProfiler:
                 h.remove()
             except Exception:
                 pass
-
-    # ---- monitoring context
 
     def monitoring(
         self,
@@ -2179,7 +2016,6 @@ class _FlopProfiler:
                 self.torch_total = 0.0
                 self.nvtx_total = 0.0
                 self.total = 0.0
-
                 self._torch_scope: Any = None
                 self._nvtx_scope: Any = None
                 self._dispatch_scope: Any = None
@@ -2189,7 +2025,6 @@ class _FlopProfiler:
                 self._outer_active = profiler.is_active()
                 profiler.activate()
                 profiler.reset()
-
                 if not self._outer_active:
                     if dispatch_mode is not None:
                         self._dispatch_scope = dispatch_mode
@@ -2197,24 +2032,20 @@ class _FlopProfiler:
                             self._dispatch_scope.__enter__()
                         except Exception:
                             self._dispatch_scope = None
-
                     if use_torch_profiler:
                         self._torch_scope = profiler._capture_torch(display)
                         if self._torch_scope is not None:
                             self._torch_scope.__enter__()
-
                     if use_nvtx:
                         self._nvtx_scope = profiler.new_flops_nvtx(device)
                         if self._nvtx_scope is not None:
                             self._nvtx_scope.__enter__()
-
                 return self
 
             def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
                 manual, breakdown = profiler.pop()
                 self.manual_total = float(manual)
                 self.manual_breakdown = breakdown
-
                 if not self._outer_active:
                     if self._nvtx_scope is not None:
                         self._nvtx_scope.__exit__(exc_type, exc, tb)
@@ -2222,21 +2053,17 @@ class _FlopProfiler:
                             self.nvtx_total = float(self._nvtx_scope.get_total_flops())
                         except Exception:
                             self.nvtx_total = 0.0
-
                     if self._torch_scope is not None:
                         self._torch_scope.__exit__(exc_type, exc, tb)
                         try:
                             self.torch_total = float(self._torch_scope.get_total_flops())
                         except Exception:
                             self.torch_total = 0.0
-
                     if self._dispatch_scope is not None:
                         try:
                             self._dispatch_scope.__exit__(exc_type, exc, tb)
                         except Exception:
                             pass
-
-                # Union-ish total:
                 base = float(max(self.torch_total, self.nvtx_total))
                 manual_total = float(self.manual_total)
                 self.total = float(max(base, manual_total, 0.0))
@@ -2279,8 +2106,6 @@ class _FlopProfiler:
 
         return _Flops()
 
-    # ---- Attention helper for legacy capture(q)
-
     def capture(
         self,
         q: torch.Tensor,
@@ -2308,14 +2133,7 @@ class _FlopProfiler:
             self.add("Attention", total)
         return float(total)
 
-
-FLOP_PROFILER = _FlopProfiler()
-
-
-# ==============================================================================
-# User-facing API
-# ==============================================================================
-
+    
 class _StaticFlops(contextlib.AbstractContextManager[Any]):
     def __init__(self, total: float, breakdown: Dict[str, float]) -> None:
         self.manual_total = float(total)
@@ -2351,7 +2169,6 @@ class _StaticFlops(contextlib.AbstractContextManager[Any]):
 
 
 class _HybridFlops(contextlib.AbstractContextManager[Any]):
-
     def __init__(
         self,
         inner: Any,
@@ -2366,7 +2183,6 @@ class _HybridFlops(contextlib.AbstractContextManager[Any]):
         self._static_breakdown = dict(static_breakdown)
         self._cache_slot = cache_slot
         self._cache_key = cache_key
-
         self.manual_total = 0.0
         self.manual_breakdown: Dict[str, float] = {}
         self.torch_total = 0.0
@@ -2379,21 +2195,17 @@ class _HybridFlops(contextlib.AbstractContextManager[Any]):
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
         self._inner.__exit__(exc_type, exc, tb)
-
         self.manual_total = float(getattr(self._inner, "manual_total", 0.0))
         self.manual_breakdown = dict(getattr(self._inner, "manual_breakdown", {}) or {})
         self.torch_total = float(getattr(self._inner, "torch_total", 0.0))
         self.nvtx_total = float(getattr(self._inner, "nvtx_total", 0.0))
         self.total = float(getattr(self._inner, "total", 0.0))
-
         if self.total > 0.0 and self._cache_slot is not None and self._cache_key is not None:
             self._cache_slot[self._cache_key] = (float(self.total), dict(self.manual_breakdown))
-
         if self.total <= 0.0 and self._static_total > 0.0:
             self.manual_total = float(self._static_total)
             self.manual_breakdown = dict(self._static_breakdown)
             self.total = float(self._static_total)
-
         return False
 
     def get_total_flops(self) -> float:
@@ -2417,9 +2229,8 @@ class _HybridFlops(contextlib.AbstractContextManager[Any]):
         except Exception:
             return _StaticFlops(self.total, self.manual_breakdown).verbose(top_k=top_k)
 
-
+    
 class FlopCounter:
-
     def __init__(
         self,
         model: nn.Module,
@@ -2428,7 +2239,7 @@ class FlopCounter:
         device: Optional[torch.device] = None,
         include_bias: bool = True,
         bwd_factor: Optional[float] = None,
-        backend: str = "auto",  # auto|hooks|dispatch|dynamo|torch
+        backend: str = "auto",
         estimate_bwd: bool = True,
         count_activations: bool = True,
         count_norms: bool = True,
@@ -2445,7 +2256,6 @@ class FlopCounter:
         self._bwd_factor = bwd_factor
         self._backend = str(backend)
         self._estimate_bwd = bool(estimate_bwd)
-
         self._count_activations = bool(count_activations)
         self._count_norms = bool(count_norms)
         self._count_softmax = bool(count_softmax)
@@ -2453,14 +2263,11 @@ class FlopCounter:
         self._count_embedding = bool(count_embedding)
         self._count_elementwise = bool(count_elementwise)
         self._static_fallback_on_zero = bool(static_fallback_on_zero)
-
         self._handles: List[Any] = []
         self._hook_count = 0
         self._active = False
-
         self._static_cache: Dict[Any, Tuple[float, Dict[str, float]]] = {}
         self._runtime_cache: Dict[Any, Tuple[float, Dict[str, float]]] = {}
-
         self._fx_estimator: Optional[_FxGraphFlopEstimator] = None
         self._effective_backend = self._backend.lower()
 
@@ -2505,19 +2312,16 @@ class FlopCounter:
             count_dropout=self._count_dropout,
             count_embedding=self._count_embedding,
         )
-
         backend = self._backend.lower()
         if backend == "auto":
             backend = "dynamo" if self._is_compiled() else ("dispatch" if TorchDispatchMode is not None else "hooks")
         self._effective_backend = backend
-
         if backend == "hooks":
             self._handles = FLOP_PROFILER.start_hooks(self._model, cfg=cfg)
             self._hook_count = len(self._handles)
         else:
             self._handles = []
             self._hook_count = 0
-
         self._active = True
         return self
 
@@ -2538,30 +2342,25 @@ class FlopCounter:
             if isinstance(x, dict):
                 return tuple(sorted((kk, k_of(vv)) for kk, vv in x.items()))
             return ("O", type(x).__name__, repr(x)[:64])
-
         return (tuple(k_of(a) for a in args), k_of(kwargs))
 
     def prepare(self, *example_args: Any, **example_kwargs: Any) -> Tuple[float, Dict[str, float]]:
         key = self._sig_key(example_args, example_kwargs)
         if key in self._static_cache:
             return self._static_cache[key]
-
         eff_bwd = self._effective_bwd()
         self._fx_estimator = _FxGraphFlopEstimator(
             include_bias=self._include_bias,
             effective_bwd=eff_bwd,
             count_elementwise=self._count_elementwise,
         )
-
         gm = _export_fx(self._orig_model(), example_args, example_kwargs)
         if gm is None:
             res = (0.0, {})
             self._static_cache[key] = res
             return res
-
         _shape_propagate(gm, example_args, example_kwargs)
         total, breakdown = self._fx_estimator.estimate(gm)
-
         res = (float(total), dict(breakdown))
         self._static_cache[key] = res
         return res
@@ -2575,25 +2374,19 @@ class FlopCounter:
     ) -> Any:
         if not self._active:
             raise RuntimeError("FlopCounter is not active. Use `with FlopCounter(...)` before measuring FLOPs.")
-
         backend = self._effective_backend.lower()
         eff_bwd = self._effective_bwd()
-
         ex_args = example_args or ()
         ex_kwargs = example_kwargs or {}
         key = self._sig_key(ex_args, ex_kwargs) if (example_args is not None or example_kwargs is not None) else None
-
         cached_total = 0.0
         cached_breakdown: Dict[str, float] = {}
         if key is not None and key in self._runtime_cache:
             cached_total, cached_breakdown = self._runtime_cache[key]
-
         static_total = 0.0
         static_breakdown: Dict[str, float] = {}
-
         if key is not None and (cached_total <= 0.0) and (backend in ("dynamo", "hooks", "dispatch")):
             static_total, static_breakdown = self.prepare(*ex_args, **ex_kwargs)
-
         match backend:
             case "dynamo":
                 if key is not None and static_total > 0.0:
@@ -2605,7 +2398,6 @@ class FlopCounter:
                     use_nvtx=True,
                     dispatch_mode=None,
                 )
-
             case "dispatch":
                 if TorchDispatchMode is None:
                     inner = FLOP_PROFILER.monitoring(
@@ -2629,7 +2421,6 @@ class FlopCounter:
                         use_nvtx=True,
                         dispatch_mode=dispatch,
                     )
-
                 if self._static_fallback_on_zero and key is not None and (static_total > 0.0 or cached_total > 0.0):
                     fallback_total = float(cached_total) if cached_total > 0.0 else float(static_total)
                     fallback_breakdown = dict(cached_breakdown) if cached_total > 0.0 else dict(static_breakdown)
@@ -2640,9 +2431,7 @@ class FlopCounter:
                         cache_slot=self._runtime_cache,
                         cache_key=key,
                     )
-
                 return inner
-
             case "hooks":
                 inner = FLOP_PROFILER.monitoring(
                     self._device,
@@ -2662,9 +2451,7 @@ class FlopCounter:
                         cache_key=key,
                     )
                 return inner
-
             case _:
-                # backend == "torch" or unknown
                 return FLOP_PROFILER.monitoring(
                     self._device,
                     display=display,
@@ -2674,41 +2461,4 @@ class FlopCounter:
                 )
 
 
-def _export_fx(model: nn.Module, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[torch.fx.GraphModule]:
-    try:
-        import torch._dynamo as dynamo
-        exported = dynamo.export(model, aten_graph=True)
-        res = exported(*args, **kwargs)
-        return res.graph_module
-    except Exception as exc:
-        _LOGGER.debug("dynamo.export failed: %s", exc)
-        return None
-
-
-def _shape_propagate(gm: torch.fx.GraphModule, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> None:
-    try:
-        from torch.fx.passes.shape_prop import ShapeProp
-        ShapeProp(gm).propagate(*args, **kwargs)
-    except Exception as exc:
-        _LOGGER.debug("ShapeProp failed: %s", exc)
-
-
-# ==============================================================================
-# Functional helpers (backward-compatible)
-# ==============================================================================
-
-def capture(
-    q: torch.Tensor,
-    *,
-    bwd_factor: float = 1.0,
-    dropout_p: float = 0.0,
-    training: bool = False,
-    include_softmax_scale_dropout: bool = True,
-) -> float:
-    return FLOP_PROFILER.capture(
-        q,
-        bwd_factor=bwd_factor,
-        dropout_p=dropout_p,
-        training=training,
-        include_softmax_scale_dropout=include_softmax_scale_dropout,
-    )
+FLOP_PROFILER = _FlopProfiler()
