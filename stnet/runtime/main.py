@@ -112,9 +112,9 @@ from ..data.pipeline import Dataset
 from ..nn.architecture import Model
 from ..nn.primitives import Recorder, resize_scaler_buffer
 
-# -----------------------------------------------------------------------------
-# Typing helpers
-# -----------------------------------------------------------------------------
+
+
+
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 
 JsonPrimitive: TypeAlias = str | int | float | bool | None
@@ -137,7 +137,7 @@ _SAMPLER_SCALE_LOG_LAST_S = {}
 _OOM_RETRY_LOCK = threading.Lock()
 _OOM_RETRY_COUNT = {}
 
-# Reusable timing events (avoid per-step allocations when timing is enabled).
+
 _TIMING_EVENT_TLS = threading.local()
 _TIMING_EVENTS_UNSUPPORTED = object()
 
@@ -243,7 +243,7 @@ def _ensure_torch_compile_safe() -> None:
     global _COMPILE_SAFE_DONE
     if _COMPILE_SAFE_DONE:
         return
-    # In no-GIL builds, make this idempotent under concurrency.
+
     with _COMPILE_SAFE_LOCK:
         if _COMPILE_SAFE_DONE:
             return
@@ -346,7 +346,7 @@ def _rt_maybe_torch_profiler(
         with contextlib.suppress(Exception):
             activities.append(getattr(_tp.ProfilerActivity, "XPU"))
     elif device.type == "mps":
-        # Some PyTorch builds expose an explicit MPS activity; use it when available.
+
         with contextlib.suppress(Exception):
             mps_act = getattr(_tp.ProfilerActivity, "MPS", None)
             if mps_act is not None:
@@ -528,7 +528,7 @@ def _oom_backoff_sleep_s(oom_try: int, phase: str | None = None) -> float:
         max_ms = 50.0
     if max_ms < 0.0:
         max_ms = 0.0
-    # Start backing off from the 2nd failure (first failure usually benefits more from cache clear).
+
     p = max(0, int(oom_try) - 2)
     try:
         sleep_ms = min(float(max_ms), float(base_ms) * (2.0 ** float(p)))
@@ -620,7 +620,7 @@ def _handle_oom_recovery(
             return ("skip", grad_accum_steps)
         return ("raise", grad_accum_steps)
 
-    # Scale down sampler on OOM (best-effort).
+
     try:
         scale_ctl = _find_sampler_scale_ctl(loader)
         if scale_ctl is not None:
@@ -643,7 +643,7 @@ def _handle_oom_recovery(
     except Exception:
         pass
 
-    # Cache clear (rate-limited by empty_device_cache)
+
     with contextlib.suppress(Exception):
         ec_min = (
             0.0 if oom_try <= 1 else _rt_env_float("STNET_OOM_EMPTY_CACHE_MIN_INTERVAL_S", 0.05)
@@ -1484,20 +1484,20 @@ def _stage_tensor_with_cpu_pool(
     if pinned_ok is None:
         pinned_ok = bool(_pinned_h2d_supported_for_device_type(dev_type))
 
-    # Already not on CPU: no staging, but keep dtype consistent if possible.
+
     if tensor.device.type != "cpu":
         if tensor.dtype != dtype:
             with contextlib.suppress(Exception):
                 tensor = tensor.to(dtype=dtype, copy=False)
         return tensor, None, False
 
-    # Fast path: already pinned + dtype matches.
+
     with contextlib.suppress(Exception):
         is_pinned = getattr(tensor, "is_pinned", None)
         if callable(is_pinned) and bool(is_pinned()) and tensor.dtype == dtype:
             return tensor, None, True
 
-    # Preferred: stage into bounded pinned pool.
+
     if cpu_pool is not None and bool(pinned_ok):
         buf, token = cpu_pool.get(tuple(tensor.shape), dtype, return_handle=True)
         buf.copy_(tensor, non_blocking=False)
@@ -1508,7 +1508,7 @@ def _stage_tensor_with_cpu_pool(
                 pinned = bool(is_pinned())
         return buf, token, pinned
 
-    # Fallback: cast (if needed) without pinning.
+
     out = tensor
     if out.dtype != dtype:
         out = out.to(dtype=dtype, copy=False)
@@ -1551,8 +1551,8 @@ def _to_device_with_stream_and_pool(
             if callable(is_pinned):
                 pinned = bool(is_pinned())
 
-    # Not on CPU (or no async backend): standard move. If a pool token was provided,
-    # release it immediately (best-effort) to avoid leaks.
+
+
     if tensor.device.type != "cpu" or (not bool(non_blocking_ok)):
         out = tensor.to(device, non_blocking=bool(non_blocking_ok))
         if handle is not None and cpu_pool is not None:
@@ -1560,8 +1560,8 @@ def _to_device_with_stream_and_pool(
                 cpu_pool.release(handle)
         return out
 
-    # No pool handle: we can still take advantage of pinned memory for async copies,
-    # but there is no pool page to release.
+
+
     if handle is None:
         return tensor.to(device, non_blocking=bool(non_blocking_ok and pinned and pinned_ok))
 
@@ -1576,8 +1576,8 @@ def _to_device_with_stream_and_pool(
             pinned and pinned_ok and callable(stream_fn) and (Event is not None)
         )
 
-    # If we cannot safely delay pool release (overflow/unpinned, or no Event/stream support),
-    # fall back to a synchronous copy and release immediately.
+
+
     if (not bool(pinned)) or (not bool(can_stream_release)):
         out = tensor.to(device, non_blocking=False)
         if cpu_pool is not None:
@@ -1585,7 +1585,7 @@ def _to_device_with_stream_and_pool(
                 cpu_pool.release(handle)
         return out
 
-    # Pinned + backend stream support: async H2D and release pool page after stream completes.
+
     stream = None
     if callable(stream_fn):
         with contextlib.suppress(Exception):
@@ -1613,7 +1613,7 @@ def _to_device_with_stream_and_pool(
         if cpu_pool is not None:
             try:
                 evt = None
-                # Prefer per-page reusable events when available.
+
                 fe = getattr(cpu_pool, "fence_event", None)
                 if callable(fe) and fence_event_factory is not None:
                     with contextlib.suppress(Exception):
@@ -1636,7 +1636,7 @@ def _to_device_with_stream_and_pool(
                         evt.record()
                     cpu_pool.release_after(handle, evt)
                 else:
-                    # No usable event -> synchronize and release synchronously.
+
                     with contextlib.suppress(Exception):
                         _accel_synchronize(device)
                     with contextlib.suppress(Exception):
@@ -1677,8 +1677,8 @@ def _preprocess_pin_h2d(
     else:
         Y_src = label if torch.is_tensor(label) else to_torch_tensor(label)
 
-    # Stage (optionally cast+pin) and then H2D. If we acquired any pool tokens but fail
-    # before scheduling a release fence, ensure we release them synchronously.
+
+
     x_tok: Pool.Token | None = None
     y_tok: Pool.Token | None = None
 
@@ -1705,7 +1705,7 @@ def _preprocess_pin_h2d(
             return X_dev, Y_dev
 
         if use_timer:
-            # Prefer device Event timing when supported (CUDA/XPU), fall back to wall-clock.
+
             pair = _get_thread_timing_events(device, slot="h2d")
             if pair is not None:
                 try:
@@ -1740,7 +1740,7 @@ def _preprocess_pin_h2d(
         return (X_dev, Y_dev, t_ready, h2d_s)
 
     finally:
-        # Only tokens that were not consumed by to_device() remain non-None.
+
         if x_tok is not None and cpu_pool is not None:
             with contextlib.suppress(Exception):
                 cpu_pool.release(x_tok)
@@ -1796,7 +1796,7 @@ def _maybe_autotune_p_gate_fallback_k(
         return
     warmup = int(getattr(target_module, "p_gate_auto_k_warmup", 0) or 0)
     if int(step) < int(warmup):
-        # Still consume+reset occasionally to prevent unbounded accumulation.
+
         if int(step) % max(1, int(interval)) == 0:
             with contextlib.suppress(Exception):
                 gate.consume_fallback_stats()
@@ -1804,7 +1804,7 @@ def _maybe_autotune_p_gate_fallback_k(
     if int(step) % int(interval) != 0:
         return
 
-    # Persist the step counter for checkpoint/resume (cheap device-side fill).
+
     step_buf = getattr(target_module, "p_gate_auto_k_step_buf", None)
     if isinstance(step_buf, torch.Tensor):
         with contextlib.suppress(Exception):
@@ -1828,7 +1828,7 @@ def _maybe_autotune_p_gate_fallback_k(
     edge_low_rate = float((stats[4] / stats[0]).item())
     edge_high_rate = float((stats[5] / stats[0]).item())
 
-    # Update per-side EMA.
+
     alpha = float(getattr(target_module, "p_gate_auto_k_ema_alpha", 0.1))
     alpha = max(0.0, min(1.0, alpha))
 
@@ -1848,14 +1848,14 @@ def _maybe_autotune_p_gate_fallback_k(
         with contextlib.suppress(Exception):
             ema_high_buf.fill_(float(ema_high_new))
 
-    # Keep an overall EMA for backwards-compatible logging/tooling.
+
     ema_overall = 0.5 * (float(ema_low_new) + float(ema_high_new))
     ema_buf = getattr(target_module, "p_gate_auto_k_ema_buf", None)
     if isinstance(ema_buf, torch.Tensor):
         with contextlib.suppress(Exception):
             ema_buf.fill_(float(ema_overall))
 
-    # Optional edge-based EMA (boundary hugging).
+
     edge_enabled = bool(getattr(target_module, "p_gate_auto_k_edge_enabled", False))
     edge_alpha = float(getattr(target_module, "p_gate_auto_k_edge_ema_alpha", alpha))
     edge_alpha = max(0.0, min(1.0, edge_alpha))
@@ -1883,14 +1883,14 @@ def _maybe_autotune_p_gate_fallback_k(
         with contextlib.suppress(Exception):
             edge_ema_buf.fill_(float(0.5 * (edge_ema_low_new + edge_ema_high_new)))
 
-    # Fallback-k buffers (prefer per-side when present).
+
     k_low_buf = getattr(target_module, "p_gate_fallback_k_low_buf", None)
     k_high_buf = getattr(target_module, "p_gate_fallback_k_high_buf", None)
     k_legacy_buf = getattr(target_module, "p_gate_fallback_k_buf", None)
 
     use_legacy = not (isinstance(k_low_buf, torch.Tensor) and isinstance(k_high_buf, torch.Tensor))
     if use_legacy:
-        # Backwards compatibility: treat a single k as symmetric.
+
         if not isinstance(k_legacy_buf, torch.Tensor):
             return
         k_low_buf = k_legacy_buf
@@ -1925,9 +1925,9 @@ def _maybe_autotune_p_gate_fallback_k(
     if k_max < k_min:
         k_max = k_min
 
-    # One-sided by default (grow fast, shrink slowly). Both directions are supported.
-    # Additionally, when constraint activation is within the target band but p frequently hugs
-    # dynamic endpoints, shrink bounds (reduce k) to prevent pathological always/never gating.
+
+
+
 
     edge_low_eff = (
         float(edge_ema_low_new) if math.isfinite(edge_ema_low_new) else float(edge_low_rate)
@@ -1977,12 +1977,12 @@ def _maybe_autotune_p_gate_fallback_k(
             if isinstance(k_high_buf, torch.Tensor):
                 k_high_buf.fill_(float(k_high_new))
 
-        # Keep legacy average buffer in sync when present (even if unused).
+
         if isinstance(k_legacy_buf, torch.Tensor) and not use_legacy:
             with contextlib.suppress(Exception):
                 k_legacy_buf.fill_(float(0.5 * (k_low_new + k_high_new)))
 
-        # Keep the boolean fallback flag consistent (used in forward without .item()).
+
         with contextlib.suppress(Exception):
             setattr(
                 target_module, "p_gate_fallback_enabled", bool(k_low_new > 0.0 and k_high_new > 0.0)
@@ -1993,7 +1993,7 @@ def _maybe_autotune_p_gate_fallback_k(
             with contextlib.suppress(Exception):
                 upd_buf.add_(1)
 
-    # Logging (rank0 only).
+
     log_interval = int(getattr(target_module, "p_gate_auto_k_log_interval", 0) or 0)
     log_due = bool(k_changed) if log_interval <= 0 else bool(int(step) % int(log_interval) == 0)
     if int(local_rank) == 0 and log_due:
@@ -2343,8 +2343,8 @@ def epochs(
     mem_util_ema = None
     util_alpha = 0.2
     global_step = 0
-    # Separate from per-epoch global_step: persists across epochs so p-gate
-    # fallback_k auto-tuning does not reset every epoch.
+
+
     p_gate_auto_step_total = 0
     with contextlib.suppress(Exception):
         target_for_autok = model.module if hasattr(model, "module") else model
@@ -2484,7 +2484,7 @@ def epochs(
         y_max = None
         y_q_low = None
         y_q_high = None
-        # Optional quantile bounds for y (used by p_gate when enabled).
+
         want_y_quantiles = bool(getattr(model_for_scaler, "p_gate_bounds_use_quantile", False))
         q_low = float(getattr(model_for_scaler, "p_gate_bounds_q_low", 0.005))
         q_high = float(getattr(model_for_scaler, "p_gate_bounds_q_high", 0.995))
@@ -2575,7 +2575,7 @@ def epochs(
                             torch.amax(yf, dim=0, out=sy_max_tmp)
                             torch.maximum(y_max, sy_max_tmp, out=y_max)
                         if want_y_quantiles and q_max > 0:
-                            # Keep an approximately-uniform sample of rows for per-dim quantile estimation.
+
                             y_take = yf
                             if int(y_take.shape[0]) > int(q_max):
                                 idx = torch.randperm(int(y_take.shape[0]), device=y_take.device)[
@@ -2614,10 +2614,10 @@ def epochs(
                     torch.distributed.all_reduce(y_min, op=torch.distributed.ReduceOp.MIN)
                 if y_max is not None:
                     torch.distributed.all_reduce(y_max, op=torch.distributed.ReduceOp.MAX)
-        # Compute y quantile bounds (per-dimension) if requested and not available from memmap stats.
+
         if want_y_quantiles and (y_q_low is None or y_q_high is None):
-            # If we didn't collect samples yet (e.g., memmap scaler stats were used),
-            # do a lightweight pass over train_loader to sample y rows.
+
+
             if y_q_samples is None:
                 for batch in train_loader:
                     _, labs = extract_xy(batch, labels_required=True)
@@ -2646,7 +2646,7 @@ def epochs(
             if y_q_samples is not None and int(y_q_samples.shape[0]) > 0:
                 y_all = y_q_samples
                 if is_distributed():
-                    # All-gather variable number of samples across ranks (pad to max first-dim).
+
                     world = int(torch.distributed.get_world_size())
                     n_local = torch.tensor(
                         [int(y_all.shape[0])], device=y_all.device, dtype=torch.int64
@@ -2674,7 +2674,7 @@ def epochs(
                         if len(parts) > 0:
                             y_all = torch.cat(parts, dim=0)
 
-                # Per-dim quantiles in original y scale.
+
                 try:
                     y_q_low = torch.quantile(y_all, float(q_low), dim=0)
                     y_q_high = torch.quantile(y_all, float(q_high), dim=0)
@@ -2977,7 +2977,7 @@ def epochs(
                                                 )
                             if should_sync:
                                 global_step += 1
-                                # p-gate fallback_k auto-tuning (SMA+EMA of fallback-bound tightness).
+
                                 p_gate_auto_step_total += 1
                                 with contextlib.suppress(Exception):
                                     target_for_autok = (
@@ -3628,7 +3628,7 @@ def infer(
         ),
     )
     dev_type = str(getattr(device, "type", "cpu"))
-    # Async writer is typically fine on CPU too; allow opt-out via env.
+
     use_async_write = bool(_rt_env_flag("STNET_PRED_ASYNC_WRITE", True))
     use_mmt_pred_parts = bool(_rt_env_flag("STNET_PRED_MMT_PARTS", dev_type != "cpu"))
     if not use_async_write:
@@ -4093,14 +4093,14 @@ def process(*args: Any, **kwargs: Any) -> object:
     ignored_sentences = [
         "torch.distributed is disabled, unavailable or uninitialized",
         "TypedStorage is deprecated",
-        # Flop counter / Triton noise (CPU or non-Triton environments)
+
         "triton not found; flop counting will not work",
-        # DTensor / distributed broadcast noise (CPU or single-rank runs)
+
         "Found a non-scalar tensor with numel=1 and ndim!=0",
         "distributed_broadcast: coalesced broadcast failed",
         "distributed_broadcast: per-tensor broadcast failed",
         "found no DeviceMesh from dtensor args",
-        # CPU AMP / fused-kernel informational notices
+
         "mixed precision.*may be unavailable",
     ]
     for msg in ignored_sentences:
@@ -4297,7 +4297,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         )
         _initialize_adamw(optimizer)
         if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-            # init_ckpt_dir is primarily a *model* initializer. Optimizer state may be absent.
+
             optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
             try:
                 with _filtered_warnings():
