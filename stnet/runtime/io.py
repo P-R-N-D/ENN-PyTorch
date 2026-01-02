@@ -436,7 +436,9 @@ class _OnnxLayer:
         supports_dynamo = "dynamo" in params
         base_kwargs = {k: v for k, v in common_kwargs.items() if k in params}
         if supports_dynamo:
-            base_kwargs_dynamo = {k: v for k, v in base_kwargs.items() if k != "dynamic_axes"}
+            base_kwargs_dynamo = dict(base_kwargs)
+            if "dynamic_shapes" in params:
+                base_kwargs_dynamo.pop("dynamic_axes", None)
             base_kwargs_dynamo.pop("dynamic_shapes", None)
             dyn_shapes = None
             if (
