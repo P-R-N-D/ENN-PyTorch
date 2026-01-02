@@ -38,13 +38,6 @@ from torch.distributed.checkpoint.state_dict import (
     set_model_state_dict,
     set_optimizer_state_dict,
 )
-try:
-    from torch.distributed._composable.fsdp import MixedPrecisionPolicy  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from torch.distributed.fsdp import MixedPrecisionPolicy  # type: ignore
-    except Exception:  # pragma: no cover
-        MixedPrecisionPolicy = None  # type: ignore[assignment]
 
 from ..config import RuntimeConfig, coerce_model_config
 from ..core.system import (
@@ -127,6 +120,14 @@ try:
     import psutil
 except Exception:
     psutil = None
+
+try:
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy
+except Exception:
+    try:
+        from torch.distributed.fsdp import MixedPrecisionPolicy
+    except Exception:
+        MixedPrecisionPolicy = None
 
 
 PathLike: TypeAlias = str | os.PathLike[str] | Path
