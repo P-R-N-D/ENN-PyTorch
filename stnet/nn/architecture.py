@@ -246,7 +246,39 @@ class SpatialExtractor(nn.Module):
         shift = bool(self.shift_order)
         bits = int(self.morton_bits)
         shared_template = (B <= 1) or (coords.stride(0) == 0)
-        if shared_template:
+        can_use_pointer_cache = (not _is_export_or_trace()) and (not is_meta_or_fake_tensor(coords))
+
+        if shared_template and (not can_use_pointer_cache):
+            coords_one = coords[:1].contiguous()
+            perm0, inv0 = _serialize_z_index(
+                coords_one,
+                bits=bits,
+                patch=patch,
+                shift_order=shift,
+                block_index=0,
+            )
+            perm0 = perm0[0].to(dtype=torch.int64)
+            inv0 = inv0[0].to(dtype=torch.int64)
+            shift_amt = 0
+            if shift:
+                shift_amt = (patch // 2) % max(int(N), 1)
+            perm1 = perm0
+            inv1 = inv0
+            if shift_amt:
+                perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=0)
+                inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
+            perms: List[torch.Tensor] = []
+            invperms: List[torch.Tensor] = []
+            for i in range(depth):
+                if shift and shift_amt and (i % 2 == 1):
+                    perms.append(perm1)
+                    invperms.append(inv1)
+                else:
+                    perms.append(perm0)
+                    invperms.append(inv0)
+            return torch.stack(perms, dim=0), torch.stack(invperms, dim=0)
+
+        if shared_template and can_use_pointer_cache:
             coords_ptr = int(coords.data_ptr()) if coords.numel() else 0
             coords_ver = int(getattr(coords, "_version", 0))
             meta = (
