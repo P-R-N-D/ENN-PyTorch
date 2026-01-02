@@ -9,6 +9,7 @@ import os
 import random
 import threading
 import time
+from itertools import chain
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import (
@@ -23,7 +24,8 @@ from typing import (
     Sequence,
     Tuple,
     TypeVar,
-    Union
+    Union,
+    cast,
 )
 
 import torch
@@ -743,6 +745,27 @@ def _fetch_iterate_sample(
     datasets: Mapping[str, "Sampler"],
     collate: Callable[[Any], Any],
 ) -> Any:
+    # Handle pre-batched sampler outputs produced by torchdata's Batcher
+    # (common in newer torchdata versions). Each element is a (key, span)
+    # tuple pointing to a dataset shard; fetch and collate into a proper batch.
+    if isinstance(sample, (list, tuple)) and sample and all(
+        isinstance(elem, tuple) and len(elem) == 2 for elem in sample
+    ):
+        batches: list[Any] = []
+        for k, span in sample:
+            ds = datasets.get(str(k))
+            if ds is None:
+                continue
+            s, e = int(span[0]), int(span[1])
+            batch = ds.get(s, e)
+            if batch is not None:
+                batches.append(batch)
+        if not batches:
+            return None
+        if len(batches) == 1:
+            return collate(batches[0])
+        flattened = _fetch_merge_batches(batches)
+        return collate(flattened)
     if isinstance(sample, tuple) and len(sample) == 2:
         k, span = sample
         ds = datasets.get(str(k))
@@ -752,6 +775,47 @@ def _fetch_iterate_sample(
         batch = ds.get(s, e)
         return collate(batch) if batch is not None else None
     return collate(sample)
+
+
+def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
+    if TensorDictBase is not None and all(isinstance(b, TensorDictBase) for b in batches):
+        with contextlib.suppress(Exception):
+            return torch.cat(list(batches), dim=0)
+    if all(isinstance(b, Mapping) for b in batches):
+        merged: dict[str, Any] = {}
+        keys = set(chain.from_iterable(b.keys() for b in batches))
+        for key in keys:
+            vals = [b.get(key) for b in batches if key in b]
+            if not vals:
+                continue
+            if all(isinstance(v, torch.Tensor) for v in vals):
+                merged[key] = torch.cat(cast(list[torch.Tensor], vals), dim=0)
+                continue
+            if key == "row_ids":
+                tensors = []
+                for v in vals:
+                    if v is None:
+                        continue
+                    tensors.append(v if isinstance(v, torch.Tensor) else torch.as_tensor(v))
+                if tensors:
+                    merged[key] = torch.cat(tensors, dim=0)
+                continue
+            if all(isinstance(v, (list, tuple)) for v in vals):
+                merged[key] = list(chain.from_iterable(
+                    v if isinstance(v, list) else list(v) for v in vals
+                ))
+                continue
+            with contextlib.suppress(Exception):
+                tensors = [v if isinstance(v, torch.Tensor) else torch.as_tensor(v) for v in vals]
+                merged[key] = torch.cat(tensors, dim=0)
+                continue
+            merged[key] = list(chain.from_iterable(
+                v if isinstance(v, (list, tuple)) else [v] for v in vals
+            ))
+        return merged
+    return list(chain.from_iterable(
+        b if isinstance(b, (list, tuple)) else [b] for b in batches
+    ))
 
 
 def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:

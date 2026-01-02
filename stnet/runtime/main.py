@@ -3125,17 +3125,26 @@ def epochs(
                                         y_rec = Y
                                         with contextlib.suppress(Exception):
                                             model_for_scaler = model.module if hasattr(model, "module") else model
-                                            scaler = getattr(model_for_scaler, "scaler", None)
-                                            if scaler is not None:
-                                                nx = getattr(scaler, "normalize_x", None)
-                                                ny = getattr(scaler, "normalize_y", None)
-                                                if callable(nx):
-                                                    x_rec = nx(x_rec)
-                                                if callable(ny):
+                                            data_scaler = getattr(model_for_scaler, "scaler", None)
+                                            if data_scaler is not None:
+                                                dy = getattr(data_scaler, "denormalize_y", None)
+                                                if callable(dy):
                                                     y_flat = y_rec
                                                     if isinstance(y_flat, torch.Tensor) and y_flat.ndim != 2:
                                                         y_flat = y_flat.reshape(y_flat.shape[0], -1)
-                                                    y_rec = ny(y_flat)
+                                                    need_denorm = True
+                                                    scale_max = (
+                                                        getattr(meta, "scale_max_value", None)
+                                                        or getattr(meta, "scale_max_abs", None)
+                                                    )
+                                                    if isinstance(y_flat, torch.Tensor) and scale_max is not None:
+                                                        with contextlib.suppress(Exception):
+                                                            max_obs = float(y_flat.detach().abs().max().item())
+                                                            # If the batch is already on the original scale, skip a second denorm.
+                                                            if max_obs >= float(scale_max) * 0.5:
+                                                                need_denorm = False
+                                                    if need_denorm:
+                                                        y_rec = dy(y_flat).view_as(y_rec)
                                         hist.record_batch(x_rec, y_rec)
                                 except Exception:
                                     pass

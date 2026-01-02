@@ -21,15 +21,14 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **torchao**: >= 0.14.0
 
 ## Features
-- **Typed configuration** (`stnet.config`): dataclass-based configs with sensible defaults and validation/coercion.
-- **API** (`stnet.api`): create models, save/load checkpoints, and provide train/predict entrypoints. Low-level exporters and native checkpoint writers live in `stnet.runtime.io`.
-- **Runtime utilities** (`stnet.runtime.main`, `stnet.core.system`): thread/NUMA tuning, mixed-precision friendly components, and training-time helpers.
-- **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
-- **Export** (`stnet.runtime.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
-- **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
-- **Core utilities** (`stnet.runtime.losses`, `stnet.runtime.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
-- **NN library** (`stnet.nn`): attention variants and spatio‑temporal layers (e.g., `Model`, `Recorder`).
-- **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
+- **Typed configuration** (`stnet.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
+- **API surface** (`stnet.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
+- **Runtime utilities** (`stnet.runtime.main`, `stnet.core.system`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks.
+- **Data pipeline** (`stnet.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
+- **Distributed** (`stnet.core.distributed`): elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Export** (`stnet.runtime.io`): ONNX/ORT/TorchScript out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras.
+- **Losses/optimizers/profiling** (`stnet.runtime.losses`, `stnet.runtime.optimizers`, `stnet.core.profiler`): Student’s t losses, SWA helpers, FLOP/IO timing.
+- **NN stack** (`stnet.nn`): spatio-temporal Fuser/Enhancer blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 
 ## Installation
 
@@ -44,8 +43,12 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 
 Optional extras:
 ```bash
-# ONNX / ORT / CoreML / TensorRT / ExecuTorch export helpers
+# Minimal ONNX / ORT export helpers
 pip install -e .[deployment]
+
+# Broader export stack (platform/python constraints; some wheels may be unavailable on py3.13/py3.14t)
+# Includes onnx-tf/onnx2tf (py<3.13), CoreML (macOS), TensorRT (Linux/CUDA), ExecuTorch (Linux, py<3.12)
+pip install -e .[deployment_full]
 
 # Dataframe integrations
 pip install -e .[pandas]      # or: .[polars]
@@ -70,7 +73,7 @@ pip install -e .[dev]
 
 > **Note**: Do **not** install `triton` manually; the correct Triton build is pulled automatically by PyTorch.
 
-> **Platform note**: some `deployment` backends are OS/driver dependent (e.g., CoreML on macOS, TensorRT on Linux with NVIDIA CUDA). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
+> **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
 
 ## Quickstart
 
@@ -172,27 +175,29 @@ stnet/
   __init__.py
   api.py
   config.py
-  runtime/
-    __init__.py
-    io.py
-    main.py
   core/
     __init__.py
-    compat.py
-    distributed.py
-    casting.py
-    graph.py
-    losses.py
-    optimizers.py
-    precision.py
-    profiler.py
-    staging.py
-    system.py
+    casting.py            # dtype helpers, env parsing, safe tensor coercions
+    compat.py             # accelerator/memory helpers, meta/fake tensor guards
+    distributed.py        # elastic launch + process group utilities
+    graph.py              # torch.compile helpers, graph break utilities
+    losses.py             # Student’s t, regression losses, mask utils
+    optimizers.py         # SGD/AdamW wrappers, SWA helper
+    precision.py          # AMP negotiation/autocast policies, dtype guards
+    profiler.py           # lightweight FLOP/IO timers
+    staging.py            # pinned-memory staging pool
+    system.py             # thread/NUMA tuning, device detection, temp dirs
   data/
     __init__.py
-    nodes.py
-    pipeline.py
-    schemas.py
+    nodes.py              # torchdata nodes, Sampler/Loader, memmap writer/reader
+    pipeline.py           # dataset fetch, collate, session orchestration
+    schemas.py            # key resolution, JSON helpers, underflow handling
+  runtime/
+    __init__.py
+    io.py                 # exporters (ONNX/ORT/TorchScript/etc.), checkpoint save/load
+    main.py               # training loop, predict path, elastic worker entrypoint
+  runtime/
+    __init__.py
   nn/
     __init__.py
     activations.py

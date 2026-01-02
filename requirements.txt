@@ -36,8 +36,10 @@ h5py>=3.11.0
 # - intel_ai: intel-extension-for-pytorch>=2.7.0
 #
 # Export / deployment (optional)
-# - deployment: onnx>=1.18.0, onnxruntime>=1.18.0, onnx-tf>=1.10.0, onnx2tf>=1.27.2,
-#              coremltools>=8.3.0, tensorrt>=10.10.0.31, executorch>=0.6.0
+# - deployment: onnx>=1.18.0, onnxruntime>=1.18.0
+# - deployment_full: onnx>=1.18.0, onnxruntime>=1.18.0, onnx-tf>=1.10.0 (py<3.13),
+#                    onnx2tf>=1.27.2 (py<3.13), coremltools>=8.3.0 (macOS),
+#                    tensorrt>=10.10.0.31 (Linux/CUDA), executorch>=0.6.0 (Linux, py<3.12; wheel availability varies)
 #
 # Telemetry
 # - telemetry: nvidia-ml-py>=11.515.48
