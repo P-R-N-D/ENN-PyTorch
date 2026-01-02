@@ -983,7 +983,7 @@ def fetch(
     io_workers = int(getattr(wp, "num_workers", 0) or 0)
     prebatch = int(getattr(wp, "prebatch", 1) or 1)
     pf_depth_fixed = max(1, min(8, int(getattr(wp, "prefetch_factor", 1) or 1)))
-    collate_fn = Collate(
+    collate_fn = Collator(
         flatten_features=bool(flatten_features),
         labels_dtype=labels_dtype,
         sanitize=bool(sanitize),
@@ -1356,7 +1356,7 @@ class BatchPolicy:
 
 
 @dataclass(slots=True)
-class Collate:
+class Collator:
     labels_dtype: Optional[torch.dtype] = None
     sanitize: bool = False
     flatten_features: bool = False
