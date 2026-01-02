@@ -1086,7 +1086,7 @@ def predict(
                     count = int(len(X_td)) if hasattr(X_td, "__len__") else 0
                 if count <= 0:
                     raise ValueError("predict: empty input")
-                get_batch = _TensorDictSliceGetter(data)
+                get_batch = _TensorDictSlicer(data)
                 in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
@@ -1130,7 +1130,7 @@ def predict(
                             const_items[k] = v
                     except Exception:
                         const_items[k] = v
-                get_batch = _MappingSliceGetter(const_items, tuple(slice_items))
+                get_batch = _MappingSlicer(const_items, tuple(slice_items))
                 in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
@@ -1468,7 +1468,7 @@ def get_prediction(
         return td_out
 
 
-class _MappingSliceGetter:
+class _MappingSlicer:
     __slots__ = ("const_items", "slice_items")
 
     def __init__(self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]) -> None:
@@ -1485,7 +1485,7 @@ class _MappingSliceGetter:
         return batch
 
 
-class _TensorDictSliceGetter:
+class _TensorDictSlicer:
     __slots__ = ("td",)
 
     def __init__(self, td: TensorDictBase) -> None:
