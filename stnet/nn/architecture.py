@@ -160,16 +160,27 @@ class _CallableFuser:
 
 
 class _ProxyDecoder(nn.Module):
+    """
+    Lightweight wrapper used during export/compile paths.
+
+    We keep weak references to the normalization/head modules to avoid
+    unhashable proxy objects being inspected by torch.compile / torch.export
+    while still delegating the actual computation to the owning model.
+    """
     def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
         super().__init__()
-        self._norm = weakref.proxy(norm)
-        self._head = weakref.proxy(head)
+        self._norm_ref = weakref.ref(norm)
+        self._head_ref = weakref.ref(head)
         self._out_shape = tuple(int(x) for x in out_shape)
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        tokens = self._norm(tokens)
+        norm = self._norm_ref()
+        head = self._head_ref()
+        if norm is None or head is None:
+            raise RuntimeError("Decoder references were cleared before use.")
+        tokens = norm(tokens)
         pooled = tokens.mean(dim=1)
-        flat = self._head(pooled)
+        flat = head(pooled)
         return flat.reshape(tokens.shape[0], *self._out_shape)
     
 
