@@ -1468,16 +1468,6 @@ def get_prediction(
         return td_out
 
 
-class _TensorDictSliceGetter:
-    __slots__ = ("td",)
-
-    def __init__(self, td: TensorDictBase) -> None:
-        self.td = td
-
-    def __call__(self, s: object, e: object) -> TensorDictBase:
-        return self.td[s:e]
-
-
 class _MappingSliceGetter:
     __slots__ = ("const_items", "slice_items")
 
@@ -1493,3 +1483,13 @@ class _MappingSliceGetter:
             except Exception:
                 batch[k] = v
         return batch
+
+
+class _TensorDictSliceGetter:
+    __slots__ = ("td",)
+
+    def __init__(self, td: TensorDictBase) -> None:
+        self.td = td
+
+    def __call__(self, s: object, e: object) -> TensorDictBase:
+        return self.td[s:e]
