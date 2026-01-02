@@ -482,7 +482,7 @@ def _coerce_prediction_overwrite(overwrite: object) -> str:
     return "error"
 
 
-def _coerce_prediction_path(path: PathLike, *, run_id: str) -> Optional[str]:
+def _coerce_prediction_path(path: PathLike, *args: Any, run_id: str) -> Optional[str]:
     p = Path(str(path))
     if p.suffix.lower() in {".h5", ".hdf5"}:
         return os.fspath(p)
