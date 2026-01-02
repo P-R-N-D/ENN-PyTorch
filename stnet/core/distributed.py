@@ -14,21 +14,19 @@ from typing import TYPE_CHECKING, Any, Iterable, Optional, TypeAlias, Union
 
 import torch
 import torch.distributed as dist
-
-# Prefer the composable FSDP API when available. Some PyTorch builds do not
-# re-export these symbols from torch.distributed.fsdp.
-try:
-    from torch.distributed._composable.fsdp import fully_shard  # type: ignore
-except Exception:  # pragma: no cover
-    try:
-        from torch.distributed.fsdp import fully_shard  # type: ignore
-    except Exception:  # pragma: no cover
-        fully_shard = None  # type: ignore[assignment]
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
 from .casting import env_bool, env_int
 from .system import get_num_accelerators, get_device, process_cpu_count
+
+try:
+    from torch.distributed._composable.fsdp import fully_shard
+except Exception:
+    try:
+        from torch.distributed.fsdp import fully_shard
+    except Exception:
+        fully_shard = None
 
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
