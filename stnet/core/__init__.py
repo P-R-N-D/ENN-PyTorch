@@ -10,8 +10,6 @@ __all__ = [
     "compat",
     "distributed",
     "graph",
-    "losses",
-    "optimizers",
     "precision",
     "profiler",
     "staging",

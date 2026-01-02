@@ -8,6 +8,8 @@ from types import ModuleType
 __all__ = [
     "io",
     "main",
+    "losses",
+    "optimizers",
 ]
 
 

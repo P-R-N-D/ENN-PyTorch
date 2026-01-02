@@ -27,7 +27,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`, Korea
 - **Distributed** (`stnet.core.distributed`): utilities to bootstrap and coordinate multi‑process training.
 - **Export** (`stnet.runtime.io`): ONNX / ONNX Runtime (ORT) / TensorRT / CoreML / ExecuTorch conversion helpers (optional `deployment` extra; some backends are platform-specific).
 - **Data pipeline** (`stnet.data`): `torchdata`-driven nodes with memmap-friendly flows.
-- **Core utilities** (`stnet.core.losses`, `stnet.core.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
+- **Core utilities** (`stnet.runtime.losses`, `stnet.runtime.optimizers`, `stnet.core.profiler`): robust losses (e.g., Student’s t), optimizer/SWA helpers, and lightweight profiling utilities.
 - **NN library** (`stnet.nn`): attention variants and spatio‑temporal layers (e.g., `Model`, `Recorder`).
 - **AMP negotiation margin** (`ModelConfig.safety_margin_pow2`): sets the conservative overflow guard band used when selecting mixed-precision dtypes (margin = 2**n).
 
@@ -82,7 +82,7 @@ import torch
 import stnet
 
 from stnet.config import ModelConfig
-from stnet.core.losses import StudentsTLoss
+from stnet.runtime.losses import StudentsTLoss
 from stnet.core.system import optimize_threads
 
 # 1) Build a config and model
