@@ -267,7 +267,7 @@ def _preload_slice_any(obj: Any, s: int, e: int, *args: Any, name: str) -> Any:
 def _preload_gather_any(obj: Any, idx: torch.Tensor, *args: Any, name: str) -> Any:
     if obj is None:
         return None
-    idx_cpu = RuntimeIO._idx_to_cpu_int64(idx)
+    idx_cpu = Storage._idx_to_cpu_int64(idx)
     if torch.is_tensor(obj):
         return obj[idx_cpu]
     if isinstance(obj, numpy.ndarray):
@@ -350,7 +350,7 @@ class _RowIndexer:
         self.features_only = bool(features_only)
 
     def __call__(self, idx: torch.Tensor) -> Mapping[str, Any]:
-        idx_cpu = RuntimeIO._idx_to_cpu_int64(idx)
+        idx_cpu = Storage._idx_to_cpu_int64(idx)
         try:
             idx_np = idx_cpu.numpy()
         except Exception:
@@ -419,7 +419,7 @@ class _ColumnCursor:
         return _ColumnView(self._data, batch_keys)
 
 
-class RuntimeIO:
+class Storage:
     @staticmethod
     def column_cursor(
         data: Mapping[Any, Any],
@@ -469,7 +469,7 @@ class RuntimeIO:
 
     @staticmethod
     def _flat2d_cpu_contig(t: torch.Tensor, n: int) -> torch.Tensor:
-        t_cpu = RuntimeIO._to_cpu_contig(t)
+        t_cpu = Storage._to_cpu_contig(t)
         if t_cpu.ndim == 0:
             t_cpu = t_cpu.reshape(1)
         return t_cpu.reshape(int(n), -1)
@@ -539,7 +539,7 @@ class RuntimeIO:
             e = min(count_i, s + int(chunk_first))
             batch = get_batch(int(s), int(e))
             fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
-            n = RuntimeIO._batch_n(fx)
+            n = Storage._batch_n(fx)
             if n <= 0:
                 continue
             expected = int(e) - int(s)
@@ -547,7 +547,7 @@ class RuntimeIO:
                 raise RuntimeError(
                     f"Pass1 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
-            fx_flat = RuntimeIO._flat2d_cpu_contig(fx, n)
+            fx_flat = Storage._flat2d_cpu_contig(fx, n)
             cur_in_dim = int(fx_flat.shape[1])
             if in_dim is None:
                 in_dim = cur_in_dim
@@ -560,7 +560,7 @@ class RuntimeIO:
                 lb_flat = None
             else:
                 cur_label_shape = tuple(lb.shape[1:])
-                lb_flat = RuntimeIO._flat2d_cpu_contig(lb, n)
+                lb_flat = Storage._flat2d_cpu_contig(lb, n)
             if label_shape is None:
                 label_shape = cur_label_shape
             elif tuple(label_shape) != tuple(cur_label_shape):
@@ -589,7 +589,7 @@ class RuntimeIO:
             underflow_action=underflow_action,
             safety_margin=1.0,
         )
-        store_float = RuntimeIO._resolve_memmap_store_float(negotiable=bool(negotiable))
+        store_float = Storage._resolve_memmap_store_float(negotiable=bool(negotiable))
         if auto_chunk:
             elem_size = int(torch.empty((), dtype=store_float).element_size())
             label_numel = 0 if bool(features_only) else int(numpy.prod(label_shape))
@@ -781,7 +781,7 @@ class RuntimeIO:
                 batch = get_by_indices(idx)
 
             fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
-            n = RuntimeIO._batch_n(fx)
+            n = Storage._batch_n(fx)
             if n <= 0:
                 continue
             expected = int(e) - int(s)
@@ -789,7 +789,7 @@ class RuntimeIO:
                 raise RuntimeError(
                     f"Pass2 batch size mismatch for out_dir={out_dir!r}: expected {expected}, got {n} (s={s}, e={e})."
                 )
-            fx_flat = RuntimeIO._flat2d_cpu_contig(fx, n)
+            fx_flat = Storage._flat2d_cpu_contig(fx, n)
             if int(fx_flat.shape[1]) != int(in_dim):
                 raise RuntimeError(
                     f"feature dim mismatch: expected {in_dim}, got {int(fx_flat.shape[1])}"
@@ -833,7 +833,7 @@ class RuntimeIO:
                         raise RuntimeError(
                             f"label shape mismatch: expected {label_shape}, got {tuple(lb.shape[1:])}"
                         )
-                    lb_cpu = RuntimeIO._to_cpu_contig(lb)
+                    lb_cpu = Storage._to_cpu_contig(lb)
                     dst_l = labels_mmt[int(s) : int(s) + int(n)]
                     if labels_cast_copy_ok is None:
                         try:
@@ -888,7 +888,7 @@ class RuntimeIO:
             }
             scaler_stats_path = "scaler_stats.pt"
             try:
-                RuntimeIO.save_temp(os.path.join(out_dir, scaler_stats_path), payload)
+                Storage.save_temp(os.path.join(out_dir, scaler_stats_path), payload)
             except Exception:
                 scaler_stats_path = None
         meta_json: Dict[str, Any] = {
@@ -920,7 +920,7 @@ class RuntimeIO:
             "underflow_action": str(underflow_action),
             "features_only": bool(features_only),
         }
-        RuntimeIO.write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
+        Storage.write_json(os.path.join(out_dir, "meta.json"), meta_json, indent=2)
         return int(in_dim), tuple(label_shape)
 
     @staticmethod
@@ -962,7 +962,7 @@ class RuntimeIO:
             if bool(shuffle)
             else None
         )
-        RuntimeIO.stream_memmap(
+        Storage.stream_memmap(
             ds=ds,
             out_dir=os.fspath(memmap_dir),
             count=int(count),
@@ -990,10 +990,10 @@ class RuntimeIO:
                 yield obj["path"]
             else:
                 for v in obj.values():
-                    yield from RuntimeIO.iter_source_path(v)
+                    yield from Storage.iter_source_path(v)
         elif isinstance(obj, (list, tuple)):
             for v in obj:
-                yield from RuntimeIO.iter_source_path(v)
+                yield from Storage.iter_source_path(v)
 
     @staticmethod
     def from_meta(memmap_dir: str) -> Dict[str, Any]:
@@ -1086,9 +1086,9 @@ class RuntimeIO:
         if isinstance(metas, list) and metas and isinstance(metas[0], dict):
             return _merge_dicts(metas)
         collected: list[dict] = []
-        for path in RuntimeIO.iter_source_path(metas):
+        for path in Storage.iter_source_path(metas):
             try:
-                meta = RuntimeIO.from_meta(path)
+                meta = Storage.from_meta(path)
             except Exception:
                 meta = None
             if isinstance(meta, dict):
@@ -1097,7 +1097,7 @@ class RuntimeIO:
 
     @staticmethod
     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:
-        expanded = RuntimeIO.expand_source(sources)
+        expanded = Storage.expand_source(sources)
         total = 0
         x_sum: Optional[torch.Tensor] = None
         x_sum_sq: Optional[torch.Tensor] = None
@@ -1111,9 +1111,9 @@ class RuntimeIO:
         y_q_low: Optional[torch.Tensor] = None
         y_q_high: Optional[torch.Tensor] = None
         have_qbounds: Optional[bool] = None
-        for path in RuntimeIO.iter_source_path(expanded):
+        for path in Storage.iter_source_path(expanded):
             try:
-                meta = RuntimeIO.from_meta(path)
+                meta = Storage.from_meta(path)
             except Exception:
                 return None
             rel = meta.get("scaler_stats_path")
@@ -1260,7 +1260,7 @@ class RuntimeIO:
 
     @staticmethod
     def open_memory_mapped_tensor(mmt_path: str) -> Optional[MemoryMappedTensor]:
-        meta_path = RuntimeIO.get_meta_path(mmt_path)
+        meta_path = Storage.get_meta_path(mmt_path)
         if not (os.path.isfile(mmt_path) and os.path.isfile(meta_path)):
             return None
         try:
@@ -1279,7 +1279,7 @@ class RuntimeIO:
 
     @staticmethod
     def load_memmap_features(memmap_dir: str) -> MemoryMappedTensor:
-        meta = RuntimeIO.load_memmap_meta(memmap_dir)
+        meta = Storage.load_memmap_meta(memmap_dir)
         n = int(meta.get("N", 0) or 0)
         if n <= 0:
             raise ValueError(f"memmap meta.json under {memmap_dir} has non-positive N={n}")
@@ -1450,7 +1450,7 @@ class RuntimeIO:
             raise ValueError(
                 f"Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
             )
-        is_contig, start, end = RuntimeIO._validate_row_contiguity(rows_t)
+        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
         if is_contig:
             if start < 0 or end > int(count):
                 raise ValueError(
@@ -1475,7 +1475,7 @@ class RuntimeIO:
         *args: Any,
         count: int,
     ) -> None:
-        is_contig, start, end = RuntimeIO._validate_row_contiguity(rows_t)
+        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
         if is_contig:
             if start < 0 or end > int(count):
                 raise ValueError(
@@ -1499,7 +1499,7 @@ class RuntimeIO:
 
     @staticmethod
     def _load_row(rows_file: str) -> torch.Tensor:
-        rows_t = RuntimeIO._torch_load_cpu(os.fspath(rows_file))
+        rows_t = Storage._torch_load_cpu(os.fspath(rows_file))
         if not isinstance(rows_t, torch.Tensor):
             rows_t = torch.as_tensor(rows_t, device="cpu")
         rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
@@ -1512,11 +1512,11 @@ class RuntimeIO:
         _ = args
         pf = os.fspath(pred_file)
         if pf.endswith(".mmt"):
-            preds_t = RuntimeIO.open_memory_mapped_tensor(pf)
+            preds_t = Storage.open_memory_mapped_tensor(pf)
             if preds_t is None:
                 raise FileNotFoundError(f"missing prediction memmap or meta: {pf!r}")
         else:
-            preds_t = RuntimeIO._torch_load_cpu(pf)
+            preds_t = Storage._torch_load_cpu(pf)
         if not isinstance(preds_t, torch.Tensor):
             preds_t = torch.as_tensor(preds_t, device="cpu")
         if preds_t.device.type != "cpu":
@@ -1551,11 +1551,11 @@ class RuntimeIO:
         for part in parts:
             rows_file = os.path.join(chunks_dir, str(part["rows"]))
             pred_file = os.path.join(chunks_dir, str(part["pred"]))
-            rows_t = RuntimeIO._load_row(rows_file)
-            preds_t = RuntimeIO._load_prediction(pred_file, dtype=store_float)
-            RuntimeIO._index_copy_rows(y_out, rows_t, preds_t, count=int(count))
-        pred_meta_path = RuntimeIO.get_meta_path(os.fspath(out_path))
-        RuntimeIO.write_json(
+            rows_t = Storage._load_row(rows_file)
+            preds_t = Storage._load_prediction(pred_file, dtype=store_float)
+            Storage._index_copy_rows(y_out, rows_t, preds_t, count=int(count))
+        pred_meta_path = Storage.get_meta_path(os.fspath(out_path))
+        Storage.write_json(
             pred_meta_path,
             {"dtype": str(store_float).replace("torch.", ""), "shape": list(map(int, full_shape))},
             indent=None,
@@ -1585,9 +1585,9 @@ class RuntimeIO:
         for part in parts:
             rows_file = os.path.join(chunks_dir, str(part["rows"]))
             pred_file = os.path.join(chunks_dir, str(part["pred"]))
-            rows_t = RuntimeIO._load_row(rows_file)
-            preds_t = RuntimeIO._load_prediction(pred_file, dtype=dtype)
-            RuntimeIO._index_copy_rows(y_out, rows_t, preds_t, count=int(count))
+            rows_t = Storage._load_row(rows_file)
+            preds_t = Storage._load_prediction(pred_file, dtype=dtype)
+            Storage._index_copy_rows(y_out, rows_t, preds_t, count=int(count))
         return y_out
 
     @staticmethod
@@ -1603,16 +1603,16 @@ class RuntimeIO:
     ) -> PersistentTensorDict:
         _ = args
 
-        x_mmt = RuntimeIO.load_memmap_features(memmap_dir)
+        x_mmt = Storage.load_memmap_features(memmap_dir)
         out_shape_t = tuple(int(x) for x in out_shape)
         os.makedirs(os.path.dirname(out_path) or os.getcwd(), exist_ok=True)
-        np_float = RuntimeIO._to_numpy_dtype(store_float)
+        np_float = Storage._to_numpy_dtype(store_float)
         cast_dtype = store_float
         if store_float == torch.bfloat16 and np_float == numpy.float32:
             cast_dtype = torch.float32
         with h5py.File(out_path, "w") as f:
             dset_X = f.create_dataset(
-                "X", shape=tuple(x_mmt.shape), dtype=RuntimeIO._to_numpy_dtype(x_mmt.dtype)
+                "X", shape=tuple(x_mmt.shape), dtype=Storage._to_numpy_dtype(x_mmt.dtype)
             )
             dset_Y = f.create_dataset("Y", shape=(int(count), *out_shape_t), dtype=np_float)
             step = int(chunk_size)
@@ -1630,14 +1630,14 @@ class RuntimeIO:
             for part in parts:
                 rows_file = os.path.join(chunks_dir, str(part["rows"]))
                 pred_file = os.path.join(chunks_dir, str(part["pred"]))
-                rows_t = RuntimeIO._load_row(rows_file)
-                preds_t = RuntimeIO._load_prediction(pred_file, dtype=cast_dtype)
+                rows_t = Storage._load_row(rows_file)
+                preds_t = Storage._load_prediction(pred_file, dtype=cast_dtype)
                 preds_np = preds_t.detach().to(device="cpu", dtype=cast_dtype).numpy()
                 if predsnp.shape[0] != int(rows_t.numel()):
                     raise ValueError(
                         f"Pred/rows mismatch in {pred_file}: preds[0]={predsnp.shape[0]} vs rows={int(rows_t.numel())}"
                     )
-                RuntimeIO._h5_write_rows(dset_Y, rows_t, preds_np, count=int(count))
+                Storage._h5_write_rows(dset_Y, rows_t, preds_np, count=int(count))
         return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
 
     @staticmethod
@@ -1651,15 +1651,15 @@ class RuntimeIO:
     ) -> PersistentTensorDict:
         _ = args
 
-        x_mmt = RuntimeIO.load_memmap_features(memmap_dir)
-        y_mmt = RuntimeIO.open_memory_mapped_tensor(os.fspath(pred_path))
+        x_mmt = Storage.load_memmap_features(memmap_dir)
+        y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
         if y_mmt is None:
             raise FileNotFoundError(f"missing prediction memmap: {pred_path}")
         n = int(y_mmt.shape[0]) if count is None else int(count)
         if n <= 0:
             raise ValueError(f"non-positive prediction count: {n}")
-        x_np_dtype = RuntimeIO._to_numpy_dtype(x_mmt.dtype)
-        y_np_dtype = RuntimeIO._to_numpy_dtype(y_mmt.dtype)
+        x_np_dtype = Storage._to_numpy_dtype(x_mmt.dtype)
+        y_np_dtype = Storage._to_numpy_dtype(y_mmt.dtype)
         y_cast_dtype = y_mmt.dtype
         if y_mmt.dtype == torch.bfloat16 and y_np_dtype == numpy.float32:
             y_cast_dtype = torch.float32
@@ -1709,7 +1709,7 @@ class RuntimeIO:
         )
         os.close(fd)
         try:
-            RuntimeIO.write_predictions_h5_from_memmap(
+            Storage.write_predictions_h5_from_memmap(
                 tmp_path,
                 memmap_dir=os.fspath(memmap_dir),
                 pred_path=os.fspath(pred_path),
@@ -1749,7 +1749,7 @@ class RuntimeIO:
         if not dst_n:
             raise ValueError("destination path must be a non-empty string")
         ow = str(overwrite or "replace").strip().lower()
-        RuntimeIO.validate_predictions_h5(src_n, out_shape=out_shape)
+        Storage.validate_predictions_h5(src_n, out_shape=out_shape)
         with suppress(Exception):
             if os.path.samefile(src_n, dst_n):
                 return PersistentTensorDict(filename=src_n, mode="r")
@@ -1757,7 +1757,7 @@ class RuntimeIO:
         os.makedirs(parent, exist_ok=True)
         if os.path.exists(dst_n):
             if ow == "resume" and os.path.isfile(dst_n):
-                RuntimeIO.validate_predictions_h5(dst_n, out_shape=out_shape)
+                Storage.validate_predictions_h5(dst_n, out_shape=out_shape)
                 return PersistentTensorDict(filename=dst_n, mode="r")
             if ow == "error":
                 raise FileExistsError(f"destination already exists: {dst_n!r}")
@@ -1782,14 +1782,14 @@ class RuntimeIO:
             with suppress(Exception):
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-        RuntimeIO.validate_predictions_h5(dst_n, out_shape=out_shape)
+        Storage.validate_predictions_h5(dst_n, out_shape=out_shape)
         return PersistentTensorDict(filename=dst_n, mode="r")
 
     @staticmethod
     def remove_prediction_artifacts(*args: Any, memmap_dir: str, pred_path: str) -> None:
         _ = args
         try:
-            meta = RuntimeIO.load_memmap_meta(memmap_dir)
+            meta = Storage.load_memmap_meta(memmap_dir)
             feat_rel = str(meta.get("features_path", "features.mmt"))
             feat_path = os.path.join(os.fspath(memmap_dir), feat_rel)
         except Exception:
@@ -1798,10 +1798,10 @@ class RuntimeIO:
         if feat_path:
             _remove_safe(os.fspath(feat_path))
             with suppress(Exception):
-                _remove_safe(RuntimeIO.get_meta_path(os.fspath(feat_path)))
+                _remove_safe(Storage.get_meta_path(os.fspath(feat_path)))
         _remove_safe(os.fspath(pred_path))
         with suppress(Exception):
-            _remove_safe(RuntimeIO.get_meta_path(os.fspath(pred_path)))
+            _remove_safe(Storage.get_meta_path(os.fspath(pred_path)))
         _remove_safe(os.path.join(os.fspath(memmap_dir), "meta.json"))
         with suppress(OSError):
             os.rmdir(os.fspath(memmap_dir))
