@@ -105,7 +105,7 @@ from ..core.profiler import FlopCounter
 from ..core.precision import Autocast, PrecisionPolicy
 from ..nn.architecture import Model, ModelPolicy
 from ..nn.primitives import Recorder, resize_scaler_buffer
-from ..core.losses import (
+from .losses import (
     CRPSLoss,
     DataFidelityLoss,
     LinearCombinationLoss,
@@ -114,7 +114,7 @@ from ..core.losses import (
     StudentsTLoss,
     TiledLoss,
 )
-from ..core.optimizers import SWALR, AdamW, stochastic_weight_average
+from .optimizers import SWALR, AdamW, stochastic_weight_average
 from ..data.nodes import RuntimeIO
 from ..data.pipeline import (
     Dataset,
@@ -1264,14 +1264,29 @@ def _get_sample_size(
                         forward_ran = True
                 else:
                     with inference_mode(model), Autocast.float(device):
-                        _ = model(
-                            X,
-                            global_loss=None,
-                            local_loss=None,
-                            loss_weights=None,
-                            calibrate_output=True,
-                            return_loss=False,
-                        )
+                        warmup_iters = int(_env_int("STNET_SERVE_WARMUP_ITERS", 0) or 0)
+                        if (
+                            warmup_iters <= 0
+                            and str(getattr(ops, "mode", "") or "") in ("predict", "infer")
+                            and _env_flag("STNET_MAX_PERF", True)
+                        ):
+                            m_eval = model.module if hasattr(model, "module") else model
+                            compiled = getattr(m_eval, "_compiled_submodules", None)
+                            warmup_iters = (
+                                3
+                                if (isinstance(compiled, dict) and any(bool(v) for v in compiled.values()))
+                                else 1
+                            )
+                        warmup_iters = max(1, min(16, int(warmup_iters)))
+                        for _i in range(warmup_iters):
+                            _ = model(
+                                X,
+                                global_loss=None,
+                                local_loss=None,
+                                loss_weights=None,
+                                calibrate_output=True,
+                                return_loss=False,
+                            )
                     forward_ran = True
         except Exception:
             forward_ran = False
@@ -2123,6 +2138,7 @@ def get_progress_bar(
         + "{bar} {percentage:3.0f}% "
         + "({unit}) Elapsed: {elapsed}, Remaining: {remaining}",
         colour="green",
+        ascii=True,
         position=0,
         leave=False,
         file=sys.stdout,
@@ -3104,7 +3120,22 @@ def epochs(
                                         train_steps <= 0
                                         or step_idx % max(1, int(train_steps * 0.01)) == 0
                                     ):
-                                        hist.record_batch(X, Y)
+                                        x_rec = X
+                                        y_rec = Y
+                                        with contextlib.suppress(Exception):
+                                            model_for_scaler = model.module if hasattr(model, "module") else model
+                                            scaler = getattr(model_for_scaler, "scaler", None)
+                                            if scaler is not None:
+                                                nx = getattr(scaler, "normalize_x", None)
+                                                ny = getattr(scaler, "normalize_y", None)
+                                                if callable(nx):
+                                                    x_rec = nx(x_rec)
+                                                if callable(ny):
+                                                    y_flat = y_rec
+                                                    if isinstance(y_flat, torch.Tensor) and y_flat.ndim != 2:
+                                                        y_flat = y_flat.reshape(y_flat.shape[0], -1)
+                                                    y_rec = ny(y_flat)
+                                        hist.record_batch(x_rec, y_rec)
                                 except Exception:
                                     pass
                             if torch_prof is not None:
@@ -3543,12 +3574,16 @@ def epochs(
                 ):
                     history_path = os.path.join(ops.ckpt_dir, "history.json")
                     records = hist.save()
+                    sampled_n_total = None
+                    with contextlib.suppress(Exception):
+                        sampled_n_total = int(round(float(prev_samples) * float(max(1, world))))
                     meta = {
                         "start_posix": float(round(float(hist.start.item()), 6)),
                         "end_posix": float(round(float(hist.end.item()), 6)),
                         "timezone": hist.timezone,
                         "peers": int(hist.peers.item()),
                         "epochs": int(hist.epochs.item()),
+                        "sampled_n": int(sampled_n_total or 0),
                         "os": hist.os,
                         "kernel": hist.kernel,
                         "cpu": list(hist.cpu),
@@ -3604,6 +3639,11 @@ def infer(
     if rank == 0:
         os.makedirs(chunk_dir, exist_ok=True)
     distributed_barrier(device)
+    _nogil_opt = False
+    with contextlib.suppress(Exception):
+        from ..core.system import Thread
+        _nogil_opt = bool(Thread.is_optimized_for_no_gil())
+    _cache_default = 16 if _nogil_opt else 4
     cache_q = max(
         1,
         int(
@@ -3613,7 +3653,7 @@ def infer(
                     "STNET_PRED_WRITE_QUEUE",
                     "STNET_CACHE_MAX_QUEUE",
                 ),
-                default=4,
+                default=_cache_default,
             )
         ),
     )
@@ -3650,12 +3690,27 @@ def infer(
         with contextlib.suppress(Exception):
             Memory.prefer_local_numa()
         with contextlib.suppress(Exception):
-            cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", 8)))
+            _nogil = False
+            with contextlib.suppress(Exception):
+                from ..core.system import Thread
+                _nogil = bool(Thread.is_optimized_for_no_gil())
+            _cpu_default = 8
+            if _nogil:
+                try:
+                    _cpu_default = max(8, min(64, int(os.cpu_count() or 8)))
+                except Exception:
+                    _cpu_default = 16
+            cpu_pool_cap = max(2, int(_env_int("STNET_RUNTIME_PIN_POOL_CAPACITY", _cpu_default)))
             cpu_pool = Pool(capacity=cpu_pool_cap)
     pred_pool = None
     if non_blocking_ok and Pool is not None and _env_flag("STNET_PRED_PINNED", True):
         with contextlib.suppress(Exception):
-            pred_pool_cap = max(2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", 2)))
+            _nogil = False
+            with contextlib.suppress(Exception):
+                from ..core.system import Thread
+                _nogil = bool(Thread.is_optimized_for_no_gil())
+            _pred_default = 2 if not _nogil else 4
+            pred_pool_cap = max(2, int(_env_int("STNET_PRED_PIN_POOL_CAPACITY", _pred_default)))
             pred_pool = Pool(capacity=pred_pool_cap, pin_memory=True)
     stage_tensor = partial(
         _pool_tensor,
@@ -4097,23 +4152,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             logger=None,
         )
         _init_optimizer(optimizer)
-        if ops.init_ckpt_dir is not None and os.path.isdir(ops.init_ckpt_dir):
-
-            optim_sd = get_optimizer_state_dict(model, optimizers=optimizer)
-            try:
-                with _filtered_warnings():
-                    load(state_dict={"optimizer": optim_sd}, storage_reader=FileSystemReader(ops.init_ckpt_dir))
-            except BaseException as exc:
-                if isinstance(exc, (SystemExit, KeyboardInterrupt)):
-                    raise
-                warnings.warn(
-                    f"optimizer state load skipped (non-fatal): {type(exc).__name__}: {exc}",
-                    RuntimeWarning,
-                )
-            else:
-                with contextlib.suppress(Exception):
-                    set_optimizer_state_dict(model, optimizer, optim_sd, options=StateDictOptions(strict=False))
-                _init_optimizer(optimizer)
         top_df = DataFidelityLoss(out_shape=ops.out_shape, reduction="mean")
         top_z = StandardNormalLoss(
             confidence=0.99,
@@ -4364,6 +4402,18 @@ def process(*args: Any, **kwargs: Any) -> object:
         if not torch.distributed.is_initialized():
             _init_distributed_group(backend, device, local_rank)
         cfg = coerce_model_config(ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict)
+        cfg = replace(cfg, device=device)
+        if _env_flag("STNET_MAX_PERF", True):
+            cm = str(getattr(cfg, "compile_mode", "disabled") or "").strip().lower()
+            if cm in ("", "none", "disabled", "disable", "off", "false", "0"):
+                default_cm = env_str("STNET_SERVE_COMPILE_MODE") or "max-autotune"
+                cfg = replace(cfg, compile_mode=str(default_cm))
+                with contextlib.suppress(Exception):
+                    setattr(cfg, "compile_heavy_submodules", bool(_env_flag("STNET_COMPILE_HEAVY", True)))
+                with contextlib.suppress(Exception):
+                    setattr(cfg, "compile_dynamic", bool(_env_flag("STNET_COMPILE_DYNAMIC", False)))
+                with contextlib.suppress(Exception):
+                    setattr(cfg, "compile_cudagraphs", bool(_env_flag("STNET_COMPILE_CUDAGRAPHS", True)))
         model = Model(ops.in_dim, ops.out_shape, config=cfg)
         if not ops.model_ckpt_dir:
             raise RuntimeError(
@@ -4407,6 +4457,19 @@ def process(*args: Any, **kwargs: Any) -> object:
             else None,
         )
         Autocast.configure(model, metadata=metadata)
+        enable_tf32 = bool(getattr(ops, "enable_tf32", True))
+        with contextlib.suppress(Exception):
+            param_dtype = next(
+                (p.dtype for p in (model.module if hasattr(model, "module") else model).parameters()),
+                None,
+            )
+        with contextlib.suppress(Exception):
+            set_float32_precision(
+                device=device,
+                dtype=param_dtype,
+                autocast_dtype=param_dtype,
+                enable_tf32=enable_tf32,
+            )
         fp8_infer_ok, fp8_infer_reason = Dataset.is_float8_supported(device)
         if fp8_infer_ok:
             model, _, _ = ModelPolicy.enable_float8_prediction(

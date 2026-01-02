@@ -13,7 +13,6 @@ import threading
 import warnings
 import weakref
 from types import ModuleType
-from functools import lru_cache
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Iterator, Protocol, Sequence, TypeAlias
@@ -285,25 +284,36 @@ def _extract_tensor(out: object) -> torch.Tensor:
     raise RuntimeError("Model forward did not return a tensor output.")
 
 
-@lru_cache(maxsize=256)
+_FORWARD_PARAM_CACHE: dict[object, object] = {}
+_FORWARD_PARAM_CACHE_LOCK = threading.Lock()
+
 def _get_forward_parameters(model_cls: object) -> object:
+    with _FORWARD_PARAM_CACHE_LOCK:
+        cached = _FORWARD_PARAM_CACHE.get(model_cls)
+    if cached is not None:
+        return cached
     try:
         sig = inspect.signature(model_cls.forward)
     except Exception:
+        with _FORWARD_PARAM_CACHE_LOCK:
+            _FORWARD_PARAM_CACHE[model_cls] = None
         return None
     names = set(sig.parameters.keys())
-    return names
+    accepts_kwargs = any(
+        getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    info = (names, bool(accepts_kwargs))
+    with _FORWARD_PARAM_CACHE_LOCK:
+        _FORWARD_PARAM_CACHE[model_cls] = info
+        if len(_FORWARD_PARAM_CACHE) > 512:
+            _FORWARD_PARAM_CACHE.clear()
+    return info
 
 def _forward(model: object, x: object) -> object:
-    names = _get_forward_parameters(type(model))
-    if names is None:
+    info = _get_forward_parameters(type(model))
+    if info is None:
         return model(x)
-    accepts_kwargs = any(
-        (
-            getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD
-            for p in inspect.signature(type(model).forward).parameters.values()
-        )
-    )
+    names, accepts_kwargs = info
     kwargs = {}
     if accepts_kwargs or "labels_flat" in names:
         kwargs["labels_flat"] = None
@@ -402,14 +412,12 @@ class _OnnxLayer:
         is_required("onnx", "pip install onnx")
         wrapper = _CompatLayer(model).eval()
         sample = _pad_sample(model, sample_input)
+        if isinstance(sample, torch.Tensor) and sample.ndim == 1:
+            sample = sample.unsqueeze(0)
         input_names = ["features"]
         output_names = ["preds_flat"]
         dynamic_axes = (
             {"features": {0: "batch"}, "preds_flat": {0: "batch"}} if dynamic_batch else None
-        )
-        export_error = getattr(torch.onnx, "OnnxExporterError", RuntimeError)
-        fallback_errors = (
-            (RuntimeError,) if export_error is RuntimeError else (RuntimeError, export_error)
         )
         common_kwargs = {
             "export_params": True,
@@ -425,15 +433,67 @@ class _OnnxLayer:
             torch.onnx.export(wrapper, sample, str(onnx_path), **common_kwargs)
             return onnx_path
         params = sig.parameters
-        base_kwargs = {k: v for k, v in common_kwargs.items() if k in params}
         supports_dynamo = "dynamo" in params
+        base_kwargs = {k: v for k, v in common_kwargs.items() if k in params}
         if supports_dynamo:
+            base_kwargs_dynamo = {k: v for k, v in base_kwargs.items() if k != "dynamic_axes"}
+            base_kwargs_dynamo.pop("dynamic_shapes", None)
+            dyn_shapes = None
+            if (
+                dynamic_batch
+                and isinstance(sample, torch.Tensor)
+                and sample.ndim >= 2
+                and "dynamic_shapes" in params
+            ):
+                Dim = None
+                with contextlib.suppress(Exception):
+                    Dim = getattr(getattr(torch, "export", None), "Dim", None)
+                if Dim is not None:
+                    with contextlib.suppress(Exception):
+                        b = Dim("batch", min=1)
+                        dyn_shapes = {"features": {0: b}, "preds_flat": {0: b}}
+            dynamo_err = None
             try:
-                torch.onnx.export(wrapper, sample, str(onnx_path), dynamo=True, **base_kwargs)
-            except fallback_errors:
+                if dyn_shapes is not None:
+                    torch.onnx.export(
+                        wrapper,
+                        sample,
+                        str(onnx_path),
+                        dynamo=True,
+                        dynamic_shapes=dyn_shapes,
+                        **base_kwargs_dynamo,
+                    )
+                else:
+                    torch.onnx.export(
+                        wrapper,
+                        sample,
+                        str(onnx_path),
+                        dynamo=True,
+                        **base_kwargs_dynamo,
+                    )
+                return onnx_path
+            except Exception as exc:
+                dynamo_err = exc
+                if dyn_shapes is not None:
+                    try:
+                        torch.onnx.export(
+                            wrapper,
+                            sample,
+                            str(onnx_path),
+                            dynamo=True,
+                            **base_kwargs_dynamo,
+                        )
+                        return onnx_path
+                    except Exception as exc2:
+                        dynamo_err = exc2
+            try:
                 torch.onnx.export(wrapper, sample, str(onnx_path), dynamo=False, **base_kwargs)
-        else:
-            torch.onnx.export(wrapper, sample, str(onnx_path), **base_kwargs)
+                return onnx_path
+            except Exception as exc:
+                raise RuntimeError(
+                    f"ONNX export failed. dynamo={type(dynamo_err).__name__}: {dynamo_err}; legacy={type(exc).__name__}: {exc}"
+                ) from exc
+        torch.onnx.export(wrapper, sample, str(onnx_path), **base_kwargs)
         return onnx_path
 
     @staticmethod
@@ -609,13 +669,24 @@ class Export:
     _defaults_lock = threading.Lock()
     _OnnxLayer = _OnnxLayer
     _OrtLayer = _OrtLayer
+    _export_sig_cache: object | None = None
+    _export_sig_lock = threading.Lock()
 
-    @lru_cache(maxsize=1)
-    def _export_sig() -> object:
-        try:
-            return inspect.signature(torch.onnx.export)
-        except Exception:
-            return None
+    @classmethod
+    def _export_sig(cls) -> object:
+        cached = getattr(cls, "_export_sig_cache", None)
+        if cached is not None:
+            return cached
+        with cls._export_sig_lock:
+            cached = getattr(cls, "_export_sig_cache", None)
+            if cached is not None:
+                return cached
+            try:
+                sig = inspect.signature(torch.onnx.export)
+            except Exception:
+                sig = None
+            cls._export_sig_cache = sig
+            return sig
 
     @classmethod
     def register(cls, name: str, exts: tuple[str, ...], impl: Format) -> None:

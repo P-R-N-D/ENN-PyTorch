@@ -1860,15 +1860,34 @@ class Scaler(nn.Module):
         self.y_std.copy_(std)
         self._invalidate_stats_cache()
 
+    @staticmethod
+    def _is_compiling_or_tracing() -> bool:
+        with contextlib.suppress(Exception):
+            if torch.jit.is_tracing() or torch.jit.is_scripting():
+                return True
+        with contextlib.suppress(Exception):
+            if getattr(torch, "_dynamo", None) is not None and torch._dynamo.is_compiling():
+                return True
+        with contextlib.suppress(Exception):
+            if getattr(torch, "compiler", None) is not None and torch.compiler.is_compiling():
+                return True
+        with contextlib.suppress(Exception):
+            if getattr(torch, "onnx", None) is not None and hasattr(torch.onnx, "is_in_onnx_export"):
+                if torch.onnx.is_in_onnx_export():
+                    return True
+        return False
+
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
-        if x.numel() == 0:
-            return x
-        feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
-        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
-            raise RuntimeError(
-                "Scaler.normalize_x: feature dimension mismatch: "
-                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
-            )
+        compiling = self._is_compiling_or_tracing()
+        if not compiling:
+            if x.numel() == 0:
+                return x
+            feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
+            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+                raise RuntimeError(
+                    "Scaler.normalize_x: feature dimension mismatch: "
+                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+                )
         key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
         with self._stats_cache_lock:
             cached = self._x_stats_cache.get(key)
@@ -1884,19 +1903,25 @@ class Scaler(nn.Module):
         if x.dim() == 1:
             return (x - mean_b) / (std_b + self.eps)
         view_shape = [1] * (x.dim() - 1) + [-1]
-        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
-        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+        if compiling:
+            mean = mean_b.view(*view_shape)
+            std = std_b.view(*view_shape)
+        else:
+            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
         return (x - mean) / (std + self.eps)
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
-        if x_scaled.numel() == 0:
-            return x_scaled
-        feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
-        if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
-            raise RuntimeError(
-                "Scaler.denormalize_x: feature dimension mismatch: "
-                f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
-            )
+        compiling = self._is_compiling_or_tracing()
+        if not compiling:
+            if x_scaled.numel() == 0:
+                return x_scaled
+            feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
+            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+                raise RuntimeError(
+                    "Scaler.denormalize_x: feature dimension mismatch: "
+                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+                )
         key = (
             x_scaled.device.type,
             int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
@@ -1916,8 +1941,12 @@ class Scaler(nn.Module):
         if x_scaled.dim() == 1:
             return x_scaled * (std_b + self.eps) + mean_b
         view_shape = [1] * (x_scaled.dim() - 1) + [-1]
-        std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
-        mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+        if compiling:
+            std = std_b.view(*view_shape)
+            mean = mean_b.view(*view_shape)
+        else:
+            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
         return x_scaled * (std + self.eps) + mean
 
     def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1939,7 +1968,8 @@ class Scaler(nn.Module):
         return mean, std
 
     def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        if y.numel() == 0:
+        compiling = self._is_compiling_or_tracing()
+        if not compiling and y.numel() == 0:
             return y
         orig_shape = y.shape
         if y.dim() == 1:
@@ -1965,19 +1995,23 @@ class Scaler(nn.Module):
                 self._y_stats_cache[key] = (mean, std)
         else:
             mean, std = cached
-        if mean.numel() == 1 and std.numel() == 1:
-            z_flat = (y_flat - mean) / (std + self.eps)
-        else:
-            if y_flat.shape[1] != mean.numel():
-                raise RuntimeError(
-                    "Scaler.normalize_y: feature dimension mismatch: "
-                    f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
-                )
+        if compiling:
             z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
+        else:
+            if mean.numel() == 1 and std.numel() == 1:
+                z_flat = (y_flat - mean) / (std + self.eps)
+            else:
+                if y_flat.shape[1] != mean.numel():
+                    raise RuntimeError(
+                        "Scaler.normalize_y: feature dimension mismatch: "
+                        f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
+                    )
+                z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
         return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
 
     def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
-        if z.numel() == 0:
+        compiling = self._is_compiling_or_tracing()
+        if not compiling and z.numel() == 0:
             return z
         orig_shape = z.shape
         if z.dim() == 1:
@@ -2003,15 +2037,18 @@ class Scaler(nn.Module):
                 self._y_stats_cache[key] = (mean, std)
         else:
             mean, std = cached
-        if mean.numel() == 1 and std.numel() == 1:
-            y_flat = z_flat * std + mean
-        else:
-            if z_flat.shape[1] != mean.numel():
-                raise RuntimeError(
-                    "Scaler.denormalize_y: feature dimension mismatch: "
-                    f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
-                )
+        if compiling:
             y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
+        else:
+            if mean.numel() == 1 and std.numel() == 1:
+                y_flat = z_flat * std + mean
+            else:
+                if z_flat.shape[1] != mean.numel():
+                    raise RuntimeError(
+                        "Scaler.denormalize_y: feature dimension mismatch: "
+                        f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
+                    )
+                y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
         return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:

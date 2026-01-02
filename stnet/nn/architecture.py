@@ -95,6 +95,23 @@ _Int8WeightOnlyConfig: Any | None
 _PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
 
 
+def _is_export_or_trace() -> bool:
+    with contextlib.suppress(Exception):
+        if torch.jit.is_tracing() or torch.jit.is_scripting():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "_dynamo", None) is not None and torch._dynamo.is_compiling():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "compiler", None) is not None and torch.compiler.is_compiling():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "onnx", None) is not None and hasattr(torch.onnx, "is_in_onnx_export"):
+            if torch.onnx.is_in_onnx_export():
+                return True
+    return False
+
+
 @lru_cache(maxsize=1)
 def _dot_product_attention_cls() -> Any:
     try:
@@ -338,9 +355,9 @@ class SpatialExtractor(nn.Module):
         coords: torch.Tensor,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if is_meta_or_fake_tensor(x):
+        if is_meta_or_fake_tensor(x) and not _is_export_or_trace():
             raise RuntimeError("x is meta/fake before SpatialExtractor.forward")
-        if is_meta_or_fake_tensor(coords):
+        if is_meta_or_fake_tensor(coords) and not _is_export_or_trace():
             raise RuntimeError("coords is meta/fake before SpatialExtractor.forward")
         if x.dim() != 3:
             raise ValueError(
@@ -373,7 +390,7 @@ class SpatialExtractor(nn.Module):
         mask_scalar: torch.Tensor | None = None
         mask_base: torch.Tensor | None = None
         if attn_mask is not None:
-            if is_meta_or_fake_tensor(attn_mask):
+            if is_meta_or_fake_tensor(attn_mask) and not _is_export_or_trace():
                 raise RuntimeError("attn_mask is meta/fake before SpatialExtractor.forward")
             if attn_mask.device != x.device:
                 if int(attn_mask.dim()) == 0:

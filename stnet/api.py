@@ -350,28 +350,16 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
         rxm = last.get("reduced_x_mean")
         ryv = last.get("reduced_y_var")
         if rxm is not None and ryv is not None:
-            proc = int(
-                last.get(
-                    "reduced_n",
-                    last.get(
-                        "sampled_n",
-                        last.get("batch_size", 0),
-                    ),
-                )
-                or 0
-            )
-            if proc > 0:
-                return {
-                    "processed_n": float(proc),
-                    "sampled_x_mean": float(last.get("reduced_x_mean", 0.0)),
-                    "sampled_x_var": float(last.get("reduced_x_var", 0.0)),
-                    "sampled_x_min": float(last.get("reduced_x_min", float("inf"))),
-                    "sampled_x_max": float(last.get("reduced_x_max", float("-inf"))),
-                    "sampled_y_mean": float(last.get("reduced_y_mean", 0.0)),
-                    "sampled_y_var": float(last.get("reduced_y_var", 0.0)),
-                    "sampled_y_min": float(last.get("reduced_y_min", float("inf"))),
-                    "sampled_y_max": float(last.get("reduced_y_max", float("-inf"))),
-                }
+            return {
+                "sampled_x_mean": float(last.get("reduced_x_mean", 0.0)),
+                "sampled_x_var": float(last.get("reduced_x_var", 0.0)),
+                "sampled_x_min": float(last.get("reduced_x_min", float("inf"))),
+                "sampled_x_max": float(last.get("reduced_x_max", float("-inf"))),
+                "sampled_y_mean": float(last.get("reduced_y_mean", 0.0)),
+                "sampled_y_var": float(last.get("reduced_y_var", 0.0)),
+                "sampled_y_min": float(last.get("reduced_y_min", float("inf"))),
+                "sampled_y_max": float(last.get("reduced_y_max", float("-inf"))),
+            }
     total_bs = 0
     sum_x = 0.0
     sum_x2 = 0.0
@@ -411,7 +399,6 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     var_x = max(sum_x2 / total_bs - mean_x * mean_x, 0.0)
     var_y = max(sum_y2 / total_bs - mean_y * mean_y, 0.0)
     return {
-        "processed_n": float(total_bs),
         "sampled_x_mean": mean_x,
         "sampled_x_var": var_x,
         "sampled_x_min": x_min,
@@ -944,22 +931,30 @@ def train(
                     logger = getattr(model, "logger", None)
                     if isinstance(meta, dict):
                         setattr(model, "_train_history_meta", dict(meta))
-                    run_stats = (
-                        _reduce_batch_stats(records)
-                        if isinstance(records, list) and records
-                        else None
-                    )
+                    run_stats = _reduce_batch_stats(records) if isinstance(records, list) and records else None
+                    sampled_n = None
+                    if isinstance(meta, dict):
+                        with contextlib.suppress(Exception):
+                            sampled_n = int(meta.get("sampled_n")) if meta.get("sampled_n") is not None else None
+                    if sampled_n is None or sampled_n <= 0:
+                        try:
+                            e = int(meta.get("epochs")) if isinstance(meta, dict) and meta.get("epochs") is not None else int(epochs)
+                        except Exception:
+                            e = int(epochs)
+                        e = max(1, int(e))
+                        try:
+                            vf = float(meta.get("val_frac")) if isinstance(meta, dict) and meta.get("val_frac") is not None else float(val_frac)
+                        except Exception:
+                            vf = float(val_frac)
+                        vf = 0.0 if vf < 0.0 else 1.0 if vf > 1.0 else vf
+                        train_frac = max(0.0, min(1.0, 1.0 - vf))
+                        sampled_n = int(round(float(num_samples_dataset) * float(train_frac) * float(e)))
+                    if sampled_n is None or sampled_n <= 0:
+                        sampled_n = int(num_samples_dataset)
                     prev_total = int(getattr(model, "_history_total_samples", 0))
-                    inc_samples = (
-                        int(run_stats.get("processed_n", 0))
-                        if run_stats
-                        else int(num_samples_dataset)
-                    )
-                    if inc_samples <= 0:
-                        inc_samples = int(num_samples_dataset)
-                    new_total = prev_total + inc_samples
+                    new_total = prev_total + int(sampled_n)
                     prev_cum = getattr(model, "_history_cum_stats", None)
-                    cum_stats = _update_batch_stats(prev_cum, prev_total, run_stats, inc_samples)
+                    cum_stats = _update_batch_stats(prev_cum, prev_total, run_stats, int(sampled_n))
                     setattr(model, "_history_total_samples", new_total)
                     setattr(model, "_history_dataset_n", int(num_samples_dataset))
                     if cum_stats is not None:
@@ -968,14 +963,11 @@ def train(
                     run_index = len(run_hist_prev) if isinstance(run_hist_prev, list) else 0
                     run_record = {
                         "run_index": run_index,
-                        "dataset_n": int(num_samples_dataset),
-                        "processed_n": int(inc_samples),
-                        "reduced_n": new_total,
+                        "sampled_n": int(sampled_n),
+                        "reduced_n": int(new_total),
                     }
                     if run_stats is not None:
-                        for k, v in run_stats.items():
-                            if k != "processed_n":
-                                run_record[k] = v
+                        run_record.update(run_stats)
                     if cum_stats is not None:
                         run_record.update(cum_stats)
                     if isinstance(meta, dict) and meta:
