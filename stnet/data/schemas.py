@@ -148,7 +148,7 @@ def default_underflow_action() -> str:
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
 
 
-def normalize_underflow_action(value: object, *, default: str = "warn") -> str:
+def normalize_underflow_action(value: object, *args: Any, default: str = "warn") -> str:
     raw = str(value if value is not None else default).strip().lower()
     if raw in _DEF_UNDERFLOW_ACTIONS:
         return raw
