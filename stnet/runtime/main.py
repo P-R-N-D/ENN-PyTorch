@@ -537,7 +537,7 @@ def _is_scale_rate_logged(
         pass
 
 
-def _get_sampler_scaler(loader: object, *, max_depth: int = 4) -> object:
+def _get_sampler_scaler(loader: object, *args: Any, max_depth: int = 4) -> object:
     obj = loader
     try:
         depth = max(1, int(max_depth))
