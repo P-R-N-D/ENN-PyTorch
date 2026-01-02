@@ -160,13 +160,6 @@ class _CallableFuser:
 
 
 class _ProxyDecoder(nn.Module):
-    """
-    Lightweight wrapper used during export/compile paths.
-
-    We keep weak references to the normalization/head modules to avoid
-    unhashable proxy objects being inspected by torch.compile / torch.export
-    while still delegating the actual computation to the owning model.
-    """
     def __init__(self, norm: nn.Module, head: nn.Module, out_shape: Sequence[int]) -> None:
         super().__init__()
         self._norm_ref = weakref.ref(norm)
