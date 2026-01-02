@@ -1304,9 +1304,16 @@ def init_python_path() -> str:
 
 def optimal_start_method() -> str:
     current = torch.multiprocessing.get_start_method(allow_none=True)
-    if current is not None:
+    platform = sys.platform
+    if platform.startswith("win"):
+        candidates = ("spawn",)
+    elif platform.startswith(("darwin", "linux")):
+        candidates = ("forkserver", "spawn")
+    else:
+        candidates = ("spawn",)
+    if current in candidates:
         return str(current)
-    for method in ("forkserver", "spawn"):
+    for method in candidates:
         try:
             multiprocessing.get_context(method)
         except ValueError:
@@ -1318,17 +1325,25 @@ def optimal_start_method() -> str:
 def init_start_method() -> None:
     with contextlib.suppress(RuntimeError):
         torch.multiprocessing.set_sharing_strategy("file_system")
-    if torch.multiprocessing.get_start_method(allow_none=True) is not None:
+    existing = torch.multiprocessing.get_start_method(allow_none=True)
+    if existing is not None and existing != "fork":
         return
     last_error: Optional[BaseException] = None
-    for method in ("forkserver", "spawn"):
+    platform = sys.platform
+    if platform.startswith("win"):
+        candidates = ("spawn",)
+    elif platform.startswith(("darwin", "linux")):
+        candidates = ("forkserver", "spawn")
+    else:
+        candidates = ("spawn",)
+    for method in candidates:
         try:
             multiprocessing.get_context(method)
         except ValueError as exc:
             last_error = exc
             continue
         try:
-            for module in (multiprocessing, mp):
+            for module in (multiprocessing, torch.multiprocessing):
                 module.set_start_method(method, force=True)
         except (RuntimeError, ValueError) as exc:
             last_error = exc

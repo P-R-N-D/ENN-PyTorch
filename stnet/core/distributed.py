@@ -591,6 +591,7 @@ def get_world_size(device: Optional[torch.device] = None) -> int:
             return max(1, min(int(ncpu), 4))
 
 
+@contextlib.contextmanager
 def no_sync(
     model: torch.nn.Module,
     *args: Any,

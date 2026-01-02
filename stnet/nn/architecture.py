@@ -23,6 +23,7 @@ from typing import (
 
 import torch
 import torch.nn as nn
+from tensordict import TensorDictBase
 
 from ..config import ModelConfig
 from ..core.casting import env_first_int, env_int

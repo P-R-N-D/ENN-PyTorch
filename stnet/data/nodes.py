@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import collections.abc
+import contextlib
+import json
 import logging
 import math
 import multiprocessing
@@ -801,7 +803,7 @@ class RuntimeIO:
                         fx_stats = fx_stats.to(dtype=torch.float64)
                     torch.sum(fx_stats, dim=0, out=x_tmp)
                     x_sum.add_(x_tmp)
-                    x2_tmultiprocessing.copy_(torch.einsum("ni,ni->i", fx_stats, fx_stats))
+                    x2_tmp.copy_(torch.einsum("ni,ni->i", fx_stats, fx_stats))
                     x_sum_sq.add_(x2_tmp)
                     if x_min is not None and x_max is not None and x_min_tmp is not None and x_max_tmp is not None:
                         torch.amin(fx_stats, dim=0, out=x_min_tmp)
@@ -853,7 +855,7 @@ class RuntimeIO:
                                 lb_stats = lb_stats.to(dtype=torch.float64)
                             torch.sum(lb_stats, dim=0, out=y_tmp)
                             y_sum.add_(y_tmp)
-                            y2_tmultiprocessing.copy_(torch.einsum("ni,ni->i", lb_stats, lb_stats))
+                            y2_tmp.copy_(torch.einsum("ni,ni->i", lb_stats, lb_stats))
                             y_sum_sq.add_(y2_tmp)
                             if y_min is not None and y_max is not None and y_min_tmp is not None and y_max_tmp is not None:
                                 torch.amin(lb_stats, dim=0, out=y_min_tmp)
@@ -1000,84 +1002,98 @@ class RuntimeIO:
         return raw if isinstance(raw, dict) else {}
 
     @staticmethod
-    def merge_meta_dicts(metas: list[dict]) -> Dict[str, Any]:
-        if not metas:
+    def merge_meta_info(metas: Any) -> Dict[str, Any]:
+        def _merge_dicts(items: list[dict]) -> Dict[str, Any]:
+            if not items:
+                return {}
+            base = dict(items[0])
+            feature_dim = base.get("feature_dim")
+            label_shape = base.get("label_shape")
+
+            has_scale = _meta_has_scale(base)
+            has_nonfinite = bool(base.get("has_nonfinite", False))
+            max_abs = base.get("scale_max_abs")
+            min_val = base.get("scale_min_value")
+            max_val = base.get("scale_max_value")
+            min_pos = base.get("scale_min_positive")
+            is_integral = base.get("scale_is_integral")
+            is_negotiable = base.get("is_negotiable")
+            underflow_action = base.get("underflow_action")
+
+            for m in items[1:]:
+                if feature_dim is not None and m.get("feature_dim") is not None:
+                    if int(m.get("feature_dim")) != int(feature_dim):
+                        raise ValueError(
+                            f"feature_dim mismatch across sources: {feature_dim} vs {m.get('feature_dim')}"
+                        )
+                if label_shape is not None and m.get("label_shape") is not None:
+                    if tuple(m.get("label_shape")) != tuple(label_shape):
+                        raise ValueError(
+                            f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}"
+                        )
+
+                has_scale = has_scale or _meta_has_scale(m)
+                has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
+
+                a = m.get("scale_max_abs")
+                if a is not None:
+                    max_abs = a if max_abs is None else max(float(max_abs), float(a))
+
+                mn = m.get("scale_min_value")
+                if mn is not None:
+                    try:
+                        min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
+                    except Exception:
+                        min_val = mn if min_val is None else min(float(min_val), float(mn))
+
+                mx = m.get("scale_max_value")
+                if mx is not None:
+                    try:
+                        max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
+                    except Exception:
+                        max_val = mx if max_val is None else max(float(max_val), float(mx))
+
+                p = m.get("scale_min_positive")
+                if p is not None:
+                    min_pos = p if min_pos is None else min(float(min_pos), float(p))
+
+                i = m.get("scale_is_integral")
+                if i is not None:
+                    is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
+
+                n = m.get("is_negotiable")
+                if n is not None:
+                    is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
+
+                underflow_action = _strictest_underflow_action(
+                    str(underflow_action) if underflow_action is not None else None,
+                    str(m.get("underflow_action")) if m.get("underflow_action") is not None else None,
+                )
+
+            base["has_scale"] = bool(has_scale)
+            base["has_nonfinite"] = bool(has_nonfinite)
+            base["scale_max_abs"] = max_abs
+            base["scale_min_value"] = min_val
+            base["scale_max_value"] = max_val
+            base["scale_min_positive"] = min_pos
+            base["scale_is_integral"] = is_integral
+            base["is_negotiable"] = is_negotiable
+            base["underflow_action"] = underflow_action
+            return base
+
+        if metas is None:
             return {}
-
-        base = dict(metas[0])
-        feature_dim = base.get("feature_dim")
-        label_shape = base.get("label_shape")
-
-        has_scale = _meta_has_scale(base)
-        has_nonfinite = bool(base.get("has_nonfinite", False))
-        max_abs = base.get("scale_max_abs")
-        min_val = base.get("scale_min_value")
-        max_val = base.get("scale_max_value")
-        min_pos = base.get("scale_min_positive")
-        is_integral = base.get("scale_is_integral")
-        is_negotiable = base.get("is_negotiable")
-        underflow_action = base.get("underflow_action")
-
-        for m in metas[1:]:
-            if feature_dim is not None and m.get("feature_dim") is not None:
-                if int(m.get("feature_dim")) != int(feature_dim):
-                    raise ValueError(
-                        f"feature_dim mismatch across sources: {feature_dim} vs {m.get('feature_dim')}"
-                    )
-            if label_shape is not None and m.get("label_shape") is not None:
-                if tuple(m.get("label_shape")) != tuple(label_shape):
-                    raise ValueError(
-                        f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}"
-                    )
-
-            has_scale = has_scale or _meta_has_scale(m)
-            has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
-
-            a = m.get("scale_max_abs")
-            if a is not None:
-                max_abs = a if max_abs is None else max(float(max_abs), float(a))
-
-            mn = m.get("scale_min_value")
-            if mn is not None:
-                try:
-                    min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
-                except Exception:
-                    min_val = mn if min_val is None else min(float(min_val), float(mn))
-
-            mx = m.get("scale_max_value")
-            if mx is not None:
-                try:
-                    max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
-                except Exception:
-                    max_val = mx if max_val is None else max(float(max_val), float(mx))
-
-            p = m.get("scale_min_positive")
-            if p is not None:
-                min_pos = p if min_pos is None else min(float(min_pos), float(p))
-
-            i = m.get("scale_is_integral")
-            if i is not None:
-                is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
-
-            n = m.get("is_negotiable")
-            if n is not None:
-                is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
-
-            underflow_action = _strictest_underflow_action(
-                str(underflow_action) if underflow_action is not None else None,
-                str(m.get("underflow_action")) if m.get("underflow_action") is not None else None,
-            )
-
-        base["has_scale"] = bool(has_scale)
-        base["has_nonfinite"] = bool(has_nonfinite)
-        base["scale_max_abs"] = max_abs
-        base["scale_min_value"] = min_val
-        base["scale_max_value"] = max_val
-        base["scale_min_positive"] = min_pos
-        base["scale_is_integral"] = is_integral
-        base["is_negotiable"] = is_negotiable
-        base["underflow_action"] = underflow_action
-        return base
+        if isinstance(metas, list) and metas and isinstance(metas[0], dict):
+            return _merge_dicts(metas)
+        collected: list[dict] = []
+        for path in RuntimeIO.iter_source_path(metas):
+            try:
+                meta = RuntimeIO.from_meta(path)
+            except Exception:
+                meta = None
+            if isinstance(meta, dict):
+                collected.append(meta)
+        return _merge_dicts(collected)
 
     @staticmethod
     def load_scaler_stats(sources: Any) -> Optional[Dict[str, Any]]:

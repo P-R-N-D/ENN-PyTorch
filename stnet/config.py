@@ -151,6 +151,25 @@ def _coerce_int_sequence(
         raise TypeError(f"{name} must be a sequence of integers, got {xs!r}") from exc
 
 
+def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
+    if not out_shape:
+        raise ValueError("RuntimeConfig.out_shape must be a non-empty sequence")
+    ndim = len(out_shape)
+    if ndim == 1:
+        return out_shape
+    if ndim == 2:
+        if out_shape[0] != out_shape[1]:
+            raise ValueError(f"RuntimeConfig.out_shape 2D must be square: got {tuple(out_shape)}")
+        return out_shape
+    if ndim == 3:
+        if not (out_shape[0] == out_shape[1] == out_shape[2]):
+            raise ValueError(f"RuntimeConfig.out_shape 3D must be cubic: got {tuple(out_shape)}")
+        return out_shape
+    raise ValueError(
+        f"RuntimeConfig.out_shape must be 1D, 2D square, or 3D cube; got rank {ndim} ({tuple(out_shape)})"
+    )
+
+
 def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[torch.device]:
     if value is None:
         return None
@@ -234,14 +253,10 @@ def coerce_patch_config(config: PatchConfig | Dict[str, Any] | None) -> PatchCon
         if patch_size_2d is None:
             raise ValueError("patch_size_2d is required when is_square is True")
         _validate_equal_dims(patch_size_2d, dims=2, name="patch_size_2d")
-        if grid_size_2d is not None:
-            _validate_equal_dims(grid_size_2d, dims=2, name="grid_size_2d")
     if is_cube:
         if patch_size_3d is None:
             raise ValueError("patch_size_3d is required when is_cube is True")
         _validate_equal_dims(patch_size_3d, dims=3, name="patch_size_3d")
-        if grid_size_3d is not None:
-            _validate_equal_dims(grid_size_3d, dims=3, name="grid_size_3d")
     return PatchConfig(
         is_square=is_square,
         patch_size_1d=patch_size_1d,
@@ -1026,9 +1041,9 @@ class RuntimeConfig:
             if k not in data or data[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
         in_dim = _coerce_int(data["in_dim"], name="in_dim", minimum=1)
-        out_shape = _coerce_int_sequence(data["out_shape"], name="out_shape", minimum=1)
-        if not out_shape:
-            raise ValueError("RuntimeConfig.out_shape must be a non-empty sequence")
+        out_shape = _validate_out_shape_dims(
+            _coerce_int_sequence(data["out_shape"], name="out_shape", minimum=1)
+        )
         cfg_obj = data["cfg_dict"]
         if isinstance(cfg_obj, dict):
             cfg_dict: Dict[str, Any] = cfg_obj

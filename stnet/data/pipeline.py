@@ -769,6 +769,7 @@ def _fetch_build_datasets(
     val_frac: float,
     sampler_scale: "BatchScaler",
     allocated: "Disposable",
+    collect_epochables: bool = False,
     epochables: Optional[list[Any]] = None,
 ) -> Dict[str, "Sampler"]:
     out: Dict[str, "Sampler"] = {}
@@ -776,7 +777,7 @@ def _fetch_build_datasets(
         ds = dataset(spec, split=split, val_frac=val_frac, sampler_scale=sampler_scale)
         allocated.add(ds)
         out[str(k)] = ds
-        if epochables is not None:
+        if collect_epochables and epochables is not None:
             epochables.append(ds)
     return out
 
