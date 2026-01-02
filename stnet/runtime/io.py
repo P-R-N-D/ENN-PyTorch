@@ -1011,7 +1011,12 @@ class TorchScript(Format):
                 if sample is None:
                     sample = _pad_sample(serving_model, None)
                 with inference_mode(wrapper):
-                    scripted = torch.jit.trace(wrapper, sample)
+                    scripted = torch.jit.trace(
+                        wrapper,
+                        sample,
+                        check_trace=False,
+                        strict=False,
+                    )
             else:
                 with inference_mode(wrapper):
                     scripted = torch.jit.script(wrapper)

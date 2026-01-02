@@ -53,11 +53,15 @@ intel_ai = ["intel-extension-for-pytorch>=2.7.0"]
 deployment = [
   "onnx>=1.18.0",
   "onnxruntime>=1.18.0",
-  "onnx-tf>=1.10.0",
-  "onnx2tf>=1.27.2",
+]
+deployment_full = [
+  "onnx>=1.18.0",
+  "onnxruntime>=1.18.0",
+  "onnx-tf>=1.10.0; python_version<'3.13'",
+  "onnx2tf>=1.27.2; python_version<'3.13'",
   "coremltools>=8.3.0; platform_system=='Darwin'",
   "tensorrt>=10.10.0.31; platform_system=='Linux'",
-  "executorch>=0.6.0",
+  "executorch>=0.6.0; platform_system=='Linux' and python_version<'3.12'",
 ]
 # NVML telemetry (optional)
 # Note: the *module* used by this project is `pynvml`, but the recommended PyPI

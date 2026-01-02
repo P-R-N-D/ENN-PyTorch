@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import contextlib
 from typing import Any, Callable, List, Optional, Tuple, Union, cast
 
 import torch
@@ -129,6 +130,19 @@ def _serialize_z_index(
     shift_order: bool,
     block_index: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # During export/tracing, avoid Morton bit ops (unsupported in some backends).
+    export_safe = False
+    with contextlib.suppress(Exception):
+        if torch.onnx.is_in_onnx_export():
+            export_safe = True
+    with contextlib.suppress(Exception):
+        if torch.jit.is_tracing():
+            export_safe = True
+    if export_safe:
+        B, N, _ = coords.shape
+        perm = torch.arange(N, device=coords.device).expand(B, N)
+        invperm = perm.clone()
+        return perm, invperm
     coords01 = _norm_vector(coords)
     keys = _to_z_index(coords01, bits=bits)
     perm = keys.argsort(dim=-1, stable=True)

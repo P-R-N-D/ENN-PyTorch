@@ -743,6 +743,26 @@ def _fetch_iterate_sample(
     datasets: Mapping[str, "Sampler"],
     collate: Callable[[Any], Any],
 ) -> Any:
+    # Handle pre-batched sampler outputs produced by torchdata's Batcher
+    # (common in newer torchdata versions). Each element is a (key, span)
+    # tuple pointing to a dataset shard; fetch and collate into a proper batch.
+    if isinstance(sample, (list, tuple)) and sample and all(
+        isinstance(elem, tuple) and len(elem) == 2 for elem in sample
+    ):
+        batches: list[Any] = []
+        for k, span in sample:
+            ds = datasets.get(str(k))
+            if ds is None:
+                continue
+            s, e = int(span[0]), int(span[1])
+            batch = ds.get(s, e)
+            if batch is not None:
+                batches.append(batch)
+        if not batches:
+            return None
+        if len(batches) == 1:
+            return collate(batches[0])
+        return collate(batches)
     if isinstance(sample, tuple) and len(sample) == 2:
         k, span = sample
         ds = datasets.get(str(k))
