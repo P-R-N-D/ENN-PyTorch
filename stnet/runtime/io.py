@@ -41,6 +41,9 @@ _IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
     "TypedStorage is deprecated. It will be removed in the future",
 )
 
+_FORWARD_PARAM_CACHE: dict[object, object] = {}
+_FORWARD_PARAM_CACHE_LOCK = threading.Lock()
+
 _SAVE_LOCK_GUARD = threading.Lock()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 
@@ -114,7 +117,7 @@ def _dist_barrier() -> None:
 
 
 @contextlib.contextmanager
-def _save_sync(path: PathLike | None = None, *, barrier: bool = False) -> None:
+def _save_sync(path: PathLike | None = None, *args: Any, barrier: bool = False) -> None:
     with _save_lock(path):
         if barrier:
             _dist_barrier()
@@ -283,9 +286,6 @@ def _extract_tensor(out: object) -> torch.Tensor:
                 return v
     raise RuntimeError("Model forward did not return a tensor output.")
 
-
-_FORWARD_PARAM_CACHE: dict[object, object] = {}
-_FORWARD_PARAM_CACHE_LOCK = threading.Lock()
 
 def _get_forward_parameters(model_cls: object) -> object:
     with _FORWARD_PARAM_CACHE_LOCK:
