@@ -14,6 +14,12 @@ import torch
 from torch import nn
 
 try:
+    from torch._ops import OpOverload, OpOverloadPacket
+except Exception:  # pragma: no cover - guard for older torch versions
+    OpOverload = tuple()  # type: ignore
+    OpOverloadPacket = tuple()  # type: ignore
+
+try:
     from torch.utils._python_dispatch import TorchDispatchMode
 except Exception:
     TorchDispatchMode = None
@@ -58,6 +64,30 @@ def _prod_int(xs: Sequence[int]) -> int:
     for v in xs:
         p *= int(v)
     return int(p)
+
+
+try:
+    from torch._ops import OpOverload, OpOverloadPacket
+except Exception:  # pragma: no cover - guard for older torch versions
+    OpOverload = tuple()  # type: ignore
+    OpOverloadPacket = tuple()  # type: ignore
+
+
+def _coerce(obj: Any) -> Any:
+    if obj is None:
+        return None
+    with contextlib.suppress(Exception):
+        if isinstance(obj, OpOverload):
+            return obj
+        if isinstance(obj, OpOverloadPacket):
+            default_overload = getattr(obj, "default", None)
+            if default_overload is not None:
+                return default_overload
+    with contextlib.suppress(Exception):
+        default_overload = getattr(obj, "default", None)
+        if default_overload is not None:
+            return default_overload
+    return obj
 
 
 def _get_forward(out: Any) -> Optional[torch.Tensor]:
@@ -859,6 +889,7 @@ class _TensorShape:
         return int(n)
 
 
+@dataclass
 class _Acc:
     total: float = 0.0
     by_type: Dict[str, float] = field(default_factory=dict)

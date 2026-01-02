@@ -682,7 +682,7 @@ class DotProductAttention(nn.Module):
                 fm = fm.to(device=q_bhsd.device, non_blocking=True)
             else:
                 fm = fm.to(device=q_bhsd.device, dtype=q_bhsd.dtype, non_blocking=True)
-            fm, batch_dim, head_count, _qdim = _flatten_attn_mask4(
+            fm, batch_dim, head_count, _qdim = _flatten_attn_mask(
                 fm,
                 device=q_bhsd.device,
                 B=B,

@@ -284,7 +284,7 @@ def _save_dataset(
         count = int(td.batch_size[0])
         if count <= 0:
             raise ValueError("Empty TensorDict provided to train().")
-        in_dim, label_shape = RuntimeIO.write_memmap_streaming_two_pass(
+        in_dim, label_shape = RuntimeIO.stream_memmap(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -307,7 +307,7 @@ def _save_dataset(
         count, _get_batch = RuntimeIO.column_cursor(d)
         if count <= 0:
             raise ValueError("Empty dataset provided to train().")
-        in_dim, label_shape = RuntimeIO.write_memmap_streaming_two_pass(
+        in_dim, label_shape = RuntimeIO.stream_memmap(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -345,6 +345,33 @@ def _save_dataset(
 def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     if not isinstance(recs, list) or not recs:
         return None
+    last = recs[-1]
+    if isinstance(last, Mapping):
+        rxm = last.get("reduced_x_mean")
+        ryv = last.get("reduced_y_var")
+        if rxm is not None and ryv is not None:
+            proc = int(
+                last.get(
+                    "reduced_n",
+                    last.get(
+                        "sampled_n",
+                        last.get("batch_size", 0),
+                    ),
+                )
+                or 0
+            )
+            if proc > 0:
+                return {
+                    "processed_n": float(proc),
+                    "sampled_x_mean": float(last.get("reduced_x_mean", 0.0)),
+                    "sampled_x_var": float(last.get("reduced_x_var", 0.0)),
+                    "sampled_x_min": float(last.get("reduced_x_min", float("inf"))),
+                    "sampled_x_max": float(last.get("reduced_x_max", float("-inf"))),
+                    "sampled_y_mean": float(last.get("reduced_y_mean", 0.0)),
+                    "sampled_y_var": float(last.get("reduced_y_var", 0.0)),
+                    "sampled_y_min": float(last.get("reduced_y_min", float("inf"))),
+                    "sampled_y_max": float(last.get("reduced_y_max", float("-inf"))),
+                }
     total_bs = 0
     sum_x = 0.0
     sum_x2 = 0.0
@@ -446,6 +473,50 @@ def _coerce_path(path: PathLike) -> Optional[PathLike]:
     if p.lower() in ("none", "null", "nil"):
         return None
     return os.path.abspath(os.path.expanduser(p))
+
+
+def _coerce_prediction_output(output: object) -> str:
+    if isinstance(output, str):
+        out = output.strip().lower()
+        if out in {"file", "disk", "lazy", "h5", "hdf5"}:
+            return "file"
+    return "memory"
+
+
+def _coerce_prediction_overwrite(overwrite: object) -> str:
+    if isinstance(overwrite, str):
+        ow = overwrite.strip().lower()
+        if ow in {"replace", "overwrite", "force"}:
+            return "replace"
+        if ow in {"ignore", "skip"}:
+            return "ignore"
+    return "error"
+
+
+def _coerce_prediction_path(path: PathLike, *, run_id: str) -> Optional[str]:
+    p = Path(str(path))
+    if p.suffix.lower() in {".h5", ".hdf5"}:
+        return os.fspath(p)
+    if p.is_dir():
+        return os.fspath(p / f"{run_id}.h5")
+    return None
+
+
+def _is_path_writable(path: PathLike) -> bool:
+    try:
+        p = Path(path)
+        if p.is_dir():
+            p.mkdir(parents=True, exist_ok=True)
+            probe = p / ".stnet_probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink(missing_ok=True)
+            return True
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(p, "a", encoding="utf-8"):
+            pass
+        return True
+    except Exception:
+        return False
 
 
 def _get_prediction_dtype(
@@ -777,9 +848,7 @@ def train(
             raise RuntimeError("no training data provided to train()")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            RuntimeIO.atomic_write_json(
-                os.path.join(memmap_dir, "multinode.json"), payload, indent=None
-            )
+            RuntimeIO.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
         ckpt_dir = new_dir("ckpt_dcp")
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
@@ -1024,7 +1093,7 @@ def predict(
                 if count <= 0:
                     raise ValueError("predict: empty input")
                 get_batch = _TensorDictSliceGetter(data)
-                in_dim, _ = RuntimeIO.write_memmap_streaming_two_pass(
+                in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1068,7 +1137,7 @@ def predict(
                     except Exception:
                         const_items[k] = v
                 get_batch = _MappingSliceGetter(const_items, tuple(slice_items))
-                in_dim, _ = RuntimeIO.write_memmap_streaming_two_pass(
+                in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1086,7 +1155,7 @@ def predict(
                 count, get_batch = RuntimeIO.column_cursor(data)
                 if int(count) <= 0:
                     raise ValueError("predict: empty input")
-                in_dim, _ = RuntimeIO.write_memmap_streaming_two_pass(
+                in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1120,7 +1189,7 @@ def predict(
 
                     return {"features": sl}
 
-                in_dim, _ = RuntimeIO.write_memmap_streaming_two_pass(
+                in_dim, _ = RuntimeIO.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),

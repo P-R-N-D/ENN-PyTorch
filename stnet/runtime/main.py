@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import random
+import platform
 import socket
 import logging
 import math
@@ -71,6 +72,7 @@ from ..core.system import (
     set_accelerator_index,
     set_accelerator_seed,
     sync_accelerator,
+    posix_time,
 )
 from ..core.casting import (
     env_bool,
@@ -86,6 +88,8 @@ from ..core.staging import Cache, Pool
 from ..core.distributed import (
     distributed_barrier,
     distributed_sync,
+    joining,
+    no_sync,
     get_world_size,
     is_distributed,
     to_ddp,
@@ -94,11 +98,13 @@ from ..core.distributed import (
 from ..core.graph import (
     inference_mode,
     compile_safe,
-    compile_distributed_safe
+    compile_distributed_safe,
+    cudagraph_mark_step_begin,
 )
+from ..core.profiler import FlopCounter
 from ..core.precision import Autocast, PrecisionPolicy
 from ..nn.architecture import Model, ModelPolicy
-from ..nn.primitives import resize_scaler_buffer
+from ..nn.primitives import Recorder, resize_scaler_buffer
 from ..core.losses import (
     CRPSLoss,
     DataFidelityLoss,
@@ -2786,6 +2792,8 @@ def epochs(
             if torch_prof is not None:
                 with contextlib.suppress(Exception):
                     torch_prof.start()
+        flop_counter_train = FlopCounter(model, mode="train", device=device)
+        flop_counter_val = FlopCounter(model, mode="eval", device=device) if val_loader is not None else None
         for epoch_idx in range(int(total_epochs)):
             with contextlib.suppress(Exception):
                 epochables = getattr(train_loader, "_stnet_epochables", None)
@@ -2810,7 +2818,6 @@ def epochs(
             io_bytes = 0.0
             flops = 0.0
             train_samples_epoch = 0.0
-            flop_counter_train = FlopCounter(model, mode="train", device=device)
             with flop_counter_train:
                 model.train()
                 train_pg = _validate_distributed_group(meta, model) if is_distributed() else None
@@ -3148,8 +3155,7 @@ def epochs(
                 lw_top_sum = None
                 lw_bottom_sum = None
                 lw_count = 0
-            if val_loader is not None:
-                flop_counter_val = FlopCounter(model, mode="eval", device=device)
+            if val_loader is not None and flop_counter_val is not None:
                 with flop_counter_val:
                     model.eval()
                     with inference_mode(model), Autocast.float(device):
@@ -3552,7 +3558,7 @@ def epochs(
                         "backends": list(hist.backends),
                     }
                     payload = {"meta": meta, "records": records}
-                    RuntimeIO.atomic_write_json(history_path, payload, indent=2)
+                    RuntimeIO.write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:
@@ -3845,7 +3851,7 @@ def infer(
                 "parts": parts,
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
-            RuntimeIO.atomic_write_json(man_path, manifest, indent=2)
+            RuntimeIO.write_json(man_path, manifest, indent=2)
         if exc_type is None:
             with contextlib.suppress(Exception):
                 distributed_barrier(device)
@@ -3951,10 +3957,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Dataset.for_device(device)
-        expanded_sources = RuntimeIO.expand_sources(ops.sources)
+        expanded_sources = RuntimeIO.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        meta_info = RuntimeIO.merge_meta_infos(ops.sources)
+        meta_info = RuntimeIO.merge_meta_info(ops.sources)
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(
@@ -4182,7 +4188,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         raw_val_loader = None
         session = None
         try:
-            expanded_sources = RuntimeIO.expand_sources(ops.sources)
+            expanded_sources = RuntimeIO.expand_source(ops.sources)
             if expanded_sources is not ops.sources:
                 ops = replace(ops, sources=expanded_sources)
             accelerator_types = {"cuda", "xpu", "mps"}
@@ -4338,7 +4344,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                         else {},
                         "val": raw_val_loader.state_dict() if raw_val_loader is not None else {},
                     }
-                    RuntimeIO.atomic_write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
+                    RuntimeIO.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -4415,7 +4421,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             _get_sample_size(
                 model=model, device=device, ops=ops, dataset=metadata, with_backward=False
             )
-        expanded_sources = RuntimeIO.expand_sources(ops.sources)
+        expanded_sources = RuntimeIO.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
         session = None
