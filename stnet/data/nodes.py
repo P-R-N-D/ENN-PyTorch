@@ -245,7 +245,7 @@ def _preload_len0(obj: Any) -> int:
         return int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
 
 
-def _preload_slice_any(obj: Any, s: int, e: int, *, name: str) -> Any:
+def _preload_slice_any(obj: Any, s: int, e: int, *args: Any, name: str) -> Any:
     if obj is None:
         return None
     s_i = int(s)
@@ -264,7 +264,7 @@ def _preload_slice_any(obj: Any, s: int, e: int, *, name: str) -> Any:
         raise TypeError(f"Object {name} does not support slicing [{s_i}:{e_i}]") from ex
 
 
-def _preload_gather_any(obj: Any, idx: torch.Tensor, *, name: str) -> Any:
+def _preload_gather_any(obj: Any, idx: torch.Tensor, *args: Any, name: str) -> Any:
     if obj is None:
         return None
     idx_cpu = RuntimeIO._idx_to_cpu_int64(idx)
@@ -286,7 +286,7 @@ def _preload_gather_any_preconverted(
     obj: Any,
     idx_cpu: torch.Tensor,
     idx_np: Any,
-    *,
+    *args: Any,
     name: str,
 ) -> Any:
     if obj is None:
@@ -329,7 +329,7 @@ def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.dev
 class _RowSlicer:
     __slots__ = ("raw_X", "raw_Y", "features_only")
 
-    def __init__(self, raw_X: Any, raw_Y: Any, *, features_only: bool) -> None:
+    def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
         self.raw_X = raw_X
         self.raw_Y = raw_Y
         self.features_only = bool(features_only)
@@ -344,7 +344,7 @@ class _RowSlicer:
 class _RowIndexer:
     __slots__ = ("raw_X", "raw_Y", "features_only")
 
-    def __init__(self, raw_X: Any, raw_Y: Any, *, features_only: bool) -> None:
+    def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
         self.raw_X = raw_X
         self.raw_Y = raw_Y
         self.features_only = bool(features_only)
@@ -444,7 +444,7 @@ class RuntimeIO:
         return False
 
     @staticmethod
-    def _resolve_memmap_store_float(*, negotiable: bool) -> torch.dtype:
+    def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
         req = str(env_str("STNET_MEMMAP_FLOAT_DTYPE") or "").strip()
         if req.startswith("torch."):
             req = req.split(".", 1)[1]
@@ -926,7 +926,7 @@ class RuntimeIO:
     @staticmethod
     def preload_memmap(
         data: Mapping[str, Any],
-        *,
+        *args: Any,
         memmap_dir: str,
         val_frac: float = 0.0,
         shuffle: bool = False,
@@ -1443,7 +1443,7 @@ class RuntimeIO:
         dst: object,
         rows_t: torch.Tensor,
         preds_t: torch.Tensor,
-        *,
+        *args: Any,
         count: int,
     ) -> None:
         if preds_t.shape[0] != rows_t.shape[0]:
@@ -1472,7 +1472,7 @@ class RuntimeIO:
         dset_Y: object,
         rows_t: torch.Tensor,
         preds_np: object,
-        *,
+        *args: Any,
         count: int,
     ) -> None:
         is_contig, start, end = RuntimeIO._validate_row_contiguity(rows_t)
@@ -1837,7 +1837,7 @@ class Disposable:
 class BatchScaler:
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
-    def __init__(self, scale: float = 1.0, *, min_scale: float = 0.5, max_scale: float = 2.0) -> None:
+    def __init__(self, scale: float = 1.0, *args: Any, min_scale: float = 0.5, max_scale: float = 2.0) -> None:
         self._min_scale = float(min_scale)
         self._max_scale = float(max_scale)
         self._v = multiprocessing.Value("d", 1.0, lock=True)
