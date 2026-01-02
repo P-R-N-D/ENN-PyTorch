@@ -486,6 +486,8 @@ def _coerce_prediction_output(output: object) -> str:
 def _coerce_prediction_overwrite(overwrite: object) -> str:
     if isinstance(overwrite, str):
         ow = overwrite.strip().lower()
+        if ow == "resume":
+            return "resume"
         if ow in {"replace", "overwrite", "force"}:
             return "replace"
         if ow in {"ignore", "skip"}:
