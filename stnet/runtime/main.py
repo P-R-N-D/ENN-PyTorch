@@ -108,7 +108,7 @@ from .losses import (
     TiledLoss,
 )
 from .optimizers import SWALR, AdamW, stochastic_weight_average
-from ..data.nodes import RuntimeIO
+from ..data.nodes import Storage
 from ..data.pipeline import (
     Dataset,
     get_row
@@ -2512,7 +2512,7 @@ def epochs(
         y_q_samples = None
         scaler_stats = None
         with contextlib.suppress(Exception):
-            scaler_stats = RuntimeIO.load_scaler_stats(ops.sources)
+            scaler_stats = Storage.load_scaler_stats(ops.sources)
         if scaler_stats is not None:
             used_memmap_stats = True
             x_count = int(scaler_stats.get("train_count") or 0)
@@ -3594,7 +3594,7 @@ def epochs(
                         "backends": list(hist.backends),
                     }
                     payload = {"meta": meta, "records": records}
-                    RuntimeIO.write_json(history_path, payload, indent=2)
+                    Storage.write_json(history_path, payload, indent=2)
             except Exception:
                 pass
     except Exception:
@@ -3883,7 +3883,7 @@ def infer(
                 pred_pt = base + "-pred.pt"
                 if os.path.exists(pred_mmt):
                     pred_path = pred_mmt
-                    meta_path = RuntimeIO.mmt_meta_path(pred_mmt)
+                    meta_path = Storage.mmt_meta_path(pred_mmt)
                     if not os.path.exists(meta_path):
                         raise RuntimeError(
                             f"infer: missing pred meta for memmap part: {pred_mmt} -> {meta_path}"
@@ -3907,7 +3907,7 @@ def infer(
                 "parts": parts,
             }
             man_path = os.path.join(chunk_dir, "manifest.json")
-            RuntimeIO.write_json(man_path, manifest, indent=2)
+            Storage.write_json(man_path, manifest, indent=2)
         if exc_type is None:
             with contextlib.suppress(Exception):
                 distributed_barrier(device)
@@ -4013,10 +4013,10 @@ def process(*args: Any, **kwargs: Any) -> object:
         if ops.sources is None:
             raise RuntimeError("RuntimeConfig.sources is required but None")
         metadata = Dataset.for_device(device)
-        expanded_sources = RuntimeIO.expand_source(ops.sources)
+        expanded_sources = Storage.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
-        meta_info = RuntimeIO.merge_meta_info(ops.sources)
+        meta_info = Storage.merge_meta_info(ops.sources)
         meta_feature_dim = int(meta_info.get("feature_dim", ops.in_dim))
         if meta_feature_dim != int(ops.in_dim):
             raise RuntimeError(
@@ -4227,7 +4227,7 @@ def process(*args: Any, **kwargs: Any) -> object:
         raw_val_loader = None
         session = None
         try:
-            expanded_sources = RuntimeIO.expand_source(ops.sources)
+            expanded_sources = Storage.expand_source(ops.sources)
             if expanded_sources is not ops.sources:
                 ops = replace(ops, sources=expanded_sources)
             accelerator_types = {"cuda", "xpu", "mps"}
@@ -4383,7 +4383,7 @@ def process(*args: Any, **kwargs: Any) -> object:
                         else {},
                         "val": raw_val_loader.state_dict() if raw_val_loader is not None else {},
                     }
-                    RuntimeIO.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
+                    Storage.write_json(get_loader_state(ops.ckpt_dir or ""), _dl, indent=2)
         torch.distributed.barrier(
             device_ids=[local_rank] if device.type in ("cuda", "xpu") else None
         )
@@ -4485,7 +4485,7 @@ def process(*args: Any, **kwargs: Any) -> object:
             _get_sample_size(
                 model=model, device=device, ops=ops, dataset=metadata, with_backward=False
             )
-        expanded_sources = RuntimeIO.expand_source(ops.sources)
+        expanded_sources = Storage.expand_source(ops.sources)
         if expanded_sources is not ops.sources:
             ops = replace(ops, sources=expanded_sources)
         session = None
@@ -4630,7 +4630,7 @@ class _PredictionWriter:
         if self.cache is not None:
             self.cache.submit(rows, path=rows_path)
         else:
-            RuntimeIO.atomic_torch_save(rows_path, rows)
+            Storage.atomic_torch_save(rows_path, rows)
 
         wait_evt = None
         release_cb = None
@@ -4658,7 +4658,7 @@ class _PredictionWriter:
             preds_cpu = preds.detach()
             if getattr(preds_cpu, "device", None) is not None and preds_cpu.device.type != "cpu":
                 preds_cpu = preds_cpu.to(device="cpu")
-            RuntimeIO.atomic_torch_save(pred_path, preds_cpu)
+            Storage.atomic_torch_save(pred_path, preds_cpu)
             if release_cb is not None:
                 with contextlib.suppress(Exception):
                     release_cb()

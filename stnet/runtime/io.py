@@ -428,7 +428,7 @@ class _OnnxLayer:
             "dynamic_axes": dynamic_axes,
         }
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
-        sig = Export._export_sig()
+        sig = Exporter._export_sig()
         if sig is None:
             torch.onnx.export(wrapper, sample, str(onnx_path), **common_kwargs)
             return onnx_path
@@ -500,7 +500,7 @@ class _OnnxLayer:
     @staticmethod
     def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
         if not onnx_path.exists():
-            return Export._OnnxLayer.export(model, onnx_path, **kwargs)
+            return Exporter._OnnxLayer.export(model, onnx_path, **kwargs)
         return onnx_path
 
 
@@ -571,14 +571,14 @@ class Format(Protocol):
     def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
 
 
-class ModelIO:
+class Builder:
     NATIVE_EXTS = {".pt", ".pth", ".safetensors"}
 
     @staticmethod
     def is_target_native(path: PathLike) -> bool:
         p = Path(path)
         suffix = p.suffix.lower()
-        return not suffix or suffix in ModelIO.NATIVE_EXTS
+        return not suffix or suffix in Builder.NATIVE_EXTS
 
     @staticmethod
     def save(
@@ -663,7 +663,7 @@ class ModelIO:
             return p
 
 
-class Export:
+class Exporter:
     _by_name: dict[str, Format] = {}
     _ext_map: dict[str, str] = {}
     _defaults_registered: bool = False
@@ -731,7 +731,7 @@ class Onnx(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = Export._OnnxLayer.export(serving, dst, **_onnx_options(kwargs))
+            out = Exporter._OnnxLayer.export(serving, dst, **_onnx_options(kwargs))
         return (out,)
 
 
@@ -746,10 +746,10 @@ class Ort(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            onnx_path = Export._OnnxLayer.coerce(
+            onnx_path = Exporter._OnnxLayer.coerce(
                 serving, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs)
             )
-            ort_path, optimized = Export.OrtLayer.to_ort(
+            ort_path, optimized = Exporter.OrtLayer.to_ort(
                 onnx_path,
                 dst,
                 optimization_level=str(kwargs.get("optimization_level", "all")),
@@ -771,7 +771,7 @@ class TensorRT(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Export._OnnxLayer.coerce(
+            onnx_path = Exporter._OnnxLayer.coerce(
                 serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs)
             )
             try:
@@ -839,7 +839,7 @@ class Nnef(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Export._OnnxLayer.coerce(
+            onnx_path = Exporter._OnnxLayer.coerce(
                 serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs)
             )
             try:
@@ -935,7 +935,7 @@ class LiteRT(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Export._OnnxLayer.coerce(
+            onnx_path = Exporter._OnnxLayer.coerce(
                 serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs)
             )
             if bool(kwargs.get("prefer_onnx2tf", True)):
@@ -1075,7 +1075,7 @@ class TensorFlow(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving_model:
-            onnx_path = Export._OnnxLayer.coerce(
+            onnx_path = Exporter._OnnxLayer.coerce(
                 serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs)
             )
             is_required("onnx", "pip install onnx")

@@ -65,7 +65,7 @@ from .core.system import (
     new_dir,
     optimal_start_method,
 )
-from .data.nodes import RuntimeIO
+from .data.nodes import Storage
 from .data.pipeline import (
     Dataset,
     default_underflow_action,
@@ -284,7 +284,7 @@ def _save_dataset(
         count = int(td.batch_size[0])
         if count <= 0:
             raise ValueError("Empty TensorDict provided to train().")
-        in_dim, label_shape = RuntimeIO.stream_memmap(
+        in_dim, label_shape = Storage.stream_memmap(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -302,12 +302,12 @@ def _save_dataset(
         isinstance(d, Mapping)
         and d
         and all((not isinstance(v, Mapping) for v in d.values()))
-        and (not RuntimeIO.is_feature_label_batch_mapping(d))
+        and (not Storage.is_feature_label_batch_mapping(d))
     ):
-        count, _get_batch = RuntimeIO.column_cursor(d)
+        count, _get_batch = Storage.column_cursor(d)
         if count <= 0:
             raise ValueError("Empty dataset provided to train().")
-        in_dim, label_shape = RuntimeIO.stream_memmap(
+        in_dim, label_shape = Storage.stream_memmap(
             ds=ds,
             out_dir=out_dir,
             count=count,
@@ -330,7 +330,7 @@ def _save_dataset(
     if count <= 0:
         raise ValueError("Empty dataset provided to train().")
     in_dim = int(fx.reshape(count, -1).shape[1])
-    RuntimeIO.preload_memmap(
+    Storage.preload_memmap(
         {"features": fx, "labels": lb},
         memmap_dir=out_dir,
         val_frac=float(val_frac),
@@ -531,7 +531,7 @@ def _get_prediction_dtype(
             continue
         pred_path = os.path.join(chunks_dir, str(pred_rel))
         if pred_path.endswith(".mmt"):
-            meta_path = RuntimeIO.mmt_meta_path(pred_path)
+            meta_path = Storage.mmt_meta_path(pred_path)
             if os.path.isfile(meta_path):
                 try:
                     meta = read_json(meta_path)
@@ -583,7 +583,7 @@ def _get_float_precision(obj: object) -> torch.dtype:
                 X_td = torch.as_tensor(X_td)
             dt = _to_torch_dtype(getattr(X_td, "dtype", None))
             return torch.float64 if dt == torch.float64 else torch.float32
-        if isinstance(obj, Mapping) and RuntimeIO.is_feature_label_batch_mapping(obj):
+        if isinstance(obj, Mapping) and Storage.is_feature_label_batch_mapping(obj):
             f_key = get_feature_key(obj)
             if f_key is not None and f_key in obj:
                 X_all = obj.get(f_key)
@@ -746,9 +746,9 @@ def save_model(
     swa_averager: object | None = None,
     **kwargs: Any,
 ) -> str:
-    from .runtime.io import Export, ModelIO
+    from .runtime.io import Exporter, Builder
     p = Path(path)
-    if ModelIO.is_target_native(p):
+    if Builder.is_target_native(p):
         if args:
             raise TypeError(
                 "Positional args are only supported for export converters; use keyword arguments for TorchIO.save()."
@@ -760,9 +760,9 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = ModelIO.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
+        out = Builder.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
         return str(out)
-    conv = Export.for_export(p.suffix)
+    conv = Exporter.for_export(p.suffix)
     if conv is None:
         raise ValueError(f"Unknown export format for path '{path}'.")
     conv.save(model, p, *args, **kwargs)
@@ -837,7 +837,7 @@ def train(
             raise RuntimeError("no training data provided to train()")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            RuntimeIO.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
+            Storage.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
         ckpt_dir = new_dir("ckpt_dcp")
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
@@ -1049,7 +1049,7 @@ def predict(
         output_mode = "memory"
     if output_mode == "file" and out_path is not None and os.path.exists(out_path):
         if overwrite_mode == "resume" and os.path.isfile(out_path):
-            RuntimeIO.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape_t)
+            Storage.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape_t)
             return PersistentTensorDict(filename=out_path, mode="r")
         if overwrite_mode == "error":
             raise FileExistsError(f"predict: destination already exists: {out_path!r}")
@@ -1087,7 +1087,7 @@ def predict(
                 if count <= 0:
                     raise ValueError("predict: empty input")
                 get_batch = _TensorDictSlicer(data)
-                in_dim, _ = RuntimeIO.stream_memmap(
+                in_dim, _ = Storage.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1101,7 +1101,7 @@ def predict(
                     features_only=True,
                     chunk_size=writer_chunk_size,
                 )
-            elif isinstance(data, Mapping) and RuntimeIO.is_feature_label_batch_mapping(data):
+            elif isinstance(data, Mapping) and Storage.is_feature_label_batch_mapping(data):
                 f_key = get_feature_key(data)
                 if f_key is None:
                     raise ValueError("predict: could not resolve feature key from mapping")
@@ -1131,7 +1131,7 @@ def predict(
                     except Exception:
                         const_items[k] = v
                 get_batch = _MappingSlicer(const_items, tuple(slice_items))
-                in_dim, _ = RuntimeIO.stream_memmap(
+                in_dim, _ = Storage.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1146,10 +1146,10 @@ def predict(
                     chunk_size=writer_chunk_size,
                 )
             elif isinstance(data, Mapping):
-                count, get_batch = RuntimeIO.column_cursor(data)
+                count, get_batch = Storage.column_cursor(data)
                 if int(count) <= 0:
                     raise ValueError("predict: empty input")
-                in_dim, _ = RuntimeIO.stream_memmap(
+                in_dim, _ = Storage.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1183,7 +1183,7 @@ def predict(
 
                     return {"features": sl}
 
-                in_dim, _ = RuntimeIO.stream_memmap(
+                in_dim, _ = Storage.stream_memmap(
                     ds=ds,
                     out_dir=memmap_dir,
                     count=int(count),
@@ -1259,25 +1259,25 @@ def predict(
                 raise RuntimeError(f"predict: missing pred_chunks at {chunks_dir!r}")
             store_float = _get_prediction_dtype(chunks_dir)
             pred_mmt_path = os.path.join(tmp_dir, "pred.mmt")
-            RuntimeIO.concat_memory_mapped_tensor(
+            Storage.concat_memory_mapped_tensor(
                 os.fspath(chunks_dir),
                 os.fspath(pred_mmt_path),
                 count=count,
                 out_shape=out_shape_t,
                 store_float=store_float,
             )
-            X_mmt = RuntimeIO.load_memmap_features(os.fspath(memmap_dir))
-            Y_mmt = RuntimeIO.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
+            X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
+            Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_mmt_path))
             if Y_mmt is None:
                 raise RuntimeError("predict: failed to open assembled pred.mmt")
             if out_path is not None:
                 if os.path.exists(out_path):
                     if overwrite_mode == "resume" and os.path.isfile(out_path):
-                        RuntimeIO.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape_t)
+                        Storage.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape_t)
                         return PersistentTensorDict(filename=out_path, mode="r")
                     if overwrite_mode == "error":
                         raise FileExistsError(f"predict: destination already exists: {out_path!r}")
-                out_td = RuntimeIO.write_predictions_h5_atomic(
+                out_td = Storage.write_predictions_h5_atomic(
                     os.fspath(out_path),
                     memmap_dir=os.fspath(memmap_dir),
                     pred_path=os.fspath(pred_mmt_path),
@@ -1288,15 +1288,15 @@ def predict(
                     raise RuntimeError(
                         f"predict: persistent output missing after write: {out_path!r}"
                     )
-                RuntimeIO.validate_predictions_h5(
+                Storage.validate_predictions_h5(
                     os.fspath(out_path),
                     out_shape=out_shape_t,
                     in_dim=(int(in_dim) if in_dim is not None else None),
                 )
                 cleanup_ok = True
                 return out_td
-            X_t = RuntimeIO.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
-            Y_t = RuntimeIO.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
+            X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
+            Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
             cleanup_ok = True
             return td_out
@@ -1349,7 +1349,7 @@ def get_prediction(
                 output_mode = "memory"
         if output_mode == "file" and out_path is not None and os.path.exists(out_path):
             if overwrite_mode == "resume" and os.path.isfile(out_path):
-                RuntimeIO.validate_predictions_h5(os.fspath(out_path))
+                Storage.validate_predictions_h5(os.fspath(out_path))
                 return PersistentTensorDict(filename=out_path, mode="r")
             if overwrite_mode == "error":
                 raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
@@ -1357,12 +1357,12 @@ def get_prediction(
             if output_mode == "file":
                 if out_path is None:
                     return PersistentTensorDict(filename=src, mode="r")
-                return RuntimeIO.copy_predictions_h5_atomic(
+                return Storage.copy_predictions_h5_atomic(
                     os.fspath(src),
                     os.fspath(out_path),
                     overwrite=str(overwrite_mode or "replace"),
                 )
-            return RuntimeIO.load_predictions_h5(os.fspath(src))
+            return Storage.load_predictions_h5(os.fspath(src))
         if not os.path.isdir(src):
             raise FileNotFoundError(f"source must be a directory or .h5 file: {src!r}")
         memmap_dir = os.path.join(src, "memmap")
@@ -1398,15 +1398,15 @@ def get_prediction(
                     f"get_prediction: invalid manifest metadata: count={count!r}, out_shape={out_shape!r}"
                 )
             store_float = _get_prediction_dtype(chunks_dir)
-            RuntimeIO.concat_memory_mapped_tensor(
+            Storage.concat_memory_mapped_tensor(
                 os.fspath(chunks_dir),
                 os.fspath(pred_path),
                 count=count,
                 out_shape=out_shape_t,
                 store_float=store_float,
             )
-        X_mmt = RuntimeIO.load_memmap_features(os.fspath(memmap_dir))
-        Y_mmt = RuntimeIO.open_memory_mapped_tensor(os.fspath(pred_path))
+        X_mmt = Storage.load_memmap_features(os.fspath(memmap_dir))
+        Y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
         if Y_mmt is None:
             raise RuntimeError("get_prediction: failed to open pred.mmt")
         if count is None:
@@ -1419,7 +1419,7 @@ def get_prediction(
         if out_path is not None:
             if os.path.exists(out_path):
                 if overwrite_mode == "resume" and os.path.isfile(out_path):
-                    RuntimeIO.validate_predictions_h5(
+                    Storage.validate_predictions_h5(
                         os.fspath(out_path),
                         out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
                         in_dim=(
@@ -1433,7 +1433,7 @@ def get_prediction(
                     raise FileExistsError(
                         f"get_prediction: destination already exists: {out_path!r}"
                     )
-            out_td = RuntimeIO.write_predictions_h5_atomic(
+            out_td = Storage.write_predictions_h5_atomic(
                 os.fspath(out_path),
                 memmap_dir=os.fspath(memmap_dir),
                 pred_path=os.fspath(pred_path),
@@ -1444,7 +1444,7 @@ def get_prediction(
                 raise RuntimeError(
                     f"get_prediction: persistent output missing after write: {out_path!r}"
                 )
-            RuntimeIO.validate_predictions_h5(
+            Storage.validate_predictions_h5(
                 os.fspath(out_path),
                 out_shape=tuple(int(d) for d in Y_mmt.shape[1:]),
                 in_dim=(
@@ -1453,15 +1453,15 @@ def get_prediction(
                     else None
                 ),
             )
-            RuntimeIO.remove_prediction_artifacts(
+            Storage.remove_prediction_artifacts(
                 memmap_dir=os.fspath(memmap_dir),
                 pred_path=os.fspath(pred_path),
             )
             return out_td
-        X_t = RuntimeIO.copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
-        Y_t = RuntimeIO.copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
+        X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=int(count), chunk_size=8192)
+        Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=int(count), chunk_size=8192)
         td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
-        RuntimeIO.remove_prediction_artifacts(
+        Storage.remove_prediction_artifacts(
             memmap_dir=os.fspath(memmap_dir),
             pred_path=os.fspath(pred_path),
         )
