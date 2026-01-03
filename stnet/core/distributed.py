@@ -10,7 +10,7 @@ import socket
 import warnings
 from contextlib import AbstractContextManager
 from functools import lru_cache
-from typing import TYPE_CHECKING, Any, Iterable, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, Any, Iterable, TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -18,21 +18,21 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import Optimizer
 
 from .casting import env_bool, env_int
-from .system import get_num_accelerators, get_device, process_cpu_count
+from .system import get_device, get_num_accelerators, process_cpu_count
+
+fully_shard = None
 
 try:
     from torch.distributed._composable.fsdp import fully_shard
-except Exception:
-    try:
+except ImportError:
+    with contextlib.suppress(ImportError):
         from torch.distributed.fsdp import fully_shard
-    except Exception:
-        fully_shard = None
 
 try:
     from torch.distributed.algorithms.join import Join as _TorchJoin
-except Exception:
+except ImportError:
     _TorchJoin = None
-    
+
 if TYPE_CHECKING:
     from torch.distributed._composable.fsdp import FSDPModule
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -41,8 +41,9 @@ else:
     FSDPModule = object
 
 
-Join: type[AbstractContextManager[None]] | None = _TorchJoin
-JoinableModel: TypeAlias = Union["DDP", "FSDP", "FSDPModule"]
+JoinType: TypeAlias = type[AbstractContextManager[None]] | None
+Join: JoinType = _TorchJoin
+JoinableModel: TypeAlias = DDP | FSDP | FSDPModule
 
 
 def _strip_ip_expr(value: Any) -> str:
