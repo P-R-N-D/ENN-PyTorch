@@ -2133,7 +2133,7 @@ def get_progress_bar(
         return None
     bar = tqdm(
         total=int(total),
-        desc=f"{title} ({device.type.upper()})",
+        desc=f"{title} ({device.type.upper()}) ",
         unit="I/O < 0.01 MB/s, COM < 0.01 TFLOPS",
         bar_format="{desc}"
         + "{bar} {percentage:3.0f}% "
