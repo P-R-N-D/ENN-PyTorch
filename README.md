@@ -21,17 +21,14 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **torchao**: >= 0.14.0
 
 ## Features
-- **Typed configuration** (`stnet.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
-- **API surface** (`stnet.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
-- **Runtime utilities** (`stnet.runtime.main`, `stnet.core.system`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks.
+- **APIs** (`stnet.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
+- **Templated configurations** (`stnet.config`): dataclass configs with coercion/validation and string canonicalizers for modeling type, normalization, and compile options.
+- **Neural network stacks** (`stnet.nn`): spatio-temporal Fuser/Enhancer blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
 - **Data pipeline** (`stnet.data`): `torchdata.nodes`-driven memmap pipeline with TensorDict support, prefetch/pin/pool options, and scale-aware dataset metadata.
-- **Distributed** (`stnet.core.distributed`): elastic launch wiring and group setup for multi-process CPU/GPU runs.
-- **Export** (`stnet.runtime.io`): ONNX/ORT/TorchScript out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras.
-- **Losses/optimizers/profiling** (`stnet.runtime.losses`, `stnet.runtime.optimizers`, `stnet.core.profiler`): Student’s t losses, SWA helpers, FLOP/IO timing.
-- **NN stack** (`stnet.nn`): spatio-temporal Fuser/Enhancer blocks, attention variants, scaler + recorder modules, AMP negotiation guard band (`ModelConfig.safety_margin_pow2`).
+- **Runnable tasks** (`stnet.runtime`): thread/NUMA tuning, free-threaded/no-GIL optimizations, mixed-precision helpers, history recorder, and OOM recovery hooks. ONNX/ORT/TorchScript out of the box; optional platform-dependent backends (TensorRT/CoreML/ExecuTorch/onnx-tf) via extras. elastic launch wiring and group setup for multi-process CPU/GPU runs.
+- **Losses/optimizers/profiling** (`stnet.core`): Student’s t losses, SWA helpers, FLOP/IO timing.
 
 ## Installation
-
 1. Install the appropriate **PyTorch** build for your accelerator first (CUDA/ROCm/XPU/CPU).
 2. Install STNet-PyTorch (editable for development is recommended):
    ```bash
@@ -206,10 +203,6 @@ stnet/
     kernels.py
     primitives.py
 ```
-
-> Note: the neural-network implementation lives under `stnet.nn`.
-> If you have local scripts that previously imported from `stnet.model`, update
-> those import paths to `stnet.nn`.
 
 ## Configuration notes
 
