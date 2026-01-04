@@ -564,7 +564,7 @@ class CRPSLoss(nn.Module):
         pred_m = self._move_sample_dim_to_1(pred, self.sample_dim)
         nd = int(pred.ndim)
         sd = self.sample_dim if self.sample_dim >= 0 else self.sample_dim + nd
-        target_m = target.unsqueeze(sd)  # insert singleton sample dim
+        target_m = target.unsqueeze(sd)
         if sd != 1:
             perm = [0, sd] + [i for i in range(1, nd) if i != sd]
             target_m = target_m.permute(*perm)
@@ -589,7 +589,7 @@ class CRPSLoss(nn.Module):
         sum_d = samples.new_zeros((B,), dtype=acc_dtype)
         for i in range(0, S, chunk):
             a = samples[:, i : i + chunk]
-            d = torch.cdist(a, samples)  # [B,chunk,S]
+            d = torch.cdist(a, samples)
             sum_d = sum_d + d.sum(dim=(1, 2)).to(acc_dtype)
         denom = float(S * (S - 1))
         term2 = sum_d / denom
@@ -1294,7 +1294,7 @@ class TiledLoss(nn.Module):
                 v_scalar = v.reshape(())
                 if base_red == "sum":
                     total_sum = v_scalar
-                else:  # assume mean
+                else:
                     total_sum = v_scalar * float(n)
                 if self.reduction == "sum":
                     return total_sum
