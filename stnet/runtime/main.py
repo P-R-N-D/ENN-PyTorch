@@ -3140,7 +3140,6 @@ def epochs(
                                                     if isinstance(y_flat, torch.Tensor) and scale_max is not None:
                                                         with contextlib.suppress(Exception):
                                                             max_obs = float(y_flat.detach().abs().max().item())
-                                                            # If the batch is already on the original scale, skip a second denorm.
                                                             if max_obs >= float(scale_max) * 0.5:
                                                                 need_denorm = False
                                                     if need_denorm:
