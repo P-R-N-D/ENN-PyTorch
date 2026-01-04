@@ -352,10 +352,10 @@ class Retention(nn.Module):
         Dh = int(msr.head_dim)
         q = msr.q_proj(x_in).view(B, L, H, Dh)
         v = msr.v_proj(x_in).view(B, L, H, Dh)
-        v = msr._apply_kpm_to_v(v, attn_mask)  # type: ignore[attr-defined]
+        v = msr._apply_kpm_to_v(v, attn_mask)
         lam_h = msr._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
-        state_fwd = msr._scan_causal(v, lam_h)  # type: ignore[attr-defined]
-        state_bwd = msr._scan_causal(v.flip(1), lam_h).flip(1)  # type: ignore[attr-defined]
+        state_fwd = msr._scan_causal(v, lam_h)
+        state_bwd = msr._scan_causal(v.flip(1), lam_h).flip(1)
         calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
         bi_state = (
             state_fwd.to(calc_dtype)
@@ -1163,7 +1163,7 @@ class SigmoidGate(nn.Module):
         )
         self.tile_net: Optional[nn.Module] = None
         if self.tile_size > 0:
-            tile_in = 3  # [base_rms, res_rms, res/base]
+            tile_in = 3
             self.tile_net = nn.Sequential(
                 nn.LayerNorm(tile_in),
                 nn.Linear(tile_in, int(hidden_dim)),
@@ -1321,7 +1321,7 @@ class SigmoidGate(nn.Module):
             feats.append(b_rms.to(dtype=tokens.dtype))
             feats.append(r_rms.to(dtype=tokens.dtype))
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
-        global_logit = self.net(x).squeeze(-1)  # (B,)
+        global_logit = self.net(x).squeeze(-1)
         use_tile = (
             self.tile_size > 0
             and self.tile_net is not None
@@ -1424,7 +1424,7 @@ class SigmoidGate(nn.Module):
                     edge_reg_low = None
                     edge_reg_high = None
             out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
-            out = p.to(dtype=out_dtype).unsqueeze(-1)  # (B, 1)
+            out = p.to(dtype=out_dtype).unsqueeze(-1)
             if bool(return_edge_reg_lr):
                 if edge_reg_low is None:
                     edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
@@ -1578,7 +1578,7 @@ class SigmoidGate(nn.Module):
                 edge_reg_low = None
                 edge_reg_high = None
         out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
-        out_full = self._expand_tiles(p_tile.to(dtype=out_dtype), dim=D)  # (B, D)
+        out_full = self._expand_tiles(p_tile.to(dtype=out_dtype), dim=D)
         if bool(return_edge_reg_lr):
             if edge_reg_low is None:
                 edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
