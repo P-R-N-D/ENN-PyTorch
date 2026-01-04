@@ -15,9 +15,9 @@ from torch import nn
 
 try:
     from torch._ops import OpOverload, OpOverloadPacket
-except Exception:  # pragma: no cover - guard for older torch versions
-    OpOverload = tuple()  # type: ignore
-    OpOverloadPacket = tuple()  # type: ignore
+except Exception:
+    OpOverload = tuple()
+    OpOverloadPacket = tuple()
 
 try:
     from torch.utils._python_dispatch import TorchDispatchMode
@@ -64,13 +64,6 @@ def _prod_int(xs: Sequence[int]) -> int:
     for v in xs:
         p *= int(v)
     return int(p)
-
-
-try:
-    from torch._ops import OpOverload, OpOverloadPacket
-except Exception:  # pragma: no cover - guard for older torch versions
-    OpOverload = tuple()  # type: ignore
-    OpOverloadPacket = tuple()  # type: ignore
 
 
 def _coerce(obj: Any) -> Any:
@@ -1751,7 +1744,7 @@ class _GraphProfiler:
             include_softmax_scale_dropout=True,
         )
 
-    def _custom(self, args: Any, out: Any, *, name: str) -> float:
+    def _custom(self, args: Any, out: Any, *args: Any, name: str) -> float:
         if isinstance(args, (tuple, list)):
             ts = [a for a in args if _is_tensorlike(a)]
         else:
@@ -2103,7 +2096,7 @@ class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
 class _Flops(contextlib.AbstractContextManager[Any]):
     def __init__(
         self,
-        *,
+        *args: Any,
         profiler: "_FlopProfiler",
         device: Optional[torch.device],
         display: bool,
