@@ -820,7 +820,13 @@ def _fetch_merge_batches(batches: Sequence[Any]) -> Any:
 
 def _fetch_normalize_sources(sources: Any) -> Dict[str, Source]:
     if isinstance(sources, Mapping) and (not _is_source(sources)):
-        return {str(k): v for k, v in sources.items()}
+        out: Dict[str, Source] = {}
+        for k, v in sources.items():
+            kk = str(k)
+            if kk in out:
+                raise ValueError(f"duplicate source key after str(): {kk!r}")
+            out[kk] = v
+        return out
     if isinstance(sources, (list, tuple)):
         return {str(i): v for i, v in enumerate(sources)}
     return {"0": sources}
@@ -867,7 +873,11 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
     if isinstance(data, TensorDictBase):
         return ([("0", data)], None)
 
-    if isinstance(data, collections.abc.Mapping) and data and all((isinstance(v, collections.abc.Mapping) for v in data.values())):
+    if (
+        isinstance(data, collections.abc.Mapping)
+        and data
+        and all((isinstance(v, (TensorDictBase, collections.abc.Mapping)) for v in data.values()))
+    ):
         manifest: dict[str, str] = {}
         items: list[tuple[str, object]] = []
         for k, d in data.items():
@@ -876,7 +886,7 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
             manifest[key] = key
         return (items, manifest)
 
-    if isinstance(data, Sequence) and data and all((isinstance(d, collections.abc.Mapping) for d in data)):
+    if isinstance(data, Sequence) and data and all((isinstance(d, (TensorDictBase, collections.abc.Mapping)) for d in data)):
         manifest_list: list[str] = []
         items2: list[tuple[str, object]] = []
         for i, d in enumerate(data):
@@ -884,6 +894,7 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
             items2.append((key, d))
             manifest_list.append(key)
         return (items2, manifest_list)
+
     return ([("0", data)], None)
 
 
@@ -929,7 +940,7 @@ def compose(
     non_blocking_copy: bool,
     io_workers: int,
     prebatch: int,
-    weights: Optional[Mapping[str, float]] = None,
+    weights: Optional[Mapping[str, float] | Sequence[float]] = None,
     seed: int = 0,
     epochables: Optional[list[Any]] = None,
     **kwargs: Any,
@@ -938,8 +949,7 @@ def compose(
     device_obj = torch.device(device) if not isinstance(device, torch.device) else device
     with contextlib.suppress(Exception):
         get_affinity(io_workers=io_workers)
-    mx_weights = weights if isinstance(node_or_nodes, Mapping) and isinstance(weights, Mapping) else None
-    sampler = Multiplexer(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=mx_weights)
+    sampler = Multiplexer(stop_criteria="ALL_DATASETS_EXHAUSTED", seed=int(seed), weights=weights)
     source = sampler.compose(node_or_nodes)
     if epochables is not None and getattr(sampler, "_node", None) is not None:
         with contextlib.suppress(Exception):
@@ -967,8 +977,8 @@ def fetch(
     sanitize: bool = False,
     non_blocking_copy: bool = True,
     train_shuffle: bool = True,
-    train_weights: Optional[Mapping[str, float]] = None,
-    val_weights: Optional[Mapping[str, float]] = None,
+    train_weights: Optional[Mapping[str, float] | Sequence[float]] = None,
+    val_weights: Optional[Mapping[str, float] | Sequence[float]] = None,
     val_frac: float = 0.0,
     loader_policy: Optional["LoaderPolicy"] = None,
     worker_policy: Optional[WorkerPolicy] = None,
@@ -992,6 +1002,99 @@ def fetch(
     scale_ctl = sampler_scale if sampler_scale is not None else BatchScaler()
     train_epochables: List[Any] = []
     specs = _fetch_normalize_sources(sources)
+    spec_keys = list(specs.keys())
+
+    def _coerce_weight(v: Any, *, name: str) -> float:
+        try:
+            fv = float(v)
+        except Exception as exc:
+            raise TypeError(f"{name} entries must be numeric (float/int)") from exc
+        if not math.isfinite(fv):
+            raise ValueError(f"{name} entries must be finite")
+        if fv < 0.0:
+            raise ValueError(f"{name} entries must be >= 0")
+        return float(fv)
+
+    def _normalize_weights_strict(
+        weights: Any,
+        keys: Sequence[str],
+        *,
+        require_mapping: Optional[bool],
+        name: str,
+    ) -> Optional[Dict[str, float]]:
+        if weights is None:
+            return None
+        key_list = [str(k) for k in keys]
+        if not key_list:
+            raise ValueError(f"{name}: no source keys available")
+        if require_mapping is True and not isinstance(weights, Mapping):
+            raise TypeError(f"{name} must be a Mapping when sources is a Mapping")
+        if require_mapping is False and not (
+            isinstance(weights, collections.abc.Sequence) and not isinstance(weights, (str, bytes, bytearray))
+        ):
+            raise TypeError(f"{name} must be a Sequence when sources is a Sequence")
+        if isinstance(weights, (int, float)) and not isinstance(weights, bool):
+            if len(key_list) != 1:
+                raise TypeError(f"{name} scalar is only valid for a single source")
+            fv = _coerce_weight(weights, name=f"{name}[0]")
+            if fv <= 0.0:
+                raise ValueError(f"{name} scalar must be > 0")
+            return {key_list[0]: float(fv)}
+        if isinstance(weights, Mapping):
+            out: Dict[str, float] = {}
+            for k, v in dict(weights).items():
+                ks = str(k)
+                if ks in out:
+                    raise ValueError(f"{name} has duplicate key after str(): {ks!r}")
+                out[ks] = _coerce_weight(v, name=f"{name}[{ks!r}]")
+            if not out:
+                raise ValueError(f"{name} mapping must be non-empty (use None for uniform)")
+            missing = set(key_list) - set(out.keys())
+            extra = set(out.keys()) - set(key_list)
+            if missing or extra:
+                raise ValueError(
+                    f"{name} keys must match sources keys exactly; "
+                    f"missing={sorted(missing)} extra={sorted(extra)} sources={sorted(key_list)}"
+                )
+            if not any((float(v) > 0.0) for v in out.values()):
+                raise ValueError(f"{name} must contain at least one positive weight")
+            return {k: float(out[k]) for k in key_list}
+        if isinstance(weights, collections.abc.Sequence) and not isinstance(weights, (str, bytes, bytearray)):
+            try:
+                seq = list(weights)
+            except Exception as exc:
+                raise TypeError(f"{name} must be a concrete Sequence") from exc
+            if len(seq) != len(key_list):
+                raise ValueError(f"{name} length mismatch: expected {len(key_list)}, got {len(seq)}")
+            out2: Dict[str, float] = {}
+            for i, ks in enumerate(key_list):
+                out2[ks] = _coerce_weight(seq[i], name=f"{name}[{i}]")
+            if not any((float(v) > 0.0) for v in out2.values()):
+                raise ValueError(f"{name} must contain at least one positive weight")
+            return out2
+        raise TypeError(f"{name} must be a Mapping[str, float] or Sequence[float]")
+
+    require_mapping: Optional[bool]
+    if isinstance(sources, Mapping) and (not _is_source(sources)):
+        require_mapping = True
+    elif isinstance(sources, (list, tuple)):
+        require_mapping = False
+    else:
+        require_mapping = None
+
+    train_weights_map = _normalize_weights_strict(
+        train_weights,
+        spec_keys,
+        require_mapping=require_mapping,
+        name="train_weights",
+    )
+    val_weights_map = _normalize_weights_strict(
+        val_weights,
+        spec_keys,
+        require_mapping=require_mapping,
+        name="val_weights",
+    )
+
     datasets_train = _fetch_build_datasets(
         specs,
         split="train",
@@ -1041,12 +1144,17 @@ def fetch(
         shuffle=bool(train_shuffle),
         seed=int(seed),
     )
-    if isinstance(train_weights, Mapping):
+    train_weights = None
+    if isinstance(train_weights_map, Mapping):
         train_weights = {
             str(k): float(v)
-            for k, v in dict(train_weights).items()
+            for k, v in dict(train_weights_map).items()
             if str(k) in sampler_nodes_train
         }
+        if train_weights and (not any((float(v) > 0.0 for v in train_weights.values()))):
+            raise ValueError(
+                "train_weights: after filtering empty sources, at least one weight must be > 0"
+            )
     if not sampler_nodes_train:
         raise RuntimeError("No non-empty training sources provided.")
     train_length: Optional[int] = int(sum(lengths_train.values())) if lengths_train else None
@@ -1071,6 +1179,8 @@ def fetch(
         length=train_length,
     )
     val_loader: Optional[Loader] = None
+    if float(val_frac) <= 0.0 and val_weights_map is not None:
+        raise ValueError("val_weights was provided but val_frac <= 0 (no validation split)")
     if float(val_frac) > 0.0:
         datasets_val = _fetch_build_datasets(
             specs,
@@ -1120,12 +1230,17 @@ def fetch(
             shuffle=False,
             seed=int(seed),
         )
-        if isinstance(val_weights, Mapping):
+        val_weights = None
+        if isinstance(val_weights_map, Mapping):
             val_weights = {
                 str(k): float(v)
-                for k, v in dict(val_weights).items()
+                for k, v in dict(val_weights_map).items()
                 if str(k) in sampler_nodes_val
             }
+            if val_weights and (not any((float(v) > 0.0 for v in val_weights.values()))):
+                raise ValueError(
+                    "val_weights: after filtering empty sources, at least one weight must be > 0"
+                )
         if not sampler_nodes_val:
             raise RuntimeError("No non-empty validation sources provided.")
         val_length: Optional[int] = int(sum(lengths_val.values())) if lengths_val else None
@@ -1519,8 +1634,8 @@ class Session:
     flatten_features: bool = True
     train_shuffle: bool = True
     seed: int = 0
-    train_weights: Optional[Mapping[str, float]] = None
-    val_weights: Optional[Mapping[str, float]] = None
+    train_weights: Optional[Mapping[str, float] | Sequence[float]] = None
+    val_weights: Optional[Mapping[str, float] | Sequence[float]] = None
     worker_policy: Optional[WorkerPolicy] = None
     loader_policy: LoaderPolicy = field(default_factory=LoaderPolicy)
     raw_training_loader: Any = None

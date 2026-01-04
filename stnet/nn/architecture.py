@@ -33,7 +33,6 @@ from ..config import ModelConfig
 from ..core.casting import env_bool, env_first_int, env_int
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.graph import (
-    compile, 
     graph_break, 
     inference_mode,
     clear_model_cache,
@@ -47,7 +46,8 @@ from ..core.system import (
     _log_debug, 
     _log_info, 
     empty_device_cache, 
-    get_device
+    get_device,
+    Thread,
 )
 from ..data.pipeline import (
     Dataset, 
@@ -214,8 +214,9 @@ class SpatialExtractor(nn.Module):
             ]
         )
         self.norm = norm_layer(norm_type, int(d_model))
-        self._ckpt_enabled = bool(activation_checkpointing)
-        self._ckpt_reentrant = bool(activation_checkpoint_reentrant)
+        self._ckpt_enabled = True
+        self._ckpt_reentrant = True
+        self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     def forward(
         self,
@@ -228,12 +229,16 @@ class SpatialExtractor(nn.Module):
         del coords, args, kwargs
         out = x
         do_ckpt = (
-            self._ckpt_enabled
-            and self.training
+            self.training
             and torch.is_grad_enabled()
             and _checkpoint is not None
             and not _is_export_or_trace()
         )
+        if do_ckpt:
+            est = 0
+            with contextlib.suppress(Exception):
+                est = int(out.numel()) * int(out.element_size()) * int(len(self.blocks))
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         for blk in self.blocks:
             if do_ckpt:
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
@@ -242,7 +247,7 @@ class SpatialExtractor(nn.Module):
                 try:
                     out = cast(
                         torch.Tensor,
-                        _checkpoint(_f, out, use_reentrant=bool(self._ckpt_reentrant)),
+                        _checkpoint(_f, out, use_reentrant=True),
                     )
                 except TypeError:
                     out = cast(torch.Tensor, _checkpoint(_f, out))
@@ -287,8 +292,9 @@ class TemporalExtractor(nn.Module):
             ]
         )
         self.norm = norm_layer(norm_type, int(d_model))
-        self._ckpt_enabled = bool(activation_checkpointing)
-        self._ckpt_reentrant = bool(activation_checkpoint_reentrant)
+        self._ckpt_enabled = True
+        self._ckpt_reentrant = True
+        self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     @staticmethod
     @torch_compiler_disable(reason="TemporalExtractor state coercion", recursive=False)
@@ -439,14 +445,18 @@ class TemporalExtractor(nn.Module):
                     dtype=x.dtype,
                 )
         do_ckpt = (
-            self._ckpt_enabled
-            and self.training
+            self.training
             and torch.is_grad_enabled()
             and _checkpoint is not None
             and not return_state
             and st_tensor is None
             and not _is_export_or_trace()
         )
+        if do_ckpt:
+            est = 0
+            with contextlib.suppress(Exception):
+                est = int(x.numel()) * int(x.element_size()) * int(len(self.blocks))
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         next_state: Optional[torch.Tensor] = None
         if return_state:
             next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
@@ -461,7 +471,7 @@ class TemporalExtractor(nn.Module):
                 try:
                     x = cast(
                         torch.Tensor,
-                        _checkpoint(_f, x, use_reentrant=bool(self._ckpt_reentrant)),
+                        _checkpoint(_f, x, use_reentrant=True),
                     )
                 except TypeError:
                     x = cast(torch.Tensor, _checkpoint(_f, x))
@@ -604,8 +614,43 @@ class GlobalExtractor(nn.Module):
         return refined
 
 
+class TokenizingView(nn.Module):
+    def __init__(self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module) -> None:
+        super().__init__()
+        self.in_dim = int(in_dim)
+        self.tokens = int(tokens)
+        self.d_model = int(d_model)
+        self.tokenizer = nn.Linear(self.in_dim, self.tokens * self.d_model)
+        self.extractor = extractor
+
+    @property
+    def depth(self) -> int:
+        return int(getattr(self.extractor, "depth", 0) or 0)
+
+    @property
+    def nhead(self) -> int:
+        return int(getattr(self.extractor, "nhead", 0) or 0)
+
+    @property
+    def head_dim(self) -> int:
+        return int(getattr(self.extractor, "head_dim", 0) or 0)
+
+    def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        B = int(x.shape[0])
+        tokens = self.tokenizer(x).reshape(B, self.tokens, self.d_model).contiguous()
+        return self.extractor(tokens, *args, **kwargs)
+
+
 class MultiViewFuser(nn.Module):
-    def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
+    def __init__(
+        self,
+        in_dim: int,
+        out_shape: Sequence[int],
+        config: ModelConfig,
+        *,
+        views: Optional[Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]] = None,
+        fusions: Optional[Mapping[str | Tuple[str, str], nn.Module] | Sequence[Tuple[str | Tuple[str, str], nn.Module]]] = None,
+    ) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
         self.out_shape = tuple((int(v) for v in out_shape))
@@ -613,57 +658,195 @@ class MultiViewFuser(nn.Module):
         self.d_model = int(config.d_model)
         self.nhead = int(config.heads)
         self.modeling_type = _coerce_modeling_types(config.modeling_type)
-        self.spatial_tokens = max(1, int(config.spatial_latents))
-        self.temporal_tokens = max(1, int(config.temporal_latents))
-        self.mlp_ratio = float(config.mlp_ratio)
-        self.dropout = float(config.dropout)
-        self.drop_path = float(config.drop_path)
-        self.norm_type = str(config.normalization_method)
+        self.spatial_tokens = max(1, int(getattr(config, "spatial_latents", 1)))
+        self.temporal_tokens = max(1, int(getattr(config, "temporal_latents", 1)))
+        self.fused_tokens = max(1, int(self.spatial_tokens + self.temporal_tokens))
+        self.mlp_ratio = float(getattr(config, "mlp_ratio", 4.0))
+        self.dropout = float(getattr(config, "dropout", 0.0))
+        self.drop_path = float(getattr(config, "drop_path", 0.0))
+        self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
+        self.gate_blend_alpha = float(getattr(config, "fuser_blend_alpha", getattr(config, "fuser_gate_blend", 0.0)))
+        self.gate_blend_alpha = float(min(max(self.gate_blend_alpha, 0.0), 1.0))
         ckpt_enabled = bool(getattr(config, "activation_checkpointing", False))
         ckpt_reentrant = bool(getattr(config, "activation_checkpoint_reentrant", False))
-        self.spatial_tokenizer = nn.Linear(self.in_dim, self.spatial_tokens * self.d_model)
-        self.temporal_tokenizer = nn.Linear(self.in_dim, self.temporal_tokens * self.d_model)
-        self.spatial_net = SpatialExtractor(
-            self.d_model,
-            self.nhead,
-            depth=max(1, int(config.spatial_depth)),
-            mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
-            drop_path=self.drop_path,
-            norm_type=self.norm_type,
-            activation_checkpointing=ckpt_enabled,
-            activation_checkpoint_reentrant=ckpt_reentrant,
-        )
-        self.temporal_net = TemporalExtractor(
-            self.d_model,
-            self.nhead,
-            depth=max(1, int(config.temporal_depth)),
-            mlp_ratio=self.mlp_ratio,
-            dropout=self.dropout,
-            drop_path=self.drop_path,
-            norm_type=self.norm_type,
-            activation_checkpointing=ckpt_enabled,
-            activation_checkpoint_reentrant=ckpt_reentrant,
-        )
-        self.perception = CrossTransformer(
-            self.d_model,
-            self.nhead,
-            dropout=self.dropout,
-            norm_type=self.norm_type,
-            mlp_ratio=self.mlp_ratio,
-            drop_path=self.drop_path,
-        )
-        self.norm = norm_layer(self.norm_type, self.d_model)
+        self.view_encoders = nn.ModuleDict()
+        if views is None:
+            spatial_extractor = SpatialExtractor(
+                self.d_model,
+                self.nhead,
+                depth=max(1, int(getattr(config, "spatial_depth", 1))),
+                mlp_ratio=self.mlp_ratio,
+                dropout=self.dropout,
+                drop_path=self.drop_path,
+                norm_type=self.norm_type,
+                activation_checkpointing=ckpt_enabled,
+                activation_checkpoint_reentrant=ckpt_reentrant,
+            )
+            temporal_extractor = TemporalExtractor(
+                self.d_model,
+                self.nhead,
+                depth=max(1, int(getattr(config, "temporal_depth", 1))),
+                mlp_ratio=self.mlp_ratio,
+                dropout=self.dropout,
+                drop_path=self.drop_path,
+                norm_type=self.norm_type,
+                activation_checkpointing=ckpt_enabled,
+                activation_checkpoint_reentrant=ckpt_reentrant,
+            )
+            self.view_encoders["spatial"] = TokenizingView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
+            self.view_encoders["temporal"] = TokenizingView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
+        else:
+            items = views.items() if isinstance(views, Mapping) else list(views)
+            for name, mod in items:
+                key = str(name)
+                if not isinstance(mod, nn.Module):
+                    raise TypeError("views must contain modules")
+                self.view_encoders[key] = mod
+        if "spatial" in self.view_encoders:
+            self.spatial_view = self.view_encoders["spatial"]
+            self.spatial_net = self.spatial_view
+        if "temporal" in self.view_encoders:
+            self.temporal_view = self.view_encoders["temporal"]
+            self.temporal_net = self.temporal_view
+        self.pair_fusers = nn.ModuleDict()
+        self._pair_endpoints: dict[str, tuple[str, str]] = {}
+        if fusions is None:
+            key, (a, b) = self._canon_pair_key_static(("spatial", "temporal"))
+            self.pair_fusers[key] = CrossTransformer(
+                self.d_model,
+                self.nhead,
+                dropout=self.dropout,
+                norm_type=self.norm_type,
+                mlp_ratio=self.mlp_ratio,
+                drop_path=self.drop_path,
+            )
+            self._pair_endpoints[key] = (a, b)
+        else:
+            items = fusions.items() if isinstance(fusions, Mapping) else list(fusions)
+            for raw_key, mod in items:
+                if not isinstance(mod, nn.Module):
+                    raise TypeError("fusions must contain modules")
+                key, (a, b) = self._canon_pair_key_static(raw_key)
+                if a == b:
+                    raise ValueError("fusion endpoints must differ")
+                self.pair_fusers[key] = mod
+                self._pair_endpoints[key] = (a, b)
+        if "spatial|temporal" in self.pair_fusers:
+            self.perception = self.pair_fusers["spatial|temporal"]
+        elif len(self.pair_fusers) == 1:
+            only_key = next(iter(self.pair_fusers.keys()))
+            self.perception = self.pair_fusers[only_key]
         hid = int(self.d_model * max(1.0, self.mlp_ratio))
+        self._agg_norm = norm_layer(self.norm_type, self.d_model)
+        self._agg_phi = nn.Sequential(
+            nn.Linear(self.d_model, hid),
+            nn.GELU(),
+            nn.Linear(hid, self.d_model),
+        )
+        self._agg_gate = nn.Sequential(
+            nn.Linear(self.d_model, hid),
+            nn.GELU(),
+            nn.Linear(hid, 1),
+        )
+        self._token_generator = nn.Linear(self.d_model, self.fused_tokens * self.d_model)
+        self.norm = norm_layer(self.norm_type, self.d_model)
         self.head_hidden_dim = hid
         self.head = nn.Sequential(
             norm_layer(self.norm_type, self.d_model),
             nn.Linear(self.d_model, hid),
-            nn.SiLU(),
+            nn.GELU(),
             nn.Dropout(self.dropout),
             nn.Linear(hid, self.out_dim),
         )
+        self.views = self.view_encoders
+        self.fusions = self.pair_fusers
 
+    @staticmethod
+    def _canon_pair_key_static(raw: str | Tuple[str, str]) -> tuple[str, tuple[str, str]]:
+        if isinstance(raw, str):
+            parts = [p for p in raw.split("|") if p]
+            if len(parts) != 2:
+                raise ValueError("fusion key string must be 'a|b'")
+            a, b = str(parts[0]), str(parts[1])
+        elif isinstance(raw, (tuple, list)) and len(raw) == 2:
+            a, b = str(raw[0]), str(raw[1])
+        else:
+            raise TypeError("fusion key must be 'a|b' or (a, b)")
+        x, y = (a, b) if a <= b else (b, a)
+        return f"{x}|{y}", (x, y)
+
+    def _canon_pair_key(self, raw: str | Tuple[str, str]) -> tuple[str, tuple[str, str]]:
+        return self._canon_pair_key_static(raw)
+
+    @staticmethod
+    def _as_3d_tokens(t: torch.Tensor) -> torch.Tensor:
+        if t.dim() == 2:
+            return t.unsqueeze(1)
+        if t.dim() != 3:
+            raise ValueError(f"expected tokens shaped (B,N,D) or (B,D), got {tuple(t.shape)}")
+        return t
+
+    def _aggregate_tokens(self, token_sets: Sequence[torch.Tensor]) -> torch.Tensor:
+        if len(token_sets) < 1:
+            raise ValueError("no token sets to aggregate")
+        summaries = torch.stack([self._agg_norm(ts.mean(dim=1)) for ts in token_sets], dim=1)
+        feats = self._agg_phi(summaries)
+        logits = self._agg_gate(feats).squeeze(-1)
+        w_soft = torch.softmax(logits, dim=1)
+        K = int(feats.shape[1])
+        w_uni = feats.new_full((int(feats.shape[0]), K), 1.0 / float(K))
+        a = float(self.gate_blend_alpha)
+        w = (1.0 - a) * w_uni + a * w_soft
+        fused_vec = torch.einsum("bk,bkd->bd", w, feats)
+        B = int(fused_vec.shape[0])
+        tokens = self._token_generator(fused_vec).reshape(B, self.fused_tokens, self.d_model).contiguous()
+        return tokens
+
+    @staticmethod
+    def _pick_view(views: Mapping[str, torch.Tensor], preferred: Sequence[str], fallback_first: bool = True) -> torch.Tensor:
+        for k in preferred:
+            if k in views:
+                return views[k]
+        if fallback_first:
+            return next(iter(views.values()))
+        raise KeyError(f"missing views: {preferred}")
+
+    def _run_views(
+        self,
+        x: torch.Tensor,
+        *,
+        temporal_state: Any = None,
+        want_state: bool = False,
+        causal_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[dict[str, torch.Tensor], Optional[Any]]:
+        out: dict[str, torch.Tensor] = {}
+        next_state: Optional[Any] = None
+        for name, mod in self.view_encoders.items():
+            if name == "temporal":
+                if want_state:
+                    y = mod(x, state=temporal_state, return_state=True, causal_mask=causal_mask)
+                    if isinstance(y, (tuple, list)) and len(y) == 2:
+                        tokens, next_state = y[0], y[1]
+                    else:
+                        tokens = y
+                else:
+                    tokens = mod(x, state=temporal_state, return_state=False, causal_mask=causal_mask)
+            else:
+                tokens = mod(x)
+            tokens = self._as_3d_tokens(cast(torch.Tensor, tokens))
+            out[name] = tokens
+        return out, next_state
+
+    def _run_fusions(self, views: Mapping[str, torch.Tensor]) -> list[torch.Tensor]:
+        out: list[torch.Tensor] = []
+        for key, fuser in self.pair_fusers.items():
+            a, b = self._pair_endpoints.get(key, (None, None))
+            if a is None or b is None:
+                continue
+            if a not in views or b not in views:
+                continue
+            out.append(fuser(views[a], views[b]))
+        return out
 
     @torch_compiler_disable(reason="MultiViewFuser orchestrates eager + compiled submodules", recursive=False)
     def forward(
@@ -674,63 +857,23 @@ class MultiViewFuser(nn.Module):
         return_temporal_state: bool = False,
         causal_mask: Optional[torch.Tensor] = None,
         **kwargs: Any,
-    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Any]:
+    ) -> Any:
         del args, kwargs
-        B = int(x.shape[0])
-        spatial_raw = self.spatial_tokenizer(x)
-        expected_spatial = B * self.spatial_tokens * self.d_model
-        if spatial_raw.numel() != expected_spatial:
-            raise RuntimeError(
-                "spatial tokenizer output has unexpected numel: "
-                f"got {spatial_raw.numel()} vs expected {expected_spatial}"
-            )
-        spatial_tokens = spatial_raw.reshape(B, self.spatial_tokens, self.d_model).contiguous()
-        temporal_raw = self.temporal_tokenizer(x)
-        expected_temporal = B * self.temporal_tokens * self.d_model
-        if temporal_raw.numel() != expected_temporal:
-            raise RuntimeError(
-                "temporal tokenizer output has unexpected numel: "
-                f"got {temporal_raw.numel()} vs expected {expected_temporal}"
-            )
-        temporal_tokens = temporal_raw.reshape(B, self.temporal_tokens, self.d_model).contiguous()
-        with contextlib.suppress(Exception):
-            if not _is_torch_compiling():
-                total_tokens = self.spatial_tokens + self.temporal_tokens
-                fl_tok = 2.0 * float(B) * float(self.in_dim) * float(total_tokens * self.d_model)
-                FLOP_PROFILER.add("Tokenizer", float(fl_tok))
-        spatial_out = self.spatial_net(spatial_tokens)
-        next_temporal_state: Any = None
-        if bool(return_temporal_state):
-            temporal_out, next_temporal_state = self.temporal_net(
-                temporal_tokens, state=temporal_state, return_state=True, causal_mask=causal_mask
-            )
-        else:
-            temporal_out = self.temporal_net(
-                temporal_tokens, state=temporal_state, return_state=False, causal_mask=causal_mask
-            )
+        views, next_state = self._run_views(x, temporal_state=temporal_state, want_state=bool(return_temporal_state), causal_mask=causal_mask)
         mode_l = _coerce_modeling_types(self.modeling_type)
         if mode_l == "ss":
-            tokens = spatial_out
+            chosen = [self._pick_view(views, ("spatial", "s"))]
         elif mode_l == "tt":
-            tokens = temporal_out
+            chosen = [self._pick_view(views, ("temporal", "t"))]
         else:
-            tokens = self.perception(spatial_out, temporal_out, mode="st")
-        tokens = self.norm(tokens).contiguous()
-        pooled = tokens.mean(dim=1)
-        flat = self.head(pooled)
-        with contextlib.suppress(Exception):
-            if not _is_torch_compiling():
-                hid = int(self.head_hidden_dim)
-                fl_head = (
-                    2.0 * float(B) * float(self.d_model) * float(hid)
-                    + 2.0 * float(B) * float(hid) * float(self.out_dim)
-                )
-                FLOP_PROFILER.add("Head", float(fl_head))
-        flat = flat.contiguous()
-        context = flat.reshape(B, *self.out_shape).contiguous()
+            fused = self._run_fusions(views)
+            chosen = fused if len(fused) > 0 else list(views.values())
+        chosen = [self._as_3d_tokens(t) for t in chosen]
+        tokens = self._aggregate_tokens(chosen)
+        context = self.decode(tokens, apply_norm=False)
         if bool(return_temporal_state):
-            return (tokens, context, next_temporal_state)
-        return (tokens, context)
+            return tokens, context, next_state
+        return tokens, context
 
     def forward_state(
         self,
@@ -747,41 +890,18 @@ class MultiViewFuser(nn.Module):
         )
         if isinstance(next_state, torch.Tensor):
             return tokens, context, next_state
-        if next_state is None:
-            B = int(x.shape[0])
-            depth = int(getattr(self.temporal_net, "depth", 0))
-            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
-            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
-            filler = tokens.new_zeros((depth, B, nhead, head_dim))
-            return tokens, context, filler
-        try:
-            return tokens, context, torch.stack([s for s in next_state], dim=0)
-        except Exception:
-            B = int(x.shape[0])
-            depth = int(getattr(self.temporal_net, "depth", 0))
-            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
-            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
-            filler = tokens.new_zeros((depth, B, nhead, head_dim))
-            return tokens, context, filler
-
-    def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B = int(x.shape[0])
-        spatial_tokens = self.spatial_tokenizer(x).reshape(B, self.spatial_tokens, self.d_model).contiguous()
-        temporal_tokens = self.temporal_tokenizer(x).reshape(B, self.temporal_tokens, self.d_model).contiguous()
-        spatial_out = self.spatial_net(spatial_tokens)
-        temporal_out = self.temporal_net(temporal_tokens)
-        mode_l = _coerce_modeling_types(self.modeling_type)
-        if mode_l == "ss":
-            tokens = spatial_out
-        elif mode_l == "tt":
-            tokens = temporal_out
+        tn = getattr(self, "temporal_net", None)
+        if tn is not None:
+            depth = int(getattr(tn, "depth", 0))
+            nhead = int(getattr(tn, "nhead", self.nhead))
+            head_dim = int(getattr(tn, "head_dim", max(1, self.d_model // max(1, nhead))))
         else:
-            tokens = self.perception(spatial_out, temporal_out, mode="st")
-        tokens = self.norm(tokens).contiguous()
-        pooled = tokens.mean(dim=1)
-        flat = self.head(pooled).contiguous()
-        context = flat.reshape(B, *self.out_shape).contiguous()
-        return tokens, context
+            depth = 0
+            nhead = int(self.nhead)
+            head_dim = int(max(1, self.d_model // max(1, nhead)))
+        filler = tokens.new_zeros((max(1, depth), B, max(1, nhead), max(1, head_dim)))
+        return tokens, context, filler
 
     def forward_stream(
         self,
@@ -790,40 +910,23 @@ class MultiViewFuser(nn.Module):
         temporal_state: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        B = int(x.shape[0])
-        spatial_tokens = self.spatial_tokenizer(x).reshape(B, self.spatial_tokens, self.d_model).contiguous()
-        temporal_tokens = self.temporal_tokenizer(x).reshape(B, self.temporal_tokens, self.d_model).contiguous()
-        spatial_out = self.spatial_net(spatial_tokens)
-        temporal_out, next_state = self.temporal_net(
-            temporal_tokens,
+        tokens, context, next_state = self.forward_state(
+            x,
+            temporal_state=temporal_state,
             causal_mask=causal_mask,
-            state=temporal_state,
-            return_state=True,
         )
-        mode_l = _coerce_modeling_types(self.modeling_type)
-        if mode_l == "ss":
-            tokens = spatial_out
-        elif mode_l == "tt":
-            tokens = temporal_out
-        else:
-            tokens = self.perception(spatial_out, temporal_out, mode="st")
-        tokens = self.norm(tokens).contiguous()
-        pooled = tokens.mean(dim=1)
-        flat = self.head(pooled).contiguous()
-        context = flat.reshape(B, *self.out_shape).contiguous()
-        if not isinstance(next_state, torch.Tensor):
-            depth = int(getattr(self.temporal_net, "depth", 1))
-            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
-            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
-            next_state = tokens.new_zeros((depth, B, nhead, head_dim))
-        return tokens, context, next_state.contiguous()
+        return tokens, context, next_state
 
-    def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any) -> torch.Tensor:
+    def decode(self, tokens: torch.Tensor, *, apply_norm: bool = False) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
         flat = self.head(pooled)
         return flat.reshape(tokens.shape[0], *self.out_shape)
+
+    def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        tokens, context = cast(Tuple[torch.Tensor, torch.Tensor], self.forward(x))
+        return tokens, context
 
 
 class Model(nn.Module):
@@ -850,12 +953,13 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
-        self.processor = MultiViewFuser(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.fuser = MultiViewFuser(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.processor = self.fuser
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
-        self.controller = GlobalExtractor(
+        self.global_extractor = GlobalExtractor(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -864,6 +968,7 @@ class Model(nn.Module):
             batch_first=True,
             length_bucket_multiple=bucket,
         ).to(self._device)
+        self.controller = self.global_extractor
         self.p_gate: Optional[SigmoidGate]
         k_default = float(getattr(config, 'p_gate_fallback_k', 6.0))
         k_low_cfg = getattr(config, 'p_gate_fallback_k_low', None)
@@ -1024,8 +1129,13 @@ class Model(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = threading.Lock()
-        self._eager_processor_temporal_net = self.processor.temporal_net
-        self._eager_processor_perception = self.processor.perception
+        self._eager_fuser_temporal_view = (
+            self.fuser.view_encoders.get(cast(str, self.fuser.temporal_view_key))
+            if getattr(self.fuser, 'temporal_view_key', None) is not None
+            else None
+        )
+        _pair_keys = list(self.fuser.pair_fusers.keys())
+        self._eager_fuser_primary_fuser = self.fuser.pair_fusers[_pair_keys[0]] if _pair_keys else None
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -1070,6 +1180,14 @@ class Model(nn.Module):
         compile_requested = compile_mode_arg is not None
         compile_available = callable(getattr(torch, "compile", None))
         compile_enabled = bool(compile_requested and compile_available)
+        nogil_opt = False
+        with contextlib.suppress(Exception):
+            nogil_opt = bool(Thread.is_optimized_for_no_gil())
+        if nogil_opt and compile_enabled:
+            _LOGGER.info(
+                "No-GIL optimized mode detected; keeping torch.compile enabled but defaulting to "
+                "conservative settings (no cudagraphs; skip heavy submodules) unless explicitly overridden"
+            )
         if compile_requested and not compile_available:
             _LOGGER.warning(
                 "torch.compile requested (compile_mode=%r) but torch.compile is unavailable; running eagerly",
@@ -1078,7 +1196,7 @@ class Model(nn.Module):
         compile_dynamic = bool(
             getattr(config, "compile_dynamic", compile_mode_canonical == "reduce-overhead")
         )
-        compile_cudagraphs_default = compile_mode_canonical not in {
+        compile_cudagraphs_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "reduce-overhead",
             "max-autotune-no-cudagraphs",
         }
@@ -1093,7 +1211,7 @@ class Model(nn.Module):
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
-        compile_heavy_submodules_default = compile_mode_canonical not in {
+        compile_heavy_submodules_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "max-autotune",
             "max-autotune-no-cudagraphs",
         }
@@ -1116,7 +1234,7 @@ class Model(nn.Module):
             try:
                 _raw_head = self.processor.head
                 _decode_mod = _ProxyDecoder(self.processor.norm, _raw_head, self.out_shape).to(self._device)
-                _compiled = compile(
+                _compiled = torch.compile(
                     _decode_mod,
                     mode=compile_mode_arg,
                     fullgraph=False,
@@ -1137,42 +1255,47 @@ class Model(nn.Module):
                 empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
             if compile_heavy_submodules:
                 try:
-                    _orig = self.processor.temporal_net
-                    _compiled = compile(
-                        _orig,
-                        mode=compile_mode_arg,
-                        fullgraph=False,
-                        dynamic=compile_dynamic,
-                        backend="inductor",
-                        disable=False,
-                        **compile_kwargs,
-                    )
-                    self.processor.temporal_net = _compiled
-                    compiled_temporal = _compiled is not _orig
+                    _orig = self._eager_fuser_temporal_view
+                    if _orig is not None:
+                        _compiled = torch.compile(
+                            _orig,
+                            mode=compile_mode_arg,
+                            fullgraph=False,
+                            dynamic=compile_dynamic,
+                            backend="inductor",
+                            disable=False,
+                            **compile_kwargs,
+                        )
+                        if getattr(self.fuser, "temporal_view_key", None) in self.fuser.view_encoders:
+                            self.fuser.view_encoders[cast(str, self.fuser.temporal_view_key)] = _compiled
+                        compiled_temporal = _compiled is not _orig
                 except Exception:
                     _LOGGER.warning(
-                        "torch.compile failed for processor.temporal_net; continuing eagerly",
+                        "torch.compile failed for fuser temporal view; continuing eagerly",
                         exc_info=True,
                     )
             if getattr(self._device, "type", None) == "cuda":
                 empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
             if compile_heavy_submodules:
                 try:
-                    _orig = self.processor.perception
-                    _compiled = compile(
-                        _orig,
-                        mode=compile_mode_arg,
-                        fullgraph=False,
-                        dynamic=compile_dynamic,
-                        backend="inductor",
-                        disable=False,
-                        **compile_kwargs,
-                    )
-                    self.processor.perception = _compiled
-                    compiled_perception = _compiled is not _orig
+                    _orig = self._eager_fuser_primary_fuser
+                    if _orig is not None:
+                        _compiled = torch.compile(
+                            _orig,
+                            mode=compile_mode_arg,
+                            fullgraph=False,
+                            dynamic=compile_dynamic,
+                            backend="inductor",
+                            disable=False,
+                            **compile_kwargs,
+                        )
+                        _pair_keys = list(self.fuser.pair_fusers.keys())
+                        if _pair_keys:
+                            self.fuser.pair_fusers[_pair_keys[0]] = _compiled
+                        compiled_perception = _compiled is not _orig
                 except Exception:
                     _LOGGER.warning(
-                        "torch.compile failed for processor.perception; continuing eagerly",
+                        "torch.compile failed for fuser primary pair fuser; continuing eagerly",
                         exc_info=True,
                     )
             if getattr(self._device, "type", None) == "cuda":
@@ -1236,31 +1359,40 @@ class Model(nn.Module):
 
     @contextlib.contextmanager
     def eager_for_export(self):
-        proc = getattr(self, "processor", None)
-        if proc is None:
+        fuser = getattr(self, "fuser", None)
+        if fuser is None:
+            fuser = getattr(self, "processor", None)
+        if fuser is None:
             yield self
             return
-        swaps: list[tuple[str, Any]] = []
+        swaps: list[tuple[str, str, nn.Module]] = []
         with contextlib.suppress(Exception):
-            eager_temporal = getattr(self, "_eager_processor_temporal_net", None)
-            if isinstance(eager_temporal, nn.Module):
-                cur = getattr(proc, "temporal_net", None)
-                if cur is not eager_temporal and cur is not None:
-                    swaps.append(("temporal_net", cur))
-                    proc.temporal_net = eager_temporal
+            eager_temporal = getattr(self, "_eager_fuser_temporal_view", None)
+            key = getattr(fuser, "temporal_view_key", None)
+            if isinstance(eager_temporal, nn.Module) and isinstance(key, str) and key in fuser.view_encoders:
+                cur = fuser.view_encoders[key]
+                if cur is not eager_temporal:
+                    swaps.append(("view", key, cur))
+                    fuser.view_encoders[key] = eager_temporal
         with contextlib.suppress(Exception):
-            eager_perception = getattr(self, "_eager_processor_perception", None)
-            if isinstance(eager_perception, nn.Module):
-                cur = getattr(proc, "perception", None)
-                if cur is not eager_perception and cur is not None:
-                    swaps.append(("perception", cur))
-                    proc.perception = eager_perception
+            eager_pair = getattr(self, "_eager_fuser_primary_fuser", None)
+            if isinstance(eager_pair, nn.Module):
+                pair_keys = list(getattr(fuser, "pair_fusers", {}).keys())
+                if pair_keys:
+                    pk = pair_keys[0]
+                    cur = fuser.pair_fusers[pk]
+                    if cur is not eager_pair:
+                        swaps.append(("pair", pk, cur))
+                        fuser.pair_fusers[pk] = eager_pair
         try:
             yield self
         finally:
-            for name, old in swaps:
+            for kind, key, old in swaps:
                 with contextlib.suppress(Exception):
-                    setattr(proc, name, old)
+                    if kind == "view":
+                        fuser.view_encoders[key] = old
+                    else:
+                        fuser.pair_fusers[key] = old
 
     def forward_export(self, features: torch.Tensor) -> torch.Tensor:
         if not isinstance(features, torch.Tensor):
@@ -1273,7 +1405,7 @@ class Model(nn.Module):
         x = self._cast_graph_safe(features, device, base_dtype)
         x = self.scaler.normalize_x(x)
         b = int(x.shape[0])
-        tokens, context = self.processor.forward_export(x)
+        tokens, context = self.fuser.forward_export(x)
         assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
             bl = self.linear_branch(self._cast_graph_safe(x, device, assembled.dtype))
@@ -1282,8 +1414,8 @@ class Model(nn.Module):
         tokens_centered = tokens - mean.to(dtype=tokens.dtype)
         if not tokens_centered.is_contiguous():
             tokens_centered = tokens_centered.contiguous()
-        refined_tokens = self.controller.forward_export(tokens_centered)
-        residual_context = self.processor.decode(refined_tokens, apply_norm=True)
+        refined_tokens = self.global_extractor.forward_export(tokens_centered)
+        residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
         enhanced = residual_context.reshape(b, -1)
         if enhanced.dtype != assembled.dtype:
             enhanced = enhanced.to(dtype=assembled.dtype)
@@ -1351,10 +1483,14 @@ class Model(nn.Module):
             x = self._cast_graph_safe(features, device, base_dtype)
             x = self.scaler.normalize_x(x)
             b = int(x.shape[0])
-            tokens, context, next_state = self.processor.forward_stream(
-                x,
-                temporal_state=temporal_state,
-                causal_mask=causal_mask,
+            tokens, context, next_state = cast(
+                Tuple[torch.Tensor, torch.Tensor, Any],
+                self.fuser(
+                    x,
+                    temporal_state=temporal_state,
+                    return_temporal_state=True,
+                    causal_mask=causal_mask,
+                ),
             )
             tokens = _coerce_tensor(tokens, enabled=sanitize_nan, inplace=False)
             context = _coerce_tensor(context, enabled=sanitize_nan, inplace=False)
@@ -1366,9 +1502,9 @@ class Model(nn.Module):
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
-            refined_tokens = self.controller.forward_export(tokens_centered)
+            refined_tokens = self.global_extractor.forward_export(tokens_centered)
             refined_tokens = _coerce_tensor(refined_tokens, enabled=sanitize_nan, inplace=False)
-            residual_context = self.processor.decode(refined_tokens, apply_norm=True)
+            residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
             enhanced = residual_context.reshape(b, -1)
             if enhanced.dtype != assembled.dtype:
                 enhanced = enhanced.to(dtype=assembled.dtype)
@@ -1517,7 +1653,7 @@ class Model(nn.Module):
             td_loss_weights = td_input.get("loss_weights", None)
             if loss_weights is None and td_loss_weights is not None:
                 loss_weights = td_loss_weights
-        device = _infer_module_device(self.processor, self._device)
+        device = _infer_module_device(self.fuser, self._device)
         x_raw = features
         if isinstance(x_raw, torch.Tensor) and x_raw.ndim == 3 and x_raw.shape[1] == 1:
             x_raw = x_raw.reshape(x_raw.shape[0], -1)
@@ -1607,21 +1743,21 @@ class Model(nn.Module):
         has_any_loss = (net_loss is not None) or (global_loss is not None) or (local_loss is not None)
         has_supervision = labels_flat is not None and has_any_loss
         is_train_path = bool(self.training and grad_enabled and has_supervision)
-        _did_unshard_processor = False
-        _unshard = getattr(self.processor, "unshard", None)
-        _reshard = getattr(self.processor, "reshard", None)
+        _did_unshard_fuser = False
+        _unshard = getattr(self.fuser, "unshard", None)
+        _reshard = getattr(self.fuser, "reshard", None)
         if callable(_unshard):
             try:
                 _unshard(async_op=False)
-                _did_unshard_processor = True
+                _did_unshard_fuser = True
             except TypeError:
                 try:
                     _unshard()
-                    _did_unshard_processor = True
+                    _did_unshard_fuser = True
                 except Exception:
-                    _did_unshard_processor = False
+                    _did_unshard_fuser = False
             except Exception:
-                _did_unshard_processor = False
+                _did_unshard_fuser = False
 
         try:
             requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
@@ -1659,9 +1795,9 @@ class Model(nn.Module):
 
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
-                    return self.processor(inp)
+                    return self.fuser(inp)
 
-            enc_ctx = inference_mode(self.processor) if infer_mode else contextlib.nullcontext()
+            enc_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with enc_ctx:
                 tokens, context = cast(
                     Tuple[torch.Tensor, torch.Tensor],
@@ -1693,7 +1829,7 @@ class Model(nn.Module):
                 tokens_centered = tokens_centered.contiguous()
             if is_train_path:
                 tokens_centered = tokens_centered.detach()
-            refined_tokens = self.controller.run(
+            refined_tokens = self.global_extractor.run(
                 tokens_centered,
                 device=device,
                 meta=meta,
@@ -1706,9 +1842,9 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
-            ctrl_mb = max(1, min(int(b), int(self.controller.microbatch) or int(b)))
+            ctrl_mb = max(1, min(int(b), int(self.global_extractor.microbatch) or int(b)))
             graph_break()
-            processor_ctx = inference_mode(self.processor) if infer_mode else contextlib.nullcontext()
+            processor_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with processor_ctx:
                 dc = getattr(self, "_decode_compiled", None)
 
@@ -1716,7 +1852,7 @@ class Model(nn.Module):
                     with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
                         if dc is not None:
                             return cast(torch.Tensor, dc(chunk))
-                        return self.processor.decode(chunk, apply_norm=True)
+                        return self.fuser.decode(chunk, apply_norm=True)
 
                 residual_context = cast(
                     torch.Tensor,
@@ -2024,7 +2160,7 @@ class Model(nn.Module):
         finally:
             if did_cudagraph_step:
                 cudagraph_mark_step_end()
-            if _did_unshard_processor and callable(_reshard):
+            if _did_unshard_fuser and callable(_reshard):
                 with contextlib.suppress(Exception):
                     _reshard()
 

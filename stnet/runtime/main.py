@@ -4267,6 +4267,8 @@ def process(*args: Any, **kwargs: Any) -> object:
                 flatten_features=True,
                 train_shuffle=bool(getattr(ops, "shuffle", True)),
                 seed=int(getattr(ops, "seed", 42)),
+                train_weights=getattr(ops, "train_weights", None),
+                val_weights=getattr(ops, "val_weights", None),
                 labels_dtype=param_dtype,
             ).open(
                 train_state=state_train if restore_dl_state else None,
@@ -4507,6 +4509,8 @@ def process(*args: Any, **kwargs: Any) -> object:
             flatten_features=True,
             train_shuffle=bool(getattr(ops, "shuffle", False)),
             seed=int(getattr(ops, "seed", 7)),
+            train_weights=getattr(ops, "train_weights", None),
+            val_weights=getattr(ops, "val_weights", None),
         ).open()
         data_loader = session.training_loader
         chunk_dir = os.path.join(ops.ckpt_dir, "pred_chunks") if ops.ckpt_dir or "" else None
