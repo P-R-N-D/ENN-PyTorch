@@ -142,7 +142,7 @@ class _CallableFuser:
 
     def __init__(
         self,
-        backbone: Fuser,
+        backbone: "MultiViewFuser",
         *args: Any,
         device: torch.device,
         meta: Any,
@@ -479,7 +479,7 @@ class TemporalExtractor(nn.Module):
         return x
 
 
-class Enhancer(nn.Module):
+class GlobalExtractor(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -567,7 +567,7 @@ class Enhancer(nn.Module):
     ) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError(
-                f"Enhancer.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+                f"GlobalExtractor.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
         B = int(tokens.shape[0])
         if graph_break_fn is not None:
@@ -604,7 +604,7 @@ class Enhancer(nn.Module):
         return refined
 
 
-class Fuser(nn.Module):
+class MultiViewFuser(nn.Module):
     def __init__(self, in_dim: int, out_shape: Sequence[int], config: ModelConfig) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -665,7 +665,7 @@ class Fuser(nn.Module):
         )
 
 
-    @torch_compiler_disable(reason="Fuser orchestrates eager + compiled submodules", recursive=False)
+    @torch_compiler_disable(reason="MultiViewFuser orchestrates eager + compiled submodules", recursive=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -850,12 +850,12 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
-        self.processor = Fuser(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.processor = MultiViewFuser(self.in_dim, self.out_shape, config=config).to(self._device)
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
-        self.controller = Enhancer(
+        self.controller = GlobalExtractor(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
