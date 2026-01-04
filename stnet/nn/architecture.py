@@ -693,8 +693,8 @@ class MultiViewFuser(nn.Module):
                 activation_checkpointing=ckpt_enabled,
                 activation_checkpoint_reentrant=ckpt_reentrant,
             )
-        self.view_encoders["spatial"] = TokenizedView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
-        self.view_encoders["temporal"] = TokenizedView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
+            self.view_encoders["spatial"] = TokenizedView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
+            self.view_encoders["temporal"] = TokenizedView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
         else:
             items = views.items() if isinstance(views, Mapping) else list(views)
             for name, mod in items:
