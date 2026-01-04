@@ -788,19 +788,23 @@ class MultiScaleRetention(nn.Module):
         self._triton_ok = bool(_HAS_TRITON_MSR and torch.cuda.is_available())
         self._decay_init = 5.0
         self._decay_range = 1.0
+        heads = torch.arange(self.nhead, dtype=torch.float32)
+        beta_init = float(self._decay_init) + float(self._decay_range) * (
+            heads / float(max(self.nhead, 1))
+        )
+        self._beta = nn.Parameter(beta_init)
 
     def _decay_lambda(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
-        heads = torch.arange(H, device=device, dtype=calc_dtype)
-        denom = float(max(H, 1))
-        gammas = 1.0 - torch.pow(
-            2.0,
-            -(
-                float(self._decay_init)
-                + float(self._decay_range) * (heads / denom)
-            ),
-        )
+        beta_param = getattr(self, "_beta", None)
+        if isinstance(beta_param, torch.Tensor) and int(beta_param.numel()) == int(H):
+            beta_h = beta_param.to(device=device, dtype=calc_dtype)
+        else:
+            heads = torch.arange(H, device=device, dtype=calc_dtype)
+            denom = float(max(H, 1))
+            beta_h = float(self._decay_init) + float(self._decay_range) * (heads / denom)
+        gammas = 1.0 - torch.pow(2.0, -beta_h)
         gammas = gammas.clamp(min=torch.finfo(calc_dtype).tiny, max=1.0 - 1e-9)
         if calc_dtype != dtype:
             gammas = gammas.to(dtype=dtype)
