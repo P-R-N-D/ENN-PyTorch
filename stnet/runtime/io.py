@@ -70,7 +70,7 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
 
 
 @contextlib.contextmanager
-def _temp_environ(updates: dict[str, str | None], *, only_if_unset: bool = True) -> Iterator[None]:
+def _temp_environ(updates: dict[str, str | None], *args: Any, only_if_unset: bool = True) -> Iterator[None]:
     prev: dict[str, str | None] = {}
     for key, val in updates.items():
         if only_if_unset and key in os.environ:
