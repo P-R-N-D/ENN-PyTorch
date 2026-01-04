@@ -75,12 +75,6 @@ _NODES_IMPORTED = False
 
 
 def _require_nodes() -> None:
-    """Lazily import torchdata/tensordict-backed pipeline nodes.
-
-    This breaks the Dataset <-> nodes import cycle while keeping runtime errors
-    actionable if optional deps are missing.
-    """
-
     global _NODES_IMPORTED
     if _NODES_IMPORTED:
         return
@@ -745,9 +739,6 @@ def _fetch_iterate_sample(
     datasets: Mapping[str, "Sampler"],
     collate: Callable[[Any], Any],
 ) -> Any:
-    # Handle pre-batched sampler outputs produced by torchdata's Batcher
-    # (common in newer torchdata versions). Each element is a (key, span)
-    # tuple pointing to a dataset shard; fetch and collate into a proper batch.
     if isinstance(sample, (list, tuple)) and sample and all(
         isinstance(elem, tuple) and len(elem) == 2 for elem in sample
     ):
@@ -953,7 +944,6 @@ def compose(
     source = sampler.compose(node_or_nodes)
     if epochables is not None and getattr(sampler, "_node", None) is not None:
         with contextlib.suppress(Exception):
-            # Put it first so it runs before per-dataset epoch hooks.
             epochables.insert(0, sampler)
     mapper = Mapper(
         map_fn=map_fn,
@@ -1004,7 +994,7 @@ def fetch(
     specs = _fetch_normalize_sources(sources)
     spec_keys = list(specs.keys())
 
-    def _coerce_weight(v: Any, *, name: str) -> float:
+    def _coerce_weight(v: Any, *args: Any, name: str) -> float:
         try:
             fv = float(v)
         except Exception as exc:
@@ -1018,7 +1008,7 @@ def fetch(
     def _normalize_weights_strict(
         weights: Any,
         keys: Sequence[str],
-        *,
+        *args: Any,
         require_mapping: Optional[bool],
         name: str,
     ) -> Optional[Dict[str, float]]:
