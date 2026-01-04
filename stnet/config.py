@@ -201,8 +201,6 @@ def _coerce_weights_spec(
     raise TypeError(f"{name} must be a Mapping[str, float] or Sequence[float]")
 
 
-# ---- weights / multi-source helpers ----
-
 def _is_source_spec(obj: Any) -> bool:
     if not isinstance(obj, Mapping):
         return False
@@ -995,8 +993,6 @@ class ModelConfig:
     p_gate_edge_reg_frac: float = 0.02
     p_gate_edge_reg_min_width_frac: float = 0.05
     p_gate_edge_reg_power: float = 2.0
-
-    # --- Memory/graph features ---
     activation_checkpointing: bool = False
     activation_checkpoint_reentrant: bool = False
     unsup_xx_weight: float = 0.0
