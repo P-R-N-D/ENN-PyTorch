@@ -300,7 +300,7 @@ class TemporalExtractor(nn.Module):
     @torch_compiler_disable(reason="TemporalExtractor state coercion", recursive=False)
     def _coerce_state_tensor(
         state: Any,
-        *,
+        *args: Any,
         depth: int,
         batch_size: int,
         nhead: int,
@@ -647,7 +647,7 @@ class MultiViewFuser(nn.Module):
         in_dim: int,
         out_shape: Sequence[int],
         config: ModelConfig,
-        *,
+        *args: Any,
         views: Optional[Mapping[str, nn.Module] | Sequence[Tuple[str, nn.Module]]] = None,
         fusions: Optional[Mapping[str | Tuple[str, str], nn.Module] | Sequence[Tuple[str | Tuple[str, str], nn.Module]]] = None,
     ) -> None:
@@ -814,7 +814,7 @@ class MultiViewFuser(nn.Module):
     def _run_views(
         self,
         x: torch.Tensor,
-        *,
+        *args: Any,
         temporal_state: Any = None,
         want_state: bool = False,
         causal_mask: Optional[torch.Tensor] = None,
@@ -878,7 +878,7 @@ class MultiViewFuser(nn.Module):
     def forward_state(
         self,
         x: torch.Tensor,
-        *,
+        *args: Any,
         temporal_state: Any = None,
         causal_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -906,7 +906,7 @@ class MultiViewFuser(nn.Module):
     def forward_stream(
         self,
         x: torch.Tensor,
-        *,
+        *args: Any,
         temporal_state: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -917,7 +917,7 @@ class MultiViewFuser(nn.Module):
         )
         return tokens, context, next_state
 
-    def decode(self, tokens: torch.Tensor, *, apply_norm: bool = False) -> torch.Tensor:
+    def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False) -> torch.Tensor:
         if apply_norm:
             tokens = self.norm(tokens)
         pooled = tokens.mean(dim=1)
@@ -1456,7 +1456,7 @@ class Model(nn.Module):
     def forward_stream(
         self,
         features: torch.Tensor,
-        *,
+        *args: Any,
         temporal_state: Optional[torch.Tensor] = None,
         causal_mask: Optional[torch.Tensor] = None,
         calibrate_output: bool = True,
