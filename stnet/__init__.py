@@ -57,7 +57,7 @@ def train(*args: Any, **kwargs: Any) -> Model:
     return api.train(*args, **kwargs)
 
 
-def predict(*args: Any, **kwargs: Any) -> TensorDictBase:
+def predict(*args: Any, **kwargs: Any) -> TensorDictBase | dict[str, TensorDictBase]:
     from . import api
 
     return api.predict(*args, **kwargs)

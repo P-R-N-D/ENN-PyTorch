@@ -100,7 +100,7 @@ TrainData: TypeAlias = (
     | object
 )
 PredictData: TypeAlias = TrainData
-PredictionOutput: TypeAlias = TensorDictBase | PersistentTensorDict | Mapping[str, torch.Tensor]
+PredictionOutput: TypeAlias = TensorDictBase | PersistentTensorDict | Mapping[str, TensorDictBase] | Mapping[str, torch.Tensor]
 logger = logging.getLogger(__name__)
 
 
@@ -1018,6 +1018,63 @@ def predict(
     out_shape_t = tuple((int(x) for x in out_shape))
     if not out_shape_t or any((int(x) <= 0 for x in out_shape_t)):
         raise ValueError(f"predict: invalid out_shape={out_shape!r}")
+    multi_sources: dict[str, TensorDictBase] | None = None
+    if not isinstance(data, TensorDictBase):
+        if isinstance(data, Mapping) and data and all((isinstance(v, TensorDictBase) for v in data.values())):
+            multi_sources = {str(k): v for k, v in data.items()}
+        elif isinstance(data, Sequence) and data and all((isinstance(v, TensorDictBase) for v in data)):
+            multi_sources = {str(i): v for i, v in enumerate(data)}
+    if multi_sources is not None:
+
+        def _safe_key(k: str) -> str:
+            s = str(k)
+            for sep in (os.sep, os.altsep):
+                if sep:
+                    s = s.replace(sep, "_")
+            return s or "0"
+
+        base_kwargs = dict(kwargs)
+        base_run_id = str(base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}"))
+        output_mode0 = _coerce_prediction_output(output)
+        path_n0 = _coerce_path(path) if path is not None else None
+        out_multi: dict[str, TensorDictBase] = {}
+        for k, td in multi_sources.items():
+            key = str(k)
+            safe = _safe_key(key)
+            per_run_id = f"{base_run_id}-{safe}" if safe else base_run_id
+            per_path: PathLike | None = path
+            if output_mode0 == "file" and path_n0 is not None:
+                try:
+                    p = Path(path_n0)
+                    suf = str(p.suffix or "").lower()
+                    if suf in {".h5", ".hdf5"} and bool(p.name):
+                        per_path = p.with_name(f"{p.stem}-{safe}{p.suffix}")
+                    else:
+                        per_path = path_n0
+                except Exception:
+                    per_path = path
+            inner_kwargs = dict(base_kwargs)
+            inner_kwargs["run_id"] = per_run_id
+            inner_kwargs.setdefault("out_shape", out_shape_t)
+            out_multi[key] = cast(
+                TensorDictBase,
+                predict(
+                    model,
+                    td,
+                    *args,
+                    mode=mode,
+                    seed=seed,
+                    shuffle=shuffle,
+                    max_nodes=max_nodes,
+                    rdzv_endpoint=rdzv_endpoint,
+                    rdzv_backend=rdzv_backend,
+                    output=output,
+                    path=per_path,
+                    overwrite=overwrite,
+                    **inner_kwargs,
+                ),
+            )
+        return out_multi
     underflow_action = kwargs.pop("underflow_action", default_underflow_action())
     chunk_size = kwargs.pop("chunk_size", None)
     output_mode = _coerce_prediction_output(output)

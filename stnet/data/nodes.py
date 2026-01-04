@@ -2532,18 +2532,18 @@ class Sampler(torch.utils.data.Sampler):
                         out["Y"] = out["Y"].pin_memory()
             return out
 
-
 class Multiplexer:
     def __init__(
         self,
         *args: Any,
         stop_criteria: str = "ALL_DATASETS_EXHAUSTED",
-        weights: Optional[Mapping[str, float]] = None,
+        weights: Optional[Mapping[str, float] | Sequence[float] | float | int] = None,
         seed: int = 0,
         **kwargs: Any,
     ) -> None:
+        _ = args, kwargs
         self.stop_criteria = str(stop_criteria)
-        self.weights = dict(weights) if isinstance(weights, Mapping) else None
+        self._raw_weights = weights
         self.seed = int(seed)
         self._epoch = 0
         self._node: Optional[Any] = None
@@ -2579,25 +2579,109 @@ class Multiplexer:
             reset(None)
 
     def compose(self, sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode") -> "BaseNode":
+        sources_kind: str
         if isinstance(sources, BaseNode):
-            return sources
-        if isinstance(sources, (list, tuple)):
-            if len(sources) == 1:
-                return sources[0]
-            sources_map = {str(i): n for i, n in enumerate(sources)}
+            sources_kind = "single"
+            sources_map = {"0": sources}
+        elif isinstance(sources, (list, tuple)):
+            sources_kind = "sequence"
+            if len(sources) < 1:
+                raise ValueError("sources must be non-empty")
+            sources_map = {"0": sources[0]} if len(sources) == 1 else {str(i): n for i, n in enumerate(sources)}
         elif isinstance(sources, Mapping):
-            sources_map = dict(sources)
-            if len(sources_map) == 1:
-                return next(iter(sources_map.values()))
+            sources_kind = "mapping"
+            if len(sources) < 1:
+                raise ValueError("sources must be non-empty")
+            sources_map: Dict[str, BaseNode] = {}
+            for k, v in dict(sources).items():
+                kk = str(k)
+                if kk in sources_map:
+                    raise ValueError(f"sources has duplicate key after str(): {kk!r}")
+                sources_map[kk] = v
         else:
             raise TypeError("sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]")
-        w = self.weights or {k: 1.0 for k in sources_map}
+
+        if len(sources_map) <= 1:
+            w = {k: 1.0 for k in sources_map.keys()}
+            self._source_keys = list(sources_map.keys())
+            node = MultiNodeWeightedSampler(
+                sources_map,
+                w,
+                stop_criteria=self.stop_criteria,
+                seed=int(self.seed),
+            )
+            self._node = node
+            return node
+
+        raw = getattr(self, "_raw_weights", None)
+
+        def _coerce_weight(v: Any, *, where: str) -> float:
+            try:
+                fv = float(v)
+            except Exception as exc:
+                raise TypeError(f"weights entry must be numeric (float/int): {where}") from exc
+            if not math.isfinite(fv):
+                raise ValueError(f"weights entry must be finite: {where}")
+            if fv < 0.0:
+                raise ValueError(f"weights entry must be >= 0: {where}")
+            return float(fv)
+
+        w: Dict[str, float]
+        if raw is None:
+            w = {k: 1.0 for k in sources_map.keys()}
+        elif isinstance(raw, Mapping):
+            if sources_kind != "mapping":
+                raise TypeError("weights must be a Mapping[str, float] when sources is a Mapping")
+            w_in: Dict[str, float] = {}
+            for k, v in dict(raw).items():
+                kk = str(k)
+                if kk in w_in:
+                    raise ValueError(f"weights has duplicate key after str(): {kk!r}")
+                w_in[kk] = _coerce_weight(v, where=f"weights[{kk!r}]")
+            if not w_in:
+                raise ValueError("weights mapping must be non-empty (use None for uniform)")
+            missing = set(sources_map.keys()) - set(w_in.keys())
+            extra = set(w_in.keys()) - set(sources_map.keys())
+            if missing or extra:
+                raise ValueError(
+                    "weights mapping keys must match sources keys exactly; "
+                    f"missing={sorted(missing)} extra={sorted(extra)} sources={sorted(sources_map.keys())}"
+                )
+            if not any((float(v) > 0.0) for v in w_in.values()):
+                raise ValueError("weights mapping must contain at least one positive weight")
+            w = {k: float(w_in[k]) for k in sources_map.keys()}
+        elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            raise TypeError("scalar weights are only supported for a single source (omit weights for multi-source)")
+        elif isinstance(raw, collections.abc.Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            if sources_kind != "sequence":
+                raise TypeError("weights must be a Sequence[float] when sources is a Sequence")
+            seq = list(raw)
+            expected = len(sources_map)
+            if len(seq) != expected:
+                raise ValueError(f"weights sequence length mismatch: expected {expected}, got {len(seq)}")
+            w_seq = [_coerce_weight(v, where=f"weights[{i}]") for i, v in enumerate(seq)]
+            if not any((float(v) > 0.0) for v in w_seq):
+                raise ValueError("weights sequence must contain at least one positive weight")
+            if not all(str(k).isdigit() for k in sources_map.keys()):
+                raise ValueError("sequence weights require digit-only source keys ('0','1',...)")
+            w = {k: float(w_seq[int(k)]) for k in sources_map.keys()}
+        else:
+            raise TypeError("weights must be a Mapping[str, float] or Sequence[float] (or omitted for uniform)")
+
+        if not any((float(v) > 0.0) for v in w.values()):
+            raise ValueError("at least one sampling weight must be positive")
         self._source_keys = list(sources_map.keys())
-        node = MultiNodeWeightedSampler(sources_map, w, stop_criteria=self.stop_criteria, seed=int(self.seed))
+        node = MultiNodeWeightedSampler(
+            sources_map,
+            w,
+            stop_criteria=self.stop_criteria,
+            seed=int(self.seed),
+        )
         self._node = node
         return node
 
 class Mapper:
+
     def __init__(
         self,
         *args: Any,

@@ -5,7 +5,7 @@ import contextlib
 import math
 from dataclasses import dataclass, field, fields
 from typing import (
-    TYPE_CHECKING, Any, ClassVar, Dict, List, Set, Literal, Optional,
+    TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Set, Literal, Optional,
     Sequence, Tuple, Union
 )
 
@@ -149,6 +149,75 @@ def _coerce_int_sequence(
         return tuple(_coerce_int(x, name=name, minimum=minimum) for x in xs)
     except TypeError as exc:
         raise TypeError(f"{name} must be a sequence of integers, got {xs!r}") from exc
+
+
+def _coerce_weights_spec(
+    value: Any,
+    *args: Any,
+    name: str,
+) -> Optional[Mapping[str, float] | Sequence[float]]:
+    _ = args
+    if value is None:
+        return None
+    def _coerce_one(v: Any, *, where: str) -> float:
+        try:
+            fv = float(v)
+        except Exception as exc:
+            raise TypeError(f"{name} entries must be numeric (float/int): {where}") from exc
+        if not math.isfinite(fv):
+            raise ValueError(f"{name} entries must be finite: {where}")
+        if fv < 0.0:
+            raise ValueError(f"{name} entries must be >= 0: {where}")
+        return float(fv)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        fv = _coerce_one(value, where=f"{name}[0]")
+        if fv <= 0.0:
+            raise ValueError(f"{name} scalar must be > 0")
+        return [fv]
+    if isinstance(value, Mapping):
+        raw = dict(value)
+        if not raw:
+            raise ValueError(f"{name} mapping must be non-empty (use None for uniform)")
+        out: Dict[str, float] = {}
+        for k, v in raw.items():
+            ks = str(k)
+            if ks in out:
+                raise ValueError(f"{name} has duplicate key after str(): {ks!r}")
+            out[ks] = _coerce_one(v, where=f"{name}[{ks!r}]")
+        if not any((float(v) > 0.0) for v in out.values()):
+            raise ValueError(f"{name} must contain at least one positive weight")
+        return out
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        seq = list(value)
+        if not seq:
+            raise ValueError(f"{name} sequence must be non-empty (use None for uniform)")
+        out_seq: List[float] = []
+        for i, v in enumerate(seq):
+            out_seq.append(_coerce_one(v, where=f"{name}[{i}]"))
+        if not any((float(v) > 0.0) for v in out_seq):
+            raise ValueError(f"{name} must contain at least one positive weight")
+        return out_seq
+    raise TypeError(f"{name} must be a Mapping[str, float] or Sequence[float]")
+
+
+# ---- weights / multi-source helpers ----
+
+def _is_source_spec(obj: Any) -> bool:
+    if not isinstance(obj, Mapping):
+        return False
+    fmt = obj.get("format", None)
+    pth = obj.get("path", None)
+    return isinstance(fmt, str) and isinstance(pth, str)
+
+
+def _effective_source_count(sources: Any) -> int:
+    if sources is None:
+        return 0
+    if isinstance(sources, (list, tuple)):
+        return int(len(sources))
+    if isinstance(sources, Mapping) and (not _is_source_spec(sources)):
+        return int(len(sources))
+    return 1
 
 
 def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
@@ -874,6 +943,7 @@ class ModelConfig:
     spatial_latents: int = 64
     temporal_latents: int = 64
     modeling_type: str = "spatiotemporal"
+    fuser_blend_alpha: float = 0.0
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
@@ -961,6 +1031,8 @@ class RuntimeConfig:
     seed: int = 42
     shuffle: bool = True
     deterministic: bool = False
+    train_weights: Optional[Mapping[str, float] | Sequence[float]] = None
+    val_weights: Optional[Mapping[str, float] | Sequence[float]] = None
     loss_tile_dim: Optional[int] = None
     loss_tile_size: Optional[int] = None
     loss_mask_mode: str = "none"
@@ -1004,6 +1076,8 @@ class RuntimeConfig:
             "seed",
             "shuffle",
             "deterministic",
+            "train_weights",
+            "val_weights",
             "loss_tile_dim",
             "loss_tile_size",
             "loss_mask_mode",
@@ -1023,6 +1097,8 @@ class RuntimeConfig:
             "seed",
             "shuffle",
             "loss_skew",
+            "train_weights",
+            "val_weights",
         }
     )
 
@@ -1041,6 +1117,9 @@ class RuntimeConfig:
             if name in data:
                 raise TypeError(f"{name} specified both positionally and as a keyword")
             data[name] = val
+        if "weights" in data and "train_weights" not in data:
+            data["train_weights"] = data.get("weights")
+        data.pop("weights", None)
         for k in ("in_dim", "out_shape", "cfg_dict"):
             if k not in data or data[k] is None:
                 raise ValueError(f"RuntimeConfig missing required key: {k}")
@@ -1075,6 +1154,13 @@ class RuntimeConfig:
             seed = _coerce_int(data.get("seed", 42), name="seed")
             shuffle = _coerce_bool(data.get("shuffle", True), name="shuffle")
             deterministic = _coerce_bool(data.get("deterministic", False), name="deterministic")
+            _src_n = _effective_source_count(data.get("sources"))
+            if _src_n <= 1:
+                train_weights = None
+                val_weights = None
+            else:
+                train_weights = _coerce_weights_spec(data.get("train_weights"), name="train_weights")
+                val_weights = _coerce_weights_spec(data.get("val_weights"), name="val_weights")
             loss_tile_dim = data.get("loss_tile_dim")
             if loss_tile_dim is not None:
                 loss_tile_dim = _coerce_int(loss_tile_dim, name="loss_tile_dim", minimum=1)
@@ -1142,6 +1228,8 @@ class RuntimeConfig:
                 seed=seed,
                 shuffle=shuffle,
                 deterministic=deterministic,
+                train_weights=train_weights,
+                val_weights=val_weights,
                 loss_tile_dim=loss_tile_dim,
                 loss_tile_size=loss_tile_size,
                 loss_mask_mode=loss_mask_mode,
@@ -1162,6 +1250,13 @@ class RuntimeConfig:
         seed = _coerce_int(data.get("seed", 7), name="seed")
         shuffle = _coerce_bool(data.get("shuffle", False), name="shuffle")
         loss_skew = _coerce_bool(data.get("loss_skew", True), name="loss_skew")
+        _src_n = _effective_source_count(data.get("sources"))
+        if _src_n <= 1:
+            train_weights = None
+            val_weights = None
+        else:
+            train_weights = _coerce_weights_spec(data.get("train_weights"), name="train_weights")
+            val_weights = _coerce_weights_spec(data.get("val_weights"), name="val_weights")
         ckpt_dir = str(data["ckpt_dir"])
         model_ckpt_dir = data.get("model_ckpt_dir")
         if model_ckpt_dir is not None:
@@ -1178,4 +1273,6 @@ class RuntimeConfig:
             seed=seed,
             shuffle=shuffle,
             loss_skew=loss_skew,
+            train_weights=train_weights,
+            val_weights=val_weights,
         )

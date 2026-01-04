@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import contextlib
-from typing import Any, Callable, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 
 import torch
 import torch.nn as nn
@@ -279,11 +279,22 @@ class CrossTransformer(nn.Module):
         norm_type: str = "layernorm",
         mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
+        cross: Optional[Sequence[nn.Module]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
-        self.cross_s = CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
-        self.cross_t = CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type)
+        if cross is None:
+            cross_mods: List[nn.Module] = [
+                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
+                CrossAttention(d_model, nhead, dropout=dropout, norm_type=norm_type),
+            ]
+        else:
+            cross_mods = list(cross)
+            if len(cross_mods) != 2:
+                raise ValueError(f"CrossTransformer expects exactly 2 cross modules, got {len(cross_mods)}")
+        self.cross = nn.ModuleList(cross_mods)
+        self.cross_s = self.cross[0]
+        self.cross_t = self.cross[1]
         self.mix_norm = norm_layer(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
@@ -294,36 +305,33 @@ class CrossTransformer(nn.Module):
 
     def forward(
         self,
-        spatial_tokens: torch.Tensor,
-        temporal_tokens: torch.Tensor,
+        tokens_a: torch.Tensor,
+        tokens_b: torch.Tensor,
         mode: Optional[str] = None,
     ) -> torch.Tensor:
+        spatial_tokens, temporal_tokens = tokens_a, tokens_b
         if spatial_tokens.dim() != 3 or temporal_tokens.dim() != 3:
             raise ValueError(
                 f"CrossTransformer expects 3D tensors, got "
-                f"spatial={tuple(spatial_tokens.shape)}, temporal={tuple(temporal_tokens.shape)}"
+                f"a={tuple(spatial_tokens.shape)}, b={tuple(temporal_tokens.shape)}"
             )
         Bs, Ns, Ds = spatial_tokens.shape
         Bt, Nt, Dt = temporal_tokens.shape
         if Bs != Bt:
-            raise ValueError(
-                f"CrossTransformer batch mismatch: spatial B={Bs}, temporal B={Bt}"
-            )
+            raise ValueError(f"CrossTransformer batch mismatch: a B={Bs}, b B={Bt}")
         if Ds != Dt:
-            raise ValueError(
-                f"CrossTransformer hidden dim mismatch: spatial D={Ds}, temporal D={Dt}"
-            )
+            raise ValueError(f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}")
         requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
         mode_l = _coerce_modeling_types(requested)
         match mode_l:
             case "ss":
-                return self.cross_s(spatial_tokens, temporal_tokens)
+                return self.cross[0](spatial_tokens, temporal_tokens)
             case "tt":
-                return self.cross_t(temporal_tokens, spatial_tokens)
+                return self.cross[1](temporal_tokens, spatial_tokens)
             case _:
                 pass
-        s_context = self.cross_s(spatial_tokens, temporal_tokens)
-        t_context = self.cross_t(temporal_tokens, spatial_tokens)
+        s_context = self.cross[0](spatial_tokens, temporal_tokens)
+        t_context = self.cross[1](temporal_tokens, spatial_tokens)
         t_summary = t_context.mean(dim=1, keepdim=True).expand_as(s_context)
         base_s = torch.cat([s_context, t_summary], dim=-1)
         fused_s = self.mix(self.mix_norm(base_s))
