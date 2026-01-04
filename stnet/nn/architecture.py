@@ -23,17 +23,23 @@ from typing import (
 
 import torch
 import torch.nn as nn
+try:
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+except Exception:
+    _checkpoint = None
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
-from ..core.casting import env_first_int, env_int
+from ..core.casting import env_bool, env_first_int, env_int
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.graph import (
     compile, 
     graph_break, 
     inference_mode,
     clear_model_cache,
-    torch_compiler_disable
+    torch_compiler_disable,
+    cudagraph_mark_step_begin,
+    cudagraph_mark_step_end,
 )
 from ..core.precision import Autocast, is_scale_safe
 from ..core.profiler import FLOP_PROFILER
@@ -49,18 +55,16 @@ from ..data.pipeline import (
     get_label_key
 )
 from .blocks import (
-    CrossTransformer, 
+    CrossTransformer,
     LongNet,
-    PointTransformer, 
     RetNet,
-    _autofit_microbatch, 
+    _autofit_microbatch,
     _coerce_modeling_types,
     _coerce_tensor,
     _infer_module_device,
-    _prealloc_microbatch, 
-    _serialize_z_index, 
-    norm_layer, 
-    stochastic_depth_schedule
+    _prealloc_microbatch,
+    norm_layer,
+    stochastic_depth_schedule,
 )
 from .primitives import (
     Recorder, 
@@ -184,443 +188,67 @@ class SpatialExtractor(nn.Module):
         nhead: int,
         depth: int,
         *args: Any,
-        coord_dim: int = 3,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        activation_checkpointing: bool = False,
+        activation_checkpoint_reentrant: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        del args, kwargs
         drops = stochastic_depth_schedule(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
-                PointTransformer(
+                RetNet(
                     d_model,
                     nhead,
-                    coord_dim=coord_dim,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
                     drop_path=drops[i],
                     norm_type=norm_type,
+                    mode="spatial",
                 )
-                for i in range(depth)
+                for i in range(int(depth))
             ]
         )
-        self.norm = norm_layer(norm_type, d_model)
-        self.patch_size: int = int(getattr(self, "patch_size", 512) or 512)
-        self.shift_order: bool = bool(getattr(self, "shift_order", True))
-        self.morton_bits: int = int(getattr(self, "morton_bits", 10) or 10)
-        self.register_buffer(
-            "_perm_cache",
-            torch.empty(0, dtype=torch.int64),
-            persistent=False,
-        )
-        self.register_buffer(
-            "_invperm_cache",
-            torch.empty(0, dtype=torch.int64),
-            persistent=False,
-        )
-        self._perm_cache_meta: Optional[Tuple[int, int, int, int, int, int, int]] = None
-        self._perm_cache_lock = threading.Lock()
+        self.norm = norm_layer(norm_type, int(d_model))
+        self._ckpt_enabled = bool(activation_checkpointing)
+        self._ckpt_reentrant = bool(activation_checkpoint_reentrant)
 
-    def __getstate__(self):
-        state = super().__getstate__()
-        state.pop("_perm_cache_lock", None)
-        return state
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        self._perm_cache_lock = threading.Lock()
-
-    def _get_permutation_cache(
-        self, coords: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        depth = len(self.blocks)
-        if coords.dim() != 3:
-            raise ValueError(
-                f"SpatialExtractor coords must be (B,N,C), got shape {tuple(coords.shape)}"
-            )
-        B, N, _ = coords.shape
-        patch = int(self.patch_size)
-        shift = bool(self.shift_order)
-        bits = int(self.morton_bits)
-        shared_template = (B <= 1) or (coords.stride(0) == 0)
-        can_use_pointer_cache = (not _is_export_or_trace()) and (not is_meta_or_fake_tensor(coords))
-
-        if shared_template and (not can_use_pointer_cache):
-            coords_one = coords[:1].contiguous()
-            perm0, inv0 = _serialize_z_index(
-                coords_one,
-                bits=bits,
-                patch=patch,
-                shift_order=shift,
-                block_index=0,
-            )
-            perm0 = perm0[0].to(dtype=torch.int64)
-            inv0 = inv0[0].to(dtype=torch.int64)
-            shift_amt = 0
-            if shift:
-                shift_amt = (patch // 2) % max(int(N), 1)
-            perm1 = perm0
-            inv1 = inv0
-            if shift_amt:
-                perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=0)
-                inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
-            perms: List[torch.Tensor] = []
-            invperms: List[torch.Tensor] = []
-            for i in range(depth):
-                if shift and shift_amt and (i % 2 == 1):
-                    perms.append(perm1)
-                    invperms.append(inv1)
-                else:
-                    perms.append(perm0)
-                    invperms.append(inv0)
-            return torch.stack(perms, dim=0), torch.stack(invperms, dim=0)
-
-        if shared_template and can_use_pointer_cache:
-            coords_ptr = int(coords.data_ptr()) if coords.numel() else 0
-            coords_ver = int(getattr(coords, "_version", 0))
-            meta = (
-                int(N),
-                int(patch),
-                int(bits),
-                int(shift),
-                int(depth),
-                coords_ptr,
-                coords_ver,
-            )
-            lock = getattr(self, "_perm_cache_lock", None)
-            if lock is None:
-                lock = threading.Lock()
-                setattr(self, "_perm_cache_lock", lock)
-            with lock:
-                perm_cache = getattr(self, "_perm_cache", None)
-                inv_cache = getattr(self, "_invperm_cache", None)
-                if (
-                    isinstance(perm_cache, torch.Tensor)
-                    and isinstance(inv_cache, torch.Tensor)
-                    and self._perm_cache_meta == meta
-                    and perm_cache.shape == (depth, N)
-                    and inv_cache.shape == (depth, N)
-                    and perm_cache.device == coords.device
-                    and inv_cache.device == coords.device
-                ):
-                    return perm_cache, inv_cache
-            coords_one = coords[:1].contiguous()
-            perm0, inv0 = _serialize_z_index(
-                coords_one,
-                bits=bits,
-                patch=patch,
-                shift_order=shift,
-                block_index=0,
-            )
-            perm0 = perm0[0].to(dtype=torch.int64)
-            inv0 = inv0[0].to(dtype=torch.int64)
-            shift_amt = 0
-            if shift:
-                shift_amt = (patch // 2) % max(int(N), 1)
-            perm1 = perm0
-            inv1 = inv0
-            if shift_amt:
-                perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=0)
-                inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
-            perms: List[torch.Tensor] = []
-            invperms: List[torch.Tensor] = []
-            for i in range(depth):
-                if shift and shift_amt and (i % 2 == 1):
-                    perms.append(perm1)
-                    invperms.append(inv1)
-                else:
-                    perms.append(perm0)
-                    invperms.append(inv0)
-            perm_new = torch.stack(perms, dim=0)
-            inv_new = torch.stack(invperms, dim=0)
-            with lock:
-                perm_cache = getattr(self, "_perm_cache", None)
-                inv_cache = getattr(self, "_invperm_cache", None)
-                if (
-                    isinstance(perm_cache, torch.Tensor)
-                    and isinstance(inv_cache, torch.Tensor)
-                    and self._perm_cache_meta == meta
-                    and perm_cache.shape == (depth, N)
-                    and inv_cache.shape == (depth, N)
-                    and perm_cache.device == coords.device
-                    and inv_cache.device == coords.device
-                ):
-                    return perm_cache, inv_cache
-                self._perm_cache = perm_new
-                self._invperm_cache = inv_new
-                self._perm_cache_meta = meta
-            return perm_new, inv_new
-        perms_b: List[torch.Tensor] = []
-        invperms_b: List[torch.Tensor] = []
-        coords_batch = coords.contiguous()
-        perm0, inv0 = _serialize_z_index(
-            coords_batch,
-            bits=bits,
-            patch=patch,
-            shift_order=shift,
-            block_index=0,
-        )
-        perm0 = perm0.to(dtype=torch.int64)
-        inv0 = inv0.to(dtype=torch.int64)
-        shift_amt = 0
-        if shift:
-            shift_amt = (patch // 2) % max(int(N), 1)
-        perm1 = perm0
-        inv1 = inv0
-        if shift_amt:
-            perm1 = torch.roll(perm0, shifts=int(shift_amt), dims=1)
-            inv1 = (inv0 + int(shift_amt)) % max(int(N), 1)
-        for i in range(depth):
-            if shift and shift_amt and (i % 2 == 1):
-                perms_b.append(perm1)
-                invperms_b.append(inv1)
-            else:
-                perms_b.append(perm0)
-                invperms_b.append(inv0)
-        perm_b = torch.stack(perms_b, dim=0)
-        inv_b = torch.stack(invperms_b, dim=0)
-        return perm_b, inv_b
-
-    @torch_compiler_disable(reason="SpatialExtractor uses dynamic gather/scatter", recursive=True)
     def forward(
         self,
         x: torch.Tensor,
-        coords: torch.Tensor,
+        coords: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
-        if is_meta_or_fake_tensor(x) and not _is_export_or_trace():
-            raise RuntimeError("x is meta/fake before SpatialExtractor.forward")
-        if is_meta_or_fake_tensor(coords) and not _is_export_or_trace():
-            raise RuntimeError("coords is meta/fake before SpatialExtractor.forward")
-        if x.dim() != 3:
-            raise ValueError(
-                f"SpatialExtractor expects (B, N, C) tokens, got shape {tuple(x.shape)}"
-            )
-        if coords.dim() != 3:
-            raise ValueError(
-                f"SpatialExtractor expects (B, N, D) coords, got shape {tuple(coords.shape)}"
-            )
-        if x.shape[:2] != coords.shape[:2]:
-            raise ValueError(
-                "tokens/coords batch or length mismatch: "
-                f"tokens={tuple(x.shape)} vs coords={tuple(coords.shape)}"
-            )
-        x = x.contiguous()
-        B, N, D = x.shape
-        Bc = int(coords.size(0))
-        if Bc != B:
-            raise ValueError(
-                f"coords batch mismatch: tokens batch={B} vs coords batch={Bc}"
-            )
-        if B > 1 and coords.stride(0) == 0:
-            coords0 = coords[0].contiguous()
-            coords = coords0.unsqueeze(0).expand(B, -1, -1)
-        else:
-            coords = coords.contiguous()
-
-        if coords.dtype != torch.float32:
-            coords = coords.float()
-        mask_scalar: torch.Tensor | None = None
-        mask_base: torch.Tensor | None = None
-        if attn_mask is not None:
-            if is_meta_or_fake_tensor(attn_mask) and not _is_export_or_trace():
-                raise RuntimeError("attn_mask is meta/fake before SpatialExtractor.forward")
-            if attn_mask.device != x.device:
-                if int(attn_mask.dim()) == 0:
-                    attn_mask = attn_mask.to(device=x.device)
-                else:
-                    raise ValueError(
-                        "attn_mask must be on the same device as tokens: "
-                        f"attn_mask.device={attn_mask.device} vs x.device={x.device}"
+        del coords, args, kwargs
+        out = x
+        do_ckpt = (
+            self._ckpt_enabled
+            and self.training
+            and torch.is_grad_enabled()
+            and _checkpoint is not None
+            and not _is_export_or_trace()
+        )
+        for blk in self.blocks:
+            if do_ckpt:
+                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    y, _ = _blk(t, causal_mask=attn_mask, state=None, mode="spatial")
+                    return y
+                try:
+                    out = cast(
+                        torch.Tensor,
+                        _checkpoint(_f, out, use_reentrant=bool(self._ckpt_reentrant)),
                     )
-            attn_mask = attn_mask.contiguous()
-            match int(attn_mask.dim()):
-                case 0:
-                    mask_scalar = attn_mask
-                case 3:
-                    if int(attn_mask.size(0)) != int(B):
-                        raise ValueError(
-                            f"attn_mask batch mismatch: expected B={B}, got {int(attn_mask.size(0))}"
-                        )
-                    if attn_mask.shape[-2:] != (N, N):
-                        raise ValueError(
-                            f"attn_mask last 2 dims must be (N,N)=({N},{N}), got {tuple(attn_mask.shape)}"
-                        )
-                    mask_base = attn_mask
-                case 4:
-                    if int(attn_mask.size(0)) != int(B):
-                        raise ValueError(
-                            f"attn_mask batch mismatch: expected B={B}, got {int(attn_mask.size(0))}"
-                        )
-                    if attn_mask.shape[-2:] != (N, N):
-                        raise ValueError(
-                            f"attn_mask last 2 dims must be (N,N)=({N},{N}), got {tuple(attn_mask.shape)}"
-                        )
-                    if attn_mask.size(1) != 1:
-                        raise ValueError("attn_mask with per-head shape not supported here")
-                    mask_base = attn_mask.squeeze(1)
-                case _:
-                    raise ValueError("attn_mask must be rank 0, 3, or 4 here")
-        b_index: torch.Tensor | None = None
-        if mask_base is not None:
-            b_index = torch.arange(B, device=mask_base.device)
-        perm_cache, inv_cache = self._get_permutation_cache(coords)
-        patch = int(self.patch_size)
-        full = (N // patch) * patch
-        nblk = (full // patch) if full > 0 else 0
-        coord_dim = int(coords.size(-1))
-        shift = bool(self.shift_order)
-        shift_amt = 0
-        if shift:
-            shift_amt = (patch // 2) % max(int(N), 1)
-        shared_perm = int(perm_cache.dim()) == 2
-        perm_even = perm_cache[0]
-        inv_even = inv_cache[0]
-        perm_odd = perm_even
-        inv_odd = inv_even
-        if shift and shift_amt and len(self.blocks) > 1:
-            perm_odd = perm_cache[1]
-            inv_odd = inv_cache[1]
-        idx_full_even: torch.Tensor | None = None
-        idx_full_odd: torch.Tensor | None = None
-        idx_tail_even: torch.Tensor | None = None
-        idx_tail_odd: torch.Tensor | None = None
-        tail_len = int(N - full)
-        if mask_base is not None:
-            if full > 0:
-                if shared_perm:
-                    idx_full_even = perm_even[:full].reshape(nblk, patch)
-                    idx_full_odd = perm_odd[:full].reshape(nblk, patch) if (shift and shift_amt) else idx_full_even
-                else:
-                    idx_full_even = perm_even[:, :full].reshape(B, nblk, patch)
-                    idx_full_odd = perm_odd[:, :full].reshape(B, nblk, patch) if (shift and shift_amt) else idx_full_even
-            if tail_len > 0:
-                if shared_perm:
-                    idx_tail_even = perm_even[full:N]
-                    idx_tail_odd = perm_odd[full:N] if (shift and shift_amt) else idx_tail_even
-                else:
-                    idx_tail_even = perm_even[:, full:N]
-                    idx_tail_odd = perm_odd[:, full:N] if (shift and shift_amt) else idx_tail_even
-        mb_full_even: torch.Tensor | None = None
-        mb_full_odd: torch.Tensor | None = None
-        mb_tail_even: torch.Tensor | None = None
-        mb_tail_odd: torch.Tensor | None = None
-        cache_full_masks = False
-        cache_tail_masks = False
-        if mask_base is not None:
-            try:
-                elem = int(mask_base.element_size())
-            except Exception:
-                elem = 1
-            if full > 0 and nblk > 0:
-                try:
-                    one_bytes = int(B) * int(nblk) * int(patch) * int(patch) * elem
-                    cache_full_masks = one_bytes <= (32 << 20)
-                except Exception:
-                    cache_full_masks = False
-            if tail_len > 0:
-                try:
-                    tail_bytes = int(B) * int(tail_len) * int(tail_len) * elem
-                    cache_tail_masks = tail_bytes <= (16 << 20)
-                except Exception:
-                    cache_tail_masks = False
-        b_full: torch.Tensor | None = None
-        b_tail: torch.Tensor | None = None
-        if mask_base is not None:
-            base = mask_base
-            if b_index is None:
-                b_index = torch.arange(B, device=base.device)
-            b_full = b_index.view(B, 1, 1, 1)
-            b_tail = b_index.view(B, 1, 1)
-        for i, blk in enumerate(self.blocks):
-            use_odd = bool(shift_amt and (i % 2 == 1))
-            if shared_perm:
-                perm_1d = perm_odd if use_odd else perm_even
-                inv_1d = inv_odd if use_odd else inv_even
-                x_s = x.index_select(1, perm_1d)
-                c_s = coords.index_select(1, perm_1d)
+                except TypeError:
+                    out = cast(torch.Tensor, _checkpoint(_f, out))
             else:
-                perm_2d = perm_odd if use_odd else perm_even
-                inv_2d = inv_odd if use_odd else inv_even
-                x_s = x.gather(1, perm_2d.unsqueeze(-1).expand(B, N, D))
-                c_s = coords.gather(1, perm_2d.unsqueeze(-1).expand(B, N, coord_dim))
-            if torch.is_grad_enabled():
-                out_s = torch.empty_like(x_s)
-            else:
-                out_s = x_s
-            if full > 0:
-                x_full = x_s[:, :full, :].contiguous().view(B, nblk, patch, D)
-                c_full = c_s[:, :full, :].contiguous().view(B, nblk, patch, coord_dim)
-                x_flat = x_full.reshape(B * nblk, patch, D)
-                c_flat = c_full.reshape(B * nblk, patch, coord_dim)
-                mb_flat: torch.Tensor | None = None
-                if mask_scalar is not None:
-                    mb_flat = mask_scalar
-                elif mask_base is not None and b_full is not None:
-                    cached = None
-                    if cache_full_masks:
-                        cached = mb_full_odd if use_odd else mb_full_even
-                    if cached is None:
-                        idx = idx_full_odd if use_odd else idx_full_even
-                        if idx is not None:
-                            if shared_perm:
-                                ii = idx.view(1, nblk, patch, 1)
-                                jj = idx.view(1, nblk, 1, patch)
-                            else:
-                                ii = idx.unsqueeze(-1)
-                                jj = idx.unsqueeze(-2)
-                            mb = mask_base[b_full, ii, jj]
-                            cached = mb.reshape(B * nblk, patch, patch).contiguous()
-                            if cache_full_masks:
-                                if use_odd:
-                                    mb_full_odd = cached
-                                else:
-                                    mb_full_even = cached
-                    mb_flat = cached
-                y_flat = blk(x_flat, c_flat, attn_mask=mb_flat)
-                out_s[:, :full, :].copy_(y_flat.reshape(B, nblk, patch, D).reshape(B, full, D))
-            if full < N:
-                s, e = full, N
-                xb = x_s[:, s:e, :]
-                cb = c_s[:, s:e, :]
-                mb: torch.Tensor | None = None
-                if mask_scalar is not None:
-                    mb = mask_scalar
-                elif mask_base is not None and b_tail is not None:
-                    cached_tail = None
-                    if cache_tail_masks:
-                        cached_tail = mb_tail_odd if use_odd else mb_tail_even
-                    if cached_tail is None:
-                        idx2 = idx_tail_odd if use_odd else idx_tail_even
-                        if idx2 is not None:
-                            if shared_perm:
-                                M = int(idx2.shape[0])
-                                ii = idx2.view(1, M, 1)
-                                jj = idx2.view(1, 1, M)
-                            else:
-                                M = int(idx2.shape[1])
-                                ii = idx2.unsqueeze(-1)
-                                jj = idx2.unsqueeze(-2)
-                            cached_tail = mask_base[b_tail, ii, jj].reshape(B, M, M).contiguous()
-                            if cache_tail_masks:
-                                if use_odd:
-                                    mb_tail_odd = cached_tail
-                                else:
-                                    mb_tail_even = cached_tail
-                    mb = cached_tail
-                out_s[:, s:e, :] = blk(xb, cb, attn_mask=mb)
-            if shared_perm:
-                x = out_s.index_select(1, inv_1d)
-            else:
-                x = out_s.gather(1, inv_2d.unsqueeze(-1).expand(B, N, D))
-        out = self.norm(x)
-        if is_meta_or_fake_tensor(out):
-            raise RuntimeError("SpatialExtractor produced meta/fake tensor")
-        return out.contiguous()
-
+                out, _ = blk(out, causal_mask=attn_mask, state=None, mode="spatial")
+        return self.norm(out)
 
 class TemporalExtractor(nn.Module):
     def __init__(
@@ -633,40 +261,221 @@ class TemporalExtractor(nn.Module):
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        activation_checkpointing: bool = False,
+        activation_checkpoint_reentrant: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
+        del args, kwargs
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        self.depth = int(depth)
+        self.head_dim = int(self.d_model // max(1, self.nhead))
         drops = stochastic_depth_schedule(drop_path, depth)
         self.blocks = nn.ModuleList(
             [
                 RetNet(
-                    d_model,
-                    nhead,
+                    self.d_model,
+                    self.nhead,
                     mlp_ratio=mlp_ratio,
                     dropout=dropout,
                     drop_path=drops[i],
                     norm_type=norm_type,
+                    mode="temporal",
                 )
-                for i in range(depth)
+                for i in range(int(depth))
             ]
         )
-        self.norm = norm_layer(norm_type, d_model)
+        self.norm = norm_layer(norm_type, int(d_model))
+        self._ckpt_enabled = bool(activation_checkpointing)
+        self._ckpt_reentrant = bool(activation_checkpoint_reentrant)
+
+    @staticmethod
+    @torch_compiler_disable(reason="TemporalExtractor state coercion", recursive=False)
+    def _coerce_state_tensor(
+        state: Any,
+        *,
+        depth: int,
+        batch_size: int,
+        nhead: int,
+        head_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if state is None:
+            return None
+        strict = env_bool(("STNET_STRICT_TEMPORAL_STATE", "STNET_STRICT_STATE"), default=False)
+
+        def _bad(reason: str) -> Optional[torch.Tensor]:
+            if not strict:
+                return None
+            cand_type = type(state).__name__
+            cand_shape = None
+            try:
+                if isinstance(state, torch.Tensor):
+                    cand_shape = tuple(state.shape)
+            except Exception:
+                cand_shape = None
+            raise ValueError(
+                "Invalid temporal_state: "
+                + reason
+                + ". Expected Tensor (depth,B,H,Dh) or Tensor (B,depth,H,Dh) or list/tuple length=depth of per-layer (B,H,Dh). "
+                + f"Got type={cand_type} shape={cand_shape}."
+            )
+        cand: Any = state
+        if isinstance(state, Mapping):
+            layers = state.get("layers", None)
+            if layers is not None:
+                cand = layers
+            else:
+                for key in ("state", "temporal_state", "retention_state", "msr_state"):
+                    v = state.get(key, None)
+                    if isinstance(v, torch.Tensor):
+                        cand = v
+                        break
+        if isinstance(cand, torch.Tensor):
+            t = cand
+            if t.dim() == 4 and int(t.shape[2]) == 1:
+                t = t[:, :, 0, :]
+            if t.dim() == 4:
+                if int(t.shape[0]) == int(depth):
+                    st = t
+                elif int(t.shape[1]) == int(depth):
+                    st = t.permute(1, 0, 2, 3)
+                else:
+                    return _bad(f"4D tensor missing depth axis={int(depth)}")
+            elif t.dim() == 3:
+                if tuple(map(int, t.shape)) != (int(batch_size), int(nhead), int(head_dim)):
+                    return _bad(
+                        f"3D tensor shape={tuple(map(int, t.shape))} expected=({int(batch_size)},{int(nhead)},{int(head_dim)})"
+                    )
+                st = torch.zeros((int(depth), int(batch_size), int(nhead), int(head_dim)), device=device, dtype=dtype)
+                st[0] = t.to(device=device, dtype=dtype)
+            else:
+                return _bad(f"tensor dim must be 3 or 4, got {int(t.dim())}")
+            if tuple(map(int, st.shape)) != (int(depth), int(batch_size), int(nhead), int(head_dim)):
+                return _bad(
+                    f"coerced tensor shape={tuple(map(int, st.shape))} expected=({int(depth)},{int(batch_size)},{int(nhead)},{int(head_dim)})"
+                )
+            if st.device != device or st.dtype != dtype:
+                st = st.to(device=device, dtype=dtype)
+            return st.contiguous()
+        if isinstance(cand, (list, tuple)):
+            out = torch.zeros((int(depth), int(batch_size), int(nhead), int(head_dim)), device=device, dtype=dtype)
+            n = min(int(depth), len(cand))
+            for i in range(n):
+                v = cand[i]
+                if isinstance(v, Mapping):
+                    for key in ("state", "temporal_state", "retention_state", "msr_state"):
+                        vv = v.get(key, None)
+                        if isinstance(vv, torch.Tensor):
+                            v = vv
+                            break
+                if not isinstance(v, torch.Tensor):
+                    continue
+                t = v
+                if t.dim() == 4 and int(t.shape[2]) == 1:
+                    t = t[:, :, 0, :]
+                if t.dim() != 3:
+                    continue
+                if tuple(map(int, t.shape)) != (int(batch_size), int(nhead), int(head_dim)):
+                    continue
+                out[i] = t.to(device=device, dtype=dtype)
+            return out.contiguous()
+        return _bad(f"unrecognized state type {type(cand).__name__}")
 
     def forward(
         self,
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
-        state: Optional[dict] = None,
+        state: Any = None,
         *args: Any,
         return_state: bool = False,
         **kwargs: Any,
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[dict]]]:
-        next_state = state
-        for blk in self.blocks:
-            x, next_state = blk(x, causal_mask=causal_mask, state=next_state)
-        x = self.norm(x)
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        del args, kwargs
+        B = int(x.shape[0])
+        st_tensor: Optional[torch.Tensor] = None
+        if state is not None:
+            depth = int(self.depth)
+            H = int(self.nhead)
+            Dh = int(self.head_dim)
+            if isinstance(state, torch.Tensor):
+                t = state
+                if t.dim() == 4 and int(t.shape[2]) == 1:
+                    t = t[:, :, 0, :]
+                st: Optional[torch.Tensor] = None
+                if t.dim() == 4:
+                    if tuple(map(int, t.shape)) == (depth, B, H, Dh):
+                        st = t
+                    elif tuple(map(int, t.shape)) == (B, depth, H, Dh):
+                        st = t.permute(1, 0, 2, 3)
+                elif t.dim() == 3:
+                    if tuple(map(int, t.shape)) == (B, H, Dh):
+                        st = t.new_zeros((depth, B, H, Dh))
+                        st[0] = t
+                if st is not None:
+                    if st.device != x.device or st.dtype != x.dtype:
+                        st = st.to(device=x.device, dtype=x.dtype)
+                    st_tensor = st.contiguous()
+                else:
+                    st_tensor = self._coerce_state_tensor(
+                        state,
+                        depth=depth,
+                        batch_size=B,
+                        nhead=H,
+                        head_dim=Dh,
+                        device=x.device,
+                        dtype=x.dtype,
+                    )
+            else:
+                st_tensor = self._coerce_state_tensor(
+                    state,
+                    depth=depth,
+                    batch_size=B,
+                    nhead=H,
+                    head_dim=Dh,
+                    device=x.device,
+                    dtype=x.dtype,
+                )
+        do_ckpt = (
+            self._ckpt_enabled
+            and self.training
+            and torch.is_grad_enabled()
+            and _checkpoint is not None
+            and not return_state
+            and st_tensor is None
+            and not _is_export_or_trace()
+        )
+        next_state: Optional[torch.Tensor] = None
         if return_state:
-            return x, next_state
+            next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
+        for i, blk in enumerate(self.blocks):
+            blk_state = None
+            if st_tensor is not None and i < int(self.depth):
+                blk_state = st_tensor[i]
+            if do_ckpt:
+                def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode='temporal')
+                    return y
+                try:
+                    x = cast(
+                        torch.Tensor,
+                        _checkpoint(_f, x, use_reentrant=bool(self._ckpt_reentrant)),
+                    )
+                except TypeError:
+                    x = cast(torch.Tensor, _checkpoint(_f, x))
+            else:
+                x, blk_next_state = blk(x, causal_mask=causal_mask, state=blk_state, mode='temporal')
+                if next_state is not None:
+                    if blk_next_state is None:
+                        blk_next_state = x.new_zeros((B, int(self.nhead), int(self.head_dim)))
+                    next_state[i] = blk_next_state
+        x = self.norm(x)
+        if next_state is not None:
+            if not torch.is_grad_enabled():
+                next_state = next_state.detach()
+            return x, next_state.contiguous()
         return x
 
 
@@ -703,6 +512,16 @@ class Enhancer(nn.Module):
         )
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
+        self._runtime_lock = threading.Lock()
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_runtime_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._runtime_lock = threading.Lock()
 
     @property
     def using(self) -> str:
@@ -723,6 +542,19 @@ class Enhancer(nn.Module):
             average_attn_weights=average_attn_weights,
         )
 
+    def forward_export(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        out, _ = self.backbone(
+            x,
+            key_padding_mask=key_padding_mask,
+            need_weights=False,
+            average_attn_weights=False,
+        )
+        return out
+
     def run(
         self,
         tokens: torch.Tensor,
@@ -740,14 +572,20 @@ class Enhancer(nn.Module):
         B = int(tokens.shape[0])
         if graph_break_fn is not None:
             graph_break_fn()
-        if self._auto_microbatch_pending:
+        with self._runtime_lock:
+            pending = bool(self._auto_microbatch_pending)
+        if pending:
             try:
-                mb = int(auto_microbatch_fn(tokens))
-                self.microbatch = max(1, min(B, mb))
+                mb_guess = int(auto_microbatch_fn(tokens))
+                mb_new = max(1, min(B, mb_guess))
             except Exception:
-                self.microbatch = max(1, B)
-            self._auto_microbatch_pending = False
-        mb = max(1, min(B, int(self.microbatch) if self.microbatch else B))
+                mb_new = max(1, B)
+            with self._runtime_lock:
+                self.microbatch = int(mb_new)
+                self._auto_microbatch_pending = False
+        with self._runtime_lock:
+            mb_cur = int(self.microbatch) if self.microbatch else B
+        mb = max(1, min(B, mb_cur))
         infer_mode = not torch.is_grad_enabled()
         controller_ctx = (
             inference_mode(self.backbone) if infer_mode else contextlib.nullcontext()
@@ -781,22 +619,20 @@ class Fuser(nn.Module):
         self.dropout = float(config.dropout)
         self.drop_path = float(config.drop_path)
         self.norm_type = str(config.normalization_method)
+        ckpt_enabled = bool(getattr(config, "activation_checkpointing", False))
+        ckpt_reentrant = bool(getattr(config, "activation_checkpoint_reentrant", False))
         self.spatial_tokenizer = nn.Linear(self.in_dim, self.spatial_tokens * self.d_model)
         self.temporal_tokenizer = nn.Linear(self.in_dim, self.temporal_tokens * self.d_model)
-        self.register_buffer(
-            "spatial_coords_template",
-            self._get_spatial_coords(self.spatial_tokens, device=torch.device("cpu")),
-            persistent=False,
-        )
         self.spatial_net = SpatialExtractor(
             self.d_model,
             self.nhead,
             depth=max(1, int(config.spatial_depth)),
-            coord_dim=self.spatial_coords_template.shape[-1],
             mlp_ratio=self.mlp_ratio,
             dropout=self.dropout,
             drop_path=self.drop_path,
             norm_type=self.norm_type,
+            activation_checkpointing=ckpt_enabled,
+            activation_checkpoint_reentrant=ckpt_reentrant,
         )
         self.temporal_net = TemporalExtractor(
             self.d_model,
@@ -806,6 +642,8 @@ class Fuser(nn.Module):
             dropout=self.dropout,
             drop_path=self.drop_path,
             norm_type=self.norm_type,
+            activation_checkpointing=ckpt_enabled,
+            activation_checkpoint_reentrant=ckpt_reentrant,
         )
         self.perception = CrossTransformer(
             self.d_model,
@@ -826,31 +664,18 @@ class Fuser(nn.Module):
             nn.Linear(hid, self.out_dim),
         )
 
-    @staticmethod
-    def _get_spatial_coords(n_tokens: int, device: torch.device) -> torch.Tensor:
-        side = max(1, int(math.ceil(n_tokens ** (1.0 / 3.0))))
-        n = int(n_tokens)
-        if side <= 1 or n <= 0:
-            return torch.zeros((max(0, n), 3), dtype=torch.float32, device=device)
-        idx = torch.arange(n, device=device, dtype=torch.long)
-        side2 = int(side) * int(side)
-        z = idx // side2
-        rem = idx % side2
-        y = rem // int(side)
-        x = rem % int(side)
-        coords = torch.stack((x, y, z), dim=1).to(dtype=torch.float32)
-        coords = coords / float(side - 1)
-        return coords
-
-    def _spatial_coords(self, batch: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        _ = dtype
-        coords = self.spatial_coords_template
-        if coords.device != device or coords.dtype is not torch.float32:
-            coords = coords.to(device=device, dtype=torch.float32)
-        return coords.unsqueeze(0).expand(int(batch), -1, -1)
 
     @torch_compiler_disable(reason="Fuser orchestrates eager + compiled submodules", recursive=False)
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *args: Any,
+        temporal_state: Any = None,
+        return_temporal_state: bool = False,
+        causal_mask: Optional[torch.Tensor] = None,
+        **kwargs: Any,
+    ) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, Any]:
+        del args, kwargs
         B = int(x.shape[0])
         spatial_raw = self.spatial_tokenizer(x)
         expected_spatial = B * self.spatial_tokens * self.d_model
@@ -873,9 +698,16 @@ class Fuser(nn.Module):
                 total_tokens = self.spatial_tokens + self.temporal_tokens
                 fl_tok = 2.0 * float(B) * float(self.in_dim) * float(total_tokens * self.d_model)
                 FLOP_PROFILER.add("Tokenizer", float(fl_tok))
-        coords = self._spatial_coords(B, x.device, spatial_tokens.dtype)
-        spatial_out = self.spatial_net(spatial_tokens, coords)
-        temporal_out = self.temporal_net(temporal_tokens)
+        spatial_out = self.spatial_net(spatial_tokens)
+        next_temporal_state: Any = None
+        if bool(return_temporal_state):
+            temporal_out, next_temporal_state = self.temporal_net(
+                temporal_tokens, state=temporal_state, return_state=True, causal_mask=causal_mask
+            )
+        else:
+            temporal_out = self.temporal_net(
+                temporal_tokens, state=temporal_state, return_state=False, causal_mask=causal_mask
+            )
         mode_l = _coerce_modeling_types(self.modeling_type)
         if mode_l == "ss":
             tokens = spatial_out
@@ -896,7 +728,95 @@ class Fuser(nn.Module):
                 FLOP_PROFILER.add("Head", float(fl_head))
         flat = flat.contiguous()
         context = flat.reshape(B, *self.out_shape).contiguous()
+        if bool(return_temporal_state):
+            return (tokens, context, next_temporal_state)
         return (tokens, context)
+
+    def forward_state(
+        self,
+        x: torch.Tensor,
+        *,
+        temporal_state: Any = None,
+        causal_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        tokens, context, next_state = self.forward(
+            x,
+            temporal_state=temporal_state,
+            return_temporal_state=True,
+            causal_mask=causal_mask,
+        )
+        if isinstance(next_state, torch.Tensor):
+            return tokens, context, next_state
+        if next_state is None:
+            B = int(x.shape[0])
+            depth = int(getattr(self.temporal_net, "depth", 0))
+            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
+            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
+            filler = tokens.new_zeros((depth, B, nhead, head_dim))
+            return tokens, context, filler
+        try:
+            return tokens, context, torch.stack([s for s in next_state], dim=0)
+        except Exception:
+            B = int(x.shape[0])
+            depth = int(getattr(self.temporal_net, "depth", 0))
+            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
+            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
+            filler = tokens.new_zeros((depth, B, nhead, head_dim))
+            return tokens, context, filler
+
+    def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B = int(x.shape[0])
+        spatial_tokens = self.spatial_tokenizer(x).reshape(B, self.spatial_tokens, self.d_model).contiguous()
+        temporal_tokens = self.temporal_tokenizer(x).reshape(B, self.temporal_tokens, self.d_model).contiguous()
+        spatial_out = self.spatial_net(spatial_tokens)
+        temporal_out = self.temporal_net(temporal_tokens)
+        mode_l = _coerce_modeling_types(self.modeling_type)
+        if mode_l == "ss":
+            tokens = spatial_out
+        elif mode_l == "tt":
+            tokens = temporal_out
+        else:
+            tokens = self.perception(spatial_out, temporal_out, mode="st")
+        tokens = self.norm(tokens).contiguous()
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled).contiguous()
+        context = flat.reshape(B, *self.out_shape).contiguous()
+        return tokens, context
+
+    def forward_stream(
+        self,
+        x: torch.Tensor,
+        *,
+        temporal_state: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        B = int(x.shape[0])
+        spatial_tokens = self.spatial_tokenizer(x).reshape(B, self.spatial_tokens, self.d_model).contiguous()
+        temporal_tokens = self.temporal_tokenizer(x).reshape(B, self.temporal_tokens, self.d_model).contiguous()
+        spatial_out = self.spatial_net(spatial_tokens)
+        temporal_out, next_state = self.temporal_net(
+            temporal_tokens,
+            causal_mask=causal_mask,
+            state=temporal_state,
+            return_state=True,
+        )
+        mode_l = _coerce_modeling_types(self.modeling_type)
+        if mode_l == "ss":
+            tokens = spatial_out
+        elif mode_l == "tt":
+            tokens = temporal_out
+        else:
+            tokens = self.perception(spatial_out, temporal_out, mode="st")
+        tokens = self.norm(tokens).contiguous()
+        pooled = tokens.mean(dim=1)
+        flat = self.head(pooled).contiguous()
+        context = flat.reshape(B, *self.out_shape).contiguous()
+        if not isinstance(next_state, torch.Tensor):
+            depth = int(getattr(self.temporal_net, "depth", 1))
+            nhead = int(getattr(self.temporal_net, "nhead", self.nhead))
+            head_dim = int(getattr(self.temporal_net, "head_dim", max(1, self.d_model // max(1, nhead))))
+            next_state = tokens.new_zeros((depth, B, nhead, head_dim))
+        return tokens, context, next_state.contiguous()
 
     def decode(self, tokens: torch.Tensor, *args: Any, apply_norm: bool = False, **kwargs: Any) -> torch.Tensor:
         if apply_norm:
@@ -1103,6 +1023,9 @@ class Model(nn.Module):
             self.x_recon_head = None
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
+        self._runtime_lock = threading.Lock()
+        self._eager_processor_temporal_net = self.processor.temporal_net
+        self._eager_processor_perception = self.processor.perception
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -1161,6 +1084,11 @@ class Model(nn.Module):
         }
         compile_cudagraphs = bool(
             getattr(config, "compile_cudagraphs", compile_cudagraphs_default)
+        )
+        self._compile_cudagraphs = bool(
+            compile_enabled
+            and compile_cudagraphs
+            and getattr(self._device, "type", None) == "cuda"
         )
         compile_kwargs: Dict[str, Any] = {}
         if not compile_cudagraphs:
@@ -1274,6 +1202,29 @@ class Model(nn.Module):
                 self.logger.cpu()
         return cast(Model, out)
 
+    def __getstate__(self):
+        ctx = contextlib.nullcontext()
+        with contextlib.suppress(Exception):
+            ctx = self.eager_for_export()
+        with ctx:
+            state = super().__getstate__()
+        state.pop("_runtime_lock", None)
+        state.pop("_amp_dtype_cache_lock", None)
+        state.pop("_amp_dtype_cache", None)
+        state.pop("_amp_dtype_cache_last_key", None)
+        state.pop("_amp_dtype_cache_last_dtype", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._runtime_lock = threading.Lock()
+        self._amp_dtype_cache_lock = threading.Lock()
+        self._amp_dtype_cache = {}
+        self._amp_dtype_cache_last_key = None
+        self._amp_dtype_cache_last_dtype = None
+        if not hasattr(self, "_amp_dtype_cache_max"):
+            self._amp_dtype_cache_max = 64
+
     @staticmethod
     def _cast_graph_safe(x: torch.Tensor, device: torch.device, dtype: Optional[torch.dtype]) -> torch.Tensor:
         target_dtype = dtype or x.dtype
@@ -1282,6 +1233,169 @@ class Model(nn.Module):
         if x.dtype != target_dtype:
             return x.to(dtype=target_dtype)
         return x
+
+    @contextlib.contextmanager
+    def eager_for_export(self):
+        proc = getattr(self, "processor", None)
+        if proc is None:
+            yield self
+            return
+        swaps: list[tuple[str, Any]] = []
+        with contextlib.suppress(Exception):
+            eager_temporal = getattr(self, "_eager_processor_temporal_net", None)
+            if isinstance(eager_temporal, nn.Module):
+                cur = getattr(proc, "temporal_net", None)
+                if cur is not eager_temporal and cur is not None:
+                    swaps.append(("temporal_net", cur))
+                    proc.temporal_net = eager_temporal
+        with contextlib.suppress(Exception):
+            eager_perception = getattr(self, "_eager_processor_perception", None)
+            if isinstance(eager_perception, nn.Module):
+                cur = getattr(proc, "perception", None)
+                if cur is not eager_perception and cur is not None:
+                    swaps.append(("perception", cur))
+                    proc.perception = eager_perception
+        try:
+            yield self
+        finally:
+            for name, old in swaps:
+                with contextlib.suppress(Exception):
+                    setattr(proc, name, old)
+
+    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("forward_export expects a Tensor")
+        device = self._device
+        try:
+            base_dtype = next(self.parameters()).dtype
+        except Exception:
+            base_dtype = features.dtype
+        x = self._cast_graph_safe(features, device, base_dtype)
+        x = self.scaler.normalize_x(x)
+        b = int(x.shape[0])
+        tokens, context = self.processor.forward_export(x)
+        assembled = context.reshape(b, -1)
+        if self.is_norm_linear and self.linear_branch is not None:
+            bl = self.linear_branch(self._cast_graph_safe(x, device, assembled.dtype))
+            assembled = assembled + bl
+        mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
+        tokens_centered = tokens - mean.to(dtype=tokens.dtype)
+        if not tokens_centered.is_contiguous():
+            tokens_centered = tokens_centered.contiguous()
+        refined_tokens = self.controller.forward_export(tokens_centered)
+        residual_context = self.processor.decode(refined_tokens, apply_norm=True)
+        enhanced = residual_context.reshape(b, -1)
+        if enhanced.dtype != assembled.dtype:
+            enhanced = enhanced.to(dtype=assembled.dtype)
+        delta = enhanced - assembled
+        y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+        if self.p_gate is not None:
+            p = self.p_gate(
+                tokens=tokens,
+                refined_tokens=refined_tokens,
+                base=assembled,
+                residue=delta,
+                fallback_bounds=False,
+            )
+            p = p.to(dtype=assembled.dtype)
+            clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
+            eps = float(getattr(self.p_gate, "eps", 0.0))
+            clip = max(clip_eps, eps)
+            clip = float(min(max(clip, 0.0), 0.49))
+            p = p.clamp(clip, 1.0 - clip)
+            y_hat = assembled + p * delta
+        z_cal = self.scaler.calibrate(y_hat)
+        pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
+        return pred
+
+    def forward_stream(
+        self,
+        features: torch.Tensor,
+        *,
+        temporal_state: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
+        calibrate_output: bool = True,
+        sanitize_nan: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("forward_stream expects a Tensor input")
+        if not isinstance(calibrate_output, bool):
+            raise TypeError("calibrate_output must be a bool")
+        if not isinstance(sanitize_nan, bool):
+            raise TypeError("sanitize_nan must be a bool")
+        device = self._device
+        did_cudagraph_step = False
+        if bool(getattr(self, "_compile_cudagraphs", False)):
+            exporting = False
+            with contextlib.suppress(Exception):
+                comp = getattr(torch, "compiler", None)
+                is_exporting = getattr(comp, "is_exporting", None)
+                if callable(is_exporting) and bool(is_exporting()):
+                    exporting = True
+            with contextlib.suppress(Exception):
+                if getattr(torch, "onnx", None) is not None and hasattr(torch.onnx, "is_in_onnx_export"):
+                    if bool(torch.onnx.is_in_onnx_export()):
+                        exporting = True
+            with contextlib.suppress(Exception):
+                if getattr(torch, "jit", None) is not None:
+                    if torch.jit.is_tracing() or torch.jit.is_scripting():
+                        exporting = True
+            if not exporting:
+                cudagraph_mark_step_begin()
+                did_cudagraph_step = True
+        try:
+            try:
+                base_dtype = next(self.parameters()).dtype
+            except Exception:
+                base_dtype = features.dtype
+            x = self._cast_graph_safe(features, device, base_dtype)
+            x = self.scaler.normalize_x(x)
+            b = int(x.shape[0])
+            tokens, context, next_state = self.processor.forward_stream(
+                x,
+                temporal_state=temporal_state,
+                causal_mask=causal_mask,
+            )
+            tokens = _coerce_tensor(tokens, enabled=sanitize_nan, inplace=False)
+            context = _coerce_tensor(context, enabled=sanitize_nan, inplace=False)
+            assembled = context.reshape(b, -1)
+            if self.is_norm_linear and self.linear_branch is not None:
+                bl = self.linear_branch(self._cast_graph_safe(x, device, assembled.dtype))
+                assembled = assembled + bl
+            mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
+            tokens_centered = tokens - mean.to(dtype=tokens.dtype)
+            if not tokens_centered.is_contiguous():
+                tokens_centered = tokens_centered.contiguous()
+            refined_tokens = self.controller.forward_export(tokens_centered)
+            refined_tokens = _coerce_tensor(refined_tokens, enabled=sanitize_nan, inplace=False)
+            residual_context = self.processor.decode(refined_tokens, apply_norm=True)
+            enhanced = residual_context.reshape(b, -1)
+            if enhanced.dtype != assembled.dtype:
+                enhanced = enhanced.to(dtype=assembled.dtype)
+            delta = enhanced - assembled
+            y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+            if self.p_gate is not None:
+                p = self.p_gate(
+                    tokens=tokens,
+                    refined_tokens=refined_tokens,
+                    base=assembled,
+                    residue=delta,
+                    fallback_bounds=False,
+                ).to(dtype=assembled.dtype)
+                clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
+                eps = float(getattr(self.p_gate, "eps", 0.0))
+                clip = max(clip_eps, eps)
+                clip = float(min(max(clip, 0.0), 0.49))
+                p = p.clamp(clip, 1.0 - clip)
+                y_hat = assembled + p * delta
+            if calibrate_output:
+                y_hat = self.scaler.calibrate(y_hat)
+            pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
+            pred = _coerce_tensor(pred, enabled=sanitize_nan, inplace=False)
+            return pred, next_state
+        finally:
+            if did_cudagraph_step:
+                cudagraph_mark_step_end()
 
     def _auto_microbatch(self, features: torch.Tensor | TensorDictBase, device: torch.device) -> int:
         if isinstance(features, TensorDictBase):
@@ -1347,6 +1461,25 @@ class Model(nn.Module):
             raise TypeError("return_aux must be a bool")
         grad_enabled = torch.is_grad_enabled()
         infer_mode = not grad_enabled
+        did_cudagraph_step = False
+        if bool(getattr(self, "_compile_cudagraphs", False)):
+            exporting = False
+            with contextlib.suppress(Exception):
+                comp = getattr(torch, "compiler", None)
+                is_exporting = getattr(comp, "is_exporting", None)
+                if callable(is_exporting) and bool(is_exporting()):
+                    exporting = True
+            with contextlib.suppress(Exception):
+                if getattr(torch, "onnx", None) is not None and hasattr(torch.onnx, "is_in_onnx_export"):
+                    if bool(torch.onnx.is_in_onnx_export()):
+                        exporting = True
+            with contextlib.suppress(Exception):
+                if getattr(torch, "jit", None) is not None:
+                    if torch.jit.is_tracing() or torch.jit.is_scripting():
+                        exporting = True
+            if not exporting:
+                cudagraph_mark_step_begin()
+                did_cudagraph_step = True
         sanitize_enabled = bool(sanitize_nan)
         sanitize_inplace = bool(sanitize_enabled and infer_mode)
         td_input: TensorDictBase | None = None
@@ -1495,7 +1628,10 @@ class Model(nn.Module):
             if requested_base is not None:
                 base_dtype = requested_base
             else:
-                base_dtype = torch.float32 if amp_enabled else amp_dtype
+                try:
+                    base_dtype = next(self.parameters()).dtype
+                except Exception:
+                    base_dtype = torch.float32 if amp_enabled else amp_dtype
             if isinstance(x_scaled, torch.Tensor) and x_scaled.device != device:
                 x_scaled = x_scaled.to(device=device, non_blocking=True)
             features_t = x_scaled.to(dtype=base_dtype) if x_scaled.dtype != base_dtype else x_scaled
@@ -1504,14 +1640,22 @@ class Model(nn.Module):
                     f"Expected features shaped (B, {self.in_dim}), got {tuple(features_t.shape)}"
                 )
             b = int(features_t.shape[0])
-            if self._auto_microbatch_pending:
+            do_auto_mb = False
+            with self._runtime_lock:
+                if self._auto_microbatch_pending:
+                    self._auto_microbatch_pending = False
+                    do_auto_mb = True
+            if do_auto_mb:
                 try:
                     mb_enc = self._auto_microbatch(features_t, device)
-                    self.microbatch = max(1, int(mb_enc))
+                    with self._runtime_lock:
+                        self.microbatch = max(1, int(mb_enc))
                 except Exception:
-                    self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
-                self._auto_microbatch_pending = False
-            mb = max(1, min(int(b), int(self.microbatch) or int(b)))
+                    with self._runtime_lock:
+                        self.microbatch = max(1, int(getattr(self, "microbatch", 64) or 64))
+            with self._runtime_lock:
+                mb_cfg = int(self.microbatch) if self.microbatch else int(b)
+            mb = max(1, min(int(b), mb_cfg))
 
             def _encode(inp: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                 with (Autocast.float(device, metadata=meta) if amp_enabled else Autocast.suspend(device)):
@@ -1589,9 +1733,10 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
-            residual = residual_context.reshape(b, -1)
-            if residual.dtype != assembled.dtype:
-                residual = residual.to(dtype=assembled.dtype)
+            enhanced = residual_context.reshape(b, -1)
+            if enhanced.dtype != assembled.dtype:
+                enhanced = enhanced.to(dtype=assembled.dtype)
+            delta = enhanced - assembled
             p: Optional[torch.Tensor] = None
             edge_reg_low: Optional[torch.Tensor] = None
             edge_reg_high: Optional[torch.Tensor] = None
@@ -1668,7 +1813,7 @@ class Model(nn.Module):
                         tokens=tokens,
                         refined_tokens=refined_tokens,
                         base=assembled,
-                        residue=residual,
+                        residue=delta,
                         z_min=z_min,
                         z_max=z_max,
                         fallback_bounds=bool(fallback_bounds),
@@ -1682,12 +1827,26 @@ class Model(nn.Module):
                         tokens=tokens,
                         refined_tokens=refined_tokens,
                         base=assembled,
-                        residue=residual,
+                        residue=delta,
                         z_min=z_min,
                         z_max=z_max,
                         fallback_bounds=bool(fallback_bounds),
                     )
-            y_hat = assembled + (residual if p is None else p * residual)
+            if p is not None:
+                p_eps = (
+                    float(getattr(self.p_gate, "clip_eps", 1e-6))
+                    if self.p_gate is not None
+                    else 1e-6
+                )
+                with contextlib.suppress(Exception):
+                    p_eps = max(p_eps, float(getattr(self.p_gate, "eps", 0.0)))
+                hi = 1.0 - p_eps
+                if hi > p_eps:
+                    p = p.clamp(min=p_eps, max=hi)
+            if p is None:
+                y_hat = assembled + assembled.new_tensor(0.5) * delta
+            else:
+                y_hat = assembled + p * delta
             y_hat = _coerce_tensor(y_hat, enabled=sanitize_enabled, inplace=sanitize_inplace)
             pred = y_hat.reshape(b, *self.out_shape)
             loss_val: Optional[torch.Tensor] = None
@@ -1720,19 +1879,25 @@ class Model(nn.Module):
                     use_base_detach = bool(
                         is_train_path and (local_loss is not None) and (float(weights[1]) > 1e-12)
                     )
-                    z_top = (
-                        _coerce_tensor(
-                            assembled.detach() + (residual if p is None else p * residual),
+                    if use_base_detach:
+                        base_det = assembled.detach()
+                        delta_det = enhanced - base_det
+                        z_top = _coerce_tensor(
+                            base_det
+                            + (
+                                base_det.new_tensor(0.5) * delta_det
+                                if p is None
+                                else p * delta_det
+                            ),
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
                         )
-                        if use_base_detach
-                        else _coerce_tensor(
+                    else:
+                        z_top = _coerce_tensor(
                             y_hat,
                             enabled=sanitize_enabled,
                             inplace=sanitize_inplace,
                         )
-                    )
                     top_component = cast(torch.Tensor, global_loss(z_top, z_true))
                     total = total + weights[0] * top_component
                 if local_loss is not None:
@@ -1780,6 +1945,8 @@ class Model(nn.Module):
                     aux_used = True
                 if self.p_prior_weight > 0.0 and p is not None:
                     clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6)) if self.p_gate is not None else 1e-6
+                    with contextlib.suppress(Exception):
+                        clip_eps = max(clip_eps, float(getattr(self.p_gate, "eps", 0.0)))
                     p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
                     a = float(self.p_prior_alpha)
                     b = float(self.p_prior_beta)
@@ -1855,6 +2022,8 @@ class Model(nn.Module):
                 return (pred, loss_val, top_component, bottom_component)
             return (pred, loss_val)
         finally:
+            if did_cudagraph_step:
+                cudagraph_mark_step_end()
             if _did_unshard_processor and callable(_reshard):
                 with contextlib.suppress(Exception):
                     _reshard()

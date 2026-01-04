@@ -69,6 +69,27 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
         yield
 
 
+@contextlib.contextmanager
+def _temp_environ(updates: dict[str, str | None], *, only_if_unset: bool = True) -> Iterator[None]:
+    prev: dict[str, str | None] = {}
+    for key, val in updates.items():
+        if only_if_unset and key in os.environ:
+            continue
+        prev[key] = os.environ.get(key)
+        if val is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(val)
+    try:
+        yield
+    finally:
+        for key, val in prev.items():
+            if val is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = val
+
+
 def _save_lock(path: PathLike | None = None) -> threading.RLock:
     if path is None:
         key = "__global__"
@@ -255,7 +276,13 @@ def _onnx_model(model: object) -> None:
                         except Exception:
                             pass
     try:
-        yield model
+        with _temp_environ({"STNET_MSR_FORCE_TORCH": "1"}, only_if_unset=True):
+            eager_ctx = getattr(model, "eager_for_export", None)
+            if callable(eager_ctx):
+                with eager_ctx():
+                    yield model
+            else:
+                yield model
     finally:
         for module, attr, v in removed_sub:
             with contextlib.suppress(Exception):
@@ -310,6 +337,9 @@ def _get_forward_parameters(model_cls: object) -> object:
     return info
 
 def _forward(model: object, x: object) -> object:
+    fwd_export = getattr(model, "forward_export", None)
+    if callable(fwd_export) and isinstance(x, torch.Tensor):
+        return fwd_export(x)
     info = _get_forward_parameters(type(model))
     if info is None:
         return model(x)
@@ -1007,6 +1037,8 @@ class TorchScript(Format):
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             wrapper = _CompatLayer(serving_model).eval()
+            if "method" not in kwargs and hasattr(serving_model, "forward_export"):
+                method = "trace"
             if method == "trace":
                 if sample is None:
                     sample = _pad_sample(serving_model, None)
@@ -1018,8 +1050,23 @@ class TorchScript(Format):
                         strict=False,
                     )
             else:
-                with inference_mode(wrapper):
-                    scripted = torch.jit.script(wrapper)
+                try:
+                    with inference_mode(wrapper):
+                        scripted = torch.jit.script(wrapper)
+                except Exception as exc:
+                    if sample is None:
+                        sample = _pad_sample(serving_model, None)
+                    warnings.warn(
+                        f"TorchScript scripting failed ({type(exc).__name__}: {exc}); falling back to tracing.",
+                        RuntimeWarning,
+                    )
+                    with inference_mode(wrapper):
+                        scripted = torch.jit.trace(
+                            wrapper,
+                            sample,
+                            check_trace=False,
+                            strict=False,
+                        )
             if bool(kwargs.get("optimize_for_mobile", False)):
                 try:
                     from torch.utils.mobile_optimizer import optimize_for_mobile
@@ -1060,7 +1107,20 @@ class ExecuTorch(Format):
             sample = _pad_sample(serving_model, sample)
             wrapper = _CompatLayer(serving_model).eval()
             with inference_mode(wrapper):
-                exported = torch_export(wrapper, (sample,))
+                try:
+                    exported = torch_export(wrapper, (sample,))
+                except Exception as exc:
+                    strict_supported = False
+                    with contextlib.suppress(Exception):
+                        sig = inspect.signature(torch_export)
+                        strict_supported = "strict" in sig.parameters
+                    if not strict_supported:
+                        raise
+                    warnings.warn(
+                        "torch.export strict=True failed; retrying strict=False for ExecuTorch export",
+                        RuntimeWarning,
+                    )
+                    exported = torch_export(wrapper, (sample,), strict=False)
             edge = exir.to_edge(exported)
             exec_prog = exir.to_executorch(edge)
             dst.parent.mkdir(parents=True, exist_ok=True)

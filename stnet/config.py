@@ -924,6 +924,10 @@ class ModelConfig:
     p_gate_edge_reg_frac: float = 0.02
     p_gate_edge_reg_min_width_frac: float = 0.05
     p_gate_edge_reg_power: float = 2.0
+
+    # --- Memory/graph features ---
+    activation_checkpointing: bool = False
+    activation_checkpoint_reentrant: bool = False
     unsup_xx_weight: float = 0.0
     unsup_yy_weight: float = 0.0
     p_prior_weight: float = 0.0

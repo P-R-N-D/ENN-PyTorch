@@ -9,8 +9,7 @@ import torch
 import torch.nn as nn
 
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from .primitives import (CrossAttention, DilatedAttention, PatchAttention,
-                         Retention, norm_layer)
+from .primitives import CrossAttention, DilatedAttention, Retention, norm_layer
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -86,122 +85,6 @@ def _autofit_microbatch(
     budget = int(effective_free * 0.35)
     max_mb = max(1, int(budget // max(per_sample_bytes, 1)))
     return max(1, min(hard_max, max_mb))
-
-
-@torch.no_grad()
-def _norm_vector(coords: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    B, N, C = coords.shape
-    if C == 2:
-        z = torch.zeros(B, N, 1, dtype=coords.dtype, device=coords.device)
-        coords = torch.cat([coords, z], dim=-1)
-    mins = coords.amin(dim=1, keepdim=True)
-    maxs = coords.amax(dim=1, keepdim=True)
-    rng = (maxs - mins).clamp_min(eps)
-    x = (coords - mins) / rng
-    return x.clamp_(0.0, 1.0 - 1e-7)
-
-
-@torch.no_grad()
-def _expand_morton_bits_3d(v: torch.Tensor) -> torch.Tensor:
-    v = (v | (v << 16)) & 0x030000FF
-    v = (v | (v << 8)) & 0x0300F00F
-    v = (v | (v << 4)) & 0x030C30C3
-    v = (v | (v << 2)) & 0x09249249
-    return v
-
-
-@torch.no_grad()
-def _to_z_index(coords01: torch.Tensor, bits: int = 10) -> torch.Tensor:
-    maxv = (1 << int(bits)) - 1
-    xyz = (coords01 * maxv).to(torch.int32)
-    x, y, z = xyz.unbind(dim=-1)
-    xx = _expand_morton_bits_3d(x)
-    yy = _expand_morton_bits_3d(y) << 1
-    zz = _expand_morton_bits_3d(z) << 2
-    return (xx | yy | zz)
-
-
-@torch.no_grad()
-def _serialize_z_index(
-    coords: torch.Tensor,
-    *args: Any,
-    bits: int,
-    patch: int,
-    shift_order: bool,
-    block_index: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # During export/tracing, avoid Morton bit ops (unsupported in some backends).
-    export_safe = False
-    with contextlib.suppress(Exception):
-        if torch.onnx.is_in_onnx_export():
-            export_safe = True
-    with contextlib.suppress(Exception):
-        if torch.jit.is_tracing():
-            export_safe = True
-    if export_safe:
-        B, N, _ = coords.shape
-        perm = torch.arange(N, device=coords.device).expand(B, N)
-        invperm = perm.clone()
-        return perm, invperm
-    coords01 = _norm_vector(coords)
-    keys = _to_z_index(coords01, bits=bits)
-    perm = keys.argsort(dim=-1, stable=True)
-    if shift_order and (block_index % 2 == 1):
-        N = int(perm.size(1))
-        shift = (patch // 2) % max(N, 1)
-        if shift:
-            perm = torch.roll(perm, shifts=int(shift), dims=1)
-    invperm = torch.empty_like(perm)
-    scatter_src = torch.arange(perm.size(1), device=perm.device)
-    if scatter_src.dim() < perm.dim():
-        scatter_src = scatter_src.view(1, -1).expand_as(perm)
-    invperm.scatter_(1, perm, scatter_src)
-    return perm, invperm
-
-
-def _preload_layernorm_(ln: nn.Module, ref: torch.Tensor) -> None:
-    if not isinstance(ln, nn.LayerNorm):
-        return
-    dev = ref.device
-    target_dtype = (
-        torch.float32
-        if (
-            dev.type == "cpu"
-            and ref.is_floating_point()
-            and ref.dtype in (torch.float16, torch.bfloat16)
-        )
-        else ref.dtype
-    )
-    w = getattr(ln, "weight", None)
-    if isinstance(w, torch.Tensor) and is_meta_or_fake_tensor(w):
-        ln.weight = nn.Parameter(
-            torch.ones(ln.normalized_shape, device=dev, dtype=target_dtype)
-        )
-    b = getattr(ln, "bias", None)
-    if isinstance(b, torch.Tensor) and is_meta_or_fake_tensor(b):
-        ln.bias = nn.Parameter(
-            torch.zeros(ln.normalized_shape, device=dev, dtype=target_dtype)
-        )
-
-
-def _apply_float16_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    if is_meta_or_fake_tensor(x):
-        raise RuntimeError("meta/fake tensor reached normalization")
-    x_in = x
-    cast_back = False
-    if (
-        x_in.device.type == "cpu"
-        and x_in.is_floating_point()
-        and x_in.dtype in (torch.float16, torch.bfloat16)
-    ):
-        x_in = x_in.float()
-        cast_back = True
-    y = norm(x_in)
-    if is_meta_or_fake_tensor(y):
-        raise RuntimeError("meta/fake tensor produced by normalization")
-    if cast_back:
-        y = y.to(dtype=x.dtype)
-    return y
 
 
 def _coerce_tensor(
@@ -336,75 +219,6 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
     return [float(i * step) for i in range(depth)]
     
 
-class PointTransformer(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        coord_dim: int = 3,
-        mlp_ratio: float = 4.0,
-        dropout: float = 0.0,
-        drop_path: float = 0.0,
-        norm_type: str = "layernorm",
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        self.coord_dim = int(coord_dim)
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.dropout = nn.Dropout(dropout)
-        self.drop_path = StochasticDepth(p=drop_path, mode="row")
-        self.norm1 = norm_layer(norm_type, self.d_model)
-        self.attn = PatchAttention(self.d_model, self.nhead, coord_dim=self.coord_dim)
-        self.norm2 = norm_layer(norm_type, self.d_model)
-        hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
-        from .activations import SwiGLU
-        self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        coords: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        if is_meta_or_fake_tensor(x):
-            raise RuntimeError("meta/fake tensor reached PointTransformer.forward (x)")
-        if is_meta_or_fake_tensor(coords):
-            raise RuntimeError(
-                "meta/fake tensor reached PointTransformer.forward (coords)"
-            )
-        if coords.shape[:2] != x.shape[:2] or coords.size(-1) != self.coord_dim:
-            raise ValueError(
-                f"coords must be (B, N, {self.coord_dim}), got {tuple(coords.shape)} vs x {tuple(x.shape)}"
-            )
-        N = int(x.shape[1])
-        x = x.contiguous()
-        coords = coords.contiguous()
-        if attn_mask is not None:
-            attn_mask = attn_mask.contiguous()
-            if is_meta_or_fake_tensor(attn_mask):
-                raise RuntimeError("attn_mask is meta/fake before attention")
-            if attn_mask.dim() == 0:
-                pass
-            elif attn_mask.dim() < 2:
-                raise ValueError(
-                    f"attn_mask must have rank 0 or >=2; got rank {attn_mask.dim()}"
-                )
-            elif attn_mask.shape[-2:] != (N, N):
-                raise ValueError(
-                    f"attn_mask trailing dims {tuple(attn_mask.shape[-2:])} must match (N={N}, N={N})"
-                )
-        _preload_layernorm_(self.norm1, x)
-        _preload_layernorm_(self.norm2, x)
-        x1 = _apply_float16_norm(self.norm1, x)
-        y = self.attn(x1, coords, attn_mask=attn_mask)
-        x = x + self.drop_path(self.dropout(y))
-        x2 = _apply_float16_norm(self.norm2, x)
-        x = x + self.drop_path(self.dropout(self.ffn(x2)))
-        return x
-
-
 class RetNet(nn.Module):
     def __init__(
         self,
@@ -415,13 +229,15 @@ class RetNet(nn.Module):
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
+        mode: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
         self.d_model = int(d_model)
         self.nhead = int(nhead)
+        self.mode = str(mode or "temporal").strip().lower()
         self.norm1 = norm_layer(norm_type, self.d_model)
-        self.retention = Retention(self.d_model, self.nhead)
+        self.retention = Retention(self.d_model, self.nhead, mode=self.mode)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
         self.norm2 = norm_layer(norm_type, self.d_model)
@@ -434,16 +250,19 @@ class RetNet(nn.Module):
         x: torch.Tensor,
         causal_mask: Optional[torch.Tensor] = None,
         state: Optional[dict] = None,
+        mode: Optional[str] = None,
     ) -> Tuple[torch.Tensor, Optional[dict]]:
         if is_meta_or_fake_tensor(x):
             raise RuntimeError("meta/fake tensor reached RetNet.forward")
         x = x.contiguous()
         if causal_mask is not None:
             causal_mask = causal_mask.contiguous()
+        eff_mode = mode if mode is not None else getattr(self, "mode", None)
         h, new_state = self.retention(
             self.norm1(x),
             attn_mask=causal_mask,
             state=state,
+            mode=eff_mode,
         )
         x = x + self.drop_path(self.dropout(h))
         x = x + self.drop_path(self.dropout(self.ffn(self.norm2(x))))
