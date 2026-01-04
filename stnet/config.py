@@ -160,7 +160,8 @@ def _coerce_weights_spec(
     _ = args
     if value is None:
         return None
-    def _coerce_one(v: Any, *, where: str) -> float:
+        
+    def _coerce_one(v: Any, *args: Any, where: str) -> float:
         try:
             fv = float(v)
         except Exception as exc:
@@ -170,6 +171,7 @@ def _coerce_weights_spec(
         if fv < 0.0:
             raise ValueError(f"{name} entries must be >= 0: {where}")
         return float(fv)
+
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         fv = _coerce_one(value, where=f"{name}[0]")
         if fv <= 0.0:
