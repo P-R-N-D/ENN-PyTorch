@@ -178,8 +178,6 @@ stnet/
     compat.py             # accelerator/memory helpers, meta/fake tensor guards
     distributed.py        # elastic launch + process group utilities
     graph.py              # torch.compile helpers, graph break utilities
-    losses.py             # Student’s t, regression losses, mask utils
-    optimizers.py         # SGD/AdamW wrappers, SWA helper
     precision.py          # AMP negotiation/autocast policies, dtype guards
     profiler.py           # lightweight FLOP/IO timers
     staging.py            # pinned-memory staging pool
@@ -193,8 +191,8 @@ stnet/
     __init__.py
     io.py                 # exporters (ONNX/ORT/TorchScript/etc.), checkpoint save/load
     main.py               # training loop, predict path, elastic worker entrypoint
-  runtime/
-    __init__.py
+    losses.py             # Student’s t, regression losses, mask utils
+    optimizers.py         # SGD/AdamW wrappers, SWA helper
   nn/
     __init__.py
     activations.py
