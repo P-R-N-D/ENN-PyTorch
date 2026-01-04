@@ -608,12 +608,6 @@ def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    """Return a decorator that logs wall-clock execution time.
-
-    Kept as a function (not a class) so it can be safely used as a decorator
-    during module import without relying on class definition order.
-    """
-
     def _decorator(fn: Callable[P, R]) -> Callable[P, R]:
         name = fn_name or getattr(fn, "__name__", "call")
         wrapped = partial(_timed_invoke, fn, log, str(name))
