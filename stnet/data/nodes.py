@@ -319,7 +319,7 @@ def _normalize_device_spec(device: torch.device | str | Sequence[torch.device | 
         for d in device:
             devs.append(d if isinstance(d, torch.device) else torch.device(str(d)))
         return devs if devs else torch.device("cpu")
-    return torch.device(device)  # type: ignore[arg-type]
+    return torch.device(device)
 
 
 def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.device:
@@ -2394,9 +2394,8 @@ class Sampler(torch.utils.data.Sampler):
                 idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1) + base
                 return self._gather(idx_tensor, features, labels)
             case _:
-                i = base + int(idx)  # scalar
+                i = base + int(idx)
                 out = self._slice(i, i + 1)
-                # Squeeze scalars for ergonomic downstream use.
                 with suppress(Exception):
                     x = out.get("X", None)
                     if torch.is_tensor(x):
@@ -2615,7 +2614,7 @@ class Multiplexer:
 
         raw = getattr(self, "_raw_weights", None)
 
-        def _coerce_weight(v: Any, *, where: str) -> float:
+        def _coerce_weight(v: Any, *args: Any, where: str) -> float:
             try:
                 fv = float(v)
             except Exception as exc:
