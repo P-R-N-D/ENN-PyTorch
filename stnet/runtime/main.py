@@ -4418,7 +4418,9 @@ def process(*args: Any, **kwargs: Any) -> object:
         if _env_flag("STNET_MAX_PERF", True):
             cm = str(getattr(cfg, "compile_mode", "disabled") or "").strip().lower()
             if cm in ("", "none", "disabled", "disable", "off", "false", "0"):
-                default_cm = env_str("STNET_SERVE_COMPILE_MODE") or "max-autotune"
+                default_cm = env_str("STNET_SERVE_COMPILE_MODE")
+                if not default_cm:
+                    default_cm = "max-autotune" if getattr(device, "type", None) == "cuda" else "max-autotune-no-cudagraphs"
                 cfg = replace(cfg, compile_mode=str(default_cm))
                 with contextlib.suppress(Exception):
                     setattr(cfg, "compile_heavy_submodules", bool(_env_flag("STNET_COMPILE_HEAVY", True)))
