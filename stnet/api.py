@@ -76,7 +76,7 @@ from .data.pipeline import (
 )
 from .data.schemas import read_json
 from .nn.architecture import Model
-from .nn.primitives import Recorder, resize_scaler_buffer
+from .nn.layers import Recorder, resize_scaler_buffer
 from .runtime.io import (
     _filtered_warnings,
     _to_tensor,

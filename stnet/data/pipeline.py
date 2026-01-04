@@ -1082,18 +1082,8 @@ def fetch(
     else:
         require_mapping = None
 
-    train_weights_map = _normalize_weights_strict(
-        train_weights,
-        spec_keys,
-        require_mapping=require_mapping,
-        name="train_weights",
-    )
-    val_weights_map = _normalize_weights_strict(
-        val_weights,
-        spec_keys,
-        require_mapping=require_mapping,
-        name="val_weights",
-    )
+    train_weights_map: Optional[Dict[str, float]] = None
+    val_weights_map: Optional[Dict[str, float]] = None
 
     datasets_train = _fetch_build_datasets(
         specs,
@@ -1144,17 +1134,24 @@ def fetch(
         shuffle=bool(train_shuffle),
         seed=int(seed),
     )
-    train_weights = None
-    if isinstance(train_weights_map, Mapping):
-        train_weights = {
-            str(k): float(v)
-            for k, v in dict(train_weights_map).items()
-            if str(k) in sampler_nodes_train
-        }
-        if train_weights and (not any((float(v) > 0.0 for v in train_weights.values()))):
-            raise ValueError(
-                "train_weights: after filtering empty sources, at least one weight must be > 0"
-            )
+    train_weights_out = None
+    if len(sampler_nodes_train) > 1:
+        train_weights_map = _normalize_weights_strict(
+            train_weights,
+            spec_keys,
+            require_mapping=require_mapping,
+            name="train_weights",
+        )
+        if isinstance(train_weights_map, Mapping):
+            train_weights_out = {
+                str(k): float(v)
+                for k, v in dict(train_weights_map).items()
+                if str(k) in sampler_nodes_train
+            }
+            if train_weights_out and (not any((float(v) > 0.0 for v in train_weights_out.values()))):
+                raise ValueError(
+                    "train_weights: after filtering empty sources, at least one weight must be > 0"
+                )
     if not sampler_nodes_train:
         raise RuntimeError("No non-empty training sources provided.")
     train_length: Optional[int] = int(sum(lengths_train.values())) if lengths_train else None
@@ -1167,7 +1164,7 @@ def fetch(
         non_blocking_copy=non_blocking_copy,
         io_workers=int(io_workers),
         prebatch=int(prebatch),
-        weights=train_weights,
+        weights=train_weights_out,
         epochables=train_epochables,
         seed=seed,
     )
@@ -1179,8 +1176,6 @@ def fetch(
         length=train_length,
     )
     val_loader: Optional[Loader] = None
-    if float(val_frac) <= 0.0 and val_weights_map is not None:
-        raise ValueError("val_weights was provided but val_frac <= 0 (no validation split)")
     if float(val_frac) > 0.0:
         datasets_val = _fetch_build_datasets(
             specs,
@@ -1230,19 +1225,26 @@ def fetch(
             shuffle=False,
             seed=int(seed),
         )
-        val_weights = None
-        if isinstance(val_weights_map, Mapping):
-            val_weights = {
-                str(k): float(v)
-                for k, v in dict(val_weights_map).items()
-                if str(k) in sampler_nodes_val
-            }
-            if val_weights and (not any((float(v) > 0.0 for v in val_weights.values()))):
-                raise ValueError(
-                    "val_weights: after filtering empty sources, at least one weight must be > 0"
-                )
         if not sampler_nodes_val:
             raise RuntimeError("No non-empty validation sources provided.")
+        val_weights_out = None
+        if len(sampler_nodes_val) > 1:
+            val_weights_map = _normalize_weights_strict(
+                val_weights,
+                spec_keys,
+                require_mapping=require_mapping,
+                name="val_weights",
+            )
+            if isinstance(val_weights_map, Mapping):
+                val_weights_out = {
+                    str(k): float(v)
+                    for k, v in dict(val_weights_map).items()
+                    if str(k) in sampler_nodes_val
+                }
+                if val_weights_out and (not any((float(v) > 0.0 for v in val_weights_out.values()))):
+                    raise ValueError(
+                        "val_weights: after filtering empty sources, at least one weight must be > 0"
+                    )
         val_length: Optional[int] = int(sum(lengths_val.values())) if lengths_val else None
         iterate_val = partial(_fetch_iterate_sample, datasets=datasets_val, collate=collate_fn)
         _, mapped_val, _ = compose(
@@ -1253,7 +1255,7 @@ def fetch(
             non_blocking_copy=non_blocking_copy,
             io_workers=int(io_workers),
             prebatch=int(prebatch),
-            weights=val_weights,
+            weights=val_weights_out,
             seed=seed,
         )
         val_loader = Loader.compose(
