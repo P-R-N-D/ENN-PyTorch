@@ -147,15 +147,12 @@ def _flatten_attn_mask(
             m = mask.to(device=device).view(int(B), 1, int(L), int(S))
             return m, int(B), 1, int(L)
         if (a == int(B)) and (b == 1):
-            # (B,1,S) -> per-batch key-only
             m = mask.to(device=device).view(int(B), 1, 1, int(S))
             return m, int(B), 1, 1
         if (a == int(H)) and (b == int(L)):
-            # (H,L,S) -> head-specific, broadcast batch
             m = mask.to(device=device).view(1, int(H), int(L), int(S))
             return m, 1, int(H), int(L)
         if (a == int(B)) and (b == int(H)):
-            # (B,H,S) -> per-(B,H) key-only
             m = mask.to(device=device).view(int(B), int(H), 1, int(S))
             return m, int(B), int(H), 1
         raise RuntimeError(
@@ -823,7 +820,7 @@ class MultiScaleRetention(nn.Module):
         return torch.where(mask, torch.zeros_like(v), v)
 
     @staticmethod
-    def _extract_state_tensor(state: Any, *, B: int, H: int) -> Optional[torch.Tensor]:
+    def _extract_state_tensor(state: Any, *args: Any, B: int, H: int) -> Optional[torch.Tensor]:
         if state is None:
             return None
         st: Optional[torch.Tensor] = None
