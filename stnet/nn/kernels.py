@@ -1,18 +1,50 @@
 # -*- coding: utf-8 -*-
+
 from __future__ import annotations
 
 import inspect
 import warnings
-from typing import Any, Optional, Tuple
+import contextlib
+from typing import Any, Optional, Tuple, Mapping
 
 import torch
 import torch._dynamo
 from torch import nn
 
-from ..core.casting import env_str
+from ..core.casting import env_str, env_bool
 from ..core.graph import torch_compiler_disable
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
+
+
+def _is_exporting_or_tracing() -> bool:
+    with contextlib.suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        is_exporting = getattr(comp, "is_exporting", None)
+        if callable(is_exporting) and bool(is_exporting()):
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "jit", None) is not None:
+            if torch.jit.is_tracing() or torch.jit.is_scripting():
+                return True
+    with contextlib.suppress(Exception):
+        onnx = getattr(torch, "onnx", None)
+        is_onnx_export = getattr(onnx, "is_in_onnx_export", None)
+        if callable(is_onnx_export) and bool(is_onnx_export()):
+            return True
+    return False
+
+
+def _is_compiling() -> bool:
+    with contextlib.suppress(Exception):
+        if getattr(torch, "_dynamo", None) is not None and torch._dynamo.is_compiling():
+            return True
+    with contextlib.suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        is_compiling = getattr(comp, "is_compiling", None)
+        if callable(is_compiling) and bool(is_compiling()):
+            return True
+    return False
 
 try:
     import triton
@@ -738,25 +770,22 @@ class DotProductAttention(nn.Module):
 class MultiScaleRetention(nn.Module):
     def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
         super().__init__()
-        self.d_model, self.nhead, self.use_gate = (
-            int(d_model),
-            int(nhead),
-            bool(use_gate),
+        self.d_model = int(d_model)
+        self.nhead = int(nhead)
+        if self.d_model % max(1, self.nhead) != 0:
+            raise ValueError(
+                f"MultiScaleRetention: d_model={self.d_model} must be divisible by nhead={self.nhead}"
+            )
+        self.head_dim = int(self.d_model // max(1, self.nhead))
+        self.use_gate = bool(use_gate)
+        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
+        self.g_proj = (
+            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
         )
-        self._fallback = MultiScaleRetentionCompat(
-            self.d_model, self.nhead, use_gate=self.use_gate
-        )
-        self._triton_ok = False
-        self._triton_msr: Optional[MultiScaleRetentionTriton]
-        self._triton_msr = None
-        if _HAS_TRITON_MSR:
-            try:
-                self._triton_msr = MultiScaleRetentionTriton(
-                    self.d_model, self.nhead, use_gate=self.use_gate
-                )
-                self._triton_ok = True
-            except Exception:
-                self._triton_ok = False
+        self.norm = nn.LayerNorm(self.d_model)
+        self._triton_ok = bool(_HAS_TRITON_MSR and torch.cuda.is_available())
         self._decay_init = 5.0
         self._decay_range = 1.0
 
@@ -777,163 +806,120 @@ class MultiScaleRetention(nn.Module):
             gammas = gammas.to(dtype=dtype)
         return gammas
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *args: Any,
-        attn_mask: Optional[torch.Tensor] = None,
-        state: Any = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        seq_len = x.shape[1]
-        dtype = x.dtype
-        device = x.device
-        lam = self._decay_lambda(device, dtype)
-        if (
-            self._triton_ok
-            and self._triton_msr is not None
-            and device.type == "cuda"
-            and torch.cuda.is_available()
-        ):
-            try:
-                out_tr = self._triton_msr(
-                    x,
-                    lam,
-                    attn_mask=attn_mask,
-                    state=state,
-                    **kwargs,
-                )
-                try:
-                    B_ = x.shape[0]
-                    fl = _compute_flops_msr(
-                        B_,
-                        seq_len,
-                        num_heads=self.nhead,
-                        head_dim=self.d_model // self.nhead,
-                        use_gate=self.use_gate,
-                    )
-                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
-                except Exception:
-                    pass
-                return out_tr
-            except Exception:
-                pass
-        return self._fallback(
-            x,
-            attn_mask=attn_mask,
-            state=state,
-            decay=lam,
-            **kwargs,
-        )
+    @staticmethod
+    def _apply_kpm_to_v(v: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+        if not isinstance(attn_mask, torch.Tensor):
+            return v
+        if attn_mask.dim() != 2 or attn_mask.dtype is not torch.bool:
+            return v
+        B, L = int(v.shape[0]), int(v.shape[1])
+        if attn_mask.shape != (B, L):
+            return v
+        mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
+        return torch.where(mask, torch.zeros_like(v), v)
 
-
-class MultiScaleRetentionTriton(nn.Module):
-    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.head_dim = self.d_model // self.nhead
-        self.use_gate = bool(use_gate)
-        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.g_proj = (
-            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
-        )
-        self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
-        self.norm = nn.LayerNorm(self.d_model)
-        if not (_HAS_TRITON_MSR and torch.cuda.is_available()):
-            raise RuntimeError("Triton MSR backend is not available (Triton+CUDA required).")
-
-    @torch_compiler_disable(recursive=False, reason='Unable to be compiled')
-    def forward(
-        self,
-        x: torch.Tensor,
-        decay: Any,
-        *args: Any,
-        attn_mask: Optional[torch.Tensor] = None,
-        state: Any = None,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        del args, kwargs
-        if x.dim() != 3:
-            raise ValueError(f"MultiScaleRetentionTriton expects (B,L,D), got {tuple(x.shape)}")
-        if x.device.type != "cuda":
-            raise RuntimeError("MultiScaleRetentionTriton only supports CUDA tensors.")
-        B, L, D = x.shape
-        if D != self.d_model:
-            raise ValueError(f"Last dimension {D} must equal d_model={self.d_model}")
-        x_in = x
-        head_dim = self.head_dim
-        q = self.q_proj(x_in).view(B, L, self.nhead, head_dim)
-        v = self.v_proj(x_in).view(B, L, self.nhead, head_dim)
-        lam_h: torch.Tensor
-        if isinstance(decay, torch.Tensor):
-            if decay.dim() == 1 and int(decay.shape[0]) == int(self.nhead):
-                lam_h = decay.to(dtype=v.dtype, device=v.device)
-            elif decay.dim() == 3:
-                H = self.nhead
-                if decay.shape[0] == H and decay.shape[1] >= 2 and decay.shape[2] >= 1:
-                    lam_h = decay[:, 1, 0].to(dtype=v.dtype, device=v.device)
-                else:
-                    lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
-            else:
-                lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
-        else:
-            lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
-        lam = lam_h
-        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2:
-            if attn_mask.shape == (B, L) and attn_mask.dtype == torch.bool:
-                mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
-                v = torch.where(mask, torch.zeros_like(v), v)
+    @staticmethod
+    def _extract_state_tensor(state: Any, *, B: int, H: int) -> Optional[torch.Tensor]:
+        if state is None:
+            return None
+        st: Optional[torch.Tensor] = None
         if isinstance(state, torch.Tensor):
             st = state
-            if st.dim() == 4 and st.shape[2] == 1:
-                st = st[:, :, 0, :]
-            if st.dim() == 3 and st.shape[:2] == (B, self.nhead):
-                v = v.clone()
-                v[:, 0] = v[:, 0] + lam.view(1, self.nhead, 1) * st.to(
-                    dtype=v.dtype, device=v.device
-                )
-        v_blhc = v.contiguous()
-        out_state = torch.empty_like(v_blhc, dtype=v_blhc.dtype)
-        SVB, SVL, SVH, SVD = v_blhc.stride()
-        SOB, SOL, SOH, SOD = out_state.stride()
-        BLOCK_DH: int
-        num_warps: int
+        elif isinstance(state, Mapping):
+            for key in ("state", "msr_state", "retention_state"):
+                v = state.get(key, None)
+                if isinstance(v, torch.Tensor):
+                    st = v
+                    break
+        if st is None:
+            return None
+        if st.dim() == 4 and int(st.shape[2]) == 1:
+            st = st[:, :, 0, :]
+        if st.dim() != 3:
+            return None
+        if tuple(st.shape[:2]) != (int(B), int(H)):
+            return None
+        return st
+
+    @staticmethod
+    def _select_last_state(state_tensor: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+        if state_tensor.dim() != 4:
+            raise ValueError(
+                f"_select_last_state expects (B,L,H,Dh), got {tuple(state_tensor.shape)}"
+            )
+        B, L, H, Dh = map(int, state_tensor.shape)
+        if L <= 0:
+            return state_tensor.new_zeros((B, H, Dh))
+        if (
+            isinstance(attn_mask, torch.Tensor)
+            and attn_mask.dim() == 2
+            and attn_mask.dtype is torch.bool
+            and tuple(attn_mask.shape) == (B, L)
+        ):
+            lengths = (~attn_mask).to(dtype=torch.int64).sum(dim=1).clamp(min=1)
+            idx = (lengths - 1).clamp(min=0, max=max(0, L - 1))
+            gather_idx = idx.view(B, 1, 1, 1).expand(B, 1, H, Dh)
+            return torch.gather(state_tensor, dim=1, index=gather_idx).squeeze(1)
+        return state_tensor[:, -1]
+
+    @staticmethod
+    def _scan_causal_torch(v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+        B, L, H, Dh = map(int, v.shape)
+        if L <= 0:
+            return v.new_zeros(v.shape)
+        calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, H, 1)
+        t = torch.arange(L, device=v.device, dtype=calc_dtype).view(1, L, 1, 1)
+        p = torch.pow(lam_calc, t)
+        tiny = torch.finfo(calc_dtype).tiny
+        p = p.clamp_min(tiny)
+        inv_p = torch.reciprocal(p)
+        v_scaled = v.to(dtype=calc_dtype) * inv_p
+        v_scaled[:, 0].zero_()
+        cumsum_scaled = torch.cumsum(v_scaled, dim=1)
+        prev_scaled = v[:, 0].to(dtype=calc_dtype).unsqueeze(1)
+        state = p * (prev_scaled + cumsum_scaled)
+        return state.to(dtype=v.dtype).contiguous()
+
+    @torch_compiler_disable(recursive=False, reason="Triton retention scan")
+    def _scan_causal_triton(self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+        if v.dim() != 4:
+            raise ValueError(f"_scan_causal_triton expects (B,L,H,Dh), got {tuple(v.shape)}")
+        if v.device.type != "cuda":
+            raise RuntimeError("_scan_causal_triton requires CUDA tensor")
+        B, L, H, Dh = map(int, v.shape)
+        out = torch.empty_like(v, dtype=v.dtype)
+        SVB, SVL, SVH, SVD = v.stride()
+        SOB, SOL, SOH, SOD = out.stride()
         env_block = env_str("STNET_MSR_TRITON_BLOCK_DH") or ""
         if env_block:
             try:
-                _b = int(env_block)
-                if _b in (16, 32, 64, 128):
-                    BLOCK_DH = _b
-                else:
+                BLOCK_DH = int(env_block)
+                if BLOCK_DH <= 0:
                     raise ValueError
             except Exception:
-                BLOCK_DH = 64 if head_dim >= 64 else 32
+                BLOCK_DH = 64 if Dh >= 64 else 32
         else:
-            BLOCK_DH = 64 if head_dim >= 64 else 32
+            BLOCK_DH = 64 if Dh >= 64 else 32
         env_warps = env_str("STNET_MSR_TRITON_NUM_WARPS") or ""
         if env_warps:
             try:
-                _w = int(env_warps)
-                if _w in (1, 2, 4, 8, 16):
-                    num_warps = _w
-                else:
+                num_warps = int(env_warps)
+                if num_warps <= 0:
                     raise ValueError
             except Exception:
                 num_warps = 8 if BLOCK_DH >= 64 else 4
         else:
             num_warps = 8 if BLOCK_DH >= 64 else 4
-        grid = (B * self.nhead, triton.cdiv(head_dim, BLOCK_DH))
+        grid = (B * H, (Dh + BLOCK_DH - 1) // BLOCK_DH)
         _triton_retention[grid](
-            v_blhc,
-            lam,
-            out_state,
+            v,
+            lam_h,
+            out,
             B,
             L,
-            self.nhead,
-            head_dim,
+            H,
+            Dh,
             SVB,
             SVL,
             SVH,
@@ -945,114 +931,116 @@ class MultiScaleRetentionTriton(nn.Module):
             BLOCK_DH=BLOCK_DH,
             num_warps=num_warps,
         )
-        state_tensor = out_state
-        y = (q * state_tensor).contiguous().view(B, L, self.d_model)
-        y = self.norm(y)
-        if self.use_gate and self.g_proj is not None:
-            gate = torch.nn.functional.silu(self.g_proj(x_in))
-            y = y * gate
-        out = self.o_proj(y)
         return out
 
-
-class MultiScaleRetentionCompat(nn.Module):
-    def __init__(self, d_model: int, nhead: int, use_gate: bool = True) -> None:
-        super().__init__()
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.head_dim = self.d_model // self.nhead
-        self.use_gate = bool(use_gate)
-        self.q_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.v_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.o_proj = nn.Linear(self.d_model, self.d_model, bias=False)
-        self.g_proj = (
-            nn.Linear(self.d_model, self.d_model, bias=False) if self.use_gate else None
+    def _scan_causal(self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
+        disable_triton = env_bool(
+            ("STNET_MSR_FORCE_TORCH", "STNET_MSR_DISABLE_TRITON", "STNET_DISABLE_TRITON_MSR"),
+            default=False,
         )
-        self._beta = nn.Parameter(torch.full((self.nhead,), -0.2))
-        self.norm = nn.LayerNorm(self.d_model)
+        use_triton = bool(
+            (not disable_triton)
+            and self._triton_ok
+            and v.is_cuda
+            and torch.cuda.is_available()
+            and (not _is_exporting_or_tracing())
+            and (not _is_compiling())
+        )
+        if use_triton:
+            try:
+                return self._scan_causal_triton(v.contiguous(), lam_h)
+            except Exception:
+                pass
+        return self._scan_causal_torch(v, lam_h)
 
     def forward(
         self,
         x: torch.Tensor,
         *args: Any,
         decay: Any = None,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: torch.Tensor | None = None,
         state: Any = None,
+        return_state: bool = False,
         **kwargs: Any,
-    ) -> torch.Tensor:
-        restore_dtype: Optional[torch.dtype] = None
+    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        del kwargs
+        restore_dtype: torch.dtype | None = None
         x_in = x
-        if getattr(x.device, "type", "cpu") == "mps" and x.dtype == torch.bfloat16:
-            restore_dtype = x.dtype
+        if getattr(x_in.device, "type", "cpu") == "mps" and x_in.dtype == torch.bfloat16:
+            restore_dtype = x_in.dtype
             x_in = x.to(torch.float16)
-        del args, kwargs
-        batch, seq_len, _ = x_in.shape
-        if seq_len == 0:
-            return x_in.new_zeros(x_in.shape)
-        head_dim = self.head_dim
-        q = self.q_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
-        v = self.v_proj(x_in).view(batch, seq_len, self.nhead, head_dim)
-        manual_flops = _compute_flops_msr(
-            batch,
-            seq_len,
-            num_heads=self.nhead,
-            head_dim=head_dim,
-            use_gate=self.use_gate and self.g_proj is not None,
-        )
-        lam_h: torch.Tensor
-        if isinstance(decay, torch.Tensor):
-            if decay.dim() == 1 and int(decay.shape[0]) == int(self.nhead):
-                lam_h = decay.to(dtype=v.dtype, device=v.device)
-            elif decay.dim() == 3:
-                H = self.nhead
-                if decay.shape[0] == H and decay.shape[1] >= 2 and decay.shape[2] >= 1:
-                    lam_h = decay[:, 1, 0].to(dtype=v.dtype, device=v.device)
-                else:
-                    lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
-            else:
-                lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
+        if x_in.dim() != 3:
+            raise ValueError(f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}")
+        B, L, D = map(int, x_in.shape)
+        if L <= 0:
+            out0 = x_in.new_zeros(x_in.shape)
+            if bool(return_state):
+                st0 = x_in.new_zeros((B, self.nhead, int(self.head_dim)))
+                if restore_dtype is not None:
+                    out0 = out0.to(restore_dtype)
+                    st0 = st0.to(restore_dtype)
+                return out0, st0
+            return out0.to(restore_dtype) if restore_dtype is not None else out0
+        if D != int(self.d_model):
+            raise ValueError(f"Last dimension {D} must equal d_model={int(self.d_model)}")
+        decay_arg = None
+        if args:
+            decay_arg = args[0]
         else:
-            lam_h = torch.sigmoid(self._beta).to(dtype=v.dtype, device=v.device)
-        lam = lam_h.view(1, self.nhead, 1)
-        if isinstance(attn_mask, torch.Tensor) and attn_mask.dim() == 2:
-            if attn_mask.shape == (batch, seq_len) and attn_mask.dtype == torch.bool:
-                mask = attn_mask.to(device=v.device).unsqueeze(-1).unsqueeze(-1)
-                v = torch.where(mask, torch.zeros_like(v), v)
-        st_bhd: Optional[torch.Tensor] = None
-        if isinstance(state, torch.Tensor):
-            st = state
-            if st.dim() == 4 and st.shape[2] == 1:
-                st = st[:, :, 0, :]
-            if st.dim() == 3 and st.shape[:2] == (batch, self.nhead):
-                st_bhd = st.to(dtype=v.dtype, device=v.device)
+            decay_arg = decay
+        head_dim = int(self.head_dim)
+        q = self.q_proj(x_in).view(B, L, self.nhead, head_dim)
+        v = self.v_proj(x_in).view(B, L, self.nhead, head_dim)
+        v = self._apply_kpm_to_v(v, attn_mask)
+        if isinstance(decay_arg, torch.Tensor) and decay_arg.numel() > 0:
+            if decay_arg.dim() == 1 and int(decay_arg.shape[0]) == int(self.nhead):
+                lam_h = decay_arg.to(dtype=v.dtype, device=v.device)
+            elif decay_arg.dim() == 3 and int(decay_arg.shape[0]) == int(self.nhead):
+                lam_h = decay_arg[:, 1, 0].to(dtype=v.dtype, device=v.device)
+            else:
+                lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+        else:
+            lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+        st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
             v = v.clone()
-            v[:, 0] = v[:, 0] + lam * st_bhd
-        calc_dtype = (
-            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
-        )
-        lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, self.nhead, 1)
-        t = torch.arange(seq_len, device=v.device, dtype=calc_dtype).view(1, seq_len, 1, 1)
-        p = torch.pow(lam_calc, t)  # (1, T, H, 1)
-        tiny = torch.finfo(calc_dtype).tiny
-        p = p.clamp_min(tiny)
-        inv_p = torch.reciprocal(p)
-        v_scaled = v.to(dtype=calc_dtype) * inv_p
-        v_scaled[:, 0].zero_()
-        cumsum_scaled = torch.cumsum(v_scaled, dim=1)
-        prev_scaled = v[:, 0].to(dtype=calc_dtype).unsqueeze(1)
-        state_tensor = p * (prev_scaled + cumsum_scaled)
-        state_tensor = state_tensor.to(dtype=v.dtype).contiguous()
-        y = (q * state_tensor).contiguous().view(batch, seq_len, self.d_model)
+            v[:, 0] = v[:, 0] + lam_h.view(1, self.nhead, 1) * st_bhd.to(
+                dtype=v.dtype, device=v.device
+            )
+        state_tensor = self._scan_causal(v, lam_h)
+        y = (q * state_tensor).contiguous().view(B, L, self.d_model)
         y = self.norm(y)
         if self.use_gate and self.g_proj is not None:
             gate = torch.nn.functional.silu(self.g_proj(x_in))
             y = y * gate
-        if manual_flops > 0.0:
-            FLOP_PROFILER.add("Retention", manual_flops)
         out = self.o_proj(y)
+        last_state: Optional[torch.Tensor] = None
+        if bool(return_state):
+            last_state = self._select_last_state(state_tensor, attn_mask).contiguous()
+            if not torch.is_grad_enabled():
+                last_state = last_state.detach()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                fl = _compute_flops_msr(
+                    B,
+                    L,
+                    num_heads=int(self.nhead),
+                    head_dim=int(head_dim),
+                    use_gate=bool(self.use_gate and self.g_proj is not None),
+                )
+                if fl > 0.0:
+                    FLOP_PROFILER.add("MultiScaleRetention", float(fl))
+            except Exception:
+                pass
         if restore_dtype is not None:
             out = out.to(restore_dtype)
+            if last_state is not None:
+                last_state = last_state.to(restore_dtype)
+        if bool(return_state):
+            if last_state is None:
+                last_state = state_tensor.new_zeros((B, self.nhead, head_dim))
+            return out, last_state
         return out
 
 

@@ -470,6 +470,26 @@ def graph_break() -> None:
     if dyn is None:
         return
     try:
+        comp = getattr(torch, "compiler", None)
+        is_exporting = getattr(comp, "is_exporting", None)
+        if callable(is_exporting) and bool(is_exporting()):
+            return
+    except Exception:
+        pass
+    try:
+        if getattr(torch, "jit", None) is not None:
+            if torch.jit.is_tracing() or torch.jit.is_scripting():
+                return
+    except Exception:
+        pass
+    try:
+        onnx = getattr(torch, "onnx", None)
+        is_onnx_export = getattr(onnx, "is_in_onnx_export", None)
+        if callable(is_onnx_export) and bool(is_onnx_export()):
+            return
+    except Exception:
+        pass
+    try:
         if not dyn.is_compiling():
             return
     except Exception:

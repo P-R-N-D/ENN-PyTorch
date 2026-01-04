@@ -18,8 +18,8 @@ from ..core.casting import env_bool, env_int, env_str
 from ..core.compat import StochasticDepth
 from ..core.profiler import FLOP_PROFILER
 from ..core.system import empty_device_cache
-from .kernels import (DotProductAttention, MultiHeadAttention,
-                      MultiScaleRetention, reshape_for_mha)
+from ..core.graph import torch_compiler_disable
+from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
 
@@ -272,68 +272,7 @@ class _FlexMaskMod:
         return keep & ~self.kpm[b, kv_idx]
     
 
-class _FlexBoolMaskMod:
-    __slots__ = ("m", "mode")
-
-    def __init__(self, m: torch.Tensor, mode: str) -> None:
-        self.m = m
-        self.mode = mode
-
-    def __call__(self, b: int, h: int, qi: int, kj: int) -> torch.Tensor:
-        m = self.m
-        match self.mode:
-            case "2d":
-                return ~m[qi, kj]
-            case "3d":
-                return ~m[b, qi, kj]
-            case "4d1":
-                return ~m[b, 0, qi, kj]
-            case "4d":
-                return ~m[b, h, qi, kj]
-            case _:
-                return ~m[qi, kj]
-
-
-class _FlexScoreMod:
-    __slots__ = ("coord_proj", "mask_bias", "mask_bias_kind")
-
-    def __init__(
-        self,
-        coord_proj: torch.Tensor,
-        *args: Any,
-        mask_bias: torch.Tensor | None,
-        mask_bias_kind: str | None,
-    ) -> None:
-        self.coord_proj = coord_proj
-        self.mask_bias = mask_bias
-        self.mask_bias_kind = mask_bias_kind
-
-    def __call__(
-        self,
-        score: torch.Tensor,
-        b: int,
-        h: int,
-        qi: int,
-        kj: int,
-    ) -> torch.Tensor:
-        total = score
-        coord_term = self.coord_proj[b, h, qi] - self.coord_proj[b, h, kj]
-        total = total + coord_term.to(dtype=score.dtype)
-        bias = self.mask_bias
-        if bias is not None:
-            match self.mask_bias_kind:
-                case "2d":
-                    total = total + bias[qi, kj].to(dtype=score.dtype)
-                case "3d":
-                    total = total + bias[b, qi, kj].to(dtype=score.dtype)
-                case "4d1":
-                    total = total + bias[b, 0, qi, kj].to(dtype=score.dtype)
-                case _:
-                    total = total + bias[b, h, qi, kj].to(dtype=score.dtype)
-        return total
-
-
-class _FlexDilatedMaskMod:
+class class _FlexDilatedMaskMod:
     __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
 
     def __init__(
@@ -369,267 +308,91 @@ class _FlexDilatedMaskMod:
         return keep
 
 
-class PatchAttention(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        nhead: int,
-        *args: Any,
-        coord_dim: int = 3,
-        **kwargs: Any,
-    ) -> None:
-        super().__init__()
-        if d_model % nhead != 0:
-            raise ValueError("d_model must be divisible by nhead for PatchAttention")
-        self.d_model = int(d_model)
-        self.nhead = int(nhead)
-        self.head_dim = self.d_model // self.nhead
-        self.coord_dim = int(coord_dim)
-        self.qkv = nn.Linear(self.d_model, 3 * self.d_model, bias=True)
-        self.rel_weight = nn.Parameter(torch.zeros(self.nhead, self.coord_dim))
-        self._fallback_attn: DotProductAttention | None = None
-        if not _HAS_FLEX_ATTENTION:
-            self._fallback_attn = DotProductAttention(
-                num_heads=self.nhead, head_dim=self.head_dim
-            )
-        self._block_mask_cache_lock = threading.Lock()
-        self._block_mask_cache = OrderedDict()
-        self._block_mask_cache_last: tuple[Any, Any] | None = None
-
-    def __getstate__(self):
-        state = super().__getstate__()
-        state.pop("_block_mask_cache_lock", None)
-        state.pop("_block_mask_cache", None)
-        state.pop("_block_mask_cache_last", None)
-        return state
-
-    def __setstate__(self, state):
-        super().__setstate__(state)
-        self._block_mask_cache_lock = threading.Lock()
-        self._block_mask_cache = OrderedDict()
-        self._block_mask_cache_last = None
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        coords: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        *args: Any,
-        block_mask: Any = None,
-    ) -> torch.Tensor:
-        B, N, _ = x.shape
-        if coords.shape[:2] != (B, N):
-            raise ValueError("coords must have shape (B, N, C)")
-        qkv = self.qkv(x)
-        q, k, v = qkv.chunk(3, dim=-1)
-        qh, kh, vh = (
-            reshape_for_mha(q, B, self.nhead, self.head_dim),
-            reshape_for_mha(k, B, self.nhead, self.head_dim),
-            reshape_for_mha(v, B, self.nhead, self.head_dim),
-        )
-        if (not _HAS_FLEX_ATTENTION) or (not x.is_cuda):
-            attn = self._fallback_attn
-            if attn is None:
-                attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
-                self._fallback_attn = attn
-            yh = attn(qh, kh, vh, attn_mask=attn_mask, training=self.training)
-            return yh.transpose(1, 2).contiguous().view(B, N, self.d_model)
-        coords_f32 = coords.to(dtype=torch.float32, device=x.device).contiguous()
-        W = self.rel_weight.to(dtype=coords_f32.dtype, device=coords_f32.device)
-        block = block_mask
-        mask_bias: torch.Tensor | None = None
-        mask_bias_kind: str | None = None
-        if isinstance(attn_mask, torch.Tensor):
-            m = attn_mask
-            if m.dtype == torch.bool:
-                if block is not None:
-                    pass
-                else:
-                    src_ptr = int(m.data_ptr()) if m.numel() else 0
-                    src_ver = int(getattr(m, "_version", 0))
-                    src_shape = tuple(int(x) for x in m.shape)
-                    src_rank = int(m.dim())
-                    _block_size: int
-                    if N <= 2048:
-                        _block_size = 128
-                    elif N <= 16384:
-                        _block_size = 256
-                    else:
-                        _block_size = 512
-                    cache_key = (
-                        src_rank,
-                        src_shape,
-                        _device_key(m.device),
-                        src_ptr,
-                        src_ver,
-                        int(B),
-                        int(self.nhead),
-                        int(N),
-                        int(_block_size),
-                        _device_key(qh.device),
-                    )
-                    last = getattr(self, "_block_mask_cache_last", None)
-                    if last is not None and last[0] == cache_key:
-                        block = last[1]
-                    else:
-                        cache = getattr(self, "_block_mask_cache", None)
-                        if cache is None:
-                            cache = OrderedDict()
-                            setattr(self, "_block_mask_cache", cache)
-                        lock = getattr(self, "_block_mask_cache_lock", None)
-                        if lock is None:
-                            lock = threading.Lock()
-                            setattr(self, "_block_mask_cache_lock", lock)
-                        with lock:
-                            cached = cache.get(cache_key)
-                            if cached is not None:
-                                with contextlib.suppress(Exception):
-                                    cache.move_to_end(cache_key)
-                                block = cached
-                        if block is not None:
-                            self._block_mask_cache_last = (cache_key, block)
-                    if block is None:
-                        if m.device != qh.device:
-                            m = m.to(device=qh.device)
-                        match m.dim():
-                            case 2:
-                                if m.shape != (N, N):
-                                    raise ValueError(
-                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (N,N)=({N},{N})"
-                                    )
-                                mask_mod = _FlexBoolMaskMod(m, "2d")
-                            case 3:
-                                if m.shape != (B, N, N):
-                                    raise ValueError(
-                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
-                                    )
-                                mask_mod = _FlexBoolMaskMod(m, "3d")
-                            case 4:
-                                b0, hm, s1, s2 = m.shape
-                                if (b0 != B) or (s1 != N) or (s2 != N):
-                                    raise ValueError(
-                                        f"bool attn_mask shape {tuple(m.shape)} incompatible with (B={B},N={N})"
-                                    )
-                                if hm == 1:
-                                    mask_mod = _FlexBoolMaskMod(m, "4d1")
-                                elif hm != self.nhead:
-                                    raise ValueError(
-                                        f"bool attn_mask head dim {hm} incompatible with nhead={self.nhead}"
-                                    )
-                                else:
-                                    mask_mod = _FlexBoolMaskMod(m, "4d")
-                            case _:
-                                raise ValueError(f"bool attn_mask rank {m.dim()} not supported")
-                        if create_block_mask is None:
-                            raise RuntimeError("create_block_mask was not imported")
-                        block_new = create_block_mask(
-                            mask_mod,
-                            B,
-                            self.nhead,
-                            N,
-                            N,
-                            device=qh.device,
-                            BLOCK_SIZE=_block_size,
-                        )
-                        est_bytes = int(B) * int(self.nhead) * int(N) * int(N)
-                        if est_bytes <= int(_FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES):
-                            with lock:
-                                if cache.get(cache_key) is None:
-                                    cache[cache_key] = block_new
-                                    with contextlib.suppress(Exception):
-                                        cache.move_to_end(cache_key)
-                                    while len(cache) > int(_FLEX_BLOCK_MASK_CACHE_MAX):
-                                        with contextlib.suppress(Exception):
-                                            cache.popitem(last=False)
-                        block = block_new
-                        self._block_mask_cache_last = (cache_key, block_new)
-            else:
-                bias = m.to(device=qh.device, dtype=qh.dtype)
-                match bias.dim():
-                    case 2:
-                        if bias.shape != (N, N):
-                            raise ValueError(
-                                f"attn_mask shape {tuple(bias.shape)} incompatible with (N,N)=(~,{N})"
-                            )
-                        mask_bias_kind = "2d"
-                    case 3:
-                        if bias.shape != (B, N, N):
-                            raise ValueError(
-                                f"attn_mask shape {tuple(bias.shape)} incompatible with (B,N,N)=({B},{N},{N})"
-                            )
-                        mask_bias_kind = "3d"
-                    case 4:
-                        b0, hm, s1, s2 = bias.shape
-                        if (b0 != B) or (s1 != N) or (s2 != N):
-                            raise ValueError(
-                                f"attn_mask shape {tuple(bias.shape)} incompatible with (B={B},N={N})"
-                            )
-                        if hm == 1:
-                            mask_bias_kind = "4d1"
-                        elif hm != self.nhead:
-                            raise ValueError(
-                                f"attn_mask head dim {hm} incompatible with nhead={self.nhead}"
-                            )
-                        else:
-                            mask_bias_kind = "4d"
-                    case _:
-                        raise ValueError(f"attn_mask rank {bias.dim()} not supported")
-                mask_bias = bias.contiguous()
-        Bc, Nc, Cc = coords_f32.shape
-        if (Bc != B) or (Nc != N) or (Cc != self.coord_dim):
-            raise ValueError(
-                f"coords_f32 shape {coords_f32.shape} incompatible with (B,N,C)=({B},{N},{self.coord_dim})"
-            )
-        coord_proj = torch.matmul(coords_f32, W.t()).transpose(1, 2).contiguous()
-        score_mod = _FlexScoreMod(
-            coord_proj,
-            mask_bias=mask_bias,
-            mask_bias_kind=mask_bias_kind,
-        )
-        scale = 1.0 / math.sqrt(float(self.head_dim))
-        out = flex_attention(
-            qh,
-            kh,
-            vh,
-            score_mod=score_mod,
-            block_mask=block,
-            scale=scale,
-            enable_gqa=False,
-            return_lse=False,
-            kernel_options=None,
-            return_aux=None,
-        )
-        H, Dh = self.nhead, self.head_dim
-        flops = 2.0 * B * H * N * Dh * N + 2.0 * B * H * N * N * Dh + (B * H * N * N * self.coord_dim)
-        try:
-            FLOP_PROFILER.add("PatchAttention", float(flops))
-        except Exception:
-            pass
-        return out.transpose(1, 2).contiguous().view(B, N, self.d_model)
-
-
 class Retention(nn.Module):
-    def __init__(self, d_model: int, nhead: int) -> None:
+    def __init__(self, d_model: int, nhead: int, *args: Any, mode: str | None = None, **kwargs: Any) -> None:
         super().__init__()
+        del args, kwargs
         self.msr = MultiScaleRetention(d_model, nhead)
+        self.mode = str(mode or "temporal").strip().lower()
+
+    @staticmethod
+    def _coerce_mode(mode: Optional[str]) -> str:
+        if mode is None:
+            return "temporal"
+        m = str(mode).strip().lower()
+        if m in ("t", "temporal", "time", "causal"):
+            return "temporal"
+        if m in (
+            "s",
+            "spatial",
+            "space",
+            "bi",
+            "bidir",
+            "bidirectional",
+            "noncausal",
+            "non-causal",
+        ):
+            return "spatial"
+        return m
+
+    def _forward_bidirectional(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        restore_dtype: Optional[torch.dtype] = None
+        x_in = x
+        if getattr(x_in.device, "type", "cpu") == "mps" and x_in.dtype == torch.bfloat16:
+            restore_dtype = x_in.dtype
+            x_in = x_in.to(torch.float16)
+        if x_in.dim() != 3:
+            raise ValueError(f"Retention(spatial) expects (B,L,D), got {tuple(x_in.shape)}")
+        B, L, D = map(int, x_in.shape)
+        if L <= 0:
+            out0 = x_in.new_zeros(x_in.shape)
+            return out0.to(restore_dtype) if restore_dtype is not None else out0
+        msr = self.msr
+        H = int(msr.nhead)
+        Dh = int(msr.head_dim)
+        q = msr.q_proj(x_in).view(B, L, H, Dh)
+        v = msr.v_proj(x_in).view(B, L, H, Dh)
+        v = msr._apply_kpm_to_v(v, attn_mask)  # type: ignore[attr-defined]
+        lam_h = msr._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+        state_fwd = msr._scan_causal(v, lam_h)  # type: ignore[attr-defined]
+        state_bwd = msr._scan_causal(v.flip(1), lam_h).flip(1)  # type: ignore[attr-defined]
+        calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        bi_state = (
+            state_fwd.to(calc_dtype)
+            + state_bwd.to(calc_dtype)
+            - v.to(calc_dtype)
+        ).to(dtype=v.dtype)
+        y = (q * bi_state).contiguous().view(B, L, int(msr.d_model))
+        y = msr.norm(y)
+        if bool(getattr(msr, "use_gate", False)) and getattr(msr, "g_proj", None) is not None:
+            gate = F.silu(msr.g_proj(x_in))
+            y = y * gate
+        out = msr.o_proj(y)
+        if restore_dtype is not None:
+            out = out.to(restore_dtype)
+        return out
 
     def forward(
         self,
         x: torch.Tensor,
-        *args: Any,
         attn_mask: Optional[torch.Tensor] = None,
-        state: Optional[dict] = None,
+        state: Any = None,
+        mode: Optional[str] = None,
         **kwargs: Any,
-    ) -> Tuple[torch.Tensor, Optional[dict]]:
-        h = self.msr(x, attn_mask=attn_mask, state=state, **kwargs)
-        if isinstance(h, tuple):
-            out, new_state = h
-            if new_state is None:
-                new_state = state
-        else:
-            out, new_state = h, state
-        return out, new_state
-
+    ) -> Tuple[torch.Tensor, Any]:
+        _ = kwargs
+        eff_mode = self._coerce_mode(mode if mode is not None else getattr(self, "mode", None))
+        if eff_mode != "spatial":
+            h = self.msr(x, attn_mask=attn_mask, state=state, return_state=True)
+            if isinstance(h, tuple):
+                out, new_state = h
+            else:
+                out, new_state = h, state
+            if isinstance(new_state, torch.Tensor) and (not torch.is_grad_enabled()):
+                new_state = new_state.detach()
+            return out, new_state
+        out = self._forward_bidirectional(x, attn_mask=attn_mask)
+        return out, None
 
 class DilatedAttention(nn.Module):
     def __init__(
@@ -1424,26 +1187,92 @@ class SigmoidGate(nn.Module):
         self.register_buffer("_fb_width_sum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_fb_edge_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
         self.register_buffer("_fb_edge_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self._fb_lock = threading.Lock()
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_fb_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._fb_lock = threading.Lock()
 
     @torch.no_grad()
     def consume_fallback_tensor_stats(self) -> torch.Tensor:
-        stats = torch.stack(
-            [
-                self._fb_count.detach(),
-                self._fb_active_low_sum.detach(),
-                self._fb_active_high_sum.detach(),
-                self._fb_width_sum.detach(),
-                self._fb_edge_low_sum.detach(),
-                self._fb_edge_high_sum.detach(),
-            ]
-        )
-        self._fb_count.zero_()
-        self._fb_active_low_sum.zero_()
-        self._fb_active_high_sum.zero_()
-        self._fb_width_sum.zero_()
-        self._fb_edge_low_sum.zero_()
-        self._fb_edge_high_sum.zero_()
-        return stats
+        lock = getattr(self, "_fb_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(self, "_fb_lock", lock)
+        with lock:
+            stats = torch.stack(
+                [
+                    self._fb_count.detach(),
+                    self._fb_active_low_sum.detach(),
+                    self._fb_active_high_sum.detach(),
+                    self._fb_width_sum.detach(),
+                    self._fb_edge_low_sum.detach(),
+                    self._fb_edge_high_sum.detach(),
+                ]
+            )
+            self._fb_count.zero_()
+            self._fb_active_low_sum.zero_()
+            self._fb_active_high_sum.zero_()
+            self._fb_width_sum.zero_()
+            self._fb_edge_low_sum.zero_()
+            self._fb_edge_high_sum.zero_()
+            return stats
+
+    @torch_compiler_disable(reason="SigmoidGate fallback stats update", recursive=False)
+    def _fb_add_stats(
+        self,
+        count: float,
+        width_sum: torch.Tensor,
+        active_low_sum: torch.Tensor,
+        active_high_sum: torch.Tensor,
+        edge_low_sum: torch.Tensor,
+        edge_high_sum: torch.Tensor,
+    ) -> None:
+        try:
+            dyn = getattr(torch, "_dynamo", None)
+            if dyn is not None:
+                is_comp = getattr(dyn, "is_compiling", None)
+                if callable(is_comp) and bool(is_comp()):
+                    return
+        except Exception:
+            pass
+        try:
+            comp = getattr(torch, "compiler", None)
+            is_exp = getattr(comp, "is_exporting", None)
+            if callable(is_exp) and bool(is_exp()):
+                return
+        except Exception:
+            pass
+        try:
+            if getattr(torch, "jit", None) is not None:
+                if torch.jit.is_tracing() or torch.jit.is_scripting():
+                    return
+        except Exception:
+            pass
+        try:
+            onnx = getattr(torch, "onnx", None)
+            is_onnx = getattr(onnx, "is_in_onnx_export", None)
+            if callable(is_onnx) and bool(is_onnx()):
+                return
+        except Exception:
+            pass
+        with torch.no_grad():
+            lock = getattr(self, "_fb_lock", None)
+            if lock is None:
+                lock = threading.Lock()
+                setattr(self, "_fb_lock", lock)
+            with lock:
+                self._fb_count.add_(float(count))
+                self._fb_width_sum.add_(width_sum.to(dtype=torch.float32))
+                self._fb_active_low_sum.add_(active_low_sum.to(dtype=torch.float32))
+                self._fb_active_high_sum.add_(active_high_sum.to(dtype=torch.float32))
+                self._fb_edge_low_sum.add_(edge_low_sum.to(dtype=torch.float32))
+                self._fb_edge_high_sum.add_(edge_high_sum.to(dtype=torch.float32))
 
     def _expand_tiles(self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
         if self.tile_size <= 0:
@@ -1534,7 +1363,7 @@ class SigmoidGate(nn.Module):
                 p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
                 p_high = torch.maximum(p_high, p_low + float(self.eps))
             p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
-            clip = float(self.clip_eps)
+            clip = float(max(self.clip_eps, self.eps))
             lo = float(self.p_floor) + clip
             hi = float(self.p_ceil) - clip
             if hi > lo:
@@ -1559,13 +1388,14 @@ class SigmoidGate(nn.Module):
                     edge_thr = w_safe * float(ethr)
                     edge_low = (p - p_low) <= edge_thr
                     edge_high = (p_high - p) <= edge_thr
-                    with torch.no_grad():
-                        self._fb_count.add_(float(p.shape[0]))
-                        self._fb_width_sum.add_(width.sum())
-                        self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
-                        self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
-                        self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
-                        self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
+                    self._fb_add_stats(
+                        float(p.shape[0]),
+                        width.sum(),
+                        active_low.to(dtype=torch.float32).sum(),
+                        active_high.to(dtype=torch.float32).sum(),
+                        edge_low.to(dtype=torch.float32).sum(),
+                        edge_high.to(dtype=torch.float32).sum(),
+                    )
                 except Exception:
                     pass
             if bool(return_edge_reg) or bool(return_edge_reg_lr):
@@ -1687,7 +1517,7 @@ class SigmoidGate(nn.Module):
                 p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
                 p_high = torch.maximum(p_high, p_low + float(self.eps))
         p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
-        clip = float(self.clip_eps)
+        clip = float(max(self.clip_eps, self.eps))
         lo = float(self.p_floor) + clip
         hi = float(self.p_ceil) - clip
         if hi > lo:
@@ -1709,13 +1539,14 @@ class SigmoidGate(nn.Module):
                 edge_thr = w_safe * float(ethr)
                 edge_low = (p_tile - p_low) <= edge_thr
                 edge_high = (p_high - p_tile) <= edge_thr
-                with torch.no_grad():
-                    self._fb_count.add_(float(p_tile.numel()))
-                    self._fb_width_sum.add_(width.sum())
-                    self._fb_active_low_sum.add_(active_low.to(dtype=torch.float32).sum())
-                    self._fb_active_high_sum.add_(active_high.to(dtype=torch.float32).sum())
-                    self._fb_edge_low_sum.add_(edge_low.to(dtype=torch.float32).sum())
-                    self._fb_edge_high_sum.add_(edge_high.to(dtype=torch.float32).sum())
+                self._fb_add_stats(
+                    float(p_tile.numel()),
+                    width.sum(),
+                    active_low.to(dtype=torch.float32).sum(),
+                    active_high.to(dtype=torch.float32).sum(),
+                    edge_low.to(dtype=torch.float32).sum(),
+                    edge_high.to(dtype=torch.float32).sum(),
+                )
             except Exception:
                 pass
         edge_reg: Optional[torch.Tensor] = None
@@ -1784,8 +1615,27 @@ class Scaler(nn.Module):
         self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
         self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
 
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_stats_cache_lock", None)
+        state.pop("_x_stats_cache", None)
+        state.pop("_y_stats_cache", None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._stats_cache_lock = threading.Lock()
+        if not hasattr(self, "_stats_cache_max"):
+            self._stats_cache_max = 8
+        self._x_stats_cache = {}
+        self._y_stats_cache = {}
+
     def _invalidate_stats_cache(self) -> None:
-        with self._stats_cache_lock:
+        lock = getattr(self, "_stats_cache_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(self, "_stats_cache_lock", lock)
+        with lock:
             self._x_stats_cache.clear()
             self._y_stats_cache.clear()
 
