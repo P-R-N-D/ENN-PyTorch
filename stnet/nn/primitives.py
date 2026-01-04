@@ -272,7 +272,7 @@ class _FlexMaskMod:
         return keep & ~self.kpm[b, kv_idx]
     
 
-class class _FlexDilatedMaskMod:
+class _FlexDilatedMaskMod:
     __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
 
     def __init__(
