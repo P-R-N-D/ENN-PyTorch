@@ -1204,7 +1204,7 @@ class Model(nn.Module):
             and getattr(self._device, "type", None) == "cuda"
         )
         compile_kwargs: Dict[str, Any] = {}
-        if not compile_cudagraphs:
+        if not self._compile_cudagraphs:
             compile_kwargs["options"] = {"triton.cudagraphs": False}
         compile_heavy_submodules_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "max-autotune",
