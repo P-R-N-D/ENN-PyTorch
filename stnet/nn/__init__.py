@@ -9,7 +9,7 @@ __all__ = [
     "architecture",
     "activations",
     "kernels",
-    "primitives",
+    "layers",
     "blocks",
 ]
 

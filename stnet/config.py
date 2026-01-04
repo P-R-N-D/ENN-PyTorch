@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 from dataclasses import dataclass, field, fields
 from typing import (
     TYPE_CHECKING, Any, ClassVar, Dict, List, Mapping, Set, Literal, Optional,
@@ -207,7 +208,7 @@ def _is_source_spec(obj: Any) -> bool:
         return False
     fmt = obj.get("format", None)
     pth = obj.get("path", None)
-    return isinstance(fmt, str) and isinstance(pth, str)
+    return isinstance(fmt, str) and isinstance(pth, (str, os.PathLike))
 
 
 def _effective_source_count(sources: Any) -> int:

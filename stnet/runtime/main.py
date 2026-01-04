@@ -97,7 +97,7 @@ from ..core.graph import (
 from ..core.profiler import FlopCounter
 from ..core.precision import Autocast, PrecisionPolicy
 from ..nn.architecture import Model, ModelPolicy
-from ..nn.primitives import Recorder, resize_scaler_buffer
+from ..nn.layers import Recorder, resize_scaler_buffer
 from .losses import (
     CRPSLoss,
     DataFidelityLoss,

@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from .primitives import CrossAttention, DilatedAttention, Retention, norm_layer
+from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
 
 _LOGGER = logging.getLogger(__name__)

@@ -66,7 +66,7 @@ from .blocks import (
     norm_layer,
     stochastic_depth_schedule,
 )
-from .primitives import (
+from .layers import (
     Recorder, 
     Scaler, 
     SigmoidGate
@@ -489,7 +489,7 @@ class TemporalExtractor(nn.Module):
         return x
 
 
-class GlobalExtractor(nn.Module):
+class TokenCollector(nn.Module):
     def __init__(
         self,
         embed_dim: int,
@@ -577,7 +577,7 @@ class GlobalExtractor(nn.Module):
     ) -> torch.Tensor:
         if tokens.ndim != 3:
             raise ValueError(
-                f"GlobalExtractor.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
+                f"TokenCollector.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
         B = int(tokens.shape[0])
         if graph_break_fn is not None:
@@ -614,7 +614,7 @@ class GlobalExtractor(nn.Module):
         return refined
 
 
-class TokenizingView(nn.Module):
+class TokenizedView(nn.Module):
     def __init__(self, in_dim: int, tokens: int, d_model: int, extractor: nn.Module) -> None:
         super().__init__()
         self.in_dim = int(in_dim)
@@ -693,8 +693,8 @@ class MultiViewFuser(nn.Module):
                 activation_checkpointing=ckpt_enabled,
                 activation_checkpoint_reentrant=ckpt_reentrant,
             )
-            self.view_encoders["spatial"] = TokenizingView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
-            self.view_encoders["temporal"] = TokenizingView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
+            self.view_encoders["spatial"] = TokenizedView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
+            self.view_encoders["temporal"] = TokenizedView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
         else:
             items = views.items() if isinstance(views, Mapping) else list(views)
             for name, mod in items:
@@ -703,11 +703,11 @@ class MultiViewFuser(nn.Module):
                     raise TypeError("views must contain modules")
                 self.view_encoders[key] = mod
         if "spatial" in self.view_encoders:
-            self.spatial_view = self.view_encoders["spatial"]
-            self.spatial_net = self.spatial_view
+            self.spatial_tokenized_view = self.view_encoders["spatial"]
+            self.spatial_net = self.spatial_tokenized_view
         if "temporal" in self.view_encoders:
-            self.temporal_view = self.view_encoders["temporal"]
-            self.temporal_net = self.temporal_view
+            self.temporal_tokenized_view = self.view_encoders["temporal"]
+            self.temporal_net = self.temporal_tokenized_view
         self.pair_fusers = nn.ModuleDict()
         self._pair_endpoints: dict[str, tuple[str, str]] = {}
         if fusions is None:
@@ -959,7 +959,7 @@ class Model(nn.Module):
             bucket = int(getattr(config, "length_bucket_multiple", 64))
         except Exception:
             bucket = 64
-        self.global_extractor = GlobalExtractor(
+        self.temporal_token_collector = TokenCollector(
             int(config.d_model),
             int(config.heads),
             depth=max(1, int(getattr(config, "temporal_depth", 1))),
@@ -968,7 +968,7 @@ class Model(nn.Module):
             batch_first=True,
             length_bucket_multiple=bucket,
         ).to(self._device)
-        self.controller = self.global_extractor
+        self.controller = self.temporal_token_collector
         self.p_gate: Optional[SigmoidGate]
         k_default = float(getattr(config, 'p_gate_fallback_k', 6.0))
         k_low_cfg = getattr(config, 'p_gate_fallback_k_low', None)
@@ -1129,13 +1129,8 @@ class Model(nn.Module):
         self.microbatch: int = 0
         self._auto_microbatch_pending: bool = True
         self._runtime_lock = threading.Lock()
-        self._eager_fuser_temporal_view = (
-            self.fuser.view_encoders.get(cast(str, self.fuser.temporal_view_key))
-            if getattr(self.fuser, 'temporal_view_key', None) is not None
-            else None
-        )
-        _pair_keys = list(self.fuser.pair_fusers.keys())
-        self._eager_fuser_primary_fuser = self.fuser.pair_fusers[_pair_keys[0]] if _pair_keys else None
+        self._eager_processor_temporal_net = getattr(self.processor, "temporal_net", None)
+        self._eager_processor_perception = getattr(self.processor, "perception", None)
         self._decode_compiled: Optional[nn.Module] = None
         try:
             self.register_buffer(
@@ -1185,8 +1180,8 @@ class Model(nn.Module):
             nogil_opt = bool(Thread.is_optimized_for_no_gil())
         if nogil_opt and compile_enabled:
             _LOGGER.info(
-                "No-GIL optimized mode detected; keeping torch.compile enabled but defaulting to "
-                "conservative settings (no cudagraphs; skip heavy submodules) unless explicitly overridden"
+                "No-GIL optimized mode detected; using conservative torch.compile defaults "
+                "(disable cudagraphs and skip heavy submodules by default)"
             )
         if compile_requested and not compile_available:
             _LOGGER.warning(
@@ -1255,7 +1250,7 @@ class Model(nn.Module):
                 empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
             if compile_heavy_submodules:
                 try:
-                    _orig = self._eager_fuser_temporal_view
+                    _orig = self._eager_processor_temporal_net
                     if _orig is not None:
                         _compiled = torch.compile(
                             _orig,
@@ -1266,8 +1261,10 @@ class Model(nn.Module):
                             disable=False,
                             **compile_kwargs,
                         )
-                        if getattr(self.fuser, "temporal_view_key", None) in self.fuser.view_encoders:
-                            self.fuser.view_encoders[cast(str, self.fuser.temporal_view_key)] = _compiled
+                        self.processor.temporal_net = _compiled
+                        with contextlib.suppress(Exception):
+                            if hasattr(self.processor, "view_encoders") and ("temporal" in self.processor.view_encoders):
+                                self.processor.view_encoders["temporal"] = _compiled
                         compiled_temporal = _compiled is not _orig
                 except Exception:
                     _LOGGER.warning(
@@ -1278,7 +1275,7 @@ class Model(nn.Module):
                 empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
             if compile_heavy_submodules:
                 try:
-                    _orig = self._eager_fuser_primary_fuser
+                    _orig = self._eager_processor_perception
                     if _orig is not None:
                         _compiled = torch.compile(
                             _orig,
@@ -1289,9 +1286,14 @@ class Model(nn.Module):
                             disable=False,
                             **compile_kwargs,
                         )
-                        _pair_keys = list(self.fuser.pair_fusers.keys())
-                        if _pair_keys:
-                            self.fuser.pair_fusers[_pair_keys[0]] = _compiled
+                        self.processor.perception = _compiled
+                        with contextlib.suppress(Exception):
+                            if hasattr(self.processor, "pair_fusers"):
+                                if "spatial|temporal" in self.processor.pair_fusers:
+                                    self.processor.pair_fusers["spatial|temporal"] = _compiled
+                                elif len(self.processor.pair_fusers) == 1:
+                                    _pair = next(iter(self.processor.pair_fusers.keys()))
+                                    self.processor.pair_fusers[_pair] = _compiled
                         compiled_perception = _compiled is not _orig
                 except Exception:
                     _LOGGER.warning(
@@ -1359,40 +1361,51 @@ class Model(nn.Module):
 
     @contextlib.contextmanager
     def eager_for_export(self):
-        fuser = getattr(self, "fuser", None)
-        if fuser is None:
-            fuser = getattr(self, "processor", None)
-        if fuser is None:
+        proc = getattr(self, "processor", None)
+        if proc is None:
+            proc = getattr(self, "fuser", None)
+        if proc is None:
             yield self
             return
-        swaps: list[tuple[str, str, nn.Module]] = []
+
+        def _sync_after_swap(swapped: str) -> None:
+            if swapped == "temporal_net":
+                with contextlib.suppress(Exception):
+                    if hasattr(proc, "view_encoders") and ("temporal" in proc.view_encoders):
+                        proc.view_encoders["temporal"] = proc.temporal_net
+            elif swapped == "perception":
+                with contextlib.suppress(Exception):
+                    if hasattr(proc, "pair_fusers"):
+                        if "spatial|temporal" in proc.pair_fusers:
+                            proc.pair_fusers["spatial|temporal"] = proc.perception
+                        elif len(proc.pair_fusers) == 1:
+                            k = next(iter(proc.pair_fusers.keys()))
+                            proc.pair_fusers[k] = proc.perception
+
+        swaps: list[tuple[str, Any]] = []
         with contextlib.suppress(Exception):
-            eager_temporal = getattr(self, "_eager_fuser_temporal_view", None)
-            key = getattr(fuser, "temporal_view_key", None)
-            if isinstance(eager_temporal, nn.Module) and isinstance(key, str) and key in fuser.view_encoders:
-                cur = fuser.view_encoders[key]
-                if cur is not eager_temporal:
-                    swaps.append(("view", key, cur))
-                    fuser.view_encoders[key] = eager_temporal
+            eager_temporal = getattr(self, "_eager_processor_temporal_net", None)
+            if isinstance(eager_temporal, nn.Module):
+                cur = getattr(proc, "temporal_net", None)
+                if cur is not eager_temporal and cur is not None:
+                    swaps.append(("temporal_net", cur))
+                    proc.temporal_net = eager_temporal
+                    _sync_after_swap("temporal_net")
         with contextlib.suppress(Exception):
-            eager_pair = getattr(self, "_eager_fuser_primary_fuser", None)
-            if isinstance(eager_pair, nn.Module):
-                pair_keys = list(getattr(fuser, "pair_fusers", {}).keys())
-                if pair_keys:
-                    pk = pair_keys[0]
-                    cur = fuser.pair_fusers[pk]
-                    if cur is not eager_pair:
-                        swaps.append(("pair", pk, cur))
-                        fuser.pair_fusers[pk] = eager_pair
+            eager_perception = getattr(self, "_eager_processor_perception", None)
+            if isinstance(eager_perception, nn.Module):
+                cur = getattr(proc, "perception", None)
+                if cur is not eager_perception and cur is not None:
+                    swaps.append(("perception", cur))
+                    proc.perception = eager_perception
+                    _sync_after_swap("perception")
         try:
             yield self
         finally:
-            for kind, key, old in swaps:
+            for name, old in swaps:
                 with contextlib.suppress(Exception):
-                    if kind == "view":
-                        fuser.view_encoders[key] = old
-                    else:
-                        fuser.pair_fusers[key] = old
+                    setattr(proc, name, old)
+                _sync_after_swap(name)
 
     def forward_export(self, features: torch.Tensor) -> torch.Tensor:
         if not isinstance(features, torch.Tensor):
@@ -1414,7 +1427,7 @@ class Model(nn.Module):
         tokens_centered = tokens - mean.to(dtype=tokens.dtype)
         if not tokens_centered.is_contiguous():
             tokens_centered = tokens_centered.contiguous()
-        refined_tokens = self.global_extractor.forward_export(tokens_centered)
+        refined_tokens = self.temporal_token_collector.forward_export(tokens_centered)
         residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
         enhanced = residual_context.reshape(b, -1)
         if enhanced.dtype != assembled.dtype:
@@ -1502,7 +1515,7 @@ class Model(nn.Module):
             tokens_centered = tokens - mean.to(dtype=tokens.dtype)
             if not tokens_centered.is_contiguous():
                 tokens_centered = tokens_centered.contiguous()
-            refined_tokens = self.global_extractor.forward_export(tokens_centered)
+            refined_tokens = self.temporal_token_collector.forward_export(tokens_centered)
             refined_tokens = _coerce_tensor(refined_tokens, enabled=sanitize_nan, inplace=False)
             residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
             enhanced = residual_context.reshape(b, -1)
@@ -1829,7 +1842,7 @@ class Model(nn.Module):
                 tokens_centered = tokens_centered.contiguous()
             if is_train_path:
                 tokens_centered = tokens_centered.detach()
-            refined_tokens = self.global_extractor.run(
+            refined_tokens = self.temporal_token_collector.run(
                 tokens_centered,
                 device=device,
                 meta=meta,
@@ -1842,7 +1855,7 @@ class Model(nn.Module):
                 enabled=sanitize_enabled,
                 inplace=sanitize_inplace,
             )
-            ctrl_mb = max(1, min(int(b), int(self.global_extractor.microbatch) or int(b)))
+            ctrl_mb = max(1, min(int(b), int(self.temporal_token_collector.microbatch) or int(b)))
             graph_break()
             processor_ctx = inference_mode(self.fuser) if infer_mode else contextlib.nullcontext()
             with processor_ctx:

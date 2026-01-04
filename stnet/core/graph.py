@@ -570,13 +570,13 @@ def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: A
     with suppress(Exception):
         compile_distributed_safe()
     if layers_module is None:
-        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks", "stnet.nn.architecture"):
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks", "stnet.nn.architecture"):
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
     scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
     if scaler_cls is None:
-        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks"):
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
                 scaler_cls = getattr(mod, "Scaler", None)
@@ -599,7 +599,7 @@ def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: A
             )
     history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
     if history_cls is None:
-        for mod_name in ("stnet.nn.primitives", "stnet.nn.blocks"):
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
                 mod = importlib.import_module(mod_name)
                 history_cls = getattr(mod, "Recorder", None)

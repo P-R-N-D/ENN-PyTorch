@@ -25,7 +25,7 @@ from tensordict import TensorDictBase
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.graph import inference_mode
 from ..data.schemas import save_temp, write_json, coerce_json
-from ..nn.primitives import Recorder
+from ..nn.layers import Recorder
 
 try:
     from torch.serialization import add_safe_globals
