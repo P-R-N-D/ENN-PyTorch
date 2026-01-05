@@ -13,6 +13,10 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 - **torchao**: >= 0.14.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
+- **numpy**: >= 2.2.5
+- **psutil**: >= 7.0.0
+- **py-cpuinfo**: >= 9.0.0
+- **tqdm**: >= 4.67.1
 - **h5py**: >= 3.11.0 (required for persisted prediction outputs)
 
 ### Recommended
@@ -20,8 +24,7 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
   - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
 - **PyTorch**: >= 2.9.1
-
-DataFrame integrations (pandas, pandas-on-Spark, polars) are optional; install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
+- DataFrame integrations (pandas, pandas-on-Spark, polars) are optional. install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
 
 ## Features
 - **APIs** (`stnet.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
