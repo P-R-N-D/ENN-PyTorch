@@ -474,8 +474,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         name="p_gate_tile_size",
         minimum=1,
     )
-    
-    
     _raw_tile_shape = get("p_gate_tile_shape", None)
     if _raw_tile_shape is None:
         p_gate_tile_shape = None
