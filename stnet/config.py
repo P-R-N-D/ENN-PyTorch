@@ -224,20 +224,11 @@ def _effective_source_count(sources: Any) -> int:
 def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     if not out_shape:
         raise ValueError("RuntimeConfig.out_shape must be a non-empty sequence")
-    ndim = len(out_shape)
-    if ndim == 1:
-        return out_shape
-    if ndim == 2:
-        if out_shape[0] != out_shape[1]:
-            raise ValueError(f"RuntimeConfig.out_shape 2D must be square: got {tuple(out_shape)}")
-        return out_shape
-    if ndim == 3:
-        if not (out_shape[0] == out_shape[1] == out_shape[2]):
-            raise ValueError(f"RuntimeConfig.out_shape 3D must be cubic: got {tuple(out_shape)}")
-        return out_shape
-    raise ValueError(
-        f"RuntimeConfig.out_shape must be 1D, 2D square, or 3D cube; got rank {ndim} ({tuple(out_shape)})"
-    )
+    if any(int(d) <= 0 for d in out_shape):
+        raise ValueError(f"RuntimeConfig.out_shape must be positive: got {tuple(out_shape)}")
+    if len(out_shape) > 1 and len(set(out_shape)) != 1:
+        raise ValueError(f"RuntimeConfig.out_shape must be isotropic (all dims equal): got {tuple(out_shape)}")
+    return out_shape
 
 
 def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[torch.device]:
