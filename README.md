@@ -9,6 +9,8 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
 ### Mandatory
 - **Python**: >= 3.10 (uses `match` / `case`)
 - **PyTorch**: >= 2.8.0
+- **Triton**: >= 3.4.0 (core JIT backend; typically installed alongside PyTorch)
+- **torchao**: >= 0.14.0
 - **torchdata**: >= 0.11.0 (`torchdata.nodes`-based pipeline)
 - **tensordict**: >= 0.10.0
 - **h5py**: >= 3.11.0 (required for persisted prediction outputs)
@@ -18,7 +20,8 @@ This repository also includes a worked example notebook (`notebook.ipynb`) and a
   - The data pipeline uses thread-parallel execution via `torchdata.nodes` and is designed to reduce GIL contention on standard CPython.
   - Free-threaded Python can further improve throughput by removing the GIL, but it is not necessary.
 - **PyTorch**: >= 2.9.1
-- **torchao**: >= 0.14.0
+
+DataFrame integrations (pandas, pandas-on-Spark, polars) are optional; install the corresponding extra (e.g., `pip install -e .[pandas]`) when needed.
 
 ## Features
 - **APIs** (`stnet.api`): build/load models, elastic train/predict entrypoints (uses `torch.distributed.elastic`), and checkpoint/export helpers.
@@ -53,10 +56,9 @@ pip install -e .[pandas]      # or: .[polars]
 # Pandas on Spark (with pandas-on-Spark)
 pip install -e .[pandas_on_spark]
 
-# NVIDIA TE / Intel IPEX / TorchAO (hardware-specific)
+# NVIDIA TE / Intel IPEX (hardware-specific)
 pip install -e .[nvidia_te_cu12]   # or .[nvidia_te_cu13]
 pip install -e .[intel_ai]
-pip install -e .[torchao]
 
 # Telemetry (NVIDIA GPU info)
 pip install -e .[telemetry]
@@ -68,7 +70,7 @@ pip install -e .[nufft]
 pip install -e .[dev]
 ```
 
-> **Note**: Do **not** install `triton` manually; the correct Triton build is pulled automatically by PyTorch.
+> **Note**: Triton >= 3.4.0 is required, but a matching build is normally installed alongside PyTorch—avoid overriding it with a mismatched wheel.
 
 > **Platform note**: many `deployment_full` backends are OS/driver/python dependent (e.g., CoreML on macOS, TensorRT on Linux/CUDA, ExecuTorch often lacks wheels for Python ≥3.12). If you only need ONNX export, installing `onnx` (and optionally `onnxruntime`) is usually sufficient.
 
