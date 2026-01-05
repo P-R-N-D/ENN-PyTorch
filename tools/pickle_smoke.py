@@ -78,8 +78,6 @@ def main() -> int:
         temporal_latents=8,
         modeling_type="st",
         compile_mode=str(getattr(args, "compile_mode", "disabled")),
-        activation_checkpointing=False,
-        activation_checkpoint_reentrant=False,
     )
 
     model = Model(int(args.in_dim), out_shape, cfg).to(device=device, dtype=dtype)
