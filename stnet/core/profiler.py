@@ -5,7 +5,6 @@ import contextlib
 import contextvars
 import logging
 import os
-import warnings
 from dataclasses import dataclass, field
 from functools import partial
 from types import TracebackType
@@ -27,55 +26,6 @@ except Exception:
 
 
 _LOGGER = logging.getLogger(__name__)
-
-class _TorchFlopCounterTritonNotFoundFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        try:
-            msg = record.getMessage()
-        except Exception:
-            try:
-                msg = str(getattr(record, "msg", ""))
-            except Exception:
-                msg = ""
-        if not msg:
-            return True
-        m = msg.lower()
-        if "triton not found" not in m:
-            return True
-        if "flop" not in m or "count" not in m:
-            return True
-        path = str(getattr(record, "pathname", "") or "").replace("\\", "/")
-        name = str(getattr(record, "name", "") or "")
-        if "torch/utils/flop_counter.py" in path or "torch.utils.flop_counter" in name:
-            return False
-        if "flop counting will not work for triton kernels" in m:
-            return False
-        return True
-
-
-@contextlib.contextmanager
-def _suppress_torch_flop_counter_triton_not_found() -> Any:
-    filt = _TorchFlopCounterTritonNotFoundFilter()
-    targets = (
-        logging.getLogger(),
-        logging.getLogger("torch"),
-        logging.getLogger("torch.utils.flop_counter"),
-    )
-    for lg in targets:
-        with contextlib.suppress(Exception):
-            lg.addFilter(filt)
-    try:
-        with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message=r".*triton not found.*flop counting.*triton kernel.*",
-                category=Warning,
-            )
-            yield
-    finally:
-        for lg in targets:
-            with contextlib.suppress(Exception):
-                lg.removeFilter(filt)
 
 FLOP_PROFILER: "_FlopProfiler" | None = None
 
@@ -2113,17 +2063,15 @@ class _TorchFlops(contextlib.AbstractContextManager[Any]):
 class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
     def __init__(self, show: bool) -> None:
         try:
-            with _suppress_torch_flop_counter_triton_not_found():
-                from torch.utils.flop_counter import FlopCounterMode as TorchMode
+            from torch.utils.flop_counter import FlopCounterMode as TorchMode
 
-                self._impl = TorchMode(display=show)
+            self._impl = TorchMode(display=show)
         except Exception:
             self._impl = None
 
     def __enter__(self) -> "_TorchFlopsCompat":
         if self._impl is not None:
-            with _suppress_torch_flop_counter_triton_not_found():
-                self._impl.__enter__()
+            self._impl.__enter__()
         return self
 
     def __exit__(
@@ -2133,8 +2081,7 @@ class _TorchFlopsCompat(contextlib.AbstractContextManager[Any]):
         tb: TracebackType | None,
     ) -> bool:
         if self._impl is not None:
-            with _suppress_torch_flop_counter_triton_not_found():
-                self._impl.__exit__(exc_type, exc, tb)
+            self._impl.__exit__(exc_type, exc, tb)
         return False
 
     def get_total_flops(self) -> float:

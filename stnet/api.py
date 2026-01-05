@@ -5,8 +5,10 @@ import contextlib
 import logging
 import os
 import random
+import re
 import shutil
 import time
+import warnings
 from functools import lru_cache, partial, update_wrapper
 from pathlib import Path
 from typing import (
@@ -103,6 +105,26 @@ PredictData: TypeAlias = TrainData
 PredictionOutput: TypeAlias = TensorDictBase | PersistentTensorDict | Mapping[str, TensorDictBase] | Mapping[str, torch.Tensor]
 logger = logging.getLogger(__name__)
 
+_IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
+    "torch.distributed is disabled, unavailable or uninitialized",
+    "TypedStorage is deprecated",
+    "Found a non-scalar tensor with numel=1 and ndim!=0",
+    "distributed_broadcast: coalesced broadcast failed",
+    "distributed_broadcast: per-tensor broadcast failed",
+    "found no DeviceMesh from dtensor args",
+    "mixed precision.*may be unavailable",
+    "Either mode or options can be specified, but both can't be specified at the same time\\.",
+)
+
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+)
+
+
+def _apply_warning_filters() -> None:
+    with contextlib.suppress(Exception):
+        warnings.filterwarnings("ignore", message=_IGNORED_WARNING_MESSAGE_RE.pattern, category=UserWarning)
+
 
 def _rewrite_state_dict_key(k: str) -> str:
     if not (k.startswith("m.") and ".module." in k):
@@ -173,6 +195,7 @@ def _clear_process_group() -> None:
 
 
 def _init_distributed() -> None:
+    _apply_warning_filters()
     _clear_process_group()
     init_python_path()
     with contextlib.suppress(Exception):

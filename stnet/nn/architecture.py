@@ -238,6 +238,22 @@ def _is_torch_compiling() -> bool:
     return False
 
 
+def _patch_inductor_config(options: Mapping[str, Any]) -> object:
+    try:
+        from torch._inductor import config as inductor_config
+    except Exception:
+        return contextlib.nullcontext()
+
+    patch = getattr(inductor_config, "patch", None)
+    if not callable(patch):
+        return contextlib.nullcontext()
+
+    try:
+        return patch(dict(options))
+    except Exception:
+        return contextlib.nullcontext()
+
+
 def _is_ptq_unavailable(
     model: nn.Module, *args: Any, **kwargs: Any
 ) -> tuple[nn.Module, bool, str]:
@@ -1334,9 +1350,13 @@ class Model(nn.Module):
             and compile_cudagraphs
             and getattr(self._device, "type", None) == "cuda"
         )
-        compile_kwargs: Dict[str, Any] = {}
-        if not self._compile_cudagraphs:
-            compile_kwargs["options"] = {"triton.cudagraphs": False}
+        compile_patch_ctx = contextlib.nullcontext()
+        if (
+            compile_enabled
+            and getattr(self._device, "type", None) == "cuda"
+            and (not bool(compile_cudagraphs))
+        ):
+            compile_patch_ctx = _patch_inductor_config({"triton.cudagraphs": False})
         compile_heavy_submodules_default = (not bool(nogil_opt)) and compile_mode_canonical not in {
             "max-autotune",
             "max-autotune-no-cudagraphs",
@@ -1357,82 +1377,80 @@ class Model(nn.Module):
         compiled_temporal = False
         compiled_perception = False
         if compile_enabled:
-            try:
-                _raw_head = self.processor.head
-                _decode_mod = _ProxyDecoder(self.processor.norm, _raw_head, self.out_shape).to(self._device)
-                _compiled = torch.compile(
-                    _decode_mod,
-                    mode=compile_mode_arg,
-                    fullgraph=False,
-                    dynamic=compile_dynamic,
-                    backend="inductor",
-                    disable=False,
-                    **compile_kwargs,
-                )
-                self._decode_compiled = _compiled
-                compiled_decode = _compiled is not _decode_mod
-            except Exception:
-                self._decode_compiled = None
-                _LOGGER.warning(
-                    "torch.compile failed for decode head; continuing without compilation",
-                    exc_info=True,
-                )
-            if getattr(self._device, "type", None) == "cuda":
-                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
-            if compile_heavy_submodules:
+            with compile_patch_ctx:
                 try:
-                    _orig = self._eager_processor_temporal_net
-                    if _orig is not None:
-                        _compiled = torch.compile(
-                            _orig,
-                            mode=compile_mode_arg,
-                            fullgraph=False,
-                            dynamic=compile_dynamic,
-                            backend="inductor",
-                            disable=False,
-                            **compile_kwargs,
-                        )
-                        self.processor.temporal_net = _compiled
-                        with contextlib.suppress(Exception):
-                            if hasattr(self.processor, "view_encoders") and ("temporal" in self.processor.view_encoders):
-                                self.processor.view_encoders["temporal"] = _compiled
-                        compiled_temporal = _compiled is not _orig
+                    _raw_head = self.processor.head
+                    _decode_mod = _ProxyDecoder(self.processor.norm, _raw_head, self.out_shape).to(self._device)
+                    _compiled = torch.compile(
+                        _decode_mod,
+                        mode=compile_mode_arg,
+                        fullgraph=False,
+                        dynamic=compile_dynamic,
+                        backend="inductor",
+                        disable=False,
+                    )
+                    self._decode_compiled = _compiled
+                    compiled_decode = _compiled is not _decode_mod
                 except Exception:
+                    self._decode_compiled = None
                     _LOGGER.warning(
-                        "torch.compile failed for fuser temporal view; continuing eagerly",
+                        "torch.compile failed for decode head; continuing without compilation",
                         exc_info=True,
                     )
-            if getattr(self._device, "type", None) == "cuda":
-                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
-            if compile_heavy_submodules:
-                try:
-                    _orig = self._eager_processor_perception
-                    if _orig is not None:
-                        _compiled = torch.compile(
-                            _orig,
-                            mode=compile_mode_arg,
-                            fullgraph=False,
-                            dynamic=compile_dynamic,
-                            backend="inductor",
-                            disable=False,
-                            **compile_kwargs,
+                if getattr(self._device, "type", None) == "cuda":
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                if compile_heavy_submodules:
+                    try:
+                        _orig = self._eager_processor_temporal_net
+                        if _orig is not None:
+                            _compiled = torch.compile(
+                                _orig,
+                                mode=compile_mode_arg,
+                                fullgraph=False,
+                                dynamic=compile_dynamic,
+                                backend="inductor",
+                                disable=False,
+                            )
+                            self.processor.temporal_net = _compiled
+                            with contextlib.suppress(Exception):
+                                if hasattr(self.processor, "view_encoders") and ("temporal" in self.processor.view_encoders):
+                                    self.processor.view_encoders["temporal"] = _compiled
+                            compiled_temporal = _compiled is not _orig
+                    except Exception:
+                        _LOGGER.warning(
+                            "torch.compile failed for fuser temporal view; continuing eagerly",
+                            exc_info=True,
                         )
-                        self.processor.perception = _compiled
-                        with contextlib.suppress(Exception):
-                            if hasattr(self.processor, "pair_fusers"):
-                                if "spatial|temporal" in self.processor.pair_fusers:
-                                    self.processor.pair_fusers["spatial|temporal"] = _compiled
-                                elif len(self.processor.pair_fusers) == 1:
-                                    _pair = next(iter(self.processor.pair_fusers.keys()))
-                                    self.processor.pair_fusers[_pair] = _compiled
-                        compiled_perception = _compiled is not _orig
-                except Exception:
-                    _LOGGER.warning(
-                        "torch.compile failed for fuser primary pair fuser; continuing eagerly",
-                        exc_info=True,
-                    )
-            if getattr(self._device, "type", None) == "cuda":
-                empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                if getattr(self._device, "type", None) == "cuda":
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
+                if compile_heavy_submodules:
+                    try:
+                        _orig = self._eager_processor_perception
+                        if _orig is not None:
+                            _compiled = torch.compile(
+                                _orig,
+                                mode=compile_mode_arg,
+                                fullgraph=False,
+                                dynamic=compile_dynamic,
+                                backend="inductor",
+                                disable=False,
+                            )
+                            self.processor.perception = _compiled
+                            with contextlib.suppress(Exception):
+                                if hasattr(self.processor, "pair_fusers"):
+                                    if "spatial|temporal" in self.processor.pair_fusers:
+                                        self.processor.pair_fusers["spatial|temporal"] = _compiled
+                                    elif len(self.processor.pair_fusers) == 1:
+                                        _pair = next(iter(self.processor.pair_fusers.keys()))
+                                        self.processor.pair_fusers[_pair] = _compiled
+                            compiled_perception = _compiled is not _orig
+                    except Exception:
+                        _LOGGER.warning(
+                            "torch.compile failed for fuser primary pair fuser; continuing eagerly",
+                            exc_info=True,
+                        )
+                if getattr(self._device, "type", None) == "cuda":
+                    empty_device_cache(device=self._device, do_gc=True, min_interval_s=0.0)
         self._compiled_submodules = {
             "decode": bool(compiled_decode),
             "temporal_net": bool(compiled_temporal),
