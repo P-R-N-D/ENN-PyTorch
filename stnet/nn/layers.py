@@ -1359,10 +1359,6 @@ class SigmoidGate(nn.Module):
             feats.append(r_rms.to(dtype=tokens.dtype))
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
         global_logit = self.net(x).squeeze(-1)
-        
-        
-        
-        
         use_tile_nd = False
         event_shape = tuple(getattr(self, "event_shape", ()) or ())
         tile_shape_nd: Tuple[int, ...] = ()
