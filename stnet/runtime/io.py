@@ -41,6 +41,10 @@ _IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
     "TypedStorage is deprecated. It will be removed in the future",
 )
 
+_IGNORED_WARNING_MESSAGE_RE: str = (
+    r".*(?:" + "|".join((re.escape(str(s)) for s in _IGNORED_WARNING_SENTENCES)) + r").*"
+)
+
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
 _FORWARD_PARAM_CACHE_LOCK = threading.Lock()
 
@@ -62,10 +66,14 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
     if not sentences:
         yield
         return
+    msg_re = _IGNORED_WARNING_MESSAGE_RE
+    if ignored_sentences is not None:
+        parts = [re.escape(str(s)) for s in sentences if s]
+        msg_re = r".*(?:" + "|".join(parts) + r").*" if parts else ""
     with warnings.catch_warnings():
-        for s in sentences:
-            with contextlib.suppress(Exception):
-                warnings.filterwarnings("ignore", message=f".*{re.escape(str(s))}.*")
+        with contextlib.suppress(Exception):
+            if msg_re:
+                warnings.filterwarnings("ignore", message=str(msg_re))
         yield
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import random
+import re
 import platform
 import socket
 import logging
@@ -162,6 +163,21 @@ _OOM_RETRY_COUNT = {}
 
 _TIMING_EVENT_TLS = threading.local()
 _TIMING_EVENTS_UNSUPPORTED = object()
+
+_IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
+    "torch.distributed is disabled, unavailable or uninitialized",
+    "TypedStorage is deprecated",
+    "Found a non-scalar tensor with numel=1 and ndim!=0",
+    "distributed_broadcast: coalesced broadcast failed",
+    "distributed_broadcast: per-tensor broadcast failed",
+    "found no DeviceMesh from dtensor args",
+    "mixed precision.*may be unavailable",
+    "Either mode or options can be specified, but both can't be specified at the same time\\.",
+)
+
+_IGNORED_WARNING_MESSAGE_RE = re.compile(
+    r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
+)
 
 MB_DIV = 1024.0 * 1024.0
 
@@ -3955,23 +3971,12 @@ def process(*args: Any, **kwargs: Any) -> object:
     det = bool(getattr(ops, "deterministic", False))
     seed_base = int(getattr(ops, "seed", 42))
     seed_value = int(seed_base) + int(local_rank)
-    ignored_sentences = [
-        "torch.distributed is disabled, unavailable or uninitialized",
-        "TypedStorage is deprecated",
-        "triton not found; flop counting will not work",
-        "Found a non-scalar tensor with numel=1 and ndim!=0",
-        "distributed_broadcast: coalesced broadcast failed",
-        "distributed_broadcast: per-tensor broadcast failed",
-        "found no DeviceMesh from dtensor args",
-        "mixed precision.*may be unavailable",
-    ]
-    for msg in ignored_sentences:
-        with contextlib.suppress(Exception):
-            warnings.filterwarnings(
-                "ignore",
-                message=f".*{msg}.*",
-                category=UserWarning,
-            )
+    with contextlib.suppress(Exception):
+        warnings.filterwarnings(
+            "ignore",
+            message=_IGNORED_WARNING_MESSAGE_RE.pattern,
+            category=UserWarning,
+        )
     with contextlib.suppress(Exception):
         random.seed(seed_value)
     with contextlib.suppress(Exception):
