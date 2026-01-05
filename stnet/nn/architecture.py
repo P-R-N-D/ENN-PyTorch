@@ -249,7 +249,7 @@ class _CallableFuser:
 
     def __init__(
         self,
-        backbone: "MultiViewFuser",
+        backbone: "TokenFuser",
         *args: Any,
         device: torch.device,
         meta: Any,
@@ -299,8 +299,6 @@ class SpatialExtractor(nn.Module):
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
-        activation_checkpointing: bool = False,
-        activation_checkpoint_reentrant: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -373,8 +371,6 @@ class TemporalExtractor(nn.Module):
         dropout: float = 0.0,
         drop_path: float = 0.0,
         norm_type: str = "layernorm",
-        activation_checkpointing: bool = False,
-        activation_checkpoint_reentrant: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -748,7 +744,7 @@ class TokenizedView(nn.Module):
         return self.extractor(tokens, *args, **kwargs)
 
 
-class MultiViewFuser(nn.Module):
+class TokenFuser(nn.Module):
     def __init__(
         self,
         in_dim: int,
@@ -774,8 +770,6 @@ class MultiViewFuser(nn.Module):
         self.norm_type = str(getattr(config, "normalization_method", "layernorm"))
         self.gate_blend_alpha = float(getattr(config, "fuser_blend_alpha", getattr(config, "fuser_gate_blend", 0.0)))
         self.gate_blend_alpha = float(min(max(self.gate_blend_alpha, 0.0), 1.0))
-        ckpt_enabled = bool(getattr(config, "activation_checkpointing", False))
-        ckpt_reentrant = bool(getattr(config, "activation_checkpoint_reentrant", False))
         self.view_encoders = nn.ModuleDict()
         if views is None:
             spatial_extractor = SpatialExtractor(
@@ -786,8 +780,6 @@ class MultiViewFuser(nn.Module):
                 dropout=self.dropout,
                 drop_path=self.drop_path,
                 norm_type=self.norm_type,
-                activation_checkpointing=ckpt_enabled,
-                activation_checkpoint_reentrant=ckpt_reentrant,
             )
             temporal_extractor = TemporalExtractor(
                 self.d_model,
@@ -797,8 +789,6 @@ class MultiViewFuser(nn.Module):
                 dropout=self.dropout,
                 drop_path=self.drop_path,
                 norm_type=self.norm_type,
-                activation_checkpointing=ckpt_enabled,
-                activation_checkpoint_reentrant=ckpt_reentrant,
             )
             self.view_encoders["spatial"] = TokenizedView(self.in_dim, self.spatial_tokens, self.d_model, spatial_extractor)
             self.view_encoders["temporal"] = TokenizedView(self.in_dim, self.temporal_tokens, self.d_model, temporal_extractor)
@@ -955,7 +945,7 @@ class MultiViewFuser(nn.Module):
             out.append(fuser(views[a], views[b]))
         return out
 
-    @torch_compiler_disable(reason="MultiViewFuser orchestrates eager + compiled submodules", recursive=False)
+    @torch_compiler_disable(reason="TokenFuser orchestrates eager + compiled submodules", recursive=False)
     def forward(
         self,
         x: torch.Tensor,
@@ -1060,7 +1050,7 @@ class Model(nn.Module):
         self.logger = Recorder()
         self.is_norm_linear = bool(getattr(config, "use_linear_branch", False))
         self.linear_branch = nn.Linear(self.in_dim, self.out_dim).to(self._device) if self.is_norm_linear else None
-        self.fuser = MultiViewFuser(self.in_dim, self.out_shape, config=config).to(self._device)
+        self.fuser = TokenFuser(self.in_dim, self.out_shape, config=config).to(self._device)
         self.processor = self.fuser
         try:
             bucket = int(getattr(config, "length_bucket_multiple", 64))
@@ -1083,9 +1073,9 @@ class Model(nn.Module):
         self.p_gate_fallback_k: float = float(k_default)
         self.p_gate_fallback_k_low: float = float(k_default if k_low_cfg is None else float(k_low_cfg))
         self.p_gate_fallback_k_high: float = float(k_default if k_high_cfg is None else float(k_high_cfg))
-        self.p_gate_auto_k_enabled: bool = bool(getattr(config, 'p_gate_auto_k_enabled', False))
-        self.p_gate_auto_k_interval: int = int(getattr(config, 'p_gate_auto_k_interval', 100) or 0)
-        self.p_gate_auto_k_warmup: int = int(getattr(config, 'p_gate_auto_k_warmup', 0) or 0)
+        self.p_gate_auto_k_enabled: bool = True
+        self.p_gate_auto_k_interval: int = max(1, int(getattr(config, 'p_gate_auto_k_interval', 100) or 100))
+        self.p_gate_auto_k_warmup: int = max(0, int(getattr(config, 'p_gate_auto_k_warmup', 0) or 0))
         self.p_gate_auto_k_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_ema_alpha', 0.1))
         self.p_gate_auto_k_target_tight: float = float(getattr(config, 'p_gate_auto_k_target_tight', 0.02))
         self.p_gate_auto_k_tolerance: float = float(getattr(config, 'p_gate_auto_k_tolerance', 0.5))
@@ -1095,7 +1085,7 @@ class Model(nn.Module):
         self.p_gate_auto_k_step_down_low: float = float(getattr(config, 'p_gate_auto_k_step_down_low', self.p_gate_auto_k_step_down))
         self.p_gate_auto_k_step_up_high: float = float(getattr(config, 'p_gate_auto_k_step_up_high', self.p_gate_auto_k_step_up))
         self.p_gate_auto_k_step_down_high: float = float(getattr(config, 'p_gate_auto_k_step_down_high', self.p_gate_auto_k_step_down))
-        self.p_gate_auto_k_edge_enabled: bool = bool(getattr(config, 'p_gate_auto_k_edge_enabled', False))
+        self.p_gate_auto_k_edge_enabled: bool = True
         self.p_gate_auto_k_target_edge: float = float(getattr(config, 'p_gate_auto_k_target_edge', 0.05))
         self.p_gate_auto_k_edge_tolerance: float = float(getattr(config, 'p_gate_auto_k_edge_tolerance', 0.5))
         self.p_gate_auto_k_edge_ema_alpha: float = float(getattr(config, 'p_gate_auto_k_edge_ema_alpha', self.p_gate_auto_k_ema_alpha))
@@ -1208,8 +1198,7 @@ class Model(nn.Module):
             )
         except Exception:
             pass
-        if bool(getattr(config, 'p_gate_enabled', False)):
-            self.p_gate = SigmoidGate(
+        self.p_gate = SigmoidGate(
                 d_model=int(config.d_model),
                 hidden_dim=int(getattr(config, 'p_gate_hidden_dim', 64)),
                 detach_inputs=bool(getattr(config, 'p_gate_detach_inputs', True)),
@@ -1223,8 +1212,6 @@ class Model(nn.Module):
                 stat_width_frac=float(getattr(config, 'p_gate_auto_k_width_frac', 0.05)),
                 stat_edge_frac=float(getattr(config, 'p_gate_auto_k_edge_frac', 0.02)),
             ).to(self._device)
-        else:
-            self.p_gate = None
         self.unsup_xx_weight = float(getattr(config, 'unsup_xx_weight', 0.0))
         self.unsup_yy_weight = float(getattr(config, 'unsup_yy_weight', 0.0))
         self.p_prior_weight = float(getattr(config, 'p_prior_weight', 0.0))

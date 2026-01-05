@@ -400,7 +400,6 @@ def _onnx_options(kwargs: object) -> object:
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": int(kwargs.get("opset_version", 18)),
-        "dynamic_batch": bool(kwargs.get("dynamic_batch", True)),
     }
 
 
@@ -436,7 +435,6 @@ class _OnnxLayer:
         *args: Any,
         sample_input: object | None = None,
         opset_version: int = 18,
-        dynamic_batch: bool = True,
         **kwargs: Any,
     ) -> object:
         is_required("onnx", "pip install onnx")
@@ -446,9 +444,7 @@ class _OnnxLayer:
             sample = sample.unsqueeze(0)
         input_names = ["features"]
         output_names = ["preds_flat"]
-        dynamic_axes = (
-            {"features": {0: "batch"}, "preds_flat": {0: "batch"}} if dynamic_batch else None
-        )
+        dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
         common_kwargs = {
             "export_params": True,
             "opset_version": opset_version,
@@ -471,8 +467,7 @@ class _OnnxLayer:
             base_kwargs_dynamo.pop("dynamic_shapes", None)
             dyn_shapes = None
             if (
-                dynamic_batch
-                and isinstance(sample, torch.Tensor)
+                isinstance(sample, torch.Tensor)
                 and sample.ndim >= 2
                 and "dynamic_shapes" in params
             ):

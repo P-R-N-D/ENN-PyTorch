@@ -216,20 +216,6 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
                 except Exception:
                     setattr(scaler, name, new_buf)
 
-
-def checkpoint_mode() -> str:
-    raw = str(env_str("STNET_CHECKPOINT_MODE") or env_str("STNET_CHECKPOINT") or "ffn").strip().lower()
-    match raw:
-        case "0" | "false" | "none" | "off" | "disable" | "disabled":
-            return "none"
-        case "attn" | "attention":
-            return "attn"
-        case "all" | "full":
-            return "all"
-        case _:
-            return "ffn"
-
-
 def norm_layer(norm_type: str, dim: int) -> nn.Module:
     norm = str(norm_type).strip().lower()
     match norm:
@@ -1050,11 +1036,15 @@ class DilatedAttention(nn.Module):
         x_out = x + self.dropout(attn_out)
         res2 = x_out
         x_out = self.norm2(x_out)
-        do_ckpt_ffn = (
-            self.training
-            and torch.is_grad_enabled()
-            and _STNET_CHECKPOINT_MODE in {"ffn", "all"}
-        )
+        ffn_bytes = 0
+        try:
+            base_bytes = int(x_out.numel()) * int(x_out.element_size()) if isinstance(x_out, torch.Tensor) else 0
+            hidden = int(getattr(self.ffn[0], 'out_features', 0) or 0) if hasattr(self, 'ffn') else 0
+            ratio = (float(hidden) / float(self.embed_dim)) if (hidden > 0 and getattr(self, 'embed_dim', 0)) else 4.0
+            ffn_bytes = int(float(base_bytes) * max(1.0, float(ratio)))
+        except Exception:
+            ffn_bytes = 0
+        do_ckpt_ffn = self.training and torch.is_grad_enabled() and ffn_bytes >= int(64 * 1024 * 1024)
         if do_ckpt_ffn:
             try:
                 x_out = checkpoint(
@@ -2520,6 +2510,3 @@ class Recorder(nn.Module):
                         if buf.dtype != torch.int64:
                             setattr(self, name, buf.to(dtype=torch.int64))
         return self
-
-
-_STNET_CHECKPOINT_MODE = checkpoint_mode()
