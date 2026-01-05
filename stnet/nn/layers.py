@@ -1127,6 +1127,8 @@ class SigmoidGate(nn.Module):
         p_floor: float = 0.0,
         p_ceil: float = 1.0,
         tile_size: Optional[int] = None,
+        tile_shape: Optional[Sequence[int]] = None,
+        event_shape: Optional[Sequence[int]] = None,
         stat_width_frac: float = 0.05,
         stat_edge_frac: float = 0.02,
         detach_inputs: bool = True,
@@ -1147,6 +1149,19 @@ class SigmoidGate(nn.Module):
         self.use_stats = bool(use_stats)
         ts = 0 if tile_size is None else int(tile_size)
         self.tile_size = int(ts) if ts > 0 else 0
+        
+        if event_shape is None:
+            self.event_shape: Tuple[int, ...] = ()
+        else:
+            self.event_shape = tuple(int(v) for v in event_shape)
+        if tile_shape is None:
+            self.tile_shape: Tuple[int, ...] = ()
+        elif isinstance(tile_shape, int) and not isinstance(tile_shape, bool):
+            self.tile_shape = (int(tile_shape),)
+        else:
+            self.tile_shape = tuple(int(v) for v in tile_shape)
+        self.event_shape = tuple(max(1, int(v)) for v in self.event_shape)
+        self.tile_shape = tuple(max(1, int(v)) for v in self.tile_shape)
         in_dim = 0
         if self.use_tokens:
             in_dim += int(d_model)
@@ -1162,7 +1177,7 @@ class SigmoidGate(nn.Module):
             nn.Linear(int(hidden_dim), 1),
         )
         self.tile_net: Optional[nn.Module] = None
-        if self.tile_size > 0:
+        if self.tile_size > 0 or len(self.tile_shape) > 0:
             tile_in = 3
             self.tile_net = nn.Sequential(
                 nn.LayerNorm(tile_in),
@@ -1284,6 +1299,28 @@ class SigmoidGate(nn.Module):
         p_full = p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
         return p_full[:, : int(dim)]
 
+    @staticmethod
+    def _prod_int(shape: Sequence[int]) -> int:
+        out = 1
+        for v in shape:
+            out *= int(v)
+        return int(out)
+
+    def _normalize_tile_shape(self, event_shape: Sequence[int]) -> Tuple[int, ...]:
+        ts = tuple(int(v) for v in (getattr(self, "tile_shape", ()) or ()))
+        if not ts or not event_shape:
+            return ()
+        ndim = int(len(event_shape))
+        if ndim <= 0:
+            return ()
+        if len(ts) == 1:
+            ts = ts * ndim
+        elif len(ts) < ndim:
+            ts = (1,) * (ndim - len(ts)) + ts
+        elif len(ts) > ndim:
+            ts = ts[-ndim:]
+        return tuple(max(1, int(v)) for v in ts)
+
     def forward(
         self,
         *args: Any,
@@ -1322,6 +1359,232 @@ class SigmoidGate(nn.Module):
             feats.append(r_rms.to(dtype=tokens.dtype))
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
         global_logit = self.net(x).squeeze(-1)
+        
+        
+        
+        
+        use_tile_nd = False
+        event_shape = tuple(getattr(self, "event_shape", ()) or ())
+        tile_shape_nd: Tuple[int, ...] = ()
+        if (
+            self.tile_net is not None
+            and base is not None
+            and residue is not None
+            and base.dim() == 2
+            and residue.dim() == 2
+            and int(base.shape[0]) == int(residue.shape[0])
+            and len(getattr(self, "tile_shape", ()) or ()) > 0
+            and len(event_shape) > 0
+        ):
+            try:
+                tile_shape_nd = self._normalize_tile_shape(event_shape)
+                D0 = int(base.shape[1])
+                use_tile_nd = bool(tile_shape_nd) and int(self._prod_int(event_shape)) == D0
+            except Exception:
+                use_tile_nd = False
+
+        if use_tile_nd:
+            assert base is not None and residue is not None
+            b = base.detach() if self.detach_inputs else base
+            r = residue.detach() if self.detach_inputs else residue
+            b32 = b.to(dtype=torch.float32)
+            r32 = r.to(dtype=torch.float32)
+            B = int(b32.shape[0])
+            D = int(b32.shape[1])
+            event_shape_t = tuple(int(v) for v in event_shape)
+            tile_shape_t = tuple(int(v) for v in tile_shape_nd)
+            grid_shape = tuple((int(d) + int(t) - 1) // int(t) for d, t in zip(event_shape_t, tile_shape_t))
+            pad_shape = tuple(int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t))
+            pads: list[int] = []
+            for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
+                pads.extend([0, int(padded - orig)])
+            pads_t = tuple(pads)
+            pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
+
+            b_nd = b32.reshape(B, *event_shape_t)
+            r_nd = r32.reshape(B, *event_shape_t)
+            if pad_needed:
+                b_nd = F.pad(b_nd, pads_t)
+                r_nd = F.pad(r_nd, pads_t)
+
+            mask_bool: Optional[torch.Tensor] = None
+            if pad_needed:
+                device = b_nd.device
+                mask_bool = None
+                ndim = int(len(event_shape_t))
+                for i, (orig, padded) in enumerate(zip(event_shape_t, pad_shape)):
+                    if int(padded) == int(orig):
+                        continue
+                    idx = torch.arange(int(padded), device=device)
+                    v = (idx < int(orig)).view(*([1] * i), int(padded), *([1] * (ndim - i - 1)))
+                    mask_bool = v if mask_bool is None else (mask_bool & v)
+                if mask_bool is None:
+                    mask_bool = torch.ones(pad_shape, device=device, dtype=torch.bool)
+
+            view_shape: list[int] = [B]
+            interleaved: list[int] = []
+            for g, t in zip(grid_shape, tile_shape_t):
+                view_shape.extend([int(g), int(t)])
+                interleaved.extend([int(g), int(t)])
+            b_tile = b_nd.reshape(*view_shape)
+            r_tile = r_nd.reshape(*view_shape)
+            mask_tile: Optional[torch.Tensor] = None
+            mask: Optional[torch.Tensor] = None
+            if mask_bool is not None:
+                mask_tile = mask_bool.reshape(*interleaved).unsqueeze(0)
+                mask = mask_tile.to(dtype=torch.float32)
+
+            tile_dims = tuple(range(2, 1 + 2 * int(len(event_shape_t)), 2))
+            if mask is None:
+                b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=tile_dims) + self.eps)
+                r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=tile_dims) + self.eps)
+            else:
+                denom = torch.clamp(mask.sum(dim=tile_dims), min=1.0)
+                b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
+                r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
+            ratio = r_rms_t / (b_rms_t + float(self.eps))
+
+            tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
+            tile_logit = self.tile_net(tile_feats).squeeze(-1)
+            g_add = global_logit.view(B, *([1] * int(len(event_shape_t))))
+            logit = g_add + tile_logit
+            sig = torch.sigmoid(logit)
+
+            p_low = sig.new_full(sig.shape, float(self.p_floor))
+            p_high = sig.new_full(sig.shape, float(self.p_ceil))
+            if z_min is not None and z_max is not None:
+                zmin = z_min.to(device=b_tile.device, dtype=torch.float32)
+                zmax = z_max.to(device=b_tile.device, dtype=torch.float32)
+                if zmin.numel() != 1:
+                    zmin = zmin.reshape(1, -1)
+                if zmax.numel() != 1:
+                    zmax = zmax.reshape(1, -1)
+                if zmin.numel() != 1 and int(zmin.shape[-1]) != D:
+                    zmin = None
+                    zmax = None
+                if zmax is not None and zmax.numel() != 1 and int(zmax.shape[-1]) != D:
+                    zmin = None
+                    zmax = None
+                if zmin is not None and zmax is not None:
+                    if zmin.numel() == 1:
+                        zmin_t = zmin
+                        zmax_t = zmax
+                    else:
+                        zmin_nd = zmin.reshape(1, *event_shape_t)
+                        zmax_nd = zmax.reshape(1, *event_shape_t)
+                        if pad_needed:
+                            zmin_nd = F.pad(zmin_nd, pads_t)
+                            zmax_nd = F.pad(zmax_nd, pads_t)
+                        zmin_t = zmin_nd.reshape(1, *interleaved)
+                        zmax_t = zmax_nd.reshape(1, *interleaved)
+                    sign = torch.where(r_tile >= 0, 1.0, -1.0)
+                    r_safe = torch.where(r_tile.abs() < self.eps, sign * self.eps, r_tile)
+                    p_a = (zmin_t - b_tile) / r_safe
+                    p_b = (zmax_t - b_tile) / r_safe
+                    p_min_dim = torch.minimum(p_a, p_b)
+                    p_max_dim = torch.maximum(p_a, p_b)
+                    if mask_tile is not None:
+                        neg_inf = torch.finfo(p_min_dim.dtype).min
+                        pos_inf = torch.finfo(p_max_dim.dtype).max
+                        p_min_dim = torch.where(mask_tile, p_min_dim, p_min_dim.new_full((), neg_inf))
+                        p_max_dim = torch.where(mask_tile, p_max_dim, p_max_dim.new_full((), pos_inf))
+                    p_low_bound = p_min_dim.amax(dim=tile_dims)
+                    p_high_bound = p_max_dim.amin(dim=tile_dims)
+                    p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                    p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                    p_high = torch.maximum(p_high, p_low + float(self.eps))
+
+            p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
+            clip = float(max(self.clip_eps, self.eps))
+            lo = float(self.p_floor) + clip
+            hi = float(self.p_ceil) - clip
+            if hi > lo:
+                p_tile = torch.clamp(p_tile, min=lo, max=hi)
+            else:
+                p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
+
+            if bool(fallback_bounds):
+                try:
+                    width = (p_high - p_low).to(dtype=torch.float32)
+                    denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
+                    tthr = float(self.stat_width_frac) * denom
+                    tthr = float(max(tthr, self.eps))
+                    trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
+                    trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
+                    active_low = trim_low >= tthr
+                    active_high = trim_high >= tthr
+                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                    ethr = float(max(float(self.stat_edge_frac), 0.0))
+                    edge_thr = w_safe * float(ethr)
+                    edge_low = (p_tile - p_low) <= edge_thr
+                    edge_high = (p_high - p_tile) <= edge_thr
+                    self._fb_add_stats(
+                        float(p_tile.numel()),
+                        width.sum(),
+                        active_low.to(dtype=torch.float32).sum(),
+                        active_high.to(dtype=torch.float32).sum(),
+                        edge_low.to(dtype=torch.float32).sum(),
+                        edge_high.to(dtype=torch.float32).sum(),
+                    )
+                except Exception:
+                    pass
+
+            edge_reg: Optional[torch.Tensor] = None
+            edge_reg_low: Optional[torch.Tensor] = None
+            edge_reg_high: Optional[torch.Tensor] = None
+            if bool(return_edge_reg) or bool(return_edge_reg_lr):
+                try:
+                    width = (p_high - p_low).to(dtype=torch.float32)
+                    full = max(float(self.p_ceil - self.p_floor), float(self.eps))
+                    min_w = float(edge_reg_min_width_frac) * full
+                    min_w = float(max(min_w, self.eps))
+                    mask_w = (width >= min_w).to(dtype=torch.float32)
+                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
+                    q = (p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                    q = torch.clamp(q, 0.0, 1.0)
+                    m = float(edge_reg_frac)
+                    m = float(min(max(m, self.eps), 0.49))
+                    inv_m = 1.0 / m
+                    d_low = F.relu(m - q) * inv_m
+                    d_high = F.relu(q - (1.0 - m)) * inv_m
+                    pen_low = d_low.pow(float(edge_reg_power)) * mask_w
+                    pen_high = d_high.pow(float(edge_reg_power)) * mask_w
+                    denom = mask_w.sum() + float(self.eps)
+                    edge_reg_low = pen_low.sum() / denom
+                    edge_reg_high = pen_high.sum() / denom
+                    edge_reg = edge_reg_low + edge_reg_high
+                except Exception:
+                    edge_reg = None
+                    edge_reg_low = None
+                    edge_reg_high = None
+
+            expand_view: list[int] = [B]
+            for g in grid_shape:
+                expand_view.extend([int(g), 1])
+            p_view = p_tile.reshape(*expand_view)
+            exp_shape: list[int] = [B]
+            for g, t in zip(grid_shape, tile_shape_t):
+                exp_shape.extend([int(g), int(t)])
+            p_exp = p_view.expand(*exp_shape)
+            p_pad = p_exp.contiguous().view(B, *pad_shape)
+            slices = (slice(None),) + tuple(slice(0, int(d)) for d in event_shape_t)
+            p_crop = p_pad[slices]
+            out_full = p_crop.reshape(B, D)
+
+            out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            out_full = out_full.to(dtype=out_dtype)
+            if bool(return_edge_reg_lr):
+                if edge_reg_low is None:
+                    edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
+                if edge_reg_high is None:
+                    edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
+                return out_full, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+            if bool(return_edge_reg):
+                if edge_reg is None:
+                    edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
+                return out_full, edge_reg.to(dtype=out_dtype)
+            return out_full
+
         use_tile = (
             self.tile_size > 0
             and self.tile_net is not None
@@ -1436,160 +1699,6 @@ class SigmoidGate(nn.Module):
                     edge_reg = out.new_tensor(0.0, dtype=torch.float32)
                 return out, edge_reg.to(dtype=out_dtype)
             return out
-        assert base is not None and residue is not None
-        b = base.detach() if self.detach_inputs else base
-        r = residue.detach() if self.detach_inputs else residue
-        b32 = b.to(dtype=torch.float32)
-        r32 = r.to(dtype=torch.float32)
-        B = int(b32.shape[0])
-        D = int(b32.shape[1])
-        tile = int(self.tile_size)
-        n_tiles = int((D + tile - 1) // tile)
-        d_pad = int(n_tiles * tile)
-        pad = int(d_pad - D)
-        if pad > 0:
-            b32p = F.pad(b32, (0, pad))
-            r32p = F.pad(r32, (0, pad))
-        else:
-            b32p = b32
-            r32p = r32
-        b_tile = b32p.reshape(B, n_tiles, tile)
-        r_tile = r32p.reshape(B, n_tiles, tile)
-        if pad > 0:
-            ar = torch.arange(d_pad, device=b_tile.device)
-            mask_bool = (ar < D).reshape(1, n_tiles, tile)
-            mask = mask_bool.to(dtype=torch.float32)
-        else:
-            mask_bool = None
-            mask = None
-        if mask is None:
-            denom = float(tile)
-            b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=2) + self.eps)
-            r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=2) + self.eps)
-        else:
-            denom = torch.clamp(mask.sum(dim=2), min=1.0)
-            b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=2) / denom + self.eps)
-            r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=2) / denom + self.eps)
-        ratio = r_rms_t / (b_rms_t + float(self.eps))
-        tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
-        tile_logit = self.tile_net(tile_feats).squeeze(-1)
-        logit = global_logit.unsqueeze(1) + tile_logit
-        sig = torch.sigmoid(logit)
-        p_low = sig.new_full(sig.shape, float(self.p_floor))
-        p_high = sig.new_full(sig.shape, float(self.p_ceil))
-        if z_min is not None and z_max is not None:
-            zmin = z_min.to(device=b_tile.device, dtype=torch.float32)
-            zmax = z_max.to(device=b_tile.device, dtype=torch.float32)
-            if zmin.numel() != 1:
-                zmin = zmin.reshape(1, -1)
-            if zmax.numel() != 1:
-                zmax = zmax.reshape(1, -1)
-            if zmin.numel() != 1 and int(zmin.shape[-1]) != int(D):
-                zmin = None
-                zmax = None
-            elif zmin is not None and zmax is not None:
-                if zmin.numel() == 1:
-                    zminp = zmin.expand(1, d_pad)
-                    zmaxp = zmax.expand(1, d_pad)
-                else:
-                    if pad > 0:
-                        zminp = F.pad(zmin, (0, pad))
-                        zmaxp = F.pad(zmax, (0, pad))
-                    else:
-                        zminp = zmin
-                        zmaxp = zmax
-                zmin_t = zminp.reshape(1, n_tiles, tile)
-                zmax_t = zmaxp.reshape(1, n_tiles, tile)
-                sign = torch.where(r_tile >= 0, 1.0, -1.0)
-                r_safe = torch.where(r_tile.abs() < self.eps, sign * self.eps, r_tile)
-                p_a = (zmin_t - b_tile) / r_safe
-                p_b = (zmax_t - b_tile) / r_safe
-                p_min_dim = torch.minimum(p_a, p_b)
-                p_max_dim = torch.maximum(p_a, p_b)
-                if mask_bool is not None:
-                    neg_inf = torch.finfo(p_min_dim.dtype).min
-                    pos_inf = torch.finfo(p_max_dim.dtype).max
-                    p_min_dim = torch.where(mask_bool, p_min_dim, p_min_dim.new_full((), neg_inf))
-                    p_max_dim = torch.where(mask_bool, p_max_dim, p_max_dim.new_full((), pos_inf))
-                p_low_bound = p_min_dim.max(dim=2).values
-                p_high_bound = p_max_dim.min(dim=2).values
-                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
-                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
-                p_high = torch.maximum(p_high, p_low + float(self.eps))
-        p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
-        clip = float(max(self.clip_eps, self.eps))
-        lo = float(self.p_floor) + clip
-        hi = float(self.p_ceil) - clip
-        if hi > lo:
-            p_tile = torch.clamp(p_tile, min=lo, max=hi)
-        else:
-            p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
-        if bool(fallback_bounds):
-            try:
-                width = (p_high - p_low).to(dtype=torch.float32)
-                denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                tthr = float(self.stat_width_frac) * denom
-                tthr = float(max(tthr, self.eps))
-                trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
-                trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
-                active_low = trim_low >= tthr
-                active_high = trim_high >= tthr
-                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                ethr = float(max(float(self.stat_edge_frac), 0.0))
-                edge_thr = w_safe * float(ethr)
-                edge_low = (p_tile - p_low) <= edge_thr
-                edge_high = (p_high - p_tile) <= edge_thr
-                self._fb_add_stats(
-                    float(p_tile.numel()),
-                    width.sum(),
-                    active_low.to(dtype=torch.float32).sum(),
-                    active_high.to(dtype=torch.float32).sum(),
-                    edge_low.to(dtype=torch.float32).sum(),
-                    edge_high.to(dtype=torch.float32).sum(),
-                )
-            except Exception:
-                pass
-        edge_reg: Optional[torch.Tensor] = None
-        edge_reg_low: Optional[torch.Tensor] = None
-        edge_reg_high: Optional[torch.Tensor] = None
-        if bool(return_edge_reg) or bool(return_edge_reg_lr):
-            try:
-                width = (p_high - p_low).to(dtype=torch.float32)
-                full = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                min_w = float(edge_reg_min_width_frac) * full
-                min_w = float(max(min_w, self.eps))
-                mask_w = (width >= min_w).to(dtype=torch.float32)
-                w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                q = (p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
-                q = torch.clamp(q, 0.0, 1.0)
-                m = float(edge_reg_frac)
-                m = float(min(max(m, self.eps), 0.49))
-                inv_m = 1.0 / m
-                d_low = F.relu(m - q) * inv_m
-                d_high = F.relu(q - (1.0 - m)) * inv_m
-                pen_low = d_low.pow(float(edge_reg_power)) * mask_w
-                pen_high = d_high.pow(float(edge_reg_power)) * mask_w
-                denom = mask_w.sum() + float(self.eps)
-                edge_reg_low = pen_low.sum() / denom
-                edge_reg_high = pen_high.sum() / denom
-                edge_reg = edge_reg_low + edge_reg_high
-            except Exception:
-                edge_reg = None
-                edge_reg_low = None
-                edge_reg_high = None
-        out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
-        out_full = self._expand_tiles(p_tile.to(dtype=out_dtype), dim=D)
-        if bool(return_edge_reg_lr):
-            if edge_reg_low is None:
-                edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
-            if edge_reg_high is None:
-                edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
-            return out_full, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
-        if bool(return_edge_reg):
-            if edge_reg is None:
-                edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
-            return out_full, edge_reg.to(dtype=out_dtype)
-        return out_full
 
 
 class Scaler(nn.Module):

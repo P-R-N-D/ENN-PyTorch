@@ -23,6 +23,7 @@ from typing import (
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 try:
     from torch.utils.checkpoint import checkpoint as _checkpoint
 except Exception:
@@ -67,9 +68,9 @@ from .blocks import (
     stochastic_depth_schedule,
 )
 from .layers import (
-    Recorder, 
-    Scaler, 
-    SigmoidGate
+    Recorder,
+    Scaler,
+    SigmoidGate,
 )
 
 try:
@@ -114,6 +115,114 @@ def _is_export_or_trace() -> bool:
             if torch.onnx.is_in_onnx_export():
                 return True
     return False
+
+
+
+
+def _prod_int(shape: Sequence[int]) -> int:
+    out = 1
+    for v in shape:
+        out *= int(v)
+    return int(out)
+
+
+def _normalize_tile_shape(
+    tile_shape: Sequence[int] | int | None,
+    event_shape: Sequence[int],
+) -> Optional[Tuple[int, ...]]:
+    if tile_shape is None:
+        return None
+    if isinstance(tile_shape, int) and not isinstance(tile_shape, bool):
+        ts = (int(tile_shape),)
+    else:
+        ts = tuple(int(v) for v in tile_shape)
+    if not ts:
+        return None
+    ev = tuple(int(v) for v in event_shape)
+    if not ev:
+        return None
+    ndim = len(ev)
+    if len(ts) == 1:
+        ts = ts * ndim
+    elif len(ts) < ndim:
+        ts = (1,) * (ndim - len(ts)) + ts
+    elif len(ts) > ndim:
+        ts = ts[-ndim:]
+    return tuple(max(1, int(v)) for v in ts)
+
+
+def _tile_counts_grid(
+    event_shape: Sequence[int],
+    tile_shape: Sequence[int],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    ev = tuple(int(v) for v in event_shape)
+    ts = tuple(int(v) for v in tile_shape)
+    grid = tuple((d + t - 1) // t for d, t in zip(ev, ts))
+    counts_1d = []
+    for d, t, g in zip(ev, ts, grid):
+        if g <= 0:
+            counts_1d.append(torch.zeros((0,), device=device, dtype=dtype))
+            continue
+        if g == 1:
+            counts_1d.append(torch.tensor([float(d)], device=device, dtype=dtype))
+            continue
+        last = d - (g - 1) * t
+        last = max(1, int(last))
+        head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
+        tail = torch.tensor([float(last)], device=device, dtype=dtype)
+        counts_1d.append(torch.cat((head, tail), dim=0))
+    out = torch.ones(grid, device=device, dtype=dtype)
+    for i, c in enumerate(counts_1d):
+        shape = [1] * len(grid)
+        shape[i] = grid[i]
+        out = out * c.view(*shape)
+    return out
+
+
+def _reduce_flat_to_grid(
+    x: torch.Tensor,
+    event_shape: Sequence[int],
+    tile_shape: Sequence[int],
+    *,
+    reduce: str = "mean",
+    eps: float = 1e-6,
+    work_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    ev = tuple(int(v) for v in event_shape)
+    ts = tuple(int(v) for v in tile_shape)
+    grid = tuple((d + t - 1) // t for d, t in zip(ev, ts))
+    padded = tuple(int(g * t) for g, t in zip(grid, ts))
+    B = int(x.shape[0])
+    x_ev = x.reshape(B, *ev)
+    pads: list[int] = []
+    for orig, pad in reversed(list(zip(ev, padded))):
+        pads.extend([0, int(pad - orig)])
+    if any(int(p) != 0 for p in pads):
+        x_ev = F.pad(x_ev, tuple(pads))
+    view_shape: list[int] = [B]
+    for g, t in zip(grid, ts):
+        view_shape.extend([int(g), int(t)])
+    blk = x_ev.reshape(*view_shape).to(dtype=work_dtype)
+    tile_dims = tuple(range(2, 1 + 2 * len(grid), 2))
+    if reduce == "sum":
+        return blk.sum(dim=tile_dims)
+    counts = _tile_counts_grid(ev, ts, device=blk.device, dtype=blk.dtype).unsqueeze(0)
+    denom = torch.clamp(counts, min=float(eps))
+    return blk.sum(dim=tile_dims) / denom
+
+
+def _tv_loss_grid(p_grid: torch.Tensor, *, power: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+    total = None
+    for axis in range(1, p_grid.dim()):
+        diff = torch.diff(p_grid, dim=axis)
+        pen = (diff.abs() + float(eps)).pow(float(power))
+        total = pen if total is None else (total + pen)
+    if total is None:
+        return p_grid.new_tensor(0.0, dtype=torch.float32)
+    return total.mean()
 
 
 @lru_cache(maxsize=1)
@@ -1008,6 +1117,33 @@ class Model(nn.Module):
             self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
         )
         self.p_gate_tile_size: Optional[int] = getattr(config, 'p_gate_tile_size', None)
+        
+        
+        
+        raw_tile_shape = getattr(config, 'p_gate_tile_shape', None)
+        tile_shape: Optional[Tuple[int, ...]]
+        try:
+            if raw_tile_shape is None:
+                tile_shape = None
+            else:
+                
+                if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
+                    tile_shape = (int(raw_tile_shape),)
+                else:
+                    tile_shape = tuple(int(v) for v in raw_tile_shape)
+                tile_shape = tuple(max(1, int(v)) for v in tile_shape)
+                
+                out_ndim = int(len(self.out_shape))
+                if out_ndim > 0:
+                    if len(tile_shape) == 1:
+                        tile_shape = tile_shape * out_ndim
+                    elif len(tile_shape) < out_ndim:
+                        tile_shape = (1,) * (out_ndim - len(tile_shape)) + tile_shape
+                    elif len(tile_shape) > out_ndim:
+                        tile_shape = tile_shape[-out_ndim:]
+        except Exception:
+            tile_shape = None
+        self.p_gate_tile_shape: Optional[Tuple[int, ...]] = tile_shape
         self.p_gate_bounds_use_quantile: bool = bool(getattr(config, 'p_gate_bounds_use_quantile', False))
         self.p_gate_bounds_q_low: float = float(getattr(config, 'p_gate_bounds_q_low', 0.005))
         self.p_gate_bounds_q_high: float = float(getattr(config, 'p_gate_bounds_q_high', 0.995))
@@ -1082,6 +1218,8 @@ class Model(nn.Module):
                 p_floor=float(getattr(config, 'p_gate_p_floor', 0.0)),
                 p_ceil=float(getattr(config, 'p_gate_p_ceil', 1.0)),
                 tile_size=getattr(config, 'p_gate_tile_size', None),
+                tile_shape=self.p_gate_tile_shape,
+                event_shape=self.out_shape,
                 clip_eps=float(getattr(config, 'p_gate_clip_eps', 1e-6)),
                 eps=float(getattr(config, 'p_gate_eps', 1e-6)),
                 stat_width_frac=float(getattr(config, 'p_gate_auto_k_width_frac', 0.05)),
@@ -1102,6 +1240,14 @@ class Model(nn.Module):
             getattr(config, 'p_gate_edge_reg_min_width_frac', getattr(config, 'p_gate_auto_k_width_frac', 0.05))
         )
         self.p_gate_edge_reg_power = float(getattr(config, 'p_gate_edge_reg_power', 2.0))
+        self.p_gate_budget_weight = float(getattr(config, 'p_gate_budget_weight', 0.0))
+        self.p_gate_budget_target = float(getattr(config, 'p_gate_budget_target', 0.5))
+        self.p_gate_tv_weight = float(getattr(config, 'p_gate_tv_weight', 0.0))
+        self.p_gate_tv_power = float(getattr(config, 'p_gate_tv_power', 1.0))
+        self.p_gate_teacher_weight = float(getattr(config, 'p_gate_teacher_weight', 0.0))
+        self.p_gate_teacher_temp = float(getattr(config, 'p_gate_teacher_temp', 0.25))
+        self.p_gate_teacher_tau = float(getattr(config, 'p_gate_teacher_tau', 0.0))
+        self.p_gate_teacher_relu = bool(getattr(config, 'p_gate_teacher_relu', False))
         try:
             w_low_cfg = getattr(config, 'p_gate_edge_reg_weight_low', None)
             w_high_cfg = getattr(config, 'p_gate_edge_reg_weight_high', None)
@@ -1886,6 +2032,12 @@ class Model(nn.Module):
             if enhanced.dtype != assembled.dtype:
                 enhanced = enhanced.to(dtype=assembled.dtype)
             delta = enhanced - assembled
+            z_true: Optional[torch.Tensor] = None
+            if labels_flat is not None and not is_cls_loss:
+                y_true_raw = labels_flat.to(device=assembled.device)
+                if not y_true_raw.is_floating_point():
+                    y_true_raw = y_true_raw.to(dtype=torch.float32)
+                z_true = self.scaler.normalize_y(y_true_raw).to(device=assembled.device, dtype=assembled.dtype)
             p: Optional[torch.Tensor] = None
             edge_reg_low: Optional[torch.Tensor] = None
             edge_reg_high: Optional[torch.Tensor] = None
@@ -2001,12 +2153,7 @@ class Model(nn.Module):
             loss_val: Optional[torch.Tensor] = None
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            z_true: Optional[torch.Tensor] = None
-            if labels_flat is not None and not is_cls_loss:
-                y_true_raw = labels_flat.to(device=y_hat.device)
-                if not y_true_raw.is_floating_point():
-                    y_true_raw = y_true_raw.to(dtype=torch.float32)
-                z_true = self.scaler.normalize_y(y_true_raw)
+            
             use_global_local = labels_flat is not None and (global_loss is not None or local_loss is not None)
             use_net = labels_flat is not None and (net_loss is not None) and (not use_global_local)
             if use_global_local:
@@ -2102,6 +2249,137 @@ class Model(nn.Module):
                     loss_p = -(((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))).mean()
                     aux_total = aux_total + self.p_prior_weight * loss_p.to(dtype=aux_total.dtype)
                     aux_used = True
+                
+                if (
+                    p is not None
+                    and (
+                        self.p_gate_budget_weight > 0.0
+                        or self.p_gate_tv_weight > 0.0
+                        or self.p_gate_teacher_weight > 0.0
+                    )
+                ):
+                    gate_eps = 1e-6
+                    p_floor = 0.0
+                    p_ceil = 1.0
+                    if self.p_gate is not None:
+                        with contextlib.suppress(Exception):
+                            gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
+                        with contextlib.suppress(Exception):
+                            gate_eps = max(gate_eps, float(getattr(self.p_gate, "eps", 0.0)))
+                        with contextlib.suppress(Exception):
+                            p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
+                        with contextlib.suppress(Exception):
+                            p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
+                    gate_eps = max(0.0, float(gate_eps))
+
+                    if self.p_gate_budget_weight > 0.0:
+                        tgt = float(self.p_gate_budget_target)
+                        if p_ceil >= p_floor:
+                            tgt = max(p_floor, min(p_ceil, tgt))
+                        mean_p = p.to(dtype=torch.float32).mean()
+                        loss_budget = (mean_p - mean_p.new_tensor(tgt)).square()
+                        aux_total = aux_total + self.p_gate_budget_weight * loss_budget.to(dtype=aux_total.dtype)
+                        aux_used = True
+
+                    p_grid: Optional[torch.Tensor] = None
+                    w_grid: Optional[torch.Tensor] = None
+                    tile_shape: Optional[Tuple[int, ...]] = None
+                    if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                        tile_shape = _normalize_tile_shape(
+                            getattr(self, "p_gate_tile_shape", None),
+                            self.out_shape,
+                        )
+                    if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                        try:
+                            if tile_shape is not None:
+                                p_grid = _reduce_flat_to_grid(
+                                    p.to(dtype=torch.float32),
+                                    self.out_shape,
+                                    tile_shape,
+                                    reduce="mean",
+                                    eps=gate_eps,
+                                    work_dtype=torch.float32,
+                                )
+                                w_grid = _tile_counts_grid(
+                                    self.out_shape,
+                                    tile_shape,
+                                    device=p_grid.device,
+                                    dtype=torch.float32,
+                                ).unsqueeze(0)
+                            else:
+                                p_grid = p.to(dtype=torch.float32).mean(dim=1, keepdim=True)
+                        except Exception:
+                            p_grid = None
+                            w_grid = None
+
+                    if self.p_gate_tv_weight > 0.0 and p_grid is not None:
+                        tv = _tv_loss_grid(p_grid, power=float(self.p_gate_tv_power), eps=gate_eps)
+                        aux_total = aux_total + self.p_gate_tv_weight * tv.to(dtype=aux_total.dtype)
+                        aux_used = True
+
+                    if (
+                        self.p_gate_teacher_weight > 0.0
+                        and p_grid is not None
+                        and (z_true is not None)
+                        and (not is_cls_loss)
+                    ):
+                        base_det = assembled.detach().to(dtype=torch.float32)
+                        ref_det = enhanced.detach().to(dtype=torch.float32)
+                        tgt_det = z_true.detach().to(device=base_det.device, dtype=torch.float32)
+                        err_base = (base_det - tgt_det).square()
+                        err_ref = (ref_det - tgt_det).square()
+                        improve = err_base - err_ref
+                        if bool(self.p_gate_teacher_relu):
+                            improve = F.relu(improve)
+                        scale = 0.5 * (err_base + err_ref)
+
+                        imp_grid: torch.Tensor
+                        scale_grid: torch.Tensor
+                        if tile_shape is not None:
+                            imp_grid = _reduce_flat_to_grid(
+                                improve,
+                                self.out_shape,
+                                tile_shape,
+                                reduce="mean",
+                                eps=gate_eps,
+                                work_dtype=torch.float32,
+                            )
+                            scale_grid = _reduce_flat_to_grid(
+                                scale,
+                                self.out_shape,
+                                tile_shape,
+                                reduce="mean",
+                                eps=gate_eps,
+                                work_dtype=torch.float32,
+                            )
+                        else:
+                            imp_grid = improve.mean(dim=1, keepdim=True)
+                            scale_grid = scale.mean(dim=1, keepdim=True)
+
+                        scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
+                        tau = float(self.p_gate_teacher_tau)
+                        temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
+                        score = (imp_grid / scale_grid - tau) / temp
+                        score = score.clamp(min=-20.0, max=20.0)
+                        p01 = torch.sigmoid(score)
+                        p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
+                        lo = float(p_floor) + float(gate_eps)
+                        hi = float(p_ceil) - float(gate_eps)
+                        if hi > lo:
+                            p_target = p_target.clamp(min=lo, max=hi)
+                        if w_grid is not None:
+                            w = w_grid.to(device=p_grid.device, dtype=torch.float32)
+                            num = ((p_grid.to(dtype=torch.float32) - p_target).square() * w).sum()
+                            den = w.sum().clamp_min(float(gate_eps))
+                            loss_teacher = num / den
+                        else:
+                            loss_teacher = F.mse_loss(
+                                p_grid.to(dtype=torch.float32),
+                                p_target,
+                                reduction="mean",
+                            )
+                        aux_total = aux_total + self.p_gate_teacher_weight * loss_teacher.to(dtype=aux_total.dtype)
+                        aux_used = True
                 if edge_reg_low is not None and self.p_gate_edge_reg_weight_low > 0.0:
                     aux_total = aux_total + self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
                     aux_used = True

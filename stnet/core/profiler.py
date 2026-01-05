@@ -1744,7 +1744,7 @@ class _GraphProfiler:
             include_softmax_scale_dropout=True,
         )
 
-    def _custom(self, args: Any, out: Any, *args: Any, name: str) -> float:
+    def _custom(self, args: Any, out: Any, *extra: Any, name: str) -> float:
         if isinstance(args, (tuple, list)):
             ts = [a for a in args if _is_tensorlike(a)]
         else:

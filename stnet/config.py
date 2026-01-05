@@ -224,20 +224,11 @@ def _effective_source_count(sources: Any) -> int:
 def _validate_out_shape_dims(out_shape: Tuple[int, ...]) -> Tuple[int, ...]:
     if not out_shape:
         raise ValueError("RuntimeConfig.out_shape must be a non-empty sequence")
-    ndim = len(out_shape)
-    if ndim == 1:
-        return out_shape
-    if ndim == 2:
-        if out_shape[0] != out_shape[1]:
-            raise ValueError(f"RuntimeConfig.out_shape 2D must be square: got {tuple(out_shape)}")
-        return out_shape
-    if ndim == 3:
-        if not (out_shape[0] == out_shape[1] == out_shape[2]):
-            raise ValueError(f"RuntimeConfig.out_shape 3D must be cubic: got {tuple(out_shape)}")
-        return out_shape
-    raise ValueError(
-        f"RuntimeConfig.out_shape must be 1D, 2D square, or 3D cube; got rank {ndim} ({tuple(out_shape)})"
-    )
+    if any(int(d) <= 0 for d in out_shape):
+        raise ValueError(f"RuntimeConfig.out_shape must be positive: got {tuple(out_shape)}")
+    if len(out_shape) > 1 and len(set(out_shape)) != 1:
+        raise ValueError(f"RuntimeConfig.out_shape must be isotropic (all dims equal): got {tuple(out_shape)}")
+    return out_shape
 
 
 def _coerce_device(value: Any, *args: Any, name: str = "device") -> Optional[torch.device]:
@@ -483,6 +474,31 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         name="p_gate_tile_size",
         minimum=1,
     )
+    
+    
+    _raw_tile_shape = get("p_gate_tile_shape", None)
+    if _raw_tile_shape is None:
+        p_gate_tile_shape = None
+    elif isinstance(_raw_tile_shape, int) and not isinstance(_raw_tile_shape, bool):
+        p_gate_tile_shape = ( _coerce_int(_raw_tile_shape, name="p_gate_tile_shape", minimum=1), )
+    elif isinstance(_raw_tile_shape, (list, tuple)):
+        if len(_raw_tile_shape) < 1:
+            raise ValueError("p_gate_tile_shape must be non-empty when provided")
+        p_gate_tile_shape = tuple(
+            _coerce_int(v, name="p_gate_tile_shape", minimum=1) for v in _raw_tile_shape
+        )
+    elif isinstance(_raw_tile_shape, str):
+        raw_s = _raw_tile_shape.strip()
+        if not raw_s:
+            p_gate_tile_shape = None
+        else:
+            s = raw_s.replace("x", ",").replace("X", ",").replace("*", ",").replace(" ", ",")
+            parts = [p for p in (p.strip() for p in s.split(",")) if p]
+            if len(parts) < 1:
+                raise ValueError(f"p_gate_tile_shape string is invalid: {_raw_tile_shape!r}")
+            p_gate_tile_shape = tuple(_coerce_int(p, name="p_gate_tile_shape", minimum=1) for p in parts)
+    else:
+        raise TypeError("p_gate_tile_shape must be int, sequence[int], or string")
     p_gate_bounds_use_quantile = _coerce_bool(
         get("p_gate_bounds_use_quantile", _MODEL_DEFAULTS.p_gate_bounds_use_quantile),
         name="p_gate_bounds_use_quantile",
@@ -725,6 +741,47 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         minimum=1.0,
         maximum=8.0,
     )
+
+    
+    p_gate_budget_weight = _coerce_float(
+        get("p_gate_budget_weight", _MODEL_DEFAULTS.p_gate_budget_weight),
+        name="p_gate_budget_weight",
+        minimum=0.0,
+    )
+    p_gate_budget_target = _coerce_float(
+        get("p_gate_budget_target", _MODEL_DEFAULTS.p_gate_budget_target),
+        name="p_gate_budget_target",
+    )
+    p_gate_tv_weight = _coerce_float(
+        get("p_gate_tv_weight", _MODEL_DEFAULTS.p_gate_tv_weight),
+        name="p_gate_tv_weight",
+        minimum=0.0,
+    )
+    p_gate_tv_power = _coerce_float(
+        get("p_gate_tv_power", _MODEL_DEFAULTS.p_gate_tv_power),
+        name="p_gate_tv_power",
+        minimum=1.0,
+        maximum=8.0,
+    )
+    p_gate_teacher_weight = _coerce_float(
+        get("p_gate_teacher_weight", _MODEL_DEFAULTS.p_gate_teacher_weight),
+        name="p_gate_teacher_weight",
+        minimum=0.0,
+    )
+    p_gate_teacher_temp = _coerce_float(
+        get("p_gate_teacher_temp", _MODEL_DEFAULTS.p_gate_teacher_temp),
+        name="p_gate_teacher_temp",
+        minimum=1e-8,
+        maximum=100.0,
+    )
+    p_gate_teacher_tau = _coerce_float(
+        get("p_gate_teacher_tau", _MODEL_DEFAULTS.p_gate_teacher_tau),
+        name="p_gate_teacher_tau",
+    )
+    p_gate_teacher_relu = _coerce_bool(
+        get("p_gate_teacher_relu", _MODEL_DEFAULTS.p_gate_teacher_relu),
+        name="p_gate_teacher_relu",
+    )
     unsup_xx_weight = _coerce_float(
         get("unsup_xx_weight", _MODEL_DEFAULTS.unsup_xx_weight),
         name="unsup_xx_weight",
@@ -772,6 +829,7 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         p_gate_hidden_dim=p_gate_hidden_dim,
         p_gate_detach_inputs=p_gate_detach_inputs,
         p_gate_tile_size=p_gate_tile_size,
+        p_gate_tile_shape=p_gate_tile_shape,
         p_gate_bounds_use_quantile=p_gate_bounds_use_quantile,
         p_gate_bounds_q_low=p_gate_bounds_q_low,
         p_gate_bounds_q_high=p_gate_bounds_q_high,
@@ -814,6 +872,14 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         p_gate_edge_reg_frac=p_gate_edge_reg_frac,
         p_gate_edge_reg_min_width_frac=p_gate_edge_reg_min_width_frac,
         p_gate_edge_reg_power=p_gate_edge_reg_power,
+        p_gate_budget_weight=p_gate_budget_weight,
+        p_gate_budget_target=p_gate_budget_target,
+        p_gate_tv_weight=p_gate_tv_weight,
+        p_gate_tv_power=p_gate_tv_power,
+        p_gate_teacher_weight=p_gate_teacher_weight,
+        p_gate_teacher_temp=p_gate_teacher_temp,
+        p_gate_teacher_tau=p_gate_teacher_tau,
+        p_gate_teacher_relu=p_gate_teacher_relu,
         unsup_xx_weight=unsup_xx_weight,
         unsup_yy_weight=unsup_yy_weight,
         p_prior_weight=p_prior_weight,
@@ -953,6 +1019,14 @@ class ModelConfig:
     p_gate_hidden_dim: int = 64
     p_gate_detach_inputs: bool = True
     p_gate_tile_size: Optional[int] = None
+    
+    
+    
+    
+    
+    
+    
+    p_gate_tile_shape: Optional[Tuple[int, ...]] = None
     p_gate_bounds_use_quantile: bool = False
     p_gate_bounds_q_low: float = 0.005
     p_gate_bounds_q_high: float = 0.995
@@ -995,6 +1069,16 @@ class ModelConfig:
     p_gate_edge_reg_frac: float = 0.02
     p_gate_edge_reg_min_width_frac: float = 0.05
     p_gate_edge_reg_power: float = 2.0
+    
+    
+    p_gate_budget_weight: float = 0.0
+    p_gate_budget_target: float = 0.5
+    p_gate_tv_weight: float = 0.0
+    p_gate_tv_power: float = 1.0
+    p_gate_teacher_weight: float = 0.0
+    p_gate_teacher_temp: float = 0.25
+    p_gate_teacher_tau: float = 0.0
+    p_gate_teacher_relu: bool = False
     activation_checkpointing: bool = False
     activation_checkpoint_reentrant: bool = False
     unsup_xx_weight: float = 0.0
