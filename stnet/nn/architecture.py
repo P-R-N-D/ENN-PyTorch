@@ -117,8 +117,6 @@ def _is_export_or_trace() -> bool:
     return False
 
 
-
-
 def _prod_int(shape: Sequence[int]) -> int:
     out = 1
     for v in shape:
