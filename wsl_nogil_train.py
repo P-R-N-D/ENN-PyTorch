@@ -1,4 +1,5 @@
 import contextlib
+import importlib
 import os
 import re
 import sys
@@ -7,10 +8,8 @@ import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
-import pandas as pd
 import psutil
 import torch
-from openpyxl import load_workbook
 from tensordict import TensorDict
 
 from stnet.api import new_model, predict, train
@@ -58,7 +57,18 @@ def parse_sheet_name(name: str) -> tuple[int, str]:
     return month, day_kind
 
 
+def _require_tabular_deps():
+    if importlib.util.find_spec("pandas") is None:
+        raise ImportError("pandas is required for dataset scripts; install with `pip install -e .[pandas]`")
+    if importlib.util.find_spec("openpyxl") is None:
+        raise ImportError("openpyxl is required for dataset scripts; install with `pip install -e .[pandas]`")
+    pd = importlib.import_module("pandas")
+    load_workbook = importlib.import_module("openpyxl").load_workbook
+    return pd, load_workbook
+
+
 def build_dataset(xlsx_path: str) -> Dict[str, Any]:
+    pd, load_workbook = _require_tabular_deps()
     HOURS = [f"{h:02d}{HOUR_SUFFIX}" for h in range(24)]
     wb = load_workbook(xlsx_path, read_only=True, data_only=True)
     sheet_names: Sequence[str] = list(wb.sheetnames)
