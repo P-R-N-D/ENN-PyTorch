@@ -422,6 +422,14 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         default=_MODEL_DEFAULTS.compile_mode,
         lower=True,
     )
+    activation_checkpointing = _coerce_bool(
+        get("activation_checkpointing", _MODEL_DEFAULTS.activation_checkpointing),
+        name="activation_checkpointing",
+    )
+    activation_checkpoint_reentrant = _coerce_bool(
+        get("activation_checkpoint_reentrant", _MODEL_DEFAULTS.activation_checkpoint_reentrant),
+        name="activation_checkpoint_reentrant",
+    )
     _cm_key = compile_mode.replace("_", "-").replace(" ", "-")
     if "-" in _cm_key:
         _cm_key = "-".join(part for part in _cm_key.split("-") if part)
@@ -810,6 +818,8 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         patch=patch_cfg,
         use_linear_branch=use_linear_branch,
         compile_mode=compile_mode,
+        activation_checkpointing=activation_checkpointing,
+        activation_checkpoint_reentrant=activation_checkpoint_reentrant,
         safety_margin_pow2=safety_margin_pow2,
         p_gate_hidden_dim=p_gate_hidden_dim,
         p_gate_detach_inputs=p_gate_detach_inputs,
@@ -997,6 +1007,8 @@ class ModelConfig:
     patch: PatchConfig = field(default_factory=PatchConfig)
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
+    activation_checkpointing: bool = True
+    activation_checkpoint_reentrant: bool = True
     safety_margin_pow2: int = 3
     p_gate_hidden_dim: int = 64
     p_gate_detach_inputs: bool = True
