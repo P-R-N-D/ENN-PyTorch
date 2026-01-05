@@ -152,7 +152,7 @@ def _normalize_tile_shape(
 def _tile_counts_grid(
     event_shape: Sequence[int],
     tile_shape: Sequence[int],
-    *,
+    *args: Any,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -184,7 +184,7 @@ def _reduce_flat_to_grid(
     x: torch.Tensor,
     event_shape: Sequence[int],
     tile_shape: Sequence[int],
-    *,
+    *args: Any,
     reduce: str = "mean",
     eps: float = 1e-6,
     work_dtype: torch.dtype = torch.float32,
@@ -212,7 +212,7 @@ def _reduce_flat_to_grid(
     return blk.sum(dim=tile_dims) / denom
 
 
-def _tv_loss_grid(p_grid: torch.Tensor, *, power: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+def _tv_loss_grid(p_grid: torch.Tensor, *args: Any, power: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
     total = None
     for axis in range(1, p_grid.dim()):
         diff = torch.diff(p_grid, dim=axis)
