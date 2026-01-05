@@ -455,10 +455,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         minimum=0,
         maximum=30,
     )
-    p_gate_enabled = _coerce_bool(
-        get("p_gate_enabled", _MODEL_DEFAULTS.p_gate_enabled),
-        name="p_gate_enabled",
-    )
     p_gate_hidden_dim = _coerce_int(
         get("p_gate_hidden_dim", _MODEL_DEFAULTS.p_gate_hidden_dim),
         name="p_gate_hidden_dim",
@@ -553,10 +549,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         _raw_k_high,
         name="p_gate_fallback_k_high",
     )
-    p_gate_auto_k_enabled = _coerce_bool(
-        get("p_gate_auto_k_enabled", _MODEL_DEFAULTS.p_gate_auto_k_enabled),
-        name="p_gate_auto_k_enabled",
-    )
     p_gate_auto_k_interval = _coerce_int(
         get("p_gate_auto_k_interval", _MODEL_DEFAULTS.p_gate_auto_k_interval),
         name="p_gate_auto_k_interval",
@@ -619,10 +611,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         name="p_gate_auto_k_step_down_high",
         minimum=0.0,
         maximum=1.0,
-    )
-    p_gate_auto_k_edge_enabled = _coerce_bool(
-        get("p_gate_auto_k_edge_enabled", _MODEL_DEFAULTS.p_gate_auto_k_edge_enabled),
-        name="p_gate_auto_k_edge_enabled",
     )
     p_gate_auto_k_target_edge = _coerce_float(
         get("p_gate_auto_k_target_edge", _MODEL_DEFAULTS.p_gate_auto_k_target_edge),
@@ -823,7 +811,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         use_linear_branch=use_linear_branch,
         compile_mode=compile_mode,
         safety_margin_pow2=safety_margin_pow2,
-        p_gate_enabled=p_gate_enabled,
         p_gate_hidden_dim=p_gate_hidden_dim,
         p_gate_detach_inputs=p_gate_detach_inputs,
         p_gate_tile_size=p_gate_tile_size,
@@ -838,7 +825,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         p_gate_fallback_k=p_gate_fallback_k,
         p_gate_fallback_k_low=p_gate_fallback_k_low,
         p_gate_fallback_k_high=p_gate_fallback_k_high,
-        p_gate_auto_k_enabled=p_gate_auto_k_enabled,
         p_gate_auto_k_interval=p_gate_auto_k_interval,
         p_gate_auto_k_warmup=p_gate_auto_k_warmup,
         p_gate_auto_k_ema_alpha=p_gate_auto_k_ema_alpha,
@@ -850,7 +836,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         p_gate_auto_k_step_down_low=p_gate_auto_k_step_down_low,
         p_gate_auto_k_step_up_high=p_gate_auto_k_step_up_high,
         p_gate_auto_k_step_down_high=p_gate_auto_k_step_down_high,
-        p_gate_auto_k_edge_enabled=p_gate_auto_k_edge_enabled,
         p_gate_auto_k_target_edge=p_gate_auto_k_target_edge,
         p_gate_auto_k_edge_tolerance=p_gate_auto_k_edge_tolerance,
         p_gate_auto_k_edge_ema_alpha=p_gate_auto_k_edge_ema_alpha,
@@ -1013,7 +998,6 @@ class ModelConfig:
     use_linear_branch: bool = False
     compile_mode: str = "disabled"
     safety_margin_pow2: int = 3
-    p_gate_enabled: bool = False
     p_gate_hidden_dim: int = 64
     p_gate_detach_inputs: bool = True
     p_gate_tile_size: Optional[int] = None
@@ -1035,7 +1019,6 @@ class ModelConfig:
     p_gate_fallback_k: float = 6.0
     p_gate_fallback_k_low: Optional[float] = None
     p_gate_fallback_k_high: Optional[float] = None
-    p_gate_auto_k_enabled: bool = False
     p_gate_auto_k_interval: int = 100
     p_gate_auto_k_warmup: int = 100
     p_gate_auto_k_ema_alpha: float = 0.1
@@ -1047,7 +1030,6 @@ class ModelConfig:
     p_gate_auto_k_step_down_low: float = 0.02
     p_gate_auto_k_step_up_high: float = 0.1
     p_gate_auto_k_step_down_high: float = 0.02
-    p_gate_auto_k_edge_enabled: bool = False
     p_gate_auto_k_target_edge: float = 0.05
     p_gate_auto_k_edge_tolerance: float = 0.5
     p_gate_auto_k_edge_ema_alpha: float = 0.1
@@ -1077,8 +1059,6 @@ class ModelConfig:
     p_gate_teacher_temp: float = 0.25
     p_gate_teacher_tau: float = 0.0
     p_gate_teacher_relu: bool = False
-    activation_checkpointing: bool = False
-    activation_checkpoint_reentrant: bool = False
     unsup_xx_weight: float = 0.0
     unsup_yy_weight: float = 0.0
     p_prior_weight: float = 0.0
