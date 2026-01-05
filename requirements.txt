@@ -1,5 +1,4 @@
 # Notes
-# - Do NOT add `triton` here; PyTorch will install a matching Triton build automatically.
 # - Install the correct PyTorch build for your accelerator (CUDA/ROCm/XPU/CPU) **before** installing this project.
 # - Python >= 3.10 is required; Python 3.14t (free-threading) is recommended for higher data pipeline throughput.
 #
@@ -8,15 +7,15 @@
 
 # Base runtime (mirrors pyproject.toml -> [project].dependencies)
 numpy>=2.2.5
-pandas>=2.2.0
-openpyxl>=3.1.5
 psutil>=7.0.0
 py-cpuinfo>=9.0.0
 torch>=2.8.0
+torchao>=0.14.0
 torchdata>=0.11.0
 tensordict>=0.10.0
 tqdm>=4.67.1
 h5py>=3.11.0
+triton>=3.4.0
 
 # Checkpoint / IO formats (optional)
 # - safetensors: enables .safetensors checkpoints
