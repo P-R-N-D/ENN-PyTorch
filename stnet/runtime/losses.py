@@ -481,6 +481,7 @@ class CRPSLoss(nn.Module):
             return pred
         perm = [0, sd] + [i for i in range(1, nd) if i != sd]
         return pred.permute(*perm)
+        
     def _recommend_energy_cdist_max_bytes(
         self, B: int, S: int, device: torch.device, out_elem_size: int
     ) -> int:
