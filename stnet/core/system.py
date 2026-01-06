@@ -2063,75 +2063,10 @@ class Thread:
         self.tune_threads(io_workers, initial=True)
 
     @staticmethod
-    def is_free_threaded_build() -> bool:
-        try:
-            v = sysconfig.get_config_var("Py_GIL_DISABLED")
-            return bool(int(v)) if v is not None else False
-        except Exception:
-            return False
-
-    @staticmethod
-    def is_gil_enabled() -> bool:
-        fn = getattr(sys, "_is_gil_enabled", None)
-        if callable(fn):
-            with contextlib.suppress(Exception):
-                return bool(fn())
-            return True
-        return True
-
-    @staticmethod
-    def is_no_gil_enforced() -> bool:
-        return Thread.is_free_threaded_build() and (not Thread.is_gil_enabled())
-
-    @staticmethod
-    def is_optimized_for_no_gil() -> bool:
-        for key in ("STNET_NOGIL_OPT", "STNET_NO_GIL_OPT", "STNET_FREE_THREADING_OPT"):
-            override = parse_bool(os.environ.get(key))
-            if override is not None:
-                return bool(override)
-        return Thread.is_no_gil_enforced()
-
-    @staticmethod
     def _import_psutil() -> ModuleType | None:
         with contextlib.suppress(Exception):
             return importlib.import_module("psutil")
         return None
-
-    def total_procs(self) -> list[int]:
-        return list(self._allowed_cpus)
-
-    @staticmethod
-    def spread_threads() -> bool:
-        plat = sys.platform
-        if plat.startswith("linux"):
-            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
-        elif plat == "darwin":
-            candidates = ["libomp.dylib", "libiomp5.dylib"]
-        elif os.name == "nt":
-            candidates = ["libiomp5md.dll", "vcomp140.dll"]
-        else:
-            candidates = []
-        for name in candidates:
-            try:
-                lib = ctypes.CDLL(name)
-            except OSError:
-                continue
-            try:
-                fn = getattr(lib, "omp_set_proc_bind")
-                fn.argtypes = [ctypes.c_int]
-                fn.restype = None
-                fn(4)
-                return True
-            except Exception:
-                pass
-            try:
-                kmp = getattr(lib, "kmp_set_defaults")
-                kmp.restype = None
-                kmp(b"KMP_AFFINITY=granularity=fine,scatter")
-                return True
-            except Exception:
-                pass
-        return False
 
     def _next_core(self) -> int:
         with self._lock:
@@ -2261,6 +2196,118 @@ class Thread:
                 return True
             return False
 
+    def _retune_threads(self) -> None:
+        if not self._enabled or self._samples < 128:
+            return
+        now = time.perf_counter()
+        if (now - self._last_retune_ts) < 1.0:
+            return
+        with self._lock:
+            wall_ns = self._wall_ns
+            self._cpu_ns = self._wall_ns = self._samples = 0
+        self._last_retune_ts = now
+        if wall_ns <= 0:
+            return
+        cpus = max(1, len(self._allowed_cpus))
+        workers = max(1, self._io_workers)
+        dev_type, nacc = WorkerPolicy._available_accelerator()
+        is_accel = bool(nacc and int(nacc) > 0)
+        cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
+        local_world = _optimal_local_worlds(1)
+        distribute_default = local_world > 1
+        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
+        thread_cap = _optimal_threads(
+            ncpu=cpus,
+            cap_mult=cap_mult,
+            local_world=local_world,
+            distribute=bool(distribute),
+        )
+        try:
+            intra = max(1, int(torch.get_num_threads()))
+        except Exception:
+            intra = int(cpus)
+        inter = 1
+        if hasattr(torch, "get_num_interop_threads"):
+            with contextlib.suppress(Exception):
+                inter = max(1, int(torch.get_num_interop_threads()))
+        total = int(intra) + int(inter) + int(workers)
+        if total <= int(thread_cap):
+            return
+        new_intra = max(1, int(thread_cap) - int(workers) - int(inter))
+        if int(new_intra) < int(intra):
+            optimize_threads(intra=int(new_intra))
+            intra = int(new_intra)
+        total = int(intra) + int(inter) + int(workers)
+        if total > int(thread_cap):
+            new_inter = max(1, int(thread_cap) - int(workers) - int(intra))
+            if int(new_inter) < int(inter):
+                optimize_threads(inter=int(new_inter))
+  
+    @staticmethod
+    def is_free_threaded_build() -> bool:
+        try:
+            v = sysconfig.get_config_var("Py_GIL_DISABLED")
+            return bool(int(v)) if v is not None else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def is_gil_enabled() -> bool:
+        fn = getattr(sys, "_is_gil_enabled", None)
+        if callable(fn):
+            with contextlib.suppress(Exception):
+                return bool(fn())
+            return True
+        return True
+
+    @staticmethod
+    def is_no_gil_enforced() -> bool:
+        return Thread.is_free_threaded_build() and (not Thread.is_gil_enabled())
+
+    @staticmethod
+    def is_optimized_for_no_gil() -> bool:
+        for key in ("STNET_NOGIL_OPT", "STNET_NO_GIL_OPT", "STNET_FREE_THREADING_OPT"):
+            override = parse_bool(os.environ.get(key))
+            if override is not None:
+                return bool(override)
+        return Thread.is_no_gil_enforced()
+
+    def total_procs(self) -> list[int]:
+        return list(self._allowed_cpus)
+
+    @staticmethod
+    def spread_threads() -> bool:
+        plat = sys.platform
+        if plat.startswith("linux"):
+            candidates = ["libgomp.so.1", "libgomp.so", "libiomp5.so", "libomp.so"]
+        elif plat == "darwin":
+            candidates = ["libomp.dylib", "libiomp5.dylib"]
+        elif os.name == "nt":
+            candidates = ["libiomp5md.dll", "vcomp140.dll"]
+        else:
+            candidates = []
+        for name in candidates:
+            try:
+                lib = ctypes.CDLL(name)
+            except OSError:
+                continue
+            try:
+                fn = getattr(lib, "omp_set_proc_bind")
+                fn.argtypes = [ctypes.c_int]
+                fn.restype = None
+                fn(4)
+                return True
+            except Exception:
+                pass
+            try:
+                kmp = getattr(lib, "kmp_set_defaults")
+                kmp.restype = None
+                kmp(b"KMP_AFFINITY=granularity=fine,scatter")
+                return True
+            except Exception:
+                pass
+        return False
+  
     def pin_thread(self) -> None:
         if not self._enabled:
             return
@@ -2357,53 +2404,6 @@ class Thread:
             return
         self._retune_threads()
 
-    def _retune_threads(self) -> None:
-        if not self._enabled or self._samples < 128:
-            return
-        now = time.perf_counter()
-        if (now - self._last_retune_ts) < 1.0:
-            return
-        with self._lock:
-            wall_ns = self._wall_ns
-            self._cpu_ns = self._wall_ns = self._samples = 0
-        self._last_retune_ts = now
-        if wall_ns <= 0:
-            return
-        cpus = max(1, len(self._allowed_cpus))
-        workers = max(1, self._io_workers)
-        dev_type, nacc = WorkerPolicy._available_accelerator()
-        is_accel = bool(nacc and int(nacc) > 0)
-        cap_mult = _default_thread_limit(cpus, is_accel=is_accel, nogil=bool(self._nogil))
-        local_world = _optimal_local_worlds(1)
-        distribute_default = local_world > 1
-        distribute = bool(env_first_int(("STNET_DISTRIBUTE_THREAD_CAP",), int(distribute_default)))
-        thread_cap = _optimal_threads(
-            ncpu=cpus,
-            cap_mult=cap_mult,
-            local_world=local_world,
-            distribute=bool(distribute),
-        )
-        try:
-            intra = max(1, int(torch.get_num_threads()))
-        except Exception:
-            intra = int(cpus)
-        inter = 1
-        if hasattr(torch, "get_num_interop_threads"):
-            with contextlib.suppress(Exception):
-                inter = max(1, int(torch.get_num_interop_threads()))
-        total = int(intra) + int(inter) + int(workers)
-        if total <= int(thread_cap):
-            return
-        new_intra = max(1, int(thread_cap) - int(workers) - int(inter))
-        if int(new_intra) < int(intra):
-            optimize_threads(intra=int(new_intra))
-            intra = int(new_intra)
-        total = int(intra) + int(inter) + int(workers)
-        if total > int(thread_cap):
-            new_inter = max(1, int(thread_cap) - int(workers) - int(intra))
-            if int(new_inter) < int(inter):
-                optimize_threads(inter=int(new_inter))
-
     def new_thread(self, fn: Callable[[Any], Any]) -> Callable[[Any], Any]:
         if not self._enabled:
             return fn
@@ -2433,53 +2433,6 @@ class Thread:
 
 class Memory:
     @staticmethod
-    def total() -> Optional[int]:
-        try:
-            import psutil
-            vm = psutil.virtual_memory()
-            if getattr(vm, "total", None):
-                return int(vm.total)
-        except Exception:
-            pass
-        try:
-            if sys.platform.startswith("linux"):
-                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
-                    for line in fh:
-                        if line.startswith("MemTotal:"):
-                            parts = line.split()
-                            if len(parts) >= 2 and parts[1].isdigit():
-                                return int(parts[1]) * 1024
-            elif sys.platform == "darwin":
-                import subprocess
-                out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode("utf-8", "ignore")
-                if out.strip().isdigit():
-                    return int(out.strip())
-            elif os.name == "nt" or sys.platform.startswith("win"):
-                class MEMORYSTATUSEX(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                    ]
-                stat = MEMORYSTATUSEX()
-                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-                    return int(stat.ullTotalPhys)
-        except Exception:
-            pass
-        return None
-
-    @staticmethod
-    def available() -> int:
-        base = Memory._sys_available_memory()
-        cgroup = Memory._linux_limit()
-        winjob = Memory._windows_limit()
-        rlim = Memory._bsd_limit()
-        candidates = [x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0]
-        return max(0, min(candidates)) if candidates else 0
-
-    @staticmethod
     def _parse_free(info: Any) -> Tuple[Optional[int], Optional[int]]:
         free: Optional[int] = None
         total: Optional[int] = None
@@ -2506,63 +2459,6 @@ class Memory:
             with contextlib.suppress(Exception):
                 if total_v is not None:
                     total = int(total_v)
-        if free is not None:
-            free = max(0, int(free))
-        if total is not None:
-            total = max(0, int(total))
-        return free, total
-
-    @staticmethod
-    def mem_get_info(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
-        free: Optional[int] = None
-        total: Optional[int] = None
-        with contextlib.suppress(Exception):
-            acc = getattr(torch, "accelerator", None)
-            if acc is not None:
-                get_memory_info = getattr(acc, "get_memory_info", None)
-                if callable(get_memory_info):
-                    info = get_memory_info(device)
-                    free, total = Memory._parse_free(info)
-                if free is None or total is None:
-                    mem_mod = getattr(acc, "memory", None)
-                    mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
-                    if callable(mem_get_info):
-                        info = mem_get_info(device)
-                        f2, t2 = Memory._parse_free(info)
-                        if free is None:
-                            free = f2
-                        if total is None:
-                            total = t2
-        dev_t = getattr(device, "type", "cpu")
-        if free is None or total is None:
-            if dev_t == "cuda" and torch.cuda.is_available():
-                with contextlib.suppress(Exception):
-                    f2, t2 = torch.cuda.mem_get_info(device=device)
-                    if free is None:
-                        free = int(f2)
-                    if total is None:
-                        total = int(t2)
-            elif dev_t == "xpu" and hasattr(torch, "xpu"):
-                with contextlib.suppress(Exception):
-                    mem_mod = getattr(torch.xpu, "memory", None)
-                    mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
-                    if not callable(mem_get_info):
-                        mem_get_info = getattr(torch.xpu, "mem_get_info", None)
-                    if callable(mem_get_info):
-                        f2, t2 = mem_get_info(device)
-                        if free is None:
-                            free = int(f2)
-                        if total is None:
-                            total = int(t2)
-            elif dev_t == "mps" and hasattr(torch, "mps"):
-                with contextlib.suppress(Exception):
-                    total_v = int(torch.mps.recommended_max_memory())
-                    used_v = int(torch.mps.driver_allocated_memory())
-                    if total_v > 0:
-                        if total is None:
-                            total = total_v
-                        if free is None:
-                            free = max(0, total_v - used_v)
         if free is not None:
             free = max(0, int(free))
         if total is not None:
@@ -2633,7 +2529,6 @@ class Memory:
     def _linux_limit() -> Optional[int]:
         if not sys.platform.startswith("linux"):
             return None
-
         try:
             root = "/sys/fs/cgroup"
             if os.path.exists(os.path.join(root, "cgroup.controllers")):
@@ -2784,6 +2679,110 @@ class Memory:
             return min(cand) if cand else None
         except Exception:
             return None
+
+    @staticmethod
+    def total() -> Optional[int]:
+        try:
+            import psutil
+            vm = psutil.virtual_memory()
+            if getattr(vm, "total", None):
+                return int(vm.total)
+        except Exception:
+            pass
+        try:
+            if sys.platform.startswith("linux"):
+                with open("/proc/meminfo", "r", encoding="utf-8", errors="ignore") as fh:
+                    for line in fh:
+                        if line.startswith("MemTotal:"):
+                            parts = line.split()
+                            if len(parts) >= 2 and parts[1].isdigit():
+                                return int(parts[1]) * 1024
+            elif sys.platform == "darwin":
+                import subprocess
+                out = subprocess.check_output(["sysctl", "-n", "hw.memsize"]).decode("utf-8", "ignore")
+                if out.strip().isdigit():
+                    return int(out.strip())
+            elif os.name == "nt" or sys.platform.startswith("win"):
+                class MEMORYSTATUSEX(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                    ]
+                stat = MEMORYSTATUSEX()
+                stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+                    return int(stat.ullTotalPhys)
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def available() -> int:
+        base = Memory._sys_available_memory()
+        cgroup = Memory._linux_limit()
+        winjob = Memory._windows_limit()
+        rlim = Memory._bsd_limit()
+        candidates = [x for x in (base, cgroup, winjob, rlim) if isinstance(x, int) and x >= 0]
+        return max(0, min(candidates)) if candidates else 0
+
+    @staticmethod
+    def mem_get_info(device: torch.device) -> Tuple[Optional[int], Optional[int]]:
+        free: Optional[int] = None
+        total: Optional[int] = None
+        with contextlib.suppress(Exception):
+            acc = getattr(torch, "accelerator", None)
+            if acc is not None:
+                get_memory_info = getattr(acc, "get_memory_info", None)
+                if callable(get_memory_info):
+                    info = get_memory_info(device)
+                    free, total = Memory._parse_free(info)
+                if free is None or total is None:
+                    mem_mod = getattr(acc, "memory", None)
+                    mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
+                    if callable(mem_get_info):
+                        info = mem_get_info(device)
+                        f2, t2 = Memory._parse_free(info)
+                        if free is None:
+                            free = f2
+                        if total is None:
+                            total = t2
+        dev_t = getattr(device, "type", "cpu")
+        if free is None or total is None:
+            if dev_t == "cuda" and torch.cuda.is_available():
+                with contextlib.suppress(Exception):
+                    f2, t2 = torch.cuda.mem_get_info(device=device)
+                    if free is None:
+                        free = int(f2)
+                    if total is None:
+                        total = int(t2)
+            elif dev_t == "xpu" and hasattr(torch, "xpu"):
+                with contextlib.suppress(Exception):
+                    mem_mod = getattr(torch.xpu, "memory", None)
+                    mem_get_info = getattr(mem_mod, "mem_get_info", None) if mem_mod is not None else None
+                    if not callable(mem_get_info):
+                        mem_get_info = getattr(torch.xpu, "mem_get_info", None)
+                    if callable(mem_get_info):
+                        f2, t2 = mem_get_info(device)
+                        if free is None:
+                            free = int(f2)
+                        if total is None:
+                            total = int(t2)
+            elif dev_t == "mps" and hasattr(torch, "mps"):
+                with contextlib.suppress(Exception):
+                    total_v = int(torch.mps.recommended_max_memory())
+                    used_v = int(torch.mps.driver_allocated_memory())
+                    if total_v > 0:
+                        if total is None:
+                            total = total_v
+                        if free is None:
+                            free = max(0, total_v - used_v)
+        if free is not None:
+            free = max(0, int(free))
+        if total is not None:
+            total = max(0, int(total))
+        return free, total
 
     @staticmethod
     def prefer_local_numa() -> bool:
