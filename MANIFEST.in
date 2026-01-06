@@ -17,7 +17,7 @@ global-exclude *.log *.orig *.rej
 # ML / export / checkpoint / data artifacts
 # Exclude heavy weights to keep the package lightweight
 global-exclude *.onnx *.ts *.pte *.tflite *.mlmodel *.pt *.pth *.bin
-global-exclude *.h5 *.hdf5 *.npz *.mmt *.td
+global-exclude *.h5 *.hdf5 *.npz *.mmt *.td *.tensordict
 
 # Sample spreadsheets (do not ship)
 global-exclude *.xlsx *.xls *.xlsm *.xlsb
