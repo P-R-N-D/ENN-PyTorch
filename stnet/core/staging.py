@@ -22,7 +22,11 @@ from .casting import env_first, env_first_float, env_flag
 
 def _get_throttle_state() -> str:
     raw = env_first(
-        ("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"),
+        (
+            "STNET_CACHE_BACKPRESSURE_MODE",
+            "STNET_CACHE_BACKPRESSURE",
+            "STNET_CACHE_MODE",
+        ),
         default="block",
     )
     s = str(raw or "block").strip().lower()
@@ -46,7 +50,9 @@ def _get_throttle_timeout() -> float:
 
 @lru_cache(maxsize=1)
 def _is_early_release_enabled() -> bool:
-    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
+    return bool(
+        env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True)
+    )
 
 
 @lru_cache(maxsize=1)
@@ -129,7 +135,9 @@ class ProducerError:
 class Page:
     __slots__ = ("_buf", "_numel", "_dtype", "_pinned")
 
-    def __init__(self, numel: int, dtype: torch.dtype, *args: Any, pin_memory: bool = True) -> None:
+    def __init__(
+        self, numel: int, dtype: torch.dtype, *args: Any, pin_memory: bool = True
+    ) -> None:
         self._numel = int(max(1, int(numel)))
         self._dtype = dtype
         self._pinned = bool(pin_memory)
@@ -243,7 +251,11 @@ class Pool:
                             e.fence = None
                             idx = j
                             self._rr = (j + 1) % max(1, n)
-                            if (e.page.dtype != dtype_t) or (e.page.numel < need) or (e.page.pinned != self._pin):
+                            if (
+                                (e.page.dtype != dtype_t)
+                                or (e.page.numel < need)
+                                or (e.page.pinned != self._pin)
+                            ):
                                 need_new_page = True
                             break
                 if idx is None:
@@ -289,7 +301,9 @@ class Pool:
                         return view
                 continue
             break
-        view = torch.empty(need, dtype=dtype_t, device="cpu", pin_memory=False).view(*shape_t)
+        view = torch.empty(need, dtype=dtype_t, device="cpu", pin_memory=False).view(
+            *shape_t
+        )
         if return_handle:
             return view, None
         return view
@@ -342,7 +356,9 @@ class Pool:
                     return e.fence_evt
         return ev_new
 
-    def release_after(self, token: Pool.Token | None, wait_event: object | None) -> None:
+    def release_after(
+        self, token: Pool.Token | None, wait_event: object | None
+    ) -> None:
         if token is None:
             return
         with self._cv:
@@ -433,6 +449,7 @@ class Cache:
         buf = tensor.detach()
         with contextlib.suppress(Exception):
             from torch.distributed.tensor import DTensor
+
             if isinstance(buf, DTensor):
                 buf = buf.to_local()
         if buf.device.type != "cpu":
@@ -443,7 +460,9 @@ class Cache:
             force_unpin = bool(getattr(self, "_force_unpin", False))
         released = False
         pinned = Cache._is_cpu_pinned(buf)
-        if pinned and (bool(force_unpin) or (bool(early_release) and callable(release_cb))):
+        if pinned and (
+            bool(force_unpin) or (bool(early_release) and callable(release_cb))
+        ):
             try:
                 tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
                 tmp.copy_(buf, non_blocking=False)
@@ -473,9 +492,12 @@ class Cache:
             buf = buf.contiguous()
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
+
             parent = os.path.dirname(path) or "."
             os.makedirs(parent, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent
+            )
             os.close(fd)
             try:
                 MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
@@ -488,10 +510,12 @@ class Cache:
                 "dtype": str(buf.dtype).replace("torch.", ""),
             }
             from ..data import schemas
+
             schemas.write_json(schemas.get_meta_path(path), meta, indent=None)
             return
         if str(path).endswith((".pt", ".pth")):
             from ..data import schemas
+
             schemas.save_temp(path, buf)
         else:
             torch.save(buf, path)
@@ -510,7 +534,9 @@ class Cache:
                 case (tensor, path, evt, rel):
                     pass
                 case _:
-                    self._err = RuntimeError(f"Invalid cache queue item: {type(item)!r}")
+                    self._err = RuntimeError(
+                        f"Invalid cache queue item: {type(item)!r}"
+                    )
                     self._err_event.set()
                     break
             if tensor is None:
@@ -613,7 +639,9 @@ class Buffer:
         self._buf: "collections.deque[Any]" = collections.deque()
         self._stop = threading.Event()
         self._cv = threading.Condition()
-        self._warn_blocking = env_flag("STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False)
+        self._warn_blocking = env_flag(
+            "STNET_BUFFER_WARN_BLOCKING", "STNET_DEBUG", default=False
+        )
 
     def put(self, item: Any, *args: Any, timeout: float | None = None) -> bool:
         if self._stop.is_set():

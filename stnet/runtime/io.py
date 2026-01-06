@@ -19,7 +19,10 @@ from typing import Any, Iterator, Protocol, Sequence, TypeAlias
 
 import torch
 from torch import nn
-from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict
+from torch.distributed.checkpoint.state_dict import (
+    StateDictOptions,
+    get_model_state_dict,
+)
 from tensordict import TensorDictBase
 
 from ..core.compat import is_meta_or_fake_tensor
@@ -42,7 +45,9 @@ _IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
 )
 
 _IGNORED_WARNING_MESSAGE_RE: str = (
-    r".*(?:" + "|".join((re.escape(str(s)) for s in _IGNORED_WARNING_SENTENCES)) + r").*"
+    r".*(?:"
+    + "|".join((re.escape(str(s)) for s in _IGNORED_WARNING_SENTENCES))
+    + r").*"
 )
 
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
@@ -59,12 +64,19 @@ def _register_torchversion_safe_global() -> None:
         return
     with contextlib.suppress(Exception):
         from torch.torch_version import TorchVersion
+
         add_safe_globals([TorchVersion])
 
 
 @contextlib.contextmanager
-def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterator[None]:
-    sentences = _IGNORED_WARNING_SENTENCES if ignored_sentences is None else tuple(ignored_sentences)
+def _filtered_warnings(
+    ignored_sentences: Sequence[str] | None = None,
+) -> Iterator[None]:
+    sentences = (
+        _IGNORED_WARNING_SENTENCES
+        if ignored_sentences is None
+        else tuple(ignored_sentences)
+    )
     if not sentences:
         yield
         return
@@ -75,7 +87,9 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
     ctx_aware = False
     with contextlib.suppress(Exception):
         if sys.version_info >= (3, 14):
-            ctx_aware = bool(getattr(getattr(sys, "flags", None), "context_aware_warnings", False))
+            ctx_aware = bool(
+                getattr(getattr(sys, "flags", None), "context_aware_warnings", False)
+            )
     guard = contextlib.nullcontext() if ctx_aware else _WARNINGS_FILTER_LOCK
     with guard:
         with warnings.catch_warnings():
@@ -86,7 +100,9 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
 
 
 @contextlib.contextmanager
-def _temp_environ(updates: dict[str, str | None], *args: Any, only_if_unset: bool = True) -> Iterator[None]:
+def _temp_environ(
+    updates: dict[str, str | None], *args: Any, only_if_unset: bool = True
+) -> Iterator[None]:
     prev: dict[str, str | None] = {}
     for key, val in updates.items():
         if only_if_unset and key in os.environ:
@@ -168,6 +184,7 @@ def _save_sync(path: PathLike | None = None, *args: Any, barrier: bool = False) 
 def _load_model_config(model: object) -> object:
     try:
         from ..config import _extract_model_config_dict
+
         return _extract_model_config_dict(model)
     except Exception:
         return {}
@@ -183,6 +200,7 @@ def _to_tensor(
         t = value
         with contextlib.suppress(Exception):
             from torch.distributed.tensor import DTensor
+
             if isinstance(t, DTensor):
                 t = t.to_local()
         if materialize_meta and is_meta_or_fake_tensor(t):
@@ -199,19 +217,32 @@ def _to_tensor(
     if isinstance(value, dict):
         return type(value)(
             (
-                (k, _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous))
+                (
+                    k,
+                    _to_tensor(
+                        v,
+                        materialize_meta=materialize_meta,
+                        make_contiguous=make_contiguous,
+                    ),
+                )
                 for k, v in value.items()
             )
         )
     if isinstance(value, list):
         return [
-            _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+            _to_tensor(
+                v, materialize_meta=materialize_meta, make_contiguous=make_contiguous
+            )
             for v in value
         ]
     if isinstance(value, tuple):
         seq = tuple(
             (
-                _to_tensor(v, materialize_meta=materialize_meta, make_contiguous=make_contiguous)
+                _to_tensor(
+                    v,
+                    materialize_meta=materialize_meta,
+                    make_contiguous=make_contiguous,
+                )
                 for v in value
             )
         )
@@ -343,7 +374,8 @@ def _get_forward_parameters(model_cls: object) -> object:
         return None
     names = set(sig.parameters.keys())
     accepts_kwargs = any(
-        getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        getattr(p, "kind", None) == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
     )
     info = (names, bool(accepts_kwargs))
     with _FORWARD_PARAM_CACHE_LOCK:
@@ -384,7 +416,9 @@ def _get_tensor_shape(model: object, sample_input: object) -> object:
         except (TypeError, ValueError):
             out_shape = None
     if (in_dim is None or out_shape is None) and sample_input is not None:
-        dev = next((p.device for p in model.parameters() if p is not None), torch.device("cpu"))
+        dev = next(
+            (p.device for p in model.parameters() if p is not None), torch.device("cpu")
+        )
         sample = sample_input.to(dev)
         with inference_mode(model.eval()):
             if sample.ndim == 1:
@@ -441,8 +475,12 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
         default_fallback = [18, 17, 16, 15, 13]
     opset_version = int(kwargs.get("opset_version", default_opset))
     dynamic_batch = bool(kwargs.get("dynamic_batch", default_dynamic_batch))
-    prefer_dynamo = bool(kwargs.get("prefer_dynamo", kwargs.get("dynamo", default_prefer_dynamo)))
-    simplify = bool(kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", default_simplify)))
+    prefer_dynamo = bool(
+        kwargs.get("prefer_dynamo", kwargs.get("dynamo", default_prefer_dynamo))
+    )
+    simplify = bool(
+        kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", default_simplify))
+    )
     fb = kwargs.get("opset_fallback", None)
     opset_fallback: list[int]
     if fb is None:
@@ -453,7 +491,9 @@ def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
         opset_fallback = [int(x) for x in fb]
     else:
         opset_fallback = [int(fb)]
-    opset_try = [opset_version] + [v for v in opset_fallback if int(v) != int(opset_version)]
+    opset_try = [opset_version] + [
+        v for v in opset_fallback if int(v) != int(opset_version)
+    ]
     return {
         "sample_input": kwargs.get("sample_input"),
         "opset_version": opset_version,
@@ -543,7 +583,9 @@ class _OnnxLayer:
             base = inspect.signature(torch.onnx.export).parameters
             return {k: v for k, v in common_kwargs.items() if k in base}
 
-        supports_dynamo = bool("dynamo" in inspect.signature(torch.onnx.export).parameters)
+        supports_dynamo = bool(
+            "dynamo" in inspect.signature(torch.onnx.export).parameters
+        )
         if opset_fallback is None:
             opset_fallback = (opset_version,)
         seen: set[int] = set()
@@ -585,13 +627,17 @@ class _OnnxLayer:
                                 **base_kwargs,
                             )
                     else:
-                        torch.onnx.export(wrapper, sample, str(onnx_path), **base_kwargs)
+                        torch.onnx.export(
+                            wrapper, sample, str(onnx_path), **base_kwargs
+                        )
                     if bool(simplify):
                         with contextlib.suppress(Exception):
                             import onnx
+
                             model_onnx = onnx.load(str(onnx_path))
                             with contextlib.suppress(Exception):
                                 import onnxsim
+
                                 model_simp, ok = onnxsim.simplify(model_onnx)
                                 if bool(ok):
                                     onnx.save(model_simp, str(onnx_path))
@@ -605,7 +651,9 @@ class _OnnxLayer:
         raise RuntimeError("ONNX export failed. " + "; ".join(errors[-6:]))
 
     @staticmethod
-    def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
+    def coerce(
+        model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any
+    ) -> object:
         if not onnx_path.exists():
             return Exporter._OnnxLayer.export(model, onnx_path, **kwargs)
         return onnx_path
@@ -625,6 +673,7 @@ class _OrtLayer:
     ) -> object:
         is_required("onnxruntime", "pip install onnxruntime")
         import onnxruntime as ort
+
         opt_map = {
             "disable": ort.GraphOptimizationLevel.ORT_DISABLE_ALL,
             "basic": ort.GraphOptimizationLevel.ORT_ENABLE_BASIC,
@@ -662,7 +711,9 @@ class _OrtLayer:
         so.graph_optimization_level = level
         so.add_session_config_entry("session.save_model_format", "ORT")
         if optimization_style.lower() == "runtime":
-            so.add_session_config_entry("optimization.minimal_build_optimizations", "save")
+            so.add_session_config_entry(
+                "optimization.minimal_build_optimizations", "save"
+            )
         ort.InferenceSession(
             str(onnx_path),
             sess_options=so,
@@ -675,7 +726,9 @@ class _OrtLayer:
 class Format(Protocol):
     name = None
 
-    def save(self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any) -> None: ...
+    def save(
+        self, model: nn.Module, dst: PathLike, *args: Any, **kwargs: Any
+    ) -> None: ...
 
 
 class Builder:
@@ -700,15 +753,20 @@ class Builder:
         if not suffix and p.exists() and p.is_dir():
             from torch.distributed.checkpoint import FileSystemWriter
             from torch.distributed.checkpoint import save as dcp_save
+
             with _save_sync(p, barrier=True):
                 opts_sd = StateDictOptions(full_state_dict=True)
                 m_sd = get_model_state_dict(model, options=opts_sd)
-                dcp_save(state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p)))
+                dcp_save(
+                    state_dict={"model": m_sd}, storage_writer=FileSystemWriter(str(p))
+                )
                 meta = {
                     "version": 1,
                     "format": "dcp-dir-v1",
                     "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple((int(x) for x in getattr(model, "out_shape", ()))),
+                    "out_shape": tuple(
+                        (int(x) for x in getattr(model, "out_shape", ()))
+                    ),
                     "config": _load_model_config(model),
                     "pytorch_version": torch.__version__,
                     "extra": coerce_json(extra or {}),
@@ -727,6 +785,7 @@ class Builder:
             if suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 from safetensors.torch import save_file as save_tensors
+
                 sd = model.state_dict()
                 cpu_sd = {k: _to_tensor(v) for k, v in sd.items()}
                 fd, tmp_name = tempfile.mkstemp(
@@ -735,7 +794,9 @@ class Builder:
                 os.close(fd)
                 tmp_path = Path(tmp_name)
                 try:
-                    save_tensors(cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"})
+                    save_tensors(
+                        cpu_sd, str(tmp_path), metadata={"format": "safetensors-v1"}
+                    )
                     tmp_path.replace(p)
                 finally:
                     with contextlib.suppress(Exception):
@@ -744,7 +805,9 @@ class Builder:
                 meta = {
                     "version": 1,
                     "in_dim": int(getattr(model, "in_dim", 0)),
-                    "out_shape": tuple((int(x) for x in getattr(model, "out_shape", ()))),
+                    "out_shape": tuple(
+                        (int(x) for x in getattr(model, "out_shape", ()))
+                    ),
                     "config": _load_model_config(model),
                     "pytorch_version": torch.__version__,
                     "extra": coerce_json(extra or {}),
@@ -837,7 +900,9 @@ class Onnx(Format):
         **kwargs: Any,
     ) -> object:
         with _onnx_model(model) as serving:
-            out = Exporter._OnnxLayer.export(serving, dst, **_onnx_options(kwargs, target="onnx"))
+            out = Exporter._OnnxLayer.export(
+                serving, dst, **_onnx_options(kwargs, target="onnx")
+            )
         return (out,)
 
 
@@ -853,7 +918,9 @@ class Ort(Format):
     ) -> object:
         with _onnx_model(model) as serving:
             onnx_path = Exporter._OnnxLayer.coerce(
-                serving, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs, target="onnx")
+                serving,
+                _coerce_onnx_path(dst, kwargs),
+                **_onnx_options(kwargs, target="onnx"),
             )
             ort_path, optimized = Exporter.OrtLayer.to_ort(
                 onnx_path,
@@ -861,7 +928,9 @@ class Ort(Format):
                 optimization_level=str(kwargs.get("optimization_level", "all")),
                 optimization_style=str(kwargs.get("optimization_style", "fixed")),
                 target_platform=kwargs.get("target_platform"),
-                save_optimized_onnx_model=bool(kwargs.get("save_optimized_onnx_model", False)),
+                save_optimized_onnx_model=bool(
+                    kwargs.get("save_optimized_onnx_model", False)
+                ),
             )
         return (ort_path, optimized) if optimized is not None else (ort_path,)
 
@@ -890,12 +959,16 @@ class TensorRT(Format):
             trt_logger = trt.Logger(trt.Logger.WARNING)
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
-                explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+                explicit_batch_flag = 1 << int(
+                    trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH
+                )
             with contextlib.ExitStack() as stack:
                 builder = stack.enter_context(trt.Builder(trt_logger))
                 create_network = getattr(builder, "create_network", None)
                 if not callable(create_network):
-                    raise RuntimeError("TensorRT builder.create_network is not available.")
+                    raise RuntimeError(
+                        "TensorRT builder.create_network is not available."
+                    )
                 try:
                     network = stack.enter_context(create_network(explicit_batch_flag))
                 except TypeError:
@@ -906,7 +979,9 @@ class TensorRT(Format):
 
                 workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
                 if hasattr(config, "set_memory_pool_limit"):
-                    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
+                    config.set_memory_pool_limit(
+                        trt.MemoryPoolType.WORKSPACE, workspace_size_bytes
+                    )
                 else:
                     config.max_workspace_size = workspace_size_bytes
                 with open(onnx_path, "rb") as handle:
@@ -985,18 +1060,24 @@ class Nnef(Format):
     ) -> object:
         with _onnx_model(model) as serving_model:
             onnx_path = Exporter._OnnxLayer.coerce(
-                serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs, target="nnef")
+                serving_model,
+                _coerce_onnx_path(dst, kwargs),
+                **_onnx_options(kwargs, target="nnef"),
             )
             try:
                 import importlib
+
                 importlib.import_module("nnef_tools.convert")
             except ImportError as exc:
-                raise ImportError("nnef-tools[onnx] is required for this export.") from exc
+                raise ImportError(
+                    "nnef-tools[onnx] is required for this export."
+                ) from exc
             input_shapes = kwargs.get("input_shapes")
             if input_shapes is None:
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 input_shapes = {"features": tuple((int(x) for x in sample.shape))}
             import json
+
             cmd = [
                 sys.executable,
                 "-m",
@@ -1038,6 +1119,7 @@ class CoreML(Format):
     ) -> object:
         is_required("coremltools", "pip install coremltools")
         import coremltools as ct
+
         with _onnx_model(model) as serving_model:
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
             wrapper = _CompatLayer(serving_model).eval()
@@ -1110,7 +1192,9 @@ class LiteRT(Format):
     ) -> object:
         with _onnx_model(model) as serving_model:
             onnx_path = Exporter._OnnxLayer.coerce(
-                serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs, target="litert")
+                serving_model,
+                _coerce_onnx_path(dst, kwargs),
+                **_onnx_options(kwargs, target="litert"),
             )
             if bool(kwargs.get("prefer_onnx2tf", True)):
                 try:
@@ -1141,11 +1225,14 @@ class LiteRT(Format):
             import onnx
             import tensorflow as tf
             from onnx_tf.backend import prepare
+
             model_onnx = onnx.load(str(onnx_path))
             with TemporaryDirectory() as tmpd:
                 saved_model_dir = Path(tmpd) / "saved_model"
                 prepare(model_onnx).export_graph(str(saved_model_dir))
-                converter = tf.lite.TFLiteConverter.from_saved_model(str(saved_model_dir))
+                converter = tf.lite.TFLiteConverter.from_saved_model(
+                    str(saved_model_dir)
+                )
                 if bool(kwargs.get("allow_fp16", False)):
                     converter.target_spec.supported_types = [tf.float16]
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
@@ -1157,7 +1244,9 @@ class LiteRT(Format):
                         )
                     converter.optimizations = [tf.lite.Optimize.DEFAULT]
                     converter.representative_dataset = rep_ds
-                    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+                    converter.target_spec.supported_ops = [
+                        tf.lite.OpsSet.TFLITE_BUILTINS_INT8
+                    ]
                     converter.inference_input_type = tf.int8
                     converter.inference_output_type = tf.int8
                 tflite_model = converter.convert()
@@ -1246,6 +1335,7 @@ class ExecuTorch(Format):
                 "torch.export is required for ExecuTorch export (PyTorch 2.0+)."
             ) from exc
         import executorch.exir as exir
+
         with _onnx_model(model) as serving_model:
             sample = kwargs.get("sample_input")
             sample = _pad_sample(serving_model, sample)
@@ -1312,6 +1402,7 @@ class TensorFlow(Format):
             is_required("onnx-tf", "pip install onnx-tf")
             from onnx_tf.backend import prepare
             import onnx
+
             model_onnx = onnx.load(str(onnx_path))
             prepare(model_onnx).export_graph(str(saved_model_dir))
         return (saved_model_dir,)

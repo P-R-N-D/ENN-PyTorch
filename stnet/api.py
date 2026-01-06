@@ -58,7 +58,7 @@ from .core.casting import env_bool, parse_torch_dtype
 from .core.distributed import (
     get_available_host,
     get_preferred_ip,
-    initialize_master_addr
+    initialize_master_addr,
 )
 from .core.graph import inference_mode
 from .core.system import (
@@ -84,7 +84,7 @@ from .runtime.io import (
     _filtered_warnings,
     _to_tensor,
     _torch_load_checkpoint,
-    is_required
+    is_required,
 )
 from .runtime.main import _coerce_dcp_keys, process
 
@@ -101,7 +101,12 @@ TrainData: TypeAlias = (
     | object
 )
 PredictData: TypeAlias = TrainData
-PredictionOutput: TypeAlias = TensorDictBase | PersistentTensorDict | Mapping[str, TensorDictBase] | Mapping[str, torch.Tensor]
+PredictionOutput: TypeAlias = (
+    TensorDictBase
+    | PersistentTensorDict
+    | Mapping[str, TensorDictBase]
+    | Mapping[str, torch.Tensor]
+)
 logger = logging.getLogger(__name__)
 
 _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
@@ -122,14 +127,21 @@ _IGNORED_WARNING_MESSAGE_RE = re.compile(
 
 def _apply_warning_filters() -> None:
     with contextlib.suppress(Exception):
-        warnings.filterwarnings("ignore", message=_IGNORED_WARNING_MESSAGE_RE.pattern, category=UserWarning)
+        warnings.filterwarnings(
+            "ignore", message=_IGNORED_WARNING_MESSAGE_RE.pattern, category=UserWarning
+        )
 
 
 def _rewrite_state_dict_key(k: str) -> str:
     if not (k.startswith("m.") and ".module." in k):
         return k
     parts = k.split(".")
-    if len(parts) >= 4 and parts[0] == "m" and parts[1].isdigit() and parts[2] == "module":
+    if (
+        len(parts) >= 4
+        and parts[0] == "m"
+        and parts[1].isdigit()
+        and parts[2] == "module"
+    ):
         return ".".join(parts[3:])
     return k
 
@@ -156,12 +168,16 @@ def _parse_meta(p: PathLike) -> Mapping[str, Any]:
         meta = read_json(meta_path)
         return meta if isinstance(meta, dict) else {}
     except Exception as exc:
-        raise RuntimeError(f"Failed to parse checkpoint metadata at {str(meta_path)!r}") from exc
+        raise RuntimeError(
+            f"Failed to parse checkpoint metadata at {str(meta_path)!r}"
+        ) from exc
 
 
 @lru_cache(maxsize=1)
 def _is_execution_time_logged() -> bool:
-    return env_bool(("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False)
+    return env_bool(
+        ("STNET_LOG_TIMINGS", "STNET_TIMINGS", "STNET_DEBUG_TIMINGS"), default=False
+    )
 
 
 def _timed_invoke(
@@ -184,6 +200,7 @@ def _timed_invoke(
 def _clear_process_group() -> None:
     try:
         import torch.distributed
+
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             with contextlib.suppress(Exception):
                 torch.distributed.barrier()
@@ -205,12 +222,15 @@ def _init_distributed() -> None:
 def _clear_device_caches() -> None:
     with contextlib.suppress(Exception):
         import gc
+
         gc.collect()
     with contextlib.suppress(Exception):
         from .core.system import empty_device_cache, get_device
+
         empty_device_cache(device=get_device(), do_gc=False, min_interval_s=0.0)
     with contextlib.suppress(Exception):
         from .core.system import collect_accelerator_ipc
+
         collect_accelerator_ipc()
 
 
@@ -232,6 +252,7 @@ def _set_seed(seed_value: int) -> None:
         pass
     with contextlib.suppress(Exception):
         from .core.system import set_accelerator_seed
+
         set_accelerator_seed(int(seed_value))
     try:
         random.seed(seed_value)
@@ -262,7 +283,9 @@ def _save_model_checkpoint(
         with _filtered_warnings():
             save(
                 state_dict={"model": m_sd},
-                storage_writer=FileSystemWriter(out_dir, sync_files=True, overwrite=bool(overwrite)),
+                storage_writer=FileSystemWriter(
+                    out_dir, sync_files=True, overwrite=bool(overwrite)
+                ),
             )
     if save_pt:
         if m_sd is not None:
@@ -432,7 +455,9 @@ def _reduce_batch_stats(recs: object) -> Optional[Mapping[str, Any]]:
     }
 
 
-def _update_batch_stats(prev: object, n_prev: object, inc: object, n_inc: object) -> Any:
+def _update_batch_stats(
+    prev: object, n_prev: object, inc: object, n_inc: object
+) -> Any:
     if inc is None or n_inc <= 0:
         return prev
     if prev is None or n_prev <= 0:
@@ -565,7 +590,9 @@ def _get_prediction_dtype(
                         return dt
         if os.path.isfile(pred_path):
             try:
-                preds_t = _torch_load_checkpoint(pred_path, map_location="cpu", weights_only=True)
+                preds_t = _torch_load_checkpoint(
+                    pred_path, map_location="cpu", weights_only=True
+                )
             except Exception:
                 preds_t = None
             if isinstance(preds_t, torch.Tensor):
@@ -630,7 +657,7 @@ def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-    
+
     def _decorator(fn: Callable[P, R]) -> Callable[P, R]:
         name = fn_name or getattr(fn, "__name__", "call")
         wrapped = partial(_timed_invoke, fn, log, str(name))
@@ -659,12 +686,18 @@ def load_model(
     weights_only: bool = True,
 ) -> Model:
     p = Path(checkpoint_path)
-    load_dev = torch.device(map_location) if map_location is not None else torch.device("cpu")
+    load_dev = (
+        torch.device(map_location) if map_location is not None else torch.device("cpu")
+    )
     if p.is_dir():
         meta = _parse_meta(p)
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim") or 0)
-        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
-        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        out_shape_meta = (
+            out_shape if out_shape is not None else meta.get("out_shape") or ()
+        )
+        use_out_shape = (
+            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        )
         user_provided_config = config is not None
         raw_cfg = config if user_provided_config else meta.get("config")
         use_config = coerce_model_config(raw_cfg)
@@ -689,15 +722,25 @@ def load_model(
     if suffix == ".safetensors":
         meta_path = p.with_suffix(".json")
         if not meta_path.exists():
-            raise RuntimeError("Missing sidecar JSON file for the safetensors checkpoint.")
+            raise RuntimeError(
+                "Missing sidecar JSON file for the safetensors checkpoint."
+            )
         meta = read_json(meta_path)
         if not isinstance(meta, dict):
-            raise RuntimeError(f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}")
+            raise RuntimeError(
+                f"Invalid sidecar JSON file for the safetensors checkpoint: {str(meta_path)!r}"
+            )
         use_in_dim = int(in_dim if in_dim is not None else meta.get("in_dim"))
-        out_shape_meta = out_shape if out_shape is not None else meta.get("out_shape") or ()
-        use_out_shape = tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        out_shape_meta = (
+            out_shape if out_shape is not None else meta.get("out_shape") or ()
+        )
+        use_out_shape = (
+            tuple((int(x) for x in out_shape_meta)) if out_shape_meta else ()
+        )
         user_provided_config = config is not None
-        use_config = coerce_model_config(config if user_provided_config else meta.get("config"))
+        use_config = coerce_model_config(
+            config if user_provided_config else meta.get("config")
+        )
         if not user_provided_config:
             use_config.device = load_dev
         elif map_location is not None and use_config.device is None:
@@ -709,6 +752,7 @@ def load_model(
         model = new_model(use_in_dim, use_out_shape, use_config)
         is_required("safetensors", "pip install safetensors")
         from safetensors.torch import load_file as load_tensors
+
         dev = None
         if map_location is None:
             dev = "cpu"
@@ -721,7 +765,9 @@ def load_model(
         resize_scaler_buffer(model, sd)
         model.load_state_dict(sd, strict=False)
         return model
-    obj = _torch_load_checkpoint(p, map_location=map_location or "cpu", weights_only=weights_only)
+    obj = _torch_load_checkpoint(
+        p, map_location=map_location or "cpu", weights_only=weights_only
+    )
     if isinstance(obj, dict):
         meta_in_dim = obj.get("in_dim")
         meta_out_shape = obj.get("out_shape")
@@ -764,6 +810,7 @@ def save_model(
     **kwargs: Any,
 ) -> str:
     from .runtime.io import Exporter, Builder
+
     p = Path(path)
     if Builder.is_target_native(p):
         if args:
@@ -777,7 +824,9 @@ def save_model(
         if swa_averager is not None and hasattr(swa_averager, "state_dict"):
             with contextlib.suppress(Exception):
                 merged_extra["swa_averager_state"] = swa_averager.state_dict()
-        out = Builder.save(model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs)
+        out = Builder.save(
+            model, p, optimizer=optimizer, extra=merged_extra or None, **kwargs
+        )
         return str(out)
     conv = Exporter.for_export(p.suffix)
     if conv is None:
@@ -848,13 +897,17 @@ def train(
                 underflow_action=underflow_action,
                 shuffle=bool(shuffle),
             )
-            first_in_dim, label_shape = _get_label_shape(first_in_dim, in_dim, label_shape, lshape)
+            first_in_dim, label_shape = _get_label_shape(
+                first_in_dim, in_dim, label_shape, lshape
+            )
             num_samples_dataset += int(n)
         if first_in_dim is None or not label_shape:
             raise RuntimeError("no training data provided to train()")
         if manifest is not None:
             payload = manifest if isinstance(manifest, dict) else list(manifest)
-            Storage.write_json(os.path.join(memmap_dir, "multinode.json"), payload, indent=None)
+            Storage.write_json(
+                os.path.join(memmap_dir, "multinode.json"), payload, indent=None
+            )
         ckpt_dir = new_dir("ckpt_dcp")
         save_dcp = env_bool("STNET_SAVE_DCP", True)
         save_pt = env_bool("STNET_SAVE_MODEL_PT", True)
@@ -923,7 +976,9 @@ def train(
         elastic_launch(lc, process)(ops)
         fallback = os.path.join(ckpt_dir, "model.pt")
         if os.path.isfile(fallback):
-            cpu_state = _torch_load_checkpoint(fallback, map_location="cpu", weights_only=True)
+            cpu_state = _torch_load_checkpoint(
+                fallback, map_location="cpu", weights_only=True
+            )
             cpu_state = _to_tensor(cpu_state)
             resize_scaler_buffer(model, cpu_state)
             model.load_state_dict(cpu_state, strict=False)
@@ -948,36 +1003,64 @@ def train(
                     logger = getattr(model, "logger", None)
                     if isinstance(meta, dict):
                         setattr(model, "_train_history_meta", dict(meta))
-                    run_stats = _reduce_batch_stats(records) if isinstance(records, list) and records else None
+                    run_stats = (
+                        _reduce_batch_stats(records)
+                        if isinstance(records, list) and records
+                        else None
+                    )
                     sampled_n = None
                     if isinstance(meta, dict):
                         with contextlib.suppress(Exception):
-                            sampled_n = int(meta.get("sampled_n")) if meta.get("sampled_n") is not None else None
+                            sampled_n = (
+                                int(meta.get("sampled_n"))
+                                if meta.get("sampled_n") is not None
+                                else None
+                            )
                     if sampled_n is None or sampled_n <= 0:
                         try:
-                            e = int(meta.get("epochs")) if isinstance(meta, dict) and meta.get("epochs") is not None else int(epochs)
+                            e = (
+                                int(meta.get("epochs"))
+                                if isinstance(meta, dict)
+                                and meta.get("epochs") is not None
+                                else int(epochs)
+                            )
                         except Exception:
                             e = int(epochs)
                         e = max(1, int(e))
                         try:
-                            vf = float(meta.get("val_frac")) if isinstance(meta, dict) and meta.get("val_frac") is not None else float(val_frac)
+                            vf = (
+                                float(meta.get("val_frac"))
+                                if isinstance(meta, dict)
+                                and meta.get("val_frac") is not None
+                                else float(val_frac)
+                            )
                         except Exception:
                             vf = float(val_frac)
                         vf = 0.0 if vf < 0.0 else 1.0 if vf > 1.0 else vf
                         train_frac = max(0.0, min(1.0, 1.0 - vf))
-                        sampled_n = int(round(float(num_samples_dataset) * float(train_frac) * float(e)))
+                        sampled_n = int(
+                            round(
+                                float(num_samples_dataset)
+                                * float(train_frac)
+                                * float(e)
+                            )
+                        )
                     if sampled_n is None or sampled_n <= 0:
                         sampled_n = int(num_samples_dataset)
                     prev_total = int(getattr(model, "_history_total_samples", 0))
                     new_total = prev_total + int(sampled_n)
                     prev_cum = getattr(model, "_history_cum_stats", None)
-                    cum_stats = _update_batch_stats(prev_cum, prev_total, run_stats, int(sampled_n))
+                    cum_stats = _update_batch_stats(
+                        prev_cum, prev_total, run_stats, int(sampled_n)
+                    )
                     setattr(model, "_history_total_samples", new_total)
                     setattr(model, "_history_dataset_n", int(num_samples_dataset))
                     if cum_stats is not None:
                         setattr(model, "_history_cum_stats", cum_stats)
                     run_hist_prev = getattr(model, "_train_history", None)
-                    run_index = len(run_hist_prev) if isinstance(run_hist_prev, list) else 0
+                    run_index = (
+                        len(run_hist_prev) if isinstance(run_hist_prev, list) else 0
+                    )
                     run_record = {
                         "run_index": run_index,
                         "sampled_n": int(sampled_n),
@@ -1037,9 +1120,17 @@ def predict(
         raise ValueError(f"predict: invalid out_shape={out_shape!r}")
     multi_sources: dict[str, TensorDictBase] | None = None
     if not isinstance(data, TensorDictBase):
-        if isinstance(data, Mapping) and data and all((isinstance(v, TensorDictBase) for v in data.values())):
+        if (
+            isinstance(data, Mapping)
+            and data
+            and all((isinstance(v, TensorDictBase) for v in data.values()))
+        ):
             multi_sources = {str(k): v for k, v in data.items()}
-        elif isinstance(data, Sequence) and data and all((isinstance(v, TensorDictBase) for v in data)):
+        elif (
+            isinstance(data, Sequence)
+            and data
+            and all((isinstance(v, TensorDictBase) for v in data))
+        ):
             multi_sources = {str(i): v for i, v in enumerate(data)}
     if multi_sources is not None:
 
@@ -1051,7 +1142,9 @@ def predict(
             return s or "0"
 
         base_kwargs = dict(kwargs)
-        base_run_id = str(base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}"))
+        base_run_id = str(
+            base_kwargs.get("run_id", f"predict-{os.getpid()}-{int(seed)}")
+        )
         output_mode0 = _coerce_prediction_output(output)
         path_n0 = _coerce_path(path) if path is not None else None
         out_multi: dict[str, TensorDictBase] = {}
@@ -1129,7 +1222,9 @@ def predict(
             raise FileExistsError(f"predict: destination already exists: {out_path!r}")
     writer_chunk_size = int(chunk_size) if chunk_size is not None else 8192
     master_dtype = _get_float_precision(data)
-    ds = Dataset.for_device("cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype)
+    ds = Dataset.for_device(
+        "cpu", feature_dtype=master_dtype, label_float_dtype=master_dtype
+    )
     ds.underflow_action = underflow_action
     tmp_dir = new_dir("infer")
     ckpt_dir = os.path.join(tmp_dir, "ckpt")
@@ -1153,7 +1248,9 @@ def predict(
             if TensorDictBase is not None and isinstance(data, TensorDictBase):
                 X_td, _ = get_row(data, labels_required=False)
                 if X_td is None:
-                    raise ValueError("predict: failed to extract features from TensorDict")
+                    raise ValueError(
+                        "predict: failed to extract features from TensorDict"
+                    )
                 try:
                     count = int(getattr(X_td, "shape", [0])[0] or 0)
                 except Exception:
@@ -1175,10 +1272,14 @@ def predict(
                     features_only=True,
                     chunk_size=writer_chunk_size,
                 )
-            elif isinstance(data, Mapping) and Storage.is_feature_label_batch_mapping(data):
+            elif isinstance(data, Mapping) and Storage.is_feature_label_batch_mapping(
+                data
+            ):
                 f_key = get_feature_key(data)
                 if f_key is None:
-                    raise ValueError("predict: could not resolve feature key from mapping")
+                    raise ValueError(
+                        "predict: could not resolve feature key from mapping"
+                    )
                 X_all = data.get(f_key)
                 try:
                     count = int(len(X_all))
@@ -1193,7 +1294,9 @@ def predict(
                         const_items[k] = v
                         continue
                     if isinstance(v, Mapping) and (
-                        not (TensorDictBase is not None and isinstance(v, TensorDictBase))
+                        not (
+                            TensorDictBase is not None and isinstance(v, TensorDictBase)
+                        )
                     ):
                         const_items[k] = v
                         continue
@@ -1272,7 +1375,9 @@ def predict(
                     chunk_size=writer_chunk_size,
                 )
             if count is None or in_dim is None:
-                raise RuntimeError("predict: failed to infer count/in_dim from input data")
+                raise RuntimeError(
+                    "predict: failed to infer count/in_dim from input data"
+                )
             cfg_obj = None
             with contextlib.suppress(Exception):
                 cfg_obj = getattr(model, "config", None)
@@ -1347,10 +1452,14 @@ def predict(
             if out_path is not None:
                 if os.path.exists(out_path):
                     if overwrite_mode == "resume" and os.path.isfile(out_path):
-                        Storage.validate_predictions_h5(os.fspath(out_path), out_shape=out_shape_t)
+                        Storage.validate_predictions_h5(
+                            os.fspath(out_path), out_shape=out_shape_t
+                        )
                         return PersistentTensorDict(filename=out_path, mode="r")
                     if overwrite_mode == "error":
-                        raise FileExistsError(f"predict: destination already exists: {out_path!r}")
+                        raise FileExistsError(
+                            f"predict: destination already exists: {out_path!r}"
+                        )
                 out_td = Storage.write_predictions_h5_atomic(
                     os.fspath(out_path),
                     memmap_dir=os.fspath(memmap_dir),
@@ -1369,8 +1478,12 @@ def predict(
                 )
                 cleanup_ok = True
                 return out_td
-            X_t = Storage.copy_mmt_to_cpu_tensor(X_mmt, count=count, chunk_size=writer_chunk_size)
-            Y_t = Storage.copy_mmt_to_cpu_tensor(Y_mmt, count=count, chunk_size=writer_chunk_size)
+            X_t = Storage.copy_mmt_to_cpu_tensor(
+                X_mmt, count=count, chunk_size=writer_chunk_size
+            )
+            Y_t = Storage.copy_mmt_to_cpu_tensor(
+                Y_mmt, count=count, chunk_size=writer_chunk_size
+            )
             td_out = TensorDict({"X": X_t, "Y": Y_t}, batch_size=[int(count)])
             cleanup_ok = True
             return td_out
@@ -1395,14 +1508,18 @@ def get_prediction(
             raise ValueError("get_prediction: 'source' must be a non-empty path")
         src = _coerce_path(source)
         if src is None:
-            raise ValueError("get_prediction: 'source' is empty/None after normalization")
+            raise ValueError(
+                "get_prediction: 'source' is empty/None after normalization"
+            )
         output_mode = _coerce_prediction_output(output)
         overwrite_mode = _coerce_prediction_overwrite(overwrite)
         out_path = None
         path_n = _coerce_path(path) if path is not None else None
         if output_mode == "file":
             if path_n is not None:
-                run_id = os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
+                run_id = (
+                    os.path.basename(src.rstrip(os.sep)) or f"prediction-{os.getpid()}"
+                )
                 out_path = _coerce_prediction_path(path_n, run_id=run_id)
                 if out_path is None:
                     logger.warning(
@@ -1426,7 +1543,9 @@ def get_prediction(
                 Storage.validate_predictions_h5(os.fspath(out_path))
                 return PersistentTensorDict(filename=out_path, mode="r")
             if overwrite_mode == "error":
-                raise FileExistsError(f"get_prediction: destination already exists: {out_path!r}")
+                raise FileExistsError(
+                    f"get_prediction: destination already exists: {out_path!r}"
+                )
         if (src.endswith(".h5") or src.endswith(".hdf5")) and os.path.isfile(src):
             if output_mode == "file":
                 if out_path is None:
@@ -1545,7 +1664,9 @@ def get_prediction(
 class _MappingSlicer:
     __slots__ = ("const_items", "slice_items")
 
-    def __init__(self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]) -> None:
+    def __init__(
+        self, const_items: Mapping[Any, Any], slice_items: Tuple[Any, ...]
+    ) -> None:
         self.const_items = dict(const_items)
         self.slice_items = tuple(slice_items)
 

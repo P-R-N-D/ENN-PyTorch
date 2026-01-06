@@ -5,9 +5,7 @@ import contextlib
 import math
 import threading
 from collections import OrderedDict
-from typing import (
-    Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
-)
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -24,8 +22,8 @@ from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetentio
 _Norm = nn.LayerNorm
 
 try:
-    from torch.nn.attention.flex_attention import (create_block_mask,
-                                                   flex_attention)
+    from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
     _HAS_FLEX_ATTENTION = True
 except Exception:
     create_block_mask = None
@@ -40,7 +38,10 @@ _FLEX_ATTENTION_KWARGS: set[str] = set()
 if _HAS_FLEX_ATTENTION and flex_attention is not None:
     with contextlib.suppress(Exception):
         import inspect
-        _FLEX_ATTENTION_KWARGS = set(inspect.signature(flex_attention).parameters.keys())
+
+        _FLEX_ATTENTION_KWARGS = set(
+            inspect.signature(flex_attention).parameters.keys()
+        )
 
 _FLEX_BLOCK_MASK_CACHE_MAX = 16
 _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES = env_int(
@@ -97,7 +98,9 @@ def _stable_softmax(scores: torch.Tensor) -> torch.Tensor:
     return exp / denom
 
 
-def _tensor_stats(t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+def _tensor_stats(
+    t: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     if t.is_floating_point() or t.is_complex():
         v, m = torch.var_mean(t, correction=0)
         mn, mx = torch.aminmax(t)
@@ -155,15 +158,24 @@ def _stream_flex_attention(
         else:
             try:
                 y_g = flex_attention(
-                    qh_g, kh_g, vh_g, block_mask=block_mask_g, scale=scale, dropout_p=dropout_p
+                    qh_g,
+                    kh_g,
+                    vh_g,
+                    block_mask=block_mask_g,
+                    scale=scale,
+                    dropout_p=dropout_p,
                 )
             except TypeError:
                 try:
-                    y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g, scale=scale)
+                    y_g = flex_attention(
+                        qh_g, kh_g, vh_g, block_mask=block_mask_g, scale=scale
+                    )
                 except TypeError:
                     y_g = flex_attention(qh_g, kh_g, vh_g, block_mask=block_mask_g)
 
-        out_g = self.out_proj(y_g.transpose(1, 2).contiguous().view(B_g, L_q, embed_dim))
+        out_g = self.out_proj(
+            y_g.transpose(1, 2).contiguous().view(B_g, L_q, embed_dim)
+        )
         if q_pad is not None:
             out_g = out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
         if out_full is None:
@@ -191,7 +203,20 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
         view = state["model"]
     else:
         view = state
-    buf_names = ("x_mean", "x_std", "y_mean", "y_std", "y_min", "y_max", "y_q_low", "y_q_high", "affine_a", "affine_b", "pw_x", "pw_y")
+    buf_names = (
+        "x_mean",
+        "x_std",
+        "y_mean",
+        "y_std",
+        "y_min",
+        "y_max",
+        "y_q_low",
+        "y_q_high",
+        "affine_a",
+        "affine_b",
+        "pw_x",
+        "pw_y",
+    )
     prefixes = ("scaler.", "module.scaler.")
     for prefix in prefixes:
         for name in buf_names:
@@ -236,7 +261,13 @@ def norm_layer(norm_type: str, dim: int) -> nn.Module:
 
 class _FlexMaskMod:
     def __init__(
-        self, L_q: int, L_k: int, causal: bool, win: int | None, dilation: int, kpm: torch.Tensor
+        self,
+        L_q: int,
+        L_k: int,
+        causal: bool,
+        win: int | None,
+        dilation: int,
+        kpm: torch.Tensor,
     ) -> None:
         self._kv_limit = L_q if L_k > L_q else None
         self.causal = causal
@@ -256,7 +287,7 @@ class _FlexMaskMod:
         if self.dilation > 1:
             keep &= (dq % self.dilation) == 0
         return keep & ~self.kpm[b, kv_idx]
-    
+
 
 class _FlexDilatedMaskMod:
     __slots__ = ("L_q", "L_k", "dilation", "win", "causal")
@@ -276,26 +307,35 @@ class _FlexDilatedMaskMod:
         self.win = None if win is None else int(win)
         self.causal = bool(causal)
 
-    def __call__(self, b: int, h: int, q_idx: torch.Tensor, kv_idx: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self, b: int, h: int, q_idx: torch.Tensor, kv_idx: torch.Tensor
+    ) -> torch.Tensor:
         _ = (b, h)
         dq = q_idx - kv_idx
         keep = torch.ones_like(dq, dtype=torch.bool)
         try:
             if int(self.L_k) > int(self.L_q):
-                keep &= (kv_idx < int(self.L_q))
+                keep &= kv_idx < int(self.L_q)
         except Exception:
             pass
         if self.causal:
-            keep &= (kv_idx <= q_idx)
+            keep &= kv_idx <= q_idx
         if self.win is not None:
-            keep &= (dq.abs() <= int(self.win))
+            keep &= dq.abs() <= int(self.win)
         if self.dilation > 1:
-            keep &= ((dq % int(self.dilation)) == 0)
+            keep &= (dq % int(self.dilation)) == 0
         return keep
 
 
 class Retention(nn.Module):
-    def __init__(self, d_model: int, nhead: int, *args: Any, mode: str | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        *args: Any,
+        mode: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         super().__init__()
         del args, kwargs
         self.msr = MultiScaleRetention(d_model, nhead)
@@ -321,14 +361,21 @@ class Retention(nn.Module):
             return "spatial"
         return m
 
-    def _forward_bidirectional(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def _forward_bidirectional(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         restore_dtype: Optional[torch.dtype] = None
         x_in = x
-        if getattr(x_in.device, "type", "cpu") == "mps" and x_in.dtype == torch.bfloat16:
+        if (
+            getattr(x_in.device, "type", "cpu") == "mps"
+            and x_in.dtype == torch.bfloat16
+        ):
             restore_dtype = x_in.dtype
             x_in = x_in.to(torch.float16)
         if x_in.dim() != 3:
-            raise ValueError(f"Retention(spatial) expects (B,L,D), got {tuple(x_in.shape)}")
+            raise ValueError(
+                f"Retention(spatial) expects (B,L,D), got {tuple(x_in.shape)}"
+            )
         B, L, D = map(int, x_in.shape)
         if L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
@@ -342,15 +389,18 @@ class Retention(nn.Module):
         lam_h = msr._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
         state_fwd = msr._scan_causal(v, lam_h)
         state_bwd = msr._scan_causal(v.flip(1), lam_h).flip(1)
-        calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        calc_dtype = (
+            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        )
         bi_state = (
-            state_fwd.to(calc_dtype)
-            + state_bwd.to(calc_dtype)
-            - v.to(calc_dtype)
+            state_fwd.to(calc_dtype) + state_bwd.to(calc_dtype) - v.to(calc_dtype)
         ).to(dtype=v.dtype)
         y = (q * bi_state).contiguous().view(B, L, int(msr.d_model))
         y = msr.norm(y)
-        if bool(getattr(msr, "use_gate", False)) and getattr(msr, "g_proj", None) is not None:
+        if (
+            bool(getattr(msr, "use_gate", False))
+            and getattr(msr, "g_proj", None) is not None
+        ):
             gate = F.silu(msr.g_proj(x_in))
             y = y * gate
         out = msr.o_proj(y)
@@ -367,7 +417,9 @@ class Retention(nn.Module):
         **kwargs: Any,
     ) -> Tuple[torch.Tensor, Any]:
         _ = kwargs
-        eff_mode = self._coerce_mode(mode if mode is not None else getattr(self, "mode", None))
+        eff_mode = self._coerce_mode(
+            mode if mode is not None else getattr(self, "mode", None)
+        )
         if eff_mode != "spatial":
             h = self.msr(x, attn_mask=attn_mask, state=state, return_state=True)
             if isinstance(h, tuple):
@@ -431,13 +483,16 @@ class DilatedAttention(nn.Module):
             nn.Linear(hidden, self.embed_dim, bias=True),
         )
         self.length_bucket_multiple: int = 64
-        self._dot_attn = DotProductAttention(num_heads=self.nhead, head_dim=self.head_dim)
+        self._dot_attn = DotProductAttention(
+            num_heads=self.nhead, head_dim=self.head_dim
+        )
         self._dot_attn_mask_kw: str | None = "attn_mask"
         self._dot_attn_dropout_kw: str | None = None
         self._dot_attn_training_kw: str | None = "training"
         self._dot_attn_causal_kw: str | None = None
         with contextlib.suppress(Exception):
             import inspect
+
             params = inspect.signature(self._dot_attn.forward).parameters
             if "attn_mask" in params:
                 self._dot_attn_mask_kw = "attn_mask"
@@ -793,7 +848,9 @@ class DilatedAttention(nn.Module):
                 base_mask_out = (~base_mask_keep).to(torch.bool)[None, None, :, :]
             causal_mask: Optional[torch.Tensor] = None
             if is_causal:
-                causal_mask = torch.ones((L_q, L_k), device=qh.device, dtype=torch.bool).triu(diagonal=1)
+                causal_mask = torch.ones(
+                    (L_q, L_k), device=qh.device, dtype=torch.bool
+                ).triu(diagonal=1)
                 causal_mask = causal_mask[None, None, :, :]
             env_mb = int(env_int("STNET_ATTN_WEIGHTS_BATCH_MICROBATCH", 0))
             est = int(B) * int(H) * int(L_q) * int(L_k)
@@ -844,10 +901,14 @@ class DilatedAttention(nn.Module):
                         probs_out = probs.to(dtype=vg.dtype)
                         yg = torch.matmul(probs_out, vg)
                         attn_out_g = self.out_proj(
-                            yg.transpose(1, 2).contiguous().view((b1 - b0), L_q, self.embed_dim)
+                            yg.transpose(1, 2)
+                            .contiguous()
+                            .view((b1 - b0), L_q, self.embed_dim)
                         )
                         if q_pad is not None:
-                            attn_out_g = attn_out_g.masked_fill(q_pad[b0:b1].unsqueeze(-1), 0.0)
+                            attn_out_g = attn_out_g.masked_fill(
+                                q_pad[b0:b1].unsqueeze(-1), 0.0
+                            )
                         out_full[b0:b1] = attn_out_g
                     last_oom = None
                     break
@@ -858,7 +919,9 @@ class DilatedAttention(nn.Module):
                     last_oom = e
                     if x_k.device.type == "cuda":
                         with contextlib.suppress(Exception):
-                            empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
+                            empty_device_cache(
+                                device=x_k.device, do_gc=False, min_interval_s=0.0
+                            )
                     group //= 2
             if last_oom is not None:
                 raise last_oom
@@ -879,7 +942,19 @@ class DilatedAttention(nn.Module):
             last_oom: Optional[RuntimeError] = None
             while group >= 1:
                 try:
-                    attn_out = _stream_flex_attention(self, qh, kh, vh, group_size=group, block_size=_block_size, win=win, scale=scale, dropout_p=dropout_p, kpm_k=kpm_k, q_pad=q_pad)
+                    attn_out = _stream_flex_attention(
+                        self,
+                        qh,
+                        kh,
+                        vh,
+                        group_size=group,
+                        block_size=_block_size,
+                        win=win,
+                        scale=scale,
+                        dropout_p=dropout_p,
+                        kpm_k=kpm_k,
+                        q_pad=q_pad,
+                    )
                     last_oom = None
                     break
                 except RuntimeError as e:
@@ -889,7 +964,9 @@ class DilatedAttention(nn.Module):
                     last_oom = e
                     if x_k.device.type == "cuda":
                         with contextlib.suppress(Exception):
-                            empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
+                            empty_device_cache(
+                                device=x_k.device, do_gc=False, min_interval_s=0.0
+                            )
                     group //= 2
             if last_oom is not None:
                 raise last_oom
@@ -912,7 +989,10 @@ class DilatedAttention(nn.Module):
                 and isinstance(kpm_k, torch.Tensor)
             ):
                 kpm_check: Optional[torch.Tensor] = None
-                if isinstance(key_padding_mask, torch.Tensor) and key_padding_mask.device.type == "cpu":
+                if (
+                    isinstance(key_padding_mask, torch.Tensor)
+                    and key_padding_mask.device.type == "cpu"
+                ):
                     kpm_check = key_padding_mask
                 elif isinstance(kpm_k, torch.Tensor) and kpm_k.device.type == "cpu":
                     kpm_check = kpm_k
@@ -920,7 +1000,9 @@ class DilatedAttention(nn.Module):
                     kpm_b = kpm_check.to(torch.bool)
                     right_padded = True
                     if int(kpm_b.shape[1]) >= 2:
-                        right_padded = not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
+                        right_padded = (
+                            not (kpm_b[:, :-1] & (~kpm_b[:, 1:])).any().item()
+                        )
                     if right_padded:
                         y_full = self._call_dot_attn(
                             qh,
@@ -931,7 +1013,9 @@ class DilatedAttention(nn.Module):
                             is_causal=True,
                         )
                         attn_out = self.out_proj(
-                            y_full.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
+                            y_full.transpose(1, 2)
+                            .contiguous()
+                            .view(B, L_q, self.embed_dim)
                         )
                         if q_pad is not None:
                             attn_out = attn_out.masked_fill(q_pad.unsqueeze(-1), 0.0)
@@ -1018,12 +1102,19 @@ class DilatedAttention(nn.Module):
                                 break
                             except RuntimeError as e:
                                 msg = str(e)
-                                if "CUDA out of memory" not in msg and "out of memory" not in msg:
+                                if (
+                                    "CUDA out of memory" not in msg
+                                    and "out of memory" not in msg
+                                ):
                                     raise
                                 last_oom = e
                                 if x_k.device.type == "cuda":
                                     with contextlib.suppress(Exception):
-                                        empty_device_cache(device=x_k.device, do_gc=False, min_interval_s=0.0)
+                                        empty_device_cache(
+                                            device=x_k.device,
+                                            do_gc=False,
+                                            min_interval_s=0.0,
+                                        )
                                 group //= 2
                         if last_oom is not None:
                             raise last_oom
@@ -1041,14 +1132,25 @@ class DilatedAttention(nn.Module):
             if isinstance(x_out, torch.Tensor) and x_out.dim() == 3:
                 B, L, D = map(int, x_out.shape)
                 bytes_e = int(x_out.element_size())
-                hidden = int(getattr(self.ffn[0], "out_features", 0) or 0) if hasattr(self, "ffn") else 0
+                hidden = (
+                    int(getattr(self.ffn[0], "out_features", 0) or 0)
+                    if hasattr(self, "ffn")
+                    else 0
+                )
                 if hidden > 0:
-                    ffn_bytes = int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+                    ffn_bytes = (
+                        int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+                    )
                 else:
                     ffn_bytes = int(B) * int(L) * int(D) * int(bytes_e) * 9
         except Exception:
             ffn_bytes = 0
-        do_ckpt_ffn = (not bool(skip_ffn_checkpoint)) and self.training and torch.is_grad_enabled() and ffn_bytes >= int(64 * 1024 * 1024)
+        do_ckpt_ffn = (
+            (not bool(skip_ffn_checkpoint))
+            and self.training
+            and torch.is_grad_enabled()
+            and ffn_bytes >= int(64 * 1024 * 1024)
+        )
         if do_ckpt_ffn:
             try:
                 x_out = checkpoint(
@@ -1189,12 +1291,26 @@ class SigmoidGate(nn.Module):
                 if isinstance(last, nn.Linear):
                     nn.init.zeros_(last.weight)
                     nn.init.zeros_(last.bias)
-        self.register_buffer("_fb_count", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_fb_active_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_fb_active_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_fb_width_sum", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_fb_edge_low_sum", torch.zeros((), dtype=torch.float32), persistent=False)
-        self.register_buffer("_fb_edge_high_sum", torch.zeros((), dtype=torch.float32), persistent=False)
+        self.register_buffer(
+            "_fb_count", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_fb_active_low_sum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_fb_active_high_sum",
+            torch.zeros((), dtype=torch.float32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_fb_width_sum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_fb_edge_low_sum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
+        self.register_buffer(
+            "_fb_edge_high_sum", torch.zeros((), dtype=torch.float32), persistent=False
+        )
         self._fb_lock = threading.Lock()
 
     def __getstate__(self):
@@ -1329,7 +1445,11 @@ class SigmoidGate(nn.Module):
         edge_reg_frac: float = 0.02,
         edge_reg_min_width_frac: float = 0.05,
         edge_reg_power: float = 2.0,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> (
+        torch.Tensor
+        | Tuple[torch.Tensor, torch.Tensor]
+        | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
         feats: list[torch.Tensor] = []
         if self.use_tokens:
             t = tokens.mean(dim=1)
@@ -1368,7 +1488,9 @@ class SigmoidGate(nn.Module):
             try:
                 tile_shape_nd = self._normalize_tile_shape(event_shape)
                 D0 = int(base.shape[1])
-                use_tile_nd = bool(tile_shape_nd) and int(self._prod_int(event_shape)) == D0
+                use_tile_nd = (
+                    bool(tile_shape_nd) and int(self._prod_int(event_shape)) == D0
+                )
             except Exception:
                 use_tile_nd = False
         if use_tile_nd:
@@ -1381,7 +1503,10 @@ class SigmoidGate(nn.Module):
             D = int(b32.shape[1])
             event_shape_t = tuple(int(v) for v in event_shape)
             tile_shape_t = tuple(int(v) for v in tile_shape_nd)
-            grid_shape = tuple((int(d) + int(t) - 1) // int(t) for d, t in zip(event_shape_t, tile_shape_t))
+            grid_shape = tuple(
+                (int(d) + int(t) - 1) // int(t)
+                for d, t in zip(event_shape_t, tile_shape_t)
+            )
             pad_shape = tuple(int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t))
             pads: list[int] = []
             for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
@@ -1402,7 +1527,9 @@ class SigmoidGate(nn.Module):
                     if int(padded) == int(orig):
                         continue
                     idx = torch.arange(int(padded), device=device)
-                    v = (idx < int(orig)).view(*([1] * i), int(padded), *([1] * (ndim - i - 1)))
+                    v = (idx < int(orig)).view(
+                        *([1] * i), int(padded), *([1] * (ndim - i - 1))
+                    )
                     mask_bool = v if mask_bool is None else (mask_bool & v)
                 if mask_bool is None:
                     mask_bool = torch.ones(pad_shape, device=device, dtype=torch.bool)
@@ -1425,10 +1552,16 @@ class SigmoidGate(nn.Module):
                 r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=tile_dims) + self.eps)
             else:
                 denom = torch.clamp(mask.sum(dim=tile_dims), min=1.0)
-                b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
-                r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
+                b_rms_t = torch.sqrt(
+                    ((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + self.eps
+                )
+                r_rms_t = torch.sqrt(
+                    ((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + self.eps
+                )
             ratio = r_rms_t / (b_rms_t + float(self.eps))
-            tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
+            tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(
+                dtype=tokens.dtype
+            )
             tile_logit = self.tile_net(tile_feats).squeeze(-1)
             g_add = global_logit.view(B, *([1] * int(len(event_shape_t))))
             logit = g_add + tile_logit
@@ -1461,7 +1594,9 @@ class SigmoidGate(nn.Module):
                         zmin_t = zmin_nd.reshape(1, *interleaved)
                         zmax_t = zmax_nd.reshape(1, *interleaved)
                     sign = torch.where(r_tile >= 0, 1.0, -1.0)
-                    r_safe = torch.where(r_tile.abs() < self.eps, sign * self.eps, r_tile)
+                    r_safe = torch.where(
+                        r_tile.abs() < self.eps, sign * self.eps, r_tile
+                    )
                     p_a = (zmin_t - b_tile) / r_safe
                     p_b = (zmax_t - b_tile) / r_safe
                     p_min_dim = torch.minimum(p_a, p_b)
@@ -1469,12 +1604,20 @@ class SigmoidGate(nn.Module):
                     if mask_tile is not None:
                         neg_inf = torch.finfo(p_min_dim.dtype).min
                         pos_inf = torch.finfo(p_max_dim.dtype).max
-                        p_min_dim = torch.where(mask_tile, p_min_dim, p_min_dim.new_full((), neg_inf))
-                        p_max_dim = torch.where(mask_tile, p_max_dim, p_max_dim.new_full((), pos_inf))
+                        p_min_dim = torch.where(
+                            mask_tile, p_min_dim, p_min_dim.new_full((), neg_inf)
+                        )
+                        p_max_dim = torch.where(
+                            mask_tile, p_max_dim, p_max_dim.new_full((), pos_inf)
+                        )
                     p_low_bound = p_min_dim.amax(dim=tile_dims)
                     p_high_bound = p_max_dim.amin(dim=tile_dims)
-                    p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
-                    p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                    p_low = torch.clamp(
+                        p_low_bound, min=float(self.p_floor), max=float(self.p_ceil)
+                    )
+                    p_high = torch.clamp(
+                        p_high_bound, min=float(self.p_floor), max=float(self.p_ceil)
+                    )
                     p_high = torch.maximum(p_high, p_low + float(self.eps))
             p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
             clip = float(max(self.clip_eps, self.eps))
@@ -1483,7 +1626,9 @@ class SigmoidGate(nn.Module):
             if hi > lo:
                 p_tile = torch.clamp(p_tile, min=lo, max=hi)
             else:
-                p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
+                p_tile = torch.clamp(
+                    p_tile, min=float(self.p_floor), max=float(self.p_ceil)
+                )
             if bool(fallback_bounds):
                 try:
                     width = (p_high - p_low).to(dtype=torch.float32)
@@ -1520,7 +1665,9 @@ class SigmoidGate(nn.Module):
                     min_w = float(max(min_w, self.eps))
                     mask_w = (width >= min_w).to(dtype=torch.float32)
                     w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    q = (p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                    q = (
+                        p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)
+                    ) / w_safe
                     q = torch.clamp(q, 0.0, 1.0)
                     m = float(edge_reg_frac)
                     m = float(min(max(m, self.eps), 0.49))
@@ -1549,14 +1696,20 @@ class SigmoidGate(nn.Module):
             slices = (slice(None),) + tuple(slice(0, int(d)) for d in event_shape_t)
             p_crop = p_pad[slices]
             out_full = p_crop.reshape(B, D)
-            out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            out_dtype = (
+                residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            )
             out_full = out_full.to(dtype=out_dtype)
             if bool(return_edge_reg_lr):
                 if edge_reg_low is None:
                     edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
                 if edge_reg_high is None:
                     edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
-                return out_full, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+                return (
+                    out_full,
+                    edge_reg_low.to(dtype=out_dtype),
+                    edge_reg_high.to(dtype=out_dtype),
+                )
             if bool(return_edge_reg):
                 if edge_reg is None:
                     edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
@@ -1599,8 +1752,12 @@ class SigmoidGate(nn.Module):
                 p_max_dim = torch.maximum(p_a, p_b)
                 p_low_bound = p_min_dim.max(dim=1).values
                 p_high_bound = p_max_dim.min(dim=1).values
-                p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
-                p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
+                p_low = torch.clamp(
+                    p_low_bound, min=float(self.p_floor), max=float(self.p_ceil)
+                )
+                p_high = torch.clamp(
+                    p_high_bound, min=float(self.p_floor), max=float(self.p_ceil)
+                )
                 p_high = torch.maximum(p_high, p_low + float(self.eps))
             p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
             clip = float(max(self.clip_eps, self.eps))
@@ -1646,7 +1803,9 @@ class SigmoidGate(nn.Module):
                     min_w = float(max(min_w, self.eps))
                     mask = (width >= min_w).to(dtype=torch.float32)
                     w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    q = (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe
+                    q = (
+                        p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)
+                    ) / w_safe
                     q = torch.clamp(q, 0.0, 1.0)
                     m = float(edge_reg_frac)
                     m = float(min(max(m, self.eps), 0.49))
@@ -1663,14 +1822,20 @@ class SigmoidGate(nn.Module):
                     edge_reg = None
                     edge_reg_low = None
                     edge_reg_high = None
-            out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            out_dtype = (
+                residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            )
             out = p.to(dtype=out_dtype).unsqueeze(-1)
             if bool(return_edge_reg_lr):
                 if edge_reg_low is None:
                     edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
                 if edge_reg_high is None:
                     edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
-                return out, edge_reg_low.to(dtype=out_dtype), edge_reg_high.to(dtype=out_dtype)
+                return (
+                    out,
+                    edge_reg_low.to(dtype=out_dtype),
+                    edge_reg_high.to(dtype=out_dtype),
+                )
             if bool(return_edge_reg):
                 if edge_reg is None:
                     edge_reg = out.new_tensor(0.0, dtype=torch.float32)
@@ -1688,18 +1853,30 @@ class Scaler(nn.Module):
         self.register_buffer("x_std", torch.ones(1, dtype=torch.float64))
         self.register_buffer("y_mean", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("y_std", torch.ones(1, dtype=torch.float64))
-        self.register_buffer("y_min", torch.full((1,), float("-inf"), dtype=torch.float64))
-        self.register_buffer("y_max", torch.full((1,), float("inf"), dtype=torch.float64))
-        self.register_buffer("y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64))
-        self.register_buffer("y_q_high", torch.full((1,), float("inf"), dtype=torch.float64))
+        self.register_buffer(
+            "y_min", torch.full((1,), float("-inf"), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "y_max", torch.full((1,), float("inf"), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "y_q_low", torch.full((1,), float("-inf"), dtype=torch.float64)
+        )
+        self.register_buffer(
+            "y_q_high", torch.full((1,), float("inf"), dtype=torch.float64)
+        )
         self.register_buffer("affine_a", torch.ones(1, dtype=torch.float64))
         self.register_buffer("affine_b", torch.zeros(1, dtype=torch.float64))
         self.register_buffer("pw_x", torch.empty(0, dtype=torch.float64))
         self.register_buffer("pw_y", torch.empty(0, dtype=torch.float64))
         self._stats_cache_lock = threading.Lock()
         self._stats_cache_max = 8
-        self._x_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
-        self._y_stats_cache: Dict[Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]] = {}
+        self._x_stats_cache: Dict[
+            Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
+        self._y_stats_cache: Dict[
+            Tuple[str, int, torch.dtype], Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
 
     def __getstate__(self):
         state = super().__getstate__()
@@ -1730,7 +1907,11 @@ class Scaler(nn.Module):
         with contextlib.suppress(Exception):
             for name in ("scale", "min_value", "max_value", "max_abs", "min_positive"):
                 t = getattr(self, name, None)
-                if isinstance(t, torch.Tensor) and t.is_floating_point() and t.dtype != torch.float64:
+                if (
+                    isinstance(t, torch.Tensor)
+                    and t.is_floating_point()
+                    and t.dtype != torch.float64
+                ):
                     setattr(self, name, t.to(dtype=torch.float64))
         self._invalidate_stats_cache()
         return self
@@ -1795,19 +1976,26 @@ class Scaler(nn.Module):
         self.y_mean.copy_(mean)
         self.y_std.copy_(std)
         self._invalidate_stats_cache()
-        
+
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         compiling = is_export_or_trace()
         if not compiling:
             if x.numel() == 0:
                 return x
             feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
-            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (
+                1,
+                feat_dim,
+            ):
                 raise RuntimeError(
                     "Scaler.normalize_x: feature dimension mismatch: "
                     f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
                 )
-        key = (x.device.type, int(x.device.index) if x.device.index is not None else -1, x.dtype)
+        key = (
+            x.device.type,
+            int(x.device.index) if x.device.index is not None else -1,
+            x.dtype,
+        )
         with self._stats_cache_lock:
             cached = self._x_stats_cache.get(key)
         if cached is None:
@@ -1835,8 +2023,13 @@ class Scaler(nn.Module):
         if not compiling:
             if x_scaled.numel() == 0:
                 return x_scaled
-            feat_dim = int(x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1])
-            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (1, feat_dim):
+            feat_dim = int(
+                x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1]
+            )
+            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (
+                1,
+                feat_dim,
+            ):
                 raise RuntimeError(
                     "Scaler.denormalize_x: feature dimension mismatch: "
                     f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
@@ -2160,11 +2353,19 @@ class Recorder(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.__stnet_precision_exempt__ = True
-        self.register_buffer("start", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("end", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "start", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "end", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
         self.timezone: str = "UTC"
-        self.register_buffer("peers", torch.zeros(1, dtype=torch.int64), persistent=True)
-        self.register_buffer("epochs", torch.zeros(1, dtype=torch.int64), persistent=True)
+        self.register_buffer(
+            "peers", torch.zeros(1, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "epochs", torch.zeros(1, dtype=torch.int64), persistent=True
+        )
         self.os: str = ""
         self.kernel: str = ""
         self.cpu: List[str] = []
@@ -2172,9 +2373,15 @@ class Recorder(nn.Module):
         self.ram_gb: float = 0.0
         self.python: str = ""
         self.backends: List[str] = []
-        self.register_buffer("sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True)
-        self.register_buffer("sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_n", torch.zeros(1, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "sampled_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "sampled_x_var", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
         self.register_buffer(
             "sampled_x_min",
             torch.full((1,), float("inf"), dtype=torch.float64),
@@ -2185,8 +2392,12 @@ class Recorder(nn.Module):
             torch.full((1,), float("-inf"), dtype=torch.float64),
             persistent=True,
         )
-        self.register_buffer("sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "sampled_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "sampled_y_var", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
         self.register_buffer(
             "sampled_y_min",
             torch.full((1,), float("inf"), dtype=torch.float64),
@@ -2197,9 +2408,15 @@ class Recorder(nn.Module):
             torch.full((1,), float("-inf"), dtype=torch.float64),
             persistent=True,
         )
-        self.register_buffer("reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True)
-        self.register_buffer("reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_n", torch.zeros(1, dtype=torch.int64), persistent=True
+        )
+        self.register_buffer(
+            "reduced_x_mean", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "reduced_x_var", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
         self.register_buffer(
             "reduced_x_min",
             torch.full((1,), float("inf"), dtype=torch.float64),
@@ -2210,8 +2427,12 @@ class Recorder(nn.Module):
             torch.full((1,), float("-inf"), dtype=torch.float64),
             persistent=True,
         )
-        self.register_buffer("reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True)
-        self.register_buffer("reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True)
+        self.register_buffer(
+            "reduced_y_mean", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
+        self.register_buffer(
+            "reduced_y_var", torch.zeros(1, dtype=torch.float64), persistent=True
+        )
         self.register_buffer(
             "reduced_y_min",
             torch.full((1,), float("inf"), dtype=torch.float64),
@@ -2233,6 +2454,7 @@ class Recorder(nn.Module):
             try:
                 import datetime
                 import time
+
                 now = datetime.datetime.now().astimezone()
                 tzinfo = now.tzinfo
                 tz_key = getattr(tzinfo, "key", None) if tzinfo is not None else None
@@ -2270,6 +2492,7 @@ class Recorder(nn.Module):
         backends: List[str],
     ) -> None:
         import platform
+
         self.os = str(os_name)
         self.kernel = str(kernel)
         self.python = str(python_version)
@@ -2277,6 +2500,7 @@ class Recorder(nn.Module):
         arch_norm: List[str] = []
         try:
             from ..core.system import cpu_info, process_cpu_count
+
             n_cores = max(1, int(process_cpu_count() or 1))
             model_name: Optional[str] = None
             with contextlib.suppress(Exception):
@@ -2287,7 +2511,9 @@ class Recorder(nn.Module):
                 if cand:
                     model_name = cand
             if not model_name:
-                model_name = platform.processor() or (cpu_list[0] if cpu_list else "Unknown CPU")
+                model_name = platform.processor() or (
+                    cpu_list[0] if cpu_list else "Unknown CPU"
+                )
             arch_name = platform.machine() or (arch_list[0] if arch_list else "unknown")
             cpu_models = [str(model_name) for _ in range(int(n_cores))]
             arch_norm = [str(arch_name) for _ in range(int(n_cores))]
@@ -2298,9 +2524,10 @@ class Recorder(nn.Module):
         self.arch = arch_norm
         try:
             from ..core.system import Memory
+
             total_bytes = Memory.total()
             if total_bytes is not None and int(total_bytes) > 0:
-                self.ram_gb = float(round(float(total_bytes) / (1024.0 ** 3), 2))
+                self.ram_gb = float(round(float(total_bytes) / (1024.0**3), 2))
             else:
                 self.ram_gb = float(ram_gb)
         except Exception:
@@ -2308,6 +2535,7 @@ class Recorder(nn.Module):
         backend_devices: List[str] = []
         try:
             from ..core.system import get_num_accelerators, is_accelerator_available
+
             if is_accelerator_available("cuda"):
                 num_cuda = int(get_num_accelerators("cuda") or 0)
                 for idx in range(num_cuda):
@@ -2319,7 +2547,11 @@ class Recorder(nn.Module):
             if is_accelerator_available("xpu"):
                 num_xpu = int(get_num_accelerators("xpu") or 0)
                 xpu_mod = getattr(torch, "xpu", None)
-                get_name = getattr(xpu_mod, "get_device_name", None) if xpu_mod is not None else None
+                get_name = (
+                    getattr(xpu_mod, "get_device_name", None)
+                    if xpu_mod is not None
+                    else None
+                )
                 for idx in range(num_xpu):
                     name = "XPU Device"
                     if callable(get_name):

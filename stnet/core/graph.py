@@ -369,7 +369,9 @@ def compile(
                         )
                         if int(local_world) > 1:
                             cpu_count = int(process_cpu_count() or 1)
-                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                            per_rank = max(
+                                1, int(cpu_count) // max(1, int(local_world))
+                            )
                             _inductor_config.compile_threads = max(
                                 1, min(4, int(per_rank) // 2)
                             )
@@ -383,10 +385,18 @@ def compile(
                 with suppress(Exception):
                     _inductor_config.autotune_remote_cache = None
                 with suppress(Exception):
-                    if getattr(_inductor_config, "max_autotune_gemm_search_space", None) is not None:
+                    if (
+                        getattr(
+                            _inductor_config, "max_autotune_gemm_search_space", None
+                        )
+                        is not None
+                    ):
                         _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
                 with suppress(Exception):
-                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
+                    if (
+                        getattr(_inductor_config, "max_autotune_pointwise", None)
+                        is not None
+                    ):
                         _inductor_config.max_autotune_pointwise = False
                 with suppress(Exception):
                     if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
@@ -432,7 +442,9 @@ def compile(
         compile_kwargs["options"] = options_merged
     if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
-        patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
+        patch = (
+            getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
+        )
 
         def _has_cfg_key(cfg: Any, key: str) -> bool:
             obj = cfg
@@ -450,7 +462,7 @@ def compile(
                 if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
             }
             with _INDUCTOR_CONFIG_LOCK:
-                with (patch(patchable) if patchable else nullcontext()):
+                with patch(patchable) if patchable else nullcontext():
                     compile_kwargs.pop("options", None)
                     return compile_fn(module, **compile_kwargs)
         compile_kwargs.pop("options", None)
@@ -550,7 +562,9 @@ def torch_compiler_disable(
     return decorator
 
 
-def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
+def compile_distributed_safe(
+    *args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES
+) -> bool:
     if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
         return False
     try:
@@ -575,7 +589,9 @@ def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECT
     return updated
 
 
-def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
+def compile_safe(
+    *args: Any, runtime_module: Any | None = None, layers_module: Any | None = None
+) -> None:
     if not torch_compiler_supported():
         return
     with suppress(Exception):
@@ -585,7 +601,9 @@ def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: A
             with suppress(Exception):
                 layers_module = importlib.import_module(mod_name)
                 break
-    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
+    scaler_cls = (
+        getattr(layers_module, "Scaler", None) if layers_module is not None else None
+    )
     if scaler_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):
@@ -608,7 +626,9 @@ def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: A
                 reason="Scaler uses Python-side caches/loops; keep eager",
                 recursive=False,
             )
-    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
+    history_cls = (
+        getattr(layers_module, "Recorder", None) if layers_module is not None else None
+    )
     if history_cls is None:
         for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
             with suppress(Exception):

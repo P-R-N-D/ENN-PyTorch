@@ -18,6 +18,7 @@ from ..core.system import get_device, get_dpa_backends, get_runtime_config
 try:
     import triton
     import triton.language as tl
+
     _HAS_TRITON_LIB = True
 except Exception:
     _HAS_TRITON_LIB = False
@@ -25,7 +26,7 @@ except Exception:
     class _TritonStub:
         def jit(self, fn=None, **kwargs):
             if fn is None:
-                return (lambda f: f)
+                return lambda f: f
             return fn
 
         @staticmethod
@@ -335,7 +336,7 @@ def _triton_retention(
     BLOCK_DH: tl.constexpr,
 ) -> None:
     pid_bh = tl.program_id(0)
-    pid_d  = tl.program_id(1)
+    pid_d = tl.program_id(1)
     b = pid_bh // H
     h = pid_bh % H
     dh_off = pid_d * BLOCK_DH + tl.arange(0, BLOCK_DH)
@@ -357,7 +358,9 @@ def reshape_for_mha(
     head_dim: int,
 ) -> torch.Tensor:
     if x.dim() != 3:
-        raise ValueError(f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}")
+        raise ValueError(
+            f"reshape_for_mha expects a 3D tensor (B,N,E), got shape={tuple(x.shape)}"
+        )
     return (
         x.reshape(int(batch), -1, int(heads), int(head_dim))
         .transpose(1, 2)
@@ -453,6 +456,7 @@ class DotProductAttention(nn.Module):
     def _is_nvidia_te_available() -> Any:
         try:
             import transformer_engine.pytorch as te_mod
+
             return (True, te_mod)
         except Exception:
             return (False, None)
@@ -538,7 +542,7 @@ class DotProductAttention(nn.Module):
                 except Exception:
                     uniq = torch.tensor([], device=m.device, dtype=m.dtype)
                 if uniq.numel() <= 2 and bool(((uniq == 0) | (uniq == 1)).all().item()):
-                    mask_bool = (m != 0)
+                    mask_bool = m != 0
                 else:
                     bias_float = m.to(dtype=q_bshd.dtype)
             else:
@@ -546,7 +550,9 @@ class DotProductAttention(nn.Module):
         mb = mh = mL = 0
         bb = bh = bL = 0
         if mask_bool is not None:
-            mask_bool = mask_bool.to(device=q_bshd.device, dtype=torch.bool, non_blocking=True)
+            mask_bool = mask_bool.to(
+                device=q_bshd.device, dtype=torch.bool, non_blocking=True
+            )
             mask_bool, mb, mh, mL = _flatten_attn_mask(
                 mask_bool,
                 device=q_bshd.device,
@@ -563,7 +569,9 @@ class DotProductAttention(nn.Module):
                 except Exception:
                     pass
         if bias_float is not None:
-            bias_float = bias_float.to(device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True)
+            bias_float = bias_float.to(
+                device=q_bshd.device, dtype=q_bshd.dtype, non_blocking=True
+            )
             bias_float, bb, bh, bL = _flatten_attn_mask(
                 bias_float,
                 device=q_bshd.device,
@@ -606,7 +614,10 @@ class DotProductAttention(nn.Module):
                 if not self._te_supports_mask:
                     use_te = False
                 elif te_mask_type is not None and te_mask_type.startswith("padding"):
-                    if not (self._te_supports_mask_type and (self._te_mask_type_param is not None)):
+                    if not (
+                        self._te_supports_mask_type
+                        and (self._te_mask_type_param is not None)
+                    ):
                         use_te = False
             if use_te and (te_mask is None) and bool(is_causal):
                 if not (self._te_supports_mask_type or self._te_supports_is_causal):
@@ -651,7 +662,7 @@ class DotProductAttention(nn.Module):
             if mask_bool is None:
                 final_mask = None
             else:
-                final_mask = (~mask_bool)
+                final_mask = ~mask_bool
                 sdpa_is_causal = False
         else:
             if mask_bool is None:
@@ -659,7 +670,9 @@ class DotProductAttention(nn.Module):
             else:
                 finfo = torch.finfo(q_bshd.dtype)
                 zero = torch.zeros((), dtype=q_bshd.dtype, device=q_bshd.device)
-                neg_inf = torch.full((), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device)
+                neg_inf = torch.full(
+                    (), finfo.min, dtype=q_bshd.dtype, device=q_bshd.device
+                )
                 mask_bias = torch.where(mask_bool, neg_inf, zero)
                 final_mask = (mask_bias + bias_float).contiguous()
             sdpa_is_causal = False
@@ -769,7 +782,9 @@ class MultiScaleRetention(nn.Module):
         else:
             heads = torch.arange(H, device=device, dtype=calc_dtype)
             denom = float(max(H, 1))
-            beta_h = float(self._decay_init) + float(self._decay_range) * (heads / denom)
+            beta_h = float(self._decay_init) + float(self._decay_range) * (
+                heads / denom
+            )
         gammas = 1.0 - torch.pow(2.0, -beta_h)
         gammas = gammas.clamp(min=torch.finfo(calc_dtype).tiny, max=1.0 - 1e-9)
         if calc_dtype != dtype:
@@ -777,7 +792,9 @@ class MultiScaleRetention(nn.Module):
         return gammas
 
     @staticmethod
-    def _apply_kpm_to_v(v: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+    def _apply_kpm_to_v(
+        v: torch.Tensor, attn_mask: torch.Tensor | None
+    ) -> torch.Tensor:
         if not isinstance(attn_mask, torch.Tensor):
             return v
         if attn_mask.dim() != 2 or attn_mask.dtype is not torch.bool:
@@ -789,7 +806,9 @@ class MultiScaleRetention(nn.Module):
         return torch.where(mask, torch.zeros_like(v), v)
 
     @staticmethod
-    def _extract_state_tensor(state: Any, *args: Any, B: int, H: int) -> Optional[torch.Tensor]:
+    def _extract_state_tensor(
+        state: Any, *args: Any, B: int, H: int
+    ) -> Optional[torch.Tensor]:
         if state is None:
             return None
         st: Optional[torch.Tensor] = None
@@ -812,7 +831,9 @@ class MultiScaleRetention(nn.Module):
         return st
 
     @staticmethod
-    def _select_last_state(state_tensor: torch.Tensor, attn_mask: torch.Tensor | None) -> torch.Tensor:
+    def _select_last_state(
+        state_tensor: torch.Tensor, attn_mask: torch.Tensor | None
+    ) -> torch.Tensor:
         if state_tensor.dim() != 4:
             raise ValueError(
                 f"_select_last_state expects (B,L,H,Dh), got {tuple(state_tensor.shape)}"
@@ -837,7 +858,9 @@ class MultiScaleRetention(nn.Module):
         B, L, H, Dh = map(int, v.shape)
         if L <= 0:
             return v.new_zeros(v.shape)
-        calc_dtype = torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        calc_dtype = (
+            torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
+        )
         lam_calc = lam_h.to(dtype=calc_dtype, device=v.device).view(1, 1, H, 1)
         t = torch.arange(L, device=v.device, dtype=calc_dtype).view(1, L, 1, 1)
         p = torch.pow(lam_calc, t)
@@ -854,7 +877,9 @@ class MultiScaleRetention(nn.Module):
     @torch_compiler_disable(recursive=False, reason="Triton retention scan")
     def _scan_causal_triton(self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
         if v.dim() != 4:
-            raise ValueError(f"_scan_causal_triton expects (B,L,H,Dh), got {tuple(v.shape)}")
+            raise ValueError(
+                f"_scan_causal_triton expects (B,L,H,Dh), got {tuple(v.shape)}"
+            )
         if v.device.type != "cuda":
             raise RuntimeError("_scan_causal_triton requires CUDA tensor")
         B, L, H, Dh = map(int, v.shape)
@@ -905,7 +930,11 @@ class MultiScaleRetention(nn.Module):
 
     def _scan_causal(self, v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
         disable_triton = env_bool(
-            ("STNET_MSR_FORCE_TORCH", "STNET_MSR_DISABLE_TRITON", "STNET_DISABLE_TRITON_MSR"),
+            (
+                "STNET_MSR_FORCE_TORCH",
+                "STNET_MSR_DISABLE_TRITON",
+                "STNET_DISABLE_TRITON_MSR",
+            ),
             default=False,
         )
         use_triton = bool(
@@ -936,11 +965,16 @@ class MultiScaleRetention(nn.Module):
         del kwargs
         restore_dtype: torch.dtype | None = None
         x_in = x
-        if getattr(x_in.device, "type", "cpu") == "mps" and x_in.dtype == torch.bfloat16:
+        if (
+            getattr(x_in.device, "type", "cpu") == "mps"
+            and x_in.dtype == torch.bfloat16
+        ):
             restore_dtype = x_in.dtype
             x_in = x.to(torch.float16)
         if x_in.dim() != 3:
-            raise ValueError(f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}")
+            raise ValueError(
+                f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}"
+            )
         B, L, D = map(int, x_in.shape)
         if L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
@@ -952,7 +986,9 @@ class MultiScaleRetention(nn.Module):
                 return out0, st0
             return out0.to(restore_dtype) if restore_dtype is not None else out0
         if D != int(self.d_model):
-            raise ValueError(f"Last dimension {D} must equal d_model={int(self.d_model)}")
+            raise ValueError(
+                f"Last dimension {D} must equal d_model={int(self.d_model)}"
+            )
         decay_arg = None
         if args:
             decay_arg = args[0]
@@ -968,9 +1004,13 @@ class MultiScaleRetention(nn.Module):
             elif decay_arg.dim() == 3 and int(decay_arg.shape[0]) == int(self.nhead):
                 lam_h = decay_arg[:, 1, 0].to(dtype=v.dtype, device=v.device)
             else:
-                lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+                lam_h = self._decay_lambda(v.device, v.dtype).to(
+                    dtype=v.dtype, device=v.device
+                )
         else:
-            lam_h = self._decay_lambda(v.device, v.dtype).to(dtype=v.dtype, device=v.device)
+            lam_h = self._decay_lambda(v.device, v.dtype).to(
+                dtype=v.dtype, device=v.device
+            )
         st_bhd = self._extract_state_tensor(state, B=B, H=int(self.nhead))
         if st_bhd is not None:
             v = v.clone()
@@ -1140,14 +1180,20 @@ class _MultiHeadAttentionNvidia(nn.Module):
         self._te_supports_training: bool = False
         self._te_supports_tuple_mask: bool = True
         if self._te_mha is not None:
-            _fwd = getattr(self._te_mha, "forward", getattr(self._te_mha, "__call__", None))
+            _fwd = getattr(
+                self._te_mha, "forward", getattr(self._te_mha, "__call__", None)
+            )
             with torch.no_grad():
                 if _fwd is not None:
                     try:
                         self._te_forward_signature = inspect.signature(_fwd)
                     except (TypeError, ValueError):
                         self._te_forward_signature = None
-            params = self._te_forward_signature.parameters if self._te_forward_signature else {}
+            params = (
+                self._te_forward_signature.parameters
+                if self._te_forward_signature
+                else {}
+            )
             if "attention_mask" in params:
                 self._te_mask_param = "attention_mask"
             elif "attn_mask" in params:
@@ -1212,22 +1258,76 @@ class _MultiHeadAttentionNvidia(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         embed_dim = int(query.shape[-1])
         if self._force_pt or (self._te_mha is None):
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         if need_weights:
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         if attn_mask is not None:
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         if (not query.is_cuda) or (query.dtype not in (torch.float16, torch.bfloat16)):
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         try:
             if torch._dynamo.is_compiling():
-                return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                return _call_sdpa_fallback(
+                    self._fallback,
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
         except Exception:
             pass
         bf = bool(self.batch_first)
         _q, _k, _v = query, key, value
         if not bf:
-            _q, _k, _v = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+            _q, _k, _v = (
+                query.transpose(0, 1),
+                key.transpose(0, 1),
+                value.transpose(0, 1),
+            )
         te_kwargs: dict[str, Any] = {}
         te_mask: Any = None
         mask_type: str | None = None
@@ -1236,7 +1336,17 @@ class _MultiHeadAttentionNvidia(nn.Module):
             Lq = int(_q.shape[1])
             Lk = int(_k.shape[1])
             if key_padding_mask.shape != (B0, Lk):
-                return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                return _call_sdpa_fallback(
+                    self._fallback,
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
             kpm = key_padding_mask
             if kpm.dtype is not torch.bool:
                 kpm = kpm.to(torch.bool)
@@ -1246,18 +1356,52 @@ class _MultiHeadAttentionNvidia(nn.Module):
                 te_mask = kv_mask
             else:
                 if not self._te_supports_tuple_mask:
-                    return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                    return _call_sdpa_fallback(
+                        self._fallback,
+                        query,
+                        key,
+                        value,
+                        attn_mask=attn_mask,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=need_weights,
+                        average_attn_weights=average_attn_weights,
+                        is_causal=is_causal,
+                    )
                 q_mask = torch.zeros((B0, 1, 1, Lq), device=_q.device, dtype=torch.bool)
                 te_mask = (q_mask, kv_mask)
             mask_type = "padding_causal" if bool(is_causal) else "padding"
         else:
             mask_type = "causal" if bool(is_causal) else "no_mask"
-        if te_mask is not None and mask_type is not None and mask_type.startswith("padding"):
+        if (
+            te_mask is not None
+            and mask_type is not None
+            and mask_type.startswith("padding")
+        ):
             if self._te_mask_type_param is None:
-                return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                return _call_sdpa_fallback(
+                    self._fallback,
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
         if te_mask is not None:
             if self._te_mask_param is None:
-                return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                return _call_sdpa_fallback(
+                    self._fallback,
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
             te_kwargs[self._te_mask_param] = te_mask
         if (mask_type is not None) and (self._te_mask_type_param is not None):
             te_kwargs[self._te_mask_type_param] = mask_type
@@ -1270,12 +1414,42 @@ class _MultiHeadAttentionNvidia(nn.Module):
         except TypeError:
             if isinstance(te_mask, tuple):
                 self._te_supports_tuple_mask = False
-                return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+                return _call_sdpa_fallback(
+                    self._fallback,
+                    query,
+                    key,
+                    value,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                    is_causal=is_causal,
+                )
             self._force_pt = True
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         except Exception:
             self._force_pt = True
-            return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
+            return _call_sdpa_fallback(
+                self._fallback,
+                query,
+                key,
+                value,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=need_weights,
+                average_attn_weights=average_attn_weights,
+                is_causal=is_causal,
+            )
         if isinstance(out, tuple) and len(out) >= 1:
             y, w = out[0], None
         else:
@@ -1291,7 +1465,7 @@ class _MultiHeadAttentionNvidia(nn.Module):
             include_projections=True,
         )
         return y, w
-    
+
 
 class _MultiHeadAttentionCompat(nn.Module):
     def __init__(
@@ -1328,7 +1502,15 @@ class _MultiHeadAttentionCompat(nn.Module):
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
-        out, w = _call_mha_compat(self.mha, query, key, value, attn_mask=attn_mask, is_causal=is_causal, kwargs=kwargs)
+        out, w = _call_mha_compat(
+            self.mha,
+            query,
+            key,
+            value,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            kwargs=kwargs,
+        )
         _compute_flops_mha(
             query,
             key,

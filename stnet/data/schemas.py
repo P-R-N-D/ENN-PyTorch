@@ -72,7 +72,9 @@ def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]
             matches.append(str(k))
     if len(matches) == 0:
         if required:
-            raise KeyError(f"Expected one label key among {sorted(_LABEL_KEY_ALIASES)}; found none")
+            raise KeyError(
+                f"Expected one label key among {sorted(_LABEL_KEY_ALIASES)}; found none"
+            )
         return None
     if len(matches) != 1:
         raise KeyError(
@@ -113,7 +115,9 @@ def write_json(path: str, payload: Any, *args: Any, indent: int | None = 2) -> N
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
     os.makedirs(parent, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent
+    )
     os.close(fd)
     try:
         with open(tmp_name, "w", encoding="utf-8") as f:
@@ -131,7 +135,9 @@ def save_temp(path: str, payload: Any, **opts: Any) -> None:
     p = os.fspath(path)
     parent = os.path.dirname(p) or "."
     os.makedirs(parent, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=os.path.basename(p) + ".", suffix=".tmp", dir=parent
+    )
     os.close(fd)
     try:
         torch.save(payload, tmp_name, **opts)
@@ -142,9 +148,17 @@ def save_temp(path: str, payload: Any, **opts: Any) -> None:
 
 
 def default_underflow_action() -> str:
-    raw = str(
-        env_first(("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"), default="warn") or "warn"
-    ).strip().lower()
+    raw = (
+        str(
+            env_first(
+                ("STNET_DATA_UNDERFLOW_ACTION", "STNET_UNDERFLOW_ACTION"),
+                default="warn",
+            )
+            or "warn"
+        )
+        .strip()
+        .lower()
+    )
     return raw if raw in _DEF_UNDERFLOW_ACTIONS else "warn"
 
 

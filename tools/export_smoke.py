@@ -47,6 +47,7 @@ def _onnx_check(path: Path) -> bool:
         print("[skip] onnx checker: package 'onnx' not installed")
         return True
     import onnx  # type: ignore
+
     try:
         m = onnx.load(str(path))
         onnx.checker.check_model(m)
@@ -68,6 +69,7 @@ def _ort_run(path: Path, x: torch.Tensor, prefer_cuda: bool) -> bool:
         return True
     import numpy as _np  # type: ignore
     import onnxruntime as ort  # type: ignore
+
     providers = ["CPUExecutionProvider"]
     if prefer_cuda:
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -84,7 +86,9 @@ def _ort_run(path: Path, x: torch.Tensor, prefer_cuda: bool) -> bool:
         if "float16" in inp_type:
             x_np = x_cpu.to(torch.float16).numpy()
         elif "bfloat16" in inp_type or "bf16" in inp_type:
-            print("[skip] onnxruntime run: input is bfloat16 (numpy dtype unsupported in many envs)")
+            print(
+                "[skip] onnxruntime run: input is bfloat16 (numpy dtype unsupported in many envs)"
+            )
             return True
         else:
             x_np = x_cpu.to(torch.float32).numpy()
@@ -139,7 +143,9 @@ def _torchscript_run(path: Path, x: torch.Tensor, device: torch.device) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", type=str, default="export_smoke_out", help="Output directory")
+    ap.add_argument(
+        "--out", type=str, default="export_smoke_out", help="Output directory"
+    )
     ap.add_argument("--device", type=str, default="cpu", help="cpu|cuda")
     ap.add_argument("--dtype", type=str, default="fp32", help="fp32|fp16|bf16")
     ap.add_argument("--batch", type=int, default=2)
@@ -210,7 +216,9 @@ def main() -> int:
 
     x = torch.randn(args.batch, args.seq, args.in_dim, device=device, dtype=dtype)
 
-    print(f"Model: in_dim={args.in_dim}, out_shape={out_shape}, device={device}, dtype={dtype}")
+    print(
+        f"Model: in_dim={args.in_dim}, out_shape={out_shape}, device={device}, dtype={dtype}"
+    )
     print(f"Input: {tuple(x.shape)}")
 
     verify = _bool_verify(args)
@@ -221,11 +229,15 @@ def main() -> int:
             with torch.no_grad():
                 y_ref = model.forward_export(x)
             if isinstance(y_ref, torch.Tensor):
-                print(f"Ref output: {tuple(y_ref.shape)} dtype={y_ref.dtype} device={y_ref.device}")
+                print(
+                    f"Ref output: {tuple(y_ref.shape)} dtype={y_ref.dtype} device={y_ref.device}"
+                )
             else:
                 y_ref = None
         except Exception as exc:
-            print(f"[warn] failed to compute reference output: {type(exc).__name__}: {exc}")
+            print(
+                f"[warn] failed to compute reference output: {type(exc).__name__}: {exc}"
+            )
             y_ref = None
 
     ok = True

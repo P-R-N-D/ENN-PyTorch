@@ -43,7 +43,13 @@ from torchdata.nodes import (
     SamplerWrapper,
 )
 
-from ..core.casting import dtype_from_name, env_bool, env_first_int, env_str, parse_torch_dtype
+from ..core.casting import (
+    dtype_from_name,
+    env_bool,
+    env_first_int,
+    env_str,
+    parse_torch_dtype,
+)
 from ..core.graph import inference_mode
 from ..core.staging import Buffer, Pool, ProducerError, close
 from ..core.system import (
@@ -94,7 +100,12 @@ def _meta_has_scale(meta: Any) -> bool:
         return False
     if bool(meta.get("has_scale", False)):
         return True
-    for k in ("scale_max_abs", "scale_min_value", "scale_max_value", "scale_min_positive"):
+    for k in (
+        "scale_max_abs",
+        "scale_min_value",
+        "scale_max_value",
+        "scale_min_positive",
+    ):
         if meta.get(k) is not None:
             return True
     ss = meta.get("scale_stats")
@@ -102,7 +113,12 @@ def _meta_has_scale(meta: Any) -> bool:
         return False
     if bool(ss.get("has_scale", False)):
         return True
-    for k in ("scale_max_abs", "scale_min_value", "scale_max_value", "scale_min_positive"):
+    for k in (
+        "scale_max_abs",
+        "scale_min_value",
+        "scale_max_value",
+        "scale_min_positive",
+    ):
         if ss.get(k) is not None:
             return True
     return False
@@ -152,10 +168,15 @@ def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
         return spec, False
     payload = schemas.read_json(mn_path)
     if isinstance(payload, dict):
-        resolved = {str(k): {"kind": "memmap", "path": os.path.join(root, str(v))} for k, v in payload.items()}
+        resolved = {
+            str(k): {"kind": "memmap", "path": os.path.join(root, str(v))}
+            for k, v in payload.items()
+        }
         return resolved, True
     if isinstance(payload, list):
-        resolved = [{"kind": "memmap", "path": os.path.join(root, str(v))} for v in payload]
+        resolved = [
+            {"kind": "memmap", "path": os.path.join(root, str(v))} for v in payload
+        ]
         return resolved, True
     return spec, False
 
@@ -191,9 +212,27 @@ def _host_guard_ok(guard_bytes: int) -> bool:
 
 @lru_cache(maxsize=1)
 def _accel_event_poll_params() -> tuple[float, float, float]:
-    start_us = int(env_first_int(("STNET_ACCEL_EVENT_POLL_START_US", "STNET_CUDA_EVENT_POLL_START_US"), default=500) or 500)
-    max_ms = int(env_first_int(("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"), default=50) or 50)
-    stop_min_ms = int(env_first_int(("STNET_ACCEL_EVENT_POLL_STOP_MIN_MS", "STNET_CUDA_EVENT_POLL_STOP_MIN_MS"), default=5) or 5)
+    start_us = int(
+        env_first_int(
+            ("STNET_ACCEL_EVENT_POLL_START_US", "STNET_CUDA_EVENT_POLL_START_US"),
+            default=500,
+        )
+        or 500
+    )
+    max_ms = int(
+        env_first_int(
+            ("STNET_ACCEL_EVENT_POLL_MAX_MS", "STNET_CUDA_EVENT_POLL_MAX_MS"),
+            default=50,
+        )
+        or 50
+    )
+    stop_min_ms = int(
+        env_first_int(
+            ("STNET_ACCEL_EVENT_POLL_STOP_MIN_MS", "STNET_CUDA_EVENT_POLL_STOP_MIN_MS"),
+            default=5,
+        )
+        or 5
+    )
     base_s = max(0.0, float(start_us) / 1_000_000.0)
     max_s = max(base_s, float(max_ms) / 1000.0)
     stop_min_s = max(0.0, float(stop_min_ms) / 1000.0)
@@ -308,7 +347,9 @@ def _preload_gather_any_preconverted(
         raise TypeError(f"Object {name} does not support gather by indices") from ex
 
 
-def _normalize_device_spec(device: torch.device | str | Sequence[torch.device | str]) -> torch.device | list[torch.device]:
+def _normalize_device_spec(
+    device: torch.device | str | Sequence[torch.device | str],
+) -> torch.device | list[torch.device]:
     if isinstance(device, torch.device):
         return device
     if isinstance(device, str):
@@ -322,7 +363,9 @@ def _normalize_device_spec(device: torch.device | str | Sequence[torch.device | 
 
 
 def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.device:
-    return device_spec[0] if isinstance(device_spec, list) and device_spec else device_spec
+    return (
+        device_spec[0] if isinstance(device_spec, list) and device_spec else device_spec
+    )
 
 
 class _RowSlicer:
@@ -334,7 +377,9 @@ class _RowSlicer:
         self.features_only = bool(features_only)
 
     def __call__(self, s: int, e: int) -> Mapping[str, Any]:
-        out: Dict[str, Any] = {"features": _preload_slice_any(self.raw_X, s, e, name="features")}
+        out: Dict[str, Any] = {
+            "features": _preload_slice_any(self.raw_X, s, e, name="features")
+        }
         if (self.raw_Y is not None) and (not self.features_only):
             out["labels"] = _preload_slice_any(self.raw_Y, s, e, name="labels")
         return out
@@ -355,9 +400,15 @@ class _RowIndexer:
         except Exception:
             idx_np = None
 
-        out: Dict[str, Any] = {"features": _preload_gather_any_preconverted(self.raw_X, idx_cpu, idx_np, name="features")}
+        out: Dict[str, Any] = {
+            "features": _preload_gather_any_preconverted(
+                self.raw_X, idx_cpu, idx_np, name="features"
+            )
+        }
         if (self.raw_Y is not None) and (not self.features_only):
-            out["labels"] = _preload_gather_any_preconverted(self.raw_Y, idx_cpu, idx_np, name="labels")
+            out["labels"] = _preload_gather_any_preconverted(
+                self.raw_Y, idx_cpu, idx_np, name="labels"
+            )
         return out
 
 
@@ -381,7 +432,9 @@ class _ColumnView(collections.abc.Mapping):
 class _ColumnCursor:
     __slots__ = ("_data", "_keys_source", "_it", "_pos")
 
-    def __init__(self, data: Mapping[Any, Any], keys: Optional[Sequence[Any]] = None) -> None:
+    def __init__(
+        self, data: Mapping[Any, Any], keys: Optional[Sequence[Any]] = None
+    ) -> None:
         self._data = data
         self._keys_source = data.keys() if keys is None else keys
         self._it = iter(self._keys_source)
@@ -436,7 +489,11 @@ class Storage:
                 req_dtype = torch.float32
         except Exception:
             req_dtype = torch.float32
-        return torch.float32 if (bool(negotiable) and req_dtype != torch.float64) else torch.float64
+        return (
+            torch.float32
+            if (bool(negotiable) and req_dtype != torch.float64)
+            else torch.float64
+        )
 
     @staticmethod
     def _to_cpu_contig(t: torch.Tensor) -> torch.Tensor:
@@ -556,7 +613,9 @@ class Storage:
         return rows_t
 
     @staticmethod
-    def _load_prediction(pred_file: str, *args: Any, dtype: torch.dtype) -> torch.Tensor:
+    def _load_prediction(
+        pred_file: str, *args: Any, dtype: torch.dtype
+    ) -> torch.Tensor:
         _ = args
         pf = os.fspath(pred_file)
         if pf.endswith(".mmt"):
@@ -638,9 +697,13 @@ class Storage:
             chunk_size = int(env_chunk)
         req_chunk = int(chunk_size or 0)
         auto_chunk = req_chunk <= 0
-        chunk_first = max(1, min(count_i, req_chunk if req_chunk > 0 else min(count_i, 256)))
+        chunk_first = max(
+            1, min(count_i, req_chunk if req_chunk > 0 else min(count_i, 256))
+        )
         allow_missing = bool(allow_missing_labels) or bool(features_only)
-        default_lshape = tuple(default_label_shape) if default_label_shape is not None else (1,)
+        default_lshape = (
+            tuple(default_label_shape) if default_label_shape is not None else (1,)
+        )
         stats: Dict[str, Any] = {
             "has_scale": False,
             "has_nonfinite": False,
@@ -669,7 +732,9 @@ class Storage:
             if in_dim is None:
                 in_dim = cur_in_dim
             elif cur_in_dim != int(in_dim):
-                raise RuntimeError(f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}")
+                raise RuntimeError(
+                    f"feature dim mismatch: expected {in_dim}, got {cur_in_dim}"
+                )
             if lb is None:
                 if not allow_missing:
                     raise RuntimeError("memmap writer requires labels (got None)")
@@ -681,7 +746,9 @@ class Storage:
             if label_shape is None:
                 label_shape = cur_label_shape
             elif tuple(label_shape) != tuple(cur_label_shape):
-                raise RuntimeError(f"label shape mismatch: expected {label_shape}, got {cur_label_shape}")
+                raise RuntimeError(
+                    f"label shape mismatch: expected {label_shape}, got {cur_label_shape}"
+                )
             f_stats = Dataset.tensor_scale_stats(fx_flat)
             if bool(features_only):
                 stats = Dataset.merge_scale_stats(stats, f_stats)
@@ -698,7 +765,9 @@ class Storage:
                     }
                 else:
                     l_stats = Dataset.tensor_scale_stats(lb_flat)
-                stats = Dataset.merge_scale_stats(stats, Dataset.merge_scale_stats(f_stats, l_stats))
+                stats = Dataset.merge_scale_stats(
+                    stats, Dataset.merge_scale_stats(f_stats, l_stats)
+                )
         if in_dim is None or label_shape is None:
             raise RuntimeError("Failed to infer in_dim/label_shape from data")
         negotiable = Dataset.is_fp32_castable(
@@ -718,10 +787,14 @@ class Storage:
             try:
                 avail = int(Memory.available() or 0)
                 if avail > 0:
-                    target_bytes = int(min(int(target_bytes), max(8 * 1024 * 1024, avail // 16)))
+                    target_bytes = int(
+                        min(int(target_bytes), max(8 * 1024 * 1024, avail // 16))
+                    )
             except Exception:
                 pass
-            chunk_second = int(max(1, min(count_i, max(32, int(target_bytes) // int(row_bytes)))))
+            chunk_second = int(
+                max(1, min(count_i, max(32, int(target_bytes) // int(row_bytes))))
+            )
         else:
             chunk_second = int(max(1, min(count_i, req_chunk)))
         val_count = max(0, min(count_i, int(round(count_i * float(val_frac)))))
@@ -757,7 +830,9 @@ class Storage:
                 5_000_000,
             )
             use_full = (max_elems is not None) and (count_i <= int(max_elems))
-            seed_i = None if seed_value is None else (int(seed_value) & 0x7FFFFFFFFFFFFFFF)
+            seed_i = (
+                None if seed_value is None else (int(seed_value) & 0x7FFFFFFFFFFFFFFF)
+            )
             if use_full:
                 g = None
                 if seed_i is not None:
@@ -774,7 +849,9 @@ class Storage:
                 shuffle_impl = "randperm"
             else:
                 if seed_i is None:
-                    seed_i = int(torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item())
+                    seed_i = int(
+                        torch.randint(0, 2**63 - 1, (1,), dtype=torch.int64).item()
+                    )
                 shuffle_seed = seed_i
                 k = max(1, int((count_i - 1)).bit_length())
                 if (k % 2) == 1:
@@ -809,7 +886,7 @@ class Storage:
                     for rk in round_keys:
                         f = _round_fn(r, rk)
                         l, r = r, (l ^ f) & mask_u
-                    return (((l << half) | r) & domain_u)
+                    return ((l << half) | r) & domain_u
 
                 def _gcd(a: int, b: int) -> int:
                     while b:
@@ -827,7 +904,9 @@ class Storage:
 
                 def _affine(pos: torch.Tensor) -> torch.Tensor:
                     p = pos.to(dtype=torch.int64)
-                    return ((p * int(a0) + int(b0)) % int(count_i)).to(dtype=torch.int64)
+                    return ((p * int(a0) + int(b0)) % int(count_i)).to(
+                        dtype=torch.int64
+                    )
 
                 def _permute(pos: torch.Tensor) -> torch.Tensor:
                     x = pos.to(dtype=torch.uint64)
@@ -868,21 +947,49 @@ class Storage:
         y_min_tmp: Optional[torch.Tensor] = None
         y_max_tmp: Optional[torch.Tensor] = None
         if compute_scaler_stats and int(train_end) > 0:
-            x_sum = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
-            x_sum_sq = torch.zeros((int(in_dim),), dtype=torch.float64, device=torch.device("cpu"))
+            x_sum = torch.zeros(
+                (int(in_dim),), dtype=torch.float64, device=torch.device("cpu")
+            )
+            x_sum_sq = torch.zeros(
+                (int(in_dim),), dtype=torch.float64, device=torch.device("cpu")
+            )
             x_tmp = torch.empty_like(x_sum)
             x2_tmp = torch.empty_like(x_sum)
             out_dim = int(numpy.prod(label_shape))
-            y_sum = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
-            y_sum_sq = torch.zeros((int(out_dim),), dtype=torch.float64, device=torch.device("cpu"))
+            y_sum = torch.zeros(
+                (int(out_dim),), dtype=torch.float64, device=torch.device("cpu")
+            )
+            y_sum_sq = torch.zeros(
+                (int(out_dim),), dtype=torch.float64, device=torch.device("cpu")
+            )
             y_tmp = torch.empty_like(y_sum)
             y2_tmp = torch.empty_like(y_sum)
-            x_min = torch.full((int(in_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
-            x_max = torch.full((int(in_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
+            x_min = torch.full(
+                (int(in_dim),),
+                float("inf"),
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+            )
+            x_max = torch.full(
+                (int(in_dim),),
+                float("-inf"),
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+            )
             x_min_tmp = torch.empty_like(x_sum)
             x_max_tmp = torch.empty_like(x_sum)
-            y_min = torch.full((int(out_dim),), float("inf"), dtype=torch.float64, device=torch.device("cpu"))
-            y_max = torch.full((int(out_dim),), float("-inf"), dtype=torch.float64, device=torch.device("cpu"))
+            y_min = torch.full(
+                (int(out_dim),),
+                float("inf"),
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+            )
+            y_max = torch.full(
+                (int(out_dim),),
+                float("-inf"),
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+            )
             y_min_tmp = torch.empty_like(y_sum)
             y_max_tmp = torch.empty_like(y_sum)
         written = 0
@@ -909,7 +1016,12 @@ class Storage:
                 raise RuntimeError(
                     f"feature dim mismatch: expected {in_dim}, got {int(fx_flat.shape[1])}"
                 )
-            if x_sum is not None and x_sum_sq is not None and x_tmp is not None and x2_tmp is not None:
+            if (
+                x_sum is not None
+                and x_sum_sq is not None
+                and x_tmp is not None
+                and x2_tmp is not None
+            ):
                 end_pos = int(s) + int(n)
                 overlap = max(0, min(end_pos, int(train_end)) - int(s))
                 if overlap > 0:
@@ -920,7 +1032,12 @@ class Storage:
                     x_sum.add_(x_tmp)
                     x2_tmp.copy_(torch.einsum("ni,ni->i", fx_stats, fx_stats))
                     x_sum_sq.add_(x2_tmp)
-                    if x_min is not None and x_max is not None and x_min_tmp is not None and x_max_tmp is not None:
+                    if (
+                        x_min is not None
+                        and x_max is not None
+                        and x_min_tmp is not None
+                        and x_max_tmp is not None
+                    ):
                         torch.amin(fx_stats, dim=0, out=x_min_tmp)
                         torch.minimum(x_min, x_min_tmp, out=x_min)
                         torch.amax(fx_stats, dim=0, out=x_max_tmp)
@@ -961,7 +1078,12 @@ class Storage:
                         dst_l.copy_(lb_cpu)
                     else:
                         dst_l.copy_(lb_cpu.to(dtype=store_float))
-                    if y_sum is not None and y_sum_sq is not None and y_tmp is not None and y2_tmp is not None:
+                    if (
+                        y_sum is not None
+                        and y_sum_sq is not None
+                        and y_tmp is not None
+                        and y2_tmp is not None
+                    ):
                         end_pos = int(s) + int(n)
                         overlap = max(0, min(end_pos, int(train_end)) - int(s))
                         if overlap > 0:
@@ -972,7 +1094,12 @@ class Storage:
                             y_sum.add_(y_tmp)
                             y2_tmp.copy_(torch.einsum("ni,ni->i", lb_stats, lb_stats))
                             y_sum_sq.add_(y2_tmp)
-                            if y_min is not None and y_max is not None and y_min_tmp is not None and y_max_tmp is not None:
+                            if (
+                                y_min is not None
+                                and y_max is not None
+                                and y_min_tmp is not None
+                                and y_max_tmp is not None
+                            ):
                                 torch.amin(lb_stats, dim=0, out=y_min_tmp)
                                 torch.minimum(y_min, y_min_tmp, out=y_min)
                                 torch.amax(lb_stats, dim=0, out=y_max_tmp)
@@ -1013,7 +1140,9 @@ class Storage:
             "labels_path": ("labels.mmt" if write_labels else None),
             "label_shape": list(label_shape),
             "features_dtype": str(store_float).replace("torch.", ""),
-            "labels_dtype": (str(store_float).replace("torch.", "") if write_labels else None),
+            "labels_dtype": (
+                str(store_float).replace("torch.", "") if write_labels else None
+            ),
             "fractions": [float(1.0 - float(val_frac)), float(val_frac)],
             "shuffled": bool(shuffle),
             "shuffle_seed": int(shuffle_seed) if shuffle_seed is not None else None,
@@ -1064,12 +1193,18 @@ class Storage:
         if not bool(features_only):
             if raw_Y is None:
                 if not bool(allow_missing_labels):
-                    raise ValueError("preload_memmap expects 'labels' unless allow_missing_labels=True")
+                    raise ValueError(
+                        "preload_memmap expects 'labels' unless allow_missing_labels=True"
+                    )
             else:
                 if _preload_len0(raw_Y) != int(count):
                     raise ValueError("features and labels must have the same length")
-        ua = normalize_underflow_action(underflow_action, default=default_underflow_action())
-        ds = Dataset.for_device("cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64)
+        ua = normalize_underflow_action(
+            underflow_action, default=default_underflow_action()
+        )
+        ds = Dataset.for_device(
+            "cpu", feature_dtype=torch.float64, label_float_dtype=torch.float64
+        )
         ds.underflow_action = ua
         get_batch = _RowSlicer(raw_X, raw_Y, features_only=bool(features_only))
         get_by_indices = (
@@ -1089,7 +1224,9 @@ class Storage:
             shuffle=bool(shuffle),
             allow_missing_labels=bool(allow_missing_labels),
             features_only=bool(features_only),
-            default_label_shape=tuple(default_label_shape) if default_label_shape is not None else None,
+            default_label_shape=(
+                tuple(default_label_shape) if default_label_shape is not None else None
+            ),
             chunk_size=int(chunk_size),
         )
         return None
@@ -1118,7 +1255,7 @@ class Storage:
 
     @staticmethod
     def merge_meta_info(metas: Any) -> Dict[str, Any]:
-        
+
         def _merge_dicts(items: list[dict]) -> Dict[str, Any]:
             if not items:
                 return {}
@@ -1153,27 +1290,51 @@ class Storage:
                 mn = m.get("scale_min_value")
                 if mn is not None:
                     try:
-                        min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
+                        min_val = (
+                            mn
+                            if min_val is None
+                            else (mn if mn <= min_val else min_val)
+                        )
                     except Exception:
-                        min_val = mn if min_val is None else min(float(min_val), float(mn))
+                        min_val = (
+                            mn if min_val is None else min(float(min_val), float(mn))
+                        )
                 mx = m.get("scale_max_value")
                 if mx is not None:
                     try:
-                        max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
+                        max_val = (
+                            mx
+                            if max_val is None
+                            else (mx if mx >= max_val else max_val)
+                        )
                     except Exception:
-                        max_val = mx if max_val is None else max(float(max_val), float(mx))
+                        max_val = (
+                            mx if max_val is None else max(float(max_val), float(mx))
+                        )
                 p = m.get("scale_min_positive")
                 if p is not None:
                     min_pos = p if min_pos is None else min(float(min_pos), float(p))
                 i = m.get("scale_is_integral")
                 if i is not None:
-                    is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
+                    is_integral = (
+                        bool(i)
+                        if is_integral is None
+                        else bool(is_integral) and bool(i)
+                    )
                 n = m.get("is_negotiable")
                 if n is not None:
-                    is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
+                    is_negotiable = (
+                        bool(n)
+                        if is_negotiable is None
+                        else bool(is_negotiable) and bool(n)
+                    )
                 underflow_action = _strictest_underflow_action(
                     str(underflow_action) if underflow_action is not None else None,
-                    str(m.get("underflow_action")) if m.get("underflow_action") is not None else None,
+                    (
+                        str(m.get("underflow_action"))
+                        if m.get("underflow_action") is not None
+                        else None
+                    ),
                 )
             base["has_scale"] = bool(has_scale)
             base["has_nonfinite"] = bool(has_nonfinite)
@@ -1246,10 +1407,26 @@ class Storage:
             ys2 = payload.get("y_sum_sq")
             if xs is None or xs2 is None or ys is None or ys2 is None:
                 return None
-            xs = xs.detach().to(dtype=torch.float64, device="cpu") if isinstance(xs, torch.Tensor) else torch.as_tensor(xs, dtype=torch.float64)
-            xs2 = xs2.detach().to(dtype=torch.float64, device="cpu") if isinstance(xs2, torch.Tensor) else torch.as_tensor(xs2, dtype=torch.float64)
-            ys = ys.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys, torch.Tensor) else torch.as_tensor(ys, dtype=torch.float64)
-            ys2 = ys2.detach().to(dtype=torch.float64, device="cpu") if isinstance(ys2, torch.Tensor) else torch.as_tensor(ys2, dtype=torch.float64)
+            xs = (
+                xs.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(xs, torch.Tensor)
+                else torch.as_tensor(xs, dtype=torch.float64)
+            )
+            xs2 = (
+                xs2.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(xs2, torch.Tensor)
+                else torch.as_tensor(xs2, dtype=torch.float64)
+            )
+            ys = (
+                ys.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(ys, torch.Tensor)
+                else torch.as_tensor(ys, dtype=torch.float64)
+            )
+            ys2 = (
+                ys2.detach().to(dtype=torch.float64, device="cpu")
+                if isinstance(ys2, torch.Tensor)
+                else torch.as_tensor(ys2, dtype=torch.float64)
+            )
             local_xmin = payload.get("x_min")
             local_xmax = payload.get("x_max")
             local_ymin = payload.get("y_min")
@@ -1267,20 +1444,44 @@ class Storage:
             elif have_bounds and not local_have_bounds:
                 have_bounds = False
                 x_min = x_max = y_min = y_max = None
-            local_have_q = (local_yq_low is not None and local_yq_high is not None)
+            local_have_q = local_yq_low is not None and local_yq_high is not None
             if have_qbounds is None:
                 have_qbounds = bool(local_have_q)
             elif have_qbounds and not local_have_q:
                 have_qbounds = False
                 y_q_low = y_q_high = None
             if have_bounds:
-                local_xmin = local_xmin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmin, torch.Tensor) else torch.as_tensor(local_xmin, dtype=torch.float64)
-                local_xmax = local_xmax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_xmax, torch.Tensor) else torch.as_tensor(local_xmax, dtype=torch.float64)
-                local_ymin = local_ymin.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymin, torch.Tensor) else torch.as_tensor(local_ymin, dtype=torch.float64)
-                local_ymax = local_ymax.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_ymax, torch.Tensor) else torch.as_tensor(local_ymax, dtype=torch.float64)
+                local_xmin = (
+                    local_xmin.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_xmin, torch.Tensor)
+                    else torch.as_tensor(local_xmin, dtype=torch.float64)
+                )
+                local_xmax = (
+                    local_xmax.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_xmax, torch.Tensor)
+                    else torch.as_tensor(local_xmax, dtype=torch.float64)
+                )
+                local_ymin = (
+                    local_ymin.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_ymin, torch.Tensor)
+                    else torch.as_tensor(local_ymin, dtype=torch.float64)
+                )
+                local_ymax = (
+                    local_ymax.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_ymax, torch.Tensor)
+                    else torch.as_tensor(local_ymax, dtype=torch.float64)
+                )
             if have_qbounds:
-                local_yq_low = local_yq_low.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_low, torch.Tensor) else torch.as_tensor(local_yq_low, dtype=torch.float64)
-                local_yq_high = local_yq_high.detach().to(dtype=torch.float64, device="cpu") if isinstance(local_yq_high, torch.Tensor) else torch.as_tensor(local_yq_high, dtype=torch.float64)
+                local_yq_low = (
+                    local_yq_low.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_yq_low, torch.Tensor)
+                    else torch.as_tensor(local_yq_low, dtype=torch.float64)
+                )
+                local_yq_high = (
+                    local_yq_high.detach().to(dtype=torch.float64, device="cpu")
+                    if isinstance(local_yq_high, torch.Tensor)
+                    else torch.as_tensor(local_yq_high, dtype=torch.float64)
+                )
             if x_sum is None:
                 x_sum = xs.clone()
                 x_sum_sq = xs2.clone()
@@ -1304,10 +1505,21 @@ class Storage:
                 y_sum += ys
                 y_sum_sq += ys2
                 if have_bounds:
-                    assert x_min is not None and x_max is not None and y_min is not None and y_max is not None
-                    if local_xmin.shape != x_min.shape or local_xmax.shape != x_max.shape:
+                    assert (
+                        x_min is not None
+                        and x_max is not None
+                        and y_min is not None
+                        and y_max is not None
+                    )
+                    if (
+                        local_xmin.shape != x_min.shape
+                        or local_xmax.shape != x_max.shape
+                    ):
                         return None
-                    if local_ymin.shape != y_min.shape or local_ymax.shape != y_max.shape:
+                    if (
+                        local_ymin.shape != y_min.shape
+                        or local_ymax.shape != y_max.shape
+                    ):
                         return None
                     torch.minimum(x_min, local_xmin, out=x_min)
                     torch.maximum(x_max, local_xmax, out=x_max)
@@ -1315,12 +1527,21 @@ class Storage:
                     torch.maximum(y_max, local_ymax, out=y_max)
                 if have_qbounds:
                     assert y_q_low is not None and y_q_high is not None
-                    if local_yq_low.shape != y_q_low.shape or local_yq_high.shape != y_q_high.shape:
+                    if (
+                        local_yq_low.shape != y_q_low.shape
+                        or local_yq_high.shape != y_q_high.shape
+                    ):
                         return None
                     torch.minimum(y_q_low, local_yq_low, out=y_q_low)
                     torch.maximum(y_q_high, local_yq_high, out=y_q_high)
             total += c
-        if total <= 0 or x_sum is None or x_sum_sq is None or y_sum is None or y_sum_sq is None:
+        if (
+            total <= 0
+            or x_sum is None
+            or x_sum_sq is None
+            or y_sum is None
+            or y_sum_sq is None
+        ):
             return None
         out: Dict[str, Any] = {
             "train_count": int(total),
@@ -1329,20 +1550,30 @@ class Storage:
             "y_sum": y_sum,
             "y_sum_sq": y_sum_sq,
         }
-        if have_bounds and x_min is not None and x_max is not None and y_min is not None and y_max is not None:
-            out.update({
-                "x_min": x_min,
-                "x_max": x_max,
-                "y_min": y_min,
-                "y_max": y_max,
-            })
+        if (
+            have_bounds
+            and x_min is not None
+            and x_max is not None
+            and y_min is not None
+            and y_max is not None
+        ):
+            out.update(
+                {
+                    "x_min": x_min,
+                    "x_max": x_max,
+                    "y_min": y_min,
+                    "y_max": y_max,
+                }
+            )
         if have_qbounds and y_q_low is not None and y_q_high is not None:
-            out.update({
-                "y_q_low": y_q_low,
-                "y_q_high": y_q_high,
-            })
+            out.update(
+                {
+                    "y_q_low": y_q_low,
+                    "y_q_high": y_q_high,
+                }
+            )
         return out
-        
+
     @staticmethod
     def expand_source(sources: Any) -> Any:
         expanded, ok = _expand_multinode_sources(sources)
@@ -1388,7 +1619,9 @@ class Storage:
         meta = Storage.load_memmap_meta(memmap_dir)
         n = int(meta.get("N", 0) or 0)
         if n <= 0:
-            raise ValueError(f"memmap meta.json under {memmap_dir} has non-positive N={n}")
+            raise ValueError(
+                f"memmap meta.json under {memmap_dir} has non-positive N={n}"
+            )
         feat_rel = str(meta.get("features_path", "features.mmt"))
         feat_path = os.path.join(os.fspath(memmap_dir), feat_rel)
         fdim = int(meta.get("feature_dim", 0) or 0)
@@ -1490,14 +1723,20 @@ class Storage:
                 )
             n = int(x_shape[0])
             if n <= 0:
-                raise ValueError(f"predictions file has non-positive row count: {n} ({p!r})")
+                raise ValueError(
+                    f"predictions file has non-positive row count: {n} ({p!r})"
+                )
             if out_shape is None:
                 if len(y_shape) < 2:
-                    raise ValueError(f"predictions file has invalid Y shape: Y={y_shape} ({p!r})")
+                    raise ValueError(
+                        f"predictions file has invalid Y shape: Y={y_shape} ({p!r})"
+                    )
             else:
                 out_shape_t = tuple(int(d) for d in out_shape)
                 if not out_shape_t or any(int(d) <= 0 for d in out_shape_t):
-                    raise ValueError(f"validate_predictions_h5: invalid out_shape={out_shape!r}")
+                    raise ValueError(
+                        f"validate_predictions_h5: invalid out_shape={out_shape!r}"
+                    )
                 if len(y_shape) != 1 + len(out_shape_t):
                     raise ValueError(
                         f"predictions file has unexpected Y rank: got {len(y_shape)}, expected {1 + len(out_shape_t)} ({p!r})"
@@ -1542,7 +1781,10 @@ class Storage:
         pred_meta_path = Storage.get_meta_path(os.fspath(out_path))
         Storage.write_json(
             pred_meta_path,
-            {"dtype": str(store_float).replace("torch.", ""), "shape": list(map(int, full_shape))},
+            {
+                "dtype": str(store_float).replace("torch.", ""),
+                "shape": list(map(int, full_shape)),
+            },
             indent=None,
         )
         return y_out
@@ -1596,9 +1838,13 @@ class Storage:
             cast_dtype = torch.float32
         with h5py.File(out_path, "w") as f:
             dset_X = f.create_dataset(
-                "X", shape=tuple(x_mmt.shape), dtype=Storage._to_numpy_dtype(x_mmt.dtype)
+                "X",
+                shape=tuple(x_mmt.shape),
+                dtype=Storage._to_numpy_dtype(x_mmt.dtype),
             )
-            dset_Y = f.create_dataset("Y", shape=(int(count), *out_shape_t), dtype=np_float)
+            dset_Y = f.create_dataset(
+                "Y", shape=(int(count), *out_shape_t), dtype=np_float
+            )
             step = int(chunk_size)
             for s in range(0, int(count), step):
                 e = min(int(count), s + step)
@@ -1622,7 +1868,9 @@ class Storage:
                         f"Pred/rows mismatch in {pred_file}: preds[0]={predsnp.shape[0]} vs rows={int(rows_t.numel())}"
                     )
                 Storage._h5_write_rows(dset_Y, rows_t, preds_np, count=int(count))
-        return PersistentTensorDict(filename=out_path, batch_size=[int(count)], mode="r")
+        return PersistentTensorDict(
+            filename=out_path, batch_size=[int(count)], mode="r"
+        )
 
     @staticmethod
     def write_predictions_h5_from_memmap(
@@ -1664,8 +1912,12 @@ class Storage:
             )
             for s in range(0, n, step):
                 e = min(n, s + step)
-                dset_X[s:e] = x_mmt[s:e].detach().to(device="cpu", dtype=x_mmt.dtype).numpy()
-                dset_Y[s:e] = y_mmt[s:e].detach().to(device="cpu", dtype=y_cast_dtype).numpy()
+                dset_X[s:e] = (
+                    x_mmt[s:e].detach().to(device="cpu", dtype=x_mmt.dtype).numpy()
+                )
+                dset_Y[s:e] = (
+                    y_mmt[s:e].detach().to(device="cpu", dtype=y_cast_dtype).numpy()
+                )
         return PersistentTensorDict(filename=out_path, batch_size=[int(n)], mode="r")
 
     @staticmethod
@@ -1707,7 +1959,9 @@ class Storage:
                     os.link(tmp_path, out_path_n)
                 os.remove(tmp_path)
             else:
-                raise ValueError(f"write_predictions_h5_atomic: invalid overwrite={overwrite!r}")
+                raise ValueError(
+                    f"write_predictions_h5_atomic: invalid overwrite={overwrite!r}"
+                )
         finally:
             with suppress(Exception):
                 if os.path.exists(tmp_path):
@@ -1758,7 +2012,9 @@ class Storage:
                     os.link(tmp_path, dst_n)
                 os.remove(tmp_path)
             else:
-                raise ValueError(f"copy_predictions_h5_atomic: invalid overwrite={overwrite!r}")
+                raise ValueError(
+                    f"copy_predictions_h5_atomic: invalid overwrite={overwrite!r}"
+                )
         finally:
             with suppress(Exception):
                 if os.path.exists(tmp_path):
@@ -1767,7 +2023,9 @@ class Storage:
         return PersistentTensorDict(filename=dst_n, mode="r")
 
     @staticmethod
-    def remove_prediction_artifacts(*args: Any, memmap_dir: str, pred_path: str) -> None:
+    def remove_prediction_artifacts(
+        *args: Any, memmap_dir: str, pred_path: str
+    ) -> None:
         _ = args
         try:
             meta = Storage.load_memmap_meta(memmap_dir)
@@ -1818,7 +2076,13 @@ class Disposable:
 class BatchScaler:
     __slots__ = ("_v", "_min_scale", "_max_scale")
 
-    def __init__(self, scale: float = 1.0, *args: Any, min_scale: float = 0.5, max_scale: float = 2.0) -> None:
+    def __init__(
+        self,
+        scale: float = 1.0,
+        *args: Any,
+        min_scale: float = 0.5,
+        max_scale: float = 2.0,
+    ) -> None:
         self._min_scale = float(min_scale)
         self._max_scale = float(max_scale)
         self._v = multiprocessing.Value("d", 1.0, lock=True)
@@ -1852,7 +2116,7 @@ class BatchScaler:
         try:
             v = float(self._v.value)
         except Exception:
-            v = float('nan')
+            v = float("nan")
         if math.isfinite(v) and (v > 0.0) and (mn <= v <= mx):
             return float(v)
         try:
@@ -1932,7 +2196,9 @@ class BatchQueue(Buffer):
         self._session = bool(_session)
         self._join_timeout_s = 0.5
         with suppress(Exception):
-            jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
+            jt_ms = int(
+                env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500
+            )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
     def __len__(self) -> int:
@@ -1995,7 +2261,9 @@ class BatchQueue(Buffer):
                 if isinstance(item, ProducerError):
                     if isinstance(item.exc, (KeyboardInterrupt, SystemExit)):
                         raise item.exc
-                    raise RuntimeError(f"BatchQueue producer crashed: {item.exc}\n{item.tb}") from item.exc
+                    raise RuntimeError(
+                        f"BatchQueue producer crashed: {item.exc}\n{item.tb}"
+                    ) from item.exc
                 yield item
         finally:
             self.stop()
@@ -2004,7 +2272,7 @@ class BatchQueue(Buffer):
             close(src_iter)
             with suppress(Exception):
                 if t.is_alive():
-                    t.join(timeout=float(getattr(self, '_join_timeout_s', 0.5)))
+                    t.join(timeout=float(getattr(self, "_join_timeout_s", 0.5)))
             close(t)
 
 
@@ -2023,7 +2291,9 @@ class Sampler(torch.utils.data.Sampler):
         self.dir = os.fspath(memmap_dir)
         self.split = str(split)
         self._meta: Mapping[str, Any] = self._load_meta(self.dir)
-        self._sampler_scale = sampler_scale if sampler_scale is not None else BatchScaler()
+        self._sampler_scale = (
+            sampler_scale if sampler_scale is not None else BatchScaler()
+        )
         self._S_B_cap = 0
         self._N = int(self._meta.get("N", 0))
         if self._N <= 0:
@@ -2049,7 +2319,9 @@ class Sampler(torch.utils.data.Sampler):
                     raise FileNotFoundError(f"labels.mmt not found under: {lab_path}")
         fdim = int(self._meta.get("feature_dim", 0))
         lshape_meta = list(self._meta.get("label_shape") or [])
-        f_dtype = dtype_from_name(self._meta.get("features_dtype", "float64"), torch.float64)
+        f_dtype = dtype_from_name(
+            self._meta.get("features_dtype", "float64"), torch.float64
+        )
         l_dtype = dtype_from_name(self._meta.get("labels_dtype", "int64"), torch.int64)
         self._include_row_ids = env_bool("STNET_INCLUDE_ROW_IDS", default=True)
         self._feat_path = feat_path
@@ -2124,7 +2396,9 @@ class Sampler(torch.utils.data.Sampler):
             val_start, val_end = max(0, self._N - vc), self._N
             train_start, train_end = 0, val_start
         if self.split == "val":
-            self._start, self._end = ((val_start, val_end) if val_end > val_start else (0, 0))
+            self._start, self._end = (
+                (val_start, val_end) if val_end > val_start else (0, 0)
+            )
         else:
             self._start, self._end = (train_start, train_end)
 
@@ -2224,7 +2498,10 @@ class Sampler(torch.utils.data.Sampler):
     def _get_mmaps(self):
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
-        has_labels = bool(getattr(self, "_labels", None) is not None and getattr(self, "_lab_path", None))
+        has_labels = bool(
+            getattr(self, "_labels", None) is not None
+            and getattr(self, "_lab_path", None)
+        )
         tls = getattr(self, "_mmap_tls", None)
         if tls is None:
             tls = threading.local()
@@ -2242,7 +2519,9 @@ class Sampler(torch.utils.data.Sampler):
             with lock:
                 created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
                 if created >= max_pairs:
-                    if not bool(getattr(self, "_mmap_thread_local_overflow_warned", False)):
+                    if not bool(
+                        getattr(self, "_mmap_thread_local_overflow_warned", False)
+                    ):
                         setattr(self, "_mmap_thread_local_overflow_warned", True)
                         with suppress(Exception):
                             _LOGGER.warning(
@@ -2283,7 +2562,9 @@ class Sampler(torch.utils.data.Sampler):
                         lock = threading.Lock()
                         self._mmap_limit_lock = lock
                     with lock:
-                        created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
+                        created = int(
+                            getattr(self, "_mmap_thread_local_created", 0) or 0
+                        )
                         setattr(self, "_mmap_thread_local_created", max(0, created - 1))
                 return self._features, self._labels
             setattr(tls, "features", f_new)
@@ -2308,12 +2589,18 @@ class Sampler(torch.utils.data.Sampler):
             out["Y"] = yt
         return out
 
-    def _gather(self, idx_tensor: torch.Tensor, features: Any, labels: Any) -> Mapping[str, torch.Tensor]:
+    def _gather(
+        self, idx_tensor: torch.Tensor, features: Any, labels: Any
+    ) -> Mapping[str, torch.Tensor]:
         idx_tensor = idx_tensor.to(dtype=torch.long, copy=False)
         try:
             x = features.index_select(0, idx_tensor)
         except Exception:
-            x = features[idx_tensor] if hasattr(features, "__getitem__") else torch.as_tensor(features)[idx_tensor]
+            x = (
+                features[idx_tensor]
+                if hasattr(features, "__getitem__")
+                else torch.as_tensor(features)[idx_tensor]
+            )
         out: Dict[str, torch.Tensor] = {"X": x}
         if bool(getattr(self, "_include_row_ids", True)):
             out["row_ids"] = idx_tensor.to(dtype=torch.int64, copy=False)
@@ -2321,13 +2608,19 @@ class Sampler(torch.utils.data.Sampler):
             try:
                 y = labels.index_select(0, idx_tensor)
             except Exception:
-                y = labels[idx_tensor] if hasattr(labels, "__getitem__") else torch.as_tensor(labels)[idx_tensor]
+                y = (
+                    labels[idx_tensor]
+                    if hasattr(labels, "__getitem__")
+                    else torch.as_tensor(labels)[idx_tensor]
+                )
             if self._label_shape:
                 y = y.reshape(y.shape[0], *self._label_shape)
             out["Y"] = y
         return out
 
-    def __getitem__(self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor) -> Mapping[str, torch.Tensor]:
+    def __getitem__(
+        self, idx: int | Tuple[int, int] | Sequence[int] | torch.Tensor
+    ) -> Mapping[str, torch.Tensor]:
         features, labels = self._get_mmaps()
         base = int(self._start)
         match idx:
@@ -2345,7 +2638,9 @@ class Sampler(torch.utils.data.Sampler):
                     return self._slice(base, base)
                 idx_tensor = idx_tensor + base
                 return self._gather(idx_tensor, features, labels)
-            case seq if isinstance(seq, Sequence) and not isinstance(seq, (str, bytes, bytearray)):
+            case seq if isinstance(seq, Sequence) and not isinstance(
+                seq, (str, bytes, bytearray)
+            ):
                 if len(seq) == 0:
                     return self._slice(base, base)
                 idx_tensor = torch.as_tensor(seq, dtype=torch.long).reshape(-1) + base
@@ -2406,7 +2701,9 @@ class Sampler(torch.utils.data.Sampler):
         n_blocks = max(1, int((total + block - 1) // block))
         if bool(getattr(self, "_S_shuffle", True)):
             g = torch.Generator(device="cpu")
-            g.manual_seed(int(getattr(self, "_S_seed", 0)) + int(getattr(self, "_S_epoch", 0)))
+            g.manual_seed(
+                int(getattr(self, "_S_seed", 0)) + int(getattr(self, "_S_epoch", 0))
+            )
             order = torch.randperm(n_blocks, generator=g, dtype=torch.int64)
         else:
             order = torch.arange(n_blocks, dtype=torch.int64)
@@ -2540,12 +2837,20 @@ class Multiplexer:
             return
 
         epoch_key = _node_state_key(node, "EPOCH_KEY", "epoch")
-        ws_key = _node_state_key(node, "WEIGHTED_SAMPLER_STATE_KEY", "weighted_sampler_state")
+        ws_key = _node_state_key(
+            node, "WEIGHTED_SAMPLER_STATE_KEY", "weighted_sampler_state"
+        )
         ny_key = _node_state_key(node, "NUM_YIELDED_KEY", "num_yielded")
         ex_key = _node_state_key(node, "DATASETS_EXHAUSTED_KEY", "datasets_exhausted")
-        dns_key = _node_state_key(node, "DATASET_NODE_STATES_KEY", "dataset_node_states")
+        dns_key = _node_state_key(
+            node, "DATASET_NODE_STATES_KEY", "dataset_node_states"
+        )
         keys = list(getattr(self, "_source_keys", []) or [])
-        initial_state: Dict[str, Any] = {epoch_key: int(self._epoch), ny_key: 0, ws_key: None}
+        initial_state: Dict[str, Any] = {
+            epoch_key: int(self._epoch),
+            ny_key: 0,
+            ws_key: None,
+        }
         if keys:
             initial_state[ex_key] = {k: False for k in keys}
             initial_state[dns_key] = {k: None for k in keys}
@@ -2559,7 +2864,9 @@ class Multiplexer:
         with suppress(Exception):
             reset(None)
 
-    def compose(self, sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode") -> "BaseNode":
+    def compose(
+        self, sources: Mapping[str, "BaseNode"] | Sequence["BaseNode"] | "BaseNode"
+    ) -> "BaseNode":
         sources_kind: str
         if isinstance(sources, BaseNode):
             sources_kind = "single"
@@ -2568,7 +2875,11 @@ class Multiplexer:
             sources_kind = "sequence"
             if len(sources) < 1:
                 raise ValueError("sources must be non-empty")
-            sources_map = {"0": sources[0]} if len(sources) == 1 else {str(i): n for i, n in enumerate(sources)}
+            sources_map = (
+                {"0": sources[0]}
+                if len(sources) == 1
+                else {str(i): n for i, n in enumerate(sources)}
+            )
         elif isinstance(sources, Mapping):
             sources_kind = "mapping"
             if len(sources) < 1:
@@ -2580,7 +2891,9 @@ class Multiplexer:
                     raise ValueError(f"sources has duplicate key after str(): {kk!r}")
                 sources_map[kk] = v
         else:
-            raise TypeError("sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]")
+            raise TypeError(
+                "sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]"
+            )
         if len(sources_map) <= 1:
             w = {k: 1.0 for k in sources_map.keys()}
             self._source_keys = list(sources_map.keys())
@@ -2598,7 +2911,9 @@ class Multiplexer:
             try:
                 fv = float(v)
             except Exception as exc:
-                raise TypeError(f"weights entry must be numeric (float/int): {where}") from exc
+                raise TypeError(
+                    f"weights entry must be numeric (float/int): {where}"
+                ) from exc
             if not math.isfinite(fv):
                 raise ValueError(f"weights entry must be finite: {where}")
             if fv < 0.0:
@@ -2610,7 +2925,9 @@ class Multiplexer:
             w = {k: 1.0 for k in sources_map.keys()}
         elif isinstance(raw, Mapping):
             if sources_kind != "mapping":
-                raise TypeError("weights must be a Mapping[str, float] when sources is a Mapping")
+                raise TypeError(
+                    "weights must be a Mapping[str, float] when sources is a Mapping"
+                )
             w_in: Dict[str, float] = {}
             for k, v in dict(raw).items():
                 kk = str(k)
@@ -2618,7 +2935,9 @@ class Multiplexer:
                     raise ValueError(f"weights has duplicate key after str(): {kk!r}")
                 w_in[kk] = _coerce_weight(v, where=f"weights[{kk!r}]")
             if not w_in:
-                raise ValueError("weights mapping must be non-empty (use None for uniform)")
+                raise ValueError(
+                    "weights mapping must be non-empty (use None for uniform)"
+                )
             missing = set(sources_map.keys()) - set(w_in.keys())
             extra = set(w_in.keys()) - set(sources_map.keys())
             if missing or extra:
@@ -2627,25 +2946,43 @@ class Multiplexer:
                     f"missing={sorted(missing)} extra={sorted(extra)} sources={sorted(sources_map.keys())}"
                 )
             if not any((float(v) > 0.0) for v in w_in.values()):
-                raise ValueError("weights mapping must contain at least one positive weight")
+                raise ValueError(
+                    "weights mapping must contain at least one positive weight"
+                )
             w = {k: float(w_in[k]) for k in sources_map.keys()}
         elif isinstance(raw, (int, float)) and not isinstance(raw, bool):
-            raise TypeError("scalar weights are only supported for a single source (omit weights for multi-source)")
-        elif isinstance(raw, collections.abc.Sequence) and not isinstance(raw, (str, bytes, bytearray)):
+            raise TypeError(
+                "scalar weights are only supported for a single source (omit weights for multi-source)"
+            )
+        elif isinstance(raw, collections.abc.Sequence) and not isinstance(
+            raw, (str, bytes, bytearray)
+        ):
             if sources_kind != "sequence":
-                raise TypeError("weights must be a Sequence[float] when sources is a Sequence")
+                raise TypeError(
+                    "weights must be a Sequence[float] when sources is a Sequence"
+                )
             seq = list(raw)
             expected = len(sources_map)
             if len(seq) != expected:
-                raise ValueError(f"weights sequence length mismatch: expected {expected}, got {len(seq)}")
-            w_seq = [_coerce_weight(v, where=f"weights[{i}]") for i, v in enumerate(seq)]
+                raise ValueError(
+                    f"weights sequence length mismatch: expected {expected}, got {len(seq)}"
+                )
+            w_seq = [
+                _coerce_weight(v, where=f"weights[{i}]") for i, v in enumerate(seq)
+            ]
             if not any((float(v) > 0.0) for v in w_seq):
-                raise ValueError("weights sequence must contain at least one positive weight")
+                raise ValueError(
+                    "weights sequence must contain at least one positive weight"
+                )
             if not all(str(k).isdigit() for k in sources_map.keys()):
-                raise ValueError("sequence weights require digit-only source keys ('0','1',...)")
+                raise ValueError(
+                    "sequence weights require digit-only source keys ('0','1',...)"
+                )
             w = {k: float(w_seq[int(k)]) for k in sources_map.keys()}
         else:
-            raise TypeError("weights must be a Mapping[str, float] or Sequence[float] (or omitted for uniform)")
+            raise TypeError(
+                "weights must be a Mapping[str, float] or Sequence[float] (or omitted for uniform)"
+            )
         if not any((float(v) > 0.0) for v in w.values()):
             raise ValueError("at least one sampling weight must be positive")
         self._source_keys = list(sources_map.keys())
@@ -2657,6 +2994,7 @@ class Multiplexer:
         )
         self._node = node
         return node
+
 
 class Mapper:
     def __init__(
@@ -2674,21 +3012,37 @@ class Mapper:
         self.map_fn = map_fn
         wp = WorkerPolicy.optimize()
         wp.set_thread_setting()
-        self.io_workers = int(io_workers) if io_workers is not None else int(getattr(wp, "num_workers", 1))
+        self.io_workers = (
+            int(io_workers)
+            if io_workers is not None
+            else int(getattr(wp, "num_workers", 1))
+        )
         self.io_workers = max(1, self.io_workers)
         self.prebatch = (
-            int(prebatch) if prebatch is not None else int(getattr(wp, "prebatch", max(1, self.io_workers * 2)))
+            int(prebatch)
+            if prebatch is not None
+            else int(getattr(wp, "prebatch", max(1, self.io_workers * 2)))
         )
         with suppress(Exception):
             self.prebatch = max(1, int(self.prebatch))
-        pf = int(prefetch_factor) if prefetch_factor is not None else int(getattr(wp, "prefetch_factor", 1))
+        pf = (
+            int(prefetch_factor)
+            if prefetch_factor is not None
+            else int(getattr(wp, "prefetch_factor", 1))
+        )
         with suppress(Exception):
             pf = max(1, int(pf))
         self._prefetch_factor = pf
         self.prefetch_factor = self._prefetch_factor
-        self.device = device if isinstance(device, torch.device) else torch.device(device)
+        self.device = (
+            device if isinstance(device, torch.device) else torch.device(device)
+        )
         self.non_blocking = bool(non_blocking)
-        pin = bool(pin_memory) if pin_memory is not None else (getattr(self.device, "type", "cpu") in {"cuda", "xpu"})
+        pin = (
+            bool(pin_memory)
+            if pin_memory is not None
+            else (getattr(self.device, "type", "cpu") in {"cuda", "xpu"})
+        )
         self._pin_memory = pin
         self.pin_memory = self._pin_memory
         self.max_concurrency = max(1, int(self.io_workers))
@@ -2747,7 +3101,9 @@ class Loader:
         prim = _primary_device(self._device)
         dev_t = getattr(prim, "type", "cpu")
         default_pin = dev_t in {"cuda", "xpu"}
-        self._pin_host = bool(pin_memory) if pin_memory is not None else bool(default_pin)
+        self._pin_host = (
+            bool(pin_memory) if pin_memory is not None else bool(default_pin)
+        )
         if dev_t == "cuda" and self._non_blocking:
             gpu_guard_mb = 2048
         elif dev_t in {"xpu"} and self._non_blocking:
@@ -2756,15 +3112,27 @@ class Loader:
             gpu_guard_mb = 0
         host_guard_mb = 1024 if self._non_blocking else 0
         with suppress(Exception):
-            gpu_guard_mb = int(env_first_int(("STNET_GPU_GUARD_MB",), default=gpu_guard_mb) or gpu_guard_mb)
+            gpu_guard_mb = int(
+                env_first_int(("STNET_GPU_GUARD_MB",), default=gpu_guard_mb)
+                or gpu_guard_mb
+            )
         with suppress(Exception):
-            host_guard_mb = int(env_first_int(("STNET_HOST_GUARD_MB",), default=host_guard_mb) or host_guard_mb)
+            host_guard_mb = int(
+                env_first_int(("STNET_HOST_GUARD_MB",), default=host_guard_mb)
+                or host_guard_mb
+            )
         self._gpu_guard_bytes = int(max(0, gpu_guard_mb) * (1 << 20))
         self._host_guard_bytes = int(max(0, host_guard_mb) * (1 << 20))
         self._node = node_obj
-        self._base_iterable = node_obj if isinstance(node_obj, torchdata.nodes.Loader) else torchdata.nodes.Loader(node_obj)
+        self._base_iterable = (
+            node_obj
+            if isinstance(node_obj, torchdata.nodes.Loader)
+            else torchdata.nodes.Loader(node_obj)
+        )
         self._thread2dev: Dict[int, torch.device] = {}
-        self._threads_hint = self._infer_mapper_threads(node_obj) if node_obj is not None else 1
+        self._threads_hint = (
+            self._infer_mapper_threads(node_obj) if node_obj is not None else 1
+        )
         self._num_shards = 1
         self._shard_id = 0
         try:
@@ -2878,20 +3246,32 @@ class Prefetcher(Buffer):
     ) -> None:
         super().__init__(max_batches=depth)
         self._src = iterable
-        self._device = torch.device(device) if not isinstance(device, torch.device) else device
+        self._device = (
+            torch.device(device) if not isinstance(device, torch.device) else device
+        )
         self._depth = max(1, int(depth))
         self._non_blocking = bool(non_blocking)
-        self._backpressure = bool(memory_backpressure) if memory_backpressure is not None else bool(oom_safe)
+        self._backpressure = (
+            bool(memory_backpressure)
+            if memory_backpressure is not None
+            else bool(oom_safe)
+        )
         self._gpu_guard_bytes = int(gpu_guard_bytes or 0)
         self._host_guard_bytes = int(host_guard_bytes or 0)
-        use_accel = isinstance(self._device, torch.device) and self._device.type in ("cuda", "xpu", "mps")
+        use_accel = isinstance(self._device, torch.device) and self._device.type in (
+            "cuda",
+            "xpu",
+            "mps",
+        )
         self._pin = bool(kwargs.get("pin_host", use_accel))
         self._pin_pool = False
         self._host_pool: Optional[Pool] = None
         if self._pin and self._non_blocking and is_stream_supported(self._device.type):
             use_pool = env_bool("STNET_PREFETCH_PIN_POOL", default=True)
             cap_default = max(8, max(2, int(self._depth) * 2))
-            cap = env_first_int(("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default)
+            cap = env_first_int(
+                ("STNET_PREFETCH_PIN_POOL_CAPACITY",), default=cap_default
+            )
             if use_pool and int(cap) > 0:
                 self._host_pool = Pool(capacity=int(cap), pin_memory=True)
                 self._pin_pool = True
@@ -2902,7 +3282,9 @@ class Prefetcher(Buffer):
         self._guard_ttl_s = max(0.0, float(ttl_ms) / 1000.0)
         self._join_timeout_s = 0.5
         with suppress(Exception):
-            jt_ms = int(env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500)
+            jt_ms = int(
+                env_first_int(("STNET_THREAD_JOIN_TIMEOUT_MS",), default=500) or 500
+            )
             self._join_timeout_s = max(0.0, float(jt_ms) / 1000.0)
 
     def _spawn_session(self) -> "Prefetcher":
@@ -2922,11 +3304,11 @@ class Prefetcher(Buffer):
         if torch.is_tensor(x):
             if x.device == device:
                 return x
-            if x.device.type == 'cpu':
+            if x.device.type == "cpu":
                 nb = bool(self._non_blocking)
                 if nb:
                     try:
-                        is_pinned = getattr(x, 'is_pinned', None)
+                        is_pinned = getattr(x, "is_pinned", None)
                         nb = bool(callable(is_pinned) and bool(is_pinned()))
                     except Exception:
                         nb = False
@@ -2943,23 +3325,23 @@ class Prefetcher(Buffer):
             return _set_tuple(x, mapped)
         if isinstance(x, dict):
             for k, v in x.items():
-                if k in ('row_ids', 'keys'):
+                if k in ("row_ids", "keys"):
                     continue
                 x[k] = self._to_device(v, device)
             return x
         if isinstance(x, collections.abc.Mapping):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                out[k] = v if k in ('row_ids', 'keys') else self._to_device(v, device)
+                out[k] = v if k in ("row_ids", "keys") else self._to_device(v, device)
             return out
         return x
 
     def _pin_memory(self, x: Any) -> Any:
         if not self._pin:
             return x
-        if torch.is_tensor(x) and x.device.type == 'cpu':
+        if torch.is_tensor(x) and x.device.type == "cpu":
             with suppress(Exception):
-                if hasattr(x, 'is_pinned') and bool(x.is_pinned()):
+                if hasattr(x, "is_pinned") and bool(x.is_pinned()):
                     return x
             return x.pin_memory()
         if isinstance(x, list):
@@ -2973,23 +3355,25 @@ class Prefetcher(Buffer):
             return _set_tuple(x, mapped)
         if isinstance(x, dict):
             for k, v in x.items():
-                if k in ('row_ids', 'keys'):
+                if k in ("row_ids", "keys"):
                     continue
                 x[k] = self._pin_memory(v)
             return x
         if isinstance(x, collections.abc.Mapping):
             out: dict[Any, Any] = {}
             for k, v in x.items():
-                out[k] = v if k in ('row_ids', 'keys') else self._pin_memory(v)
+                out[k] = v if k in ("row_ids", "keys") else self._pin_memory(v)
             return out
         return x
 
-    def _stage_with_pool(self, obj: Any, pool: Pool, tokens: list[Optional[Pool.Token]]) -> Any:
-        if torch.is_tensor(obj) and getattr(obj, 'device', None) is not None:
-            if obj.device.type != 'cpu':
+    def _stage_with_pool(
+        self, obj: Any, pool: Pool, tokens: list[Optional[Pool.Token]]
+    ) -> Any:
+        if torch.is_tensor(obj) and getattr(obj, "device", None) is not None:
+            if obj.device.type != "cpu":
                 return obj
             try:
-                if hasattr(obj, 'is_pinned') and bool(obj.is_pinned()):
+                if hasattr(obj, "is_pinned") and bool(obj.is_pinned()):
                     return obj
             except Exception:
                 pass
@@ -3008,14 +3392,18 @@ class Prefetcher(Buffer):
             return _set_tuple(obj, mapped)
         if isinstance(obj, dict):
             for k, v in obj.items():
-                if k in ('row_ids', 'keys'):
+                if k in ("row_ids", "keys"):
                     continue
                 obj[k] = self._stage_with_pool(v, pool, tokens)
             return obj
         if isinstance(obj, collections.abc.Mapping):
             out: dict[Any, Any] = {}
             for k, v in obj.items():
-                out[k] = v if k in ('row_ids', 'keys') else self._stage_with_pool(v, pool, tokens)
+                out[k] = (
+                    v
+                    if k in ("row_ids", "keys")
+                    else self._stage_with_pool(v, pool, tokens)
+                )
             return out
         return obj
 
@@ -3045,7 +3433,11 @@ class Prefetcher(Buffer):
         try:
             if use_device and isinstance(device, torch.device):
                 backend = accelerator_type(device.type)
-                set_dev = getattr(backend, "set_device", None) if backend is not None else None
+                set_dev = (
+                    getattr(backend, "set_device", None)
+                    if backend is not None
+                    else None
+                )
                 with suppress(Exception):
                     if callable(set_dev) and device.index is not None:
                         set_dev(int(device.index))
@@ -3192,7 +3584,9 @@ class Prefetcher(Buffer):
                 if isinstance(item, ProducerError):
                     if isinstance(item.exc, (KeyboardInterrupt, SystemExit)):
                         raise item.exc
-                    raise RuntimeError(f"Prefetcher producer crashed: {item.exc}\n{item.tb}") from item.exc
+                    raise RuntimeError(
+                        f"Prefetcher producer crashed: {item.exc}\n{item.tb}"
+                    ) from item.exc
                 batch, ev = item
                 if use_accel_stream and ev is not None:
                     cs = current_accelerator_stream(device)
