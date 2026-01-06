@@ -5,19 +5,19 @@ import contextlib
 import importlib
 import threading
 from contextlib import AbstractContextManager, suppress, nullcontext
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Iterator
 
 import torch
 from torch import nn
+
+from .casting import env_first, env_first_int
+from .distributed import broadcast_scalar, is_distributed
+from .system import is_accelerator_available, process_cpu_count
 
 try:
     from torch.utils.checkpoint import checkpoint as _torch_checkpoint
 except Exception:
     _torch_checkpoint = None
-
-from .casting import env_first, env_first_int
-from .distributed import broadcast_scalar, is_distributed
-from .system import is_accelerator_available, process_cpu_count
 
 
 try:
@@ -625,7 +625,7 @@ def compile_safe(
             "normalize_y",
             "denormalize_y",
             "calibrate",
-        "_piecewise",
+            "_piecewise",
         ):
             torch_compiler_disable(
                 scaler_cls,
@@ -662,7 +662,7 @@ def compile_safe(
             )
 
 
-def to_submodule(model: object) -> object:
+def to_submodule(model: nn.Module) -> Optional[nn.Module]:
     m = model
     for _ in range(8):
         if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
@@ -674,7 +674,7 @@ def to_submodule(model: object) -> object:
     return None
 
 
-def iter_checkpoint(root: object):
+def iter_checkpoint(root: nn.Module) -> Iterator[nn.Module]:
     try:
         import torch.nn as nn
 
@@ -751,7 +751,7 @@ def to_checkpoint(
     return bool(changed)
 
 
-def from_checkpoint(model: object, *args: Any, step_total: int) -> None:
+def from_checkpoint(model: nn.Module, *args: Any, step_total: int) -> None:
     inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
     if inst is None:
         return
