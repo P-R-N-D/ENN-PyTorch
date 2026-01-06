@@ -10,6 +10,7 @@ import socket
 import warnings
 from contextlib import AbstractContextManager
 from functools import lru_cache
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Iterable, TypeAlias
 
 import torch
@@ -40,10 +41,45 @@ else:
     FSDP = object
     FSDPModule = object
 
+try:
+    from torch.distributed.tensor import DTensor as _DTensor
+except Exception:
+    try:
+        from torch.distributed._tensor import DTensor as _DTensor
+    except Exception:
+        _DTensor = None
+
 
 JoinType: TypeAlias = type[AbstractContextManager[None]] | None
 Join: JoinType = _TorchJoin
 JoinableModel: TypeAlias = DDP | FSDP | FSDPModule
+
+
+def _unshard_fsdp_module(module: torch.nn.Module) -> None:
+    with contextlib.suppress(Exception):
+        if not (dist.is_available() and dist.is_initialized()):
+            return
+    unshard = getattr(module, "unshard", None)
+    if not callable(unshard):
+        return
+    with contextlib.suppress(Exception):
+        p0 = next(module.parameters(recurse=False), None)
+        if p0 is not None:
+            if _DTensor is not None:
+                if not (isinstance(p0, _DTensor) or isinstance(getattr(p0, "data", None), _DTensor)):
+                    return
+            else:
+                tname = type(p0).__name__
+                dname = type(getattr(p0, "data", SimpleNamespace())).__name__
+                if tname != "DTensor" and dname != "DTensor":
+                    return
+    with contextlib.suppress(Exception):
+        handle = unshard(async_op=True)
+        if handle is None:
+            return
+        wait = getattr(handle, "wait", None)
+        if callable(wait):
+            wait()
 
 
 def _strip_ip_expr(value: Any) -> str:
