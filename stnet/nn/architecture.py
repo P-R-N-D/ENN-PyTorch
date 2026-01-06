@@ -65,6 +65,7 @@ from .blocks import (
     _coerce_tensor,
     _infer_module_device,
     _prealloc_microbatch,
+    _size_of_retnet,
     norm_layer,
     stochastic_depth_schedule,
 )
@@ -116,29 +117,6 @@ def _is_export_or_trace() -> bool:
             if torch.onnx.is_in_onnx_export():
                 return True
     return False
-
-
-def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *, mode: str) -> int:
-    if not isinstance(x, torch.Tensor) or x.dim() != 3:
-        return 0
-    B, L, D = map(int, x.shape)
-    if B <= 0 or L <= 0 or D <= 0:
-        return 0
-    bytes_e = int(x.element_size())
-    base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
-    m = str(mode or "temporal").strip().lower()
-    ret_factor = 8 if m == "spatial" else 6
-    retention_bytes = int(base_bytes) * int(ret_factor)
-    hid = 0
-    ffn = getattr(blk0, "ffn", None)
-    with contextlib.suppress(Exception):
-        hid = int(getattr(ffn, "hidden_dim", 0) or getattr(ffn, "hid", 0) or 0)
-    if hid <= 0:
-        hid = int(float(D) * 4.0 * (2.0 / 3.0))
-    ffn_elems = int(B) * int(L) * (int(3) * int(hid) + int(D))
-    ffn_bytes = int(ffn_elems) * int(bytes_e)
-    extra_bytes = int(base_bytes) * 2
-    return int(retention_bytes + ffn_bytes + extra_bytes)
 
 
 def _prod_int(shape: Sequence[int]) -> int:
