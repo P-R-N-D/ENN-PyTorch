@@ -12,13 +12,13 @@ from torch import nn
 from .casting import env_first, env_first_int
 from .system import is_accelerator_available, process_cpu_count
 
-_TORCH_COMPILER = getattr(torch, "compiler", None)
-
 try:
     _TORCH_DYNAMO = importlib.import_module("torch._dynamo")
 except Exception:
     _TORCH_DYNAMO = None
 
+
+_TORCH_COMPILER = getattr(torch, "compiler", None)
 
 _INDUCTOR_CONFIG_LOCK = threading.RLock()
 
@@ -38,97 +38,6 @@ _NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
 
 _GRAPH_BREAK_FN: Callable[[], None] | None = None
 _GRAPH_BREAK_LOCK = threading.Lock()
-
-
-def is_compiling() -> bool:
-    """Best-effort check for torch.compile / torch._dynamo compilation contexts."""
-    with suppress(Exception):
-        dyn = getattr(torch, "_dynamo", None)
-        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
-            if bool(dyn.is_compiling()):
-                return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_compiling", None)
-        if callable(fn) and bool(fn()):
-            return True
-    return False
-
-
-def is_tracing_or_exporting() -> bool:
-    """Best-effort check for tracing / scripting / ONNX export contexts."""
-    with suppress(Exception):
-        jit = getattr(torch, "jit", None)
-        if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
-            return True
-    with suppress(Exception):
-        comp = getattr(torch, "compiler", None)
-        fn = getattr(comp, "is_exporting", None)
-        if callable(fn) and bool(fn()):
-            return True
-    with suppress(Exception):
-        onnx = getattr(torch, "onnx", None)
-        fn = getattr(onnx, "is_in_onnx_export", None)
-        if callable(fn) and bool(fn()):
-            return True
-    return False
-
-
-def is_export_or_trace() -> bool:
-    """Unified helper used across the project to gate export/trace/compile sensitive code."""
-    return bool(is_compiling() or is_tracing_or_exporting())
-
-
-def canonicalize_compile_mode(mode: object | None) -> str:
-    """Normalize/validate compile mode strings.
-
-    Supported user-facing values (case-insensitive; '-'/'_' treated the same):
-
-    - disabled  (also when mode is None or not a str)
-    - aot_eager (alias: debug)
-    - reduce-overhead (alias: stable)
-    - max-autotune
-    - max-autotune-no-cudagraphs
-
-    Any other value is treated as "disabled".
-    """
-    if mode is None or not isinstance(mode, str):
-        return "disabled"
-
-    mode_raw = mode.strip().lower()
-    canonical = mode_raw.replace("_", "-").replace(" ", "-")
-    if "-" in canonical:
-        canonical = "-".join(part for part in canonical.split("-") if part)
-    compact = canonical.replace("-", "")
-
-    if canonical in {"", "none", "null", "disabled", "disable", "off", "false", "0"}:
-        return "disabled"
-
-    if canonical == "debug":
-        return "aot-eager"
-    if canonical == "stable":
-        return "reduce-overhead"
-
-    if canonical in {
-        "aot-eager",
-        "reduce-overhead",
-        "max-autotune",
-        "max-autotune-no-cudagraphs",
-    }:
-        return canonical
-
-    match compact:
-        case "aoteager":
-            return "aot-eager"
-        case "reduceoverhead":
-            return "reduce-overhead"
-        case "maxautotune":
-            return "max-autotune"
-        case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
-            return "max-autotune-no-cudagraphs"
-        case _:
-            return "disabled"
-
 
 
 def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
@@ -303,8 +212,59 @@ def _decorate_compiler_disable(
             continue
         except Exception:
             break
-
     return _identity
+
+
+def is_compiling() -> bool:
+    with suppress(Exception):
+        dyn = getattr(torch, "_dynamo", None)
+        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
+            if bool(dyn.is_compiling()):
+                return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        fn = getattr(comp, "is_compiling", None)
+        if callable(fn) and bool(fn()):
+            return True
+    return False
+
+
+def is_tracing_or_exporting() -> bool:
+    with suppress(Exception):
+        jit = getattr(torch, "jit", None)
+        if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
+            return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        fn = getattr(comp, "is_exporting", None)
+        if callable(fn) and bool(fn()):
+            return True
+    with suppress(Exception):
+        onnx = getattr(torch, "onnx", None)
+        fn = getattr(onnx, "is_in_onnx_export", None)
+        if callable(fn) and bool(fn()):
+            return True
+    return False
+
+
+def is_export_or_trace() -> bool:
+    return bool(is_compiling() or is_tracing_or_exporting())
+
+
+def canonicalize_compile_mode(mode: object | None) -> str:
+    if not isinstance(mode, str):
+        return "disabled"
+    compact_mode = mode.lower().replace("_", "").replace("-", "").replace(" ", "")
+    mode_map = {
+        "aoteager": "aot-eager",
+        "reduceoverhead": "reduce-overhead",
+        "maxautotune": "max-autotune",
+        "maxautotunenocudagraphs": "max-autotune-no-cudagraphs",
+        "maxautotunenocudagraph": "max-autotune-no-cudagraphs",
+        "debug": "aot-eager",
+        "stable": "reduce-overhead",
+    }
+    return mode_map.get(compact_mode, "disabled")
 
 
 def clear_model_cache(model: Optional[nn.Module]) -> None:
@@ -359,7 +319,6 @@ def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
     return torch.inference_mode()
 
 
-
 def compile(
     module: nn.Module,
     *args: Any,
@@ -371,34 +330,21 @@ def compile(
     disable: bool = False,
     **kwargs: Any,
 ) -> nn.Module:
-    """torch.compile wrapper with:
-    - compile mode normalization
-    - safe handling of (mode + options) in PyTorch versions where it's mutually exclusive
-    - no-GIL friendly locking around temporary inductor config patches
-    """
     del args
     if disable:
         return module
-
     canonical_mode = canonicalize_compile_mode(mode)
     if canonical_mode == "disabled":
         return module
-
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         return module
-
-    # Ensure max-autotune doesn't try to enable cudagraphs on non-CUDA modules.
     if canonical_mode == "max-autotune" and not _is_for_cuda(module):
         canonical_mode = "max-autotune-no-cudagraphs"
-
-    # Merge / derive inductor options.
     opt: Dict[str, Any] = dict(options or {})
     if canonical_mode == "max-autotune-no-cudagraphs":
         opt.setdefault("triton.cudagraphs", False)
     options_merged: Dict[str, Any] | None = opt or None
-
-    # One-time-ish inductor config defaults (global), guarded by a lock.
     _inductor_config = _get_inductor_config()
     if _inductor_config is not None:
         with _INDUCTOR_CONFIG_LOCK:
@@ -429,9 +375,7 @@ def compile(
                             )
             except Exception:
                 pass
-
             if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
-                # Prefer isolation/caching for autotune to avoid lock contention.
                 with suppress(Exception):
                     _inductor_config.autotune_in_subproc = True
                 with suppress(Exception):
@@ -447,8 +391,6 @@ def compile(
                 with suppress(Exception):
                     if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
                         _inductor_config.max_autotune_gemm = True
-                # When user didn't explicitly override compile_threads, keep it low to reduce
-                # compilation contention across ranks.
                 with suppress(Exception):
                     if getattr(_inductor_config, "compile_threads", None) is not None:
                         override_raw = env_first(
@@ -465,7 +407,6 @@ def compile(
                                 override_valid = True
                         if not override_valid:
                             _inductor_config.compile_threads = 1
-
     backend_value = backend
     mode_value: Optional[str] = None
     match canonical_mode:
@@ -475,7 +416,6 @@ def compile(
             mode_value = canonical_mode
         case _:
             mode_value = str(mode) if mode is not None else None
-
     compile_kwargs: Dict[str, Any] = dict(kwargs)
     if backend_value is not None:
         compile_kwargs["backend"] = backend_value
@@ -485,16 +425,11 @@ def compile(
         compile_kwargs["fullgraph"] = bool(fullgraph)
     if dynamic is not None:
         compile_kwargs["dynamic"] = bool(dynamic)
-
-    # Merge options with any existing compile_kwargs["options"].
     if options_merged is not None:
         existing = compile_kwargs.get("options", {})
         if isinstance(existing, dict):
             options_merged = {**options_merged, **existing}
         compile_kwargs["options"] = options_merged
-
-    # PyTorch 2.5+ disallows passing (mode, options) together. If both were specified,
-    # patch inductor config temporarily while compiling.
     if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
         inductor_cfg = _get_inductor_config()
         patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
@@ -514,18 +449,13 @@ def compile(
                 for k, v in options_dict.items()
                 if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
             }
-            # Serialize the patch+compile region to avoid cross-thread config races (no-GIL).
             with _INDUCTOR_CONFIG_LOCK:
                 with (patch(patchable) if patchable else nullcontext()):
                     compile_kwargs.pop("options", None)
                     return compile_fn(module, **compile_kwargs)
-
-        # If patch isn't available, drop options (success > exact options) and compile.
         compile_kwargs.pop("options", None)
         return compile_fn(module, **compile_kwargs)
-
     return compile_fn(module, **compile_kwargs)
-
 
 
 def torch_compiler_supported() -> bool:
