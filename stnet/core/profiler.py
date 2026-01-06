@@ -25,9 +25,9 @@ except Exception:
     TorchDispatchMode = None
 
 
-_LOGGER = logging.getLogger(__name__)
-
 FLOP_PROFILER: "_FlopProfiler" | None = None
+
+_LOGGER = logging.getLogger(__name__)
 
 _ACT_COEFF: Dict[type, float] = {
     nn.ReLU: 1.0,
@@ -937,7 +937,6 @@ class _OpFlopDispatchMode(TorchDispatchMode):
                 getattr(self._aten.scaled_dot_product_attention, "default", None),
                 self._h_sdpa,
             )
-
         for name in (
             "_scaled_dot_product_flash_attention",
             "_scaled_dot_product_flash_attention_for_cpu",
@@ -1448,24 +1447,6 @@ class _GraphProfiler:
             if op is not None and hasattr(op, "default"):
                 self._sdpa_like_ops.append(op.default)
 
-    def estimate(self, gm: torch.fx.GraphModule) -> Tuple[float, Dict[str, float]]:
-
-        total = 0.0
-        by: Dict[str, float] = {}
-        for node in gm.graph.nodes:
-            if node.op != "call_function":
-                continue
-            target = node.target
-            args = _fx_resolve(node.args, gm)
-            kwargs = _fx_resolve(node.kwargs or {}, gm)
-            out = _fx_resolve_node(node, gm)
-            flops, typ = self._call(target, args, kwargs, out)
-            if flops <= 0.0:
-                continue
-            total += float(flops)
-            by[typ] = by.get(typ, 0.0) + float(flops)
-        return float(total), by
-
     def _as_tensor(self, out: Any) -> Any:
         if isinstance(out, (tuple, list)) and out:
             return out[0]
@@ -1789,6 +1770,23 @@ class _GraphProfiler:
                 return float(fwd * (1.0 + max(0.0, self._effective_bwd)))
         return self._eltwise(out, 1.0)
 
+    def estimate(self, gm: torch.fx.GraphModule) -> Tuple[float, Dict[str, float]]:
+        total = 0.0
+        by: Dict[str, float] = {}
+        for node in gm.graph.nodes:
+            if node.op != "call_function":
+                continue
+            target = node.target
+            args = _fx_resolve(node.args, gm)
+            kwargs = _fx_resolve(node.kwargs or {}, gm)
+            out = _fx_resolve_node(node, gm)
+            flops, typ = self._call(target, args, kwargs, out)
+            if flops <= 0.0:
+                continue
+            total += float(flops)
+            by[typ] = by.get(typ, 0.0) + float(flops)
+        return float(total), by
+
 
 class _FlopProfiler:
     _stack_var: contextvars.ContextVar[Tuple[_Acc, ...]] = contextvars.ContextVar("stnet_flops_stack", default=())
@@ -1796,6 +1794,16 @@ class _FlopProfiler:
 
     def _stack(self) -> Tuple[_Acc, ...]:
         return self._stack_var.get()
+
+    def _capture_torch(self, display: bool = False) -> Any:
+        profile_fn = None
+        try:
+            from torch.profiler import profile as profile_fn
+        except Exception:
+            profile_fn = None
+        if profile_fn is not None:
+            return _TorchFlops(profile_fn, show=bool(display))
+        return _TorchFlopsCompat(show=bool(display))
 
     def is_active(self) -> bool:
         return len(self._stack()) > 0
@@ -1888,16 +1896,6 @@ class _FlopProfiler:
         except Exception:
             return contextlib.nullcontext()
         return _NvtxFlops(device, getter)
-
-    def _capture_torch(self, display: bool = False) -> Any:
-        profile_fn = None
-        try:
-            from torch.profiler import profile as profile_fn
-        except Exception:
-            profile_fn = None
-        if profile_fn is not None:
-            return _TorchFlops(profile_fn, show=bool(display))
-        return _TorchFlopsCompat(show=bool(display))
 
     def start(self, model: nn.Module, *args: Any, cfg: _ProfilerConfig) -> List[Any]:
         handles: List[Any] = []
@@ -2110,13 +2108,11 @@ class _Flops(contextlib.AbstractContextManager[Any]):
         self._use_torch_profiler = bool(use_torch_profiler)
         self._use_nvtx = bool(use_nvtx)
         self._dispatch_mode = dispatch_mode
-
         self.manual_total = 0.0
         self.manual_breakdown: Dict[str, float] = {}
         self.torch_total = 0.0
         self.nvtx_total = 0.0
         self.total = 0.0
-
         self._torch_scope: Any = None
         self._nvtx_scope: Any = None
         self._dispatch_scope: Any = None
@@ -2346,14 +2342,6 @@ class FlopCounter:
         self._fx_estimator: Optional[_GraphProfiler] = None
         self._effective_backend = self._backend.lower()
 
-    @property
-    def device(self) -> Optional[torch.device]:
-        return self._device
-
-    @property
-    def hook_count(self) -> int:
-        return int(self._hook_count)
-
     def _effective_bwd(self) -> float:
         eff = 2.0 if self._mode == "train" else 0.0
         if self._bwd_factor is not None:
@@ -2411,6 +2399,13 @@ class FlopCounter:
     def _sig_key(self, args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
         return (tuple(_flop_sig_key_of(a) for a in args), _flop_sig_key_of(kwargs))
 
+    @property
+    def device(self) -> Optional[torch.device]:
+        return self._device
+
+    @property
+    def hook_count(self) -> int:
+        return int(self._hook_count)
 
     def prepare(self, *example_args: Any, **example_kwargs: Any) -> Tuple[float, Dict[str, float]]:
         key = self._sig_key(example_args, example_kwargs)
