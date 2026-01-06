@@ -31,6 +31,21 @@ def _casefold_str(x: Any) -> Optional[str]:
     return None
 
 
+def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
+    try:
+        td.set(key, value)
+    except Exception:
+        td[key] = value
+
+
+def _td_del(td: TensorDictBase, key: str) -> None:
+    try:
+        td.del_(key)
+    except Exception:
+        with contextlib.suppress(Exception):
+            del td[key]
+
+
 def get_feature_key(data: Any) -> str:
     if not isinstance(data, (Mapping, TensorDictBase)):
         raise TypeError("resolve_feature_key expects a Mapping or TensorDict")
@@ -64,21 +79,6 @@ def get_label_key(data: Any, *args: Any, required: bool = True) -> Optional[str]
             f"Expected exactly one label key among {sorted(_LABEL_KEY_ALIASES)}; found {matches}"
         )
     return matches[0]
-
-
-def _td_set(td: TensorDictBase, key: str, value: Any) -> None:
-    try:
-        td.set(key, value)
-    except Exception:
-        td[key] = value
-
-
-def _td_del(td: TensorDictBase, key: str) -> None:
-    try:
-        td.del_(key)
-    except Exception:
-        with contextlib.suppress(Exception):
-            del td[key]
 
 
 def get_meta_path(mmt_path: str) -> str:
