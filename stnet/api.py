@@ -34,6 +34,7 @@ from tensordict import (
     TensorDict,
     TensorDictBase,
 )
+from torch.distributed.run import LaunchConfig, elastic_launch
 from torch.distributed.checkpoint import (
     FileSystemReader,
     FileSystemWriter,
@@ -86,8 +87,6 @@ from .runtime.io import (
     is_required
 )
 from .runtime.main import _coerce_dcp_keys, process
-
-from torch.distributed.run import LaunchConfig, elastic_launch
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -631,6 +630,7 @@ def get_execution_time(
     log: logging.Logger,
     fn_name: str = "",
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    
     def _decorator(fn: Callable[P, R]) -> Callable[P, R]:
         name = fn_name or getattr(fn, "__name__", "call")
         wrapped = partial(_timed_invoke, fn, log, str(name))
