@@ -43,7 +43,6 @@ _IGNORED_WARNING_SENTENCES: tuple[str, ...] = (
     "torch.distributed is disabled, unavailable or uninitialized, assuming the intent is to save in a single process.",
     "TypedStorage is deprecated. It will be removed in the future",
 )
-
 _IGNORED_WARNING_MESSAGE_RE: str = (
     r".*(?:"
     + "|".join((re.escape(str(s)) for s in _IGNORED_WARNING_SENTENCES))
