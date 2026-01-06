@@ -24,10 +24,6 @@ else:
 OpsMode = Literal["train", "predict", "infer"]
 
 
-def _to_dict_strict(obj: Any) -> Dict[Any, Any]:
-    return {f.name: getattr(obj, f.name) for f in fields(obj.__class__)}
-
-
 def _to_dict(value: Any) -> Optional[Dict[Any, Any] | List[Any] | Set[Any]]:
     if isinstance(value, dict):
         return dict(value)
@@ -36,6 +32,10 @@ def _to_dict(value: Any) -> Optional[Dict[Any, Any] | List[Any] | Set[Any]]:
     if isinstance(value, set):
         return set(value)
     return value
+
+
+def _to_dict_strict(obj: Any) -> Dict[Any, Any]:
+    return {f.name: getattr(obj, f.name) for f in fields(obj.__class__)}
 
 
 def _to_frozenset(cls: type) -> frozenset[str]:
@@ -264,6 +264,28 @@ def _validate_equal_dims(value: Union[int, Tuple[int, ...]], *args: Any, dims: i
         raise ValueError(f"{name} must have equal dimensions (dims={dims}), got {t}")
 
 
+def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
+    cfg_obj = None
+    with contextlib.suppress(Exception):
+        cfg_obj = getattr(model, "config", None)
+    if cfg_obj is None:
+        cfg_obj = getattr(model, "__stnet_instance_config__", None)
+    if cfg_obj is None:
+        with contextlib.suppress(Exception):
+            for submodule in model.modules():
+                with contextlib.suppress(Exception):
+                    cfg_obj = getattr(submodule, "config", None)
+                if cfg_obj is None:
+                    cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
+                if cfg_obj is not None:
+                    break
+    if isinstance(cfg_obj, ModelConfig):
+        return cfg_obj.to_dict()
+    if isinstance(cfg_obj, dict):
+        return coerce_model_config(cfg_obj).to_dict()
+    return {}
+
+
 def coerce_patch_config(config: PatchConfig | Dict[str, Any] | None) -> PatchConfig:
     _PATCH_FIELDS = _to_frozenset(PatchConfig)
     _PATCH_DEFAULTS = PatchConfig()
@@ -419,7 +441,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         get("use_linear_branch", _MODEL_DEFAULTS.use_linear_branch),
         name="use_linear_branch",
     )
-
     compile_mode = canonicalize_compile_mode(
         _coerce_str(
             get("compile_mode", _MODEL_DEFAULTS.compile_mode),
@@ -428,8 +449,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
             lower=True,
         )
     )
-
-
     safety_margin_pow2 = _coerce_int(
         get("safety_margin_pow2", _MODEL_DEFAULTS.safety_margin_pow2),
         name="safety_margin_pow2",
@@ -708,8 +727,6 @@ def coerce_model_config(config: ModelConfig | Dict[str, Any] | None) -> ModelCon
         minimum=1.0,
         maximum=8.0,
     )
-
-    
     p_gate_budget_weight = _coerce_float(
         get("p_gate_budget_weight", _MODEL_DEFAULTS.p_gate_budget_weight),
         name="p_gate_budget_weight",
@@ -869,28 +886,6 @@ def model_config_to_dict(config: ModelConfig | Dict[str, Any] | None) -> Dict[st
     return cfg.to_dict()
 
 
-def _extract_model_config_dict(model: Any) -> Dict[str, Any]:
-    cfg_obj = None
-    with contextlib.suppress(Exception):
-        cfg_obj = getattr(model, "config", None)
-    if cfg_obj is None:
-        cfg_obj = getattr(model, "__stnet_instance_config__", None)
-    if cfg_obj is None:
-        with contextlib.suppress(Exception):
-            for submodule in model.modules():
-                with contextlib.suppress(Exception):
-                    cfg_obj = getattr(submodule, "config", None)
-                if cfg_obj is None:
-                    cfg_obj = getattr(submodule, "__stnet_instance_config__", None)
-                if cfg_obj is not None:
-                    break
-    if isinstance(cfg_obj, ModelConfig):
-        return cfg_obj.to_dict()
-    if isinstance(cfg_obj, dict):
-        return coerce_model_config(cfg_obj).to_dict()
-    return {}
-
-
 def patch_config(base: PatchConfig | Dict[str, Any] | None = None, /, **overrides: Any) -> PatchConfig:
     if base is None:
         data: Dict[str, Any] = {}
@@ -982,13 +977,6 @@ class ModelConfig:
     p_gate_hidden_dim: int = 64
     p_gate_detach_inputs: bool = True
     p_gate_tile_size: Optional[int] = None
-    
-    
-    
-    
-    
-    
-    
     p_gate_tile_shape: Optional[Tuple[int, ...]] = None
     p_gate_bounds_use_quantile: bool = False
     p_gate_bounds_q_low: float = 0.005
@@ -1030,8 +1018,6 @@ class ModelConfig:
     p_gate_edge_reg_frac: float = 0.02
     p_gate_edge_reg_min_width_frac: float = 0.05
     p_gate_edge_reg_power: float = 2.0
-    
-    
     p_gate_budget_weight: float = 0.0
     p_gate_budget_target: float = 0.5
     p_gate_tv_weight: float = 0.0
