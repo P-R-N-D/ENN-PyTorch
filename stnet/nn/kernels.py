@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
 import inspect
@@ -15,7 +14,6 @@ from ..core.casting import env_str, env_bool
 from ..core.graph import torch_compiler_disable, is_compiling, is_tracing_or_exporting
 from ..core.profiler import FLOP_PROFILER, capture
 from ..core.system import get_device, get_dpa_backends, get_runtime_config
-
 
 try:
     import triton
@@ -46,6 +44,7 @@ _HAS_TRITON_MSR = bool(_HAS_TRITON_LIB and torch.cuda.is_available())
 _HAS_TE: bool
 
 te = None
+
 _should_import_te = True
 
 if not torch.cuda.is_available():
@@ -57,7 +56,6 @@ else:
         device = torch.device("cuda", 0)
     if getattr(device, "type", "cpu") != "cuda":
         _should_import_te = False
-
 if _should_import_te:
     try:
         import transformer_engine.pytorch as te
@@ -1213,7 +1211,6 @@ class _MultiHeadAttentionNvidia(nn.Module):
         average_attn_weights: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         embed_dim = int(query.shape[-1])
-
         if self._force_pt or (self._te_mha is None):
             return _call_sdpa_fallback(self._fallback, query, key, value, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=need_weights, average_attn_weights=average_attn_weights, is_causal=is_causal)
         if need_weights:
@@ -1331,7 +1328,6 @@ class _MultiHeadAttentionCompat(nn.Module):
         kwargs = dict(key_padding_mask=key_padding_mask, need_weights=need_weights)
         if need_weights:
             kwargs["average_attn_weights"] = bool(average_attn_weights)
-
         out, w = _call_mha_compat(self.mha, query, key, value, attn_mask=attn_mask, is_causal=is_causal, kwargs=kwargs)
         _compute_flops_mha(
             query,
