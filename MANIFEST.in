@@ -1,17 +1,21 @@
 include LICENSE*
 include pyproject.toml
 include requirements.txt
+include README.md
 
 # Source + lightweight human-readable config/docs only
+# (Ensure 'stnet' matches your actual package directory name)
 recursive-include stnet *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt
 
 # Generic junk / build outputs
-global-exclude __pycache__ .DS_Store *.py[cod] *.so *.dylib  *.whl *.metadata *.meta
+# Note: Re-typed spaces to ensure no non-breaking space characters
+global-exclude __pycache__ .DS_Store *.py[cod] *.so *.dylib *.whl *.metadata *.meta
 
 # Logs / patch rejects / backups
 global-exclude *.log *.orig *.rej
 
 # ML / export / checkpoint / data artifacts
+# Exclude heavy weights to keep the package lightweight
 global-exclude *.onnx *.ts *.pte *.tflite *.mlmodel *.pt *.pth *.bin
 global-exclude *.h5 *.hdf5 *.npz *.mmt *.td
 
