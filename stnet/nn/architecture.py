@@ -24,10 +24,6 @@ from typing import (
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-try:
-    from torch.utils.checkpoint import checkpoint as _checkpoint
-except Exception:
-    _checkpoint = None
 from tensordict import TensorDictBase
 
 from ..config import ModelConfig
@@ -77,6 +73,11 @@ from .layers import (
 )
 
 try:
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+except Exception:
+    _checkpoint = None
+    
+try:
     from torchao.quantization.quant_api import (
         Int8DynamicActivationInt8WeightConfig as _Int8DynamicActivationInt8WeightConfig,
         Int8WeightOnlyConfig as _Int8WeightOnlyConfig,
@@ -101,7 +102,6 @@ _Int8DynamicActivationInt8WeightConfig: Any | None
 _Int8WeightOnlyConfig: Any | None
 
 _PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
-
 
 
 def _prod_int(shape: Sequence[int]) -> int:
@@ -217,7 +217,6 @@ def _dot_product_attention_cls() -> Any:
         return DotProductAttention
     except Exception:
         return None
-
 
 
 def _is_ptq_unavailable(
@@ -346,6 +345,7 @@ class SpatialExtractor(nn.Module):
             else:
                 out, _ = blk(out, causal_mask=attn_mask, state=None, mode="spatial")
         return self.norm(out)
+
 
 class TemporalExtractor(nn.Module):
     def __init__(
@@ -477,6 +477,7 @@ class TemporalExtractor(nn.Module):
                     continue
                 out[i] = t.to(device=device, dtype=dtype)
             return out.contiguous()
+            
         return _bad(f"unrecognized state type {type(cand).__name__}")
 
     def forward(
@@ -886,7 +887,6 @@ class TokenFuser(nn.Module):
         w_uni = feats.new_full((int(feats.shape[0]), K), 1.0 / float(K))
         a = float(self.gate_blend_alpha)
         w = (1.0 - a) * w_uni + a * w_soft
-        # ONNX/TF converters tend to be happier with bmm than einsum.
         fused_vec = torch.bmm(w.unsqueeze(1), feats).squeeze(1)
         B = int(fused_vec.shape[0])
         tokens = self._token_generator(fused_vec).reshape(B, self.fused_tokens, self.d_model).contiguous()
@@ -1015,11 +1015,6 @@ class TokenFuser(nn.Module):
         return flat.reshape(tokens.shape[0], *self.out_shape)
 
     def forward_export(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Export-friendly forward path.
-
-        Avoids calling the main `forward()` (which is decorated with torch.compiler.disable) to
-        keep ONNX export / downstream converters as deterministic and tool-friendly as possible.
-        """
         if not isinstance(x, torch.Tensor):
             raise TypeError("forward_export expects a Tensor")
         views, _ = self._run_views(x, temporal_state=None, want_state=False, causal_mask=None)
@@ -1116,16 +1111,12 @@ class Model(nn.Module):
             self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
         )
         self.p_gate_tile_size: Optional[int] = getattr(config, 'p_gate_tile_size', None)
-        
-        
-        
         raw_tile_shape = getattr(config, 'p_gate_tile_shape', None)
         tile_shape: Optional[Tuple[int, ...]]
         try:
             if raw_tile_shape is None:
                 tile_shape = None
             else:
-                
                 if isinstance(raw_tile_shape, int) and not isinstance(raw_tile_shape, bool):
                     tile_shape = (int(raw_tile_shape),)
                 else:
@@ -1283,12 +1274,8 @@ class Model(nn.Module):
         except Exception:
             pass
         raw_mode = getattr(config, "compile_mode", "disabled")
-
         compile_mode_canonical = canonicalize_compile_mode(raw_mode)
-
         compile_mode_arg = None if compile_mode_canonical == "disabled" else compile_mode_canonical
-
-        
         compile_requested = compile_mode_arg is not None
         compile_available = callable(getattr(torch, "compile", None))
         compile_enabled = bool(compile_requested and compile_available)
@@ -1857,7 +1844,6 @@ class Model(nn.Module):
                     _did_unshard_fuser = False
             except Exception:
                 _did_unshard_fuser = False
-
         try:
             requested_base = getattr(self, "base_dtype", None) or getattr(self, "_base_dtype", None)
             if requested_base is not None:
@@ -2093,7 +2079,6 @@ class Model(nn.Module):
             loss_val: Optional[torch.Tensor] = None
             top_component: Optional[torch.Tensor] = None
             bottom_component: Optional[torch.Tensor] = None
-            
             use_global_local = labels_flat is not None and (global_loss is not None or local_loss is not None)
             use_net = labels_flat is not None and (net_loss is not None) and (not use_global_local)
             if use_global_local:
@@ -2189,7 +2174,6 @@ class Model(nn.Module):
                     loss_p = -(((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))).mean()
                     aux_total = aux_total + self.p_prior_weight * loss_p.to(dtype=aux_total.dtype)
                     aux_used = True
-                
                 if (
                     p is not None
                     and (
@@ -2211,7 +2195,6 @@ class Model(nn.Module):
                         with contextlib.suppress(Exception):
                             p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
                     gate_eps = max(0.0, float(gate_eps))
-
                     if self.p_gate_budget_weight > 0.0:
                         tgt = float(self.p_gate_budget_target)
                         if p_ceil >= p_floor:
@@ -2220,7 +2203,6 @@ class Model(nn.Module):
                         loss_budget = (mean_p - mean_p.new_tensor(tgt)).square()
                         aux_total = aux_total + self.p_gate_budget_weight * loss_budget.to(dtype=aux_total.dtype)
                         aux_used = True
-
                     p_grid: Optional[torch.Tensor] = None
                     w_grid: Optional[torch.Tensor] = None
                     tile_shape: Optional[Tuple[int, ...]] = None
@@ -2251,12 +2233,10 @@ class Model(nn.Module):
                         except Exception:
                             p_grid = None
                             w_grid = None
-
                     if self.p_gate_tv_weight > 0.0 and p_grid is not None:
                         tv = _tv_loss_grid(p_grid, power=float(self.p_gate_tv_power), eps=gate_eps)
                         aux_total = aux_total + self.p_gate_tv_weight * tv.to(dtype=aux_total.dtype)
                         aux_used = True
-
                     if (
                         self.p_gate_teacher_weight > 0.0
                         and p_grid is not None
@@ -2272,7 +2252,6 @@ class Model(nn.Module):
                         if bool(self.p_gate_teacher_relu):
                             improve = F.relu(improve)
                         scale = 0.5 * (err_base + err_ref)
-
                         imp_grid: torch.Tensor
                         scale_grid: torch.Tensor
                         if tile_shape is not None:
@@ -2295,7 +2274,6 @@ class Model(nn.Module):
                         else:
                             imp_grid = improve.mean(dim=1, keepdim=True)
                             scale_grid = scale.mean(dim=1, keepdim=True)
-
                         scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
                         tau = float(self.p_gate_teacher_tau)
                         temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
@@ -2820,7 +2798,6 @@ class ModelPolicy:
             from torchao.quantization import (
                 Float8DynamicActivationFloat8WeightConfig,
                 Float8WeightOnlyConfig, quantize_)
-
             cfg = (
                 Float8DynamicActivationFloat8WeightConfig()
                 if dynamic_activations
@@ -2856,7 +2833,6 @@ class ModelPolicy:
                 Autocast.configure(model, metadata=meta)
                 return (model, False, "data scale")
         params_dtype = ModelPolicy.negotiate(device, metadata=meta)
-
         for backend in ("te", "torchao"):
             if backend == "te":
                 m2, ok2, why = ModelPolicy._enable_nvidia_training(
@@ -3002,9 +2978,7 @@ class Quantization:
             from torchao.quantization.fake_quant import (FakeQuantizeConfig,
                                                          Int8ActivationConfig,
                                                          Int8WeightConfig)
-            from torchao.quantization.fake_quant import \
-                prepare_qat_ as _prepare_qat
-
+            from torchao.quantization.fake_quant import prepare_qat_ as _prepare_qat
             cfg = FakeQuantizeConfig(
                 activation=Int8ActivationConfig(dynamic=bool(dynamic_activations)),
                 weight=Int8WeightConfig(group_size=int(group_size)),
