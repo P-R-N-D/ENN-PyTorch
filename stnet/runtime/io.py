@@ -352,6 +352,7 @@ def _get_forward_parameters(model_cls: object) -> object:
             _FORWARD_PARAM_CACHE.clear()
     return info
 
+
 def _forward(model: object, x: object) -> object:
     fwd_export = getattr(model, "forward_export", None)
     if callable(fwd_export) and isinstance(x, torch.Tensor):
@@ -412,13 +413,7 @@ def _pad_sample(model: object, sample_input: object) -> object:
     return torch.zeros(1, in_dim, dtype=dtype, device=device)
 
 
-def _onnx_options(kwargs: object, *, target: str = "onnx") -> object:
-    """Centralized ONNX export defaults.
-
-    목표:
-    - ONNX/ORT: 최대한 동적(batch) 유지 + 최신 opset 우선
-    - TF/LiteRT/NNEF: 변환 성공률 최우선(정적 batch, 보수적인 opset, legacy exporter 우선)
-    """
+def _onnx_options(kwargs: object, *args: Any, target: str = "onnx") -> object:
     target_l = str(target or "onnx").strip().lower()
     if target_l in {"tensorrt", "trt", "tensor-rt", "tensor_rt"}:
         default_opset = 17
@@ -444,12 +439,10 @@ def _onnx_options(kwargs: object, *, target: str = "onnx") -> object:
         default_prefer_dynamo = True
         default_simplify = False
         default_fallback = [18, 17, 16, 15, 13]
-
     opset_version = int(kwargs.get("opset_version", default_opset))
     dynamic_batch = bool(kwargs.get("dynamic_batch", default_dynamic_batch))
     prefer_dynamo = bool(kwargs.get("prefer_dynamo", kwargs.get("dynamo", default_prefer_dynamo)))
     simplify = bool(kwargs.get("simplify_onnx", kwargs.get("onnx_simplify", default_simplify)))
-
     fb = kwargs.get("opset_fallback", None)
     opset_fallback: list[int]
     if fb is None:
@@ -460,8 +453,6 @@ def _onnx_options(kwargs: object, *, target: str = "onnx") -> object:
         opset_fallback = [int(x) for x in fb]
     else:
         opset_fallback = [int(fb)]
-
-    # Ensure the requested opset is tried first.
     opset_try = [opset_version] + [v for v in opset_fallback if int(v) != int(opset_version)]
     return {
         "sample_input": kwargs.get("sample_input"),
@@ -511,30 +502,20 @@ class _OnnxLayer:
         simplify: bool = False,
         **kwargs: Any,
     ) -> object:
-        """Export a model to ONNX with converter-friendly fallbacks.
-
-        - TF/LiteRT/NNEF 쪽은 동적 axis/dynamo exporter가 실패 원인이 되는 경우가 많아서
-          (정적 batch + legacy exporter 우선 + 낮은 opset) 조합을 기본값으로 둔다.
-        - ONNX/ORT 쪽은 최신 opset + dynamo exporter 우선, 실패 시 legacy로 폴백한다.
-        """
         del args, kwargs
         is_required("onnx", "pip install onnx")
         wrapper = _CompatLayer(model).eval()
         sample = _pad_sample(model, sample_input)
         if isinstance(sample, torch.Tensor) and sample.ndim == 1:
             sample = sample.unsqueeze(0)
-
         onnx_path = Path(onnx_path)
         onnx_path.parent.mkdir(parents=True, exist_ok=True)
-
         input_names = ["features"]
         output_names = ["preds_flat"]
-
         dynamic_axes = None
         dynamic_shapes = None
         if bool(dynamic_batch):
             dynamic_axes = {"features": {0: "batch"}, "preds_flat": {0: "batch"}}
-            # Dynamo exporter uses dynamic_shapes + torch.export.Dim (if available).
             with contextlib.suppress(Exception):
                 if hasattr(torch, "export") and hasattr(torch.export, "Dim"):
                     dynamic_shapes = (
@@ -565,7 +546,6 @@ class _OnnxLayer:
         supports_dynamo = bool("dynamo" in inspect.signature(torch.onnx.export).parameters)
         if opset_fallback is None:
             opset_fallback = (opset_version,)
-        # De-dup while keeping order.
         seen: set[int] = set()
         opset_try: list[int] = []
         for v in (int(opset_version), *[int(x) for x in opset_fallback]):
@@ -574,14 +554,11 @@ class _OnnxLayer:
                 opset_try.append(v)
         if len(opset_try) == 0:
             opset_try = [int(opset_version)]
-
-        # Prefer dynamo vs legacy depending on target, but always fallback.
         exporter_order: list[bool]
         if supports_dynamo:
             exporter_order = [True, False] if bool(prefer_dynamo) else [False, True]
         else:
             exporter_order = [False]
-
         errors: list[str] = []
         for opset in opset_try:
             base_kwargs = _base_kwargs(opset)
@@ -609,13 +586,12 @@ class _OnnxLayer:
                             )
                     else:
                         torch.onnx.export(wrapper, sample, str(onnx_path), **base_kwargs)
-
                     if bool(simplify):
                         with contextlib.suppress(Exception):
                             import onnx
                             model_onnx = onnx.load(str(onnx_path))
                             with contextlib.suppress(Exception):
-                                import onnxsim  # type: ignore
+                                import onnxsim
                                 model_simp, ok = onnxsim.simplify(model_onnx)
                                 if bool(ok):
                                     onnx.save(model_simp, str(onnx_path))
@@ -627,7 +603,6 @@ class _OnnxLayer:
                     continue
 
         raise RuntimeError("ONNX export failed. " + "; ".join(errors[-6:]))
-
 
     @staticmethod
     def coerce(model: nn.Module, onnx_path: PathLike, *args: Any, **kwargs: Any) -> object:
@@ -752,7 +727,6 @@ class Builder:
             if suffix == ".safetensors":
                 is_required("safetensors", "pip install safetensors")
                 from safetensors.torch import save_file as save_tensors
-
                 sd = model.state_dict()
                 cpu_sd = {k: _to_tensor(v) for k, v in sd.items()}
                 fd, tmp_name = tempfile.mkstemp(
@@ -917,7 +891,6 @@ class TensorRT(Format):
             explicit_batch_flag = 0
             with contextlib.suppress(Exception):
                 explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-
             with contextlib.ExitStack() as stack:
                 builder = stack.enter_context(trt.Builder(trt_logger))
                 create_network = getattr(builder, "create_network", None)
@@ -967,7 +940,6 @@ class TensorRT(Format):
                 profile = builder.create_optimization_profile()
                 profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
                 config.add_optimization_profile(profile)
-
                 engine_blob = None
                 build_serialized = getattr(builder, "build_serialized_network", None)
                 if callable(build_serialized):
@@ -983,17 +955,14 @@ class TensorRT(Format):
 
                 if engine_blob is None:
                     raise RuntimeError("Failed to build the TensorRT engine.")
-
                 try:
                     engine_bytes = bytes(engine_blob)
                 except Exception:
                     engine_bytes = engine_blob
-
                 if not isinstance(engine_bytes, (bytes, bytearray)):
                     buf = getattr(engine_blob, "buffer", None)
                     if buf is not None:
                         engine_bytes = buf
-
                 if not isinstance(engine_bytes, (bytes, bytearray)):
                     raise RuntimeError(
                         f"TensorRT engine serialization returned unexpected type: {type(engine_blob)}"
@@ -1109,7 +1078,6 @@ class CoreML(Format):
                 convert_to_try.append("neuralnetwork")
             if ct_to_l != "mlprogram":
                 convert_to_try.append("mlprogram")
-
             mlmodel = None
             last_exc: Exception | None = None
             for ct_to in convert_to_try:
@@ -1321,10 +1289,8 @@ class TensorFlow(Format):
                 dst,
                 **_onnx_options(kwargs, target="tensorflow"),
             )
-
             saved_model_dir = dst.with_suffix("") if dst.suffix else dst
             saved_model_dir.parent.mkdir(parents=True, exist_ok=True)
-
             prefer_onnx2tf = bool(kwargs.get("prefer_onnx2tf", True))
             if prefer_onnx2tf and shutil.which("onnx2tf") is not None:
                 with contextlib.suppress(Exception):
@@ -1338,22 +1304,16 @@ class TensorFlow(Format):
                         ],
                         "onnx2tf",
                     )
-                    # onnx2tf may nest the SavedModel; locate it if needed.
                     if (saved_model_dir / "saved_model.pb").exists():
                         return (saved_model_dir,)
                     found = list(saved_model_dir.rglob("saved_model.pb"))
                     if len(found) > 0:
                         return (found[0].parent,)
-
-            # Fallback: onnx-tf
             is_required("onnx-tf", "pip install onnx-tf")
             from onnx_tf.backend import prepare
-
             import onnx
-
             model_onnx = onnx.load(str(onnx_path))
             prepare(model_onnx).export_graph(str(saved_model_dir))
-
         return (saved_model_dir,)
 
 
