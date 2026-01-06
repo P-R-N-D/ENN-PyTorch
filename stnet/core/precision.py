@@ -235,6 +235,12 @@ class DeviceMeta:
     is_negotiable: Optional[bool] = None
     underflow_action: str = "warn"
 
+    def _refresh_device_info(self) -> None:
+        ds = get_device_stats(self.device)
+        self.device = ds.device
+        self.device_type = ds.device_type
+        self.cuda_cc = ds.cuda_cc
+    
     def coerce_device_info(self) -> "DeviceMeta":
         self._refresh_device_info()
         return self
@@ -252,12 +258,6 @@ class DeviceMeta:
 
     def is_disabled(self) -> bool:
         return False
-
-    def _refresh_device_info(self) -> None:
-        ds = get_device_stats(self.device)
-        self.device = ds.device
-        self.device_type = ds.device_type
-        self.cuda_cc = ds.cuda_cc
 
     @classmethod
     def for_device(cls, device: Union[torch.device, str]) -> "DeviceMeta":
@@ -290,10 +290,6 @@ class Autocast:
     def _set_tls_metadata(cls, meta: Any | None) -> None:
         setattr(cls._metadata_tls, "meta", meta)
         cls._metadata = meta
-
-    @classmethod
-    def metadata(cls) -> Any | None:
-        return cls._get_tls_metadata()
 
     @staticmethod
     def _device(device: Optional[Union[torch.device, str]] = None) -> torch.device:
@@ -397,6 +393,100 @@ class Autocast:
                     continue
         cls._preferred_int_backend = None
         return None
+
+    @classmethod
+    def _nvidia_float8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            te = importlib.import_module("transformer_engine.pytorch")
+            fp8_ctx = getattr(te, "fp8_autocast", None)
+            if callable(fp8_ctx):
+                contexts.append(fp8_ctx(enabled=True))
+            else:
+                raise AttributeError("transformer_engine.fp8_autocast missing")
+        except Exception as exc:
+            _LOGGER.debug("Autocast FP8 TE failed: %s", exc)
+            cls._preferred_fp8_backend = None
+        return contexts
+
+    @classmethod
+    def _torchao_float8(cls, enabled: bool) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            fp8_mod = importlib.import_module("torchao.float8")
+            fp8_autocast = getattr(fp8_mod, "fp8_autocast", None)
+            if callable(fp8_autocast):
+                contexts.append(fp8_autocast(enabled=True))
+            else:
+                raise AttributeError("torchao.float8.fp8_autocast missing")
+        except Exception as exc:
+            _LOGGER.debug("Autocast FP8 torchao failed: %s", exc)
+            cls._preferred_fp8_backend = None
+        return contexts
+
+    @classmethod
+    def _torchao_int8_backend(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        backend = cls._preferred_int_backend
+        if backend == "te":
+            try:
+                te = importlib.import_module("transformer_engine.pytorch")
+                int_ctx = getattr(te, "int8_autocast", None)
+                if callable(int_ctx):
+                    contexts.append(int_ctx(enabled=True))
+                else:
+                    raise AttributeError("transformer_engine.int8_autocast missing")
+            except Exception as exc:
+                _LOGGER.debug("Autocast INT8 TE failed: %s", exc)
+                cls._preferred_int_backend = None
+        elif backend == "ao":
+            try:
+                quant_mod = importlib.import_module("torchao.quantization")
+                int8_autocast = getattr(quant_mod, "int8_autocast", None)
+                if callable(int8_autocast):
+                    contexts.append(int8_autocast(enabled=True))
+                else:
+                    raise AttributeError("torchao.quantization.int8_autocast missing")
+            except Exception as exc:
+                _LOGGER.debug("Autocast INT8 torchao failed: %s", exc)
+                cls._preferred_int_backend = None
+        return contexts
+
+    @classmethod
+    def _torchao_int4(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+        contexts: List[AbstractContextManager[None]] = []
+        if not enabled:
+            return contexts
+        try:
+            quant_mod = importlib.import_module("torchao.quantization")
+            int4_autocast = getattr(quant_mod, "int4_autocast", None)
+            if callable(int4_autocast):
+                contexts.append(int4_autocast(enabled=True))
+            else:
+                raise AttributeError("torchao.quantization.int4_autocast missing")
+        except Exception as exc:
+            _LOGGER.debug("Autocast INT4 torchao failed: %s", exc)
+        return contexts
+
+    @classmethod
+    def _torchao_int8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+        return cls._torchao_int8_autocast(device, enabled)
+
+    @classmethod
+    def _torchao_int8_autocast(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
+        if cls._preferred_int_backend is None:
+            cls._preferred_int_backend = "ao"
+        return cls._torchao_int8_backend(device, enabled)
+
+    @classmethod
+    def metadata(cls) -> Any | None:
+        return cls._get_tls_metadata()
 
     @staticmethod
     def float8_formats() -> Tuple[torch.dtype, ...]:
@@ -657,7 +747,6 @@ class Autocast:
                     disable = bool(fn())
         if disable:
             return None
-
         requested_dtype = _coerce_torch_dtype(dtype, torch.float16)
         candidates: Tuple[torch.dtype, ...] = (requested_dtype, cls._last_float_dtype)
         extra = getattr(meta, "float_dtypes", None) if meta is not None else None
@@ -871,96 +960,6 @@ class Autocast:
                         ),
                     )
             yield
-
-    @classmethod
-    def _nvidia_float8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        contexts: List[AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        try:
-            te = importlib.import_module("transformer_engine.pytorch")
-            fp8_ctx = getattr(te, "fp8_autocast", None)
-            if callable(fp8_ctx):
-                contexts.append(fp8_ctx(enabled=True))
-            else:
-                raise AttributeError("transformer_engine.fp8_autocast missing")
-        except Exception as exc:
-            _LOGGER.debug("Autocast FP8 TE failed: %s", exc)
-            cls._preferred_fp8_backend = None
-        return contexts
-
-    @classmethod
-    def _torchao_float8(cls, enabled: bool) -> List[AbstractContextManager[None]]:
-        contexts: List[AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        try:
-            fp8_mod = importlib.import_module("torchao.float8")
-            fp8_autocast = getattr(fp8_mod, "fp8_autocast", None)
-            if callable(fp8_autocast):
-                contexts.append(fp8_autocast(enabled=True))
-            else:
-                raise AttributeError("torchao.float8.fp8_autocast missing")
-        except Exception as exc:
-            _LOGGER.debug("Autocast FP8 torchao failed: %s", exc)
-            cls._preferred_fp8_backend = None
-        return contexts
-
-    @classmethod
-    def _torchao_int8_backend(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        contexts: List[AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        backend = cls._preferred_int_backend
-        if backend == "te":
-            try:
-                te = importlib.import_module("transformer_engine.pytorch")
-                int_ctx = getattr(te, "int8_autocast", None)
-                if callable(int_ctx):
-                    contexts.append(int_ctx(enabled=True))
-                else:
-                    raise AttributeError("transformer_engine.int8_autocast missing")
-            except Exception as exc:
-                _LOGGER.debug("Autocast INT8 TE failed: %s", exc)
-                cls._preferred_int_backend = None
-        elif backend == "ao":
-            try:
-                quant_mod = importlib.import_module("torchao.quantization")
-                int8_autocast = getattr(quant_mod, "int8_autocast", None)
-                if callable(int8_autocast):
-                    contexts.append(int8_autocast(enabled=True))
-                else:
-                    raise AttributeError("torchao.quantization.int8_autocast missing")
-            except Exception as exc:
-                _LOGGER.debug("Autocast INT8 torchao failed: %s", exc)
-                cls._preferred_int_backend = None
-        return contexts
-
-    @classmethod
-    def _torchao_int4(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        contexts: List[AbstractContextManager[None]] = []
-        if not enabled:
-            return contexts
-        try:
-            quant_mod = importlib.import_module("torchao.quantization")
-            int4_autocast = getattr(quant_mod, "int4_autocast", None)
-            if callable(int4_autocast):
-                contexts.append(int4_autocast(enabled=True))
-            else:
-                raise AttributeError("torchao.quantization.int4_autocast missing")
-        except Exception as exc:
-            _LOGGER.debug("Autocast INT4 torchao failed: %s", exc)
-        return contexts
-
-    @classmethod
-    def _torchao_int8(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        return cls._torchao_int8_autocast(device, enabled)
-
-    @classmethod
-    def _torchao_int8_autocast(cls, device: torch.device, enabled: bool) -> List[AbstractContextManager[None]]:
-        if cls._preferred_int_backend is None:
-            cls._preferred_int_backend = "ao"
-        return cls._torchao_int8_backend(device, enabled)
 
 
 @dataclass(slots=True)
