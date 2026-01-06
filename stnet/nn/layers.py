@@ -10,13 +10,12 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.checkpoint import checkpoint
 
 from ..core.casting import env_bool, env_int, env_str
 from ..core.compat import StochasticDepth
 from ..core.profiler import FLOP_PROFILER
 from ..core.system import empty_device_cache
-from ..core.graph import torch_compiler_disable, is_export_or_trace
+from ..core.graph import coerce_checkpoint, torch_compiler_disable, is_export_or_trace
 from .kernels import DotProductAttention, MultiHeadAttention, MultiScaleRetention
 
 _Norm = nn.LayerNorm
@@ -1153,7 +1152,7 @@ class DilatedAttention(nn.Module):
         )
         if do_ckpt_ffn:
             try:
-                x_out = checkpoint(
+                x_out = coerce_checkpoint(
                     self.ffn,
                     x_out,
                     use_reentrant=True,
@@ -1161,7 +1160,7 @@ class DilatedAttention(nn.Module):
                     determinism_check="none",
                 )
             except TypeError:
-                x_out = checkpoint(
+                x_out = coerce_checkpoint(
                     self.ffn,
                     x_out,
                     use_reentrant=True,

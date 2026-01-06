@@ -75,6 +75,7 @@ from ..core.casting import (
 from ..core.compat import is_meta_or_fake_tensor
 from ..core.staging import Cache, Pool
 from ..core.distributed import (
+    broadcast_scalar,
     distributed_barrier,
     distributed_sync,
     joining,
@@ -91,6 +92,10 @@ from ..core.graph import (
     compile_distributed_safe,
     cudagraph_mark_step_begin,
     cudagraph_mark_step_end,
+    from_checkpoint,
+    iter_checkpoint,
+    to_submodule,
+    to_checkpoint,
 )
 from ..core.profiler import FlopCounter
 from ..core.precision import Autocast, PrecisionPolicy
@@ -714,13 +719,13 @@ def _recover_oom(
         with contextlib.suppress(Exception):
             optimizer.zero_grad(set_to_none=True)
 
-    inst_pressure = _to_submodule(model) or (
+    inst_pressure = to_submodule(model) or (
         model.module if hasattr(model, "module") else model
     )
     if inst_pressure is not None:
         cur_step_total = int(getattr(inst_pressure, "_stnet_step_total", 0) or 0)
         if int(oom_try) <= 1:
-            applied = _to_checkpoint(
+            applied = to_checkpoint(
                 model,
                 device=device,
                 step_total=cur_step_total,
@@ -735,7 +740,7 @@ def _recover_oom(
                 return ("retry", grad_accum_steps)
 
     reduced_any = False
-    inst = _to_submodule(model)
+    inst = to_submodule(model)
     if inst is not None:
         cur_mb = 0
         with contextlib.suppress(Exception):
@@ -743,7 +748,7 @@ def _recover_oom(
         if cur_mb > 1:
             new_mb = max(1, cur_mb // 2)
             try:
-                new_mb = _sync_tensor(new_mb, device=device, src=0)
+                new_mb = broadcast_scalar(new_mb, device=device, src=0)
             except Exception:
                 pass
             if new_mb < cur_mb:
@@ -765,7 +770,7 @@ def _recover_oom(
         if cur_ga > int(min_grad_accum):
             new_ga = max(int(min_grad_accum), cur_ga // 2)
             try:
-                new_ga = _sync_tensor(new_ga, device=device, src=0)
+                new_ga = broadcast_scalar(new_ga, device=device, src=0)
             except Exception:
                 pass
             if int(new_ga) != int(cur_ga):
@@ -1635,17 +1640,6 @@ def _mps_mem_util(device: TorchDeviceLike) -> object:
     return None
 
 
-def _sync_tensor(value: object, device: TorchDeviceLike, src: int = 0) -> object:
-    if not is_distributed():
-        return int(value)
-    try:
-        tensor = torch.tensor([int(value)], device=device, dtype=torch.int32)
-        torch.distributed.broadcast(tensor, src=src)
-        return int(tensor.item())
-    except Exception:
-        return int(value)
-
-
 def _get_cpu_load() -> object:
     if psutil is None:
         return None
@@ -2202,130 +2196,6 @@ def _set_gate_factor(
         )
 
 
-def _to_submodule(model: object) -> object:
-    m = model
-    for _ in range(8):
-        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
-            return m
-        child = getattr(m, "module", None)
-        if child is None or child is m:
-            break
-        m = child
-    return None
-
-
-def _iter_checkpoint(root: object):
-    try:
-        import torch.nn as nn
-
-        if isinstance(root, nn.Module):
-            for mod in root.modules():
-                if hasattr(mod, "_ckpt_min_bytes") and hasattr(mod, "_ckpt_enabled"):
-                    yield mod
-    except Exception:
-        return
-
-
-def _to_checkpoint(
-    model: object,
-    *args: Any,
-    device: torch.device,
-    step_total: int,
-    ttl_steps: int,
-    min_bytes: int,
-) -> bool:
-    inst = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
-    if inst is None:
-        return False
-    try:
-        ttl_steps = max(1, int(ttl_steps))
-        min_bytes = max(0, int(min_bytes))
-        step_total = max(0, int(step_total))
-    except Exception:
-        return False
-    until = step_total + ttl_steps
-    try:
-        until = int(_sync_tensor(until, device=device, src=0))
-        min_bytes = int(_sync_tensor(min_bytes, device=device, src=0))
-    except Exception:
-        pass
-    cur_until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
-    if (
-        cur_until >= until
-        and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes
-    ):
-        return False
-    changed = False
-    for mod in _iter_checkpoint(inst):
-        if not hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
-            with contextlib.suppress(Exception):
-                setattr(
-                    mod,
-                    "_stnet_ckpt_saved_min_bytes",
-                    int(getattr(mod, "_ckpt_min_bytes", 0) or 0),
-                )
-                setattr(
-                    mod,
-                    "_stnet_ckpt_saved_enabled",
-                    bool(getattr(mod, "_ckpt_enabled", True)),
-                )
-        try:
-            cur = int(getattr(mod, "_ckpt_min_bytes", 0) or 0)
-            if min_bytes < cur:
-                setattr(mod, "_ckpt_min_bytes", int(min_bytes))
-                changed = True
-            if not bool(getattr(mod, "_ckpt_enabled", True)):
-                setattr(mod, "_ckpt_enabled", True)
-                changed = True
-        except Exception:
-            pass
-    with contextlib.suppress(Exception):
-        setattr(inst, "_stnet_ckpt_pressure_until", int(max(cur_until, until)))
-        prev_mb = int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0)
-        if prev_mb <= 0:
-            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
-        else:
-            setattr(
-                inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes))
-            )
-    return bool(changed)
-
-
-def _from_checkpoint(model: object, *args: Any, step_total: int) -> None:
-    inst = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
-    if inst is None:
-        return
-    try:
-        step_total = int(step_total)
-    except Exception:
-        return
-    until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
-    if until <= 0 or step_total < until:
-        return
-    for mod in _iter_checkpoint(inst):
-        try:
-            if hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
-                setattr(
-                    mod,
-                    "_ckpt_min_bytes",
-                    int(getattr(mod, "_stnet_ckpt_saved_min_bytes", 0) or 0),
-                )
-            if hasattr(mod, "_stnet_ckpt_saved_enabled"):
-                setattr(
-                    mod,
-                    "_ckpt_enabled",
-                    bool(getattr(mod, "_stnet_ckpt_saved_enabled", True)),
-                )
-            for k in ("_stnet_ckpt_saved_min_bytes", "_stnet_ckpt_saved_enabled"):
-                with contextlib.suppress(Exception):
-                    delattr(mod, k)
-        except Exception:
-            pass
-    with contextlib.suppress(Exception):
-        setattr(inst, "_stnet_ckpt_pressure_until", 0)
-        setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
-
-
 def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     batch_dim: int | None = None
     bytes_per_sample = 0
@@ -2647,7 +2517,7 @@ def epochs(
             int(min_grad_accum), min(int(max_grad_accum), int(max_from_mem))
         )
     grad_accum_steps = int(min_grad_accum)
-    grad_accum_steps = _sync_tensor(grad_accum_steps, device=device, src=0)
+    grad_accum_steps = broadcast_scalar(grad_accum_steps, device=device, src=0)
     proc = None
     if psutil is not None:
         try:
@@ -3289,7 +3159,7 @@ def epochs(
                                             else model
                                         )
                                         inst_step = (
-                                            _to_submodule(target_for_step)
+                                            to_submodule(target_for_step)
                                             or target_for_step
                                         )
                                         with contextlib.suppress(Exception):
@@ -3336,7 +3206,7 @@ def epochs(
                                                 0.92, prev_ema * 1.25
                                             )
                                             if frac > 0.92 or spike:
-                                                _to_checkpoint(
+                                                to_checkpoint(
                                                     model,
                                                     device=device,
                                                     step_total=int(
@@ -3345,7 +3215,7 @@ def epochs(
                                                     ttl_steps=128,
                                                     min_bytes=16 * 1024 * 1024,
                                                 )
-                                        _from_checkpoint(
+                                        from_checkpoint(
                                             model,
                                             step_total=int(p_gate_auto_step_total),
                                         )
@@ -3515,7 +3385,7 @@ def epochs(
                                         if grad_accum_steps > min_grad_accum:
                                             new_grad_accum = min_grad_accum
                                     if new_grad_accum != grad_accum_steps:
-                                        new_grad_accum = _sync_tensor(
+                                        new_grad_accum = broadcast_scalar(
                                             new_grad_accum, device=device, src=0
                                         )
                                         _LOGGER.info(
