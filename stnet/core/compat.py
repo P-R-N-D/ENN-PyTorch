@@ -239,7 +239,6 @@ except Exception:
         _ = backends
         yield
 
-
 StochasticDepth = getattr(nn, "StochasticDepth", None)
 if StochasticDepth is None:
     StochasticDepth = _StochasticDepthFallback
