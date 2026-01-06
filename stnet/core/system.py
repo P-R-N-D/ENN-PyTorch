@@ -42,23 +42,13 @@ except Exception:
     ZoneInfo = None
 
 
-_RUNTIME_CFG = SimpleNamespace(
-    deterministic=False,
-    allow_tf32=None,
-    cudnn_benchmark=None,
-    matmul_precision=None,
-    sdpa_backends=None,
-    te_first=True,
-)
-_RUNTIME_CFG_LOCK = threading.Lock()
+_LOGGER = logging.getLogger(__name__)
 
 _FP32_PRECISION_CACHE: dict[str, str] = {}
 _FP32_PRECISION_LOCK = threading.Lock()
 
 _EMPTY_CACHE_LOCK = threading.Lock()
 _EMPTY_CACHE_LAST_CALL_S_BY_DEVICE: dict[Tuple[str, int], float] = {}
-
-_LOGGER = logging.getLogger(__name__)
 
 _TORCH_THREAD_CFG_LOCK = threading.Lock()
 _TORCH_NUM_THREADS_SET: Optional[int] = None
@@ -128,6 +118,16 @@ _TZ_ALIASES = {
     "CAT": "Africa/Maputo",
     "WAT": "Africa/Lagos",
 }
+
+_RUNTIME_CFG = SimpleNamespace(
+    deterministic=False,
+    allow_tf32=None,
+    cudnn_benchmark=None,
+    matmul_precision=None,
+    sdpa_backends=None,
+    te_first=True,
+)
+_RUNTIME_CFG_LOCK = threading.Lock()
 
 
 def _log_info(logger: Optional[Any], msg: str) -> None:
