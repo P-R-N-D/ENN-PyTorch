@@ -9,6 +9,7 @@ from typing import Any
 import numpy
 import torch
 
+
 _TRUE = frozenset({"1", "true", "yes", "y", "on", "enable", "enabled"})
 
 _FALSE = frozenset({"0", "false", "no", "n", "off", "disable", "disabled"})
@@ -110,11 +111,51 @@ _PLATFORM_ALIASES: dict[str, str] = {
 }
 
 
+def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
+    s = env_str(name)
+    if s is None:
+        return default
+    try:
+        return cast(s)
+    except (ValueError, TypeError):
+        return default
+
+
 def _env_clean(value: object | None) -> str | None:
     if value is None:
         return None
     s = str(value).strip()
     return s or None
+
+
+def _canonical_dtype(src: Any) -> str:
+    if src is None:
+        raise TypeError("dtype cannot be None")
+    if isinstance(src, torch.dtype):
+        key = str(src)
+    elif isinstance(src, str):
+        key = src
+    elif isinstance(src, numpy.dtype):
+        key = src.name
+    else:
+        try:
+            key = numpy.dtype(src).name
+        except Exception:
+            key = str(src)
+    key = key.strip().lower()
+    if key.startswith("torch."):
+        key = key.split(".", 1)[1]
+    if key.startswith("numpy."):
+        key = key.split(".", 1)[1]
+    if key.startswith("dtype(") and key.endswith(")"):
+        inner = key[5:].strip("()").strip().strip("'\"")
+        if inner:
+            key = inner
+    key = key.lstrip("<>|=")
+    canonical = _DTYPE_ALIASES.get(key, key)
+    if canonical not in _CANONICAL_DTYPES:
+        raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
+    return canonical
 
 
 def parse_bool(value: object) -> bool | None:
@@ -133,16 +174,6 @@ def parse_bool(value: object) -> bool | None:
 def env_str(name: str, default: str | None = None) -> str | None:
     s = _env_clean(os.getenv(name))
     return s if s is not None else default
-
-
-def _env_cast(name: str, cast: Callable[[str], Any], default: Any) -> Any:
-    s = env_str(name)
-    if s is None:
-        return default
-    try:
-        return cast(s)
-    except (ValueError, TypeError):
-        return default
 
 
 def env_bool(name: str | Sequence[str], default: bool = False) -> bool:
@@ -210,36 +241,6 @@ def env_first_float(keys: Sequence[str], default: float = 0.0) -> float:
         return float(v)
     except (ValueError, TypeError):
         return float(default)
-
-
-def _canonical_dtype(src: Any) -> str:
-    if src is None:
-        raise TypeError("dtype cannot be None")
-    if isinstance(src, torch.dtype):
-        key = str(src)
-    elif isinstance(src, str):
-        key = src
-    elif isinstance(src, numpy.dtype):
-        key = src.name
-    else:
-        try:
-            key = numpy.dtype(src).name
-        except Exception:
-            key = str(src)
-    key = key.strip().lower()
-    if key.startswith("torch."):
-        key = key.split(".", 1)[1]
-    if key.startswith("numpy."):
-        key = key.split(".", 1)[1]
-    if key.startswith("dtype(") and key.endswith(")"):
-        inner = key[5:].strip("()").strip().strip("'\"")
-        if inner:
-            key = inner
-    key = key.lstrip("<>|=")
-    canonical = _DTYPE_ALIASES.get(key, key)
-    if canonical not in _CANONICAL_DTYPES:
-        raise TypeError(f"unsupported dtype: {src!r} (normalized key={key!r})")
-    return canonical
 
 
 def to_platform_dtype(src: Any, platform: str) -> Any:
