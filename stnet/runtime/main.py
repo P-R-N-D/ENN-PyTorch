@@ -91,6 +91,7 @@ from ..core.distributed import (
 )
 from ..core.graph import (
     inference_mode,
+    canonicalize_compile_mode,
     compile_safe,
     compile_distributed_safe,
     cudagraph_mark_step_begin,
@@ -4582,8 +4583,8 @@ def process(*args: Any, **kwargs: Any) -> object:
         cfg = coerce_model_config(ops.cfg_dict if isinstance(ops.cfg_dict, dict) else ops.cfg_dict)
         cfg = replace(cfg, device=device)
         if _env_flag("STNET_MAX_PERF", True):
-            cm = str(getattr(cfg, "compile_mode", "disabled") or "").strip().lower()
-            if cm in ("", "none", "disabled", "disable", "off", "false", "0"):
+            cm = canonicalize_compile_mode(getattr(cfg, "compile_mode", None))
+            if cm == "disabled":
                 default_cm = env_str("STNET_SERVE_COMPILE_MODE")
                 if not default_cm:
                     default_cm = "max-autotune" if getattr(device, "type", None) == "cuda" else "max-autotune-no-cudagraphs"

@@ -79,37 +79,55 @@ def is_export_or_trace() -> bool:
     return bool(is_compiling() or is_tracing_or_exporting())
 
 
-def canonicalize_compile_mode(mode: str | None) -> str:
-    """Normalize compile mode aliases to torch.compile accepted values."""
-    mode_given = str(mode) if mode is not None else ""
-    mode_raw = str(mode_given or "").strip().lower()
+def canonicalize_compile_mode(mode: object | None) -> str:
+    """Normalize/validate compile mode strings.
+
+    Supported user-facing values (case-insensitive; '-'/'_' treated the same):
+
+    - disabled  (also when mode is None or not a str)
+    - aot_eager (alias: debug)
+    - reduce-overhead (alias: stable)
+    - max-autotune
+    - max-autotune-no-cudagraphs
+
+    Any other value is treated as "disabled".
+    """
+    if mode is None or not isinstance(mode, str):
+        return "disabled"
+
+    mode_raw = mode.strip().lower()
     canonical = mode_raw.replace("_", "-").replace(" ", "-")
     if "-" in canonical:
         canonical = "-".join(part for part in canonical.split("-") if part)
     compact = canonical.replace("-", "")
-    match canonical:
-        case "" | "none" | "disabled" | "disable" | "off" | "false" | "0":
-            return "disabled"
-        case (
-            "default"
-            | "reduce-overhead"
-            | "max-autotune"
-            | "max-autotune-no-cudagraphs"
-            | "aot-eager"
-        ):
-            return canonical
+
+    if canonical in {"", "none", "null", "disabled", "disable", "off", "false", "0"}:
+        return "disabled"
+
+    if canonical == "debug":
+        return "aot-eager"
+    if canonical == "stable":
+        return "reduce-overhead"
+
+    if canonical in {
+        "aot-eager",
+        "reduce-overhead",
+        "max-autotune",
+        "max-autotune-no-cudagraphs",
+    }:
+        return canonical
+
+    match compact:
+        case "aoteager":
+            return "aot-eager"
+        case "reduceoverhead":
+            return "reduce-overhead"
+        case "maxautotune":
+            return "max-autotune"
+        case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
+            return "max-autotune-no-cudagraphs"
         case _:
-            match compact:
-                case "reduceoverhead":
-                    return "reduce-overhead"
-                case "maxautotune":
-                    return "max-autotune"
-                case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
-                    return "max-autotune-no-cudagraphs"
-                case "aoteager":
-                    return "aot-eager"
-                case _:
-                    return canonical or "disabled"
+            return "disabled"
 
 
 
@@ -453,7 +471,7 @@ def compile(
     match canonical_mode:
         case "aot-eager":
             backend_value = "aot_eager"
-        case "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
+        case "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
             mode_value = canonical_mode
         case _:
             mode_value = str(mode) if mode is not None else None

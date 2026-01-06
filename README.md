@@ -218,9 +218,11 @@ to reduce "almost-right" config bugs:
   - Examples accepted: `spatial`, `temporal`, `spatiotemporal`, `spatio-temporal`, `spatio_temporal`, `temporal-spatial`, …
 - `normalization_method`: canonical values `layernorm`, `batchnorm`, `rmsnorm`.
   - Examples accepted: `ln`, `layer_norm`, `layer-norm`, `bn`, `batch_norm`, `rms_norm`, …
-- `compile_mode`: canonical values `disabled` (default), `default`, `reduce-overhead`, `max-autotune`,
-  `max-autotune-no-cudagraphs`, `aot-eager`.
-  - Examples accepted: `max_autotune`, `max-autotune`, `reduce_overhead`, `aot_eager`, …
+- `compile_mode`: canonical values `disabled` (default), `reduce-overhead` (alias: `stable`),
+  `max-autotune`, `max-autotune-no-cudagraphs`, `aot-eager` (alias: `debug`).
+  - Examples accepted (case-insensitive; `-`/`_` treated the same): `max_autotune`, `max-autotune`,
+    `stable`, `reduce_overhead`, `debug`, `aot_eager`, …
+  - Any other value is treated as `disabled`.
 
 ### RuntimeConfig string options (training)
 

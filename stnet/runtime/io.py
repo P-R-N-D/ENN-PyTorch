@@ -48,6 +48,8 @@ _IGNORED_WARNING_MESSAGE_RE: str = (
 _FORWARD_PARAM_CACHE: dict[object, object] = {}
 _FORWARD_PARAM_CACHE_LOCK = threading.Lock()
 
+_WARNINGS_FILTER_LOCK = threading.Lock()
+
 _SAVE_LOCK_GUARD = threading.Lock()
 _SAVE_PATH_LOCKS = weakref.WeakValueDictionary()
 
@@ -70,11 +72,17 @@ def _filtered_warnings(ignored_sentences: Sequence[str] | None = None) -> Iterat
     if ignored_sentences is not None:
         parts = [re.escape(str(s)) for s in sentences if s]
         msg_re = r".*(?:" + "|".join(parts) + r").*" if parts else ""
-    with warnings.catch_warnings():
-        with contextlib.suppress(Exception):
-            if msg_re:
-                warnings.filterwarnings("ignore", message=str(msg_re))
-        yield
+    ctx_aware = False
+    with contextlib.suppress(Exception):
+        if sys.version_info >= (3, 14):
+            ctx_aware = bool(getattr(getattr(sys, "flags", None), "context_aware_warnings", False))
+    guard = contextlib.nullcontext() if ctx_aware else _WARNINGS_FILTER_LOCK
+    with guard:
+        with warnings.catch_warnings():
+            with contextlib.suppress(Exception):
+                if msg_re:
+                    warnings.filterwarnings("ignore", message=str(msg_re))
+            yield
 
 
 @contextlib.contextmanager
@@ -412,7 +420,13 @@ def _onnx_options(kwargs: object, *, target: str = "onnx") -> object:
     - TF/LiteRT/NNEF: 변환 성공률 최우선(정적 batch, 보수적인 opset, legacy exporter 우선)
     """
     target_l = str(target or "onnx").strip().lower()
-    if target_l in {"tensorflow", "tf", "litert", "tflite"}:
+    if target_l in {"tensorrt", "trt", "tensor-rt", "tensor_rt"}:
+        default_opset = 17
+        default_dynamic_batch = True
+        default_prefer_dynamo = False
+        default_simplify = True
+        default_fallback = [17, 16, 15, 14, 13]
+    elif target_l in {"tensorflow", "tf", "litert", "tflite"}:
         default_opset = 15
         default_dynamic_batch = False
         default_prefer_dynamo = False
@@ -528,14 +542,21 @@ class _OnnxLayer:
                         {"preds_flat": {0: torch.export.Dim("batch")}},
                     )
 
+        training_mode = None
+        with contextlib.suppress(Exception):
+            training_mode = torch.onnx.TrainingMode.EVAL
+
         def _base_kwargs(opset: int) -> dict[str, Any]:
             common_kwargs: dict[str, Any] = {
                 "export_params": True,
                 "opset_version": int(opset),
                 "do_constant_folding": True,
+                "keep_initializers_as_inputs": False,
                 "input_names": input_names,
                 "output_names": output_names,
             }
+            if training_mode is not None:
+                common_kwargs["training"] = training_mode
             if dynamic_axes is not None:
                 common_kwargs["dynamic_axes"] = dynamic_axes
             base = inspect.signature(torch.onnx.export).parameters
@@ -881,22 +902,35 @@ class TensorRT(Format):
         *args: Any,
         **kwargs: Any,
     ) -> object:
+        del args
         with _onnx_model(model) as serving_model:
             onnx_path = Exporter._OnnxLayer.coerce(
-                serving_model, _coerce_onnx_path(dst, kwargs), **_onnx_options(kwargs, target="onnx")
+                serving_model,
+                _coerce_onnx_path(dst, kwargs),
+                **_onnx_options(kwargs, target="tensorrt"),
             )
             try:
                 import tensorrt as trt
             except ImportError as exc:
                 raise ImportError("TensorRT is required for this export.") from exc
             trt_logger = trt.Logger(trt.Logger.WARNING)
-            explicit_batch = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
-            with (
-                trt.Builder(trt_logger) as builder,
-                builder.create_network(explicit_batch) as network,
-                trt.OnnxParser(network, trt_logger) as parser,
-                builder.create_builder_config() as config,
-            ):
+            explicit_batch_flag = 0
+            with contextlib.suppress(Exception):
+                explicit_batch_flag = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
+
+            with contextlib.ExitStack() as stack:
+                builder = stack.enter_context(trt.Builder(trt_logger))
+                create_network = getattr(builder, "create_network", None)
+                if not callable(create_network):
+                    raise RuntimeError("TensorRT builder.create_network is not available.")
+                try:
+                    network = stack.enter_context(create_network(explicit_batch_flag))
+                except TypeError:
+                    network = stack.enter_context(create_network())
+
+                parser = stack.enter_context(trt.OnnxParser(network, trt_logger))
+                config = stack.enter_context(builder.create_builder_config())
+
                 workspace_size_bytes = int(kwargs.get("workspace_size_bytes", 1 << 30))
                 if hasattr(config, "set_memory_pool_limit"):
                     config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size_bytes)
@@ -909,18 +943,21 @@ class TensorRT(Format):
                         raise RuntimeError("TensorRT could not parse the ONNX model.")
                 use_fp16 = bool(kwargs.get("fp16", True))
                 use_int8 = bool(kwargs.get("int8", False))
-                if use_fp16 and builder.platform_has_fast_fp16:
-                    config.set_flag(trt.BuilderFlag.FP16)
+                if use_fp16 and bool(getattr(builder, "platform_has_fast_fp16", False)):
+                    with contextlib.suppress(Exception):
+                        config.set_flag(trt.BuilderFlag.FP16)
                 if use_int8:
-                    if not builder.platform_has_fast_int8:
+                    if not bool(getattr(builder, "platform_has_fast_int8", False)):
                         warnings.warn(
                             "INT8 precision is not supported on this platform; ignoring request."
                         )
                     else:
                         calibrator = kwargs.get("calibrator")
                         if calibrator is not None:
-                            config.set_int8_calibrator(calibrator)
-                        config.set_flag(trt.BuilderFlag.INT8)
+                            with contextlib.suppress(Exception):
+                                config.set_int8_calibrator(calibrator)
+                        with contextlib.suppress(Exception):
+                            config.set_flag(trt.BuilderFlag.INT8)
                 input_tensor = network.get_input(0)
                 sample = _pad_sample(serving_model, kwargs.get("sample_input"))
                 shape = tuple((int(x) for x in sample.shape))
@@ -930,9 +967,37 @@ class TensorRT(Format):
                 profile = builder.create_optimization_profile()
                 profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
                 config.add_optimization_profile(profile)
-                engine_bytes = builder.build_serialized_network(network, config)
-                if engine_bytes is None:
+
+                engine_blob = None
+                build_serialized = getattr(builder, "build_serialized_network", None)
+                if callable(build_serialized):
+                    engine_blob = build_serialized(network, config)
+                else:
+                    build_engine = getattr(builder, "build_engine", None) or getattr(
+                        builder, "build_cuda_engine", None
+                    )
+                    if callable(build_engine):
+                        engine = build_engine(network, config)
+                        if engine is not None:
+                            engine_blob = getattr(engine, "serialize", lambda: None)()
+
+                if engine_blob is None:
                     raise RuntimeError("Failed to build the TensorRT engine.")
+
+                try:
+                    engine_bytes = bytes(engine_blob)
+                except Exception:
+                    engine_bytes = engine_blob
+
+                if not isinstance(engine_bytes, (bytes, bytearray)):
+                    buf = getattr(engine_blob, "buffer", None)
+                    if buf is not None:
+                        engine_bytes = buf
+
+                if not isinstance(engine_bytes, (bytes, bytearray)):
+                    raise RuntimeError(
+                        f"TensorRT engine serialization returned unexpected type: {type(engine_blob)}"
+                    )
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 with open(dst, "wb") as handle:
                     handle.write(engine_bytes)
@@ -1008,7 +1073,16 @@ class CoreML(Format):
             sample = _pad_sample(serving_model, kwargs.get("sample_input"))
             wrapper = _CompatLayer(serving_model).eval()
             with inference_mode(wrapper):
-                scripted = torch.jit.trace(wrapper, sample)
+                scripted = torch.jit.trace(
+                    wrapper,
+                    sample,
+                    check_trace=False,
+                    strict=False,
+                )
+            with contextlib.suppress(Exception):
+                scripted = torch.jit.freeze(scripted)
+            with contextlib.suppress(Exception):
+                scripted = torch.jit.optimize_for_inference(scripted)
             cu_map = {
                 "ALL": getattr(ct.ComputeUnit, "ALL", None),
                 "CPU_ONLY": getattr(ct.ComputeUnit, "CPU_ONLY", None),
@@ -1029,7 +1103,28 @@ class CoreML(Format):
                 target = getattr(ct.target, deployment_target, None)
                 if target is not None:
                     kwargs_dict["minimum_deployment_target"] = target
-            mlmodel = ct.convert(scripted, **kwargs_dict)
+            convert_to_try = [str(convert_to)]
+            ct_to_l = str(convert_to).strip().lower()
+            if ct_to_l != "neuralnetwork":
+                convert_to_try.append("neuralnetwork")
+            if ct_to_l != "mlprogram":
+                convert_to_try.append("mlprogram")
+
+            mlmodel = None
+            last_exc: Exception | None = None
+            for ct_to in convert_to_try:
+                kwargs_dict["convert_to"] = ct_to
+                try:
+                    mlmodel = ct.convert(scripted, **kwargs_dict)
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    mlmodel = None
+
+            if mlmodel is None:
+                raise RuntimeError(
+                    f"CoreML conversion failed. Tried convert_to={convert_to_try}."
+                ) from last_exc
             dst.parent.mkdir(parents=True, exist_ok=True)
             mlmodel.save(str(dst))
         return (dst,)
