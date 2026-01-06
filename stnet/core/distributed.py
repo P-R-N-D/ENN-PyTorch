@@ -733,7 +733,7 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
-def broadcast_scalar(value: object, device: torch.device, src: int = 0) -> object:
+def broadcast_scalar(value: int | float, device: torch.device, src: int = 0) -> int:
     if not is_distributed():
         return int(value)
     try:
