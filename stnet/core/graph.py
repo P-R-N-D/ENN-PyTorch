@@ -12,11 +12,11 @@ from torch import nn
 from .casting import env_first, env_first_int
 from .system import is_accelerator_available, process_cpu_count
 
+
 try:
     _TORCH_DYNAMO = importlib.import_module("torch._dynamo")
 except Exception:
     _TORCH_DYNAMO = None
-
 
 _TORCH_COMPILER = getattr(torch, "compiler", None)
 
