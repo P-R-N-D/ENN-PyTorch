@@ -46,14 +46,18 @@ def _worker(
         if barrier is not None:
             barrier.wait()
         for _ in range(int(iters)):
-            x = torch.randn(int(batch), int(seq), int(in_dim), device=device, dtype=dtype)
+            x = torch.randn(
+                int(batch), int(seq), int(in_dim), device=device, dtype=dtype
+            )
             y, state = model.forward_stream(x, temporal_state=state)
             if not isinstance(y, torch.Tensor):
                 raise RuntimeError("forward_stream did not return Tensor output")
             if not isinstance(state, torch.Tensor):
                 raise RuntimeError("forward_stream did not return Tensor state")
             if state.dim() != 4:
-                raise RuntimeError(f"state dim mismatch: expected 4D, got {state.dim()}D")
+                raise RuntimeError(
+                    f"state dim mismatch: expected 4D, got {state.dim()}D"
+                )
             if not state.is_contiguous():
                 raise RuntimeError("state is not contiguous")
             if state.device != device:
@@ -71,7 +75,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--device", type=str, default="cpu", help="cpu|cuda")
     ap.add_argument("--dtype", type=str, default="fp32", help="fp32|fp16|bf16")
-    ap.add_argument("--compile-mode", type=str, default="disabled", help="torch.compile mode: disabled|reduce-overhead|max-autotune|max-autotune-no-cudagraphs|aot-eager")
+    ap.add_argument(
+        "--compile-mode",
+        type=str,
+        default="disabled",
+        help="torch.compile mode: disabled|reduce-overhead|max-autotune|max-autotune-no-cudagraphs|aot-eager",
+    )
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--iters", type=int, default=20)
     ap.add_argument("--batch", type=int, default=2)
@@ -90,7 +99,9 @@ def main() -> int:
 
     device = torch.device(args.device)
     dtype = _dtype_from_str(args.dtype)
-    out_shape = tuple(int(p.strip()) for p in str(args.out_shape).split(",") if p.strip())
+    out_shape = tuple(
+        int(p.strip()) for p in str(args.out_shape).split(",") if p.strip()
+    )
     if not out_shape:
         raise ValueError("out-shape must be like '8,8'")
 
@@ -144,7 +155,9 @@ def main() -> int:
 
     ok = all(r.ok for r in results)
     if ok:
-        print(f"[ok] forward_stream smoke: threads={n} iters={int(args.iters)} device={device} dtype={dtype}")
+        print(
+            f"[ok] forward_stream smoke: threads={n} iters={int(args.iters)} device={device} dtype={dtype}"
+        )
         return 0
     for i, r in enumerate(results):
         if not r.ok:

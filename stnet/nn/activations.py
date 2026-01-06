@@ -24,14 +24,22 @@ class GLU(nn.Module):
         self.hid = int(hidden_dim)
         self.out_dim = int(out_dim if out_dim is not None else self.in_dim)
         if self.in_dim <= 0:
-            raise ValueError(f"{self.__class__.__name__}: in_dim must be > 0, got {self.in_dim}")
+            raise ValueError(
+                f"{self.__class__.__name__}: in_dim must be > 0, got {self.in_dim}"
+            )
         if self.hid <= 0:
-            raise ValueError(f"{self.__class__.__name__}: hidden_dim must be > 0, got {self.hid}")
+            raise ValueError(
+                f"{self.__class__.__name__}: hidden_dim must be > 0, got {self.hid}"
+            )
         if self.out_dim <= 0:
-            raise ValueError(f"{self.__class__.__name__}: out_dim must be > 0, got {self.out_dim}")
+            raise ValueError(
+                f"{self.__class__.__name__}: out_dim must be > 0, got {self.out_dim}"
+            )
         p = float(dropout)
         if p < 0.0 or p > 1.0:
-            raise ValueError(f"{self.__class__.__name__}: dropout must be in [0, 1], got {p}")
+            raise ValueError(
+                f"{self.__class__.__name__}: dropout must be in [0, 1], got {p}"
+            )
         if not isinstance(activation, nn.Module):
             raise TypeError(
                 f"{self.__class__.__name__}: activation must be an nn.Module, got {type(activation)!r}"
@@ -48,7 +56,11 @@ class GLU(nn.Module):
 
     def extra_repr(self) -> str:
         act_name = self.activation.__class__.__name__
-        drop = 0.0 if isinstance(self.dropout, nn.Identity) else getattr(self.dropout, "p", None)
+        drop = (
+            0.0
+            if isinstance(self.dropout, nn.Identity)
+            else getattr(self.dropout, "p", None)
+        )
         return (
             f"in_dim={self.in_dim}, hidden_dim={self.hid}, out_dim={self.out_dim}, "
             f"activation={act_name}, dropout={drop}, check_input={self.check_input}"

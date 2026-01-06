@@ -203,7 +203,9 @@ def _nufft_nd(
         out = fk0.new_empty((B, *fk0.shape))
         out[0] = fk0
         for b in range(1, B):
-            out[b] = torch.as_tensor(plan.execute(x_cplx[b].contiguous()), device=device)
+            out[b] = torch.as_tensor(
+                plan.execute(x_cplx[b].contiguous()), device=device
+            )
         return out
     if omega.dim() == 3:
         try:
@@ -320,7 +322,9 @@ class MultipleQuantileLoss(nn.Module):
         if self.reduction == "none":
             return losses.transpose(0, qdim) if qdim != 0 else losses
         dims = tuple(range(1, losses.ndim))
-        per_q = losses.mean(dim=dims) if self.reduction == "mean" else losses.sum(dim=dims)
+        per_q = (
+            losses.mean(dim=dims) if self.reduction == "mean" else losses.sum(dim=dims)
+        )
         return (per_q * self.w).sum()
 
 
@@ -445,7 +449,9 @@ class CRPSLoss(nn.Module):
             z_pair = delta.unsqueeze(0) * z0.abs() + tail.unsqueeze(0) * z1
             m_pairs = min(int(pair_k * (pair_k - 1)), 64)
             idx_i = torch.randint(0, pair_k, (m_pairs,), device=device)
-            idx_j = (idx_i + torch.randint(1, pair_k, (m_pairs,), device=device)) % pair_k
+            idx_j = (
+                idx_i + torch.randint(1, pair_k, (m_pairs,), device=device)
+            ) % pair_k
             diff = (z_pair[idx_i] - z_pair[idx_j]).abs()
             e2 = 0.5 * diff.mean(dim=0)
         else:
@@ -455,7 +461,9 @@ class CRPSLoss(nn.Module):
 
     def _crps_normal(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         if pred.shape != target.shape:
-            raise ValueError(f"shape mismatch: pred={pred.shape}, target={target.shape}")
+            raise ValueError(
+                f"shape mismatch: pred={pred.shape}, target={target.shape}"
+            )
         dims = self._dims(pred)
         err = target - pred
         if self.std_param is not None:
@@ -481,7 +489,7 @@ class CRPSLoss(nn.Module):
             return pred
         perm = [0, sd] + [i for i in range(1, nd) if i != sd]
         return pred.permute(*perm)
-        
+
     def _recommend_energy_cdist_max_bytes(
         self, B: int, S: int, device: torch.device, out_elem_size: int
     ) -> int:
@@ -493,12 +501,14 @@ class CRPSLoss(nn.Module):
             if not is_compiling():
                 with contextlib.suppress(Exception):
                     from .system import Memory
+
                     free_i, total_i = Memory.mem_get_info(device)
                     free = int(free_i) if free_i is not None else None
                     total = int(total_i) if total_i is not None else None
             if total is None or total <= 0:
                 with contextlib.suppress(Exception):
                     from .system import available_accelerator_memory
+
                     total = available_accelerator_memory(device)
             if total is None or total <= 0:
                 cap = candidates[0]
@@ -537,13 +547,21 @@ class CRPSLoss(nn.Module):
         dev_idx = -1
         if dev.type == "cuda":
             from .system import get_accelerator_index
-            dev_idx = int(dev.index) if dev.index is not None else int(
-                get_accelerator_index("cuda")
+
+            dev_idx = (
+                int(dev.index)
+                if dev.index is not None
+                else int(get_accelerator_index("cuda"))
             )
         key = (dev.type, dev_idx, int(B), int(S), int(out_elem_size))
-        if self._energy_cdist_cache_key == key and self._energy_cdist_cache_val is not None:
+        if (
+            self._energy_cdist_cache_key == key
+            and self._energy_cdist_cache_val is not None
+        ):
             return int(self._energy_cdist_cache_val)
-        budget = self._recommend_energy_cdist_max_bytes(int(B), int(S), dev, out_elem_size)
+        budget = self._recommend_energy_cdist_max_bytes(
+            int(B), int(S), dev, out_elem_size
+        )
         self._energy_cdist_cache_key = key
         self._energy_cdist_cache_val = int(budget)
         return int(budget)
@@ -660,7 +678,9 @@ class DistributionLoss(nn.Module):
         return t
 
     @staticmethod
-    def _safe_std(x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float) -> torch.Tensor:
+    def _safe_std(
+        x: torch.Tensor, dim: Tuple[int, ...], ddof: int, eps: float
+    ) -> torch.Tensor:
         return _coerce_std(x, dim, ddof, eps)
 
     def reduce(self, x: torch.Tensor) -> torch.Tensor:
@@ -676,7 +696,9 @@ class DistributionLoss(nn.Module):
     def _dims(self, pred: torch.Tensor) -> Tuple[int, ...]:
         return _canonize_dims(pred, self.dim, keep_batch=False)
 
-    def compute_mu(self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
+    def compute_mu(
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
+    ) -> torch.Tensor:
         dims = _canonize_dims(pred, dims)
         match self.mu_mode:
             case "target":
@@ -692,7 +714,8 @@ class DistributionLoss(nn.Module):
                     mu = 0.5 * (mu_t + mu_p)
                 else:
                     mu = 0.5 * (
-                        target.mean(dim=dims, keepdim=True) + pred.mean(dim=dims, keepdim=True)
+                        target.mean(dim=dims, keepdim=True)
+                        + pred.mean(dim=dims, keepdim=True)
                     )
                 if self.detach_stats:
                     mu = mu.detach()
@@ -712,20 +735,46 @@ class DistributionLoss(nn.Module):
                 return mu.detach() if self.detach_stats else mu
             case _:
                 raise ValueError("invalid mu_mode")
-        mu = _median_over_dims(x, dims) if self.skew else reducer(x, dim=dims, keepdim=True)
+        mu = (
+            _median_over_dims(x, dims)
+            if self.skew
+            else reducer(x, dim=dims, keepdim=True)
+        )
         return mu.detach() if self.detach_stats else mu
 
-    def compute_std(self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]) -> torch.Tensor:
+    def compute_std(
+        self, pred: torch.Tensor, target: torch.Tensor, dims: Tuple[int, ...]
+    ) -> torch.Tensor:
         dims = _canonize_dims(pred, dims)
         match self.std_mode:
             case "target":
-                std = _mad_std(target, dims=dims, eps=self.eps) if self.skew else self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = (
+                    _mad_std(target, dims=dims, eps=self.eps)
+                    if self.skew
+                    else self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                )
             case "pred":
-                std = _mad_std(pred, dims=dims, eps=self.eps) if self.skew else self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                std = (
+                    _mad_std(pred, dims=dims, eps=self.eps)
+                    if self.skew
+                    else self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                )
             case "pooled":
-                std_t = _mad_std(target, dims=dims, eps=self.eps) if self.skew else self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
-                std_p = _mad_std(pred, dims=dims, eps=self.eps) if self.skew else self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
-                std = torch.sqrt(torch.clamp(0.5 * (std_t * std_t + std_p * std_p), min=self.eps * self.eps))
+                std_t = (
+                    _mad_std(target, dims=dims, eps=self.eps)
+                    if self.skew
+                    else self._safe_std(target, dim=dims, ddof=self.ddof, eps=self.eps)
+                )
+                std_p = (
+                    _mad_std(pred, dims=dims, eps=self.eps)
+                    if self.skew
+                    else self._safe_std(pred, dim=dims, ddof=self.ddof, eps=self.eps)
+                )
+                std = torch.sqrt(
+                    torch.clamp(
+                        0.5 * (std_t * std_t + std_p * std_p), min=self.eps * self.eps
+                    )
+                )
             case "provided":
                 if self.std is None:
                     raise ValueError("std required when std_mode='provided'")
@@ -738,10 +787,23 @@ class DistributionLoss(nn.Module):
             std = std.detach()
         return torch.clamp(std, min=self.eps)
 
-    def _statistic_abs(self, pred: torch.Tensor, target: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    def _statistic_abs(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
         return ((pred - target - mu) / std).abs()
 
-    def _compute_margin(self, stat_abs: torch.Tensor, pred: torch.Tensor, target: torch.Tensor, mu: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
+    def _compute_margin(
+        self,
+        stat_abs: torch.Tensor,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mu: torch.Tensor,
+        std: torch.Tensor,
+    ) -> torch.Tensor:
         raise NotImplementedError
 
     def _apply_penalty(self, margin: torch.Tensor) -> torch.Tensor:
@@ -815,13 +877,24 @@ class StandardNormalLoss(DistributionLoss):
             skew=skew,
             **kwargs,
         )
-        valid = {"z", "z_score", "z_value", "zscore", "zvalue", "p", "p_value", "pvalue"}
+        valid = {
+            "z",
+            "z_score",
+            "z_value",
+            "zscore",
+            "zvalue",
+            "p",
+            "p_value",
+            "pvalue",
+        }
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StandardNormalLoss: {self.metric}")
         self._std_normal = Normal(loc=0.0, scale=1.0)
         q = 0.5 + 0.5 * self.confidence if self.two_tailed else self.confidence
         try:
-            self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q, dtype=torch.float64)).item())
+            self._z_threshold_f64 = float(
+                self._std_normal.icdf(torch.tensor(q, dtype=torch.float64)).item()
+            )
         except Exception:
             self._z_threshold_f64 = float(self._std_normal.icdf(torch.tensor(q)).item())
 
@@ -859,7 +932,9 @@ class StandardNormalLoss(DistributionLoss):
             case "p" | "p_value" | "pvalue":
                 x = z_abs
                 try:
-                    one_tail = torch.clamp(1.0 - Normal(loc=0.0, scale=1.0).cdf(x), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - Normal(loc=0.0, scale=1.0).cdf(x), min=self.eps
+                    )
                 except NotImplementedError:
                     one_tail = torch.clamp(1.0 - _normal_cdf(x), min=self.eps)
                 p = 2.0 * one_tail if self.two_tailed else one_tail
@@ -914,7 +989,16 @@ class StudentsTLoss(DistributionLoss):
             skew=skew,
             **kwargs,
         )
-        valid = {"t", "t_score", "t_value", "tscore", "tvalue", "p", "p_value", "pvalue"}
+        valid = {
+            "t",
+            "t_score",
+            "t_value",
+            "tscore",
+            "tvalue",
+            "p",
+            "p_value",
+            "pvalue",
+        }
         if self.metric not in valid:
             raise ValueError(f"Invalid metric for StudentsTLoss: {self.metric}")
         self._cached_t_threshold_f64: Optional[float] = None
@@ -940,7 +1024,9 @@ class StudentsTLoss(DistributionLoss):
             and self._cached_t_df == df_scalar
             and self._cached_t_q == float(q)
         ):
-            return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
+            return torch.tensor(
+                self._cached_t_threshold_f64, device=device, dtype=dtype
+            )
         df = self._to_tensor_like(self.df, torch.empty((), device=device, dtype=dtype))
         try:
             dist = StudentT(df=df)
@@ -962,7 +1048,9 @@ class StudentsTLoss(DistributionLoss):
                 self._cached_t_threshold_f64 = float(thr.detach().double().cpu().item())
                 self._cached_t_df = float(df_scalar)
                 self._cached_t_q = float(q)
-                return torch.tensor(self._cached_t_threshold_f64, device=device, dtype=dtype)
+                return torch.tensor(
+                    self._cached_t_threshold_f64, device=device, dtype=dtype
+                )
             except Exception:
                 pass
         return thr
@@ -998,12 +1086,18 @@ class StudentsTLoss(DistributionLoss):
             case "p" | "p_value" | "pvalue":
                 df = self._expand_params(self.df, t_abs)
                 df_safe = torch.clamp(df, min=2.0 + self.eps)
-                scale = std * torch.sqrt(torch.clamp((df_safe - 2.0) / df_safe, min=self.eps))
+                scale = std * torch.sqrt(
+                    torch.clamp((df_safe - 2.0) / df_safe, min=self.eps)
+                )
                 x = mu + t_abs * scale
                 try:
-                    one_tail = torch.clamp(1.0 - StudentT(df=df, loc=mu, scale=scale).cdf(x), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - StudentT(df=df, loc=mu, scale=scale).cdf(x), min=self.eps
+                    )
                 except NotImplementedError:
-                    one_tail = torch.clamp(1.0 - _students_t_cdf(x, df, mu, scale), min=self.eps)
+                    one_tail = torch.clamp(
+                        1.0 - _students_t_cdf(x, df, mu, scale), min=self.eps
+                    )
                 p = 2.0 * one_tail if self.two_tailed else one_tail
                 alpha = max(1.0 - self.confidence, self.eps)
                 return -torch.log(torch.clamp(p, min=self.eps)) + math.log(alpha)
@@ -1031,7 +1125,9 @@ class DataFidelityLoss(nn.Module):
         self.ndim = len(self.out_shape)
         self.mode = str(mode).lower()
         self.backend = None if backend is None else str(backend).lower()
-        self.register_buffer("ktraj", ktraj if ktraj is not None else None, persistent=False)
+        self.register_buffer(
+            "ktraj", ktraj if ktraj is not None else None, persistent=False
+        )
         self.weight = float(weight)
         self.fft_norm = fft_norm
         self.reduction = str(reduction).lower()
@@ -1042,7 +1138,9 @@ class DataFidelityLoss(nn.Module):
             raise ValueError("ktraj is required for NUFFT mode")
 
     def _mse(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        diff = (a - b).abs() if (torch.is_complex(a) or torch.is_complex(b)) else (a - b)
+        diff = (
+            (a - b).abs() if (torch.is_complex(a) or torch.is_complex(b)) else (a - b)
+        )
         sq = diff * diff
         match self.reduction:
             case "mean":
@@ -1056,17 +1154,37 @@ class DataFidelityLoss(nn.Module):
                 raise ValueError(f"invalid reduction={self.reduction}")
         return val * self.weight
 
-    def forward(self, pred_flat: torch.Tensor, target_flat: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, pred_flat: torch.Tensor, target_flat: torch.Tensor
+    ) -> torch.Tensor:
         B = int(pred_flat.shape[0])
         shape = self.out_shape
         x = pred_flat.view(B, *shape)
         y = target_flat.view(B, *shape)
-        base_dtype = torch.float64 if (x.dtype == torch.float64 or y.dtype == torch.float64) else torch.float32
-        cplx_dtype = torch.complex128 if base_dtype == torch.float64 else torch.complex64
+        base_dtype = (
+            torch.float64
+            if (x.dtype == torch.float64 or y.dtype == torch.float64)
+            else torch.float32
+        )
+        cplx_dtype = (
+            torch.complex128 if base_dtype == torch.float64 else torch.complex64
+        )
         match self.mode:
             case "fft":
-                Xk = _fft_nd(x.to(cplx_dtype) if not torch.is_complex(x) else x, shape, real_input=False, inverse=False, norm=self.fft_norm)
-                Yk = _fft_nd(y.to(cplx_dtype) if not torch.is_complex(y) else y, shape, real_input=False, inverse=False, norm=self.fft_norm)
+                Xk = _fft_nd(
+                    x.to(cplx_dtype) if not torch.is_complex(x) else x,
+                    shape,
+                    real_input=False,
+                    inverse=False,
+                    norm=self.fft_norm,
+                )
+                Yk = _fft_nd(
+                    y.to(cplx_dtype) if not torch.is_complex(y) else y,
+                    shape,
+                    real_input=False,
+                    inverse=False,
+                    norm=self.fft_norm,
+                )
             case "nufft":
                 match self.backend:
                     case None | "cufinufft":
@@ -1087,9 +1205,23 @@ class DataFidelityLoss(nn.Module):
                             )
                         except RuntimeError as e:
                             msg = str(e)
-                            if ("cuFINUFFT not available" in msg) or ("requires CUDA tensors" in msg):
-                                Xk = _fft_nd(x.to(cplx_dtype), shape, real_input=False, inverse=False, norm=self.fft_norm)
-                                Yk = _fft_nd(y.to(cplx_dtype), shape, real_input=False, inverse=False, norm=self.fft_norm)
+                            if ("cuFINUFFT not available" in msg) or (
+                                "requires CUDA tensors" in msg
+                            ):
+                                Xk = _fft_nd(
+                                    x.to(cplx_dtype),
+                                    shape,
+                                    real_input=False,
+                                    inverse=False,
+                                    norm=self.fft_norm,
+                                )
+                                Yk = _fft_nd(
+                                    y.to(cplx_dtype),
+                                    shape,
+                                    real_input=False,
+                                    inverse=False,
+                                    norm=self.fft_norm,
+                                )
                             else:
                                 raise
                     case "finufft":
@@ -1150,7 +1282,9 @@ class LinearCombinationLoss(nn.Module):
         with torch.no_grad():
             device = self.loss_avg.device
             dtype = self.loss_avg.dtype
-            vals_t = torch.stack([v.detach().abs().mean() for v in per_loss_vals]).to(device=device, dtype=dtype)
+            vals_t = torch.stack([v.detach().abs().mean() for v in per_loss_vals]).to(
+                device=device, dtype=dtype
+            )
             vals_t = torch.clamp(vals_t, min=self.eps)
             m = float(max(0.0, min(1.0, self.schedule_momentum)))
             self.loss_avg.mul_(m).add_(vals_t * (1.0 - m))
@@ -1163,10 +1297,14 @@ class LinearCombinationLoss(nn.Module):
                 hi = float(self.max_coeff)
                 new_w = torch.clamp(new_w, min=lo, max=hi)
                 new_w = new_w / torch.clamp(new_w.sum(), min=self.eps)
-            self.coefficient.copy_(new_w.to(self.coefficient.device, dtype=self.coefficient.dtype))
+            self.coefficient.copy_(
+                new_w.to(self.coefficient.device, dtype=self.coefficient.dtype)
+            )
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        weights = self.coefficient.detach().clone().to(device=pred.device, dtype=pred.dtype)
+        weights = (
+            self.coefficient.detach().clone().to(device=pred.device, dtype=pred.dtype)
+        )
         total = pred.new_tensor(self.offset, dtype=pred.dtype)
         per_loss_vals: List[torch.Tensor] = []
         for w, L in zip(weights, self.losses):
@@ -1204,7 +1342,9 @@ class TiledLoss(nn.Module):
         self.tile_size = int(tile_size) if tile_size is not None else None
         reduction_v = str(reduction).lower()
         if reduction_v not in ("mean", "sum", "none"):
-            raise ValueError(f"reduction must be one of ('mean', 'sum', 'none'), got {reduction!r}")
+            raise ValueError(
+                f"reduction must be one of ('mean', 'sum', 'none'), got {reduction!r}"
+            )
         self.reduction = reduction_v
         base_red = str(base_reduction).lower()
         if base_red not in ("auto", "none", "mean", "sum"):
@@ -1226,7 +1366,9 @@ class TiledLoss(nn.Module):
                 if self.mask_value is None:
                     return None
                 try:
-                    base = target.new_tensor(self.mask_value, dtype=target.dtype, device=target.device)
+                    base = target.new_tensor(
+                        self.mask_value, dtype=target.dtype, device=target.device
+                    )
                     return expand_to_pred(target != base, pred)
                 except Exception:
                     return None
@@ -1234,7 +1376,9 @@ class TiledLoss(nn.Module):
                 return None
 
     @staticmethod
-    def _masked_select_safe(x: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+    def _masked_select_safe(
+        x: torch.Tensor, mask: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         if mask is None:
             return x
         if x.shape == mask.shape:
@@ -1300,7 +1444,11 @@ class TiledLoss(nn.Module):
         td = int(self.tile_dim) + nd if int(self.tile_dim) < 0 else int(self.tile_dim)
         td = max(0, min(td, nd - 1))
         N = int(pred.shape[td])
-        acc_dtype = torch.float32 if pred.dtype in (torch.float16, torch.bfloat16) else pred.dtype
+        acc_dtype = (
+            torch.float32
+            if pred.dtype in (torch.float16, torch.bfloat16)
+            else pred.dtype
+        )
         total_sum = pred.new_tensor(0.0, dtype=acc_dtype)
         total_count: int = 0
         parts: List[torch.Tensor] = []
@@ -1389,16 +1537,22 @@ class LossWeightController:
             return (0.5, 0.5)
         return (ratio_top / norm, ratio_bottom / norm)
 
-    def update(self, top_loss: Optional[torch.Tensor], bottom_loss: Optional[torch.Tensor]) -> None:
+    def update(
+        self, top_loss: Optional[torch.Tensor], bottom_loss: Optional[torch.Tensor]
+    ) -> None:
         if top_loss is not None:
             try:
                 top_val = float(top_loss.detach().abs().mean().item())
             except Exception:
                 top_val = float(self.eps)
-            self.top_avg = self.momentum * self.top_avg + (1.0 - self.momentum) * max(top_val, self.eps)
+            self.top_avg = self.momentum * self.top_avg + (1.0 - self.momentum) * max(
+                top_val, self.eps
+            )
         if bottom_loss is not None:
             try:
                 bottom_val = float(bottom_loss.detach().abs().mean().item())
             except Exception:
                 bottom_val = float(self.eps)
-            self.bottom_avg = self.momentum * self.bottom_avg + (1.0 - self.momentum) * max(bottom_val, self.eps)
+            self.bottom_avg = self.momentum * self.bottom_avg + (
+                1.0 - self.momentum
+            ) * max(bottom_val, self.eps)

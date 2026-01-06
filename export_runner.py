@@ -15,7 +15,9 @@ from stnet.config import ModelConfig, PatchConfig
 from stnet.runtime.io import Exporter
 
 
-def export_and_validate(model: torch.nn.Module, sample: torch.Tensor, out_dir: Path) -> Dict[str, Any]:
+def export_and_validate(
+    model: torch.nn.Module, sample: torch.Tensor, out_dir: Path
+) -> Dict[str, Any]:
     out_dir.mkdir(exist_ok=True)
     targets = {
         "torchscript": out_dir / "model.ts",
@@ -36,7 +38,10 @@ def export_and_validate(model: torch.nn.Module, sample: torch.Tensor, out_dir: P
                 # TorchScript scripting dislikes **kwargs in Model.forward; trace is safer here.
                 save_kwargs["method"] = "trace"
             out = fmt.save(model, path, **save_kwargs)
-            results[name] = {"status": "ok", "path": str(out if out is not None else path)}
+            results[name] = {
+                "status": "ok",
+                "path": str(out if out is not None else path),
+            }
         except Exception as exc:  # pragma: no cover - diagnostic output
             results[name] = {"status": "error", "error": repr(exc)}
 
@@ -57,9 +62,13 @@ def export_and_validate(model: torch.nn.Module, sample: torch.Tensor, out_dir: P
     onnx_path = targets["onnx"]
     if onnx_path.exists():
         try:
-            sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+            sess = ort.InferenceSession(
+                str(onnx_path), providers=["CPUExecutionProvider"]
+            )
             inp_name = sess.get_inputs()[0].name
-            onnx_out = sess.run(None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)})[0]
+            onnx_out = sess.run(
+                None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
+            )[0]
             torch_out = model(sample, return_loss=False).detach().cpu().numpy()
             validations["onnx_mae"] = float(np.mean(np.abs(torch_out - onnx_out)))
         except Exception as exc:
@@ -76,7 +85,9 @@ def main() -> None:
     T = data["T"]
     print(f"[export] dataset groups={data['B']} grid={S}x{T}")
     device = torch.device("cpu")
-    patch = PatchConfig(is_cube=True, grid_size_3d=(S, T, 1), patch_size_3d=(1, 1, 1), use_padding=True)
+    patch = PatchConfig(
+        is_cube=True, grid_size_3d=(S, T, 1), patch_size_3d=(1, 1, 1), use_padding=True
+    )
     cfg = ModelConfig(
         device=device,
         patch=patch,
@@ -93,7 +104,9 @@ def main() -> None:
         modeling_type="spatiotemporal",
         compile_mode="disabled",
     )
-    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(device)
+    model = new_model(in_dim=td_train["X"].shape[1], out_shape=(S, T), config=cfg).to(
+        device
+    )
     print("[export] training short run (epochs=2) for exportable weights")
     train(
         model,

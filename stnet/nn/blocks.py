@@ -98,6 +98,7 @@ def _autofit_microbatch(
     dev_free: Optional[int] = None
     host_free: Optional[int] = None
     from ..core.system import Memory as _Mem
+
     try:
         host_free = int(_Mem.available())
     except Exception:
@@ -191,7 +192,9 @@ def _prealloc_microbatch(
         else:
             outs = cast(Tuple[torch.Tensor, ...], out)
         if len(outs) == 0:
-            raise RuntimeError(f"{stage}: run_fn returned an empty tuple at slice s={s}")
+            raise RuntimeError(
+                f"{stage}: run_fn returned an empty tuple at slice s={s}"
+            )
         processed: List[torch.Tensor] = []
         for j, t in enumerate(outs):
             if not torch.is_tensor(t):
@@ -252,7 +255,7 @@ def stochastic_depth_schedule(drop_path: float, depth: int) -> List[float]:
         return [float(drop_path)]
     step = float(drop_path) / float(depth - 1)
     return [float(i * step) for i in range(depth)]
-    
+
 
 class RetNet(nn.Module):
     def __init__(
@@ -278,6 +281,7 @@ class RetNet(nn.Module):
         self.norm2 = norm_layer(norm_type, self.d_model)
         hid = int(self.d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
+
         self.ffn = SwiGLU(self.d_model, hid, out_dim=self.d_model, dropout=dropout)
 
     def forward(
@@ -326,13 +330,16 @@ class CrossTransformer(nn.Module):
         else:
             cross_mods = list(cross)
             if len(cross_mods) != 2:
-                raise ValueError(f"CrossTransformer expects exactly 2 cross modules, got {len(cross_mods)}")
+                raise ValueError(
+                    f"CrossTransformer expects exactly 2 cross modules, got {len(cross_mods)}"
+                )
         self.cross = nn.ModuleList(cross_mods)
         self.cross_s = self.cross[0]
         self.cross_t = self.cross[1]
         self.mix_norm = norm_layer(norm_type, 2 * d_model)
         hid = int(2 * d_model * mlp_ratio * (2.0 / 3.0))
         from .activations import SwiGLU
+
         self.mix = SwiGLU(2 * d_model, hid, out_dim=d_model, dropout=dropout)
         self.dropout = nn.Dropout(dropout)
         self.drop_path = StochasticDepth(p=drop_path, mode="row")
@@ -355,7 +362,9 @@ class CrossTransformer(nn.Module):
         if Bs != Bt:
             raise ValueError(f"CrossTransformer batch mismatch: a B={Bs}, b B={Bt}")
         if Ds != Dt:
-            raise ValueError(f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}")
+            raise ValueError(
+                f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}"
+            )
         spatial_tokens = spatial_tokens.contiguous()
         temporal_tokens = temporal_tokens.contiguous()
         requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
@@ -395,7 +404,13 @@ class CrossTransformer(nn.Module):
         if do_ckpt:
             return cast(
                 torch.Tensor,
-                _checkpoint(_ckpt_impl, spatial_tokens, temporal_tokens, use_reentrant=True, preserve_rng_state=True),
+                _checkpoint(
+                    _ckpt_impl,
+                    spatial_tokens,
+                    temporal_tokens,
+                    use_reentrant=True,
+                    preserve_rng_state=True,
+                ),
             )
         return _impl(spatial_tokens, temporal_tokens)
 
@@ -493,15 +508,25 @@ class LongNet(nn.Module):
             est_bytes = 0
             with contextlib.suppress(Exception):
                 if layout_batch_first:
-                    B = int(out.shape[0]); L = int(out.shape[1]); D = int(out.shape[2])
+                    B = int(out.shape[0])
+                    L = int(out.shape[1])
+                    D = int(out.shape[2])
                 else:
-                    L = int(out.shape[0]); B = int(out.shape[1]); D = int(out.shape[2])
+                    L = int(out.shape[0])
+                    B = int(out.shape[1])
+                    D = int(out.shape[2])
                 H = int(getattr(self, "nhead", 1) or 1)
                 bytes_e = int(out.element_size())
                 base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
-                score_bytes = 4 if out.dtype in (torch.float16, torch.bfloat16) else int(bytes_e)
+                score_bytes = (
+                    4 if out.dtype in (torch.float16, torch.bfloat16) else int(bytes_e)
+                )
                 peak_per_layer = 0
-                flex_ok = bool(_STNET_HAS_FLEX_ATTENTION and out.is_cuda and (not bool(need_weights)))
+                flex_ok = bool(
+                    _STNET_HAS_FLEX_ATTENTION
+                    and out.is_cuda
+                    and (not bool(need_weights))
+                )
                 has_kpm = isinstance(key_padding_mask, torch.Tensor)
                 for lyr in self.layers:
                     dilation = int(getattr(lyr, "dilation", 1) or 1)
@@ -514,16 +539,29 @@ class LongNet(nn.Module):
                         else:
                             if is_simple and (not has_kpm):
                                 dense_scores = False
-                    scores_bytes = int(B) * int(H) * int(L) * int(L) * int(score_bytes) if dense_scores else 0
+                    scores_bytes = (
+                        int(B) * int(H) * int(L) * int(L) * int(score_bytes)
+                        if dense_scores
+                        else 0
+                    )
                     attn_linear = int(base_bytes) * 5
                     attn_bytes = int(attn_linear) + int(scores_bytes)
                     hidden = 0
                     with contextlib.suppress(Exception):
                         f0 = getattr(lyr, "ffn", None)
-                        if isinstance(f0, nn.Sequential) and len(f0) > 0 and hasattr(f0[0], "out_features"):
+                        if (
+                            isinstance(f0, nn.Sequential)
+                            and len(f0) > 0
+                            and hasattr(f0[0], "out_features")
+                        ):
                             hidden = int(getattr(f0[0], "out_features", 0) or 0)
                     if hidden > 0:
-                        ffn_bytes = int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+                        ffn_bytes = (
+                            int(B)
+                            * int(L)
+                            * (int(2) * int(hidden) + int(D))
+                            * int(bytes_e)
+                        )
                     else:
                         ffn_bytes = int(base_bytes) * 9
                     layer_saved = int(attn_bytes + ffn_bytes)
@@ -532,6 +570,7 @@ class LongNet(nn.Module):
             do_ckpt = bool(est_bytes >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         for layer in self.layers:
             if do_ckpt:
+
                 def _f(t: torch.Tensor, _layer: nn.Module = layer) -> torch.Tensor:
                     if torch.is_grad_enabled():
                         _unshard_fsdp_module(self)
@@ -544,6 +583,7 @@ class LongNet(nn.Module):
                         skip_ffn_checkpoint=True,
                     )
                     return y
+
                 out = cast(
                     torch.Tensor,
                     _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),

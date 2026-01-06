@@ -42,7 +42,9 @@ def _fmin_impl(torch_mod: Any, a: Any, b: Any) -> Any:
     )
 
 
-def _nanmin_impl(torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool = False) -> Any:
+def _nanmin_impl(
+    torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool = False
+) -> Any:
     if isinstance(x, torch.Tensor) and not torch_mod.is_floating_point(x):
         return x.min() if dim is None else x.min(dim=dim, keepdim=keepdim)
     mask = torch_mod.isfinite(x)
@@ -50,15 +52,21 @@ def _nanmin_impl(torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool =
     if dim is None:
         values = xp.min()
         any_valid = mask.any()
-        return torch_mod.where(any_valid, values, torch_mod.full_like(values, float("nan")))
+        return torch_mod.where(
+            any_valid, values, torch_mod.full_like(values, float("nan"))
+        )
     values, indices = xp.min(dim=dim, keepdim=keepdim)
     any_valid = mask.any(dim=dim, keepdim=keepdim)
-    values = torch_mod.where(any_valid, values, torch_mod.full_like(values, float("nan")))
+    values = torch_mod.where(
+        any_valid, values, torch_mod.full_like(values, float("nan"))
+    )
     indices = torch_mod.where(any_valid, indices, torch_mod.zeros_like(indices))
     return (values, indices)
 
 
-def _nanmax_impl(torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool = False) -> Any:
+def _nanmax_impl(
+    torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool = False
+) -> Any:
     if isinstance(x, torch.Tensor) and not torch_mod.is_floating_point(x):
         return x.max() if dim is None else x.max(dim=dim, keepdim=keepdim)
     mask = torch_mod.isfinite(x)
@@ -66,10 +74,14 @@ def _nanmax_impl(torch_mod: Any, x: Any, dim: int | None = None, keepdim: bool =
     if dim is None:
         values = xp.max()
         any_valid = mask.any()
-        return torch_mod.where(any_valid, values, torch_mod.full_like(values, float("nan")))
+        return torch_mod.where(
+            any_valid, values, torch_mod.full_like(values, float("nan"))
+        )
     values, indices = xp.max(dim=dim, keepdim=keepdim)
     any_valid = mask.any(dim=dim, keepdim=keepdim)
-    values = torch_mod.where(any_valid, values, torch_mod.full_like(values, float("nan")))
+    values = torch_mod.where(
+        any_valid, values, torch_mod.full_like(values, float("nan"))
+    )
     indices = torch_mod.where(any_valid, indices, torch_mod.zeros_like(indices))
     return (values, indices)
 
@@ -107,7 +119,9 @@ def is_fake_tensor(value: Any) -> bool:
     if _tdx_is_fake is not None:
         with suppress(Exception):
             return bool(_tdx_is_fake(value))
-    return isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+    return (
+        isinstance(value, FakeTensor) or getattr(value, "fake_mode", None) is not None
+    )
 
 
 def is_meta_tensor(value: Any) -> bool:
@@ -118,7 +132,9 @@ def is_meta_or_fake_tensor(value: Any) -> bool:
     return is_meta_tensor(value) or is_fake_tensor(value)
 
 
-def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> TorchCompat:
+def torch_compat(
+    module: Any | None = None, nn_module: Any | None = None
+) -> TorchCompat:
     global _TORCH_COMPAT
     with _PATCH_LOCK:
         if _TORCH_COMPAT is None or module is not None or nn_module is not None:
@@ -139,7 +155,7 @@ class _RMSNormFallback(nn.Module):
     def forward(self, x: Any) -> Any:
         inv_rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return x * inv_rms * self.weight
-    
+
 
 class _StochasticDepthFallback(nn.Module):
     def __init__(self, p: float = 0.0, mode: str = "row") -> None:
@@ -171,7 +187,9 @@ class _SDPBackendFallback:
 class TorchCompat:
     def __init__(self, module: Any | None = None, nn_module: Any | None = None) -> None:
         self.module = module if module is not None else torch
-        self.nn_module = nn_module if nn_module is not None else getattr(self.module, "nn", nn)
+        self.nn_module = (
+            nn_module if nn_module is not None else getattr(self.module, "nn", nn)
+        )
 
     def _patch_rmsnorm(self) -> None:
         global RMSNorm
@@ -200,7 +218,7 @@ class TorchCompat:
         if hasattr(self.module, "nansum"):
             return
         setattr(self.module, "nansum", partial(_nansum_impl, self.module))
-        
+
     def apply(self) -> None:
         with _PATCH_LOCK:
             self._patch_rmsnorm()
@@ -220,6 +238,7 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
+
 
 StochasticDepth = getattr(nn, "StochasticDepth", None)
 if StochasticDepth is None:
