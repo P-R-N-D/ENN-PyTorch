@@ -125,6 +125,7 @@ except Exception:
         MixedPrecisionPolicy = None
 
 
+MB_DIV = 1024.0 * 1024.0
 PathLike: TypeAlias = str | os.PathLike[str] | Path
 JsonPrimitive: TypeAlias = str | int | float | bool | None
 JsonValue: TypeAlias = JsonPrimitive | list["JsonValue"] | dict[str, "JsonValue"]
@@ -168,12 +169,9 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
-
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
     r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
 )
-
-MB_DIV = 1024.0 * 1024.0
 
 _DL_STATE_FILE = "dataloader.json"
 
