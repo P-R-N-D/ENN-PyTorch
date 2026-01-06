@@ -22,7 +22,6 @@ from typing import (
 
 import torch
 
-
 from .core.graph import canonicalize_compile_mode
 
 if TYPE_CHECKING:
