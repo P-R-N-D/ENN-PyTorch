@@ -674,6 +674,7 @@ class DilatedAttention(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
         average_attn_weights: bool = False,
+        skip_ffn_checkpoint: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         transposed = False
         if not self.batch_first:
@@ -1038,13 +1039,17 @@ class DilatedAttention(nn.Module):
         x_out = self.norm2(x_out)
         ffn_bytes = 0
         try:
-            base_bytes = int(x_out.numel()) * int(x_out.element_size()) if isinstance(x_out, torch.Tensor) else 0
-            hidden = int(getattr(self.ffn[0], 'out_features', 0) or 0) if hasattr(self, 'ffn') else 0
-            ratio = (float(hidden) / float(self.embed_dim)) if (hidden > 0 and getattr(self, 'embed_dim', 0)) else 4.0
-            ffn_bytes = int(float(base_bytes) * max(1.0, float(ratio)))
+            if isinstance(x_out, torch.Tensor) and x_out.dim() == 3:
+                B, L, D = map(int, x_out.shape)
+                bytes_e = int(x_out.element_size())
+                hidden = int(getattr(self.ffn[0], "out_features", 0) or 0) if hasattr(self, "ffn") else 0
+                if hidden > 0:
+                    ffn_bytes = int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+                else:
+                    ffn_bytes = int(B) * int(L) * int(D) * int(bytes_e) * 9
         except Exception:
             ffn_bytes = 0
-        do_ckpt_ffn = self.training and torch.is_grad_enabled() and ffn_bytes >= int(64 * 1024 * 1024)
+        do_ckpt_ffn = (not bool(skip_ffn_checkpoint)) and self.training and torch.is_grad_enabled() and ffn_bytes >= int(64 * 1024 * 1024)
         if do_ckpt_ffn:
             try:
                 x_out = checkpoint(

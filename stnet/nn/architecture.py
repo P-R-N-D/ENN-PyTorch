@@ -117,6 +117,30 @@ def _is_export_or_trace() -> bool:
                 return True
     return False
 
+
+def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *, mode: str) -> int:
+    if not isinstance(x, torch.Tensor) or x.dim() != 3:
+        return 0
+    B, L, D = map(int, x.shape)
+    if B <= 0 or L <= 0 or D <= 0:
+        return 0
+    bytes_e = int(x.element_size())
+    base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
+    m = str(mode or "temporal").strip().lower()
+    ret_factor = 8 if m == "spatial" else 6
+    retention_bytes = int(base_bytes) * int(ret_factor)
+    hid = 0
+    ffn = getattr(blk0, "ffn", None)
+    with contextlib.suppress(Exception):
+        hid = int(getattr(ffn, "hidden_dim", 0) or getattr(ffn, "hid", 0) or 0)
+    if hid <= 0:
+        hid = int(float(D) * 4.0 * (2.0 / 3.0))
+    ffn_elems = int(B) * int(L) * (int(3) * int(hid) + int(D))
+    ffn_bytes = int(ffn_elems) * int(bytes_e)
+    extra_bytes = int(base_bytes) * 2
+    return int(retention_bytes + ffn_bytes + extra_bytes)
+
+
 def _prod_int(shape: Sequence[int]) -> int:
     out = 1
     for v in shape:
@@ -353,13 +377,25 @@ class SpatialExtractor(nn.Module):
             self.training
             and torch.is_grad_enabled()
             and _checkpoint is not None
+            and bool(getattr(self, "_ckpt_enabled", True))
             and not _is_export_or_trace()
         )
+        if do_ckpt:
+            est = 0
+            with contextlib.suppress(Exception):
+                blk0 = self.blocks[0] if len(self.blocks) > 0 else None
+                if blk0 is not None:
+                    per_blk = _size_of_retnet(out, blk0, mode="spatial")
+                    est = int(per_blk) * int(len(self.blocks))
+                else:
+                    est = int(out.numel()) * int(out.element_size()) * int(len(self.blocks))
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         for blk in self.blocks:
             if do_ckpt:
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    _unshard_fsdp_module(self)
-                    _unshard_fsdp_module(_blk)
+                    if torch.is_grad_enabled():
+                        _unshard_fsdp_module(self)
+                        _unshard_fsdp_module(_blk)
                     y, _ = _blk(t, causal_mask=attn_mask, state=None, mode="spatial")
                     return y
                 out = cast(
@@ -561,10 +597,21 @@ class TemporalExtractor(nn.Module):
             self.training
             and torch.is_grad_enabled()
             and _checkpoint is not None
+            and bool(getattr(self, "_ckpt_enabled", True))
             and not return_state
             and st_tensor is None
             and not _is_export_or_trace()
         )
+        if do_ckpt:
+            est = 0
+            with contextlib.suppress(Exception):
+                blk0 = self.blocks[0] if len(self.blocks) > 0 else None
+                if blk0 is not None:
+                    per_blk = _size_of_retnet(x, blk0, mode="temporal")
+                    est = int(per_blk) * int(len(self.blocks))
+                else:
+                    est = int(x.numel()) * int(x.element_size()) * int(len(self.blocks))
+            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         next_state: Optional[torch.Tensor] = None
         if return_state:
             next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
@@ -574,8 +621,9 @@ class TemporalExtractor(nn.Module):
                 blk_state = st_tensor[i]
             if do_ckpt:
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    _unshard_fsdp_module(self)
-                    _unshard_fsdp_module(_blk)
+                    if torch.is_grad_enabled():
+                        _unshard_fsdp_module(self)
+                        _unshard_fsdp_module(_blk)
                     y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="temporal")
                     return y
                 x = cast(

@@ -700,6 +700,25 @@ def _recover_oom(
     if optimizer is not None:
         with contextlib.suppress(Exception):
             optimizer.zero_grad(set_to_none=True)
+
+    inst_pressure = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    if inst_pressure is not None:
+        cur_step_total = int(getattr(inst_pressure, "_stnet_step_total", 0) or 0)
+        if int(oom_try) <= 1:
+            applied = _to_checkpoint(
+                model,
+                device=device,
+                step_total=cur_step_total,
+                ttl_steps=64,
+                min_bytes=0,
+            )
+            if applied:
+                sleep_s = _get_oom_blocking_time(oom_try, ph)
+                if sleep_s > 0.0:
+                    with contextlib.suppress(Exception):
+                        time.sleep(float(sleep_s))
+                return ("retry", grad_accum_steps)
+
     reduced_any = False
     inst = _to_submodule(model)
     if inst is not None:
@@ -2101,6 +2120,99 @@ def _to_submodule(model: object) -> object:
     return None
 
 
+def _iter_checkpoint(root: object):
+    try:
+        import torch.nn as nn
+        if isinstance(root, nn.Module):
+            for mod in root.modules():
+                if hasattr(mod, "_ckpt_min_bytes") and hasattr(mod, "_ckpt_enabled"):
+                    yield mod
+    except Exception:
+        return
+
+
+def _to_checkpoint(
+    model: object,
+    *,
+    device: torch.device,
+    step_total: int,
+    ttl_steps: int,
+    min_bytes: int,
+) -> bool:
+    inst = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    if inst is None:
+        return False
+    try:
+        ttl_steps = max(1, int(ttl_steps))
+        min_bytes = max(0, int(min_bytes))
+        step_total = max(0, int(step_total))
+    except Exception:
+        return False
+
+    until = step_total + ttl_steps
+    try:
+        until = int(_sync_tensor(until, device=device, src=0))
+        min_bytes = int(_sync_tensor(min_bytes, device=device, src=0))
+    except Exception:
+        pass
+
+    cur_until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
+    if cur_until >= until and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes:
+        return False
+
+    changed = False
+    for mod in _iter_checkpoint(inst):
+        if not hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
+            with contextlib.suppress(Exception):
+                setattr(mod, "_stnet_ckpt_saved_min_bytes", int(getattr(mod, "_ckpt_min_bytes", 0) or 0))
+                setattr(mod, "_stnet_ckpt_saved_enabled", bool(getattr(mod, "_ckpt_enabled", True)))
+        try:
+            cur = int(getattr(mod, "_ckpt_min_bytes", 0) or 0)
+            if min_bytes < cur:
+                setattr(mod, "_ckpt_min_bytes", int(min_bytes))
+                changed = True
+            if not bool(getattr(mod, "_ckpt_enabled", True)):
+                setattr(mod, "_ckpt_enabled", True)
+                changed = True
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        setattr(inst, "_stnet_ckpt_pressure_until", int(max(cur_until, until)))
+        prev_mb = int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0)
+        if prev_mb <= 0:
+            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
+        else:
+            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes)))
+    return bool(changed)
+
+
+def _from_checkpoint(model: object, *, step_total: int) -> None:
+    inst = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    if inst is None:
+        return
+    try:
+        step_total = int(step_total)
+    except Exception:
+        return
+    until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
+    if until <= 0 or step_total < until:
+        return
+    for mod in _iter_checkpoint(inst):
+        try:
+            if hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
+                setattr(mod, "_ckpt_min_bytes", int(getattr(mod, "_stnet_ckpt_saved_min_bytes", 0) or 0))
+            if hasattr(mod, "_stnet_ckpt_saved_enabled"):
+                setattr(mod, "_ckpt_enabled", bool(getattr(mod, "_stnet_ckpt_saved_enabled", True)))
+            for k in ("_stnet_ckpt_saved_min_bytes", "_stnet_ckpt_saved_enabled"):
+                with contextlib.suppress(Exception):
+                    delattr(mod, k)
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        setattr(inst, "_stnet_ckpt_pressure_until", 0)
+        setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
+
+
 def _compute_batch_bytes_per_sample(obj: object) -> tuple[int | None, int]:
     batch_dim: int | None = None
     bytes_per_sample = 0
@@ -2866,6 +2978,8 @@ def epochs(
                     train_accum_since_last += 1
                     while True:
                         try:
+                            with contextlib.suppress(Exception):
+                                flush_accelerator_memory_stats(device)
                             X, Y_opt, t_ready, h2d_s = _pin(
                                 meta,
                                 _raw,
@@ -2963,6 +3077,37 @@ def epochs(
                                         scaler.step(optimizer)
                                         scaler.update()
                                         optimizer.zero_grad(set_to_none=True)
+
+                                        target_for_step = model.module if hasattr(model, "module") else model
+                                        inst_step = _to_submodule(target_for_step) or target_for_step
+                                        with contextlib.suppress(Exception):
+                                            setattr(inst_step, "_stnet_step_total", int(p_gate_auto_step_total))
+
+                                        peak = None
+                                        free = None
+                                        total = None
+                                        with contextlib.suppress(Exception):
+                                            peak = int(accelerator_max_allocated_memory(device))
+                                        with contextlib.suppress(Exception):
+                                            free, total = _device_mem_get_info(device)
+                                        if isinstance(peak, int) and peak > 0 and isinstance(total, int) and total and total > 0:
+                                            frac = float(peak) / float(total)
+                                            prev_ema = float(getattr(inst_step, "_stnet_peak_ema", 0.0) or 0.0)
+                                            ema = frac if prev_ema <= 0.0 else (0.9 * prev_ema + 0.1 * frac)
+                                            with contextlib.suppress(Exception):
+                                                setattr(inst_step, "_stnet_peak_ema", float(ema))
+                                            spike = (prev_ema > 0.0 and frac > max(0.92, prev_ema * 1.25))
+                                            if frac > 0.92 or spike:
+                                                _to_checkpoint(
+                                                    model,
+                                                    device=device,
+                                                    step_total=int(p_gate_auto_step_total),
+                                                    ttl_steps=128,
+                                                    min_bytes=16 * 1024 * 1024,
+                                                )
+
+                                        _from_checkpoint(model, step_total=int(p_gate_auto_step_total))
+
                                         if scheduler_step_per_batch:
                                             with contextlib.suppress(Exception):
                                                 sched.step()
