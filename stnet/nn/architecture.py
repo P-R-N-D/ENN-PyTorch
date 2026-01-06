@@ -773,7 +773,7 @@ class TokenizedView(nn.Module):
         return int(getattr(self.extractor, "head_dim", 0) or 0)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        B = int(x.shape[0])
+        B = x.shape[0]
         tokens = self.tokenizer(x).reshape(B, self.tokens, self.d_model).contiguous()
         return self.extractor(tokens, *args, **kwargs)
 
@@ -1747,7 +1747,7 @@ class Model(nn.Module):
             base_dtype = features.dtype
         x = self._cast_graph_safe(features, device, base_dtype)
         x = self.scaler.normalize_x(x)
-        b = int(x.shape[0])
+        b = x.shape[0]
         tokens, context = self.fuser.forward_export(x)
         assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
