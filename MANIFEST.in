@@ -2,5 +2,18 @@ include LICENSE*
 include pyproject.toml
 include requirements.txt
 
-recursive-include stnet *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt *.pt *.pth *.onnx *.bin
-global-exclude __pycache__ *.py[cod] *.so *.dylib .DS_Store
+# Source + lightweight human-readable config/docs only
+recursive-include stnet *.py *.json *.yaml *.yml *.ini *.cfg *.md *.txt
+
+# Generic junk / build outputs
+global-exclude __pycache__ .DS_Store *.py[cod] *.so *.dylib  *.whl *.metadata *.meta
+
+# Logs / patch rejects / backups
+global-exclude *.log *.orig *.rej
+
+# ML / export / checkpoint / data artifacts
+global-exclude *.onnx *.ts *.pte *.tflite *.mlmodel *.pt *.pth *.bin
+global-exclude *.h5 *.hdf5 *.npz *.mmt *.td
+
+# Sample spreadsheets (do not ship)
+global-exclude *.xlsx *.xls *.xlsm *.xlsb
