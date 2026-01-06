@@ -4645,10 +4645,6 @@ def process(*args: Any, **kwargs: Any) -> object:
             device=device, metadata=metadata, logger=_LOGGER
         )
         param_dtype = precision.master_float
-        if device.type != "cuda":
-            _LOGGER.warning(
-                "Forcing CPU / non-CUDA config: mixed precision + NVIDIA fused layers may be unavailable."
-            )
         model, _, _ = ModelPolicy.use_nvidia_layers(
             model,
             device=device,
