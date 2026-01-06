@@ -1,0 +1,687 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import importlib
+import threading
+from contextlib import AbstractContextManager, suppress, nullcontext
+from typing import Any, Callable, Dict, List, Optional
+
+import torch
+from torch import nn
+
+from .casting import env_first, env_first_int
+from .system import is_accelerator_available, process_cpu_count
+
+_TORCH_COMPILER = getattr(torch, "compiler", None)
+
+try:
+    _TORCH_DYNAMO = importlib.import_module("torch._dynamo")
+except Exception:
+    _TORCH_DYNAMO = None
+
+
+_INDUCTOR_CONFIG_LOCK = threading.RLock()
+
+_SAFE_DIST_LOCK = threading.Lock()
+_SAFE_DIST_PATCHED: set[str] = set()
+
+_COLLECTIVE_NAMES: tuple[str, ...] = (
+    "all_gather",
+    "all_gather_into_tensor",
+    "all_reduce",
+    "reduce_scatter_tensor",
+    "broadcast",
+    "barrier",
+)
+
+_NO_COMPILE_SENTINEL = "__stnet_no_compile_wrapped__"
+
+_GRAPH_BREAK_FN: Callable[[], None] | None = None
+_GRAPH_BREAK_LOCK = threading.Lock()
+
+
+def is_compiling() -> bool:
+    """Best-effort check for torch.compile / torch._dynamo compilation contexts."""
+    with suppress(Exception):
+        dyn = getattr(torch, "_dynamo", None)
+        if dyn is not None and callable(getattr(dyn, "is_compiling", None)):
+            if bool(dyn.is_compiling()):
+                return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        fn = getattr(comp, "is_compiling", None)
+        if callable(fn) and bool(fn()):
+            return True
+    return False
+
+
+def is_tracing_or_exporting() -> bool:
+    """Best-effort check for tracing / scripting / ONNX export contexts."""
+    with suppress(Exception):
+        jit = getattr(torch, "jit", None)
+        if jit is not None and (torch.jit.is_tracing() or torch.jit.is_scripting()):
+            return True
+    with suppress(Exception):
+        comp = getattr(torch, "compiler", None)
+        fn = getattr(comp, "is_exporting", None)
+        if callable(fn) and bool(fn()):
+            return True
+    with suppress(Exception):
+        onnx = getattr(torch, "onnx", None)
+        fn = getattr(onnx, "is_in_onnx_export", None)
+        if callable(fn) and bool(fn()):
+            return True
+    return False
+
+
+def is_export_or_trace() -> bool:
+    """Unified helper used across the project to gate export/trace/compile sensitive code."""
+    return bool(is_compiling() or is_tracing_or_exporting())
+
+
+def canonicalize_compile_mode(mode: str | None) -> str:
+    """Normalize compile mode aliases to torch.compile accepted values."""
+    mode_given = str(mode) if mode is not None else ""
+    mode_raw = str(mode_given or "").strip().lower()
+    canonical = mode_raw.replace("_", "-").replace(" ", "-")
+    if "-" in canonical:
+        canonical = "-".join(part for part in canonical.split("-") if part)
+    compact = canonical.replace("-", "")
+    match canonical:
+        case "" | "none" | "disabled" | "disable" | "off" | "false" | "0":
+            return "disabled"
+        case (
+            "default"
+            | "reduce-overhead"
+            | "max-autotune"
+            | "max-autotune-no-cudagraphs"
+            | "aot-eager"
+        ):
+            return canonical
+        case _:
+            match compact:
+                case "reduceoverhead":
+                    return "reduce-overhead"
+                case "maxautotune":
+                    return "max-autotune"
+                case "maxautotunenocudagraphs" | "maxautotunenocudagraph":
+                    return "max-autotune-no-cudagraphs"
+                case "aoteager":
+                    return "aot-eager"
+                case _:
+                    return canonical or "disabled"
+
+
+
+def _is_compiled_for_inference(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_compiled_for_inference__", None)
+    if isinstance(cached, bool):
+        return cached
+    compile_attrs = (
+        "_is_compiled_for_inference",
+        "__is_compiled_for_inference__",
+        "__compiled_for_serving__",
+        "__serving_compiled__",
+        "_is_serialized_for_serving",
+    )
+    if any(bool(getattr(model, attr, False)) for attr in compile_attrs):
+        try:
+            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+        except Exception:
+            pass
+        return True
+    jit = getattr(torch, "jit", None)
+    script_like_types: List[type] = []
+    if jit is not None:
+        for name in ("ScriptModule", "RecursiveScriptModule", "TopLevelTracedModule"):
+            typ = getattr(jit, name, None)
+            if isinstance(typ, type):
+                script_like_types.append(typ)
+        for mod_name in ("_script", "_trace"):
+            submod = getattr(jit, mod_name, None)
+            if submod is None:
+                continue
+            for name in ("RecursiveScriptModule", "TopLevelTracedModule"):
+                typ = getattr(submod, name, None)
+                if isinstance(typ, type):
+                    script_like_types.append(typ)
+    if any(isinstance(model, typ) for typ in script_like_types):
+        try:
+            setattr(model, "__stnet_cached_is_compiled_for_inference__", True)
+        except Exception:
+            pass
+        return True
+    try:
+        modules = tuple(model.modules())
+    except (RuntimeError, AttributeError, TypeError):
+        modules = ()
+    for module in modules:
+        if module is model:
+            continue
+        if any(bool(getattr(module, attr, False)) for attr in compile_attrs):
+            return True
+        if any(isinstance(module, typ) for typ in script_like_types):
+            return True
+    try:
+        setattr(model, "__stnet_cached_is_compiled_for_inference__", False)
+    except Exception:
+        pass
+    return False
+
+
+def _is_aot_autograd_enabled(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_aot_autograd_enabled__", None)
+    if isinstance(cached, bool):
+        return cached
+    indicator_attrs = (
+        "_aot_autograd_graph",
+        "_aot_autograd_cache",
+        "_aot_compiled_autograd",
+        "_aot_autograd_traced_module",
+        "__aot_autograd__",
+        "__compiled_with_aot_autograd__",
+    )
+    if any(getattr(model, attr, None) for attr in indicator_attrs):
+        try:
+            setattr(model, "__stnet_cached_is_aot_autograd_enabled__", True)
+        except Exception:
+            pass
+        return True
+    try:
+        modules = tuple(model.modules())
+    except (RuntimeError, AttributeError, TypeError):
+        modules = ()
+    for module in modules:
+        if module is model:
+            continue
+        if any(getattr(module, attr, None) for attr in indicator_attrs):
+            return True
+        class_name = module.__class__.__name__
+        module_name = getattr(module.__class__, "__module__", "")
+        if "AOTAutograd" in class_name or "aot_autograd" in module_name:
+            return True
+    try:
+        setattr(model, "__stnet_cached_is_aot_autograd_enabled__", False)
+    except Exception:
+        pass
+    return False
+
+
+def _is_for_cuda(module: nn.Module) -> bool:
+    try:
+        p0 = next(module.parameters(), None)
+        if isinstance(p0, torch.Tensor):
+            return p0.device.type == "cuda"
+    except Exception:
+        pass
+    try:
+        b0 = next(module.buffers(), None)
+        if isinstance(b0, torch.Tensor):
+            return b0.device.type == "cuda"
+    except Exception:
+        pass
+    return bool(is_accelerator_available("cuda"))
+
+
+def _resolve_compiler_disable() -> Any | None:
+    if _TORCH_COMPILER is not None:
+        fn = getattr(_TORCH_COMPILER, "disable", None)
+        if callable(fn):
+            return fn
+    if _TORCH_DYNAMO is not None:
+        fn = getattr(_TORCH_DYNAMO, "disable", None)
+        if callable(fn):
+            return fn
+    return None
+
+
+def _resolve_graph_break() -> Callable[[], None] | None:
+    try:
+        inductor = importlib.import_module("torch._inductor")
+        gb = getattr(inductor, "graph_break", None)
+        if callable(gb):
+            return gb
+    except Exception:
+        pass
+    if _TORCH_DYNAMO is not None:
+        gb = getattr(_TORCH_DYNAMO, "graph_break", None)
+        if callable(gb):
+            return gb
+    return None
+
+
+def _get_inductor_config() -> Any | None:
+    try:
+        from torch._inductor import config
+    except Exception:
+        return None
+    return config
+
+
+def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
+    return fn
+
+
+def _decorate_compiler_disable(
+    *args: Any, reason: str | None = None, recursive: bool = True
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    if _resolve_compiler_disable() is None:
+        return _identity
+    kwargs: dict[str, Any] = {}
+    if reason is not None:
+        kwargs["reason"] = reason
+    kwargs["recursive"] = bool(recursive)
+    for opts in (
+        kwargs,
+        {k: v for k, v in kwargs.items() if k != "recursive"},
+        {k: v for k, v in kwargs.items() if k != "reason"},
+        {},
+    ):
+        try:
+            dec = _resolve_compiler_disable()(**opts)
+            if callable(dec):
+                return dec
+        except TypeError:
+            continue
+        except Exception:
+            break
+
+    return _identity
+
+
+def clear_model_cache(model: Optional[nn.Module]) -> None:
+    if not isinstance(model, nn.Module):
+        return
+    for attr in (
+        "__stnet_cached_is_compiled_for_inference__",
+        "__stnet_cached_is_aot_autograd_enabled__",
+        "__stnet_cached_is_nvidia_te_available__",
+    ):
+        with suppress(Exception):
+            delattr(model, attr)
+
+
+def is_nvidia_te_available(model: torch.nn.Module) -> bool:
+    cached = getattr(model, "__stnet_cached_is_nvidia_te_available__", None)
+    if isinstance(cached, bool):
+        return cached
+    te_flags = (
+        getattr(model, "__fp8_inference_te__", False),
+        getattr(model, "__fp8_training_te__", False),
+        getattr(model, "__te_fp8_default__", False),
+    )
+    if any(te_flags):
+        try:
+            setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+        except Exception:
+            pass
+        return True
+    for module in model.modules():
+        mod_name = getattr(module.__class__, "__module__", "")
+        if isinstance(mod_name, str) and mod_name.startswith("transformer_engine"):
+            try:
+                setattr(model, "__stnet_cached_is_nvidia_te_available__", True)
+            except Exception:
+                pass
+            return True
+    try:
+        setattr(model, "__stnet_cached_is_nvidia_te_available__", False)
+    except Exception:
+        pass
+    return False
+
+
+def inference_mode(model: torch.nn.Module) -> AbstractContextManager[None]:
+    if (
+        is_nvidia_te_available(model)
+        or _is_compiled_for_inference(model)
+        or _is_aot_autograd_enabled(model)
+    ):
+        return torch.no_grad()
+    return torch.inference_mode()
+
+
+
+def compile(
+    module: nn.Module,
+    *args: Any,
+    backend: Optional[str] = None,
+    mode: Optional[str] = None,
+    fullgraph: Optional[bool] = None,
+    dynamic: Optional[bool] = None,
+    options: Optional[Dict[str, Any]] = None,
+    disable: bool = False,
+    **kwargs: Any,
+) -> nn.Module:
+    """torch.compile wrapper with:
+    - compile mode normalization
+    - safe handling of (mode + options) in PyTorch versions where it's mutually exclusive
+    - no-GIL friendly locking around temporary inductor config patches
+    """
+    del args
+    if disable:
+        return module
+
+    canonical_mode = canonicalize_compile_mode(mode)
+    if canonical_mode == "disabled":
+        return module
+
+    compile_fn = getattr(torch, "compile", None)
+    if compile_fn is None:
+        return module
+
+    # Ensure max-autotune doesn't try to enable cudagraphs on non-CUDA modules.
+    if canonical_mode == "max-autotune" and not _is_for_cuda(module):
+        canonical_mode = "max-autotune-no-cudagraphs"
+
+    # Merge / derive inductor options.
+    opt: Dict[str, Any] = dict(options or {})
+    if canonical_mode == "max-autotune-no-cudagraphs":
+        opt.setdefault("triton.cudagraphs", False)
+    options_merged: Dict[str, Any] | None = opt or None
+
+    # One-time-ish inductor config defaults (global), guarded by a lock.
+    _inductor_config = _get_inductor_config()
+    if _inductor_config is not None:
+        with _INDUCTOR_CONFIG_LOCK:
+            try:
+                if getattr(_inductor_config, "compile_threads", None) is not None:
+                    override = env_first(
+                        ("STNET_INDUCTOR_COMPILE_THREADS", "STNET_COMPILE_THREADS"),
+                        None,
+                    )
+                    if override is None:
+                        override = env_first(("TORCHINDUCTOR_COMPILE_THREADS",), None)
+                    if override is not None:
+                        _inductor_config.compile_threads = max(1, int(override))
+                    else:
+                        local_world = env_first_int(
+                            (
+                                "STNET_LOCAL_WORLD_SIZE",
+                                "LOCAL_WORLD_SIZE",
+                                "SLURM_NTASKS_PER_NODE",
+                            ),
+                            1,
+                        )
+                        if int(local_world) > 1:
+                            cpu_count = int(process_cpu_count() or 1)
+                            per_rank = max(1, int(cpu_count) // max(1, int(local_world)))
+                            _inductor_config.compile_threads = max(
+                                1, min(4, int(per_rank) // 2)
+                            )
+            except Exception:
+                pass
+
+            if canonical_mode in {"max-autotune", "max-autotune-no-cudagraphs"}:
+                # Prefer isolation/caching for autotune to avoid lock contention.
+                with suppress(Exception):
+                    _inductor_config.autotune_in_subproc = True
+                with suppress(Exception):
+                    _inductor_config.autotune_local_cache = True
+                with suppress(Exception):
+                    _inductor_config.autotune_remote_cache = None
+                with suppress(Exception):
+                    if getattr(_inductor_config, "max_autotune_gemm_search_space", None) is not None:
+                        _inductor_config.max_autotune_gemm_search_space = "DEFAULT"
+                with suppress(Exception):
+                    if getattr(_inductor_config, "max_autotune_pointwise", None) is not None:
+                        _inductor_config.max_autotune_pointwise = False
+                with suppress(Exception):
+                    if getattr(_inductor_config, "max_autotune_gemm", None) is not None:
+                        _inductor_config.max_autotune_gemm = True
+                # When user didn't explicitly override compile_threads, keep it low to reduce
+                # compilation contention across ranks.
+                with suppress(Exception):
+                    if getattr(_inductor_config, "compile_threads", None) is not None:
+                        override_raw = env_first(
+                            (
+                                "STNET_INDUCTOR_COMPILE_THREADS",
+                                "STNET_COMPILE_THREADS",
+                                "TORCHINDUCTOR_COMPILE_THREADS",
+                            )
+                        )
+                        override_valid = False
+                        if override_raw is not None:
+                            with suppress(Exception):
+                                int(override_raw)
+                                override_valid = True
+                        if not override_valid:
+                            _inductor_config.compile_threads = 1
+
+    backend_value = backend
+    mode_value: Optional[str] = None
+    match canonical_mode:
+        case "aot-eager":
+            backend_value = "aot_eager"
+        case "default" | "reduce-overhead" | "max-autotune" | "max-autotune-no-cudagraphs":
+            mode_value = canonical_mode
+        case _:
+            mode_value = str(mode) if mode is not None else None
+
+    compile_kwargs: Dict[str, Any] = dict(kwargs)
+    if backend_value is not None:
+        compile_kwargs["backend"] = backend_value
+    if mode_value is not None:
+        compile_kwargs["mode"] = mode_value
+    if fullgraph is not None:
+        compile_kwargs["fullgraph"] = bool(fullgraph)
+    if dynamic is not None:
+        compile_kwargs["dynamic"] = bool(dynamic)
+
+    # Merge options with any existing compile_kwargs["options"].
+    if options_merged is not None:
+        existing = compile_kwargs.get("options", {})
+        if isinstance(existing, dict):
+            options_merged = {**options_merged, **existing}
+        compile_kwargs["options"] = options_merged
+
+    # PyTorch 2.5+ disallows passing (mode, options) together. If both were specified,
+    # patch inductor config temporarily while compiling.
+    if mode_value is not None and isinstance(compile_kwargs.get("options", None), dict):
+        inductor_cfg = _get_inductor_config()
+        patch = getattr(inductor_cfg, "patch", None) if inductor_cfg is not None else None
+
+        def _has_cfg_key(cfg: Any, key: str) -> bool:
+            obj = cfg
+            for part in key.split("."):
+                if not hasattr(obj, part):
+                    return False
+                obj = getattr(obj, part)
+            return True
+
+        options_dict = dict(compile_kwargs.get("options") or {})
+        if callable(patch) and options_dict:
+            patchable = {
+                k: v
+                for k, v in options_dict.items()
+                if isinstance(k, str) and _has_cfg_key(inductor_cfg, k)
+            }
+            # Serialize the patch+compile region to avoid cross-thread config races (no-GIL).
+            with _INDUCTOR_CONFIG_LOCK:
+                with (patch(patchable) if patchable else nullcontext()):
+                    compile_kwargs.pop("options", None)
+                    return compile_fn(module, **compile_kwargs)
+
+        # If patch isn't available, drop options (success > exact options) and compile.
+        compile_kwargs.pop("options", None)
+        return compile_fn(module, **compile_kwargs)
+
+    return compile_fn(module, **compile_kwargs)
+
+
+
+def torch_compiler_supported() -> bool:
+    return callable(getattr(torch, "compile", None))
+
+
+def cudagraph_mark_step_begin() -> None:
+    mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_begin", None)
+    if callable(mark_step):
+        with suppress(Exception):
+            mark_step()
+
+
+def cudagraph_mark_step_end() -> None:
+    mark_step = getattr(_TORCH_COMPILER, "cudagraph_mark_step_end", None)
+    if callable(mark_step):
+        with suppress(Exception):
+            mark_step()
+
+
+def graph_break() -> None:
+    dyn = _TORCH_DYNAMO
+    if dyn is None:
+        return
+    try:
+        comp = getattr(torch, "compiler", None)
+        is_exporting = getattr(comp, "is_exporting", None)
+        if callable(is_exporting) and bool(is_exporting()):
+            return
+    except Exception:
+        pass
+    try:
+        if getattr(torch, "jit", None) is not None:
+            if torch.jit.is_tracing() or torch.jit.is_scripting():
+                return
+    except Exception:
+        pass
+    try:
+        onnx = getattr(torch, "onnx", None)
+        is_onnx_export = getattr(onnx, "is_in_onnx_export", None)
+        if callable(is_onnx_export) and bool(is_onnx_export()):
+            return
+    except Exception:
+        pass
+    try:
+        if not dyn.is_compiling():
+            return
+    except Exception:
+        return
+    global _GRAPH_BREAK_FN
+    fn = _GRAPH_BREAK_FN
+    if fn is None:
+        with _GRAPH_BREAK_LOCK:
+            if _GRAPH_BREAK_FN is None:
+                _GRAPH_BREAK_FN = _resolve_graph_break()
+            fn = _GRAPH_BREAK_FN
+    if fn is None:
+        return
+    with suppress(Exception):
+        fn()
+
+
+def torch_compiler_disable(
+    target: Any | None = None,
+    attr: str | None = None,
+    /,
+    *args: Any,
+    reason: str | None = None,
+    recursive: bool = True,
+) -> Any:
+    if attr is not None:
+        if target is None or (not hasattr(target, attr)):
+            return False
+        fn = getattr(target, attr)
+        if getattr(fn, _NO_COMPILE_SENTINEL, False):
+            return True
+        decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
+        try:
+            wrapped = decorator(fn)
+        except Exception:
+            return False
+        with suppress(Exception):
+            setattr(wrapped, _NO_COMPILE_SENTINEL, True)
+        try:
+            setattr(target, attr, wrapped)
+        except Exception:
+            return False
+        return True
+    decorator = _decorate_compiler_disable(reason=reason, recursive=recursive)
+    if callable(target):
+        return decorator(target)
+    return decorator
+
+
+def compile_distributed_safe(*args: Any, collectives: tuple[str, ...] = _COLLECTIVE_NAMES) -> bool:
+    if _TORCH_DYNAMO is None or not hasattr(_TORCH_DYNAMO, "disallow_in_graph"):
+        return False
+    try:
+        import torch.distributed as dist
+    except Exception:
+        return False
+    disallow = getattr(_TORCH_DYNAMO, "disallow_in_graph", None)
+    if disallow is None:
+        return False
+    updated = False
+    with _SAFE_DIST_LOCK:
+        for name in collectives:
+            if name in _SAFE_DIST_PATCHED:
+                continue
+            fn = getattr(dist, name, None)
+            if fn is None:
+                continue
+            with suppress(Exception):
+                disallow(fn)
+                _SAFE_DIST_PATCHED.add(name)
+                updated = True
+    return updated
+
+
+def compile_safe(*args: Any, runtime_module: Any | None = None, layers_module: Any | None = None) -> None:
+    if not torch_compiler_supported():
+        return
+    with suppress(Exception):
+        compile_distributed_safe()
+    if layers_module is None:
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks", "stnet.nn.architecture"):
+            with suppress(Exception):
+                layers_module = importlib.import_module(mod_name)
+                break
+    scaler_cls = getattr(layers_module, "Scaler", None) if layers_module is not None else None
+    if scaler_cls is None:
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
+            with suppress(Exception):
+                mod = importlib.import_module(mod_name)
+                scaler_cls = getattr(mod, "Scaler", None)
+                if scaler_cls is not None:
+                    break
+    if scaler_cls is not None:
+        for attr in (
+            "normalize_x",
+            "denormalize_x",
+            "normalize_y",
+            "denormalize_y",
+            "calibrate",
+            "_piecewise",
+        ):
+            torch_compiler_disable(
+                scaler_cls,
+                attr,
+                reason="Scaler uses Python-side caches/loops; keep eager",
+                recursive=False,
+            )
+    history_cls = getattr(layers_module, "Recorder", None) if layers_module is not None else None
+    if history_cls is None:
+        for mod_name in ("stnet.nn.layers", "stnet.nn.blocks"):
+            with suppress(Exception):
+                mod = importlib.import_module(mod_name)
+                history_cls = getattr(mod, "Recorder", None)
+                if history_cls is not None:
+                    break
+    if history_cls is not None:
+        for attr in (
+            "start_session",
+            "end_session",
+            "set_epochs",
+            "set_system_info",
+            "record_batch",
+            "_append",
+            "save",
+            "clear",
+        ):
+            torch_compiler_disable(
+                history_cls,
+                attr,
+                reason="Recorder is logging/bookkeeping; keep eager",
+                recursive=False,
+            )
