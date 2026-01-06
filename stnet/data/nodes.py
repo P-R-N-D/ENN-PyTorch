@@ -97,7 +97,6 @@ def _meta_has_scale(meta: Any) -> bool:
     for k in ("scale_max_abs", "scale_min_value", "scale_max_value", "scale_min_positive"):
         if meta.get(k) is not None:
             return True
-
     ss = meta.get("scale_stats")
     if not isinstance(ss, Mapping):
         return False
@@ -420,28 +419,9 @@ class _ColumnCursor:
 
 
 class Storage:
-    @staticmethod
-    def column_cursor(
-        data: Mapping[Any, Any],
-        *args: Any,
-        keys: Optional[Sequence[Any]] = None,
-    ) -> Tuple[int, Callable[[int, int], _ColumnView]]:
-        count = int(len(data) if keys is None else len(keys))
-        if count <= 0:
-            raise ValueError("Empty mapping: no keys")
-        return count, _ColumnCursor(data, keys)
-
-    @staticmethod
-    def is_feature_label_batch_mapping(obj: Any) -> bool:
-        if not isinstance(obj, Mapping) or not obj:
-            return False
-        for k in obj.keys():
-            if not isinstance(k, str):
-                continue
-            ck = k.casefold()
-            if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
-                return True
-        return False
+    get_meta_path = staticmethod(schemas.get_meta_path)
+    write_json = staticmethod(schemas.write_json)
+    save_temp = staticmethod(schemas.save_temp)
 
     @staticmethod
     def _resolve_memmap_store_float(*args: Any, negotiable: bool) -> torch.dtype:
@@ -490,9 +470,146 @@ class Storage:
         idx = idx.reshape(-1)
         return idx.to(dtype=torch.int64, copy=False)
 
-    get_meta_path = staticmethod(schemas.get_meta_path)
-    write_json = staticmethod(schemas.write_json)
-    save_temp = staticmethod(schemas.save_temp)
+    @staticmethod
+    def _validate_row_contiguity(rows: torch.Tensor) -> tuple[bool, int, int]:
+        rows = rows.reshape(-1)
+        n = int(rows.numel())
+        if n <= 0:
+            return (True, 0, 0)
+        start = int(rows[0].item())
+        if n == 1:
+            return (True, start, start + 1)
+        last = int(rows[-1].item())
+        if last != start + n - 1:
+            return (False, 0, 0)
+        if not bool(torch.all(rows[1:] == rows[:-1] + 1)):
+            return (False, 0, 0)
+        return (True, start, start + n)
+
+    @staticmethod
+    def _index_copy_rows(
+        dst: object,
+        rows_t: torch.Tensor,
+        preds_t: torch.Tensor,
+        *args: Any,
+        count: int,
+    ) -> None:
+        if preds_t.shape[0] != rows_t.shape[0]:
+            raise ValueError(
+                f"Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
+            )
+        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
+        if is_contig:
+            if start < 0 or end > int(count):
+                raise ValueError(
+                    f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}"
+                )
+            dst[start:end].copy_(preds_t)
+            return
+        if rows_t.numel() > 0:
+            rmin = int(rows_t.min().item())
+            rmax = int(rows_t.max().item())
+            if rmin < 0 or rmax >= int(count):
+                raise ValueError(
+                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
+                )
+        dst.index_copy_(0, rows_t, preds_t)
+
+    @staticmethod
+    def _h5_write_rows(
+        dset_Y: object,
+        rows_t: torch.Tensor,
+        preds_np: object,
+        *args: Any,
+        count: int,
+    ) -> None:
+        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
+        if is_contig:
+            if start < 0 or end > int(count):
+                raise ValueError(
+                    f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}"
+                )
+            dset_Y[start:end] = preds_np
+            return
+        rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
+        if rowsnp.size:
+            rmin = int(rowsnp.min())
+            rmax = int(rowsnp.max())
+            if rmin < 0 or rmax >= int(count):
+                raise ValueError(
+                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
+                )
+        dset_Y[rows_np] = preds_np
+
+    @staticmethod
+    def _torch_load_cpu(path: str) -> object:
+        return torch.load(path, map_location="cpu", weights_only=True)
+
+    @staticmethod
+    def _load_row(rows_file: str) -> torch.Tensor:
+        rows_t = Storage._torch_load_cpu(os.fspath(rows_file))
+        if not isinstance(rows_t, torch.Tensor):
+            rows_t = torch.as_tensor(rows_t, device="cpu")
+        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
+        if not bool(rows_t.is_contiguous()):
+            rows_t = rows_t.contiguous()
+        return rows_t
+
+    @staticmethod
+    def _load_prediction(pred_file: str, *args: Any, dtype: torch.dtype) -> torch.Tensor:
+        _ = args
+        pf = os.fspath(pred_file)
+        if pf.endswith(".mmt"):
+            preds_t = Storage.open_memory_mapped_tensor(pf)
+            if preds_t is None:
+                raise FileNotFoundError(f"missing prediction memmap or meta: {pf!r}")
+        else:
+            preds_t = Storage._torch_load_cpu(pf)
+        if not isinstance(preds_t, torch.Tensor):
+            preds_t = torch.as_tensor(preds_t, device="cpu")
+        if preds_t.device.type != "cpu":
+            preds_t = preds_t.to(device="cpu")
+        return preds_t.to(dtype=dtype, copy=False)
+
+    @staticmethod
+    def _to_numpy_dtype(dtype: torch.dtype):
+        np_bfloat16 = getattr(numpy, "bfloat16", numpy.float32)
+        mapping = {
+            torch.float16: numpy.float16,
+            torch.float32: numpy.float32,
+            torch.float64: numpy.float64,
+            torch.bfloat16: np_bfloat16,
+            torch.int8: numpy.int8,
+            torch.uint8: numpy.uint8,
+            torch.int16: numpy.int16,
+            torch.int32: numpy.int32,
+            torch.int64: numpy.int64,
+            torch.bool: numpy.bool_,
+        }
+        return mapping.get(dtype, numpy.float32)
+
+    @staticmethod
+    def column_cursor(
+        data: Mapping[Any, Any],
+        *args: Any,
+        keys: Optional[Sequence[Any]] = None,
+    ) -> Tuple[int, Callable[[int, int], _ColumnView]]:
+        count = int(len(data) if keys is None else len(keys))
+        if count <= 0:
+            raise ValueError("Empty mapping: no keys")
+        return count, _ColumnCursor(data, keys)
+
+    @staticmethod
+    def is_feature_label_batch_mapping(obj: Any) -> bool:
+        if not isinstance(obj, Mapping) or not obj:
+            return False
+        for k in obj.keys():
+            if not isinstance(k, str):
+                continue
+            ck = k.casefold()
+            if ck in _FEATURE_KEY_ALIASES or ck in _LABEL_KEY_ALIASES:
+                return True
+        return False
 
     @staticmethod
     def stream_memmap(
@@ -733,7 +850,6 @@ class Storage:
 
                 shuffle_indexer = _idx
                 shuffle_impl = "prp"
-
         compute_scaler_stats = bool(write_labels) and (not bool(allow_missing_labels))
         x_sum: Optional[torch.Tensor] = None
         x_sum_sq: Optional[torch.Tensor] = None
@@ -779,7 +895,6 @@ class Storage:
             else:
                 idx = shuffle_indexer(int(s), int(e))
                 batch = get_by_indices(idx)
-
             fx, lb, _, _ = ds.preprocess(batch, return_keys=False)
             n = Storage._batch_n(fx)
             if n <= 0:
@@ -1003,13 +1118,13 @@ class Storage:
 
     @staticmethod
     def merge_meta_info(metas: Any) -> Dict[str, Any]:
+        
         def _merge_dicts(items: list[dict]) -> Dict[str, Any]:
             if not items:
                 return {}
             base = dict(items[0])
             feature_dim = base.get("feature_dim")
             label_shape = base.get("label_shape")
-
             has_scale = _meta_has_scale(base)
             has_nonfinite = bool(base.get("has_nonfinite", False))
             max_abs = base.get("scale_max_abs")
@@ -1019,7 +1134,6 @@ class Storage:
             is_integral = base.get("scale_is_integral")
             is_negotiable = base.get("is_negotiable")
             underflow_action = base.get("underflow_action")
-
             for m in items[1:]:
                 if feature_dim is not None and m.get("feature_dim") is not None:
                     if int(m.get("feature_dim")) != int(feature_dim):
@@ -1031,45 +1145,36 @@ class Storage:
                         raise ValueError(
                             f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}"
                         )
-
                 has_scale = has_scale or _meta_has_scale(m)
                 has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
-
                 a = m.get("scale_max_abs")
                 if a is not None:
                     max_abs = a if max_abs is None else max(float(max_abs), float(a))
-
                 mn = m.get("scale_min_value")
                 if mn is not None:
                     try:
                         min_val = mn if min_val is None else (mn if mn <= min_val else min_val)
                     except Exception:
                         min_val = mn if min_val is None else min(float(min_val), float(mn))
-
                 mx = m.get("scale_max_value")
                 if mx is not None:
                     try:
                         max_val = mx if max_val is None else (mx if mx >= max_val else max_val)
                     except Exception:
                         max_val = mx if max_val is None else max(float(max_val), float(mx))
-
                 p = m.get("scale_min_positive")
                 if p is not None:
                     min_pos = p if min_pos is None else min(float(min_pos), float(p))
-
                 i = m.get("scale_is_integral")
                 if i is not None:
                     is_integral = bool(i) if is_integral is None else bool(is_integral) and bool(i)
-
                 n = m.get("is_negotiable")
                 if n is not None:
                     is_negotiable = bool(n) if is_negotiable is None else bool(is_negotiable) and bool(n)
-
                 underflow_action = _strictest_underflow_action(
                     str(underflow_action) if underflow_action is not None else None,
                     str(m.get("underflow_action")) if m.get("underflow_action") is not None else None,
                 )
-
             base["has_scale"] = bool(has_scale)
             base["has_nonfinite"] = bool(has_nonfinite)
             base["scale_max_abs"] = max_abs
@@ -1237,6 +1342,7 @@ class Storage:
                 "y_q_high": y_q_high,
             })
         return out
+        
     @staticmethod
     def expand_source(sources: Any) -> Any:
         expanded, ok = _expand_multinode_sources(sources)
@@ -1329,26 +1435,7 @@ class Storage:
         return out
 
     @staticmethod
-    def _to_numpy_dtype(dtype: torch.dtype):
-
-        np_bfloat16 = getattr(numpy, "bfloat16", numpy.float32)
-        mapping = {
-            torch.float16: numpy.float16,
-            torch.float32: numpy.float32,
-            torch.float64: numpy.float64,
-            torch.bfloat16: np_bfloat16,
-            torch.int8: numpy.int8,
-            torch.uint8: numpy.uint8,
-            torch.int16: numpy.int16,
-            torch.int32: numpy.int32,
-            torch.int64: numpy.int64,
-            torch.bool: numpy.bool_,
-        }
-        return mapping.get(dtype, numpy.float32)
-
-    @staticmethod
     def load_predictions_h5(path: str) -> TensorDict:
-
         p = os.fspath(path)
         if not p or not os.path.isfile(p):
             raise FileNotFoundError(f"predictions .h5 not found: {path!r}")
@@ -1369,7 +1456,6 @@ class Storage:
         in_dim: object | None = None,
     ) -> int:
         _ = args
-
         p = os.fspath(path)
         if not p or not os.path.isfile(p):
             raise FileNotFoundError(f"predictions file not found: {path!r}")
@@ -1421,107 +1507,6 @@ class Storage:
                         f"predictions file has unexpected Y shape: got {tuple(int(d) for d in y_shape[1:])}, expected {out_shape_t} ({p!r})"
                     )
         return int(n)
-
-    @staticmethod
-    def _validate_row_contiguity(rows: torch.Tensor) -> tuple[bool, int, int]:
-        rows = rows.reshape(-1)
-        n = int(rows.numel())
-        if n <= 0:
-            return (True, 0, 0)
-        start = int(rows[0].item())
-        if n == 1:
-            return (True, start, start + 1)
-        last = int(rows[-1].item())
-        if last != start + n - 1:
-            return (False, 0, 0)
-        if not bool(torch.all(rows[1:] == rows[:-1] + 1)):
-            return (False, 0, 0)
-        return (True, start, start + n)
-
-    @staticmethod
-    def _index_copy_rows(
-        dst: object,
-        rows_t: torch.Tensor,
-        preds_t: torch.Tensor,
-        *args: Any,
-        count: int,
-    ) -> None:
-        if preds_t.shape[0] != rows_t.shape[0]:
-            raise ValueError(
-                f"Pred/rows mismatch: preds[0]={preds_t.shape[0]} vs rows={rows_t.shape[0]}"
-            )
-        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
-        if is_contig:
-            if start < 0 or end > int(count):
-                raise ValueError(
-                    f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}"
-                )
-            dst[start:end].copy_(preds_t)
-            return
-        if rows_t.numel() > 0:
-            rmin = int(rows_t.min().item())
-            rmax = int(rows_t.max().item())
-            if rmin < 0 or rmax >= int(count):
-                raise ValueError(
-                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
-                )
-        dst.index_copy_(0, rows_t, preds_t)
-
-    @staticmethod
-    def _h5_write_rows(
-        dset_Y: object,
-        rows_t: torch.Tensor,
-        preds_np: object,
-        *args: Any,
-        count: int,
-    ) -> None:
-        is_contig, start, end = Storage._validate_row_contiguity(rows_t)
-        if is_contig:
-            if start < 0 or end > int(count):
-                raise ValueError(
-                    f"Row indices out of bounds: [{start}, {end}) vs count={int(count)}"
-                )
-            dset_Y[start:end] = preds_np
-            return
-        rows_np = rows_t.detach().to(device="cpu", dtype=torch.int64).numpy()
-        if rowsnp.size:
-            rmin = int(rowsnp.min())
-            rmax = int(rowsnp.max())
-            if rmin < 0 or rmax >= int(count):
-                raise ValueError(
-                    f"Row indices out of bounds: min={rmin}, max={rmax}, count={int(count)}"
-                )
-        dset_Y[rows_np] = preds_np
-
-    @staticmethod
-    def _torch_load_cpu(path: str) -> object:
-        return torch.load(path, map_location="cpu", weights_only=True)
-
-    @staticmethod
-    def _load_row(rows_file: str) -> torch.Tensor:
-        rows_t = Storage._torch_load_cpu(os.fspath(rows_file))
-        if not isinstance(rows_t, torch.Tensor):
-            rows_t = torch.as_tensor(rows_t, device="cpu")
-        rows_t = rows_t.reshape(-1).to(dtype=torch.int64, device="cpu", copy=False)
-        if not bool(rows_t.is_contiguous()):
-            rows_t = rows_t.contiguous()
-        return rows_t
-
-    @staticmethod
-    def _load_prediction(pred_file: str, *args: Any, dtype: torch.dtype) -> torch.Tensor:
-        _ = args
-        pf = os.fspath(pred_file)
-        if pf.endswith(".mmt"):
-            preds_t = Storage.open_memory_mapped_tensor(pf)
-            if preds_t is None:
-                raise FileNotFoundError(f"missing prediction memmap or meta: {pf!r}")
-        else:
-            preds_t = Storage._torch_load_cpu(pf)
-        if not isinstance(preds_t, torch.Tensor):
-            preds_t = torch.as_tensor(preds_t, device="cpu")
-        if preds_t.device.type != "cpu":
-            preds_t = preds_t.to(device="cpu")
-        return preds_t.to(dtype=dtype, copy=False)
 
     @staticmethod
     def concat_memory_mapped_tensor(
@@ -1602,7 +1587,6 @@ class Storage:
         chunk_size: int = 8192,
     ) -> PersistentTensorDict:
         _ = args
-
         x_mmt = Storage.load_memmap_features(memmap_dir)
         out_shape_t = tuple(int(x) for x in out_shape)
         os.makedirs(os.path.dirname(out_path) or os.getcwd(), exist_ok=True)
@@ -1650,7 +1634,6 @@ class Storage:
         chunk_size: int = 8192,
     ) -> PersistentTensorDict:
         _ = args
-
         x_mmt = Storage.load_memmap_features(memmap_dir)
         y_mmt = Storage.open_memory_mapped_tensor(os.fspath(pred_path))
         if y_mmt is None:
@@ -1695,7 +1678,6 @@ class Storage:
         overwrite: str = "replace",
     ) -> PersistentTensorDict:
         _ = args
-
         out_path_n = os.fspath(out_path)
         parent = os.path.dirname(out_path_n) or "."
         os.makedirs(parent, exist_ok=True)
@@ -1741,7 +1723,6 @@ class Storage:
         out_shape: object | None = None,
     ) -> PersistentTensorDict:
         _ = args
-
         src_n = os.fspath(src_path)
         dst_n = os.fspath(dst_path)
         if not src_n or not os.path.isfile(src_n):
@@ -2030,16 +2011,6 @@ class BatchQueue(Buffer):
 class Sampler(torch.utils.data.Sampler):
     _per_sample_mem_bytes: int = 0
 
-    @classmethod
-    def _load_meta(cls: type["Sampler"], memmap_dir: str) -> Mapping[str, Any]:
-        meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
-        meta = schemas.read_json(meta_path)
-        if not isinstance(meta, Mapping):
-            raise ValueError(f"meta.json under {memmap_dir} must contain a mapping")
-        return meta
-
     def __init__(
         self,
         memmap_dir: str,
@@ -2157,17 +2128,15 @@ class Sampler(torch.utils.data.Sampler):
         else:
             self._start, self._end = (train_start, train_end)
 
-    @property
-    def sampler_scale(self) -> "BatchScaler":
-        return self._sampler_scale
-
-    @property
-    def base_batch_size(self) -> int:
-        try:
-            b = int(getattr(self, "_S_B_base", 1) or 1)
-        except Exception:
-            b = 1
-        return max(1, int(b))
+    @classmethod
+    def _load_meta(cls: type["Sampler"], memmap_dir: str) -> Mapping[str, Any]:
+        meta_path = os.path.join(os.fspath(memmap_dir), "meta.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"meta.json not found under: {memmap_dir}")
+        meta = schemas.read_json(meta_path)
+        if not isinstance(meta, Mapping):
+            raise ValueError(f"meta.json under {memmap_dir} must contain a mapping")
+        return meta
 
     def _effective_batch_size(self) -> int:
         base = self.base_batch_size
@@ -2322,18 +2291,6 @@ class Sampler(torch.utils.data.Sampler):
                 setattr(tls, "labels", l_new)
             return f_new, (l_new if has_labels else None)
 
-    @property
-    def start(self) -> int:
-        return int(self._start)
-
-    @property
-    def end(self) -> int:
-        return int(self._end)
-
-    @property
-    def meta(self) -> Mapping[str, Any]:
-        return dict(self._meta or {})
-
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         start = int(start)
         end = int(end)
@@ -2426,27 +2383,6 @@ class Sampler(torch.utils.data.Sampler):
             self._num_shards = 1
             self._shard_id = 0
 
-    def compose(
-        self,
-        *args: Any,
-        batch_size: int,
-        shuffle: bool = True,
-        seed: int = 0,
-        key: str = "",
-        **kwargs: Any,
-    ) -> "BaseNode":
-        self._S_B = max(1, int(batch_size))
-        self._S_shuffle = bool(shuffle)
-        self._S_seed = int(seed)
-        self._S_epoch = 0
-        self._key = str(key)
-        self._len_epoch = int(self._S_epoch)
-        self._len_B_snapshot = max(1, int(self._effective_batch_size()))
-        self._shard()
-        if SamplerWrapper is None:
-            raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
-        return SamplerWrapper(self)
-
     def __iter__(self) -> Iterator[tuple[str, tuple[int, int]]]:
         start = int(getattr(self, "start", 0))
         end = int(getattr(self, "end", 0))
@@ -2499,6 +2435,51 @@ class Sampler(torch.utils.data.Sampler):
             return int(total)
         return max(0, (int(total) - si + ns - 1) // ns)
 
+    @property
+    def sampler_scale(self) -> "BatchScaler":
+        return self._sampler_scale
+
+    @property
+    def base_batch_size(self) -> int:
+        try:
+            b = int(getattr(self, "_S_B_base", 1) or 1)
+        except Exception:
+            b = 1
+        return max(1, int(b))
+
+    @property
+    def start(self) -> int:
+        return int(self._start)
+
+    @property
+    def end(self) -> int:
+        return int(self._end)
+
+    @property
+    def meta(self) -> Mapping[str, Any]:
+        return dict(self._meta or {})
+
+    def compose(
+        self,
+        *args: Any,
+        batch_size: int,
+        shuffle: bool = True,
+        seed: int = 0,
+        key: str = "",
+        **kwargs: Any,
+    ) -> "BaseNode":
+        self._S_B = max(1, int(batch_size))
+        self._S_shuffle = bool(shuffle)
+        self._S_seed = int(seed)
+        self._S_epoch = 0
+        self._key = str(key)
+        self._len_epoch = int(self._S_epoch)
+        self._len_B_snapshot = max(1, int(self._effective_batch_size()))
+        self._shard()
+        if SamplerWrapper is None:
+            raise RuntimeError("torchdata.nodes.SamplerWrapper is required")
+        return SamplerWrapper(self)
+
     def set_epoch(self, epoch: int) -> None:
         self._S_epoch = int(epoch)
         self._len_epoch = int(self._S_epoch)
@@ -2530,6 +2511,7 @@ class Sampler(torch.utils.data.Sampler):
                     if out.get("Y") is not None:
                         out["Y"] = out["Y"].pin_memory()
             return out
+
 
 class Multiplexer:
     def __init__(
@@ -2599,7 +2581,6 @@ class Multiplexer:
                 sources_map[kk] = v
         else:
             raise TypeError("sources must be a BaseNode, Sequence[BaseNode], or Mapping[str, BaseNode]")
-
         if len(sources_map) <= 1:
             w = {k: 1.0 for k in sources_map.keys()}
             self._source_keys = list(sources_map.keys())
@@ -2611,7 +2592,6 @@ class Multiplexer:
             )
             self._node = node
             return node
-
         raw = getattr(self, "_raw_weights", None)
 
         def _coerce_weight(v: Any, *args: Any, where: str) -> float:
@@ -2666,7 +2646,6 @@ class Multiplexer:
             w = {k: float(w_seq[int(k)]) for k in sources_map.keys()}
         else:
             raise TypeError("weights must be a Mapping[str, float] or Sequence[float] (or omitted for uniform)")
-
         if not any((float(v) > 0.0) for v in w.values()):
             raise ValueError("at least one sampling weight must be positive")
         self._source_keys = list(sources_map.keys())
@@ -2680,7 +2659,6 @@ class Multiplexer:
         return node
 
 class Mapper:
-
     def __init__(
         self,
         *args: Any,
@@ -2715,7 +2693,6 @@ class Mapper:
         self.pin_memory = self._pin_memory
         self.max_concurrency = max(1, int(self.io_workers))
         try:
-
             get_affinity(io_workers=self.io_workers)
         except Exception:
             pass
@@ -2741,29 +2718,8 @@ class Mapper:
             node = torchdata.nodes.Unbatcher(node)
         return node
 
-class Loader:
-    @staticmethod
-    def compose(
-        source: "BaseNode",
-        *args: Any,
-        device: torch.device | str | Sequence[torch.device | str],
-        prefetch_factor: int = 2,
-        non_blocking: bool = True,
-        length: Optional[int] = None,
-        pin_memory: Optional[bool] = None,
-        **kwargs: Any,
-    ) -> "Loader":
-        if not isinstance(source, BaseNode):
-            raise TypeError("Loader.compose expects a torchdata.nodes.BaseNode source.")
-        return Loader(
-            device=device,
-            node=source,
-            prefetch_factor=int(prefetch_factor),
-            non_blocking=bool(non_blocking),
-            length=length,
-            pin_memory=pin_memory,
-        )
 
+class Loader:
     def __init__(
         self,
         device: torch.device | str | Sequence[torch.device | str],
@@ -2881,6 +2837,29 @@ class Loader:
         except Exception:
             pass
         return 0
+
+    @staticmethod
+    def compose(
+        source: "BaseNode",
+        *args: Any,
+        device: torch.device | str | Sequence[torch.device | str],
+        prefetch_factor: int = 2,
+        non_blocking: bool = True,
+        length: Optional[int] = None,
+        pin_memory: Optional[bool] = None,
+        **kwargs: Any,
+    ) -> "Loader":
+        if not isinstance(source, BaseNode):
+            raise TypeError("Loader.compose expects a torchdata.nodes.BaseNode source.")
+        return Loader(
+            device=device,
+            node=source,
+            prefetch_factor=int(prefetch_factor),
+            non_blocking=bool(non_blocking),
+            length=length,
+            pin_memory=pin_memory,
+        )
+
 
 class Prefetcher(Buffer):
     def __init__(
