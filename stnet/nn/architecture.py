@@ -33,6 +33,7 @@ from tensordict import TensorDictBase
 from ..config import ModelConfig
 from ..core.casting import env_bool, env_first_int, env_int
 from ..core.compat import is_meta_or_fake_tensor
+from ..core.distributed import _unshard_fsdp_module
 from ..core.graph import (
     graph_break, 
     inference_mode,
@@ -115,7 +116,6 @@ def _is_export_or_trace() -> bool:
             if torch.onnx.is_in_onnx_export():
                 return True
     return False
-
 
 def _prod_int(shape: Sequence[int]) -> int:
     out = 1
@@ -355,23 +355,17 @@ class SpatialExtractor(nn.Module):
             and _checkpoint is not None
             and not _is_export_or_trace()
         )
-        if do_ckpt:
-            est = 0
-            with contextlib.suppress(Exception):
-                est = int(out.numel()) * int(out.element_size()) * int(len(self.blocks))
-            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         for blk in self.blocks:
             if do_ckpt:
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
+                    _unshard_fsdp_module(self)
+                    _unshard_fsdp_module(_blk)
                     y, _ = _blk(t, causal_mask=attn_mask, state=None, mode="spatial")
                     return y
-                try:
-                    out = cast(
-                        torch.Tensor,
-                        _checkpoint(_f, out, use_reentrant=True),
-                    )
-                except TypeError:
-                    out = cast(torch.Tensor, _checkpoint(_f, out))
+                out = cast(
+                    torch.Tensor,
+                    _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
+                )
             else:
                 out, _ = blk(out, causal_mask=attn_mask, state=None, mode="spatial")
         return self.norm(out)
@@ -571,11 +565,6 @@ class TemporalExtractor(nn.Module):
             and st_tensor is None
             and not _is_export_or_trace()
         )
-        if do_ckpt:
-            est = 0
-            with contextlib.suppress(Exception):
-                est = int(x.numel()) * int(x.element_size()) * int(len(self.blocks))
-            do_ckpt = bool(est >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
         next_state: Optional[torch.Tensor] = None
         if return_state:
             next_state = x.new_empty((int(self.depth), B, int(self.nhead), int(self.head_dim)))
@@ -585,17 +574,16 @@ class TemporalExtractor(nn.Module):
                 blk_state = st_tensor[i]
             if do_ckpt:
                 def _f(t: torch.Tensor, _blk: RetNet = blk) -> torch.Tensor:
-                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode='temporal')
+                    _unshard_fsdp_module(self)
+                    _unshard_fsdp_module(_blk)
+                    y, _ = _blk(t, causal_mask=causal_mask, state=None, mode="temporal")
                     return y
-                try:
-                    x = cast(
-                        torch.Tensor,
-                        _checkpoint(_f, x, use_reentrant=True),
-                    )
-                except TypeError:
-                    x = cast(torch.Tensor, _checkpoint(_f, x))
+                x = cast(
+                    torch.Tensor,
+                    _checkpoint(_f, x, use_reentrant=True, preserve_rng_state=True),
+                )
             else:
-                x, blk_next_state = blk(x, causal_mask=causal_mask, state=blk_state, mode='temporal')
+                x, blk_next_state = blk(x, causal_mask=causal_mask, state=blk_state, mode="temporal")
                 if next_state is not None:
                     if blk_next_state is None:
                         blk_next_state = x.new_zeros((B, int(self.nhead), int(self.head_dim)))

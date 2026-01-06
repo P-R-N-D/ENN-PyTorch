@@ -8,6 +8,12 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 import torch
 import torch.nn as nn
 
+try:
+    from torch.utils.checkpoint import checkpoint as _checkpoint
+except Exception:
+    _checkpoint = None
+from ..core.distributed import _unshard_fsdp_module
+
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
@@ -35,6 +41,22 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
     "spatio-temporal": "st",
 }
 
+
+def _is_export_or_trace() -> bool:
+    with contextlib.suppress(Exception):
+        if torch.jit.is_tracing() or torch.jit.is_scripting():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "_dynamo", None) is not None and torch._dynamo.is_compiling():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "compiler", None) is not None and torch.compiler.is_compiling():
+            return True
+    with contextlib.suppress(Exception):
+        if getattr(torch, "onnx", None) is not None and hasattr(torch.onnx, "is_in_onnx_export"):
+            if torch.onnx.is_in_onnx_export():
+                return True
+    return False
 
 def _infer_module_device(module: nn.Module, fallback: torch.device) -> torch.device:
     try:
@@ -321,26 +343,46 @@ class CrossTransformer(nn.Module):
             raise ValueError(f"CrossTransformer batch mismatch: a B={Bs}, b B={Bt}")
         if Ds != Dt:
             raise ValueError(f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}")
+
+        spatial_tokens = spatial_tokens.contiguous()
+        temporal_tokens = temporal_tokens.contiguous()
+
         requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
         mode_l = _coerce_modeling_types(requested)
-        match mode_l:
-            case "ss":
-                return self.cross[0](spatial_tokens, temporal_tokens)
-            case "tt":
-                return self.cross[1](temporal_tokens, spatial_tokens)
-            case _:
-                pass
-        s_context = self.cross[0](spatial_tokens, temporal_tokens)
-        t_context = self.cross[1](temporal_tokens, spatial_tokens)
-        t_summary = t_context.mean(dim=1, keepdim=True).expand_as(s_context)
-        base_s = torch.cat([s_context, t_summary], dim=-1)
-        fused_s = self.mix(self.mix_norm(base_s))
-        out_s = s_context + self.drop_path(self.dropout(fused_s))
-        s_summary = s_context.mean(dim=1, keepdim=True).expand_as(t_context)
-        base_t = torch.cat([t_context, s_summary], dim=-1)
-        fused_t = self.mix(self.mix_norm(base_t))
-        out_t = t_context + self.drop_path(self.dropout(fused_t))
-        return torch.cat([out_s, out_t], dim=1)
+
+        def _impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            _unshard_fsdp_module(self)
+            match mode_l:
+                case "ss":
+                    return self.cross[0](a, b)
+                case "tt":
+                    return self.cross[1](b, a)
+                case _:
+                    pass
+            s_context = self.cross[0](a, b)
+            t_context = self.cross[1](b, a)
+            t_summary = t_context.mean(dim=1, keepdim=True).expand_as(s_context)
+            base_s = torch.cat([s_context, t_summary], dim=-1)
+            fused_s = self.mix(self.mix_norm(base_s))
+            out_s = s_context + self.drop_path(self.dropout(fused_s))
+            s_summary = s_context.mean(dim=1, keepdim=True).expand_as(t_context)
+            base_t = torch.cat([t_context, s_summary], dim=-1)
+            fused_t = self.mix(self.mix_norm(base_t))
+            out_t = t_context + self.drop_path(self.dropout(fused_t))
+            return torch.cat([out_s, out_t], dim=1)
+
+        do_ckpt = (
+            self.training
+            and torch.is_grad_enabled()
+            and _checkpoint is not None
+            and not _is_export_or_trace()
+        )
+        if do_ckpt:
+            return cast(
+                torch.Tensor,
+                _checkpoint(_impl, spatial_tokens, temporal_tokens, use_reentrant=True, preserve_rng_state=True),
+            )
+        return _impl(spatial_tokens, temporal_tokens)
 
 
 class LongNet(nn.Module):
@@ -398,6 +440,9 @@ class LongNet(nn.Module):
             dilation = max(1, dilation * max(1, int(dilation_growth)))
         self.layers = nn.ModuleList(layers)
         self.norm = nn.LayerNorm(embed_dim)
+        self._ckpt_enabled = True
+        self._ckpt_reentrant = True
+        self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     @property
     def using(self) -> str:
@@ -418,16 +463,62 @@ class LongNet(nn.Module):
             and (self.batch_first is False)
             and out.shape[0] != out.shape[1]
         )
+        layout_batch_first = self.batch_first
         if need_transpose_fallback:
             out = out.transpose(0, 1)
+            layout_batch_first = True
+
+        do_ckpt = (
+            self.training
+            and torch.is_grad_enabled()
+            and _checkpoint is not None
+            and (not bool(need_weights))
+            and bool(getattr(self, "_ckpt_enabled", True))
+            and not _is_export_or_trace()
+        )
+        if do_ckpt:
+            est_bytes = 0
+            with contextlib.suppress(Exception):
+                if layout_batch_first:
+                    B = int(out.shape[0])
+                    L = int(out.shape[1])
+                else:
+                    L = int(out.shape[0])
+                    B = int(out.shape[1])
+                H = int(getattr(self, "nhead", 1) or 1)
+                # Conservative: assume dense attention score tensor (B,H,L,L) in fp32 (4 bytes).
+                est_bytes = int(B) * int(H) * int(L) * int(L) * 4
+                # Depth multiplies activation savings benefit; keep conservative.
+                est_bytes *= max(1, int(len(self.layers)))
+            do_ckpt = bool(est_bytes >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
+
         for layer in self.layers:
-            out, attn_w = layer(
-                out,
-                key_padding_mask=key_padding_mask,
-                need_weights=need_weights,
-                average_attn_weights=average_attn_weights,
-            )
+            if do_ckpt:
+                def _f(t: torch.Tensor, _layer: nn.Module = layer) -> torch.Tensor:
+                    _unshard_fsdp_module(self)
+                    _unshard_fsdp_module(_layer)
+                    y, _ = _layer(
+                        t,
+                        key_padding_mask=key_padding_mask,
+                        need_weights=False,
+                        average_attn_weights=False,
+                    )
+                    return y
+
+                out = cast(
+                    torch.Tensor,
+                    _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
+                )
+                attn_w = None
+            else:
+                out, attn_w = layer(
+                    out,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=need_weights,
+                    average_attn_weights=average_attn_weights,
+                )
         out = self.norm(out)
         if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
             out = out.transpose(0, 1)
+
         return out, attn_w
