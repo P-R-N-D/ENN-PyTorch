@@ -707,7 +707,6 @@ def distributed_broadcast(
         tensors.append(t)
     with contextlib.suppress(Exception):
         from torch.distributed.tensor import DTensor
-
         tensors = [t for t in tensors if not isinstance(t, DTensor)]
     if not tensors:
         return
