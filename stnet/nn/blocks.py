@@ -13,6 +13,10 @@ try:
 except Exception:
     _checkpoint = None
 from ..core.distributed import _unshard_fsdp_module
+try:
+    from .layers import _HAS_FLEX_ATTENTION as _STNET_HAS_FLEX_ATTENTION
+except Exception:
+    _STNET_HAS_FLEX_ATTENTION = False
 
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
@@ -351,7 +355,6 @@ class CrossTransformer(nn.Module):
         mode_l = _coerce_modeling_types(requested)
 
         def _impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            _unshard_fsdp_module(self)
             match mode_l:
                 case "ss":
                     return self.cross[0](a, b)
@@ -371,6 +374,11 @@ class CrossTransformer(nn.Module):
             out_t = t_context + self.drop_path(self.dropout(fused_t))
             return torch.cat([out_s, out_t], dim=1)
 
+        def _ckpt_impl(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            if torch.is_grad_enabled():
+                _unshard_fsdp_module(self)
+            return _impl(a, b)
+
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
@@ -380,7 +388,7 @@ class CrossTransformer(nn.Module):
         if do_ckpt:
             return cast(
                 torch.Tensor,
-                _checkpoint(_impl, spatial_tokens, temporal_tokens, use_reentrant=True, preserve_rng_state=True),
+                _checkpoint(_ckpt_impl, spatial_tokens, temporal_tokens, use_reentrant=True, preserve_rng_state=True),
             )
         return _impl(spatial_tokens, temporal_tokens)
 
@@ -480,28 +488,56 @@ class LongNet(nn.Module):
             est_bytes = 0
             with contextlib.suppress(Exception):
                 if layout_batch_first:
-                    B = int(out.shape[0])
-                    L = int(out.shape[1])
+                    B = int(out.shape[0]); L = int(out.shape[1]); D = int(out.shape[2])
                 else:
-                    L = int(out.shape[0])
-                    B = int(out.shape[1])
+                    L = int(out.shape[0]); B = int(out.shape[1]); D = int(out.shape[2])
                 H = int(getattr(self, "nhead", 1) or 1)
-                # Conservative: assume dense attention score tensor (B,H,L,L) in fp32 (4 bytes).
-                est_bytes = int(B) * int(H) * int(L) * int(L) * 4
-                # Depth multiplies activation savings benefit; keep conservative.
-                est_bytes *= max(1, int(len(self.layers)))
+                bytes_e = int(out.element_size())
+                base_bytes = int(B) * int(L) * int(D) * int(bytes_e)
+                score_bytes = 4 if out.dtype in (torch.float16, torch.bfloat16) else int(bytes_e)
+                peak_per_layer = 0
+                flex_ok = bool(_STNET_HAS_FLEX_ATTENTION and out.is_cuda and (not bool(need_weights)))
+                has_kpm = isinstance(key_padding_mask, torch.Tensor)
+                for lyr in self.layers:
+                    dilation = int(getattr(lyr, "dilation", 1) or 1)
+                    win = getattr(lyr, "window_size", None)
+                    is_simple = (dilation == 1) and (win is None)
+                    dense_scores = True
+                    if out.is_cuda:
+                        if flex_ok:
+                            dense_scores = False
+                        else:
+                            if is_simple and (not has_kpm):
+                                dense_scores = False
+                    scores_bytes = int(B) * int(H) * int(L) * int(L) * int(score_bytes) if dense_scores else 0
+                    attn_linear = int(base_bytes) * 5
+                    attn_bytes = int(attn_linear) + int(scores_bytes)
+                    hidden = 0
+                    with contextlib.suppress(Exception):
+                        f0 = getattr(lyr, "ffn", None)
+                        if isinstance(f0, nn.Sequential) and len(f0) > 0 and hasattr(f0[0], "out_features"):
+                            hidden = int(getattr(f0[0], "out_features", 0) or 0)
+                    if hidden > 0:
+                        ffn_bytes = int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+                    else:
+                        ffn_bytes = int(base_bytes) * 9
+                    layer_saved = int(attn_bytes + ffn_bytes)
+                    peak_per_layer = max(int(peak_per_layer), int(layer_saved))
+                est_bytes = int(peak_per_layer) * max(1, int(len(self.layers)))
             do_ckpt = bool(est_bytes >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
 
         for layer in self.layers:
             if do_ckpt:
                 def _f(t: torch.Tensor, _layer: nn.Module = layer) -> torch.Tensor:
-                    _unshard_fsdp_module(self)
-                    _unshard_fsdp_module(_layer)
+                    if torch.is_grad_enabled():
+                        _unshard_fsdp_module(self)
+                        _unshard_fsdp_module(_layer)
                     y, _ = _layer(
                         t,
                         key_padding_mask=key_padding_mask,
                         need_weights=False,
                         average_attn_weights=False,
+                        skip_ffn_checkpoint=True,
                     )
                     return y
 
