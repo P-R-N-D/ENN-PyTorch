@@ -53,6 +53,7 @@ def _is_early_release_enabled() -> bool:
 def _is_force_unpin_enabled() -> bool:
     return bool(env_flag("STNET_CACHE_FORCE_UNPIN", "STNET_CACHE_UNPIN", default=False))
 
+
 def _prod_int(shape: Sequence[int]) -> int:
     try:
         n = int(math.prod(int(s) for s in shape))
@@ -180,10 +181,6 @@ class Pool:
         self._rr = 0
         self._cv = threading.Condition()
 
-    @property
-    def capacity(self) -> int:
-        return int(self._cap)
-
     def _event_finished(self, evt: object | None) -> bool:
         if evt is None:
             return True
@@ -208,6 +205,10 @@ class Pool:
                 e.fence = None
                 freed += 1
         return freed
+
+    @property
+    def capacity(self) -> int:
+        return int(self._cap)
 
     def get(
         self,
@@ -391,64 +392,6 @@ class Cache:
         self._closed = threading.Event()
         self._t.start()
 
-    def submit(
-        self,
-        tensor: torch.Tensor,
-        path: Optional[str] = None,
-        idx: Optional[int] = None,
-        wait_event: Optional[object] = None,
-        release_cb: Optional[object] = None,
-    ) -> None:
-        if self._err_event.is_set():
-            raise RuntimeError(f"Async writer error: {self._err!r}")
-        if self._closed.is_set():
-            raise RuntimeError("Cache is closed")
-        if path is None:
-            if idx is None:
-                raise ValueError("either path or idx required")
-            path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
-        path = os.fspath(path)
-        acquired = False
-        sem = self._sem
-        if sem is not None:
-            mode = str(getattr(self, "_bp_mode", "block") or "block").lower()
-            timeout_s = float(getattr(self, "_bp_timeout_s", 0.05) or 0.0)
-            if mode == "sync":
-                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
-                if not acquired:
-                    self._wait(wait_event)
-                    buf, released = self._init_tensor(
-                        tensor,
-                        release_cb=(release_cb if callable(release_cb) else None),
-                        early_release=False,
-                        force_unpin=bool(getattr(self, "_force_unpin", False)),
-                    )
-                    self._save_tensor(buf, path)
-                    if callable(release_cb) and not released:
-                        with contextlib.suppress(Exception):
-                            release_cb()
-                    return
-            elif mode == "raise":
-                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
-                if not acquired:
-                    raise RuntimeError("Cache queue is full")
-            else:
-                if timeout_s > 0:
-                    acquired = bool(sem.acquire(timeout=float(timeout_s)))
-                while not acquired:
-                    if self._err_event.is_set():
-                        raise RuntimeError(f"Async writer error: {self._err!r}")
-                    if self._closed.is_set():
-                        raise RuntimeError("Cache is closed")
-                    acquired = bool(sem.acquire(timeout=0.1))
-        try:
-            self._q.put((tensor, path, wait_event, release_cb))
-        except Exception:
-            if acquired and sem is not None:
-                with contextlib.suppress(Exception):
-                    sem.release()
-            raise
-
     def _wait(self, evt: object | None) -> None:
         if evt is None:
             return
@@ -553,13 +496,6 @@ class Cache:
         else:
             torch.save(buf, path)
 
-    def close(self) -> None:
-        if self._closed.is_set():
-            return
-        self._closed.set()
-        self._q.put((None, None, None, None))
-        self._t.join()
-
     def __enter__(self):
         return self
 
@@ -602,6 +538,71 @@ class Cache:
                     with contextlib.suppress(Exception):
                         self._sem.release()
 
+    def submit(
+        self,
+        tensor: torch.Tensor,
+        path: Optional[str] = None,
+        idx: Optional[int] = None,
+        wait_event: Optional[object] = None,
+        release_cb: Optional[object] = None,
+    ) -> None:
+        if self._err_event.is_set():
+            raise RuntimeError(f"Async writer error: {self._err!r}")
+        if self._closed.is_set():
+            raise RuntimeError("Cache is closed")
+        if path is None:
+            if idx is None:
+                raise ValueError("either path or idx required")
+            path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
+        path = os.fspath(path)
+        acquired = False
+        sem = self._sem
+        if sem is not None:
+            mode = str(getattr(self, "_bp_mode", "block") or "block").lower()
+            timeout_s = float(getattr(self, "_bp_timeout_s", 0.05) or 0.0)
+            if mode == "sync":
+                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
+                if not acquired:
+                    self._wait(wait_event)
+                    buf, released = self._init_tensor(
+                        tensor,
+                        release_cb=(release_cb if callable(release_cb) else None),
+                        early_release=False,
+                        force_unpin=bool(getattr(self, "_force_unpin", False)),
+                    )
+                    self._save_tensor(buf, path)
+                    if callable(release_cb) and not released:
+                        with contextlib.suppress(Exception):
+                            release_cb()
+                    return
+            elif mode == "raise":
+                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
+                if not acquired:
+                    raise RuntimeError("Cache queue is full")
+            else:
+                if timeout_s > 0:
+                    acquired = bool(sem.acquire(timeout=float(timeout_s)))
+                while not acquired:
+                    if self._err_event.is_set():
+                        raise RuntimeError(f"Async writer error: {self._err!r}")
+                    if self._closed.is_set():
+                        raise RuntimeError("Cache is closed")
+                    acquired = bool(sem.acquire(timeout=0.1))
+        try:
+            self._q.put((tensor, path, wait_event, release_cb))
+        except Exception:
+            if acquired and sem is not None:
+                with contextlib.suppress(Exception):
+                    sem.release()
+            raise
+
+    def close(self) -> None:
+        if self._closed.is_set():
+            return
+        self._closed.set()
+        self._q.put((None, None, None, None))
+        self._t.join()
+
     def had_error(self) -> bool:
         return bool(self._err_event.is_set())
 
@@ -642,6 +643,9 @@ class Buffer:
                 int(self.max_batches),
             )
         return True
+
+    def __len__(self) -> int:
+        return self.size()
 
     def get(self, block: bool = True, timeout: float | None = None) -> Any:
         if not bool(block):
@@ -704,6 +708,3 @@ class Buffer:
 
     def is_stopped(self) -> bool:
         return bool(self._stop.is_set())
-
-    def __len__(self) -> int:
-        return self.size()
