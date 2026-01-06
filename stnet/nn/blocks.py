@@ -8,19 +8,20 @@ from typing import Any, Callable, List, Optional, Sequence, Tuple, Union, cast
 import torch
 import torch.nn as nn
 
+from ..core.distributed import _unshard_fsdp_module
+from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
+from ..core.graph import is_export_or_trace
+from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
+
 try:
     from torch.utils.checkpoint import checkpoint as _checkpoint
 except Exception:
     _checkpoint = None
-from ..core.distributed import _unshard_fsdp_module
+
 try:
     from .layers import _HAS_FLEX_ATTENTION as _STNET_HAS_FLEX_ATTENTION
 except Exception:
     _STNET_HAS_FLEX_ATTENTION = False
-
-from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from ..core.graph import is_export_or_trace
-from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,8 +48,7 @@ _MODELING_TYPE_ALIASES: dict[str, str] = {
 }
 
 
-
-def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *, mode: str) -> int:
+def _size_of_retnet(x: torch.Tensor, blk0: nn.Module, *args: Any, mode: str) -> int:
     if not isinstance(x, torch.Tensor) or x.dim() != 3:
         return 0
     B, L, D = map(int, x.shape)
@@ -356,10 +356,8 @@ class CrossTransformer(nn.Module):
             raise ValueError(f"CrossTransformer batch mismatch: a B={Bs}, b B={Bt}")
         if Ds != Dt:
             raise ValueError(f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}")
-
         spatial_tokens = spatial_tokens.contiguous()
         temporal_tokens = temporal_tokens.contiguous()
-
         requested = self._fixed_mode if self._fixed_mode is not None else (mode or "st")
         mode_l = _coerce_modeling_types(requested)
 
@@ -483,7 +481,6 @@ class LongNet(nn.Module):
         if need_transpose_fallback:
             out = out.transpose(0, 1)
             layout_batch_first = True
-
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
@@ -533,7 +530,6 @@ class LongNet(nn.Module):
                     peak_per_layer = max(int(peak_per_layer), int(layer_saved))
                 est_bytes = int(peak_per_layer) * max(1, int(len(self.layers)))
             do_ckpt = bool(est_bytes >= int(getattr(self, "_ckpt_min_bytes", 0) or 0))
-
         for layer in self.layers:
             if do_ckpt:
                 def _f(t: torch.Tensor, _layer: nn.Module = layer) -> torch.Tensor:
@@ -548,7 +544,6 @@ class LongNet(nn.Module):
                         skip_ffn_checkpoint=True,
                     )
                     return y
-
                 out = cast(
                     torch.Tensor,
                     _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
@@ -564,5 +559,4 @@ class LongNet(nn.Module):
         out = self.norm(out)
         if need_transpose_fallback and out.dim() == 3 and out.shape[0] != out.shape[1]:
             out = out.transpose(0, 1)
-
         return out, attn_w
