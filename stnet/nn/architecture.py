@@ -38,6 +38,7 @@ from ..core.graph import (
     compile as compile_module,
     canonicalize_compile_mode,
     is_export_or_trace,
+    coerce_checkpoint,
 )
 from ..core.precision import Autocast, is_scale_safe
 from ..core.profiler import FLOP_PROFILER
@@ -67,11 +68,6 @@ from .layers import (
     Scaler,
     SigmoidGate,
 )
-
-try:
-    from torch.utils.checkpoint import checkpoint as _checkpoint
-except Exception:
-    _checkpoint = None
 
 try:
     from torchao.quantization.quant_api import (
@@ -318,7 +314,6 @@ class SpatialExtractor(nn.Module):
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
-            and _checkpoint is not None
             and bool(getattr(self, "_ckpt_enabled", True))
             and not is_export_or_trace()
         )
@@ -348,7 +343,7 @@ class SpatialExtractor(nn.Module):
 
                 out = cast(
                     torch.Tensor,
-                    _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
+                    coerce_checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
                 )
             else:
                 out, _ = blk(out, causal_mask=attn_mask, state=None, mode="spatial")
@@ -574,7 +569,6 @@ class TemporalExtractor(nn.Module):
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
-            and _checkpoint is not None
             and bool(getattr(self, "_ckpt_enabled", True))
             and not return_state
             and st_tensor is None
@@ -610,7 +604,7 @@ class TemporalExtractor(nn.Module):
 
                 x = cast(
                     torch.Tensor,
-                    _checkpoint(_f, x, use_reentrant=True, preserve_rng_state=True),
+                    coerce_checkpoint(_f, x, use_reentrant=True, preserve_rng_state=True),
                 )
             else:
                 x, blk_next_state = blk(

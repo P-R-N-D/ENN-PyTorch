@@ -10,13 +10,8 @@ import torch.nn as nn
 
 from ..core.distributed import _unshard_fsdp_module
 from ..core.compat import StochasticDepth, is_meta_or_fake_tensor
-from ..core.graph import is_export_or_trace
+from ..core.graph import coerce_checkpoint, is_export_or_trace
 from .layers import CrossAttention, DilatedAttention, Retention, norm_layer
-
-try:
-    from torch.utils.checkpoint import checkpoint as _checkpoint
-except Exception:
-    _checkpoint = None
 
 try:
     from .layers import _HAS_FLEX_ATTENTION as _STNET_HAS_FLEX_ATTENTION
@@ -398,13 +393,12 @@ class CrossTransformer(nn.Module):
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
-            and _checkpoint is not None
             and not is_export_or_trace()
         )
         if do_ckpt:
             return cast(
                 torch.Tensor,
-                _checkpoint(
+                coerce_checkpoint(
                     _ckpt_impl,
                     spatial_tokens,
                     temporal_tokens,
@@ -499,7 +493,6 @@ class LongNet(nn.Module):
         do_ckpt = (
             self.training
             and torch.is_grad_enabled()
-            and _checkpoint is not None
             and (not bool(need_weights))
             and bool(getattr(self, "_ckpt_enabled", True))
             and not is_export_or_trace()
@@ -586,7 +579,7 @@ class LongNet(nn.Module):
 
                 out = cast(
                     torch.Tensor,
-                    _checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
+                    coerce_checkpoint(_f, out, use_reentrant=True, preserve_rng_state=True),
                 )
                 attn_w = None
             else:

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import contextlib
 import importlib
 import threading
 from contextlib import AbstractContextManager, suppress, nullcontext
@@ -9,7 +10,13 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from torch import nn
 
+try:
+    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+except Exception:
+    _torch_checkpoint = None
+
 from .casting import env_first, env_first_int
+from .distributed import broadcast_scalar, is_distributed
 from .system import is_accelerator_available, process_cpu_count
 
 
@@ -618,7 +625,7 @@ def compile_safe(
             "normalize_y",
             "denormalize_y",
             "calibrate",
-            "_piecewise",
+        "_piecewise",
         ):
             torch_compiler_disable(
                 scaler_cls,
@@ -653,3 +660,158 @@ def compile_safe(
                 reason="Recorder is logging/bookkeeping; keep eager",
                 recursive=False,
             )
+
+
+def to_submodule(model: object) -> object:
+    m = model
+    for _ in range(8):
+        if hasattr(m, "microbatch") and hasattr(m, "_auto_microbatch_pending"):
+            return m
+        child = getattr(m, "module", None)
+        if child is None or child is m:
+            break
+        m = child
+    return None
+
+
+def iter_checkpoint(root: object):
+    try:
+        import torch.nn as nn
+
+        if isinstance(root, nn.Module):
+            for mod in root.modules():
+                if hasattr(mod, "_ckpt_min_bytes") and hasattr(mod, "_ckpt_enabled"):
+                    yield mod
+    except Exception:
+        return
+
+
+def to_checkpoint(
+    model: object,
+    *args: Any,
+    device: torch.device,
+    step_total: int,
+    ttl_steps: int,
+    min_bytes: int,
+) -> bool:
+    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    if inst is None:
+        return False
+    try:
+        ttl_steps = max(1, int(ttl_steps))
+        min_bytes = max(0, int(min_bytes))
+        step_total = max(0, int(step_total))
+    except Exception:
+        return False
+    until = step_total + ttl_steps
+    try:
+        until = int(broadcast_scalar(until, device=device, src=0))
+        min_bytes = int(broadcast_scalar(min_bytes, device=device, src=0))
+    except Exception:
+        pass
+    cur_until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
+    if (
+        cur_until >= until
+        and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes
+    ):
+        return False
+    changed = False
+    for mod in iter_checkpoint(inst):
+        if not hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
+            with contextlib.suppress(Exception):
+                setattr(
+                    mod,
+                    "_stnet_ckpt_saved_min_bytes",
+                    int(getattr(mod, "_ckpt_min_bytes", 0) or 0),
+                )
+                setattr(
+                    mod,
+                    "_stnet_ckpt_saved_enabled",
+                    bool(getattr(mod, "_ckpt_enabled", True)),
+                )
+        try:
+            cur = int(getattr(mod, "_ckpt_min_bytes", 0) or 0)
+            if min_bytes < cur:
+                setattr(mod, "_ckpt_min_bytes", int(min_bytes))
+                changed = True
+            if not bool(getattr(mod, "_ckpt_enabled", True)):
+                setattr(mod, "_ckpt_enabled", True)
+                changed = True
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        setattr(inst, "_stnet_ckpt_pressure_until", int(max(cur_until, until)))
+        prev_mb = int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0)
+        if prev_mb <= 0:
+            setattr(inst, "_stnet_ckpt_pressure_min_bytes", int(min_bytes))
+        else:
+            setattr(
+                inst, "_stnet_ckpt_pressure_min_bytes", int(min(prev_mb, min_bytes))
+            )
+    return bool(changed)
+
+
+def from_checkpoint(model: object, *args: Any, step_total: int) -> None:
+    inst = to_submodule(model) or (model.module if hasattr(model, "module") else model)
+    if inst is None:
+        return
+    try:
+        step_total = int(step_total)
+    except Exception:
+        return
+    until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
+    if until <= 0 or step_total < until:
+        return
+    for mod in iter_checkpoint(inst):
+        try:
+            if hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
+                setattr(
+                    mod,
+                    "_ckpt_min_bytes",
+                    int(getattr(mod, "_stnet_ckpt_saved_min_bytes", 0) or 0),
+                )
+            if hasattr(mod, "_stnet_ckpt_saved_enabled"):
+                setattr(
+                    mod,
+                    "_ckpt_enabled",
+                    bool(getattr(mod, "_stnet_ckpt_saved_enabled", True)),
+                )
+            for k in ("_stnet_ckpt_saved_min_bytes", "_stnet_ckpt_saved_enabled"):
+                with contextlib.suppress(Exception):
+                    delattr(mod, k)
+        except Exception:
+            pass
+    with contextlib.suppress(Exception):
+        setattr(inst, "_stnet_ckpt_pressure_until", 0)
+        setattr(inst, "_stnet_ckpt_pressure_min_bytes", 0)
+
+
+def coerce_checkpoint(
+    fn: Callable[..., Any],
+    *args: Any,
+    **ckpt_kwargs: Any,
+) -> Any:
+    if _torch_checkpoint is None:
+        return fn(*args)
+    for t in args:
+        if isinstance(t, torch.Tensor) and t.requires_grad:
+            return _torch_checkpoint(fn, *args, **ckpt_kwargs)
+    base = next(
+        (
+            t
+            for t in args
+            if isinstance(t, torch.Tensor) and (t.is_floating_point() or t.is_complex())
+        ),
+        None,
+    )
+    if base is None:
+        return fn(*args)
+    try:
+        dummy = base.new_zeros((), requires_grad=True)
+    except Exception:
+        return fn(*args)
+
+    def _fn_with_dummy(*inps: Any) -> Any:
+        return fn(*inps[:-1])
+
+    return _torch_checkpoint(_fn_with_dummy, *args, dummy, **ckpt_kwargs)

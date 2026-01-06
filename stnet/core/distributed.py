@@ -733,6 +733,17 @@ def joining(
     return Join(joinables, throw_on_early_termination=True)
 
 
+def broadcast_scalar(value: object, device: torch.device, src: int = 0) -> object:
+    if not is_distributed():
+        return int(value)
+    try:
+        tensor = torch.tensor([int(value)], device=device, dtype=torch.int32)
+        dist.broadcast(tensor, src=src)
+        return int(tensor.item())
+    except Exception:
+        return int(value)
+
+
 def is_distributed() -> bool:
     try:
         return dist.is_available() and dist.is_initialized()
