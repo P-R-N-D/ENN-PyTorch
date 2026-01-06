@@ -142,7 +142,6 @@ def _stream_flex_attention(
             block_mask_g = create_block_mask(
                 mask_mod, B_g, H, L_q, L_k, device=qh.device, BLOCK_SIZE=block_size
             )
-
         if _FLEX_ATTENTION_KWARGS:
             flex_kwargs: dict[str, Any] = {"block_mask": block_mask_g}
             if "scale" in _FLEX_ATTENTION_KWARGS:
@@ -215,6 +214,7 @@ def resize_scaler_buffer(model: nn.Module, state: Mapping[str, Any]) -> None:
                     scaler._buffers[name] = new_buf
                 except Exception:
                     setattr(scaler, name, new_buf)
+
 
 def norm_layer(norm_type: str, dim: int) -> nn.Module:
     norm = str(norm_type).strip().lower()
@@ -379,6 +379,7 @@ class Retention(nn.Module):
             return out, new_state
         out = self._forward_bidirectional(x, attn_mask=attn_mask)
         return out, None
+
 
 class DilatedAttention(nn.Module):
     def __init__(
@@ -771,7 +772,6 @@ class DilatedAttention(nn.Module):
         training = bool(self.training)
         dropout_p = float(self.dropout_p) if training else 0.0
         attn_w: Optional[torch.Tensor] = None
-
         if want_weights:
             is_simple = (int(self.dilation) == 1) and (self.window_size is None)
             base_mask_keep: Optional[torch.Tensor] = None
@@ -875,7 +875,6 @@ class DilatedAttention(nn.Module):
             scale = 1.0 / math.sqrt(float(Dh))
             max_group = int(getattr(self, "flex_batch_microbatch", 0) or B)
             max_group = max(1, min(B, max_group))
-
             group = max_group
             last_oom: Optional[RuntimeError] = None
             while group >= 1:
@@ -1144,7 +1143,6 @@ class SigmoidGate(nn.Module):
         self.use_stats = bool(use_stats)
         ts = 0 if tile_size is None else int(tile_size)
         self.tile_size = int(ts) if ts > 0 else 0
-        
         if event_shape is None:
             self.event_shape: Tuple[int, ...] = ()
         else:
@@ -1373,7 +1371,6 @@ class SigmoidGate(nn.Module):
                 use_tile_nd = bool(tile_shape_nd) and int(self._prod_int(event_shape)) == D0
             except Exception:
                 use_tile_nd = False
-
         if use_tile_nd:
             assert base is not None and residue is not None
             b = base.detach() if self.detach_inputs else base
@@ -1391,13 +1388,11 @@ class SigmoidGate(nn.Module):
                 pads.extend([0, int(padded - orig)])
             pads_t = tuple(pads)
             pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
-
             b_nd = b32.reshape(B, *event_shape_t)
             r_nd = r32.reshape(B, *event_shape_t)
             if pad_needed:
                 b_nd = F.pad(b_nd, pads_t)
                 r_nd = F.pad(r_nd, pads_t)
-
             mask_bool: Optional[torch.Tensor] = None
             if pad_needed:
                 device = b_nd.device
@@ -1411,7 +1406,6 @@ class SigmoidGate(nn.Module):
                     mask_bool = v if mask_bool is None else (mask_bool & v)
                 if mask_bool is None:
                     mask_bool = torch.ones(pad_shape, device=device, dtype=torch.bool)
-
             view_shape: list[int] = [B]
             interleaved: list[int] = []
             for g, t in zip(grid_shape, tile_shape_t):
@@ -1434,13 +1428,11 @@ class SigmoidGate(nn.Module):
                 b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
                 r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + self.eps)
             ratio = r_rms_t / (b_rms_t + float(self.eps))
-
             tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(dtype=tokens.dtype)
             tile_logit = self.tile_net(tile_feats).squeeze(-1)
             g_add = global_logit.view(B, *([1] * int(len(event_shape_t))))
             logit = g_add + tile_logit
             sig = torch.sigmoid(logit)
-
             p_low = sig.new_full(sig.shape, float(self.p_floor))
             p_high = sig.new_full(sig.shape, float(self.p_ceil))
             if z_min is not None and z_max is not None:
@@ -1484,7 +1476,6 @@ class SigmoidGate(nn.Module):
                     p_low = torch.clamp(p_low_bound, min=float(self.p_floor), max=float(self.p_ceil))
                     p_high = torch.clamp(p_high_bound, min=float(self.p_floor), max=float(self.p_ceil))
                     p_high = torch.maximum(p_high, p_low + float(self.eps))
-
             p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
             clip = float(max(self.clip_eps, self.eps))
             lo = float(self.p_floor) + clip
@@ -1493,7 +1484,6 @@ class SigmoidGate(nn.Module):
                 p_tile = torch.clamp(p_tile, min=lo, max=hi)
             else:
                 p_tile = torch.clamp(p_tile, min=float(self.p_floor), max=float(self.p_ceil))
-
             if bool(fallback_bounds):
                 try:
                     width = (p_high - p_low).to(dtype=torch.float32)
@@ -1519,7 +1509,6 @@ class SigmoidGate(nn.Module):
                     )
                 except Exception:
                     pass
-
             edge_reg: Optional[torch.Tensor] = None
             edge_reg_low: Optional[torch.Tensor] = None
             edge_reg_high: Optional[torch.Tensor] = None
@@ -1548,7 +1537,6 @@ class SigmoidGate(nn.Module):
                     edge_reg = None
                     edge_reg_low = None
                     edge_reg_high = None
-
             expand_view: list[int] = [B]
             for g in grid_shape:
                 expand_view.extend([int(g), 1])
@@ -1561,7 +1549,6 @@ class SigmoidGate(nn.Module):
             slices = (slice(None),) + tuple(slice(0, int(d)) for d in event_shape_t)
             p_crop = p_pad[slices]
             out_full = p_crop.reshape(B, D)
-
             out_dtype = residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
             out_full = out_full.to(dtype=out_dtype)
             if bool(return_edge_reg_lr):
@@ -1575,7 +1562,6 @@ class SigmoidGate(nn.Module):
                     edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
                 return out_full, edge_reg.to(dtype=out_dtype)
             return out_full
-
         use_tile = (
             self.tile_size > 0
             and self.tile_net is not None
@@ -1809,6 +1795,7 @@ class Scaler(nn.Module):
         self.y_mean.copy_(mean)
         self.y_std.copy_(std)
         self._invalidate_stats_cache()
+        
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
         compiling = is_export_or_trace()
         if not compiling:
@@ -2364,7 +2351,6 @@ class Recorder(nn.Module):
             return
         x_det = x.detach()
         y_det = y.detach()
-
         xvar_dev, xm_dev, xmin_dev, xmax_dev = _tensor_stats(x_det)
         yvar_dev, ym_dev, ymin_dev, ymax_dev = _tensor_stats(y_det)
         stats_device = self.sampled_x_mean.device
@@ -2436,7 +2422,6 @@ class Recorder(nn.Module):
     ) -> None:
         t = int(step) if step is not None else int(self._global_step)
         self._global_step = t + 1
-
         rec: Dict[str, Any] = {
             "timestep": t,
             "batch_size": int(batch_size),
