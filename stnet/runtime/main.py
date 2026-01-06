@@ -904,7 +904,6 @@ def _cast_float_dtype(model: object, dtype: torch.dtype) -> object:
             return
     except Exception:
         return
-
     with torch.no_grad():
         for mod in getattr(model, "modules", lambda: [])():
             if _is_precision_exempted(mod):
@@ -1252,7 +1251,6 @@ def _get_sample_size(
     if N <= 0:
         return
     B0 = max(1, min(int(max_probe_batch), N))
-
     try:
         base_alloc = allocated_accelerator_memory(device)
         if base_alloc is None:
@@ -1950,7 +1948,6 @@ def _set_gate_factor(
     if bool(is_distributed()):
         with contextlib.suppress(Exception):
             _reduce_sum(stats, pg)
-
     count = float(stats[0].item())
     if not math.isfinite(count) or count <= 0.0:
         return
@@ -2135,7 +2132,7 @@ def _iter_checkpoint(root: object):
 
 def _to_checkpoint(
     model: object,
-    *,
+    *args: Any,
     device: torch.device,
     step_total: int,
     ttl_steps: int,
@@ -2150,18 +2147,15 @@ def _to_checkpoint(
         step_total = max(0, int(step_total))
     except Exception:
         return False
-
     until = step_total + ttl_steps
     try:
         until = int(_sync_tensor(until, device=device, src=0))
         min_bytes = int(_sync_tensor(min_bytes, device=device, src=0))
     except Exception:
         pass
-
     cur_until = int(getattr(inst, "_stnet_ckpt_pressure_until", 0) or 0)
     if cur_until >= until and int(getattr(inst, "_stnet_ckpt_pressure_min_bytes", 0) or 0) <= min_bytes:
         return False
-
     changed = False
     for mod in _iter_checkpoint(inst):
         if not hasattr(mod, "_stnet_ckpt_saved_min_bytes"):
@@ -2188,7 +2182,7 @@ def _to_checkpoint(
     return bool(changed)
 
 
-def _from_checkpoint(model: object, *, step_total: int) -> None:
+def _from_checkpoint(model: object, *args: Any, step_total: int) -> None:
     inst = _to_submodule(model) or (model.module if hasattr(model, "module") else model)
     if inst is None:
         return
@@ -2367,8 +2361,6 @@ def epochs(
         if isinstance(v, int) and v > 0:
             est_bytes_per_sample = int(v)
     if per_batch is None or int(per_batch) <= 0 or est_bytes_per_sample is None:
-
-
         try:
             it = iter(train_loader)
             sample = next(it)
@@ -2534,8 +2526,6 @@ def epochs(
             p_gate_auto_step_total = int(step_buf.item())
     util_adjust_interval = 0
     util_warmup_steps = 0
-
-
     if buffers_dtype is not None:
         target_for_buffers = model.module if hasattr(model, "module") else model
         _cast_batchnorm_buffers_dtype(target_for_buffers, buffers_dtype)
@@ -3088,7 +3078,6 @@ def epochs(
                                         inst_step = _to_submodule(target_for_step) or target_for_step
                                         with contextlib.suppress(Exception):
                                             setattr(inst_step, "_stnet_step_total", int(p_gate_auto_step_total))
-
                                         peak = None
                                         free = None
                                         total = None
@@ -3111,9 +3100,7 @@ def epochs(
                                                     ttl_steps=128,
                                                     min_bytes=16 * 1024 * 1024,
                                                 )
-
                                         _from_checkpoint(model, step_total=int(p_gate_auto_step_total))
-
                                         if scheduler_step_per_batch:
                                             with contextlib.suppress(Exception):
                                                 sched.step()
@@ -3934,7 +3921,6 @@ def infer(
         target_rows=int(target_rows),
         make_fence_event=make_fence_event,
     )
-
     try:
         with inference_mode(run_model), Autocast.float(device):
             row_ids_buf = None
@@ -4876,7 +4862,6 @@ class _PredictionWriter:
                 self.flush()
                 self.use_buffer = False
                 self.pending_tail = None
-
         if not self.use_buffer:
             if self.pending_tail is None:
                 self.pending_tail = tail
@@ -4891,7 +4876,6 @@ class _PredictionWriter:
             if self.pending_count >= self.target_rows:
                 self.flush()
             return
-
         if self.rows_buf is None:
             self.rows_buf = torch.empty((self.target_rows,), dtype=torch.int64)
 
@@ -4917,7 +4901,6 @@ class _PredictionWriter:
             self.pred_buf = None
             self.pred_handle = None
             self.pred_buf_is_pinned = False
-
         start = 0
         while start < b:
             if self.pred_buf is None:
