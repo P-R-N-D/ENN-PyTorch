@@ -73,6 +73,10 @@ else:
 _NODES_LOCK = threading.Lock()
 _NODES_IMPORTED = False
 
+_device_mem_get_info = Memory.mem_get_info
+
+TExtra = TypeVar("TExtra")
+
 
 def _require_nodes() -> None:
     global _NODES_IMPORTED
@@ -101,11 +105,6 @@ def _require_nodes() -> None:
             }
         )
         _NODES_IMPORTED = True
-
-
-_device_mem_get_info = Memory.mem_get_info
-
-TExtra = TypeVar("TExtra")
 
 
 def _sync_device(device: torch.device) -> None:
@@ -876,7 +875,6 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
             items.append((key, d))
             manifest[key] = key
         return (items, manifest)
-
     if isinstance(data, Sequence) and data and all((isinstance(d, (TensorDictBase, collections.abc.Mapping)) for d in data)):
         manifest_list: list[str] = []
         items2: list[tuple[str, object]] = []
@@ -885,7 +883,6 @@ def iter_dataset(data: object) -> tuple[list[tuple[str, object]], object | None]
             items2.append((key, d))
             manifest_list.append(key)
         return (items2, manifest_list)
-
     return ([("0", data)], None)
 
 
@@ -1071,10 +1068,8 @@ def fetch(
         require_mapping = False
     else:
         require_mapping = None
-
     train_weights_map: Optional[Dict[str, float]] = None
     val_weights_map: Optional[Dict[str, float]] = None
-
     datasets_train = _fetch_build_datasets(
         specs,
         split="train",
@@ -1188,7 +1183,6 @@ def fetch(
             )
         else:
             bs_val = int(bs_train)
-
         pf_val = _fetch_cap_pf_depth(
             datasets_val,
             device_obj,
@@ -1261,7 +1255,6 @@ def fetch(
             setattr(train_loader, "_stnet_epochables", list(train_epochables))
         if val_loader is not None:
             setattr(val_loader, "_stnet_sampler_scale", scale_ctl)
-
     return {
         "training_loader": train_loader,
         "validation_loader": val_loader,
@@ -1638,6 +1631,12 @@ class Session:
     sampler_scale: Optional["BatchScaler"] = None
     _opened: bool = False
 
+    def __enter__(self) -> "Session":
+        return self.open()
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
     def open(
         self,
         *args: Any,
@@ -1710,12 +1709,6 @@ class Session:
                 keep.cleanup()
         self._opened = False
 
-    def __enter__(self) -> "Session":
-        return self.open()
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.close()
-
 
 @dataclass
 class Dataset(Generic[TExtra]):
@@ -1746,6 +1739,51 @@ class Dataset(Generic[TExtra]):
         self._refresh_device_info()
         self._refresh_dtypes_from_env()
         self._refresh_quant_from_env()
+
+    def _refresh_device_info(self) -> None:
+        stats = get_device_stats(self.device)
+        self.device = stats.device
+        self.device_type = stats.device_type
+        self.cuda_cc = stats.cuda_cc
+
+    @staticmethod
+    def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
+        if device is not None:
+            return torch.device(device)
+        with contextlib.suppress(Exception):
+            return get_device()
+        return torch.device("cpu")
+
+    @staticmethod
+    def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
+        entries: list[torch.dtype] = []
+        for token in str(value).split(","):
+            name = token.strip()
+            if not name:
+                continue
+            dtype = getattr(torch, name, None)
+            if isinstance(dtype, torch.dtype):
+                entries.append(dtype)
+        return tuple(entries)
+
+    def _refresh_dtypes_from_env(self) -> None:
+        float_env = env_first(("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES"))
+        if float_env:
+            parsed = self._parse_dtypes_env(float_env)
+            if parsed:
+                self.float_dtypes = parsed
+        int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
+        if int_env:
+            parsed = self._parse_dtypes_env(int_env)
+            if parsed:
+                self.int_dtypes = parsed
+
+    def _refresh_quant_from_env(self) -> None:
+        bits = env_first_int(
+            ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
+        )
+        if bits > 0:
+            self.int_quant_bits = int(bits)
 
     @property
     def device_stats(self):
@@ -2147,12 +2185,6 @@ class Dataset(Generic[TExtra]):
             labels = labels.to(device=dev, non_blocking=non_blocking)
         return feats, labels
 
-    def _refresh_device_info(self) -> None:
-        stats = get_device_stats(self.device)
-        self.device = stats.device
-        self.device_type = stats.device_type
-        self.cuda_cc = stats.cuda_cc
-
     @staticmethod
     def cuda_compute_capability(device: Union[torch.device, str]) -> Tuple[int, int]:
         return cuda_compute_capability(device)
@@ -2164,45 +2196,6 @@ class Dataset(Generic[TExtra]):
     @staticmethod
     def is_cuda_bf16_supported(device: Optional[Union[torch.device, str]] = None) -> bool:
         return bool(is_cuda_bf16_supported(device))
-
-    @staticmethod
-    def _resolve_device(device: Optional[Union[torch.device, str]]) -> torch.device:
-        if device is not None:
-            return torch.device(device)
-        with contextlib.suppress(Exception):
-            return get_device()
-        return torch.device("cpu")
-
-    @staticmethod
-    def _parse_dtypes_env(value: str) -> Tuple[torch.dtype, ...]:
-        entries: list[torch.dtype] = []
-        for token in str(value).split(","):
-            name = token.strip()
-            if not name:
-                continue
-            dtype = getattr(torch, name, None)
-            if isinstance(dtype, torch.dtype):
-                entries.append(dtype)
-        return tuple(entries)
-
-    def _refresh_dtypes_from_env(self) -> None:
-        float_env = env_first(("STNET_DATA_FLOAT_DTYPES", "STNET_FLOAT_DTYPES"))
-        if float_env:
-            parsed = self._parse_dtypes_env(float_env)
-            if parsed:
-                self.float_dtypes = parsed
-        int_env = env_first(("STNET_DATA_INT_DTYPES", "STNET_INT_DTYPES"))
-        if int_env:
-            parsed = self._parse_dtypes_env(int_env)
-            if parsed:
-                self.int_dtypes = parsed
-
-    def _refresh_quant_from_env(self) -> None:
-        bits = env_first_int(
-            ("STNET_DATA_INT_QUANT_BITS", "STNET_INT_QUANT_BITS"), default=0
-        )
-        if bits > 0:
-            self.int_quant_bits = int(bits)
 
     @classmethod
     def is_float8_supported(
