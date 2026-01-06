@@ -23,6 +23,7 @@ try:
 except Exception:
     FakeTensor = tuple()
 
+
 _PATCH_LOCK = threading.RLock()
 
 _TORCH_COMPAT: TorchCompat | None = None
@@ -129,49 +130,6 @@ def torch_compat(module: Any | None = None, nn_module: Any | None = None) -> Tor
         return compat
 
 
-class TorchCompat:
-    def __init__(self, module: Any | None = None, nn_module: Any | None = None) -> None:
-        self.module = module if module is not None else torch
-        self.nn_module = nn_module if nn_module is not None else getattr(self.module, "nn", nn)
-
-    def apply(self) -> None:
-        with _PATCH_LOCK:
-            self._patch_rmsnorm()
-            self._patch_fmin()
-            self._patch_nanmin()
-            self._patch_nanmax()
-            self._patch_nansum()
-            compile_distributed_safe()
-
-    def _patch_rmsnorm(self) -> None:
-        global RMSNorm
-        if hasattr(self.nn_module, "RMSNorm"):
-            RMSNorm = getattr(self.nn_module, "RMSNorm", None)
-            return
-        setattr(self.nn_module, "RMSNorm", _RMSNormFallback)
-        RMSNorm = getattr(self.nn_module, "RMSNorm", None)
-
-    def _patch_fmin(self) -> None:
-        if hasattr(self.module, "fmin"):
-            return
-        setattr(self.module, "fmin", partial(_fmin_impl, self.module))
-
-    def _patch_nanmin(self) -> None:
-        if hasattr(self.module, "nanmin"):
-            return
-        setattr(self.module, "nanmin", partial(_nanmin_impl, self.module))
-
-    def _patch_nanmax(self) -> None:
-        if hasattr(self.module, "nanmax"):
-            return
-        setattr(self.module, "nanmax", partial(_nanmax_impl, self.module))
-
-    def _patch_nansum(self) -> None:
-        if hasattr(self.module, "nansum"):
-            return
-        setattr(self.module, "nansum", partial(_nansum_impl, self.module))
-
-
 class _RMSNormFallback(nn.Module):
     def __init__(self, d_model: int, eps: float = 1e-06) -> None:
         super().__init__()
@@ -210,6 +168,49 @@ class _SDPBackendFallback:
     CUDNN_ATTENTION = object()
 
 
+class TorchCompat:
+    def __init__(self, module: Any | None = None, nn_module: Any | None = None) -> None:
+        self.module = module if module is not None else torch
+        self.nn_module = nn_module if nn_module is not None else getattr(self.module, "nn", nn)
+
+    def _patch_rmsnorm(self) -> None:
+        global RMSNorm
+        if hasattr(self.nn_module, "RMSNorm"):
+            RMSNorm = getattr(self.nn_module, "RMSNorm", None)
+            return
+        setattr(self.nn_module, "RMSNorm", _RMSNormFallback)
+        RMSNorm = getattr(self.nn_module, "RMSNorm", None)
+
+    def _patch_fmin(self) -> None:
+        if hasattr(self.module, "fmin"):
+            return
+        setattr(self.module, "fmin", partial(_fmin_impl, self.module))
+
+    def _patch_nanmin(self) -> None:
+        if hasattr(self.module, "nanmin"):
+            return
+        setattr(self.module, "nanmin", partial(_nanmin_impl, self.module))
+
+    def _patch_nanmax(self) -> None:
+        if hasattr(self.module, "nanmax"):
+            return
+        setattr(self.module, "nanmax", partial(_nanmax_impl, self.module))
+
+    def _patch_nansum(self) -> None:
+        if hasattr(self.module, "nansum"):
+            return
+        setattr(self.module, "nansum", partial(_nansum_impl, self.module))
+        
+    def apply(self) -> None:
+        with _PATCH_LOCK:
+            self._patch_rmsnorm()
+            self._patch_fmin()
+            self._patch_nanmin()
+            self._patch_nanmax()
+            self._patch_nansum()
+            compile_distributed_safe()
+
+
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
 except Exception:
@@ -219,7 +220,6 @@ except Exception:
     def sdpa_kernel(*backends: Any) -> Iterator[None]:
         _ = backends
         yield
-
 
 StochasticDepth = getattr(nn, "StochasticDepth", None)
 if StochasticDepth is None:
