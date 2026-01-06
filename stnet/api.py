@@ -120,7 +120,6 @@ _IGNORED_WARNING_PATTERNS: tuple[str, ...] = (
     "mixed precision.*may be unavailable",
     "Either mode or options can be specified, but both can't be specified at the same time\\.",
 )
-
 _IGNORED_WARNING_MESSAGE_RE = re.compile(
     r".*(?:" + "|".join((f"(?:{p})" for p in _IGNORED_WARNING_PATTERNS)) + r").*"
 )
