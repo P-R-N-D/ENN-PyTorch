@@ -55,10 +55,11 @@ def _unshard_fsdp_module(module: torch.nn.Module) -> None:
         if (handle := unshard(async_op=True)) and callable(wait := getattr(handle, "wait", None)): wait()
     except: pass
 
-def _clean_ip_str(v: Any) -> str:
+def _clean_ip_str(v: Any, strip_zone: bool = True) -> str:
     s = str(v).strip() if v is not None else ""
-    if "%" in s: s = s.partition("%")[0].strip()
-    return s[1:-1].strip() if s.startswith("[") and s.endswith("]") else s
+    if s.startswith("[") and s.endswith("]"): s = s[1:-1].strip()
+    if strip_zone and "%" in s: s = s.partition("%")[0].strip()
+    return s
 
 
 def _looks_like_ip(value: str) -> bool:
@@ -79,8 +80,11 @@ def _canonize_ip(value: Any, loopback: bool = False, link_local: bool = False) -
 
 
 def _format_endpoint(host: str, port: int) -> str:
-    h, p = _clean_ip_str(host) or "127.0.0.1", int(port)
-    try: h = f"[{h}]" if ipaddress.ip_address(h).version == 6 and ":" in h else h
+    host_text = str(host).strip() if host is not None else ""
+    if host_text.startswith("[") and host_text.endswith("]"): host_text = host_text[1:-1].strip()
+    h, p = host_text or "127.0.0.1", int(port)
+    try:
+        h = f"[{h}]" if ipaddress.ip_address(_clean_ip_str(h)).version == 6 and ":" in h else h
     except: pass
     return f"{h}:{p}"
 

@@ -641,7 +641,7 @@ def accelerator(device: torch.device) -> contextlib.AbstractContextManager[None]
         return contextlib.nullcontext()
     mod = _acc_mod(dev.type)
     if mod and hasattr(mod, "device"):
-        return mod.device(dev.index if dev.index is not None else 0)
+        return mod.device(dev if dev.index is None else dev.index)
     return contextlib.nullcontext()
 
 
