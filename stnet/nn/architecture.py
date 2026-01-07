@@ -119,17 +119,14 @@ def _import_torchao_quantization() -> None:
 
 
 def _prod_int(shape: Sequence[int]) -> int:
-    out = 1
-    for v in shape:
-        out *= int(v)
-    return int(out)
+    return int(math.prod(int(v) for v in shape))
 
 
 def _normalize_tile_shape(
     tile_shape: Sequence[int] | int | None,
     event_shape: Sequence[int],
 ) -> Optional[Tuple[int, ...]]:
-    if tile_shape is None:
+    if tile_shape is None or not event_shape:
         return None
     if isinstance(tile_shape, int) and not isinstance(tile_shape, bool):
         ts = (int(tile_shape),)
@@ -137,15 +134,12 @@ def _normalize_tile_shape(
         ts = tuple(int(v) for v in tile_shape)
     if not ts:
         return None
-    ev = tuple(int(v) for v in event_shape)
-    if not ev:
-        return None
-    ndim = len(ev)
+    ndim = len(event_shape)
     if len(ts) == 1:
         ts = ts * ndim
     elif len(ts) < ndim:
         ts = (1,) * (ndim - len(ts)) + ts
-    elif len(ts) > ndim:
+    else:
         ts = ts[-ndim:]
     return tuple(max(1, int(v)) for v in ts)
 
@@ -164,15 +158,13 @@ def _tile_counts_grid(
     for d, t, g in zip(ev, ts, grid):
         if g <= 0:
             counts_1d.append(torch.zeros((0,), device=device, dtype=dtype))
-            continue
-        if g == 1:
+        elif g == 1:
             counts_1d.append(torch.tensor([float(d)], device=device, dtype=dtype))
-            continue
-        last = d - (g - 1) * t
-        last = max(1, int(last))
-        head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
-        tail = torch.tensor([float(last)], device=device, dtype=dtype)
-        counts_1d.append(torch.cat((head, tail), dim=0))
+        else:
+            last = max(1, int(d - (g - 1) * t))
+            head = torch.full((g - 1,), float(t), device=device, dtype=dtype)
+            tail = torch.tensor([float(last)], device=device, dtype=dtype)
+            counts_1d.append(torch.cat((head, tail), dim=0))
     out = torch.ones(grid, device=device, dtype=dtype)
     for i, c in enumerate(counts_1d):
         shape = [1] * len(grid)
@@ -193,24 +185,24 @@ def _reduce_flat_to_grid(
     ev = tuple(int(v) for v in event_shape)
     ts = tuple(int(v) for v in tile_shape)
     grid = tuple((d + t - 1) // t for d, t in zip(ev, ts))
-    padded = tuple(int(g * t) for g, t in zip(grid, ts))
     B = x.size(0)
     x_ev = x.reshape(B, *ev)
-    pads: list[int] = []
-    for orig, pad in reversed(list(zip(ev, padded))):
-        pads.extend([0, int(pad - orig)])
-    if any(int(p) != 0 for p in pads):
+    pads = []
+    for orig, g, t in reversed(list(zip(ev, grid, ts))):
+        pads.extend([0, int(g * t - orig)])
+    if any(p != 0 for p in pads):
         x_ev = F.pad(x_ev, tuple(pads))
-    view_shape: list[int] = [B]
+
+    view_shape = [B]
     for g, t in zip(grid, ts):
         view_shape.extend([int(g), int(t)])
     blk = x_ev.reshape(*view_shape).to(dtype=work_dtype)
     tile_dims = tuple(range(2, 1 + 2 * len(grid), 2))
+    sum_v = blk.sum(dim=tile_dims)
     if reduce == "sum":
-        return blk.sum(dim=tile_dims)
+        return sum_v
     counts = _tile_counts_grid(ev, ts, device=blk.device, dtype=blk.dtype).unsqueeze(0)
-    denom = torch.clamp(counts, min=float(eps))
-    return blk.sum(dim=tile_dims) / denom
+    return sum_v / torch.clamp(counts, min=float(eps))
 
 
 def _tv_loss_grid(
@@ -230,7 +222,6 @@ def _tv_loss_grid(
 def _dot_product_attention_cls() -> Any:
     try:
         from .kernels import DotProductAttention
-
         return DotProductAttention
     except Exception:
         return None
@@ -410,7 +401,6 @@ class TemporalExtractor(nn.Module):
         self._ckpt_min_bytes = int(64 * 1024 * 1024)
 
     @staticmethod
-    @torch_compiler_disable(reason="TemporalExtractor state coercion", recursive=False)
     def _coerce_state_tensor(
         state: Any,
         *args: Any,
@@ -1149,6 +1139,9 @@ class TokenFuser(nn.Module):
 
 
 class Model(nn.Module):
+    def _get_cfg(self, cfg, name, default, type_=float):
+        return type_(getattr(cfg, name, default))
+
     def __init__(
         self, in_dim: int, out_shape: Sequence[int], config: ModelConfig
     ) -> None:
@@ -1183,10 +1176,7 @@ class Model(nn.Module):
             self._device
         )
         self.processor = self.fuser
-        try:
-            bucket = int(getattr(config, "length_bucket_multiple", 64))
-        except Exception:
-            bucket = 64
+        bucket = self._get_cfg(config, "length_bucket_multiple", 64, int)
         self.temporal_token_collector = TokenCollector(
             int(config.d_model),
             int(config.heads),
@@ -1198,59 +1188,25 @@ class Model(nn.Module):
         ).to(self._device)
         self.controller = self.temporal_token_collector
         self.p_gate: Optional[SigmoidGate]
-        k_default = float(getattr(config, "p_gate_fallback_k", 6.0))
-        k_low_cfg = getattr(config, "p_gate_fallback_k_low", None)
-        k_high_cfg = getattr(config, "p_gate_fallback_k_high", None)
-        self.p_gate_fallback_k: float = float(k_default)
-        self.p_gate_fallback_k_low: float = float(
-            k_default if k_low_cfg is None else float(k_low_cfg)
-        )
-        self.p_gate_fallback_k_high: float = float(
-            k_default if k_high_cfg is None else float(k_high_cfg)
-        )
+        k_def = self._get_cfg(config, "p_gate_fallback_k", 6.0)
+        self.p_gate_fallback_k: float = float(k_def)
+        self.p_gate_fallback_k_low = float(getattr(config, "p_gate_fallback_k_low", k_def) or k_def)
+        self.p_gate_fallback_k_high = float(getattr(config, "p_gate_fallback_k_high", k_def) or k_def)
         self.p_gate_auto_k_enabled: bool = True
-        self.p_gate_auto_k_interval: int = max(
-            1, int(getattr(config, "p_gate_auto_k_interval", 100) or 100)
-        )
-        self.p_gate_auto_k_warmup: int = max(
-            0, int(getattr(config, "p_gate_auto_k_warmup", 0) or 0)
-        )
-        self.p_gate_auto_k_ema_alpha: float = float(
-            getattr(config, "p_gate_auto_k_ema_alpha", 0.1)
-        )
-        self.p_gate_auto_k_target_tight: float = float(
-            getattr(config, "p_gate_auto_k_target_tight", 0.02)
-        )
-        self.p_gate_auto_k_tolerance: float = float(
-            getattr(config, "p_gate_auto_k_tolerance", 0.5)
-        )
-        self.p_gate_auto_k_step_up: float = float(
-            getattr(config, "p_gate_auto_k_step_up", 0.1)
-        )
-        self.p_gate_auto_k_step_down: float = float(
-            getattr(config, "p_gate_auto_k_step_down", 0.02)
-        )
-        self.p_gate_auto_k_step_up_low: float = float(
-            getattr(config, "p_gate_auto_k_step_up_low", self.p_gate_auto_k_step_up)
-        )
-        self.p_gate_auto_k_step_down_low: float = float(
-            getattr(config, "p_gate_auto_k_step_down_low", self.p_gate_auto_k_step_down)
-        )
-        self.p_gate_auto_k_step_up_high: float = float(
-            getattr(config, "p_gate_auto_k_step_up_high", self.p_gate_auto_k_step_up)
-        )
-        self.p_gate_auto_k_step_down_high: float = float(
-            getattr(
-                config, "p_gate_auto_k_step_down_high", self.p_gate_auto_k_step_down
-            )
-        )
+        self.p_gate_auto_k_interval = max(1, self._get_cfg(config, "p_gate_auto_k_interval", 100, int))
+        self.p_gate_auto_k_warmup = max(0, self._get_cfg(config, "p_gate_auto_k_warmup", 0, int))
+        self.p_gate_auto_k_ema_alpha = self._get_cfg(config, "p_gate_auto_k_ema_alpha", 0.1)
+        self.p_gate_auto_k_target_tight = self._get_cfg(config, "p_gate_auto_k_target_tight", 0.02)
+        self.p_gate_auto_k_tolerance = self._get_cfg(config, "p_gate_auto_k_tolerance", 0.5)
+        self.p_gate_auto_k_step_up = self._get_cfg(config, "p_gate_auto_k_step_up", 0.1)
+        self.p_gate_auto_k_step_down = self._get_cfg(config, "p_gate_auto_k_step_down", 0.02)
+        self.p_gate_auto_k_step_up_low = self._get_cfg(config, "p_gate_auto_k_step_up_low", self.p_gate_auto_k_step_up)
+        self.p_gate_auto_k_step_down_low = self._get_cfg(config, "p_gate_auto_k_step_down_low", self.p_gate_auto_k_step_down)
+        self.p_gate_auto_k_step_up_high = self._get_cfg(config, "p_gate_auto_k_step_up_high", self.p_gate_auto_k_step_up)
+        self.p_gate_auto_k_step_down_high = self._get_cfg(config, "p_gate_auto_k_step_down_high", self.p_gate_auto_k_step_down)
         self.p_gate_auto_k_edge_enabled: bool = True
-        self.p_gate_auto_k_target_edge: float = float(
-            getattr(config, "p_gate_auto_k_target_edge", 0.05)
-        )
-        self.p_gate_auto_k_edge_tolerance: float = float(
-            getattr(config, "p_gate_auto_k_edge_tolerance", 0.5)
-        )
+        self.p_gate_auto_k_target_edge = self._get_cfg(config, "p_gate_auto_k_target_edge", 0.05)
+        self.p_gate_auto_k_edge_tolerance = self._get_cfg(config, "p_gate_auto_k_edge_tolerance", 0.5)
         self.p_gate_auto_k_edge_ema_alpha: float = float(
             getattr(
                 config, "p_gate_auto_k_edge_ema_alpha", self.p_gate_auto_k_ema_alpha
@@ -1275,11 +1231,10 @@ class Model(nn.Module):
         self.p_gate_auto_k_log_interval: int = int(
             getattr(config, "p_gate_auto_k_log_interval", 200) or 0
         )
-        if self.p_gate_auto_k_enabled:
-            if self.p_gate_fallback_k_low <= 0.0:
-                self.p_gate_fallback_k_low = max(float(self.p_gate_auto_k_min), 1e-6)
-            if self.p_gate_fallback_k_high <= 0.0:
-                self.p_gate_fallback_k_high = max(float(self.p_gate_auto_k_min), 1e-6)
+        if self.p_gate_auto_k_enabled and (self.p_gate_fallback_k_low <= 0.0 or self.p_gate_fallback_k_high <= 0.0):
+            m = max(float(self.p_gate_auto_k_min), 1e-6)
+            self.p_gate_fallback_k_low = max(self.p_gate_fallback_k_low, m)
+            self.p_gate_fallback_k_high = max(self.p_gate_fallback_k_high, m)
         self.p_gate_fallback_enabled: bool = bool(
             self.p_gate_fallback_k_low > 0.0 and self.p_gate_fallback_k_high > 0.0
         )
@@ -1758,51 +1713,96 @@ class Model(nn.Module):
                     setattr(proc, name, old)
                 _sync_after_swap(name)
 
-    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
-        if not isinstance(features, torch.Tensor):
-            raise TypeError("forward_export expects a Tensor")
-        device = self._device
-        try:
-            base_dtype = next(self.parameters()).dtype
-        except Exception:
-            base_dtype = features.dtype
-        x = self._cast_graph_safe(features, device, base_dtype)
+    def _run_forward_core(
+        self,
+        features: torch.Tensor,
+        *,
+        export: bool = False,
+        temporal_state: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
+        sanitize_nan: bool = True,
+        calibrate_output: bool = True,
+        device: Optional[torch.device] = None,
+        base_dtype: Optional[torch.dtype] = None,
+    ):
+        x = self._cast_graph_safe(
+            features, device or self._device, base_dtype or features.dtype
+        )
         x = self.scaler.normalize_x(x)
         b = x.size(0)
-        tokens, context = self.fuser.forward_export(x)
+        if export:
+            tokens, context = self.fuser.forward_export(x)
+            next_state = None
+        else:
+            tokens, context, next_state = self.fuser(
+                x,
+                temporal_state=temporal_state,
+                return_temporal_state=True,
+                causal_mask=causal_mask,
+            )
+        if sanitize_nan:
+            tokens = _coerce_tensor(tokens, enabled=True, inplace=not export)
+            context = _coerce_tensor(context, enabled=True, inplace=not export)
         assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
-            bl = self.linear_branch(self._cast_graph_safe(x, device, assembled.dtype))
-            assembled = assembled + bl
-        mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
-        tokens_centered = tokens - mean.to(dtype=tokens.dtype)
-        if not tokens_centered.is_contiguous():
-            tokens_centered = tokens_centered.contiguous()
-        refined_tokens = self.temporal_token_collector.forward_export(tokens_centered)
-        residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
-        enhanced = residual_context.reshape(b, -1)
-        if enhanced.dtype != assembled.dtype:
-            enhanced = enhanced.to(dtype=assembled.dtype)
+            assembled = assembled + self.linear_branch(
+                self._cast_graph_safe(x, self._device, assembled.dtype)
+            )
+        tokens_centered = (
+            tokens
+            - tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype).to(tokens.dtype)
+        ).contiguous()
+        if export:
+            refined = self.temporal_token_collector.forward_export(tokens_centered)
+        else:
+            refined = self.temporal_token_collector.forward(tokens_centered)[0]
+        if sanitize_nan:
+            refined = _coerce_tensor(refined, enabled=True, inplace=not export)
+        residual = self.fuser.decode(refined, apply_norm=True)
+        if sanitize_nan:
+            residual = _coerce_tensor(residual, enabled=True, inplace=not export)
+        enhanced = residual.reshape(b, -1).to(dtype=assembled.dtype)
         delta = enhanced - assembled
-        y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+        p = None
         if self.p_gate is not None:
             p = self.p_gate(
                 tokens=tokens,
-                refined_tokens=refined_tokens,
+                refined_tokens=refined,
                 base=assembled,
                 residue=delta,
                 fallback_bounds=False,
+            ).to(dtype=assembled.dtype)
+            clip = float(
+                min(
+                    max(
+                        max(
+                            float(getattr(self.p_gate, "clip_eps", 1e-6)),
+                            float(getattr(self.p_gate, "eps", 0.0)),
+                        ),
+                        0.0,
+                    ),
+                    0.49,
+                )
             )
-            p = p.to(dtype=assembled.dtype)
-            clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
-            eps = float(getattr(self.p_gate, "eps", 0.0))
-            clip = max(clip_eps, eps)
-            clip = float(min(max(clip, 0.0), 0.49))
             p = p.clamp(clip, 1.0 - clip)
             y_hat = assembled + p * delta
-        z_cal = self.scaler.calibrate(y_hat)
-        pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
-        return pred
+        else:
+            y_hat = assembled + assembled.new_tensor(0.5) * delta
+        if sanitize_nan:
+            y_hat = _coerce_tensor(y_hat, enabled=True, inplace=not export)
+        if calibrate_output:
+            y_hat = self.scaler.calibrate(y_hat)
+        pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
+        if sanitize_nan:
+            pred = _coerce_tensor(pred, enabled=True, inplace=not export)
+        return pred, next_state, p, assembled, enhanced, delta, tokens, refined
+
+    def forward_export(self, features: torch.Tensor) -> torch.Tensor:
+        if not isinstance(features, torch.Tensor):
+            raise TypeError("forward_export expects Tensor")
+        return self._run_forward_core(
+            features, export=True, sanitize_nan=False, calibrate_output=True
+        )[0]
 
     def forward_stream(
         self,
@@ -1815,73 +1815,188 @@ class Model(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if not isinstance(features, torch.Tensor):
             raise TypeError("forward_stream expects a Tensor input")
-        if not isinstance(calibrate_output, bool):
-            raise TypeError("calibrate_output must be a bool")
-        if not isinstance(sanitize_nan, bool):
-            raise TypeError("sanitize_nan must be a bool")
-        device = self._device
-        try:
-            try:
-                base_dtype = next(self.parameters()).dtype
-            except Exception:
-                base_dtype = features.dtype
-            x = self._cast_graph_safe(features, device, base_dtype)
-            x = self.scaler.normalize_x(x)
-            b = x.size(0)
-            tokens, context, next_state = cast(
-                Tuple[torch.Tensor, torch.Tensor, Any],
-                self.fuser(
-                    x,
-                    temporal_state=temporal_state,
-                    return_temporal_state=True,
-                    causal_mask=causal_mask,
-                ),
+        pred, next_state, _, _, _, _, _, _ = self._run_forward_core(
+            features,
+            export=False,
+            temporal_state=temporal_state,
+            causal_mask=causal_mask,
+            sanitize_nan=sanitize_nan,
+            calibrate_output=calibrate_output,
+        )
+        return pred, next_state
+
+    def _compute_aux_losses(
+        self,
+        loss_val,
+        y_hat,
+        assembled,
+        enhanced,
+        tokens,
+        p,
+        z_true,
+        features_t,
+        is_cls_loss,
+        edge_reg_low,
+        edge_reg_high,
+    ):
+        if not (self.training and torch.is_grad_enabled()):
+            return loss_val
+        aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
+        aux_used = False
+        if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
+            loss_xx = F.smooth_l1_loss(
+                self.x_recon_head(tokens.mean(dim=1)).float(),
+                features_t.float(),
+                reduction="mean",
             )
-            tokens = _coerce_tensor(tokens, enabled=sanitize_nan, inplace=False)
-            context = _coerce_tensor(context, enabled=sanitize_nan, inplace=False)
-            assembled = context.reshape(b, -1)
-            if self.is_norm_linear and self.linear_branch is not None:
-                bl = self.linear_branch(
-                    self._cast_graph_safe(x, device, assembled.dtype)
-                )
-                assembled = assembled + bl
-            mean = tokens.mean(dim=1, keepdim=True, dtype=tokens.dtype)
-            tokens_centered = tokens - mean.to(dtype=tokens.dtype)
-            if not tokens_centered.is_contiguous():
-                tokens_centered = tokens_centered.contiguous()
-            refined_tokens = self.temporal_token_collector.forward_export(
-                tokens_centered
+            aux_total += self.unsup_xx_weight * loss_xx.to(aux_total.dtype)
+            aux_used = True
+        if self.unsup_yy_weight > 0.0:
+            if p is not None:
+                if p.dim() != 2 or p.shape[1] == 1:
+                    w = p.detach().squeeze(-1).clamp(min=0.0)
+                else:
+                    w = p.detach().mean(dim=1).clamp(min=0.0)
+                loss_yy = (
+                    F.smooth_l1_loss(assembled, y_hat.detach(), reduction="none")
+                    .mean(dim=1)
+                    * w
+                ).mean()
+            else:
+                loss_yy = F.smooth_l1_loss(assembled, y_hat.detach(), reduction="mean")
+            aux_total += self.unsup_yy_weight * loss_yy.to(aux_total.dtype)
+            aux_used = True
+        if self.p_prior_weight > 0.0 and p is not None:
+            clip_eps = max(
+                float(getattr(self.p_gate, "clip_eps", 1e-6)),
+                float(getattr(self.p_gate, "eps", 0.0)),
             )
-            refined_tokens = _coerce_tensor(
-                refined_tokens, enabled=sanitize_nan, inplace=False
-            )
-            residual_context = self.fuser.decode(refined_tokens, apply_norm=True)
-            enhanced = residual_context.reshape(b, -1)
-            if enhanced.dtype != assembled.dtype:
-                enhanced = enhanced.to(dtype=assembled.dtype)
-            delta = enhanced - assembled
-            y_hat = assembled + (assembled.new_tensor(0.5) * delta)
+            p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
+            loss_p = -(
+                ((self.p_prior_alpha - 1.0) * torch.log(p01))
+                + ((self.p_prior_beta - 1.0) * torch.log1p(-p01))
+            ).mean()
+            aux_total += self.p_prior_weight * loss_p.to(aux_total.dtype)
+            aux_used = True
+        if p is not None and (
+            self.p_gate_budget_weight > 0.0
+            or self.p_gate_tv_weight > 0.0
+            or self.p_gate_teacher_weight > 0.0
+        ):
+            gate_eps = 1e-6
+            p_floor = 0.0
+            p_ceil = 1.0
             if self.p_gate is not None:
-                p = self.p_gate(
-                    tokens=tokens,
-                    refined_tokens=refined_tokens,
-                    base=assembled,
-                    residue=delta,
-                    fallback_bounds=False,
-                ).to(dtype=assembled.dtype)
-                clip_eps = float(getattr(self.p_gate, "clip_eps", 1e-6))
-                eps = float(getattr(self.p_gate, "eps", 0.0))
-                clip = max(clip_eps, eps)
-                clip = float(min(max(clip, 0.0), 0.49))
-                p = p.clamp(clip, 1.0 - clip)
-                y_hat = assembled + p * delta
-            if calibrate_output:
-                y_hat = self.scaler.calibrate(y_hat)
-            pred = self.scaler.denormalize_y(y_hat).reshape(b, *self.out_shape)
-            pred = _coerce_tensor(pred, enabled=sanitize_nan, inplace=False)
-            return pred, next_state
-        finally:
-            pass
+                with contextlib.suppress(Exception):
+                    gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
+                with contextlib.suppress(Exception):
+                    gate_eps = max(gate_eps, float(getattr(self.p_gate, "eps", 0.0)))
+                with contextlib.suppress(Exception):
+                    p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
+                with contextlib.suppress(Exception):
+                    p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
+            gate_eps = max(0.0, float(gate_eps))
+            if self.p_gate_budget_weight > 0.0:
+                tgt = float(self.p_gate_budget_target)
+                if p_ceil >= p_floor:
+                    tgt = max(p_floor, min(p_ceil, tgt))
+                loss_budget = (
+                    p.to(dtype=torch.float32).mean() - p.new_tensor(tgt)
+                ).square()
+                aux_total += self.p_gate_budget_weight * loss_budget.to(aux_total.dtype)
+                aux_used = True
+            p_grid = None
+            w_grid = None
+            tile_shape = None
+            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                tile_shape = _normalize_tile_shape(
+                    getattr(self, "p_gate_tile_shape", None), self.out_shape
+                )
+            if (self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0) and self.out_shape:
+                try:
+                    if tile_shape is not None:
+                        p_grid = _reduce_flat_to_grid(
+                            p.to(dtype=torch.float32),
+                            self.out_shape,
+                            tile_shape,
+                            reduce="mean",
+                            eps=gate_eps,
+                            work_dtype=torch.float32,
+                        )
+                        w_grid = _tile_counts_grid(
+                            self.out_shape,
+                            tile_shape,
+                            device=p_grid.device,
+                            dtype=torch.float32,
+                        ).unsqueeze(0)
+                    else:
+                        p_grid = p.to(dtype=torch.float32).mean(dim=1, keepdim=True)
+                except Exception:
+                    p_grid = None
+                    w_grid = None
+            if self.p_gate_tv_weight > 0.0 and p_grid is not None:
+                tv = _tv_loss_grid(p_grid, power=float(self.p_gate_tv_power), eps=gate_eps)
+                aux_total += self.p_gate_tv_weight * tv.to(dtype=aux_total.dtype)
+                aux_used = True
+            if self.p_gate_teacher_weight > 0.0 and p_grid is not None and z_true is not None and (not is_cls_loss):
+                base_det = assembled.detach().to(dtype=torch.float32)
+                ref_det = enhanced.detach().to(dtype=torch.float32)
+                tgt_det = z_true.detach().to(device=base_det.device, dtype=torch.float32)
+                err_base = (base_det - tgt_det).square()
+                err_ref = (ref_det - tgt_det).square()
+                improve = err_base - err_ref
+                if bool(self.p_gate_teacher_relu):
+                    improve = F.relu(improve)
+                scale = 0.5 * (err_base + err_ref)
+                if tile_shape is not None:
+                    imp_grid = _reduce_flat_to_grid(
+                        improve,
+                        self.out_shape,
+                        tile_shape,
+                        reduce="mean",
+                        eps=gate_eps,
+                        work_dtype=torch.float32,
+                    )
+                    scale_grid = _reduce_flat_to_grid(
+                        scale,
+                        self.out_shape,
+                        tile_shape,
+                        reduce="mean",
+                        eps=gate_eps,
+                        work_dtype=torch.float32,
+                    )
+                else:
+                    imp_grid = improve.mean(dim=1, keepdim=True)
+                    scale_grid = scale.mean(dim=1, keepdim=True)
+                scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
+                temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
+                score = ((imp_grid / scale_grid - float(self.p_gate_teacher_tau)) / temp).clamp(
+                    min=-20.0, max=20.0
+                )
+                p01 = torch.sigmoid(score)
+                p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
+                lo = float(p_floor) + float(gate_eps)
+                hi = float(p_ceil) - float(gate_eps)
+                if hi > lo:
+                    p_target = p_target.clamp(min=lo, max=hi)
+                if w_grid is not None:
+                    w = w_grid.to(device=p_grid.device, dtype=torch.float32)
+                    loss_teacher = (
+                        (p_grid.to(dtype=torch.float32) - p_target).square() * w
+                    ).sum() / w.sum().clamp_min(float(gate_eps))
+                else:
+                    loss_teacher = F.mse_loss(p_grid.to(dtype=torch.float32), p_target, reduction="mean")
+                aux_total += self.p_gate_teacher_weight * loss_teacher.to(dtype=aux_total.dtype)
+                aux_used = True
+        if self.p_gate_edge_reg_weight_low > 0.0 and edge_reg_low is not None:
+            aux_total += self.p_gate_edge_reg_weight_low * edge_reg_low.to(dtype=aux_total.dtype)
+            aux_used = True
+        if self.p_gate_edge_reg_weight_high > 0.0 and edge_reg_high is not None:
+            aux_total += self.p_gate_edge_reg_weight_high * edge_reg_high.to(dtype=aux_total.dtype)
+            aux_used = True
+        if aux_used:
+            return (loss_val + aux_total) if (loss_val is not None) else aux_total
+        return loss_val
 
     def _auto_microbatch(
         self, features: torch.Tensor | TensorDictBase, device: torch.device
@@ -2515,221 +2630,19 @@ class Model(nn.Module):
                 loss_val = torch.as_tensor(
                     loss_val, device=y_hat.device, dtype=y_hat.dtype
                 )
-            if self.training and grad_enabled:
-                aux_total = y_hat.new_tensor(0.0, dtype=y_hat.dtype)
-                aux_used = False
-                if self.unsup_xx_weight > 0.0 and self.x_recon_head is not None:
-                    x_recon = self.x_recon_head(tokens.mean(dim=1))
-                    loss_xx = F.smooth_l1_loss(
-                        x_recon.to(dtype=torch.float32),
-                        features_t.to(dtype=torch.float32),
-                        reduction="mean",
-                    )
-                    aux_total = aux_total + self.unsup_xx_weight * loss_xx.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if self.unsup_yy_weight > 0.0:
-                    teacher = y_hat.detach()
-                    student = assembled
-                    if p is not None:
-                        w = p.detach()
-                        if w.dim() == 2 and int(w.shape[1]) != 1:
-                            w = w.mean(dim=1)
-                        else:
-                            w = w.squeeze(-1)
-                        w = w.clamp(min=0.0)
-                        per = F.smooth_l1_loss(student, teacher, reduction="none").mean(
-                            dim=1
-                        )
-                        loss_yy = (per * w).mean()
-                    else:
-                        loss_yy = F.smooth_l1_loss(student, teacher, reduction="mean")
-                    aux_total = aux_total + self.unsup_yy_weight * loss_yy.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if self.p_prior_weight > 0.0 and p is not None:
-                    clip_eps = (
-                        float(getattr(self.p_gate, "clip_eps", 1e-6))
-                        if self.p_gate is not None
-                        else 1e-6
-                    )
-                    with contextlib.suppress(Exception):
-                        clip_eps = max(
-                            clip_eps, float(getattr(self.p_gate, "eps", 0.0))
-                        )
-                    p01 = p.squeeze(-1).clamp(min=clip_eps, max=1.0 - clip_eps)
-                    a = float(self.p_prior_alpha)
-                    b = float(self.p_prior_beta)
-                    loss_p = -(
-                        ((a - 1.0) * torch.log(p01)) + ((b - 1.0) * torch.log1p(-p01))
-                    ).mean()
-                    aux_total = aux_total + self.p_prior_weight * loss_p.to(
-                        dtype=aux_total.dtype
-                    )
-                    aux_used = True
-                if p is not None and (
-                    self.p_gate_budget_weight > 0.0
-                    or self.p_gate_tv_weight > 0.0
-                    or self.p_gate_teacher_weight > 0.0
-                ):
-                    gate_eps = 1e-6
-                    p_floor = 0.0
-                    p_ceil = 1.0
-                    if self.p_gate is not None:
-                        with contextlib.suppress(Exception):
-                            gate_eps = float(getattr(self.p_gate, "clip_eps", gate_eps))
-                        with contextlib.suppress(Exception):
-                            gate_eps = max(
-                                gate_eps, float(getattr(self.p_gate, "eps", 0.0))
-                            )
-                        with contextlib.suppress(Exception):
-                            p_floor = float(getattr(self.p_gate, "p_floor", p_floor))
-                        with contextlib.suppress(Exception):
-                            p_ceil = float(getattr(self.p_gate, "p_ceil", p_ceil))
-                    gate_eps = max(0.0, float(gate_eps))
-                    if self.p_gate_budget_weight > 0.0:
-                        tgt = float(self.p_gate_budget_target)
-                        if p_ceil >= p_floor:
-                            tgt = max(p_floor, min(p_ceil, tgt))
-                        mean_p = p.to(dtype=torch.float32).mean()
-                        loss_budget = (mean_p - mean_p.new_tensor(tgt)).square()
-                        aux_total = (
-                            aux_total
-                            + self.p_gate_budget_weight
-                            * loss_budget.to(dtype=aux_total.dtype)
-                        )
-                        aux_used = True
-                    p_grid: Optional[torch.Tensor] = None
-                    w_grid: Optional[torch.Tensor] = None
-                    tile_shape: Optional[Tuple[int, ...]] = None
-                    if (
-                        self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
-                    ) and self.out_shape:
-                        tile_shape = _normalize_tile_shape(
-                            getattr(self, "p_gate_tile_shape", None),
-                            self.out_shape,
-                        )
-                    if (
-                        self.p_gate_tv_weight > 0.0 or self.p_gate_teacher_weight > 0.0
-                    ) and self.out_shape:
-                        try:
-                            if tile_shape is not None:
-                                p_grid = _reduce_flat_to_grid(
-                                    p.to(dtype=torch.float32),
-                                    self.out_shape,
-                                    tile_shape,
-                                    reduce="mean",
-                                    eps=gate_eps,
-                                    work_dtype=torch.float32,
-                                )
-                                w_grid = _tile_counts_grid(
-                                    self.out_shape,
-                                    tile_shape,
-                                    device=p_grid.device,
-                                    dtype=torch.float32,
-                                ).unsqueeze(0)
-                            else:
-                                p_grid = p.to(dtype=torch.float32).mean(
-                                    dim=1, keepdim=True
-                                )
-                        except Exception:
-                            p_grid = None
-                            w_grid = None
-                    if self.p_gate_tv_weight > 0.0 and p_grid is not None:
-                        tv = _tv_loss_grid(
-                            p_grid, power=float(self.p_gate_tv_power), eps=gate_eps
-                        )
-                        aux_total = aux_total + self.p_gate_tv_weight * tv.to(
-                            dtype=aux_total.dtype
-                        )
-                        aux_used = True
-                    if (
-                        self.p_gate_teacher_weight > 0.0
-                        and p_grid is not None
-                        and (z_true is not None)
-                        and (not is_cls_loss)
-                    ):
-                        base_det = assembled.detach().to(dtype=torch.float32)
-                        ref_det = enhanced.detach().to(dtype=torch.float32)
-                        tgt_det = z_true.detach().to(
-                            device=base_det.device, dtype=torch.float32
-                        )
-                        err_base = (base_det - tgt_det).square()
-                        err_ref = (ref_det - tgt_det).square()
-                        improve = err_base - err_ref
-                        if bool(self.p_gate_teacher_relu):
-                            improve = F.relu(improve)
-                        scale = 0.5 * (err_base + err_ref)
-                        imp_grid: torch.Tensor
-                        scale_grid: torch.Tensor
-                        if tile_shape is not None:
-                            imp_grid = _reduce_flat_to_grid(
-                                improve,
-                                self.out_shape,
-                                tile_shape,
-                                reduce="mean",
-                                eps=gate_eps,
-                                work_dtype=torch.float32,
-                            )
-                            scale_grid = _reduce_flat_to_grid(
-                                scale,
-                                self.out_shape,
-                                tile_shape,
-                                reduce="mean",
-                                eps=gate_eps,
-                                work_dtype=torch.float32,
-                            )
-                        else:
-                            imp_grid = improve.mean(dim=1, keepdim=True)
-                            scale_grid = scale.mean(dim=1, keepdim=True)
-                        scale_grid = torch.clamp(scale_grid, min=float(gate_eps))
-                        tau = float(self.p_gate_teacher_tau)
-                        temp = max(float(self.p_gate_teacher_temp), float(gate_eps))
-                        score = (imp_grid / scale_grid - tau) / temp
-                        score = score.clamp(min=-20.0, max=20.0)
-                        p01 = torch.sigmoid(score)
-                        p_target = p01 * float(p_ceil - p_floor) + float(p_floor)
-                        lo = float(p_floor) + float(gate_eps)
-                        hi = float(p_ceil) - float(gate_eps)
-                        if hi > lo:
-                            p_target = p_target.clamp(min=lo, max=hi)
-                        if w_grid is not None:
-                            w = w_grid.to(device=p_grid.device, dtype=torch.float32)
-                            num = (
-                                (p_grid.to(dtype=torch.float32) - p_target).square() * w
-                            ).sum()
-                            den = w.sum().clamp_min(float(gate_eps))
-                            loss_teacher = num / den
-                        else:
-                            loss_teacher = F.mse_loss(
-                                p_grid.to(dtype=torch.float32),
-                                p_target,
-                                reduction="mean",
-                            )
-                        aux_total = (
-                            aux_total
-                            + self.p_gate_teacher_weight
-                            * loss_teacher.to(dtype=aux_total.dtype)
-                        )
-                        aux_used = True
-                if edge_reg_low is not None and self.p_gate_edge_reg_weight_low > 0.0:
-                    aux_total = (
-                        aux_total
-                        + self.p_gate_edge_reg_weight_low
-                        * edge_reg_low.to(dtype=aux_total.dtype)
-                    )
-                    aux_used = True
-                if edge_reg_high is not None and self.p_gate_edge_reg_weight_high > 0.0:
-                    aux_total = (
-                        aux_total
-                        + self.p_gate_edge_reg_weight_high
-                        * edge_reg_high.to(dtype=aux_total.dtype)
-                    )
-                    aux_used = True
-                if aux_used:
-                    loss_val = aux_total if loss_val is None else (loss_val + aux_total)
+            loss_val = self._compute_aux_losses(
+                loss_val,
+                y_hat,
+                assembled,
+                enhanced,
+                tokens,
+                p,
+                z_true,
+                features_t,
+                is_cls_loss,
+                edge_reg_low,
+                edge_reg_high,
+            )
             if infer_mode and calibrate_output and (not is_cls_loss):
                 z_cal = self.scaler.calibrate(y_hat)
                 pred = self.scaler.denormalize_y(z_cal).reshape(b, *self.out_shape)
