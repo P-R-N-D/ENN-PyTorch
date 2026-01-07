@@ -78,18 +78,39 @@ def _flatten_attn_mask(
     L: int,
     S: int,
 ) -> tuple[torch.Tensor, int, int, int]:
+    del args
+    tracing_or_export = bool(is_tracing_or_exporting())
+    has_symbolic_expected = not all(isinstance(x, int) for x in (B, H, L, S))
+    has_symbolic_mask = False
+    if tracing_or_export:
+        try:
+            has_symbolic_mask = not all(isinstance(d, int) for d in mask.shape)
+        except Exception:
+            has_symbolic_mask = True
+    symbolic_shapes = bool(tracing_or_export and (has_symbolic_expected or has_symbolic_mask))
+
     if mask.dim() == 0:
         m = mask.to(device=device).view(1, 1, 1, 1)
         m = m.expand(1, 1, 1, S)
         return m, 1, 1, 1
     if mask.dim() == 1:
-        if mask.shape[0] != S:
+        if (not tracing_or_export) and mask.shape[0] != S:
             raise RuntimeError(
                 f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
             )
-        m = mask.to(device=device).view(1, 1, 1, S)
+        if (tracing_or_export and (not symbolic_shapes)) and mask.shape[0] != S:
+            raise RuntimeError(
+                f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
+            )
+        m = mask.to(device=device).view(1, 1, 1, mask.shape[0])
         return m, 1, 1, 1
     if mask.dim() == 2:
+        if tracing_or_export and symbolic_shapes:
+            raise RuntimeError(
+                "2D attn_mask is ambiguous under symbolic-shape export. "
+                "Pass a 4D mask with explicit semantics instead: "
+                "padding (B,1,1,S) or attn (1,1,L,S)."
+            )
         a, b = mask.shape
         if b != S:
             raise RuntimeError(
@@ -108,6 +129,12 @@ def _flatten_attn_mask(
             f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
         )
     if mask.dim() == 3:
+        if tracing_or_export and symbolic_shapes:
+            raise RuntimeError(
+                "3D attn_mask is ambiguous under symbolic-shape export. "
+                "Pass a 4D mask with explicit semantics instead: "
+                "(B,1,L,S), (B,1,1,S), (1,H,L,S), or (B,H,1,S)."
+            )
         a, b, c = mask.shape
         if c != S:
             raise RuntimeError(
@@ -130,17 +157,21 @@ def _flatten_attn_mask(
         )
     if mask.dim() == 4:
         b0, h0, l0, s0 = mask.shape
-        if (not torch.jit.is_tracing()) and s0 != S:
+        if (not tracing_or_export) and s0 != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
             )
-        if (not torch.jit.is_tracing()) and b0 not in (1, B):
+        if (not tracing_or_export) and b0 not in (1, B):
             raise RuntimeError(f"attn_mask batch dim {b0} incompatible with B={int(B)}")
-        if (not torch.jit.is_tracing()) and h0 not in (1, H):
+        if (not tracing_or_export) and h0 not in (1, H):
             raise RuntimeError(f"attn_mask head dim {h0} incompatible with H={int(H)}")
-        if (not torch.jit.is_tracing()) and l0 not in (1, L):
+        if (not tracing_or_export) and l0 not in (1, L):
             raise RuntimeError(
                 f"attn_mask query dim {l0} incompatible with L={int(L)} (broadcast 1 or L allowed)"
+            )
+        if (tracing_or_export and (not symbolic_shapes)) and s0 != S:
+            raise RuntimeError(
+                f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
             )
         m = mask.to(device=device)
         return m, b0, h0, l0
@@ -494,10 +525,7 @@ class DotProductAttention(nn.Module):
         Bq, Hq, Lq, Dq = q.shape
         Bk, Hk, Lk, Dk = k.shape
         Bv, Hv, Lv, Dv = v.shape
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
+        tracing = bool(is_tracing_or_exporting())
         if (not tracing) and (Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv):
             raise ValueError(
                 "DotProductAttention expects matching batch and head dims for q/k/v, "
@@ -796,7 +824,8 @@ class MultiScaleRetention(nn.Module):
         H = int(self.nhead)
         calc_dtype = dtype if dtype in (torch.float32, torch.float64) else torch.float32
         beta_param = getattr(self, "_beta", None)
-        if isinstance(beta_param, torch.Tensor) and beta_param.numel() == H:
+        tracing = bool(is_tracing_or_exporting())
+        if isinstance(beta_param, torch.Tensor) and (tracing or beta_param.numel() == H):
             beta_h = beta_param.to(device=device, dtype=calc_dtype)
         else:
             heads = torch.arange(H, device=device, dtype=calc_dtype)
@@ -858,10 +887,7 @@ class MultiScaleRetention(nn.Module):
                 f"_select_last_state expects (B,L,H,Dh), got {tuple(state_tensor.shape)}"
             )
         B, L, H, Dh = state_tensor.shape
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
+        tracing = bool(is_tracing_or_exporting())
         if (not tracing) and L <= 0:
             return state_tensor.new_zeros((B, H, Dh))
         if (
@@ -879,11 +905,8 @@ class MultiScaleRetention(nn.Module):
     @staticmethod
     def _scan_causal_torch(v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
         B, L, H, Dh = v.shape
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
-        if L <= 0:
+        tracing = bool(is_tracing_or_exporting())
+        if (not tracing) and L <= 0:
             return v.new_zeros(v.shape)
         calc_dtype = (
             torch.float32 if v.dtype in (torch.float16, torch.bfloat16) else v.dtype
@@ -1003,10 +1026,7 @@ class MultiScaleRetention(nn.Module):
                 f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}"
             )
         B, L, D = x_in.shape
-        try:
-            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
-        except Exception:
-            tracing = False
+        tracing = bool(is_tracing_or_exporting())
         if (not tracing) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
             if bool(return_state):

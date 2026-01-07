@@ -42,6 +42,15 @@ def export_and_validate(
                 "status": "ok",
                 "path": str(out if out is not None else path),
             }
+        except ImportError as exc:
+            if name in ("torchscript", "onnx"):
+                results[name] = {"status": "error", "error": repr(exc)}
+            else:
+                results[name] = {
+                    "status": "skipped",
+                    "reason": "missing_optional_dependency",
+                    "error": repr(exc),
+                }
         except Exception as exc:  # pragma: no cover - diagnostic output
             results[name] = {"status": "error", "error": repr(exc)}
 

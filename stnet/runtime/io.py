@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import inspect
 import os
 import re
@@ -1222,7 +1223,9 @@ class LiteRT(Format):
                 _coerce_onnx_path(dst, kwargs),
                 **_onnx_options(kwargs, target="litert"),
             )
-            if bool(kwargs.get("prefer_onnx2tf", True)):
+            if bool(kwargs.get("prefer_onnx2tf", True)) and (
+                importlib.util.find_spec("onnx2tf") is not None
+            ):
                 try:
                     out_dir = dst.with_suffix("")
                     out_dir.mkdir(parents=True, exist_ok=True)
