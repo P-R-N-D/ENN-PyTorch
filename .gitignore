@@ -1,6 +1,0 @@
-.venv*/
-__pycache__/
-*.pyc
-export_artifacts/
-predictions.h5
-stnet/**/__pycache__/
