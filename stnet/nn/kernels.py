@@ -80,7 +80,14 @@ def _flatten_attn_mask(
 ) -> tuple[torch.Tensor, int, int, int]:
     del args
     tracing_or_export = bool(is_tracing_or_exporting())
-    symbolic_shapes = tracing_or_export and (not all(isinstance(x, int) for x in (B, H, L, S)))
+    has_symbolic_expected = not all(isinstance(x, int) for x in (B, H, L, S))
+    has_symbolic_mask = False
+    if tracing_or_export:
+        try:
+            has_symbolic_mask = not all(isinstance(d, int) for d in mask.shape)
+        except Exception:
+            has_symbolic_mask = True
+    symbolic_shapes = bool(tracing_or_export and (has_symbolic_expected or has_symbolic_mask))
 
     if mask.dim() == 0:
         m = mask.to(device=device).view(1, 1, 1, 1)
