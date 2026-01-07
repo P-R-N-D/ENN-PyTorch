@@ -67,7 +67,7 @@ class GLU(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.check_input and x.size(-1) != self.in_dim:
+        if self.check_input and (not torch.jit.is_tracing()) and x.size(-1) != self.in_dim:
             raise ValueError(
                 f"{self.__class__.__name__} expected last dimension {self.in_dim}, got {x.size(-1)}"
             )

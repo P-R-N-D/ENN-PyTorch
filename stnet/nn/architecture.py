@@ -35,6 +35,7 @@ from ..core.graph import (
     inference_mode,
     clear_model_cache,
     torch_compiler_disable,
+    torch_compiler_supported,
     compile as compile_module,
     canonicalize_compile_mode,
     is_export_or_trace,
@@ -173,7 +174,7 @@ def _reduce_flat_to_grid(
     ts = tuple(int(v) for v in tile_shape)
     grid = tuple((d + t - 1) // t for d, t in zip(ev, ts))
     padded = tuple(int(g * t) for g, t in zip(grid, ts))
-    B = int(x.shape[0])
+    B = x.size(0)
     x_ev = x.reshape(B, *ev)
     pads: list[int] = []
     for orig, pad in reversed(list(zip(ev, padded))):
@@ -522,7 +523,7 @@ class TemporalExtractor(nn.Module):
         **kwargs: Any,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         del args, kwargs
-        B = int(x.shape[0])
+        B = x.size(0)
         st_tensor: Optional[torch.Tensor] = None
         if state is not None:
             depth = int(self.depth)
@@ -714,7 +715,7 @@ class TokenCollector(nn.Module):
             raise ValueError(
                 f"TokenCollector.run expects tokens (B,N,D), got shape {tuple(tokens.shape)}"
             )
-        B = int(tokens.shape[0])
+        B = tokens.size(0)
         if graph_break_fn is not None:
             graph_break_fn()
         with self._runtime_lock:
@@ -773,7 +774,7 @@ class TokenizedView(nn.Module):
         return int(getattr(self.extractor, "head_dim", 0) or 0)
 
     def forward(self, x: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
-        B = x.shape[0]
+        B = x.size(0)
         tokens = self.tokenizer(x).reshape(B, self.tokens, self.d_model).contiguous()
         return self.extractor(tokens, *args, **kwargs)
 
@@ -947,12 +948,12 @@ class TokenFuser(nn.Module):
         feats = self._agg_phi(summaries)
         logits = self._agg_gate(feats).squeeze(-1)
         w_soft = torch.softmax(logits, dim=1)
-        K = int(feats.shape[1])
-        w_uni = feats.new_full((int(feats.shape[0]), K), 1.0 / float(K))
+        K = feats.size(1)
+        w_uni = feats.new_ones((feats.size(0), K)) / K
         a = float(self.gate_blend_alpha)
         w = (1.0 - a) * w_uni + a * w_soft
         fused_vec = torch.bmm(w.unsqueeze(1), feats).squeeze(1)
-        B = int(fused_vec.shape[0])
+        B = fused_vec.size(0)
         tokens = (
             self._token_generator(fused_vec)
             .reshape(B, self.fused_tokens, self.d_model)
@@ -1069,7 +1070,7 @@ class TokenFuser(nn.Module):
         )
         if isinstance(next_state, torch.Tensor):
             return tokens, context, next_state
-        B = int(x.shape[0])
+        B = x.size(0)
         tn = getattr(self, "temporal_net", None)
         if tn is not None:
             depth = int(getattr(tn, "depth", 0))
@@ -1467,7 +1468,7 @@ class Model(nn.Module):
             None if compile_mode_canonical == "disabled" else compile_mode_canonical
         )
         compile_requested = compile_mode_arg is not None
-        compile_available = callable(getattr(torch, "compile", None))
+        compile_available = bool(torch_compiler_supported())
         compile_enabled = bool(compile_requested and compile_available)
         nogil_opt = False
         with contextlib.suppress(Exception):
@@ -1747,7 +1748,7 @@ class Model(nn.Module):
             base_dtype = features.dtype
         x = self._cast_graph_safe(features, device, base_dtype)
         x = self.scaler.normalize_x(x)
-        b = x.shape[0]
+        b = x.size(0)
         tokens, context = self.fuser.forward_export(x)
         assembled = context.reshape(b, -1)
         if self.is_norm_linear and self.linear_branch is not None:
@@ -1806,7 +1807,7 @@ class Model(nn.Module):
                 base_dtype = features.dtype
             x = self._cast_graph_safe(features, device, base_dtype)
             x = self.scaler.normalize_x(x)
-            b = int(x.shape[0])
+            b = x.size(0)
             tokens, context, next_state = cast(
                 Tuple[torch.Tensor, torch.Tensor, Any],
                 self.fuser(

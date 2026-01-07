@@ -354,9 +354,9 @@ class CrossTransformer(nn.Module):
             )
         Bs, Ns, Ds = spatial_tokens.shape
         Bt, Nt, Dt = temporal_tokens.shape
-        if Bs != Bt:
+        if (not torch.jit.is_tracing()) and Bs != Bt:
             raise ValueError(f"CrossTransformer batch mismatch: a B={Bs}, b B={Bt}")
-        if Ds != Dt:
+        if (not torch.jit.is_tracing()) and Ds != Dt:
             raise ValueError(
                 f"CrossTransformer hidden dim mismatch: a D={Ds}, b D={Dt}"
             )

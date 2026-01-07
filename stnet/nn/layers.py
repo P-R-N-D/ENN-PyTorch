@@ -73,7 +73,11 @@ def _get_dilated_mask(
 ) -> torch.Tensor:
     if dilation < 1:
         raise ValueError(f"dilation must be >= 1, got {dilation}")
-    L = int(seq_len)
+    try:
+        tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+    except Exception:
+        tracing = False
+    L = seq_len if tracing else int(seq_len)
     device = torch.device("cpu") if device is None else torch.device(device)
     i = torch.arange(L, device=device).unsqueeze(1).expand(L, L)
     j = torch.arange(L, device=device).unsqueeze(0).expand(L, L)
@@ -375,8 +379,12 @@ class Retention(nn.Module):
             raise ValueError(
                 f"Retention(spatial) expects (B,L,D), got {tuple(x_in.shape)}"
             )
-        B, L, D = map(int, x_in.shape)
-        if L <= 0:
+        B, L, D = x_in.shape
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if (not tracing) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
             return out0.to(restore_dtype) if restore_dtype is not None else out0
         msr = self.msr
@@ -544,9 +552,21 @@ class DilatedAttention(nn.Module):
         self._flex_block_mask_cache_last = None
 
     def _get_mask(self, L: int, device: torch.device) -> torch.Tensor:
-        if int(L) > _DILATED_MASK_CACHE_MAX_L:
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if tracing:
             return _get_dilated_mask(
-                int(L),
+                L,
+                dilation=self.dilation,
+                window_size=self.window_size,
+                causal=self.causal,
+                device=device,
+            )
+        if L > _DILATED_MASK_CACHE_MAX_L:
+            return _get_dilated_mask(
+                L,
                 dilation=self.dilation,
                 window_size=self.window_size,
                 causal=self.causal,
@@ -554,7 +574,7 @@ class DilatedAttention(nn.Module):
             )
         win_key = int(self.window_size) if self.window_size is not None else -1
         key = (
-            int(L),
+            L,
             int(self.dilation),
             win_key,
             int(self.causal),
@@ -579,7 +599,7 @@ class DilatedAttention(nn.Module):
                 self._mask_cache_last = (key, cached)
                 return cached
         mask = _get_dilated_mask(
-            int(L),
+            L,
             dilation=self.dilation,
             window_size=self.window_size,
             causal=self.causal,
@@ -759,7 +779,11 @@ class DilatedAttention(nn.Module):
                 f"DilatedAttention expects a 3D tensor (B,L,D), got shape {tuple(x.shape)}"
             )
         B, L, D = x.shape
-        if D != self.embed_dim:
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if (not tracing) and D != self.embed_dim:
             raise ValueError(f"x.shape[-1]={D} must match embed_dim={self.embed_dim}")
         want_weights = bool(need_weights)
         avg_weights = bool(average_attn_weights) if want_weights else False
@@ -783,8 +807,8 @@ class DilatedAttention(nn.Module):
             with contextlib.suppress(Exception):
                 q_pad = q_pad.contiguous()
         use_flex = bool(_HAS_FLEX_ATTENTION and x.is_cuda and (not want_weights))
-        if want_weights:
-            L_k = int(L)
+        if want_weights or tracing:
+            L_k = L
             pad_len = 0
         else:
             base_mult = max(int(getattr(self, "length_bucket_multiple", 64)), 1)
@@ -795,7 +819,7 @@ class DilatedAttention(nn.Module):
             else:
                 mult = base_mult * 4
             mult = max(mult, 1)
-            L_k = int(((L + mult - 1) // mult) * mult)
+            L_k = ((L + mult - 1) // mult) * mult
             pad_len = L_k - L
         x_k = x
         kpm_k: Optional[torch.Tensor] = kpm
@@ -819,7 +843,7 @@ class DilatedAttention(nn.Module):
         q, k, v = qkv.chunk(3, dim=-1)
         H = self.num_heads
         Dh = self.head_dim
-        L_q = int(L)
+        L_q = L
         qh = q[:, :L_q, :].reshape(B, L_q, H, Dh).transpose(1, 2)
         kh = k.reshape(B, L_k, H, Dh).transpose(1, 2)
         vh = v.reshape(B, L_k, H, Dh).transpose(1, 2)
@@ -1056,7 +1080,7 @@ class DilatedAttention(nn.Module):
                             dropout_p=dropout_p,
                             is_causal=False,
                         )
-                    elif int(key_mask.shape[0]) == 1:
+                    elif key_mask.shape[0] == 1:
                         attn_mask = base_mask[None, None, :, :] | key_mask
                         y = self._call_dot_attn(
                             qh,
@@ -1127,23 +1151,27 @@ class DilatedAttention(nn.Module):
         res2 = x_out
         x_out = self.norm2(x_out)
         ffn_bytes = 0
-        try:
-            if isinstance(x_out, torch.Tensor) and x_out.dim() == 3:
-                B, L, D = map(int, x_out.shape)
-                bytes_e = int(x_out.element_size())
-                hidden = (
-                    int(getattr(self.ffn[0], "out_features", 0) or 0)
-                    if hasattr(self, "ffn")
-                    else 0
-                )
-                if hidden > 0:
-                    ffn_bytes = (
-                        int(B) * int(L) * (int(2) * int(hidden) + int(D)) * int(bytes_e)
+        if not tracing:
+            try:
+                if isinstance(x_out, torch.Tensor) and x_out.dim() == 3:
+                    B, L, D = x_out.shape
+                    bytes_e = int(x_out.element_size())
+                    hidden = (
+                        int(getattr(self.ffn[0], "out_features", 0) or 0)
+                        if hasattr(self, "ffn")
+                        else 0
                     )
-                else:
-                    ffn_bytes = int(B) * int(L) * int(D) * int(bytes_e) * 9
-        except Exception:
-            ffn_bytes = 0
+                    if hidden > 0:
+                        ffn_bytes = (
+                            int(B)
+                            * int(L)
+                            * (int(2) * int(hidden) + int(D))
+                            * int(bytes_e)
+                        )
+                    else:
+                        ffn_bytes = int(B) * int(L) * int(D) * int(bytes_e) * 9
+            except Exception:
+                ffn_bytes = 0
         do_ckpt_ffn = (
             (not bool(skip_ffn_checkpoint))
             and self.training
@@ -1400,9 +1428,9 @@ class SigmoidGate(nn.Module):
     def _expand_tiles(self, p_tile: torch.Tensor, dim: int) -> torch.Tensor:
         if self.tile_size <= 0:
             raise RuntimeError("SigmoidGate._expand_tiles called with tile_size<=0")
-        b = int(p_tile.shape[0])
+        b = p_tile.size(0)
         tile = int(self.tile_size)
-        n_tiles = int(p_tile.shape[1])
+        n_tiles = p_tile.size(1)
         d_pad = int(n_tiles * tile)
         p_full = p_tile.unsqueeze(-1).expand(b, n_tiles, tile).reshape(b, d_pad)
         return p_full[:, : int(dim)]
