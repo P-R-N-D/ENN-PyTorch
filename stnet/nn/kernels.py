@@ -90,9 +90,6 @@ def _flatten_attn_mask(
         m = mask.to(device=device).view(1, 1, 1, S)
         return m, 1, 1, 1
     if mask.dim() == 2:
-        if torch.jit.is_tracing() or torch.jit.is_scripting():
-            m = mask.to(device=device).view(1, 1, L, S)
-            return m, 1, 1, L
         a, b = mask.shape
         if b != S:
             raise RuntimeError(
@@ -111,9 +108,6 @@ def _flatten_attn_mask(
             f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
         )
     if mask.dim() == 3:
-        if torch.jit.is_tracing() or torch.jit.is_scripting():
-            m = mask.to(device=device).view(B, 1, L, S)
-            return m, B, 1, L
         a, b, c = mask.shape
         if c != S:
             raise RuntimeError(
