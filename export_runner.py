@@ -62,7 +62,10 @@ def export_and_validate(
             ts_model = torch.jit.load(str(ts_path))
             with torch.no_grad():
                 ts_out = ts_model(sample)
-            torch_out = model(sample, return_loss=False)
+            if hasattr(model, "forward_export"):
+                torch_out = model.forward_export(sample)
+            else:
+                torch_out = model(sample, return_loss=False)
             ts_mae = float(torch.mean(torch.abs(ts_out - torch_out)).item())
             validations["torchscript_mae"] = ts_mae
         except Exception as exc:
@@ -78,7 +81,12 @@ def export_and_validate(
             onnx_out = sess.run(
                 None, {inp_name: sample.detach().cpu().numpy().astype(np.float32)}
             )[0]
-            torch_out = model(sample, return_loss=False).detach().cpu().numpy()
+            with torch.no_grad():
+                if hasattr(model, "forward_export"):
+                    torch_out_t = model.forward_export(sample)
+                else:
+                    torch_out_t = model(sample, return_loss=False)
+            torch_out = torch_out_t.detach().cpu().numpy()
             validations["onnx_mae"] = float(np.mean(np.abs(torch_out - onnx_out)))
         except Exception as exc:
             validations["onnx_error"] = repr(exc)
