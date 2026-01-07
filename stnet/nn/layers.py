@@ -532,6 +532,65 @@ class DilatedAttention(nn.Module):
         self._mask_cache_last: tuple[Any, Any] | None = None
         self._flex_block_mask_cache_last: tuple[Any, Any] | None = None
 
+    def _get_cached_item(
+        self,
+        cache,
+        lock,
+        key,
+        factory_fn,
+        last_attr_name,
+        max_size,
+        value_checker=None,
+    ):
+        last = getattr(self, last_attr_name, None)
+        if last is not None and last[0] == key:
+            return last[1]
+        if cache is None:
+            cache = OrderedDict()
+            setattr(
+                self,
+                "_mask_cache"
+                if "mask_cache" in last_attr_name
+                else "_flex_block_mask_cache",
+                cache,
+            )
+        if lock is None:
+            lock = threading.Lock()
+            setattr(
+                self,
+                "_mask_cache_lock"
+                if "mask_cache" in last_attr_name
+                else "_flex_block_mask_cache_lock",
+                lock,
+            )
+
+        with lock:
+            cached = cache.get(key)
+            if cached is not None:
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                setattr(self, last_attr_name, (key, cached))
+                return cached
+
+        item = factory_fn()
+        if value_checker and not value_checker(item):
+            return item
+
+        with lock:
+            if key in cache:  # Double check
+                item = cache[key]
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+            else:
+                cache[key] = item
+                with contextlib.suppress(Exception):
+                    cache.move_to_end(key)
+                if len(cache) > int(max_size):
+                    with contextlib.suppress(Exception):
+                        cache.popitem(last=False)
+            setattr(self, last_attr_name, (key, item))
+        return item
+
     def __getstate__(self):
         state = super().__getstate__()
         state.pop("_mask_cache_lock", None)
@@ -580,52 +639,28 @@ class DilatedAttention(nn.Module):
             int(self.causal),
             _device_key(device),
         )
-        last = getattr(self, "_mask_cache_last", None)
-        if last is not None and last[0] == key:
-            return last[1]
-        cache = getattr(self, "_mask_cache", None)
-        if cache is None:
-            cache = OrderedDict()
-            setattr(self, "_mask_cache", cache)
-        lock = getattr(self, "_mask_cache_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            setattr(self, "_mask_cache_lock", lock)
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                self._mask_cache_last = (key, cached)
-                return cached
-        mask = _get_dilated_mask(
-            L,
-            dilation=self.dilation,
-            window_size=self.window_size,
-            causal=self.causal,
-            device=device,
-        )
-        with contextlib.suppress(Exception):
+        def _factory():
+            return _get_dilated_mask(
+                L,
+                dilation=self.dilation,
+                window_size=self.window_size,
+                causal=self.causal,
+                device=device,
+            )
+
+        def _checker(mask):
             mask_bytes = int(mask.numel()) * int(mask.element_size())
-            if mask_bytes > _DILATED_MASK_CACHE_ENTRY_MAX_BYTES:
-                return mask
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                self._mask_cache_last = (key, cached)
-                return cached
-            cache[key] = mask
-            self._mask_cache_last = (key, mask)
-            with contextlib.suppress(Exception):
-                cache.move_to_end(key)
-            try:
-                while len(cache) > int(_DILATED_MASK_CACHE_MAX):
-                    cache.popitem(last=False)
-            except Exception:
-                pass
-        return mask
+            return mask_bytes <= _DILATED_MASK_CACHE_ENTRY_MAX_BYTES
+
+        return self._get_cached_item(
+            getattr(self, "_mask_cache", None),
+            getattr(self, "_mask_cache_lock", None),
+            key,
+            _factory,
+            "_mask_cache_last",
+            _DILATED_MASK_CACHE_MAX,
+            _checker,
+        )
 
     def _get_flex_block_mask(
         self,
@@ -650,66 +685,42 @@ class DilatedAttention(nn.Module):
             win_key,
             int(self.causal),
         )
-        last = getattr(self, "_flex_block_mask_cache_last", None)
-        if last is not None and last[0] == key:
-            return last[1]
-        cache = getattr(self, "_flex_block_mask_cache", None)
-        if cache is None:
-            cache = OrderedDict()
-            setattr(self, "_flex_block_mask_cache", cache)
-        lock = getattr(self, "_flex_block_mask_cache_lock", None)
-        if lock is None:
-            lock = threading.Lock()
-            setattr(self, "_flex_block_mask_cache_lock", lock)
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                self._flex_block_mask_cache_last = (key, cached)
-                return cached
-        try:
-            est_bool_bytes = int(B) * int(H) * int(L_q) * int(L_k)
-        except Exception:
-            est_bool_bytes = _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES + 1
-        skip_cache = est_bool_bytes > _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES
-        if create_block_mask is None:
-            raise RuntimeError("create_block_mask was not imported")
-        mask_mod = _FlexDilatedMaskMod(
-            L_q=int(L_q),
-            L_k=int(L_k),
-            dilation=int(self.dilation),
-            win=win,
-            causal=bool(self.causal),
-        )
-        block_mask = create_block_mask(
-            mask_mod,
-            B,
-            H,
-            L_q,
-            L_k,
-            device=device,
-            BLOCK_SIZE=int(block_size),
-        )
-        if skip_cache:
-            return block_mask
-        with lock:
-            cached = cache.get(key)
-            if cached is not None:
-                with contextlib.suppress(Exception):
-                    cache.move_to_end(key)
-                self._flex_block_mask_cache_last = (key, cached)
-                return cached
-            cache[key] = block_mask
-            self._flex_block_mask_cache_last = (key, block_mask)
-            with contextlib.suppress(Exception):
-                cache.move_to_end(key)
+        def _factory():
+            if create_block_mask is None:
+                raise RuntimeError("create_block_mask was not imported")
+            mask_mod = _FlexDilatedMaskMod(
+                L_q=int(L_q),
+                L_k=int(L_k),
+                dilation=int(self.dilation),
+                win=win,
+                causal=bool(self.causal),
+            )
+            return create_block_mask(
+                mask_mod,
+                B,
+                H,
+                L_q,
+                L_k,
+                device=device,
+                BLOCK_SIZE=int(block_size),
+            )
+
+        def _checker(_):
             try:
-                while len(cache) > int(_FLEX_BLOCK_MASK_CACHE_MAX):
-                    cache.popitem(last=False)
+                est = int(B) * int(H) * int(L_q) * int(L_k)
             except Exception:
-                pass
-        return block_mask
+                est = _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES + 1
+            return est <= _FLEX_BLOCK_MASK_CACHE_EST_MAX_BYTES
+
+        return self._get_cached_item(
+            getattr(self, "_flex_block_mask_cache", None),
+            getattr(self, "_flex_block_mask_cache_lock", None),
+            key,
+            _factory,
+            "_flex_block_mask_cache_last",
+            _FLEX_BLOCK_MASK_CACHE_MAX,
+            _checker,
+        )
 
     def _call_dot_attn(
         self,
@@ -742,6 +753,24 @@ class DilatedAttention(nn.Module):
         if causal_kw is not None:
             kwargs[str(causal_kw)] = bool(is_causal)
         return attn(q, k, v, **kwargs)
+
+    def _run_with_oom_retry(self, func, B, device):
+        group = B
+        last_oom = None
+        while group >= 1:
+            try:
+                return func(group)
+            except RuntimeError as e:
+                if "out of memory" not in str(e):
+                    raise
+                last_oom = e
+                if device.type == "cuda":
+                    with contextlib.suppress(Exception):
+                        empty_device_cache(
+                            device=device, do_gc=False, min_interval_s=0.0
+                        )
+                group //= 2
+        raise last_oom
 
     def forward(
         self,
@@ -896,59 +925,43 @@ class DilatedAttention(nn.Module):
                 attn_w_full = qh.new_empty((B, L_q, L_k))
             else:
                 attn_w_full = qh.new_empty((B, H, L_q, L_k))
-            last_oom: Optional[RuntimeError] = None
-            while group >= 1:
-                try:
-                    for b0 in range(0, B, group):
-                        b1 = min(B, b0 + group)
-                        qg = qh[b0:b1]
-                        kg = kh[b0:b1]
-                        vg = vh[b0:b1]
-                        scores = torch.matmul(qg, kg.transpose(-2, -1))
-                        scores = scores * (1.0 / math.sqrt(float(Dh)))
-                        scores = scores.to(torch.float32)
-                        if causal_mask is not None:
-                            scores.masked_fill_(causal_mask, float("-inf"))
-                        if base_mask_out is not None:
-                            scores.masked_fill_(base_mask_out, float("-inf"))
-                        if key_mask is not None:
-                            km = key_mask if key_mask.shape[0] == 1 else key_mask[b0:b1]
-                            scores.masked_fill_(km, float("-inf"))
-                        probs = _stable_softmax(scores)
-                        if dropout_p > 0.0:
-                            probs = F.dropout(probs, p=dropout_p, training=True)
-                        if avg_weights:
-                            attn_w_full[b0:b1] = probs.mean(dim=1).to(dtype=qh.dtype)
-                        else:
-                            attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
-                        probs_out = probs.to(dtype=vg.dtype)
-                        yg = torch.matmul(probs_out, vg)
-                        attn_out_g = self.out_proj(
-                            yg.transpose(1, 2)
-                            .contiguous()
-                            .view((b1 - b0), L_q, self.embed_dim)
+            def _chunk_weights_fn(grp):
+                for b0 in range(0, B, grp):
+                    b1 = min(B, b0 + grp)
+                    scores = torch.matmul(
+                        qh[b0:b1], kh[b0:b1].transpose(-2, -1)
+                    ) * (1.0 / math.sqrt(float(Dh)))
+                    scores = scores.to(torch.float32)
+                    if causal_mask is not None:
+                        scores.masked_fill_(causal_mask, float("-inf"))
+                    if base_mask_out is not None:
+                        scores.masked_fill_(base_mask_out, float("-inf"))
+                    if key_mask is not None:
+                        scores.masked_fill_(
+                            key_mask if key_mask.shape[0] == 1 else key_mask[b0:b1],
+                            float("-inf"),
                         )
-                        if q_pad is not None:
-                            attn_out_g = attn_out_g.masked_fill(
-                                q_pad[b0:b1].unsqueeze(-1), 0.0
-                            )
-                        out_full[b0:b1] = attn_out_g
-                    last_oom = None
-                    break
-                except RuntimeError as e:
-                    msg = str(e)
-                    if "CUDA out of memory" not in msg and "out of memory" not in msg:
-                        raise
-                    last_oom = e
-                    if x_k.device.type == "cuda":
-                        with contextlib.suppress(Exception):
-                            empty_device_cache(
-                                device=x_k.device, do_gc=False, min_interval_s=0.0
-                            )
-                    group //= 2
-            if last_oom is not None:
-                raise last_oom
-            attn_out = out_full
+                    probs = _stable_softmax(scores)
+                    if dropout_p > 0.0:
+                        probs = F.dropout(probs, p=dropout_p, training=True)
+                    if avg_weights:
+                        attn_w_full[b0:b1] = probs.mean(dim=1).to(dtype=qh.dtype)
+                    else:
+                        attn_w_full[b0:b1] = probs.to(dtype=qh.dtype)
+                    yg = torch.matmul(probs.to(dtype=vh.dtype), vh[b0:b1])
+                    attn_out_g = self.out_proj(
+                        yg.transpose(1, 2)
+                        .contiguous()
+                        .view((b1 - b0), L_q, self.embed_dim)
+                    )
+                    if q_pad is not None:
+                        attn_out_g = attn_out_g.masked_fill(
+                            q_pad[b0:b1].unsqueeze(-1), 0.0
+                        )
+                    out_full[b0:b1] = attn_out_g
+                return out_full
+
+            attn_out = self._run_with_oom_retry(_chunk_weights_fn, group, x_k.device)
             attn_w = attn_w_full
         elif use_flex:
             win = int(self.window_size) if self.window_size is not None else None
@@ -962,37 +975,22 @@ class DilatedAttention(nn.Module):
             max_group = int(getattr(self, "flex_batch_microbatch", 0) or B)
             max_group = max(1, min(B, max_group))
             group = max_group
-            last_oom: Optional[RuntimeError] = None
-            while group >= 1:
-                try:
-                    attn_out = _stream_flex_attention(
-                        self,
-                        qh,
-                        kh,
-                        vh,
-                        group_size=group,
-                        block_size=_block_size,
-                        win=win,
-                        scale=scale,
-                        dropout_p=dropout_p,
-                        kpm_k=kpm_k,
-                        q_pad=q_pad,
-                    )
-                    last_oom = None
-                    break
-                except RuntimeError as e:
-                    msg = str(e)
-                    if "CUDA out of memory" not in msg and "out of memory" not in msg:
-                        raise
-                    last_oom = e
-                    if x_k.device.type == "cuda":
-                        with contextlib.suppress(Exception):
-                            empty_device_cache(
-                                device=x_k.device, do_gc=False, min_interval_s=0.0
-                            )
-                    group //= 2
-            if last_oom is not None:
-                raise last_oom
+            def _flex_fn(grp):
+                return _stream_flex_attention(
+                    self,
+                    qh,
+                    kh,
+                    vh,
+                    group_size=grp,
+                    block_size=_block_size,
+                    win=win,
+                    scale=scale,
+                    dropout_p=dropout_p,
+                    kpm_k=kpm_k,
+                    q_pad=q_pad,
+                )
+
+            attn_out = self._run_with_oom_retry(_flex_fn, group, x_k.device)
         else:
             qkv = self.qkv(x_k)
             q, k, v = qkv.chunk(3, dim=-1)
@@ -1106,42 +1104,21 @@ class DilatedAttention(nn.Module):
                                 group = int(B)
                         group = max(1, min(int(B), int(group)))
                         out_full = qh.new_empty((B, H, L_q, Dh))
-                        last_oom: Optional[RuntimeError] = None
-                        while group >= 1:
-                            try:
-                                for b0 in range(0, B, group):
-                                    b1 = min(B, b0 + group)
-                                    attn_mask_g = base4 | key_mask[b0:b1]
-                                    y_g = self._call_dot_attn(
-                                        qh[b0:b1],
-                                        kh[b0:b1],
-                                        vh[b0:b1],
-                                        attn_mask=attn_mask_g,
-                                        dropout_p=dropout_p,
-                                        is_causal=False,
-                                    )
-                                    out_full[b0:b1] = y_g
-                                last_oom = None
-                                break
-                            except RuntimeError as e:
-                                msg = str(e)
-                                if (
-                                    "CUDA out of memory" not in msg
-                                    and "out of memory" not in msg
-                                ):
-                                    raise
-                                last_oom = e
-                                if x_k.device.type == "cuda":
-                                    with contextlib.suppress(Exception):
-                                        empty_device_cache(
-                                            device=x_k.device,
-                                            do_gc=False,
-                                            min_interval_s=0.0,
-                                        )
-                                group //= 2
-                        if last_oom is not None:
-                            raise last_oom
-                        y = out_full
+                        def _sdpa_chunk_fn(grp):
+                            for b0 in range(0, B, grp):
+                                b1 = min(B, b0 + grp)
+                                y_g = self._call_dot_attn(
+                                    qh[b0:b1],
+                                    kh[b0:b1],
+                                    vh[b0:b1],
+                                    attn_mask=base4 | key_mask[b0:b1],
+                                    dropout_p=dropout_p,
+                                    is_causal=False,
+                                )
+                                out_full[b0:b1] = y_g
+                            return out_full
+
+                        y = self._run_with_oom_retry(_sdpa_chunk_fn, group, x_k.device)
                 attn_out = self.out_proj(
                     y.transpose(1, 2).contiguous().view(B, L_q, self.embed_dim)
                 )
@@ -1457,6 +1434,238 @@ class SigmoidGate(nn.Module):
             ts = ts[-ndim:]
         return tuple(max(1, int(v)) for v in ts)
 
+    def _calc_edge_reg(
+        self,
+        p,
+        p_low,
+        p_high,
+        p_ceil,
+        p_floor,
+        eps,
+        width,
+        out_full,
+        return_edge_reg,
+        return_edge_reg_lr,
+        edge_reg_min_width_frac,
+        edge_reg_frac,
+        edge_reg_power,
+    ):
+        try:
+            full = max(float(p_ceil - p_floor), float(eps))
+            min_w = float(max(float(edge_reg_min_width_frac) * full, eps))
+            mask = (width >= min_w).to(dtype=torch.float32)
+            w_safe = torch.maximum(width, width.new_full((), float(eps)))
+            q = torch.clamp(
+                (p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)) / w_safe,
+                0.0,
+                1.0,
+            )
+            m = float(min(max(float(edge_reg_frac), eps), 0.49))
+            inv_m = 1.0 / m
+            pen_low = (F.relu(m - q) * inv_m).pow(float(edge_reg_power)) * mask
+            pen_high = (F.relu(q - (1.0 - m)) * inv_m).pow(float(edge_reg_power)) * mask
+            denom = mask.sum() + float(eps)
+            er_l = pen_low.sum() / denom
+            er_h = pen_high.sum() / denom
+        except Exception:
+            er_l, er_h = None, None
+
+        out_dtype = out_full.dtype
+        if return_edge_reg_lr:
+            return (
+                out_full,
+                er_l.to(dtype=out_dtype)
+                if er_l is not None
+                else out_full.new_zeros((), dtype=out_dtype),
+                er_h.to(dtype=out_dtype)
+                if er_h is not None
+                else out_full.new_zeros((), dtype=out_dtype),
+            )
+        if return_edge_reg:
+            er = (
+                (er_l + er_h)
+                if (er_l is not None and er_h is not None)
+                else out_full.new_zeros((), dtype=out_dtype)
+            )
+            return out_full, er.to(dtype=out_dtype)
+        return out_full
+
+    def _compute_tile_score(
+        self,
+        global_logit,
+        base,
+        residue,
+        tokens_dtype,
+        eps,
+        p_floor,
+        p_ceil,
+        z_min,
+        z_max,
+        fallback_bounds,
+        stat_width_frac,
+        stat_edge_frac,
+    ):
+        b = base.detach() if self.detach_inputs else base
+        r = residue.detach() if self.detach_inputs else residue
+        b32, r32 = b.to(dtype=torch.float32), r.to(dtype=torch.float32)
+        B, D = int(b32.shape[0]), int(b32.shape[1])
+        event_shape_t = tuple(int(v) for v in self.event_shape)
+        tile_shape_t = tuple(int(v) for v in self._normalize_tile_shape(self.event_shape))
+        grid_shape = tuple(
+            (int(d) + int(t) - 1) // int(t)
+            for d, t in zip(event_shape_t, tile_shape_t)
+        )
+        pad_shape = tuple(int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t))
+        pads = []
+        for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
+            pads.extend([0, int(padded - orig)])
+
+        pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
+        b_nd, r_nd = b32.reshape(B, *event_shape_t), r32.reshape(B, *event_shape_t)
+        if pad_needed:
+            b_nd, r_nd = F.pad(b_nd, tuple(pads)), F.pad(r_nd, tuple(pads))
+
+        mask_bool = None
+        if pad_needed:
+            for i, (orig, padded) in enumerate(zip(event_shape_t, pad_shape)):
+                if int(padded) == int(orig):
+                    continue
+                v = (torch.arange(int(padded), device=b_nd.device) < int(orig)).view(
+                    *([1] * i),
+                    int(padded),
+                    *([1] * (len(event_shape_t) - i - 1)),
+                )
+                mask_bool = v if mask_bool is None else (mask_bool & v)
+            if mask_bool is None:
+                mask_bool = torch.ones(pad_shape, device=b_nd.device, dtype=torch.bool)
+
+        view_shape, interleaved = [B], []
+        for g, t in zip(grid_shape, tile_shape_t):
+            view_shape.extend([int(g), int(t)])
+            interleaved.extend([int(g), int(t)])
+        b_tile, r_tile = b_nd.reshape(*view_shape), r_nd.reshape(*view_shape)
+        tile_dims = tuple(range(2, 1 + 2 * len(event_shape_t), 2))
+
+        mask = (
+            mask_bool.reshape(*interleaved).unsqueeze(0).to(dtype=torch.float32)
+            if mask_bool is not None
+            else None
+        )
+        if mask is None:
+            b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=tile_dims) + eps)
+            r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=tile_dims) + eps)
+        else:
+            denom = torch.clamp(mask.sum(dim=tile_dims), min=1.0)
+            b_rms_t = torch.sqrt(((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + eps)
+            r_rms_t = torch.sqrt(((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + eps)
+
+        tile_feats = torch.stack(
+            [b_rms_t, r_rms_t, r_rms_t / (b_rms_t + eps)], dim=-1
+        ).to(dtype=tokens_dtype)
+        sig = torch.sigmoid(
+            global_logit.view(B, *([1] * len(event_shape_t)))
+            + self.tile_net(tile_feats).squeeze(-1)
+        )
+        p_low, p_high = sig.new_full(sig.shape, float(p_floor)), sig.new_full(
+            sig.shape, float(p_ceil)
+        )
+
+        if z_min is not None and z_max is not None:
+            try:
+                zmin_t = z_min.reshape(1, *interleaved) if z_min.numel() > 1 else z_min
+                zmax_t = z_max.reshape(1, *interleaved) if z_max.numel() > 1 else z_max
+                if pad_needed and z_min.numel() > 1:
+                    zmin_t = F.pad(z_min.reshape(1, *event_shape_t), tuple(pads)).reshape(
+                        1, *interleaved
+                    )
+                    zmax_t = F.pad(z_max.reshape(1, *event_shape_t), tuple(pads)).reshape(
+                        1, *interleaved
+                    )
+                r_safe = torch.where(
+                    r_tile.abs() < eps,
+                    torch.where(r_tile >= 0, 1.0, -1.0) * eps,
+                    r_tile,
+                )
+                p_a, p_b = (zmin_t - b_tile) / r_safe, (zmax_t - b_tile) / r_safe
+                p_min, p_max = torch.minimum(p_a, p_b), torch.maximum(p_a, p_b)
+                if mask_bool is not None:
+                    mask_t = mask_bool.reshape(*interleaved).unsqueeze(0)
+                    p_min = torch.where(
+                        mask_t, p_min, p_min.new_full((), torch.finfo(p_min.dtype).min)
+                    )
+                    p_max = torch.where(
+                        mask_t, p_max, p_max.new_full((), torch.finfo(p_max.dtype).max)
+                    )
+                p_low = torch.clamp(
+                    p_min.amax(dim=tile_dims), min=float(p_floor), max=float(p_ceil)
+                )
+                p_high = torch.maximum(
+                    torch.clamp(
+                        p_max.amin(dim=tile_dims), min=float(p_floor), max=float(p_ceil)
+                    ),
+                    p_low + float(eps),
+                )
+            except Exception:
+                pass
+
+        p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
+        clip = float(max(self.clip_eps, eps))
+        p_tile = torch.clamp(
+            p_tile,
+            min=float(p_floor) + clip
+            if float(p_ceil) - clip > float(p_floor) + clip
+            else float(p_floor),
+            max=float(p_ceil) - clip,
+        )
+
+        if bool(fallback_bounds):
+            self._update_stats(
+                p_tile,
+                p_low,
+                p_high,
+                p_ceil,
+                p_floor,
+                eps,
+                stat_width_frac,
+                stat_edge_frac,
+            )
+        expand_view, exp_shape = [B], [B]
+        for g, t in zip(grid_shape, tile_shape_t):
+            expand_view.extend([int(g), 1])
+            exp_shape.extend([int(g), int(t)])
+        p_crop = (
+            p_tile.reshape(*expand_view)
+            .expand(*exp_shape)
+            .contiguous()
+            .view(B, *pad_shape)[
+                (slice(None),) + tuple(slice(0, int(d)) for d in event_shape_t)
+            ]
+        )
+        return p_crop.reshape(B, D), p_low, p_high
+
+    def _update_stats(
+        self, p, p_low, p_high, p_ceil, p_floor, eps, stat_width_frac, stat_edge_frac
+    ):
+        try:
+            width = (p_high - p_low).to(dtype=torch.float32)
+            denom = max(float(p_ceil - p_floor), float(eps))
+            tthr = float(max(float(stat_width_frac) * denom, eps))
+            active_low = (p_low - float(p_floor)).to(dtype=torch.float32) >= tthr
+            active_high = (float(p_ceil) - p_high).to(dtype=torch.float32) >= tthr
+            edge_thr = torch.maximum(width, width.new_full((), float(eps))) * float(
+                max(float(stat_edge_frac), 0.0)
+            )
+            self._fb_add_stats(
+                float(p.numel()),
+                width.sum(),
+                active_low.float().sum(),
+                active_high.float().sum(),
+                ((p - p_low) <= edge_thr).float().sum(),
+                ((p_high - p) <= edge_thr).float().sum(),
+            )
+        except Exception:
+            pass
+
     def forward(
         self,
         *args: Any,
@@ -1500,8 +1709,6 @@ class SigmoidGate(nn.Module):
         x = feats[0] if len(feats) == 1 else torch.cat(feats, dim=1)
         global_logit = self.net(x).squeeze(-1)
         use_tile_nd = False
-        event_shape = tuple(getattr(self, "event_shape", ()) or ())
-        tile_shape_nd: Tuple[int, ...] = ()
         if (
             self.tile_net is not None
             and base is not None
@@ -1510,257 +1717,34 @@ class SigmoidGate(nn.Module):
             and residue.dim() == 2
             and int(base.shape[0]) == int(residue.shape[0])
             and len(getattr(self, "tile_shape", ()) or ()) > 0
-            and len(event_shape) > 0
+            and len(getattr(self, "event_shape", ()) or ()) > 0
         ):
             try:
-                tile_shape_nd = self._normalize_tile_shape(event_shape)
-                D0 = int(base.shape[1])
-                use_tile_nd = (
-                    bool(tile_shape_nd) and int(self._prod_int(event_shape)) == D0
-                )
+                use_tile_nd = bool(self._normalize_tile_shape(self.event_shape)) and int(
+                    self._prod_int(self.event_shape)
+                ) == int(base.shape[1])
             except Exception:
                 use_tile_nd = False
         if use_tile_nd:
-            assert base is not None and residue is not None
-            b = base.detach() if self.detach_inputs else base
-            r = residue.detach() if self.detach_inputs else residue
-            b32 = b.to(dtype=torch.float32)
-            r32 = r.to(dtype=torch.float32)
-            B = int(b32.shape[0])
-            D = int(b32.shape[1])
-            event_shape_t = tuple(int(v) for v in event_shape)
-            tile_shape_t = tuple(int(v) for v in tile_shape_nd)
-            grid_shape = tuple(
-                (int(d) + int(t) - 1) // int(t)
-                for d, t in zip(event_shape_t, tile_shape_t)
+            out_full, p_low, p_high = self._compute_tile_score(
+                global_logit,
+                base,
+                residue,
+                tokens.dtype,
+                self.eps,
+                self.p_floor,
+                self.p_ceil,
+                z_min,
+                z_max,
+                fallback_bounds,
+                self.stat_width_frac,
+                self.stat_edge_frac,
             )
-            pad_shape = tuple(int(g) * int(t) for g, t in zip(grid_shape, tile_shape_t))
-            pads: list[int] = []
-            for orig, padded in reversed(list(zip(event_shape_t, pad_shape))):
-                pads.extend([0, int(padded - orig)])
-            pads_t = tuple(pads)
-            pad_needed = any(int(p) > int(o) for p, o in zip(pad_shape, event_shape_t))
-            b_nd = b32.reshape(B, *event_shape_t)
-            r_nd = r32.reshape(B, *event_shape_t)
-            if pad_needed:
-                b_nd = F.pad(b_nd, pads_t)
-                r_nd = F.pad(r_nd, pads_t)
-            mask_bool: Optional[torch.Tensor] = None
-            if pad_needed:
-                device = b_nd.device
-                mask_bool = None
-                ndim = int(len(event_shape_t))
-                for i, (orig, padded) in enumerate(zip(event_shape_t, pad_shape)):
-                    if int(padded) == int(orig):
-                        continue
-                    idx = torch.arange(int(padded), device=device)
-                    v = (idx < int(orig)).view(
-                        *([1] * i), int(padded), *([1] * (ndim - i - 1))
-                    )
-                    mask_bool = v if mask_bool is None else (mask_bool & v)
-                if mask_bool is None:
-                    mask_bool = torch.ones(pad_shape, device=device, dtype=torch.bool)
-            view_shape: list[int] = [B]
-            interleaved: list[int] = []
-            for g, t in zip(grid_shape, tile_shape_t):
-                view_shape.extend([int(g), int(t)])
-                interleaved.extend([int(g), int(t)])
-            b_tile = b_nd.reshape(*view_shape)
-            r_tile = r_nd.reshape(*view_shape)
-            mask_tile: Optional[torch.Tensor] = None
-            mask: Optional[torch.Tensor] = None
-            if mask_bool is not None:
-                mask_tile = mask_bool.reshape(*interleaved).unsqueeze(0)
-                mask = mask_tile.to(dtype=torch.float32)
-
-            tile_dims = tuple(range(2, 1 + 2 * int(len(event_shape_t)), 2))
-            if mask is None:
-                b_rms_t = torch.sqrt((b_tile * b_tile).mean(dim=tile_dims) + self.eps)
-                r_rms_t = torch.sqrt((r_tile * r_tile).mean(dim=tile_dims) + self.eps)
-            else:
-                denom = torch.clamp(mask.sum(dim=tile_dims), min=1.0)
-                b_rms_t = torch.sqrt(
-                    ((b_tile * b_tile) * mask).sum(dim=tile_dims) / denom + self.eps
-                )
-                r_rms_t = torch.sqrt(
-                    ((r_tile * r_tile) * mask).sum(dim=tile_dims) / denom + self.eps
-                )
-            ratio = r_rms_t / (b_rms_t + float(self.eps))
-            tile_feats = torch.stack([b_rms_t, r_rms_t, ratio], dim=-1).to(
-                dtype=tokens.dtype
-            )
-            tile_logit = self.tile_net(tile_feats).squeeze(-1)
-            g_add = global_logit.view(B, *([1] * int(len(event_shape_t))))
-            logit = g_add + tile_logit
-            sig = torch.sigmoid(logit)
-            p_low = sig.new_full(sig.shape, float(self.p_floor))
-            p_high = sig.new_full(sig.shape, float(self.p_ceil))
-            if z_min is not None and z_max is not None:
-                zmin = z_min.to(device=b_tile.device, dtype=torch.float32)
-                zmax = z_max.to(device=b_tile.device, dtype=torch.float32)
-                if zmin.numel() != 1:
-                    zmin = zmin.reshape(1, -1)
-                if zmax.numel() != 1:
-                    zmax = zmax.reshape(1, -1)
-                if zmin.numel() != 1 and int(zmin.shape[-1]) != D:
-                    zmin = None
-                    zmax = None
-                if zmax is not None and zmax.numel() != 1 and int(zmax.shape[-1]) != D:
-                    zmin = None
-                    zmax = None
-                if zmin is not None and zmax is not None:
-                    if zmin.numel() == 1:
-                        zmin_t = zmin
-                        zmax_t = zmax
-                    else:
-                        zmin_nd = zmin.reshape(1, *event_shape_t)
-                        zmax_nd = zmax.reshape(1, *event_shape_t)
-                        if pad_needed:
-                            zmin_nd = F.pad(zmin_nd, pads_t)
-                            zmax_nd = F.pad(zmax_nd, pads_t)
-                        zmin_t = zmin_nd.reshape(1, *interleaved)
-                        zmax_t = zmax_nd.reshape(1, *interleaved)
-                    sign = torch.where(r_tile >= 0, 1.0, -1.0)
-                    r_safe = torch.where(
-                        r_tile.abs() < self.eps, sign * self.eps, r_tile
-                    )
-                    p_a = (zmin_t - b_tile) / r_safe
-                    p_b = (zmax_t - b_tile) / r_safe
-                    p_min_dim = torch.minimum(p_a, p_b)
-                    p_max_dim = torch.maximum(p_a, p_b)
-                    if mask_tile is not None:
-                        neg_inf = torch.finfo(p_min_dim.dtype).min
-                        pos_inf = torch.finfo(p_max_dim.dtype).max
-                        p_min_dim = torch.where(
-                            mask_tile, p_min_dim, p_min_dim.new_full((), neg_inf)
-                        )
-                        p_max_dim = torch.where(
-                            mask_tile, p_max_dim, p_max_dim.new_full((), pos_inf)
-                        )
-                    p_low_bound = p_min_dim.amax(dim=tile_dims)
-                    p_high_bound = p_max_dim.amin(dim=tile_dims)
-                    p_low = torch.clamp(
-                        p_low_bound, min=float(self.p_floor), max=float(self.p_ceil)
-                    )
-                    p_high = torch.clamp(
-                        p_high_bound, min=float(self.p_floor), max=float(self.p_ceil)
-                    )
-                    p_high = torch.maximum(p_high, p_low + float(self.eps))
-            p_tile = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
-            clip = float(max(self.clip_eps, self.eps))
-            lo = float(self.p_floor) + clip
-            hi = float(self.p_ceil) - clip
-            if hi > lo:
-                p_tile = torch.clamp(p_tile, min=lo, max=hi)
-            else:
-                p_tile = torch.clamp(
-                    p_tile, min=float(self.p_floor), max=float(self.p_ceil)
-                )
-            if bool(fallback_bounds):
-                try:
-                    width = (p_high - p_low).to(dtype=torch.float32)
-                    denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                    tthr = float(self.stat_width_frac) * denom
-                    tthr = float(max(tthr, self.eps))
-                    trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
-                    trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
-                    active_low = trim_low >= tthr
-                    active_high = trim_high >= tthr
-                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    ethr = float(max(float(self.stat_edge_frac), 0.0))
-                    edge_thr = w_safe * float(ethr)
-                    edge_low = (p_tile - p_low) <= edge_thr
-                    edge_high = (p_high - p_tile) <= edge_thr
-                    self._fb_add_stats(
-                        float(p_tile.numel()),
-                        width.sum(),
-                        active_low.to(dtype=torch.float32).sum(),
-                        active_high.to(dtype=torch.float32).sum(),
-                        edge_low.to(dtype=torch.float32).sum(),
-                        edge_high.to(dtype=torch.float32).sum(),
-                    )
-                except Exception:
-                    pass
-            edge_reg: Optional[torch.Tensor] = None
-            edge_reg_low: Optional[torch.Tensor] = None
-            edge_reg_high: Optional[torch.Tensor] = None
-            if bool(return_edge_reg) or bool(return_edge_reg_lr):
-                try:
-                    width = (p_high - p_low).to(dtype=torch.float32)
-                    full = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                    min_w = float(edge_reg_min_width_frac) * full
-                    min_w = float(max(min_w, self.eps))
-                    mask_w = (width >= min_w).to(dtype=torch.float32)
-                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    q = (
-                        p_tile.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)
-                    ) / w_safe
-                    q = torch.clamp(q, 0.0, 1.0)
-                    m = float(edge_reg_frac)
-                    m = float(min(max(m, self.eps), 0.49))
-                    inv_m = 1.0 / m
-                    d_low = F.relu(m - q) * inv_m
-                    d_high = F.relu(q - (1.0 - m)) * inv_m
-                    pen_low = d_low.pow(float(edge_reg_power)) * mask_w
-                    pen_high = d_high.pow(float(edge_reg_power)) * mask_w
-                    denom = mask_w.sum() + float(self.eps)
-                    edge_reg_low = pen_low.sum() / denom
-                    edge_reg_high = pen_high.sum() / denom
-                    edge_reg = edge_reg_low + edge_reg_high
-                except Exception:
-                    edge_reg = None
-                    edge_reg_low = None
-                    edge_reg_high = None
-            expand_view: list[int] = [B]
-            for g in grid_shape:
-                expand_view.extend([int(g), 1])
-            p_view = p_tile.reshape(*expand_view)
-            exp_shape: list[int] = [B]
-            for g, t in zip(grid_shape, tile_shape_t):
-                exp_shape.extend([int(g), int(t)])
-            p_exp = p_view.expand(*exp_shape)
-            p_pad = p_exp.contiguous().view(B, *pad_shape)
-            slices = (slice(None),) + tuple(slice(0, int(d)) for d in event_shape_t)
-            p_crop = p_pad[slices]
-            out_full = p_crop.reshape(B, D)
-            out_dtype = (
-                residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
-            )
-            out_full = out_full.to(dtype=out_dtype)
-            if bool(return_edge_reg_lr):
-                if edge_reg_low is None:
-                    edge_reg_low = out_full.new_tensor(0.0, dtype=torch.float32)
-                if edge_reg_high is None:
-                    edge_reg_high = out_full.new_tensor(0.0, dtype=torch.float32)
-                return (
-                    out_full,
-                    edge_reg_low.to(dtype=out_dtype),
-                    edge_reg_high.to(dtype=out_dtype),
-                )
-            if bool(return_edge_reg):
-                if edge_reg is None:
-                    edge_reg = out_full.new_tensor(0.0, dtype=torch.float32)
-                return out_full, edge_reg.to(dtype=out_dtype)
-            return out_full
-        use_tile = (
-            self.tile_size > 0
-            and self.tile_net is not None
-            and base is not None
-            and residue is not None
-            and base.dim() == 2
-            and residue.dim() == 2
-            and int(base.shape[0]) == int(residue.shape[0])
-        )
-        if not use_tile:
+        else:
             sig = torch.sigmoid(global_logit)
             p_low = sig.new_full(sig.shape, float(self.p_floor))
             p_high = sig.new_full(sig.shape, float(self.p_ceil))
-            if (
-                z_min is not None
-                and z_max is not None
-                and base is not None
-                and residue is not None
-            ):
+            if z_min is not None and z_max is not None and base is not None and residue is not None:
                 b = base.detach() if self.detach_inputs else base
                 r = residue.detach() if self.detach_inputs else residue
                 b32 = b.to(dtype=torch.float32)
@@ -1775,10 +1759,8 @@ class SigmoidGate(nn.Module):
                 r_safe = torch.where(r32.abs() < self.eps, sign * self.eps, r32)
                 p_a = (zmin - b32) / r_safe
                 p_b = (zmax - b32) / r_safe
-                p_min_dim = torch.minimum(p_a, p_b)
-                p_max_dim = torch.maximum(p_a, p_b)
-                p_low_bound = p_min_dim.max(dim=1).values
-                p_high_bound = p_max_dim.min(dim=1).values
+                p_low_bound = torch.minimum(p_a, p_b).max(dim=1).values
+                p_high_bound = torch.maximum(p_a, p_b).min(dim=1).values
                 p_low = torch.clamp(
                     p_low_bound, min=float(self.p_floor), max=float(self.p_ceil)
                 )
@@ -1788,86 +1770,41 @@ class SigmoidGate(nn.Module):
                 p_high = torch.maximum(p_high, p_low + float(self.eps))
             p = p_low + (p_high - p_low) * sig.to(dtype=p_low.dtype)
             clip = float(max(self.clip_eps, self.eps))
-            lo = float(self.p_floor) + clip
-            hi = float(self.p_ceil) - clip
-            if hi > lo:
-                p = torch.clamp(p, min=lo, max=hi)
-            else:
-                p = torch.clamp(p, min=float(self.p_floor), max=float(self.p_ceil))
-            edge_reg: Optional[torch.Tensor] = None
-            edge_reg_low: Optional[torch.Tensor] = None
-            edge_reg_high: Optional[torch.Tensor] = None
-            if bool(fallback_bounds):
-                try:
-                    width = (p_high - p_low).to(dtype=torch.float32)
-                    denom = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                    tthr = float(self.stat_width_frac) * denom
-                    tthr = float(max(tthr, self.eps))
-                    trim_low = (p_low - float(self.p_floor)).to(dtype=torch.float32)
-                    trim_high = (float(self.p_ceil) - p_high).to(dtype=torch.float32)
-                    active_low = trim_low >= tthr
-                    active_high = trim_high >= tthr
-                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    ethr = float(max(float(self.stat_edge_frac), 0.0))
-                    edge_thr = w_safe * float(ethr)
-                    edge_low = (p - p_low) <= edge_thr
-                    edge_high = (p_high - p) <= edge_thr
-                    self._fb_add_stats(
-                        float(p.shape[0]),
-                        width.sum(),
-                        active_low.to(dtype=torch.float32).sum(),
-                        active_high.to(dtype=torch.float32).sum(),
-                        edge_low.to(dtype=torch.float32).sum(),
-                        edge_high.to(dtype=torch.float32).sum(),
-                    )
-                except Exception:
-                    pass
-            if bool(return_edge_reg) or bool(return_edge_reg_lr):
-                try:
-                    width = (p_high - p_low).to(dtype=torch.float32)
-                    full = max(float(self.p_ceil - self.p_floor), float(self.eps))
-                    min_w = float(edge_reg_min_width_frac) * full
-                    min_w = float(max(min_w, self.eps))
-                    mask = (width >= min_w).to(dtype=torch.float32)
-                    w_safe = torch.maximum(width, width.new_full((), float(self.eps)))
-                    q = (
-                        p.to(dtype=torch.float32) - p_low.to(dtype=torch.float32)
-                    ) / w_safe
-                    q = torch.clamp(q, 0.0, 1.0)
-                    m = float(edge_reg_frac)
-                    m = float(min(max(m, self.eps), 0.49))
-                    inv_m = 1.0 / m
-                    d_low = F.relu(m - q) * inv_m
-                    d_high = F.relu(q - (1.0 - m)) * inv_m
-                    pen_low = d_low.pow(float(edge_reg_power)) * mask
-                    pen_high = d_high.pow(float(edge_reg_power)) * mask
-                    denom = mask.sum() + float(self.eps)
-                    edge_reg_low = pen_low.sum() / denom
-                    edge_reg_high = pen_high.sum() / denom
-                    edge_reg = edge_reg_low + edge_reg_high
-                except Exception:
-                    edge_reg = None
-                    edge_reg_low = None
-                    edge_reg_high = None
-            out_dtype = (
-                residue.dtype if isinstance(residue, torch.Tensor) else tokens.dtype
+            p = torch.clamp(
+                p,
+                min=float(self.p_floor) + clip
+                if float(self.p_ceil) - clip > float(self.p_floor) + clip
+                else float(self.p_floor),
+                max=float(self.p_ceil) - clip,
             )
-            out = p.to(dtype=out_dtype).unsqueeze(-1)
-            if bool(return_edge_reg_lr):
-                if edge_reg_low is None:
-                    edge_reg_low = out.new_tensor(0.0, dtype=torch.float32)
-                if edge_reg_high is None:
-                    edge_reg_high = out.new_tensor(0.0, dtype=torch.float32)
-                return (
-                    out,
-                    edge_reg_low.to(dtype=out_dtype),
-                    edge_reg_high.to(dtype=out_dtype),
+            if bool(fallback_bounds):
+                self._update_stats(
+                    p,
+                    p_low,
+                    p_high,
+                    self.p_ceil,
+                    self.p_floor,
+                    self.eps,
+                    self.stat_width_frac,
+                    self.stat_edge_frac,
                 )
-            if bool(return_edge_reg):
-                if edge_reg is None:
-                    edge_reg = out.new_tensor(0.0, dtype=torch.float32)
-                return out, edge_reg.to(dtype=out_dtype)
-            return out
+            out_full = p.unsqueeze(-1)
+
+        return self._calc_edge_reg(
+            out_full if use_tile_nd else p,
+            p_low,
+            p_high,
+            self.p_ceil,
+            self.p_floor,
+            self.eps,
+            (p_high - p_low).to(dtype=torch.float32),
+            out_full,
+            return_edge_reg,
+            return_edge_reg_lr,
+            edge_reg_min_width_frac,
+            edge_reg_frac,
+            edge_reg_power,
+        )
 
 
 class Scaler(nn.Module):
@@ -1964,129 +1901,123 @@ class Scaler(nn.Module):
         )
         self._invalidate_stats_cache()
 
+    def _update_stats_impl(
+        self, tensor: torch.Tensor, mean_buf: torch.Tensor, std_buf: torch.Tensor
+    ):
+        if tensor.numel() == 0:
+            return
+        t_flat = (
+            tensor.detach().view(-1, 1)
+            if tensor.dim() == 1
+            else tensor.detach().reshape(-1, tensor.shape[-1])
+        ).to(dtype=torch.float64)
+        mean, std = (
+            t_flat.mean(dim=0),
+            t_flat.std(dim=0, unbiased=False).clamp_min(self.eps),
+        )
+        if mean_buf.shape != mean.shape:
+            mean_buf.resize_(mean.shape)
+        if std_buf.shape != std.shape:
+            std_buf.resize_(std.shape)
+        mean_buf.copy_(mean)
+        std_buf.copy_(std)
+        self._invalidate_stats_cache()
+
     @torch.no_grad()
     def update_x(self, x: torch.Tensor) -> None:
-        if x.numel() == 0:
-            return
-        x_work = x.detach()
-        if x_work.dim() == 1:
-            x_flat = x_work.view(-1, 1)
-        else:
-            x_flat = x_work.reshape(-1, x_work.shape[-1])
-        x_flat = x_flat.to(dtype=torch.float64)
-        mean = x_flat.mean(dim=0)
-        std = x_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
-        if self.x_mean.shape != mean.shape:
-            self.x_mean.resize_(mean.shape)
-        if self.x_std.shape != std.shape:
-            self.x_std.resize_(std.shape)
-        self.x_mean.copy_(mean)
-        self.x_std.copy_(std)
-        self._invalidate_stats_cache()
+        self._update_stats_impl(x, self.x_mean, self.x_std)
 
     @torch.no_grad()
     def update_y(self, y: torch.Tensor) -> None:
-        if y.numel() == 0:
-            return
-        y_work = y.detach()
-        if y_work.dim() == 1:
-            y_flat = y_work.view(-1, 1)
+        self._update_stats_impl(y, self.y_mean, self.y_std)
+
+    def _normalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
+        compiling = is_export_or_trace()
+        if not compiling:
+            if t.numel() == 0:
+                return t
+            feat_dim = int(t.shape[0] if t.dim() == 1 else t.shape[-1])
+            if mean_buf.numel() not in (1, feat_dim) or std_buf.numel() not in (
+                1,
+                feat_dim,
+            ):
+                raise RuntimeError(
+                    f"Scaler: feature dimension mismatch: got {feat_dim}, expected {int(mean_buf.numel())}"
+                )
+        key = (
+            t.device.type,
+            int(t.device.index) if t.device.index is not None else -1,
+            t.dtype,
+        )
+        cache_dict = getattr(self, f"_{cache_key_prefix}_stats_cache")
+        with self._stats_cache_lock:
+            cached = cache_dict.get(key)
+        if cached is None:
+            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+            std_b = std_buf.to(device=t.device, dtype=t.dtype)
+            with self._stats_cache_lock:
+                if len(cache_dict) >= int(self._stats_cache_max):
+                    cache_dict.clear()
+                cache_dict[key] = (mean_b, std_b)
         else:
-            y_flat = y_work.reshape(-1, y_work.shape[-1])
-        y_flat = y_flat.to(dtype=torch.float64)
-        mean = y_flat.mean(dim=0)
-        std = y_flat.std(dim=0, unbiased=False).clamp_min(self.eps)
-        if self.y_mean.shape != mean.shape:
-            self.y_mean.resize_(mean.shape)
-        if self.y_std.shape != std.shape:
-            self.y_std.resize_(std.shape)
-        self.y_mean.copy_(mean)
-        self.y_std.copy_(std)
-        self._invalidate_stats_cache()
+            mean_b, std_b = cached
+        if t.dim() == 1:
+            return (t - mean_b) / (std_b + self.eps)
+        view_shape = [1] * (t.dim() - 1) + [-1]
+        if compiling:
+            mean = mean_b.view(*view_shape)
+            std = std_b.view(*view_shape)
+        else:
+            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
+        return (t - mean) / (std + self.eps)
 
     def normalize_x(self, x: torch.Tensor) -> torch.Tensor:
+        return self._normalize_impl(x, self.x_mean, self.x_std, "x")
+
+    def _denormalize_impl(self, t, mean_buf, std_buf, cache_key_prefix):
         compiling = is_export_or_trace()
         if not compiling:
-            if x.numel() == 0:
-                return x
-            feat_dim = int(x.shape[0] if x.dim() == 1 else x.shape[-1])
-            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (
+            if t.numel() == 0:
+                return t
+            feat_dim = int(t.shape[0] if t.dim() == 1 else t.shape[-1])
+            if mean_buf.numel() not in (1, feat_dim) or std_buf.numel() not in (
                 1,
                 feat_dim,
             ):
                 raise RuntimeError(
-                    "Scaler.normalize_x: feature dimension mismatch: "
-                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
+                    f"Scaler: feature dimension mismatch: got {feat_dim}, expected {int(mean_buf.numel())}"
                 )
         key = (
-            x.device.type,
-            int(x.device.index) if x.device.index is not None else -1,
-            x.dtype,
+            t.device.type,
+            int(t.device.index) if t.device.index is not None else -1,
+            t.dtype,
         )
+        cache_dict = getattr(self, f"_{cache_key_prefix}_stats_cache")
         with self._stats_cache_lock:
-            cached = self._x_stats_cache.get(key)
+            cached = cache_dict.get(key)
         if cached is None:
-            mean_b = self.x_mean.to(device=x.device, dtype=x.dtype)
-            std_b = self.x_std.to(device=x.device, dtype=x.dtype)
+            mean_b = mean_buf.to(device=t.device, dtype=t.dtype)
+            std_b = std_buf.to(device=t.device, dtype=t.dtype)
             with self._stats_cache_lock:
-                if len(self._x_stats_cache) >= int(self._stats_cache_max):
-                    self._x_stats_cache.clear()
-                self._x_stats_cache[key] = (mean_b, std_b)
+                if len(cache_dict) >= int(self._stats_cache_max):
+                    cache_dict.clear()
+                cache_dict[key] = (mean_b, std_b)
         else:
             mean_b, std_b = cached
-        if x.dim() == 1:
-            return (x - mean_b) / (std_b + self.eps)
-        view_shape = [1] * (x.dim() - 1) + [-1]
+        if t.dim() == 1:
+            return t * (std_b + self.eps) + mean_b
+        view_shape = [1] * (t.dim() - 1) + [-1]
         if compiling:
-            mean = mean_b.view(*view_shape)
             std = std_b.view(*view_shape)
+            mean = mean_b.view(*view_shape)
         else:
-            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
             std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
-        return (x - mean) / (std + self.eps)
+            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
+        return t * (std + self.eps) + mean
 
     def denormalize_x(self, x_scaled: torch.Tensor) -> torch.Tensor:
-        compiling = is_export_or_trace()
-        if not compiling:
-            if x_scaled.numel() == 0:
-                return x_scaled
-            feat_dim = int(
-                x_scaled.shape[0] if x_scaled.dim() == 1 else x_scaled.shape[-1]
-            )
-            if self.x_mean.numel() not in (1, feat_dim) or self.x_std.numel() not in (
-                1,
-                feat_dim,
-            ):
-                raise RuntimeError(
-                    "Scaler.denormalize_x: feature dimension mismatch: "
-                    f"got {feat_dim} features, expected {int(self.x_mean.numel())}"
-                )
-        key = (
-            x_scaled.device.type,
-            int(x_scaled.device.index) if x_scaled.device.index is not None else -1,
-            x_scaled.dtype,
-        )
-        with self._stats_cache_lock:
-            cached = self._x_stats_cache.get(key)
-        if cached is None:
-            mean_b = self.x_mean.to(device=x_scaled.device, dtype=x_scaled.dtype)
-            std_b = self.x_std.to(device=x_scaled.device, dtype=x_scaled.dtype)
-            with self._stats_cache_lock:
-                if len(self._x_stats_cache) >= int(self._stats_cache_max):
-                    self._x_stats_cache.clear()
-                self._x_stats_cache[key] = (mean_b, std_b)
-        else:
-            mean_b, std_b = cached
-        if x_scaled.dim() == 1:
-            return x_scaled * (std_b + self.eps) + mean_b
-        view_shape = [1] * (x_scaled.dim() - 1) + [-1]
-        if compiling:
-            std = std_b.view(*view_shape)
-            mean = mean_b.view(*view_shape)
-        else:
-            std = std_b if std_b.numel() == 1 else std_b.view(*view_shape)
-            mean = mean_b if mean_b.numel() == 1 else mean_b.view(*view_shape)
-        return x_scaled * (std + self.eps) + mean
+        return self._denormalize_impl(x_scaled, self.x_mean, self.x_std, "x")
 
     def _y_stats_vector(self) -> Tuple[torch.Tensor, torch.Tensor]:
         mean = self.y_mean
@@ -2107,88 +2038,26 @@ class Scaler(nn.Module):
         return mean, std
 
     def normalize_y(self, y: torch.Tensor) -> torch.Tensor:
-        compiling = is_export_or_trace()
-        if not compiling and y.numel() == 0:
-            return y
         orig_shape = y.shape
-        if y.dim() == 1:
-            y_flat = y.view(1, -1)
-            batch_first = False
-        else:
-            y_flat = y.view(y.shape[0], -1)
-            batch_first = True
         mean_vec, std_vec = self._y_stats_vector()
-        key = (
-            y_flat.device.type,
-            int(y_flat.device.index) if y_flat.device.index is not None else -1,
-            y_flat.dtype,
+        z = self._normalize_impl(
+            y.view(1, -1) if y.dim() == 1 else y.view(y.shape[0], -1),
+            mean_vec,
+            std_vec,
+            "y",
         )
-        with self._stats_cache_lock:
-            cached = self._y_stats_cache.get(key)
-        if cached is None:
-            mean = mean_vec.to(device=y_flat.device, dtype=y_flat.dtype)
-            std = std_vec.to(device=y_flat.device, dtype=y_flat.dtype)
-            with self._stats_cache_lock:
-                if len(self._y_stats_cache) >= int(self._stats_cache_max):
-                    self._y_stats_cache.clear()
-                self._y_stats_cache[key] = (mean, std)
-        else:
-            mean, std = cached
-        if compiling:
-            z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
-        else:
-            if mean.numel() == 1 and std.numel() == 1:
-                z_flat = (y_flat - mean) / (std + self.eps)
-            else:
-                if y_flat.shape[1] != mean.numel():
-                    raise RuntimeError(
-                        "Scaler.normalize_y: feature dimension mismatch: "
-                        f"got {y_flat.shape[1]} features, expected {int(mean.numel())}"
-                    )
-                z_flat = (y_flat - mean.view(1, -1)) / (std.view(1, -1) + self.eps)
-        return z_flat.view(orig_shape) if batch_first else z_flat.view(-1)
+        return z.view(-1) if y.dim() == 1 else z.view(orig_shape)
 
     def denormalize_y(self, z: torch.Tensor) -> torch.Tensor:
-        compiling = is_export_or_trace()
-        if not compiling and z.numel() == 0:
-            return z
         orig_shape = z.shape
-        if z.dim() == 1:
-            z_flat = z.view(1, -1)
-            batch_first = False
-        else:
-            z_flat = z.view(z.shape[0], -1)
-            batch_first = True
         mean_vec, std_vec = self._y_stats_vector()
-        key = (
-            z_flat.device.type,
-            int(z_flat.device.index) if z_flat.device.index is not None else -1,
-            z_flat.dtype,
+        y = self._denormalize_impl(
+            z.view(1, -1) if z.dim() == 1 else z.view(z.shape[0], -1),
+            mean_vec,
+            std_vec,
+            "y",
         )
-        with self._stats_cache_lock:
-            cached = self._y_stats_cache.get(key)
-        if cached is None:
-            mean = mean_vec.to(device=z_flat.device, dtype=z_flat.dtype)
-            std = std_vec.to(device=z_flat.device, dtype=z_flat.dtype)
-            with self._stats_cache_lock:
-                if len(self._y_stats_cache) >= int(self._stats_cache_max):
-                    self._y_stats_cache.clear()
-                self._y_stats_cache[key] = (mean, std)
-        else:
-            mean, std = cached
-        if compiling:
-            y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
-        else:
-            if mean.numel() == 1 and std.numel() == 1:
-                y_flat = z_flat * std + mean
-            else:
-                if z_flat.shape[1] != mean.numel():
-                    raise RuntimeError(
-                        "Scaler.denormalize_y: feature dimension mismatch: "
-                        f"got {z_flat.shape[1]} features, expected {int(mean.numel())}"
-                    )
-                y_flat = z_flat * std.view(1, -1) + mean.view(1, -1)
-        return y_flat.view(orig_shape) if batch_first else y_flat.view(-1)
+        return y.view(-1) if z.dim() == 1 else y.view(orig_shape)
 
     def calibrate(self, z_raw: torch.Tensor) -> torch.Tensor:
         match self.calib_mode:
@@ -2592,6 +2461,28 @@ class Recorder(nn.Module):
             backend_devices = list(backends)
         self.backends = backend_devices
 
+    def _accumulate(
+        self,
+        count_buf,
+        mean_buf,
+        var_buf,
+        min_buf,
+        max_buf,
+        new_n,
+        new_mean,
+        new_var,
+        new_min,
+        new_max,
+    ):
+        n = int(count_buf.item())
+        total = n + new_n
+        w_old, w_new = (n / total, new_n / total) if total > 0 else (0.0, 0.0)
+        count_buf.fill_(total)
+        mean_buf.mul_(w_old).add_(new_mean * w_new)
+        var_buf.mul_(w_old).add_(new_var * w_new)
+        min_buf.copy_(torch.minimum(min_buf, new_min.view(1)))
+        max_buf.copy_(torch.maximum(max_buf, new_max.view(1)))
+
     @torch.no_grad()
     def record_batch(
         self,
@@ -2608,54 +2499,72 @@ class Recorder(nn.Module):
             return
         x_det = x.detach()
         y_det = y.detach()
-        xvar_dev, xm_dev, xmin_dev, xmax_dev = _tensor_stats(x_det)
-        yvar_dev, ym_dev, ymin_dev, ymax_dev = _tensor_stats(y_det)
-        stats_device = self.sampled_x_mean.device
-        xm = xm_dev.to(device=stats_device, dtype=torch.float64)
-        xvar = xvar_dev.to(device=stats_device, dtype=torch.float64)
-        xmin = xmin_dev.to(device=stats_device, dtype=torch.float64)
-        xmax = xmax_dev.to(device=stats_device, dtype=torch.float64)
-        ym = ym_dev.to(device=stats_device, dtype=torch.float64)
-        yvar = yvar_dev.to(device=stats_device, dtype=torch.float64)
-        ymin = ymin_dev.to(device=stats_device, dtype=torch.float64)
-        ymax = ymax_dev.to(device=stats_device, dtype=torch.float64)
+        dev = self.sampled_x_mean.device
+        xv, xm, xmn, xmx = [
+            t.to(device=dev, dtype=torch.float64) for t in _tensor_stats(x_det)
+        ]
+        yv, ym, ymn, ymx = [
+            t.to(device=dev, dtype=torch.float64) for t in _tensor_stats(y_det)
+        ]
         if use_for_sample:
-            n = int(self.sampled_n.item())
-            n_new = n + 1
-            w_old = n / n_new if n_new > 0 else 0.0
-            w_new = 1.0 / n_new
-            self.sampled_n.fill_(n_new)
-            self.sampled_x_mean.mul_(w_old).add_(xm * w_new)
-            self.sampled_x_var.mul_(w_old).add_(xvar * w_new)
-            self.sampled_x_min.copy_(torch.minimum(self.sampled_x_min, xmin.view(1)))
-            self.sampled_x_max.copy_(torch.maximum(self.sampled_x_max, xmax.view(1)))
-            self.sampled_y_mean.mul_(w_old).add_(ym * w_new)
-            self.sampled_y_var.mul_(w_old).add_(yvar * w_new)
-            self.sampled_y_min.copy_(torch.minimum(self.sampled_y_min, ymin.view(1)))
-            self.sampled_y_max.copy_(torch.maximum(self.sampled_y_max, ymax.view(1)))
+            self._accumulate(
+                self.sampled_n,
+                self.sampled_x_mean,
+                self.sampled_x_var,
+                self.sampled_x_min,
+                self.sampled_x_max,
+                1,
+                xm,
+                xv,
+                xmn,
+                xmx,
+            )
+            self._accumulate(
+                self.sampled_n,
+                self.sampled_y_mean,
+                self.sampled_y_var,
+                self.sampled_y_min,
+                self.sampled_y_max,
+                1,
+                ym,
+                yv,
+                ymn,
+                ymx,
+            )
         if use_for_reduced:
-            n = int(self.reduced_n.item())
-            n_new = n + 1
-            w_old = n / n_new if n_new > 0 else 0.0
-            w_new = 1.0 / n_new
-            self.reduced_n.fill_(n_new)
-            self.reduced_x_mean.mul_(w_old).add_(xm * w_new)
-            self.reduced_x_var.mul_(w_old).add_(xvar * w_new)
-            self.reduced_x_min.copy_(torch.minimum(self.reduced_x_min, xmin.view(1)))
-            self.reduced_x_max.copy_(torch.maximum(self.reduced_x_max, xmax.view(1)))
-            self.reduced_y_mean.mul_(w_old).add_(ym * w_new)
-            self.reduced_y_var.mul_(w_old).add_(yvar * w_new)
-            self.reduced_y_min.copy_(torch.minimum(self.reduced_y_min, ymin.view(1)))
-            self.reduced_y_max.copy_(torch.maximum(self.reduced_y_max, ymax.view(1)))
+            self._accumulate(
+                self.reduced_n,
+                self.reduced_x_mean,
+                self.reduced_x_var,
+                self.reduced_x_min,
+                self.reduced_x_max,
+                1,
+                xm,
+                xv,
+                xmn,
+                xmx,
+            )
+            self._accumulate(
+                self.reduced_n,
+                self.reduced_y_mean,
+                self.reduced_y_var,
+                self.reduced_y_min,
+                self.reduced_y_max,
+                1,
+                ym,
+                yv,
+                ymn,
+                ymx,
+            )
         self._append(
             xm=xm,
-            xvar=xvar,
-            xmin=xmin,
-            xmax=xmax,
+            xvar=xv,
+            xmin=xmn,
+            xmax=xmx,
             ym=ym,
-            yvar=yvar,
-            ymin=ymin,
-            ymax=ymax,
+            yvar=yv,
+            ymin=ymn,
+            ymax=ymx,
             batch_size=int(x.shape[0]),
             step=step,
             extra=extra,
