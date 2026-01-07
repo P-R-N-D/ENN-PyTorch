@@ -85,50 +85,26 @@ SourceType = Literal["memmap"]
 
 
 def _strictest_underflow_action(v1: Optional[str], v2: Optional[str]) -> Optional[str]:
+    if v1 is None or v2 is None:
+        return v1 or v2
     order = {"allow": 0, "warn": 1, "forbid": 2}
-    if v1 is None:
-        return v2
-    if v2 is None:
-        return v1
-    i1 = int(order.get(str(v1), 0))
-    i2 = int(order.get(str(v2), 0))
-    return v1 if i1 >= i2 else v2
+    return v1 if order.get(str(v1), 0) >= order.get(str(v2), 0) else v2
 
 
 def _meta_has_scale(meta: Any) -> bool:
     if not isinstance(meta, Mapping):
         return False
-    if bool(meta.get("has_scale", False)):
+    keys = ("scale_max_abs", "scale_min_value", "scale_max_value", "scale_min_positive")
+    if meta.get("has_scale") or any(meta.get(k) is not None for k in keys):
         return True
-    for k in (
-        "scale_max_abs",
-        "scale_min_value",
-        "scale_max_value",
-        "scale_min_positive",
-    ):
-        if meta.get(k) is not None:
-            return True
-    ss = meta.get("scale_stats")
-    if not isinstance(ss, Mapping):
-        return False
-    if bool(ss.get("has_scale", False)):
-        return True
-    for k in (
-        "scale_max_abs",
-        "scale_min_value",
-        "scale_max_value",
-        "scale_min_positive",
-    ):
-        if ss.get(k) is not None:
-            return True
-    return False
+    return isinstance((ss := meta.get("scale_stats")), Mapping) and (
+        ss.get("has_scale") or any(ss.get(k) is not None for k in keys)
+    )
 
 
 def _remove_safe(path: str) -> None:
-    try:
+    with suppress(FileNotFoundError):
         os.remove(path)
-    except FileNotFoundError:
-        return
 
 
 def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
@@ -142,16 +118,12 @@ def _flatten_args(items: Sequence[Any]) -> Iterator[Any]:
 
 
 def _set_tuple(proto: tuple[Any, ...], items: tuple[Any, ...]) -> Any:
-    tp = type(proto)
-    if tp is tuple:
+    if type(proto) is tuple:
         return items
     try:
-        return tp(*items)
+        return type(proto)(*items)
     except Exception:
-        try:
-            return tp(items)
-        except Exception:
-            return items
+        return type(proto)(items) if hasattr(type(proto), "__iter__") else items
 
 
 def _node_state_key(node: Any, attr: str, fallback: str) -> str:
@@ -160,7 +132,7 @@ def _node_state_key(node: Any, attr: str, fallback: str) -> str:
 
 
 def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
-    if not isinstance(spec, dict) or "path" not in spec or "kind" not in spec:
+    if not (isinstance(spec, dict) and "path" in spec and "kind" in spec):
         return spec, False
     root = os.fspath(spec.get("path") or "")
     mn_path = os.path.join(root, "multinode.json")
@@ -168,46 +140,32 @@ def _expand_multinode_sources(spec: Any) -> tuple[Any, bool]:
         return spec, False
     payload = schemas.read_json(mn_path)
     if isinstance(payload, dict):
-        resolved = {
+        return {
             str(k): {"kind": "memmap", "path": os.path.join(root, str(v))}
             for k, v in payload.items()
-        }
-        return resolved, True
+        }, True
     if isinstance(payload, list):
-        resolved = [
+        return [
             {"kind": "memmap", "path": os.path.join(root, str(v))} for v in payload
-        ]
-        return resolved, True
+        ], True
     return spec, False
 
 
 def _is_accelerator_available() -> bool:
-    return bool(
-        is_accelerator_available("cuda")
-        or is_accelerator_available("xpu")
-        or is_accelerator_available("mps")
-    )
+    return any(is_accelerator_available(a) for a in ("cuda", "xpu", "mps"))
 
 
 def _device_guard_ok(device: torch.device, guard_bytes: int) -> bool:
-    if int(guard_bytes) <= 0:
+    if guard_bytes <= 0:
         return True
     try:
-        free_b, _total_b = Memory.mem_get_info(device)
-        if free_b is None:
-            return True
-        return bool(int(free_b) >= int(guard_bytes))
+        return (free_b := Memory.mem_get_info(device)[0]) is None or free_b >= guard_bytes
     except Exception:
         return True
 
 
 def _host_guard_ok(guard_bytes: int) -> bool:
-    if int(guard_bytes) <= 0:
-        return True
-    try:
-        return bool(int(Memory.available()) >= int(guard_bytes))
-    except Exception:
-        return True
+    return guard_bytes <= 0 or getattr(Memory, "available", lambda: guard_bytes)() >= guard_bytes
 
 
 @lru_cache(maxsize=1)
@@ -248,20 +206,16 @@ def _wait_accel_event_done(
     stop_min_sleep_s: float | None = None,
 ) -> None:
     stop_fn = stopped if stopped is not None else (lambda: False)
-    if base_sleep_s is None or max_sleep_s is None or stop_min_sleep_s is None:
-        d_base, d_max, d_stop_min = _accel_event_poll_params()
-        if base_sleep_s is None:
-            base_sleep_s = d_base
-        if max_sleep_s is None:
-            max_sleep_s = d_max
-        if stop_min_sleep_s is None:
-            stop_min_sleep_s = d_stop_min
+    d_base, d_max, d_stop_min = _accel_event_poll_params()
+    base_sleep_s = base_sleep_s if base_sleep_s is not None else d_base
+    max_sleep_s = max_sleep_s if max_sleep_s is not None else d_max
+    stop_min_sleep_s = stop_min_sleep_s if stop_min_sleep_s is not None else d_stop_min
     sleep_s = max(0.0, float(base_sleep_s))
     max_s = max(sleep_s, float(max_sleep_s))
     stop_min_s = max(0.0, float(stop_min_sleep_s))
     while True:
         try:
-            if bool(ev.query()):
+            if ev.query():
                 return
         except Exception:
             with suppress(Exception):
@@ -274,57 +228,25 @@ def _wait_accel_event_done(
 
 
 def _preload_len0(obj: Any) -> int:
-    if isinstance(obj, torch.Tensor):
-        return int(obj.shape[0]) if getattr(obj, "ndim", 0) > 0 else 1
-    try:
-        return int(len(obj))
-    except Exception:
-        t = torch.as_tensor(obj)
-        return int(t.shape[0]) if getattr(t, "ndim", 0) > 0 else 1
+    return (
+        obj.shape[0] if getattr(obj, "ndim", 0) > 0 else 1
+    ) if isinstance(obj, torch.Tensor) else len(obj)
 
 
-def _preload_slice_any(obj: Any, s: int, e: int, *args: Any, name: str) -> Any:
+def _preload_slice_any(obj: Any, s: int, e: int, *args, name: str) -> Any:
     if obj is None:
         return None
-    s_i = int(s)
-    e_i = int(e)
-    if torch.is_tensor(obj):
-        return obj[s_i:e_i]
-    if isinstance(obj, numpy.ndarray):
-        return obj[s_i:e_i]
     try:
-        return obj[s_i:e_i]
+        return obj[s:e]
     except Exception:
-        pass
-    try:
-        return [obj[i] for i in range(s_i, e_i)]
-    except Exception as ex:
-        raise TypeError(f"Object {name} does not support slicing [{s_i}:{e_i}]") from ex
-
-
-def _preload_gather_any(obj: Any, idx: torch.Tensor, *args: Any, name: str) -> Any:
-    if obj is None:
-        return None
-    idx_cpu = Storage._idx_to_cpu_int64(idx)
-    if torch.is_tensor(obj):
-        return obj[idx_cpu]
-    if isinstance(obj, numpy.ndarray):
-        return obj[idx_cpu.numpy()]
-    try:
-        return obj[idx_cpu.numpy()]
-    except Exception:
-        pass
-    try:
-        return [obj[int(i)] for i in idx_cpu.tolist()]
-    except Exception as ex:
-        raise TypeError(f"Object {name} does not support gather by indices") from ex
+        return [obj[i] for i in range(s, e)]
 
 
 def _preload_gather_any_preconverted(
     obj: Any,
     idx_cpu: torch.Tensor,
     idx_np: Any,
-    *args: Any,
+    *args,
     name: str,
 ) -> Any:
     if obj is None:
@@ -332,19 +254,11 @@ def _preload_gather_any_preconverted(
     if torch.is_tensor(obj):
         return obj[idx_cpu]
     if isinstance(obj, numpy.ndarray):
-        if idx_np is None:
-            idx_np = idx_cpu.numpy()
-        return obj[idx_np]
+        return obj[idx_np if idx_np is not None else idx_cpu.numpy()]
     try:
-        if idx_np is None:
-            idx_np = idx_cpu.numpy()
-        return obj[idx_np]
+        return obj[idx_np if idx_np is not None else idx_cpu.numpy()]
     except Exception:
-        pass
-    try:
         return [obj[int(i)] for i in idx_cpu.tolist()]
-    except Exception as ex:
-        raise TypeError(f"Object {name} does not support gather by indices") from ex
 
 
 def _normalize_device_spec(
@@ -369,43 +283,30 @@ def _primary_device(device_spec: torch.device | list[torch.device]) -> torch.dev
 
 
 class _RowSlicer:
-    __slots__ = ("raw_X", "raw_Y", "features_only")
-
     def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
-        self.raw_X = raw_X
-        self.raw_Y = raw_Y
-        self.features_only = bool(features_only)
+        self.raw_X, self.raw_Y, self.features_only = raw_X, raw_Y, bool(features_only)
 
     def __call__(self, s: int, e: int) -> Mapping[str, Any]:
-        out: Dict[str, Any] = {
-            "features": _preload_slice_any(self.raw_X, s, e, name="features")
-        }
-        if (self.raw_Y is not None) and (not self.features_only):
+        out = {"features": _preload_slice_any(self.raw_X, s, e, name="features")}
+        if self.raw_Y is not None and not self.features_only:
             out["labels"] = _preload_slice_any(self.raw_Y, s, e, name="labels")
         return out
 
 
 class _RowIndexer:
-    __slots__ = ("raw_X", "raw_Y", "features_only")
-
     def __init__(self, raw_X: Any, raw_Y: Any, *args: Any, features_only: bool) -> None:
-        self.raw_X = raw_X
-        self.raw_Y = raw_Y
-        self.features_only = bool(features_only)
+        self.raw_X, self.raw_Y, self.features_only = raw_X, raw_Y, bool(features_only)
 
     def __call__(self, idx: torch.Tensor) -> Mapping[str, Any]:
         idx_cpu = Storage._idx_to_cpu_int64(idx)
-        try:
-            idx_np = idx_cpu.numpy()
-        except Exception:
-            idx_np = None
+        idx_np = idx_cpu.numpy() if hasattr(idx_cpu, "numpy") else None
 
         out: Dict[str, Any] = {
             "features": _preload_gather_any_preconverted(
                 self.raw_X, idx_cpu, idx_np, name="features"
             )
         }
-        if (self.raw_Y is not None) and (not self.features_only):
+        if self.raw_Y is not None and not self.features_only:
             out["labels"] = _preload_gather_any_preconverted(
                 self.raw_Y, idx_cpu, idx_np, name="labels"
             )
@@ -1255,96 +1156,43 @@ class Storage:
 
     @staticmethod
     def merge_meta_info(metas: Any) -> Dict[str, Any]:
-
         def _merge_dicts(items: list[dict]) -> Dict[str, Any]:
             if not items:
                 return {}
             base = dict(items[0])
-            feature_dim = base.get("feature_dim")
-            label_shape = base.get("label_shape")
-            has_scale = _meta_has_scale(base)
-            has_nonfinite = bool(base.get("has_nonfinite", False))
-            max_abs = base.get("scale_max_abs")
-            min_val = base.get("scale_min_value")
-            max_val = base.get("scale_max_value")
-            min_pos = base.get("scale_min_positive")
-            is_integral = base.get("scale_is_integral")
-            is_negotiable = base.get("is_negotiable")
-            underflow_action = base.get("underflow_action")
+
+            def _upd_min(k, v):
+                base[k] = v if base.get(k) is None else min(float(base[k]), float(v))
+
+            def _upd_max(k, v):
+                base[k] = v if base.get(k) is None else max(float(base[k]), float(v))
+
             for m in items[1:]:
-                if feature_dim is not None and m.get("feature_dim") is not None:
-                    if int(m.get("feature_dim")) != int(feature_dim):
-                        raise ValueError(
-                            f"feature_dim mismatch across sources: {feature_dim} vs {m.get('feature_dim')}"
-                        )
-                if label_shape is not None and m.get("label_shape") is not None:
-                    if tuple(m.get("label_shape")) != tuple(label_shape):
-                        raise ValueError(
-                            f"label_shape mismatch across sources: {label_shape} vs {m.get('label_shape')}"
-                        )
-                has_scale = has_scale or _meta_has_scale(m)
-                has_nonfinite = has_nonfinite or bool(m.get("has_nonfinite", False))
-                a = m.get("scale_max_abs")
-                if a is not None:
-                    max_abs = a if max_abs is None else max(float(max_abs), float(a))
-                mn = m.get("scale_min_value")
-                if mn is not None:
-                    try:
-                        min_val = (
-                            mn
-                            if min_val is None
-                            else (mn if mn <= min_val else min_val)
-                        )
-                    except Exception:
-                        min_val = (
-                            mn if min_val is None else min(float(min_val), float(mn))
-                        )
-                mx = m.get("scale_max_value")
-                if mx is not None:
-                    try:
-                        max_val = (
-                            mx
-                            if max_val is None
-                            else (mx if mx >= max_val else max_val)
-                        )
-                    except Exception:
-                        max_val = (
-                            mx if max_val is None else max(float(max_val), float(mx))
-                        )
-                p = m.get("scale_min_positive")
-                if p is not None:
-                    min_pos = p if min_pos is None else min(float(min_pos), float(p))
-                i = m.get("scale_is_integral")
-                if i is not None:
-                    is_integral = (
-                        bool(i)
-                        if is_integral is None
-                        else bool(is_integral) and bool(i)
+                if (fd := m.get("feature_dim")) and fd != base.get("feature_dim"):
+                    raise ValueError("feature_dim mismatch")
+                if "label_shape" in m:
+                    ls = m.get("label_shape")
+                    if tuple(ls) != tuple(base.get("label_shape", [])):
+                        raise ValueError("label_shape mismatch")
+                base["has_scale"] |= _meta_has_scale(m)
+                base["has_nonfinite"] |= bool(m.get("has_nonfinite"))
+                if (v := m.get("scale_max_abs")) is not None:
+                    _upd_max("scale_max_abs", v)
+                if (v := m.get("scale_min_value")) is not None:
+                    _upd_min("scale_min_value", v)
+                if (v := m.get("scale_max_value")) is not None:
+                    _upd_max("scale_max_value", v)
+                if (v := m.get("scale_min_positive")) is not None:
+                    _upd_min("scale_min_positive", v)
+                if (v := m.get("scale_is_integral")) is not None:
+                    base["scale_is_integral"] = bool(v) and base.get(
+                        "scale_is_integral", True
                     )
-                n = m.get("is_negotiable")
-                if n is not None:
-                    is_negotiable = (
-                        bool(n)
-                        if is_negotiable is None
-                        else bool(is_negotiable) and bool(n)
-                    )
-                underflow_action = _strictest_underflow_action(
-                    str(underflow_action) if underflow_action is not None else None,
-                    (
-                        str(m.get("underflow_action"))
-                        if m.get("underflow_action") is not None
-                        else None
-                    ),
+                if (v := m.get("is_negotiable")) is not None:
+                    base["is_negotiable"] = bool(v) and base.get("is_negotiable", True)
+                base["underflow_action"] = _strictest_underflow_action(
+                    base.get("underflow_action"), m.get("underflow_action")
                 )
-            base["has_scale"] = bool(has_scale)
-            base["has_nonfinite"] = bool(has_nonfinite)
-            base["scale_max_abs"] = max_abs
-            base["scale_min_value"] = min_val
-            base["scale_max_value"] = max_val
-            base["scale_min_positive"] = min_pos
-            base["scale_is_integral"] = is_integral
-            base["is_negotiable"] = is_negotiable
-            base["underflow_action"] = underflow_action
             return base
 
         if metas is None:
@@ -1929,44 +1777,16 @@ class Storage:
         chunk_size: int = 8192,
         overwrite: str = "replace",
     ) -> PersistentTensorDict:
-        _ = args
-        out_path_n = os.fspath(out_path)
-        parent = os.path.dirname(out_path_n) or "."
-        os.makedirs(parent, exist_ok=True)
-        ow = str(overwrite or "replace").strip().lower()
-        if ow == "resume" and os.path.isfile(out_path_n):
-            return PersistentTensorDict(filename=out_path_n, mode="r")
-        if ow == "error" and os.path.exists(out_path_n):
-            raise FileExistsError(f"destination already exists: {out_path_n!r}")
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=os.path.basename(out_path_n) + ".", suffix=".tmp", dir=parent
+        return Storage._atomic_h5_op(
+            out_path,
+            overwrite,
+            lambda tmp: Storage.write_predictions_h5_from_memmap(
+                tmp,
+                memmap_dir=memmap_dir,
+                pred_path=pred_path,
+                chunk_size=chunk_size,
+            ),
         )
-        os.close(fd)
-        try:
-            Storage.write_predictions_h5_from_memmap(
-                tmp_path,
-                memmap_dir=os.fspath(memmap_dir),
-                pred_path=os.fspath(pred_path),
-                chunk_size=int(chunk_size),
-            )
-            if ow == "replace":
-                os.replace(tmp_path, out_path_n)
-            elif ow == "error":
-                os.link(tmp_path, out_path_n)
-                os.remove(tmp_path)
-            elif ow == "resume":
-                if not os.path.exists(out_path_n):
-                    os.link(tmp_path, out_path_n)
-                os.remove(tmp_path)
-            else:
-                raise ValueError(
-                    f"write_predictions_h5_atomic: invalid overwrite={overwrite!r}"
-                )
-        finally:
-            with suppress(Exception):
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-        return PersistentTensorDict(filename=out_path_n, mode="r")
 
     @staticmethod
     def copy_predictions_h5_atomic(
@@ -1976,51 +1796,43 @@ class Storage:
         overwrite: str = "replace",
         out_shape: object | None = None,
     ) -> PersistentTensorDict:
-        _ = args
-        src_n = os.fspath(src_path)
-        dst_n = os.fspath(dst_path)
-        if not src_n or not os.path.isfile(src_n):
-            raise FileNotFoundError(f"source .h5/.hdf5 not found: {src_path!r}")
-        if not dst_n:
-            raise ValueError("destination path must be a non-empty string")
+        Storage.validate_predictions_h5(src_path, out_shape=out_shape)
+        res = Storage._atomic_h5_op(
+            dst_path, overwrite, lambda tmp: shutil.copy2(src_path, tmp)
+        )
+        Storage.validate_predictions_h5(dst_path, out_shape=out_shape)
+        return res
+
+    @staticmethod
+    def _atomic_h5_op(out_path, overwrite, op_fn):
+        out_path = os.fspath(out_path)
         ow = str(overwrite or "replace").strip().lower()
-        Storage.validate_predictions_h5(src_n, out_shape=out_shape)
-        with suppress(Exception):
-            if os.path.samefile(src_n, dst_n):
-                return PersistentTensorDict(filename=src_n, mode="r")
-        parent = os.path.dirname(dst_n) or "."
-        os.makedirs(parent, exist_ok=True)
-        if os.path.exists(dst_n):
-            if ow == "resume" and os.path.isfile(dst_n):
-                Storage.validate_predictions_h5(dst_n, out_shape=out_shape)
-                return PersistentTensorDict(filename=dst_n, mode="r")
-            if ow == "error":
-                raise FileExistsError(f"destination already exists: {dst_n!r}")
-        fd, tmp_path = tempfile.mkstemp(
-            prefix=os.path.basename(dst_n) + ".", suffix=".tmp", dir=parent
+        if ow == "resume" and os.path.isfile(out_path):
+            return PersistentTensorDict(filename=out_path, mode="r")
+        if ow == "error" and os.path.exists(out_path):
+            raise FileExistsError(f"Exists: {out_path}")
+
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        fd, tmp = tempfile.mkstemp(
+            prefix=os.path.basename(out_path) + ".",
+            suffix=".tmp",
+            dir=os.path.dirname(out_path),
         )
         os.close(fd)
         try:
-            shutil.copy2(src_n, tmp_path)
+            op_fn(tmp)
             if ow == "replace":
-                os.replace(tmp_path, dst_n)
-            elif ow == "error":
-                os.link(tmp_path, dst_n)
-                os.remove(tmp_path)
-            elif ow == "resume":
-                if not os.path.exists(dst_n):
-                    os.link(tmp_path, dst_n)
-                os.remove(tmp_path)
+                os.replace(tmp, out_path)
+            elif ow in ("error", "resume"):
+                if not os.path.exists(out_path):
+                    os.link(tmp, out_path)
+                os.remove(tmp)
             else:
-                raise ValueError(
-                    f"copy_predictions_h5_atomic: invalid overwrite={overwrite!r}"
-                )
+                raise ValueError(f"Invalid overwrite={overwrite}")
         finally:
             with suppress(Exception):
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-        Storage.validate_predictions_h5(dst_n, out_shape=out_shape)
-        return PersistentTensorDict(filename=dst_n, mode="r")
+                os.remove(tmp)
+        return PersistentTensorDict(filename=out_path, mode="r")
 
     @staticmethod
     def remove_prediction_artifacts(
@@ -2337,17 +2149,18 @@ class Sampler(torch.utils.data.Sampler):
         self._features = MemoryMappedTensor.from_filename(
             filename=feat_path, dtype=f_dtype, shape=torch.Size([self._N, fdim])
         )
-        lshape = tuple(lshape_meta) if lshape_meta else tuple()
-        self._label_shape_full = torch.Size([self._N] + list(lshape))
-        self._labels = None
-        if self._lab_path is not None:
-            self._labels = MemoryMappedTensor.from_filename(
+        lshape = tuple(lshape_meta)
+        self._label_shape_full = torch.Size([self._N, *lshape])
+        self._labels = (
+            MemoryMappedTensor.from_filename(
                 filename=str(self._lab_path),
                 dtype=l_dtype,
-                shape=torch.Size([self._N] + list(lshape)),
+                shape=self._label_shape_full,
             )
-        self._mmap_tls: Optional[threading.local] = None
-        self._mmap_limit_lock: Optional[threading.Lock] = threading.Lock()
+            if self._lab_path
+            else None
+        )
+        self._mmap_tls, self._mmap_limit_lock = None, threading.Lock()
         self._mmap_thread_local = False
         self._mmap_thread_local_max = 0
         self._mmap_thread_local_created = 0
@@ -2498,79 +2311,48 @@ class Sampler(torch.utils.data.Sampler):
     def _get_mmaps(self):
         if not getattr(self, "_mmap_thread_local", False):
             return self._features, self._labels
-        has_labels = bool(
-            getattr(self, "_labels", None) is not None
-            and getattr(self, "_lab_path", None)
-        )
-        tls = getattr(self, "_mmap_tls", None)
-        if tls is None:
-            tls = threading.local()
-            self._mmap_tls = tls
-        f = getattr(tls, "features", None)
-        l = getattr(tls, "labels", None)
-        if f is not None and (not has_labels or l is not None):
-            return f, (l if has_labels else None)
+        has_labels = bool(self._labels is not None and self._lab_path)
+        tls = self._mmap_tls or threading.local()
+        self._mmap_tls = tls
+        if getattr(tls, "features", None) is not None:
+            return tls.features, getattr(tls, "labels", None)
         max_pairs = int(getattr(self, "_mmap_thread_local_max", 0) or 0)
         if max_pairs > 0:
-            lock = getattr(self, "_mmap_limit_lock", None)
-            if lock is None:
-                lock = threading.Lock()
-                self._mmap_limit_lock = lock
-            with lock:
-                created = int(getattr(self, "_mmap_thread_local_created", 0) or 0)
+            with self._mmap_limit_lock:
+                created = self._mmap_thread_local_created
                 if created >= max_pairs:
-                    if not bool(
-                        getattr(self, "_mmap_thread_local_overflow_warned", False)
-                    ):
-                        setattr(self, "_mmap_thread_local_overflow_warned", True)
-                        with suppress(Exception):
-                            _LOGGER.warning(
-                                "[memmap] thread-local handle limit reached (%d). "
-                                "Falling back to shared memmap handles for overflow threads. "
-                                "Override: STNET_MEMMAP_THREAD_LOCAL_MAX / STNET_MEMMAP_TL_MAX.",
-                                int(max_pairs),
-                            )
-                    return self._features, self._labels
-                setattr(self, "_mmap_thread_local_created", created + 1)
-        init_lock = getattr(tls, "init_lock", None)
-        if init_lock is None:
-            init_lock = threading.Lock()
-            setattr(tls, "init_lock", init_lock)
-        with init_lock:
-            f = getattr(tls, "features", None)
-            l = getattr(tls, "labels", None)
-            if f is not None and (not has_labels or l is not None):
-                return f, (l if has_labels else None)
-            try:
-                f_new = MemoryMappedTensor.from_filename(
-                    filename=str(self._feat_path),
-                    dtype=self._feat_dtype,
-                    shape=self._feat_shape,
-                )
-                if has_labels:
-                    l_new = MemoryMappedTensor.from_filename(
-                        filename=str(self._lab_path),
-                        dtype=self._label_dtype,
-                        shape=self._label_shape_full,
-                    )
-                else:
-                    l_new = None
-            except Exception:
-                if max_pairs > 0:
-                    lock = getattr(self, "_mmap_limit_lock", None)
-                    if lock is None:
-                        lock = threading.Lock()
-                        self._mmap_limit_lock = lock
-                    with lock:
-                        created = int(
-                            getattr(self, "_mmap_thread_local_created", 0) or 0
+                    if not self._mmap_thread_local_overflow_warned:
+                        self._mmap_thread_local_overflow_warned = True
+                        _LOGGER.warning(
+                            f"[memmap] limit reached ({max_pairs}). Falling back."
                         )
-                        setattr(self, "_mmap_thread_local_created", max(0, created - 1))
-                return self._features, self._labels
-            setattr(tls, "features", f_new)
-            if has_labels:
-                setattr(tls, "labels", l_new)
-            return f_new, (l_new if has_labels else None)
+                    return self._features, self._labels
+                self._mmap_thread_local_created += 1
+
+        try:
+            f_new = MemoryMappedTensor.from_filename(
+                filename=str(self._feat_path),
+                dtype=self._feat_dtype,
+                shape=self._feat_shape,
+            )
+            l_new = (
+                MemoryMappedTensor.from_filename(
+                    filename=str(self._lab_path),
+                    dtype=self._label_dtype,
+                    shape=self._label_shape_full,
+                )
+                if has_labels
+                else None
+            )
+            tls.features, tls.labels = f_new, l_new
+            return f_new, l_new
+        except Exception:
+            if max_pairs > 0:
+                with self._mmap_limit_lock:
+                    self._mmap_thread_local_created = max(
+                        0, self._mmap_thread_local_created - 1
+                    )
+            return self._features, self._labels
 
     def _slice(self, start: int, end: int) -> Mapping[str, torch.Tensor]:
         start = int(start)
@@ -2983,14 +2765,11 @@ class Multiplexer:
             raise TypeError(
                 "weights must be a Mapping[str, float] or Sequence[float] (or omitted for uniform)"
             )
-        if not any((float(v) > 0.0) for v in w.values()):
-            raise ValueError("at least one sampling weight must be positive")
+        if not any(v > 0.0 for v in w.values()):
+            raise ValueError("At least one weight must be > 0")
         self._source_keys = list(sources_map.keys())
         node = MultiNodeWeightedSampler(
-            sources_map,
-            w,
-            stop_criteria=self.stop_criteria,
-            seed=int(self.seed),
+            sources_map, w, stop_criteria=self.stop_criteria, seed=int(self.seed)
         )
         self._node = node
         return node
@@ -3300,112 +3079,60 @@ class Prefetcher(Buffer):
             _session=True,
         )
 
+    def _apply_structure(self, obj, func):
+        if isinstance(obj, list):
+            return [self._apply_structure(x, func) for x in obj]
+        if isinstance(obj, tuple):
+            return type(obj)(*(self._apply_structure(x, func) for x in obj))
+        if isinstance(obj, dict):
+            return {
+                k: (v if k in ("row_ids", "keys") else self._apply_structure(v, func))
+                for k, v in obj.items()
+            }
+        return func(obj)
+
     def _to_device(self, x: Any, device: torch.device) -> Any:
-        if torch.is_tensor(x):
-            if x.device == device:
-                return x
-            if x.device.type == "cpu":
-                nb = bool(self._non_blocking)
-                if nb:
-                    try:
-                        is_pinned = getattr(x, "is_pinned", None)
-                        nb = bool(callable(is_pinned) and bool(is_pinned()))
-                    except Exception:
-                        nb = False
-                return x.to(device, non_blocking=nb)
-            return x.to(device, non_blocking=bool(self._non_blocking))
-        if isinstance(x, list):
-            for i in range(len(x)):
-                x[i] = self._to_device(x[i], device)
-            return x
-        if isinstance(x, tuple):
-            mapped = tuple(self._to_device(t, device) for t in x)
-            if type(x) is tuple:
-                return mapped
-            return _set_tuple(x, mapped)
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k in ("row_ids", "keys"):
-                    continue
-                x[k] = self._to_device(v, device)
-            return x
-        if isinstance(x, collections.abc.Mapping):
-            out: dict[Any, Any] = {}
-            for k, v in x.items():
-                out[k] = v if k in ("row_ids", "keys") else self._to_device(v, device)
-            return out
-        return x
+        def _f(t):
+            if not torch.is_tensor(t) or t.device == device:
+                return t
+            nb = self._non_blocking and (
+                t.device.type != "cpu"
+                or (hasattr(t, "is_pinned") and t.is_pinned())
+            )
+            return t.to(device, non_blocking=nb)
+
+        return self._apply_structure(x, _f)
 
     def _pin_memory(self, x: Any) -> Any:
         if not self._pin:
             return x
-        if torch.is_tensor(x) and x.device.type == "cpu":
-            with suppress(Exception):
-                if hasattr(x, "is_pinned") and bool(x.is_pinned()):
-                    return x
-            return x.pin_memory()
-        if isinstance(x, list):
-            for i in range(len(x)):
-                x[i] = self._pin_memory(x[i])
-            return x
-        if isinstance(x, tuple):
-            mapped = tuple(self._pin_memory(t) for t in x)
-            if type(x) is tuple:
-                return mapped
-            return _set_tuple(x, mapped)
-        if isinstance(x, dict):
-            for k, v in x.items():
-                if k in ("row_ids", "keys"):
-                    continue
-                x[k] = self._pin_memory(v)
-            return x
-        if isinstance(x, collections.abc.Mapping):
-            out: dict[Any, Any] = {}
-            for k, v in x.items():
-                out[k] = v if k in ("row_ids", "keys") else self._pin_memory(v)
-            return out
-        return x
+
+        def _f(t):
+            if (
+                torch.is_tensor(t)
+                and t.device.type == "cpu"
+                and not (hasattr(t, "is_pinned") and t.is_pinned())
+            ):
+                return t.pin_memory()
+            return t
+
+        return self._apply_structure(x, _f)
 
     def _stage_with_pool(
         self, obj: Any, pool: Pool, tokens: list[Optional[Pool.Token]]
     ) -> Any:
-        if torch.is_tensor(obj) and getattr(obj, "device", None) is not None:
-            if obj.device.type != "cpu":
-                return obj
-            try:
-                if hasattr(obj, "is_pinned") and bool(obj.is_pinned()):
-                    return obj
-            except Exception:
-                pass
+        def _f(t):
+            if (
+                not (torch.is_tensor(t) and t.device.type == "cpu")
+                or (hasattr(t, "is_pinned") and t.is_pinned())
+            ):
+                return t
             buf, tok = pool.get_like(obj, return_handle=True, block=False)
-            buf.copy_(obj, non_blocking=False)
+            buf.copy_(t, non_blocking=False)
             tokens.append(tok)
             return buf
-        if isinstance(obj, list):
-            for i in range(len(obj)):
-                obj[i] = self._stage_with_pool(obj[i], pool, tokens)
-            return obj
-        if isinstance(obj, tuple):
-            mapped = tuple(self._stage_with_pool(t, pool, tokens) for t in obj)
-            if type(obj) is tuple:
-                return mapped
-            return _set_tuple(obj, mapped)
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if k in ("row_ids", "keys"):
-                    continue
-                obj[k] = self._stage_with_pool(v, pool, tokens)
-            return obj
-        if isinstance(obj, collections.abc.Mapping):
-            out: dict[Any, Any] = {}
-            for k, v in obj.items():
-                out[k] = (
-                    v
-                    if k in ("row_ids", "keys")
-                    else self._stage_with_pool(v, pool, tokens)
-                )
-            return out
-        return obj
+
+        return self._apply_structure(obj, _f)
 
     def _pin_batch(self, x: Any) -> tuple[Any, list[Optional[Pool.Token]]]:
         if not self._pin:
