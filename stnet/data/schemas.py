@@ -41,6 +41,7 @@ def _resolve_key(data: Any, aliases: frozenset, name: str, required: bool) -> Op
     if not isinstance(data, (Mapping, TensorDictBase)): raise TypeError(f"get_{name}_key expects Mapping/TensorDict")
     matches = [str(k) for k in data.keys() if isinstance(k, str) and k.casefold() in aliases]
     if len(matches) == 1: return matches[0]
+    if len(matches) > 1: raise KeyError(f"Expected exactly one {name} key among {sorted(aliases)}; found {matches}")
     if required: raise KeyError(f"Expected exactly one {name} key among {sorted(aliases)}; found {matches or 'none'}")
     return None
 

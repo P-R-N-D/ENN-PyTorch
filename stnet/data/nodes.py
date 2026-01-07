@@ -1170,10 +1170,10 @@ class Storage:
             for m in items[1:]:
                 if (fd := m.get("feature_dim")) and fd != base.get("feature_dim"):
                     raise ValueError("feature_dim mismatch")
-                if (ls := m.get("label_shape")) and tuple(ls) != tuple(
-                    base.get("label_shape", [])
-                ):
-                    raise ValueError("label_shape mismatch")
+                if "label_shape" in m:
+                    ls = m.get("label_shape")
+                    if tuple(ls) != tuple(base.get("label_shape", [])):
+                        raise ValueError("label_shape mismatch")
                 base["has_scale"] |= _meta_has_scale(m)
                 base["has_nonfinite"] |= bool(m.get("has_nonfinite"))
                 if (v := m.get("scale_max_abs")) is not None:
