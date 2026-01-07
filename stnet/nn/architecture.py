@@ -71,19 +71,18 @@ from .layers import (
     SigmoidGate,
 )
 
-_Int8DynamicActivationInt8WeightConfig = None
-_Int8WeightOnlyConfig = None
-_PTQ_IMPL = None
-_qp = None
-_TORCHAO_IMPORT_TRIED = False
-_TORCHAO_IMPORT_LOCK = threading.Lock()
 
 _LOGGER = logging.getLogger(__name__)
 
-_Int8DynamicActivationInt8WeightConfig: Any | None
-_Int8WeightOnlyConfig: Any | None
+_Int8DynamicActivationInt8WeightConfig = None
+_Int8WeightOnlyConfig = None
 
-_PTQ_IMPL: Callable[..., tuple[nn.Module, bool, str]] | None
+_PTQ_IMPL = None
+
+_qp = None
+
+_TORCHAO_IMPORT_TRIED = False
+_TORCHAO_IMPORT_LOCK = threading.Lock()
 
 
 def _import_torchao_quantization() -> None:
