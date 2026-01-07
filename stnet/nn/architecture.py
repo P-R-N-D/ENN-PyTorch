@@ -1800,8 +1800,16 @@ class Model(nn.Module):
     def forward_export(self, features: torch.Tensor) -> torch.Tensor:
         if not isinstance(features, torch.Tensor):
             raise TypeError("forward_export expects Tensor")
+        base_dtype = None
+        param = next(self.parameters(), None)
+        if param is not None:
+            base_dtype = param.dtype
         return self._run_forward_core(
-            features, export=True, sanitize_nan=False, calibrate_output=True
+            features,
+            export=True,
+            sanitize_nan=False,
+            calibrate_output=True,
+            base_dtype=base_dtype,
         )[0]
 
     def forward_stream(
