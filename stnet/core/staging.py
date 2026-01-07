@@ -21,38 +21,18 @@ from .casting import env_first, env_first_float, env_flag
 
 
 def _get_throttle_state() -> str:
-    raw = env_first(
-        (
-            "STNET_CACHE_BACKPRESSURE_MODE",
-            "STNET_CACHE_BACKPRESSURE",
-            "STNET_CACHE_MODE",
-        ),
-        default="block",
-    )
-    s = str(raw or "block").strip().lower()
-    if s in {"sync", "synchronous"}:
-        return "sync"
-    if s in {"raise", "error"}:
-        return "raise"
-    return "block"
+    s = str(env_first(("STNET_CACHE_BACKPRESSURE_MODE", "STNET_CACHE_BACKPRESSURE", "STNET_CACHE_MODE"), default="block") or "block").strip().lower()
+    return "sync" if s in {"sync", "synchronous"} else ("raise" if s in {"raise", "error"} else "block")
 
 
 @lru_cache(maxsize=1)
 def _get_throttle_timeout() -> float:
-    t = env_first_float(
-        ("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"),
-        default=0.05,
-    )
-    with contextlib.suppress(Exception):
-        return max(0.0, float(t))
-    return 0.05
+    return max(0.0, float(env_first_float(("STNET_CACHE_BACKPRESSURE_TIMEOUT_S", "STNET_CACHE_SUBMIT_TIMEOUT_S"), default=0.05) or 0.05))
 
 
 @lru_cache(maxsize=1)
 def _is_early_release_enabled() -> bool:
-    return bool(
-        env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True)
-    )
+    return bool(env_flag("STNET_CACHE_EARLY_RELEASE", "STNET_CACHE_RELEASE_EARLY", default=True))
 
 
 @lru_cache(maxsize=1)
@@ -61,41 +41,15 @@ def _is_force_unpin_enabled() -> bool:
 
 
 def _prod_int(shape: Sequence[int]) -> int:
-    try:
-        n = int(math.prod(int(s) for s in shape))
-    except Exception:
-        n = 1
-        for s in shape:
-            n *= int(s)
-    return int(max(1, n))
+    return int(max(1, math.prod(int(s) for s in shape)))
 
 
 def close(obj: Any, *args: Any, join_timeout: float | None = 1.0) -> None:
-    for name in (
-        "cleanup",
-        "close",
-        "shutdown",
-        "stop",
-        "terminate",
-        "disconnect",
-        "release",
-        "join",
-    ):
-        fn = getattr(obj, name, None)
-        if callable(fn):
-            try:
-                if name == "join" and join_timeout is not None:
-                    fn(timeout=float(join_timeout))
-                else:
-                    fn()
-            except Exception:
-                pass
+    for name in ("cleanup", "close", "shutdown", "stop", "terminate", "disconnect", "release", "join"):
+        if callable(fn := getattr(obj, name, None)):
+            with contextlib.suppress(Exception): fn(timeout=float(join_timeout)) if name == "join" and join_timeout is not None else fn()
             return
-    if callable(obj):
-        try:
-            obj()
-        except Exception:
-            pass
+    with contextlib.suppress(Exception): obj() if callable(obj) else None
 
 
 class _QueryEvent(Protocol):
@@ -192,17 +146,9 @@ class Pool:
     def _event_finished(self, evt: object | None) -> bool:
         if evt is None:
             return True
-        if isinstance(evt, _QueryEvent):
-            try:
-                return bool(evt.query())
-            except Exception:
-                return False
-        is_set = getattr(evt, "is_set", None)
-        if callable(is_set):
-            try:
-                return bool(is_set())
-            except Exception:
-                return False
+        with contextlib.suppress(Exception):
+            if isinstance(evt, _QueryEvent): return bool(evt.query())
+            if callable(is_set := getattr(evt, "is_set", None)): return bool(is_set())
         return False
 
     def _scavenge_lock(self) -> int:
@@ -228,85 +174,52 @@ class Pool:
         timeout: float | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, Pool.Token | None]:
         shape_t = tuple(int(s) for s in shape)
-        dtype_t = dtype
         need = _prod_int(shape_t)
-        deadline: float | None = None
-        if timeout is not None:
-            deadline = time.monotonic() + float(timeout)
+        deadline = (time.monotonic() + float(timeout)) if timeout is not None else None
         check_interval = 0.01
+        
         while True:
-            idx: int | None = None
-            need_new_page = False
-            want_grow = False
+            idx, need_new, grow = None, False, False
             with self._cv:
                 self._scavenge_lock()
                 n = len(self._pages)
                 if n:
-                    start = self._rr % n
                     for k in range(n):
-                        j = (start + k) % n
+                        j = (self._rr + k) % n
                         e = self._pages[j]
                         if not e.busy:
-                            e.busy = True
-                            e.fence = None
-                            idx = j
-                            self._rr = (j + 1) % max(1, n)
-                            if (
-                                (e.page.dtype != dtype_t)
-                                or (e.page.numel < need)
-                                or (e.page.pinned != self._pin)
-                            ):
-                                need_new_page = True
+                            e.busy, e.fence, idx, self._rr = True, None, j, (j + 1) % max(1, n)
+                            need_new = (e.page.dtype != dtype) or (e.page.numel < need) or (e.page.pinned != self._pin)
                             break
                 if idx is None:
-                    if n < self._cap:
-                        want_grow = True
-                    else:
-                        if block:
-                            if deadline is not None:
-                                remaining = deadline - time.monotonic()
-                                if remaining <= 0:
-                                    want_grow = False
-                                    break
-                                self._cv.wait(timeout=min(check_interval, remaining))
-                            else:
-                                self._cv.wait(timeout=check_interval)
-                            continue
-                        break
-            if idx is not None:
-                new_page: Page | None = None
-                if need_new_page:
-                    new_page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
+                    if n < self._cap: grow = True
+                    elif block:
+                        if deadline and (wait := deadline - time.monotonic()) <= 0: break
+                        self._cv.wait(timeout=min(check_interval, wait) if deadline else check_interval)
+                        continue
+                    else: break
+            
+            if idx is not None: 
+                new_page = Page(numel=need, dtype=dtype, pin_memory=self._pin) if need_new else None
                 with self._cv:
                     e = self._pages[idx]
-                    if need_new_page and new_page is not None:
-                        e.page = new_page
-                        e.gen += 1
-                    gen = int(e.gen)
-                view = e.page.view(*shape_t)
-                if return_handle:
-                    return view, Pool.Token(int(idx), gen)
-                return view
-            if want_grow:
-                page = Page(numel=need, dtype=dtype_t, pin_memory=self._pin)
-                entry = Pool._Entry(page=page, busy=True, fence=None, gen=0)
+                    if new_page: e.page, e.gen = new_page, e.gen + 1
+                    view, token = e.page.view(*shape_t), Pool.Token(int(idx), int(e.gen))
+                return (view, token) if return_handle else view
+
+            if grow:
+                entry = Pool._Entry(page=Page(numel=need, dtype=dtype, pin_memory=self._pin), busy=True, fence=None, gen=0)
                 with self._cv:
                     if len(self._pages) < self._cap:
                         self._pages.append(entry)
-                        idx2 = len(self._pages) - 1
-                        self._rr = (idx2 + 1) % self._cap
-                        view = entry.page.view(*shape_t)
-                        if return_handle:
-                            return view, Pool.Token(int(idx2), int(entry.gen))
-                        return view
+                        self._rr = len(self._pages) % self._cap
+                        view, token = entry.page.view(*shape_t), Pool.Token(len(self._pages)-1, 0)
+                        return (view, token) if return_handle else view
                 continue
             break
-        view = torch.empty(need, dtype=dtype_t, device="cpu", pin_memory=False).view(
-            *shape_t
-        )
-        if return_handle:
-            return view, None
-        return view
+        
+        view = torch.empty(need, dtype=dtype, device="cpu", pin_memory=False).view(*shape_t)
+        return (view, None) if return_handle else view
 
     def get_like(
         self,
@@ -336,59 +249,41 @@ class Pool:
         if i < 0:
             return None
         with self._cv:
-            if 0 <= i < len(self._pages):
-                e = self._pages[i]
-                if e.gen == g and e.fence_evt is not None:
-                    return e.fence_evt
-        try:
-            ev_new = factory()
-        except Exception:
-            return None
-        if ev_new is None:
-            return None
+            if 0 <= i < len(self._pages) and self._pages[i].gen == g and self._pages[i].fence_evt: return self._pages[i].fence_evt
+        
+        try: ev_new = factory()
+        except: return None
+        if not ev_new: return None
+
         with self._cv:
-            if 0 <= i < len(self._pages):
-                e = self._pages[i]
-                if e.gen == g:
-                    if e.fence_evt is None:
-                        e.fence_evt = ev_new
-                        return ev_new
-                    return e.fence_evt
+            if 0 <= i < len(self._pages) and self._pages[i].gen == g:
+                if not self._pages[i].fence_evt: self._pages[i].fence_evt = ev_new
+                return self._pages[i].fence_evt
         return ev_new
 
     def release_after(
         self, token: Pool.Token | None, wait_event: object | None
     ) -> None:
-        if token is None:
-            return
+        if token is None: return
         with self._cv:
             i = int(getattr(token, "i", -1))
             g = int(getattr(token, "g", -1))
-            if 0 <= i < len(self._pages):
-                e = self._pages[i]
-                if e.gen == g:
-                    e.busy = True
-                    e.fence = wait_event
-                    self._cv.notify()
+            if 0 <= i < len(self._pages) and self._pages[i].gen == g:
+                self._pages[i].busy, self._pages[i].fence = True, wait_event
+                self._cv.notify()
 
     def release(self, token: Pool.Token | None) -> None:
-        if token is None:
-            return
+        if token is None: return
         with self._cv:
             i = int(getattr(token, "i", -1))
             g = int(getattr(token, "g", -1))
-            if 0 <= i < len(self._pages):
-                e = self._pages[i]
-                if e.gen == g:
-                    e.busy = False
-                    e.fence = None
-                    self._cv.notify()
+            if 0 <= i < len(self._pages) and self._pages[i].gen == g:
+                self._pages[i].busy, self._pages[i].fence = False, None
+                self._cv.notify()
 
     def collect(self) -> None:
         with self._cv:
-            freed = self._scavenge_lock()
-            if freed:
-                self._cv.notify_all()
+            if self._scavenge_lock(): self._cv.notify_all()
 
 
 class Cache:
@@ -411,18 +306,9 @@ class Cache:
     def _wait(self, evt: object | None) -> None:
         if evt is None:
             return
-        try:
-            if isinstance(evt, _SyncEvent):
-                evt.synchronize()
-                return
-        except Exception:
-            pass
-        try:
-            if isinstance(evt, _WaitEvent):
-                evt.wait()
-                return
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            if isinstance(evt, _SyncEvent): evt.synchronize(); return
+            if isinstance(evt, _WaitEvent): evt.wait(); return
 
     @staticmethod
     def _is_cpu_pinned(t: torch.Tensor) -> bool:
@@ -430,10 +316,7 @@ class Cache:
             return False
         if getattr(t, "device", None) is None or t.device.type != "cpu":
             return False
-        is_pinned = getattr(t, "is_pinned", None)
-        if callable(is_pinned):
-            with contextlib.suppress(Exception):
-                return bool(is_pinned())
+        with contextlib.suppress(Exception): return bool(t.is_pinned()) if hasattr(t, "is_pinned") else False
         return False
 
     def _init_tensor(
@@ -444,75 +327,54 @@ class Cache:
         early_release: bool | None = None,
         force_unpin: bool | None = None,
     ) -> tuple[torch.Tensor, bool]:
-        if not torch.is_tensor(tensor):
-            tensor = torch.as_tensor(tensor)
+        if not torch.is_tensor(tensor): tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
-        with contextlib.suppress(Exception):
-            from torch.distributed.tensor import DTensor
-
-            if isinstance(buf, DTensor):
-                buf = buf.to_local()
-        if buf.device.type != "cpu":
-            buf = buf.to(device="cpu", non_blocking=False)
-        if early_release is None:
-            early_release = bool(getattr(self, "_early_release", True))
-        if force_unpin is None:
-            force_unpin = bool(getattr(self, "_force_unpin", False))
+        
+        if hasattr(buf, "to_local"): buf = buf.to_local()
+        if buf.device.type != "cpu": buf = buf.to(device="cpu", non_blocking=False)
+        
+        early = early_release if early_release is not None else self._early_release
+        unpin = force_unpin if force_unpin is not None else self._force_unpin
         released = False
-        pinned = Cache._is_cpu_pinned(buf)
-        if pinned and (
-            bool(force_unpin) or (bool(early_release) and callable(release_cb))
-        ):
+        
+        if Cache._is_cpu_pinned(buf) and (unpin or (early and callable(release_cb))):
             try:
                 tmp = torch.empty_like(buf, device="cpu", pin_memory=False)
                 tmp.copy_(buf, non_blocking=False)
-                buf = tmp
-                if bool(early_release) and callable(release_cb):
-                    with contextlib.suppress(Exception):
-                        release_cb()
-                    released = True
+                buf, released = tmp, bool(early and callable(release_cb))
+                if released:
+                    with contextlib.suppress(Exception): release_cb()
             except Exception:
                 released = False
-        if not bool(buf.is_contiguous()):
-            buf = buf.contiguous()
+        
+        if not buf.is_contiguous(): buf = buf.contiguous()
         return buf, released
 
     def _save_tensor(self, tensor: torch.Tensor, path: str) -> None:
-        if not torch.is_tensor(tensor):
-            tensor = torch.as_tensor(tensor)
+        if not torch.is_tensor(tensor): tensor = torch.as_tensor(tensor)
         buf = tensor.detach()
-        with contextlib.suppress(Exception):
-            from torch.distributed.tensor import DTensor
-
-            if isinstance(buf, DTensor):
-                buf = buf.to_local()
-        if buf.device.type != "cpu":
-            buf = buf.to(device="cpu", non_blocking=False)
-        if not bool(buf.is_contiguous()):
-            buf = buf.contiguous()
+        
+        if hasattr(buf, "to_local"): buf = buf.to_local()
+        if buf.device.type != "cpu": buf = buf.to(device="cpu", non_blocking=False)
+        if not buf.is_contiguous(): buf = buf.contiguous()
+        
         if str(path).endswith(".mmt"):
             from tensordict import MemoryMappedTensor
 
             parent = os.path.dirname(path) or "."
             os.makedirs(parent, exist_ok=True)
-            fd, tmp_name = tempfile.mkstemp(
-                prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent
-            )
+            fd, tmp_name = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=parent)
             os.close(fd)
             try:
                 MemoryMappedTensor.from_tensor(buf, filename=tmp_name, existsok=True)
                 os.replace(tmp_name, path)
             finally:
-                with contextlib.suppress(Exception):
-                    os.remove(tmp_name)
-            meta = {
-                "shape": [int(x) for x in buf.shape],
-                "dtype": str(buf.dtype).replace("torch.", ""),
-            }
+                with contextlib.suppress(Exception): os.remove(tmp_name)
+            
             from ..data import schemas
-
-            schemas.write_json(schemas.get_meta_path(path), meta, indent=None)
+            schemas.write_json(schemas.get_meta_path(path), {"shape": list(map(int, buf.shape)), "dtype": str(buf.dtype).replace("torch.", "")}, indent=None)
             return
+            
         if str(path).endswith((".pt", ".pth")):
             from ..data import schemas
 
@@ -530,39 +392,21 @@ class Cache:
     def _run(self) -> None:
         while True:
             item = self._q.get()
-            match item:
-                case (tensor, path, evt, rel):
-                    pass
-                case _:
-                    self._err = RuntimeError(
-                        f"Invalid cache queue item: {type(item)!r}"
-                    )
-                    self._err_event.set()
-                    break
-            if tensor is None:
-                break
+            if item[0] is None: break
+            
+            tensor, path, evt, rel = item
             rel_cb = rel if callable(rel) else None
-            released_early = False
             try:
                 self._wait(evt)
-                buf, released_early = self._init_tensor(
-                    tensor,
-                    release_cb=rel_cb,
-                    early_release=bool(getattr(self, "_early_release", True)),
-                    force_unpin=bool(getattr(self, "_force_unpin", False)),
-                )
+                buf, released_early = self._init_tensor(tensor, release_cb=rel_cb)
                 self._save_tensor(buf, path)
                 if rel_cb is not None and not released_early:
-                    with contextlib.suppress(Exception):
-                        rel_cb()
+                    with contextlib.suppress(Exception): rel_cb()
             except Exception as e:
-                self._err = e
-                self._err_event.set()
+                self._err, _ = e, self._err_event.set()
                 break
             finally:
-                if self._sem is not None:
-                    with contextlib.suppress(Exception):
-                        self._sem.release()
+                with contextlib.suppress(Exception): self._sem.release() if self._sem else None
 
     def submit(
         self,
@@ -572,59 +416,37 @@ class Cache:
         wait_event: Optional[object] = None,
         release_cb: Optional[object] = None,
     ) -> None:
-        if self._err_event.is_set():
-            raise RuntimeError(f"Async writer error: {self._err!r}")
-        if self._closed.is_set():
-            raise RuntimeError("Cache is closed")
-        if path is None:
-            if idx is None:
-                raise ValueError("either path or idx required")
-            path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt")
-        path = os.fspath(path)
+        if self._err_event.is_set(): raise RuntimeError(f"Async writer error: {self._err!r}")
+        if self._closed.is_set(): raise RuntimeError("Cache is closed")
+        
+        path = os.path.join(self._root, f"chunk_{int(idx):06d}.pt") if path is None and idx is not None else os.fspath(path)
         acquired = False
-        sem = self._sem
-        if sem is not None:
-            mode = str(getattr(self, "_bp_mode", "block") or "block").lower()
-            timeout_s = float(getattr(self, "_bp_timeout_s", 0.05) or 0.0)
-            if mode == "sync":
-                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
+        if self._sem:
+            mode, timeout = self._bp_mode, self._bp_timeout_s
+            if mode in ("sync", "raise"):
+                acquired = self._sem.acquire(timeout=timeout)
                 if not acquired:
+                    if mode == "raise": raise RuntimeError("Cache queue is full")
                     self._wait(wait_event)
-                    buf, released = self._init_tensor(
-                        tensor,
-                        release_cb=(release_cb if callable(release_cb) else None),
-                        early_release=False,
-                        force_unpin=bool(getattr(self, "_force_unpin", False)),
-                    )
+                    buf, released = self._init_tensor(tensor, release_cb=release_cb, early_release=False)
                     self._save_tensor(buf, path)
                     if callable(release_cb) and not released:
-                        with contextlib.suppress(Exception):
-                            release_cb()
+                        with contextlib.suppress(Exception): release_cb()
                     return
-            elif mode == "raise":
-                acquired = bool(sem.acquire(timeout=max(0.0, float(timeout_s))))
-                if not acquired:
-                    raise RuntimeError("Cache queue is full")
             else:
-                if timeout_s > 0:
-                    acquired = bool(sem.acquire(timeout=float(timeout_s)))
+                acquired = self._sem.acquire(timeout=timeout) if timeout > 0 else False
                 while not acquired:
-                    if self._err_event.is_set():
-                        raise RuntimeError(f"Async writer error: {self._err!r}")
-                    if self._closed.is_set():
-                        raise RuntimeError("Cache is closed")
-                    acquired = bool(sem.acquire(timeout=0.1))
+                    if self._err_event.is_set() or self._closed.is_set(): raise RuntimeError("Cache unavailable")
+                    acquired = self._sem.acquire(timeout=0.1)
         try:
             self._q.put((tensor, path, wait_event, release_cb))
         except Exception:
-            if acquired and sem is not None:
-                with contextlib.suppress(Exception):
-                    sem.release()
+            if acquired:
+                with contextlib.suppress(Exception): self._sem.release()
             raise
 
     def close(self) -> None:
-        if self._closed.is_set():
-            return
+        if self._closed.is_set(): return
         self._closed.set()
         self._q.put((None, None, None, None))
         self._t.join()
