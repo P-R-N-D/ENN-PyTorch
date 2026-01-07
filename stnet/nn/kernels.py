@@ -80,29 +80,29 @@ def _flatten_attn_mask(
 ) -> tuple[torch.Tensor, int, int, int]:
     if mask.dim() == 0:
         m = mask.to(device=device).view(1, 1, 1, 1)
-        m = m.expand(1, 1, 1, int(S))
+        m = m.expand(1, 1, 1, S)
         return m, 1, 1, 1
     if mask.dim() == 1:
-        if int(mask.shape[0]) != int(S):
+        if mask.shape[0] != S:
             raise RuntimeError(
                 f"attn_mask shape {tuple(mask.shape)} incompatible with key length S={int(S)}"
             )
-        m = mask.to(device=device).view(1, 1, 1, int(S))
+        m = mask.to(device=device).view(1, 1, 1, S)
         return m, 1, 1, 1
     if mask.dim() == 2:
-        a, b = int(mask.shape[0]), int(mask.shape[1])
-        if b != int(S):
+        a, b = mask.shape
+        if b != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {b} does not match expected S={int(S)}"
             )
-        if a == int(L):
-            m = mask.to(device=device).view(1, 1, int(L), int(S))
+        if a == L:
+            m = mask.to(device=device).view(1, 1, L, S)
             return m, 1, 1, int(L)
         if a == 1:
-            m = mask.to(device=device).view(1, 1, 1, int(S))
+            m = mask.to(device=device).view(1, 1, 1, S)
             return m, 1, 1, 1
         if a == int(B):
-            m = mask.to(device=device).view(int(B), 1, 1, int(S))
+            m = mask.to(device=device).view(B, 1, 1, S)
             return m, int(B), 1, 1
         raise RuntimeError(
             f"unsupported 2D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, L={int(L)}, S={int(S)})"
@@ -117,7 +117,7 @@ def _flatten_attn_mask(
             m = mask.to(device=device).view(int(B), 1, int(L), int(S))
             return m, int(B), 1, int(L)
         if (a == int(B)) and (b == 1):
-            m = mask.to(device=device).view(int(B), 1, 1, int(S))
+            m = mask.to(device=device).view(B, 1, 1, S)
             return m, int(B), 1, 1
         if (a == int(H)) and (b == int(L)):
             m = mask.to(device=device).view(1, int(H), int(L), int(S))
@@ -129,16 +129,16 @@ def _flatten_attn_mask(
             f"unsupported 3D attn_mask shape {tuple(mask.shape)} for (B={int(B)}, H={int(H)}, L={int(L)}, S={int(S)})"
         )
     if mask.dim() == 4:
-        b0, h0, l0, s0 = map(int, mask.shape)
-        if s0 != int(S):
+        b0, h0, l0, s0 = mask.shape
+        if (not torch.jit.is_tracing()) and s0 != S:
             raise RuntimeError(
                 f"attn_mask trailing dim {s0} does not match expected S={int(S)}"
             )
-        if b0 not in (1, int(B)):
+        if (not torch.jit.is_tracing()) and b0 not in (1, B):
             raise RuntimeError(f"attn_mask batch dim {b0} incompatible with B={int(B)}")
-        if h0 not in (1, int(H)):
+        if (not torch.jit.is_tracing()) and h0 not in (1, H):
             raise RuntimeError(f"attn_mask head dim {h0} incompatible with H={int(H)}")
-        if l0 not in (1, int(L)):
+        if (not torch.jit.is_tracing()) and l0 not in (1, L):
             raise RuntimeError(
                 f"attn_mask query dim {l0} incompatible with L={int(L)} (broadcast 1 or L allowed)"
             )
@@ -173,18 +173,30 @@ def _compute_flops_mha(
     label: str = "MultiHeadAttention",
 ) -> None:
     try:
+        if FLOP_PROFILER is None:
+            return
+        if torch.jit.is_tracing() or torch.jit.is_scripting():
+            return
+        try:
+            if torch.compiler.is_compiling():
+                return
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
         if batch_first:
             if query.dim() < 3 or key.dim() < 3:
                 return
-            B = int(query.shape[0])
-            Lq = int(query.shape[1])
-            Sk = int(key.shape[1])
+            B = query.size(0)
+            Lq = query.size(1)
+            Sk = key.size(1)
         else:
             if query.dim() < 3 or key.dim() < 3:
                 return
-            Lq = int(query.shape[0])
-            B = int(query.shape[1])
-            Sk = int(key.shape[0])
+            Lq = query.size(0)
+            B = query.size(1)
+            Sk = key.size(0)
         H = int(num_heads)
         E = int(embed_dim)
         if B <= 0 or Lq <= 0 or Sk <= 0 or H <= 0 or E <= 0:
@@ -482,22 +494,26 @@ class DotProductAttention(nn.Module):
         Bq, Hq, Lq, Dq = q.shape
         Bk, Hk, Lk, Dk = k.shape
         Bv, Hv, Lv, Dv = v.shape
-        if Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv:
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if (not tracing) and (Bq != Bk or Hq != Hk or Bq != Bv or Hq != Hv):
             raise ValueError(
                 "DotProductAttention expects matching batch and head dims for q/k/v, "
                 f"got q={tuple(q.shape)}, k={tuple(k.shape)}, v={tuple(v.shape)}"
             )
-        if Lk != Lv:
+        if (not tracing) and Lk != Lv:
             raise ValueError(
                 "DotProductAttention expects matching sequence length for k and v, "
                 f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
             )
-        if Dq != Dk:
+        if (not tracing) and (Dq != Dk):
             raise ValueError(
                 "DotProductAttention expects matching embedding dims for q and k, "
                 f"got q={tuple(q.shape)}, k={tuple(k.shape)}"
             )
-        if Dk != Dv:
+        if (not tracing) and Dk != Dv:
             raise ValueError(
                 "DotProductAttention expects matching embedding dims for k and v, "
                 f"got k={tuple(k.shape)}, v={tuple(v.shape)}"
@@ -508,7 +524,7 @@ class DotProductAttention(nn.Module):
         q_bshd = q.contiguous()
         k_bshd = k.contiguous()
         v_bshd = v.contiguous()
-        if _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
+        if (not tracing) and _is_bshd_contiguous(q_bshd) and _is_bshd_contiguous(k_bshd):
             try:
                 capture(
                     q_bshd,
@@ -561,7 +577,7 @@ class DotProductAttention(nn.Module):
                 L=L,
                 S=S,
             )
-            if int(mh) == 1 and int(mL) == int(L):
+            if (not tracing) and int(mh) == 1 and int(mL) == int(L):
                 try:
                     if int(mask_bool.stride(-2)) == 0:
                         mask_bool = mask_bool[..., :1, :]
@@ -590,6 +606,7 @@ class DotProductAttention(nn.Module):
             and not self._force_pt
             and (self._te_attn is not None)
             and not is_compiling
+            and (not tracing)
             and q_bshd.is_cuda
             and q_bshd.dtype in (torch.float16, torch.bfloat16)
         )
@@ -652,7 +669,8 @@ class DotProductAttention(nn.Module):
                     B_, H_, L_, D_ = q_bshd.shape
                     S_ = k_bshd.shape[2]
                     flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
-                    FLOP_PROFILER.add("DotProductAttention", float(flops))
+                    if (FLOP_PROFILER is not None) and (not tracing):
+                        FLOP_PROFILER.add("DotProductAttention", float(flops))
                 except Exception:
                     pass
                 return out_te
@@ -685,8 +703,8 @@ class DotProductAttention(nn.Module):
         k_bhsd = k_bshd.contiguous()
         v_bhsd = v_bshd.contiguous()
         B, H, _, _ = q_bhsd.shape
-        L2 = int(q_bhsd.shape[2])
-        S2 = int(k_bhsd.shape[2])
+        L2 = q_bhsd.shape[2]
+        S2 = k_bhsd.shape[2]
         fm = sdpa_kwargs["attn_mask"]
         if fm is not None:
             if fm.dtype is torch.bool:
@@ -701,11 +719,11 @@ class DotProductAttention(nn.Module):
                 L=L2,
                 S=S2,
             )
-            if batch_dim not in (1, B):
+            if (not tracing) and batch_dim not in (1, B):
                 raise RuntimeError(
                     f"attn_mask batch dimension {batch_dim} incompatible with batch {B}"
                 )
-            if head_count not in (1, H):
+            if (not tracing) and head_count not in (1, H):
                 raise RuntimeError(
                     f"attn_mask head count {head_count} incompatible with num_heads {H}"
                 )
@@ -731,7 +749,8 @@ class DotProductAttention(nn.Module):
             B_, H_, L_, D_ = q_bhsd.shape
             S_ = k_bhsd.shape[2]
             flops = 2.0 * B_ * H_ * L_ * D_ * S_ + 2.0 * B_ * H_ * L_ * S_ * D_
-            FLOP_PROFILER.add("DotProductAttention", float(flops))
+            if (FLOP_PROFILER is not None) and (not tracing):
+                FLOP_PROFILER.add("DotProductAttention", float(flops))
         except Exception:
             pass
         return sdpa_out
@@ -838,8 +857,12 @@ class MultiScaleRetention(nn.Module):
             raise ValueError(
                 f"_select_last_state expects (B,L,H,Dh), got {tuple(state_tensor.shape)}"
             )
-        B, L, H, Dh = map(int, state_tensor.shape)
-        if L <= 0:
+        B, L, H, Dh = state_tensor.shape
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if (not tracing) and L <= 0:
             return state_tensor.new_zeros((B, H, Dh))
         if (
             isinstance(attn_mask, torch.Tensor)
@@ -855,7 +878,11 @@ class MultiScaleRetention(nn.Module):
 
     @staticmethod
     def _scan_causal_torch(v: torch.Tensor, lam_h: torch.Tensor) -> torch.Tensor:
-        B, L, H, Dh = map(int, v.shape)
+        B, L, H, Dh = v.shape
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
         if L <= 0:
             return v.new_zeros(v.shape)
         calc_dtype = (
@@ -882,7 +909,7 @@ class MultiScaleRetention(nn.Module):
             )
         if v.device.type != "cuda":
             raise RuntimeError("_scan_causal_triton requires CUDA tensor")
-        B, L, H, Dh = map(int, v.shape)
+        B, L, H, Dh = v.shape
         out = torch.empty_like(v, dtype=v.dtype)
         SVB, SVL, SVH, SVD = v.stride()
         SOB, SOL, SOH, SOD = out.stride()
@@ -975,8 +1002,12 @@ class MultiScaleRetention(nn.Module):
             raise ValueError(
                 f"MultiScaleRetention expects (B,L,D), got {tuple(x_in.shape)}"
             )
-        B, L, D = map(int, x_in.shape)
-        if L <= 0:
+        B, L, D = x_in.shape
+        try:
+            tracing = bool(torch.jit.is_tracing() or torch.jit.is_scripting())
+        except Exception:
+            tracing = False
+        if (not tracing) and L <= 0:
             out0 = x_in.new_zeros(x_in.shape)
             if bool(return_state):
                 st0 = x_in.new_zeros((B, self.nhead, int(self.head_dim)))
@@ -985,7 +1016,7 @@ class MultiScaleRetention(nn.Module):
                     st0 = st0.to(restore_dtype)
                 return out0, st0
             return out0.to(restore_dtype) if restore_dtype is not None else out0
-        if D != int(self.d_model):
+        if (not tracing) and D != int(self.d_model):
             raise ValueError(
                 f"Last dimension {D} must equal d_model={int(self.d_model)}"
             )

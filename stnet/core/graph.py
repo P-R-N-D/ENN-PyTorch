@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import sys
 import threading
 from contextlib import AbstractContextManager, suppress, nullcontext
 from typing import Any, Callable, Dict, List, Optional, Iterator
@@ -346,6 +347,8 @@ def compile(
     compile_fn = getattr(torch, "compile", None)
     if compile_fn is None:
         return module
+    if sys.version_info >= (3, 14):
+        return module
     if canonical_mode == "max-autotune" and not _is_for_cuda(module):
         canonical_mode = "max-autotune-no-cudagraphs"
     opt: Dict[str, Any] = dict(options or {})
@@ -478,7 +481,25 @@ def compile(
 
 
 def torch_compiler_supported() -> bool:
-    return callable(getattr(torch, "compile", None))
+    if sys.version_info >= (3, 14):
+        return False
+    compile_fn = getattr(torch, "compile", None)
+    if not callable(compile_fn):
+        return False
+    try:
+        if getattr(torch, "jit", None) is not None:
+            if torch.jit.is_tracing() or torch.jit.is_scripting():
+                return False
+    except Exception:
+        pass
+    try:
+        comp = getattr(torch, "compiler", None)
+        is_exporting = getattr(comp, "is_exporting", None) if comp is not None else None
+        if callable(is_exporting) and bool(is_exporting()):
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def cudagraph_mark_step_begin() -> None:
