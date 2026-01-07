@@ -350,6 +350,49 @@ def _save_dataset(
     if not needs_preprocess:
         if count <= 0:
             raise ValueError("Empty dataset")
+        shuffle_enabled = bool(shuffle)
+        get_by_indices = None
+        if shuffle_enabled:
+            if isinstance(getter, _TensorDictSlicer):
+                td = getter.td
+
+                def _td_indexer(indices: object) -> TensorDictBase:
+                    return td[indices]
+
+                get_by_indices = _td_indexer
+            elif isinstance(getter, _MappingSlicer):
+                def _can_index(value: object) -> bool:
+                    if isinstance(value, (list, tuple)):
+                        return True
+                    try:
+                        value[[0]]
+                    except Exception:
+                        return False
+                    return True
+
+                if not all(_can_index(v) for _, v in getter.slice_items):
+                    shuffle_enabled = False
+                else:
+                    const_items = dict(getter.const_items)
+                    slice_items = tuple(getter.slice_items)
+
+                    def _map_indexer(indices: object) -> Mapping[Any, Any]:
+                        batch = dict(const_items)
+                        idx_list = None
+                        if isinstance(indices, torch.Tensor):
+                            idx_list = indices.tolist()
+                        for k, v in slice_items:
+                            if isinstance(v, (list, tuple)):
+                                if idx_list is None:
+                                    idx_list = list(indices)
+                                batch[k] = [v[i] for i in idx_list]
+                            else:
+                                batch[k] = v[indices]
+                        return batch
+
+                    get_by_indices = _map_indexer
+        if shuffle_enabled and get_by_indices is None:
+            shuffle_enabled = False
         in_dim, label_shape = Storage.stream_memmap(
             ds=ds,
             out_dir=out_dir,
@@ -358,7 +401,8 @@ def _save_dataset(
             val_frac=float(val_frac),
             seed_value=seed_value,
             underflow_action=underflow_action,
-            shuffle=bool(shuffle),
+            shuffle=shuffle_enabled,
+            get_by_indices=get_by_indices,
             allow_missing_labels=False,
             chunk_size=0,
         )
