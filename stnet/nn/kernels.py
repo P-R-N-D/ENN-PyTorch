@@ -95,6 +95,15 @@ def _flatten_attn_mask(
     if mask.dim() == 2:
         a, b = mask.shape
         if tracing_or_export:
+            if a == B:
+                m = mask.to(device=device).view(B, 1, 1, b)
+                return m, B, 1, 1
+            if a == L:
+                m = mask.to(device=device).view(1, 1, L, b)
+                return m, 1, 1, L
+            if a == 1:
+                m = mask.to(device=device).view(1, 1, 1, b)
+                return m, 1, 1, 1
             m = mask.to(device=device).view(1, 1, a, b)
             return m, 1, 1, a
         if b != S:
@@ -116,6 +125,18 @@ def _flatten_attn_mask(
     if mask.dim() == 3:
         a, b, c = mask.shape
         if tracing_or_export:
+            if (a == B) and (b == L):
+                m = mask.to(device=device).view(B, 1, L, c)
+                return m, B, 1, L
+            if (a == B) and (b == 1):
+                m = mask.to(device=device).view(B, 1, 1, c)
+                return m, B, 1, 1
+            if (a == H) and (b == L):
+                m = mask.to(device=device).view(1, H, L, c)
+                return m, 1, H, L
+            if (a == B) and (b == H):
+                m = mask.to(device=device).view(B, H, 1, c)
+                return m, B, H, 1
             m = mask.to(device=device).view(a, 1, b, c)
             return m, a, 1, b
         if c != S:
